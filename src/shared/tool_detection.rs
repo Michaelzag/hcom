@@ -97,10 +97,22 @@ const PI_NATIVE: &[EnvPredicate] = &[EnvPredicate {
     var: "HCOM_PI",
     condition: EnvMatch::Equals("1"),
 }];
-const OMP_NATIVE: &[EnvPredicate] = &[EnvPredicate {
-    var: "HCOM_OMP",
-    condition: EnvMatch::Equals("1"),
-}];
+// OMPCODE=1 is set by OMP's own shell spawner for every Bash-tool child
+// (packages/utils/src/procmgr.ts), so it is present wherever `hcom start` is
+// run inside an OMP session. CLAUDECODE=1 is NOT omp-exclusive: OMP's spawner
+// sets that too (mirroring Claude's child shell), and real Claude Code sets it
+// as well — so CLAUDECODE alone cannot discriminate the two. OMPCODE can:
+// Claude Code never emits it (absent from the 2.1.268 binary).
+const OMP_NATIVE: &[EnvPredicate] = &[
+    EnvPredicate {
+        var: "HCOM_OMP",
+        condition: EnvMatch::Equals("1"),
+    },
+    EnvPredicate {
+        var: "OMPCODE",
+        condition: EnvMatch::Equals("1"),
+    },
+];
 
 macro_rules! hcom_tool_predicate {
     ($name:literal, $ident:ident) => {
@@ -124,7 +136,24 @@ hcom_tool_predicate!("pi", HCOM_TOOL_PI);
 hcom_tool_predicate!("omp", HCOM_TOOL_OMP);
 
 /// Detection precedence: native markers first, then hcom's explicit fallback.
+///
+/// Omp precedes Claude deliberately. OMP's shell spawner exports `CLAUDECODE=1`
+/// to every Bash-tool child (packages/utils/src/procmgr.ts, mirroring Claude's
+/// own child shell), so a plain OMP session satisfies the Claude native rule.
+/// Ordering Claude first made `hcom start` inside OMP believe it was running in
+/// Claude Code and rewrite `~/.claude/settings.json` (2026-09-12). `OMPCODE=1`
+/// is the discriminator: OMP sets it, Claude Code never does.
 pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
+    ToolDetectionRule {
+        tool: Tool::Omp,
+        predicates: OMP_NATIVE,
+        clear_for_child: &[
+            "HCOM_OMP",
+            "OMPCODE",
+            "PI_CODING_AGENT",
+            "PI_CODING_AGENT_SESSION_DIR",
+        ],
+    },
     ToolDetectionRule {
         tool: Tool::Claude,
         predicates: CLAUDE_NATIVE,
@@ -175,11 +204,6 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
         tool: Tool::Pi,
         predicates: PI_NATIVE,
         clear_for_child: &["HCOM_PI", "PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Omp,
-        predicates: OMP_NATIVE,
-        clear_for_child: &["HCOM_OMP", "PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
     },
     ToolDetectionRule {
         tool: Tool::Claude,
@@ -308,6 +332,19 @@ mod tests {
             detect_tool(&env(&[("ANTIGRAVITY_AGENT", "1"), ("GEMINI_CLI", "1")])),
             Tool::Antigravity
         );
+    }
+
+    #[test]
+    fn omp_session_beats_claude_marker_from_its_own_shell_spawner() {
+        // OMP's shell spawner exports CLAUDECODE=1 (and OMPCODE=1) to every
+        // Bash-tool child, so `hcom start` run inside OMP sees both. Detecting
+        // Claude there rewrote ~/.claude/settings.json. OMPCODE is the tiebreak.
+        assert_eq!(
+            detect_tool(&env(&[("CLAUDECODE", "1"), ("OMPCODE", "1")])),
+            Tool::Omp
+        );
+        // A real Claude Code child shell sets CLAUDECODE but never OMPCODE.
+        assert_eq!(detect_tool(&env(&[("CLAUDECODE", "1")])), Tool::Claude);
     }
 
     #[test]
