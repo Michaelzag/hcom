@@ -315,7 +315,14 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				if (isIdle) {
 					await pi.sendUserMessage(formatted);
 				} else {
-					await pi.sendUserMessage(formatted, { deliverAs: "followUp" });
+					// Busy lane: `aside`, not `followUp`. Per omp's
+					// docs/extensions.md:200, `aside` is "injected at the next agent
+					// step boundary without interrupting the current tool batch",
+					// whereas `followUp` is "queued to run after current run" — which
+					// delayed an inbound peer message by 44 s (measured) and paid a
+					// whole extra turn boundary for it. `steer` is wrong here: it
+					// interrupts and can abort the rest of the tool batch.
+					await pi.sendUserMessage(formatted, { deliverAs: "aside" });
 				}
 				const sender = String(pending.messages[0]?.from ?? "");
 				await reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver");
@@ -324,7 +331,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 					pending_ack: pending.maxId,
 					idle: isIdle,
 				});
-				await ackPending(isIdle ? "sendUserMessage" : "followUp");
+				await ackPending(isIdle ? "sendUserMessage" : "aside");
 				return true;
 			} catch (error) {
 				if (pendingAckId === pending.maxId) pendingAckId = null;
