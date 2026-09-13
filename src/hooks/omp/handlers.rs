@@ -125,10 +125,61 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
             }) {
                 Some(name) => name,
                 None => {
-                    return (
-                        0,
-                        r#"{"error":"No instance bound to this process"}"#.to_string(),
-                    );
+                    // Launcher-less first bind. `HCOM_LAUNCHED=1` with a fresh
+                    // `HCOM_PROCESS_ID` and no launcher-created row means this
+                    // session was started outside hcom (e.g. a plain `omp -p`)
+                    // and is asking to participate. Mint an identity the same way
+                    // Claude/Gemini/Kimi do for orphaned PTY sessions: generate a
+                    // name, create the row, and bind session+process to it.
+                    //
+                    // Gated on `HCOM_LAUNCHED` so launcher-managed sessions keep
+                    // their launcher-created bindings untouched: a launcher always
+                    // pre-registers the row, so it never reaches this arm, and a
+                    // session without the flag keeps the previous refusal.
+                    if ctx.is_launched {
+                        match instance_binding::create_orphaned_pty_identity(
+                            db,
+                            &session_id,
+                            Some(&process_id),
+                            "omp",
+                        ) {
+                            Some(name) => {
+                                log_info(
+                                    "hooks",
+                                    "omp-start.minted_identity",
+                                    &format!("instance={} session_id={} process_id={}", name, session_id, process_id),
+                                );
+                                name
+                            }
+                            None => {
+                                log_error(
+                                    "hooks",
+                                    "omp-start.mint_failed",
+                                    &format!("session_id={} process_id={}", session_id, process_id),
+                                );
+                                return (
+                                    0,
+                                    r#"{"error":"No instance bound to this process"}"#.to_string(),
+                                );
+                            }
+                        }
+                    } else {
+                        // Log the refusal: a silent return here is the hardest
+                        // failure to debug (a plain session sees no delivery and
+                        // no diagnostic explaining why).
+                        log_info(
+                            "hooks",
+                            "omp-start.unbound_no_launch",
+                            &format!(
+                                "no instance bound and HCOM_LAUNCHED != 1; session_id={} process_id={}",
+                                session_id, process_id
+                            ),
+                        );
+                        return (
+                            0,
+                            r#"{"error":"No instance bound to this process"}"#.to_string(),
+                        );
+                    }
                 }
             },
         };
