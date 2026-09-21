@@ -2506,8 +2506,11 @@ pub fn run_delivery_loop(
         "ready_never_observed",
     );
 
-    let owns_instance = instance_owns_process_binding(db, &process_id, &current_name);
-
+    let owns_instance = if process_id.is_empty() {
+        true
+    } else {
+        matches!(db.get_process_binding(&process_id), Ok(Some(b)) if b == current_name)
+    };
     if matches!(
         Tool::from_str(&config.tool),
         Ok(Tool::Antigravity | Tool::Omp)
@@ -2515,18 +2518,6 @@ pub fn run_delivery_loop(
         antigravity::cleanup_antigravity_pty_exit(db, &current_name, &process_id, owns_instance);
     } else {
         cleanup_pty_exit_default(db, &current_name, &process_id, owns_instance);
-    }
-}
-
-/// True when this delivery thread's process_id still owns `current_name`.
-fn instance_owns_process_binding(db: &HcomDb, process_id: &str, current_name: &str) -> bool {
-    if process_id.is_empty() {
-        return true;
-    }
-    match db.get_process_binding(process_id) {
-        Ok(Some(bound_name)) => bound_name == current_name,
-        Ok(None) => false,
-        Err(_) => false,
     }
 }
 

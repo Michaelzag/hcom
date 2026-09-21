@@ -1692,15 +1692,23 @@ pub fn soft_finalize_session(
 
 /// Set inactive status, persist updates, and stop instance.
 ///
-/// Common to Claude and Gemini SessionEnd handlers. Catches all errors
-/// internally — callers don't need error handling.
+/// Common to Claude and Gemini SessionEnd handlers. Catches DB errors
+/// internally — callers don't need error handling — but returns the
+/// [`StopOutcome`] so tests can observe it.
 ///
+/// When the reap gate refuses (harness survivors after SIGKILL) the session
+/// is NOT cleanly ended: the row lingers and the harness still runs. That
+/// must be visible, so the refusal is logged at warn with the surviving pids
+/// (they ride in the error text) AND printed to hook stderr — the same
+/// channel hook denials use — while the hook exit code stays 0 (SessionEnd
+/// must not block the harness from exiting; the operator reads the warning
+/// and runs `hcom kill <name>`).
 pub fn finalize_session(
     db: &HcomDb,
     instance_name: &str,
     reason: &str,
     updates: Option<&serde_json::Map<String, Value>>,
-) {
+) -> StopOutcome {
     log::log_info(
         "hooks",
         "sessionend",
@@ -1722,7 +1730,18 @@ pub fn finalize_session(
     }
 
     // Full stop_instance chain: snapshot, cleanup bindings, log, delete
-    stop_instance(db, instance_name, "session", &format!("exit:{}", reason));
+    let outcome = stop_instance(db, instance_name, "session", &format!("exit:{}", reason));
+    if let StopOutcome::RetryableError(e) = &outcome {
+        log::log_warn(
+            "hooks",
+            "sessionend.stop_refused",
+            &format!("instance={instance_name} reason={reason} err={e}"),
+        );
+        eprintln!(
+            "[hcom] warn: SessionEnd for '{instance_name}' did not stop the session: {e}"
+        );
+    }
+    outcome
 }
 
 /// Update instance status for tool execution.
@@ -2732,7 +2751,8 @@ mod tests {
             [],
         );
 
-        finalize_session(&db, "inst", "user_quit", None);
+        let outcome = finalize_session(&db, "inst", "user_quit", None);
+        assert_eq!(outcome, StopOutcome::Stopped);
 
         // Instance should be deleted
         let count: i64 = db

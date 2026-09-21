@@ -629,7 +629,13 @@ fn kill_single(
                         reap_failed = true;
                     }
                 }
-                pidtrack::remove_pid(hcom_dir, orphan.pid);
+                // Keep the pidtrack handle while survivors live: it is the
+                // only handle by which a retry can rediscover this orphan.
+                // Dropping it on reap failure would force a hand-kill from
+                // the error text.
+                if !reap_failed {
+                    pidtrack::remove_pid(hcom_dir, orphan.pid);
+                }
                 return Ok(
                     if reap_failed
                         || report_incomplete_pane_cleanup(
