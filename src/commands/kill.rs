@@ -820,6 +820,7 @@ fn kill_instance(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
     use serial_test::serial;
 
     #[test]

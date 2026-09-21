@@ -286,7 +286,7 @@ pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), 
     {
         let _ = name;
         let _ = binding_ids;
-        return Ok(());
+        Ok(())
     }
     #[cfg(unix)]
     {
@@ -658,6 +658,7 @@ mod tests {
     // names. Names embed the test-runner pid so parallel tests (and any real
     // session on this host) can never collide with them.
 
+    #[cfg(unix)]
     fn unique_name(tag: &str) -> String {
         format!(
             "hcom-proctruth-{}-{}-{}",
@@ -667,6 +668,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn rand_suffix() -> u32 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};

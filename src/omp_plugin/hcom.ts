@@ -321,8 +321,8 @@ export default function hcomExtension(pi: ExtensionAPI) {
 					// extension API (SendUserMessageHandler in SDK 17.0.6) accepts
 					// just `steer` | `followUp`, so `aside` never typechecked, and
 					// worse, at runtime the session falls an unknown deliverAs
-					// through to prompt(streamingBehavior: "steer") — the old code
-					// steered while claiming not to. `steer` is wrong here: it
+					// through to prompt() with steer-on-stream behavior — the old
+					// code steered while claiming not to. `steer` is wrong here:
 					// interrupts and can abort the rest of the tool batch.
 					// `followUp` waits for the run to end (one probe measured
 					// 44 s plus a turn boundary) but delivers visibly and never
