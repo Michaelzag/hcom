@@ -4,12 +4,56 @@
 use crate::paths::{FLAGS_DIR, atomic_write, hcom_path};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(86400); // 24 hours
-const UNIX_INSTALL_CMD: &str =
-    "curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh";
-const WINDOWS_INSTALL_CMD: &str = "powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex\"";
+
+/// Owner/repo of the release source of truth. Every update URL and command
+/// below derives from this — the fork must never check upstream tags.
+pub const RELEASE_REPO: &str = "Michaelzag/hcom";
+
+/// curl-pipe-to-sh installer command for Unix, derived from [`RELEASE_REPO`].
+pub(crate) fn unix_install_cmd() -> &'static str {
+    static CMD: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            "curl -fsSL https://github.com/{RELEASE_REPO}/releases/latest/download/hcom-installer.sh | sh"
+        )
+    });
+    &CMD
+}
+
+/// PowerShell installer command for Windows, derived from [`RELEASE_REPO`].
+pub(crate) fn windows_install_cmd() -> &'static str {
+    static CMD: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command \"{}\"",
+            windows_installer_script()
+        )
+    });
+    &CMD
+}
+
+/// The `irm ... | iex` fragment run inside the PowerShell installer command,
+/// derived from [`RELEASE_REPO`].
+pub(crate) fn windows_installer_script() -> &'static str {
+    static SCRIPT: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            "irm https://github.com/{RELEASE_REPO}/releases/latest/download/hcom-installer.ps1 | iex"
+        )
+    });
+    &SCRIPT
+}
+
+/// `git ls-remote` endpoint for latest-tag checks, derived from [`RELEASE_REPO`].
+fn git_remote_url() -> String {
+    format!("https://github.com/{RELEASE_REPO}.git")
+}
+
+/// GitHub REST fallback for latest-release checks, derived from [`RELEASE_REPO`].
+fn github_api_latest_url() -> String {
+    format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest")
+}
 
 pub(crate) fn flag_path() -> PathBuf {
     hcom_path(&[FLAGS_DIR, "update_check"])
@@ -47,10 +91,10 @@ fn spawn_background_check(flag: &Path, current: &str) {
     // Runs completely detached — parent doesn't wait.
     let script = format!(
         r#"
-TAG=$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=5 git ls-remote --tags --sort=version:refname https://github.com/aannoo/hcom.git 2>/dev/null | grep -v '\^{{}}' | tail -1 | sed 's|.*refs/tags/||')
+TAG=$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=5 git ls-remote --tags --sort=version:refname https://github.com/{RELEASE_REPO}.git 2>/dev/null | grep -v '\^{{}}' | tail -1 | sed 's|.*refs/tags/||')
 # Fallback to GitHub API if git unavailable
 if [ -z "$TAG" ]; then
-    TAG=$(curl -fsSL --max-time 5 https://api.github.com/repos/aannoo/hcom/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+    TAG=$(curl -fsSL --max-time 5 https://api.github.com/repos/{RELEASE_REPO}/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | cut -d'"' -f4)
 fi
 VER="${{TAG#v}}"
 if [ -n "$VER" ]; then
@@ -84,12 +128,13 @@ fn fetch_latest_version() -> Option<String> {
 }
 
 fn fetch_via_git() -> Option<String> {
+    let url = git_remote_url();
     let output = std::process::Command::new("git")
         .args([
             "ls-remote",
             "--tags",
             "--sort=version:refname",
-            "https://github.com/aannoo/hcom.git",
+            url.as_str(),
         ])
         .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
         .env("GIT_HTTP_LOW_SPEED_TIME", "5")
@@ -114,13 +159,9 @@ fn fetch_via_git() -> Option<String> {
 }
 
 fn fetch_via_curl() -> Option<String> {
+    let url = github_api_latest_url();
     let output = std::process::Command::new("curl")
-        .args([
-            "-fsSL",
-            "--max-time",
-            "5",
-            "https://api.github.com/repos/aannoo/hcom/releases/latest",
-        ])
+        .args(["-fsSL", "--max-time", "5", url.as_str()])
         .output()
         .ok()?;
 
@@ -183,10 +224,8 @@ pub(crate) fn is_shell_pipe_command(cmd: &str) -> bool {
 }
 
 pub(crate) fn is_powershell_installer_command(cmd: &str) -> bool {
-    cmd == WINDOWS_INSTALL_CMD
+    cmd == windows_install_cmd()
 }
-
-/// Prefer `pwsh` over `powershell`: Windows PowerShell 5.1's module load can
 /// fail on a polluted `PSModulePath` (nested shells, OneDrive redirects);
 /// `pwsh` isn't affected. Falls back to `powershell` if pwsh isn't installed.
 pub(crate) fn windows_installer_program() -> &'static str {
@@ -262,9 +301,9 @@ fn get_update_cmd_for_exe(exe: &Path) -> &'static str {
 
 fn platform_installer_cmd() -> &'static str {
     if cfg!(windows) {
-        WINDOWS_INSTALL_CMD
+        windows_install_cmd()
     } else {
-        UNIX_INSTALL_CMD
+        unix_install_cmd()
     }
 }
 
@@ -404,9 +443,24 @@ mod tests {
         assert!(!is_shell_pipe_command("pip install -U hcom"));
         assert!(!is_shell_pipe_command("uv tool upgrade hcom"));
         assert!(!is_shell_pipe_command("brew upgrade hcom"));
-        assert!(!is_shell_pipe_command(WINDOWS_INSTALL_CMD));
-        assert!(is_powershell_installer_command(WINDOWS_INSTALL_CMD));
+        assert!(!is_shell_pipe_command(windows_install_cmd()));
+        assert!(is_powershell_installer_command(windows_install_cmd()));
         assert!(!is_powershell_installer_command("pip install -U hcom"));
+    }
+
+    #[test]
+    fn test_release_repo_is_single_source_of_truth() {
+        assert_eq!(RELEASE_REPO, "Michaelzag/hcom");
+        for cmd in [
+            unix_install_cmd(),
+            windows_install_cmd(),
+            windows_installer_script(),
+        ] {
+            assert!(cmd.contains(RELEASE_REPO), "missing repo: {cmd}");
+            assert!(!cmd.contains("aannoo"), "stale upstream ref: {cmd}");
+        }
+        assert!(git_remote_url().contains(RELEASE_REPO));
+        assert!(github_api_latest_url().contains(RELEASE_REPO));
     }
 
     #[test]
