@@ -1188,7 +1188,7 @@ mod tests {
         db.set_process_binding(&binding, "sess", &name).unwrap();
         let mut sleeper = spawn_pid_only_sleeper(&binding);
         let pid = sleeper.id();
-        wait_for_enumerated(&name, &[binding.clone()], pid);
+        wait_for_enumerated(&name, std::slice::from_ref(&binding), pid);
         let swept = sweep_vanished_instances(&db);
         assert!(
             !swept.iter().any(|n| n == &name),
@@ -1227,7 +1227,7 @@ mod tests {
         let binding = format!("proc-reap-{}", rand_suffix());
         let mut sleeper = spawn_pid_only_sleeper(&binding);
         let pid = sleeper.id();
-        wait_for_enumerated(&name, &[binding.clone()], pid);
+        wait_for_enumerated(&name, std::slice::from_ref(&binding), pid);
         assert!(reap_instance_tree_for(&name, &[binding]).is_ok());
         sleeper.wait().ok();
         assert!(

@@ -918,11 +918,9 @@ fn resume_system_prompt(tool: &str, name: &str, fork: bool, child_name: Option<&
         format!("YOUR SESSION HAS BEEN RESUMED! You are still '{}'.", name)
     }
 }
-/// Load data from an active or stopped instance.
-fn load_instance_data(
-    db: &HcomDb,
-    name: &str,
-) -> Result<(
+/// Loaded instance row for resume: (tool, session_id, launch_args, tag,
+/// background, last_event_id, directory, purpose, current).
+type LoadedInstanceData = (
     String,
     String,
     String,
@@ -932,7 +930,10 @@ fn load_instance_data(
     String,
     String,
     String,
-)> {
+);
+
+/// Load data from an active or stopped instance.
+fn load_instance_data(db: &HcomDb, name: &str) -> Result<LoadedInstanceData> {
     // Try active instance first
     if let Ok(Some(inst)) = db.get_instance_full(name) {
         return Ok((
@@ -953,20 +954,7 @@ fn load_instance_data(
 }
 
 /// Load stopped snapshot from life events.
-fn load_stopped_snapshot(
-    db: &HcomDb,
-    name: &str,
-) -> Result<(
-    String,
-    String,
-    String,
-    String,
-    bool,
-    i64,
-    String,
-    String,
-    String,
-)> {
+fn load_stopped_snapshot(db: &HcomDb, name: &str) -> Result<LoadedInstanceData> {
     // Filter action='stopped' in SQL so we can't miss it past a LIMIT window
     // (old 10-row LIMIT could drop the snapshot after many relaunches).
     let mut stmt = db.conn().prepare(
