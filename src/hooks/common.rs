@@ -1739,9 +1739,7 @@ pub fn finalize_session(
             "sessionend.stop_refused",
             &format!("instance={instance_name} reason={reason} err={e}"),
         );
-        eprintln!(
-            "[hcom] warn: SessionEnd for '{instance_name}' did not stop the session: {e}"
-        );
+        eprintln!("[hcom] warn: SessionEnd for '{instance_name}' did not stop the session: {e}");
     }
     outcome
 }
@@ -1932,7 +1930,13 @@ mod tests {
         assert_eq!(row.current.as_deref(), Some("Reading model role settings"));
 
         // Payload without an intent leaves the phase alone.
-        update_tool_status(&db, "nova", "omp", "read", &serde_json::json!({"path": "/tmp/x"}));
+        update_tool_status(
+            &db,
+            "nova",
+            "omp",
+            "read",
+            &serde_json::json!({"path": "/tmp/x"}),
+        );
         let row = db.get_instance_full("nova").unwrap().unwrap();
         assert_eq!(row.current.as_deref(), Some("Reading model role settings"));
     }

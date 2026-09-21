@@ -190,7 +190,10 @@ const INSTANCE_KEYS: &[(&str, &str)] = &[
         "subagent_timeout",
         "Instance-specific subagent timeout in seconds",
     ),
-    ("purpose", "What this session is for (shows in title and list)"),
+    (
+        "purpose",
+        "What this session is for (shows in title and list)",
+    ),
     ("current", "Live subtask (auto-updates from tool intents)"),
 ];
 

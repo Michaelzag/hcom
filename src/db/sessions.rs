@@ -688,7 +688,6 @@ impl HcomDb {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(ids)
     }
-
 }
 
 #[cfg(test)]
