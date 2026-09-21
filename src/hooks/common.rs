@@ -1500,9 +1500,11 @@ fn stop_instance_inner(
 
     // Reap the whole live tree for this name before releasing the row.
     // Process truth gates the release: the stopped event is only written
-    // (and the row only deleted) once no process carries the name. The pty
+    // (and the row only deleted) once no process holds the instance — by
+    // name or, for self-bound sessions, by binding process id. The pty
     // wrapper is signalled first via oldest-first ordering inside reap.
-    if let Err(survivors) = crate::proctruth::reap_instance_tree(instance_name) {
+    let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
+    if let Err(survivors) = crate::proctruth::reap_instance_tree_for(instance_name, &binding_ids) {
         let pids = survivors
             .iter()
             .map(|p| p.to_string())
