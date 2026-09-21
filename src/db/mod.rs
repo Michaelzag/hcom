@@ -37,7 +37,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 18;
+const SCHEMA_VERSION: i32 = 19;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -66,6 +66,11 @@ const MIGRATIONS: &[(i32, &str)] = &[
              ON claude_actor_capabilities(expires_at);
          CREATE INDEX IF NOT EXISTS idx_claude_actor_session
              ON claude_actor_capabilities(session_id);",
+    ),
+    (
+        19,
+        "ALTER TABLE instances ADD COLUMN purpose TEXT DEFAULT '';
+         ALTER TABLE instances ADD COLUMN current TEXT DEFAULT '';",
     ),
 ];
 
@@ -330,14 +335,11 @@ impl HcomDb {
                 running_tasks TEXT DEFAULT '',
                 origin_device_id TEXT DEFAULT '',
                 hints TEXT DEFAULT '',
-                subagent_timeout INTEGER,
-                tool TEXT DEFAULT 'claude',
-                launch_args TEXT DEFAULT '',
-                terminal_preset_requested TEXT DEFAULT '',
-                terminal_preset_effective TEXT DEFAULT '',
                 idle_since TEXT DEFAULT '',
                 pid INTEGER DEFAULT NULL,
                 launch_context TEXT DEFAULT '',
+                purpose TEXT DEFAULT '',
+                current TEXT DEFAULT '',
                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
             );
 
@@ -681,7 +683,7 @@ impl HcomDb {
 
         // (migration version, a column that migration introduces)
         const COLUMN_MIGRATIONS: &[(i32, &str)] =
-            &[(17, "terminal_preset_requested"), (18, "last_seen")];
+            &[(17, "terminal_preset_requested"), (18, "last_seen"), (19, "purpose")];
         for (migration, column) in COLUMN_MIGRATIONS {
             if !columns.contains(*column) {
                 return migration - 1;

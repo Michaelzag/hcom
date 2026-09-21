@@ -86,15 +86,10 @@ fn last_osc_title(buffer: &[u8]) -> Option<String> {
 /// readable in tab bars after hcom's `{icon} name [tool]` prefix.
 const MAX_CHILD_TITLE_CHARS: usize = 160;
 
-/// Normalize a wrapped tool's raw title into a single bounded line safe to embed
-/// inside hcom's own OSC sequence.
-///
-/// The input is untrusted display text (model output, project paths, etc.). We
-/// drop control characters (which could terminate or reshape our OSC) and other
-/// C0/C1 codepoints, collapse whitespace runs to a single space, trim the ends,
-/// and bound the result to [`MAX_CHILD_TITLE_CHARS`]. Mirrors codex's own
-/// `sanitize_terminal_title` so passthrough matches what the tool would render.
-fn sanitize_child_title(title: &str) -> String {
+/// Normalize untrusted display text into a single bounded line safe to embed
+/// inside hcom's own OSC sequence: drop controls/C0/C1 and invisible/bidi
+/// format chars, collapse whitespace runs, trim ends, bound to `max_chars`.
+pub(crate) fn sanitize_title_capped(title: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut pending_space = false;
     for ch in title.chars() {
@@ -111,13 +106,25 @@ fn sanitize_child_title(title: &str) -> String {
             out.push(' ');
             pending_space = false;
         }
-        if out.chars().count() >= MAX_CHILD_TITLE_CHARS {
+        if out.chars().count() >= max_chars {
             break;
         }
         out.push(ch);
     }
     out
 }
+
+ /// Normalize a wrapped tool's raw title into a single bounded line safe to embed
+ /// inside hcom's own OSC sequence.
+ ///
+ /// The input is untrusted display text (model output, project paths, etc.). We
+ /// drop control characters (which could terminate or reshape our OSC) and other
+ /// C0/C1 codepoints, collapse whitespace runs to a single space, trim the ends,
+ /// and bound the result to [`MAX_CHILD_TITLE_CHARS`]. Mirrors codex's own
+ /// `sanitize_terminal_title` so passthrough matches what the tool would render.
+ fn sanitize_child_title(title: &str) -> String {
+    sanitize_title_capped(title, MAX_CHILD_TITLE_CHARS)
+ }
 
 /// Trim whitespace including NBSP (U+00A0) from both ends
 fn trim_with_nbsp(s: &str) -> &str {

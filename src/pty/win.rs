@@ -54,6 +54,8 @@ pub struct Proxy {
     notify_port: Arc<AtomicU16>,
     current_name: Arc<RwLock<String>>,
     current_status: Arc<RwLock<String>>,
+    title_purpose: Arc<RwLock<String>>,
+    title_current: Arc<RwLock<String>>,
     rows: u16,
     cols: u16,
     /// Delivery thread handle. Wrapped in `Arc<Mutex<Option<_>>>` because the
@@ -158,9 +160,20 @@ impl Proxy {
 
         // Tie the child to a kill-on-close job so its whole tree is reaped if we
         // die abnormally (the explicit snapshot-kill in Drop covers clean exit).
-        let job = child.process_id().and_then(job::KillOnDropJob::assign);
-
         let initial_name = config.instance_name.clone().unwrap_or_default();
+        // Seed the first title frame from the row so `--hcom-title` shows
+        // immediately instead of waiting for the first delivery-loop poll.
+        let (initial_purpose, initial_current) = if initial_name.is_empty() {
+            (String::new(), String::new())
+        } else if let Ok(db) = HcomDb::open() {
+            db.get_instance_full(&initial_name)
+                .ok()
+                .flatten()
+                .map(|row| (row.purpose.unwrap_or_default(), row.current.unwrap_or_default()))
+                .unwrap_or_default()
+        } else {
+            (String::new(), String::new())
+        };
 
         Ok(Self {
             config,
@@ -173,6 +186,8 @@ impl Proxy {
             notify_port: Arc::new(AtomicU16::new(0)),
             current_name: Arc::new(RwLock::new(initial_name)),
             current_status: Arc::new(RwLock::new(String::new())),
+            title_purpose: Arc::new(RwLock::new(initial_purpose)),
+            title_current: Arc::new(RwLock::new(initial_current)),
             rows,
             cols,
             delivery_handle: Arc::new(Mutex::new(None)),
@@ -330,6 +345,8 @@ impl Proxy {
         let instance = self.config.instance_name.clone();
         let current_name = self.current_name.clone();
         let current_status = self.current_status.clone();
+        let title_purpose = self.title_purpose.clone();
+        let title_current = self.title_current.clone();
         let notify_port = self.notify_port.clone();
         let delivery_handle = self.delivery_handle.clone();
         let launch_failed = self.launch_failed.clone();
@@ -355,6 +372,8 @@ impl Proxy {
                         notify_port.clone(),
                         current_name.clone(),
                         current_status.clone(),
+                        title_purpose.clone(),
+                        title_current.clone(),
                         None,
                     ) {
                         Ok(shared::DeliveryStart::Started(h)) => {
@@ -472,6 +491,8 @@ impl Proxy {
         let instance = self.config.instance_name.clone();
         let current_name = self.current_name.clone();
         let current_status = self.current_status.clone();
+        let title_purpose = self.title_purpose.clone();
+        let title_current = self.title_current.clone();
         let approval_clear_requested = self.approval_clear_requested.clone();
         let pending_resize = self.pending_resize.clone();
         let last_tail = self.last_tail.clone();
@@ -529,6 +550,8 @@ impl Proxy {
             let headless = !std::io::stdout().is_terminal();
             let mut last_name = String::new();
             let mut last_status = String::new();
+            let mut last_purpose = String::new();
+            let mut last_current = String::new();
             // Terminal-title behavior. Read once; the child title comes from the
             // reader-owned `screen`, no extra lock needed. In `Off` the filter
             // passes the tool's own titles through and we write nothing.
@@ -693,10 +716,18 @@ impl Proxy {
                         if !headless
                             && title_enabled
                             && filter.title_write_safe()
-                            && let (Ok(name), Ok(status)) =
-                                (current_name.read(), current_status.read())
+                            && let (Ok(name), Ok(status), Ok(purpose), Ok(current)) = (
+                                current_name.read(),
+                                current_status.read(),
+                                title_purpose.read(),
+                                title_current.read(),
+                            )
                             && !name.is_empty()
-                            && (*name != last_name || *status != last_status || child != last_child)
+                            && (*name != last_name
+                                || *status != last_status
+                                || *purpose != last_purpose
+                                || *current != last_current
+                                || child != last_child)
                         {
                             let child_opt = (!child.is_empty()).then_some(child);
                             let esc = shared::build_title_escape(
@@ -705,6 +736,8 @@ impl Proxy {
                                 target.name(),
                                 title_mode,
                                 child_opt,
+                                &purpose,
+                                &current,
                             );
                             let _ = stdout.write_all(esc.as_bytes());
                             let _ = stdout.flush();
@@ -712,6 +745,8 @@ impl Proxy {
                             last_child.push_str(child);
                             last_name = name.clone();
                             last_status = status.clone();
+                            last_purpose = purpose.clone();
+                            last_current = current.clone();
                         }
                     }
                 }

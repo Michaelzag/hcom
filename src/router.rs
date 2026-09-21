@@ -36,6 +36,7 @@ const COMMANDS: &[&str] = &[
     "bundle",
     "kill",
     "term",
+    "title",
     "relay",
     "run",
     "update",
@@ -605,6 +606,7 @@ pub fn dispatch() -> anyhow::Result<()> {
                     | "reset"
                     | "hooks"
                     | "term"
+                    | "title"
                     | "relay"
                     | "run"
                     | "update"
@@ -870,6 +872,9 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }),
         "term" => clap_dispatch!(crate::commands::term::TermArgs, cmd, &cmd_argv, |args| {
             crate::commands::term::cmd_term(&db, &args, Some(&ctx))
+        }),
+        "title" => clap_dispatch!(crate::commands::title::TitleArgs, cmd, &cmd_argv, |args| {
+            crate::commands::title::cmd_title(&db, &args, Some(&ctx))
         }),
         "relay" => clap_dispatch!(crate::commands::relay::RelayArgs, cmd, &cmd_argv, |args| {
             crate::commands::relay::cmd_relay(&db, &args, Some(&ctx))

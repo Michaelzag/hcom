@@ -35,6 +35,7 @@ pub mod shared;
 mod shell_env;
 mod sys;
 pub mod terminal;
+pub mod title;
 mod tool;
 pub mod tools;
 pub mod transcript;

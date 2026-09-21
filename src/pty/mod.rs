@@ -628,6 +628,10 @@ pub struct Proxy {
     current_name: Arc<RwLock<String>>,
     /// Current status (shared with delivery thread, updated on status change)
     current_status: Arc<RwLock<String>>,
+    /// Session purpose (shared with delivery thread, updated on title change)
+    title_purpose: Arc<RwLock<String>>,
+    /// Live subtask (shared with delivery thread, updated on title change)
+    title_current: Arc<RwLock<String>>,
     /// Read side used to interrupt the proxy poll when title state changes.
     title_notify_read: OwnedFd,
     /// Write side shared with the delivery thread's title wake callback.
@@ -730,21 +734,32 @@ impl Proxy {
 
         // Initialize shared state for terminal title (updated by delivery thread).
         // Query tag from DB to show full display name (tag-name) from the start.
-        let initial_display_name = {
+        // Purpose/current seed the first title frame so `--hcom-title` shows
+        // immediately instead of waiting for the first delivery-loop poll.
+        let (initial_display_name, initial_purpose, initial_current) = {
             let base = config.instance_name.clone().unwrap_or_default();
             if base.is_empty() {
-                base
+                (base, String::new(), String::new())
             } else if let Ok(db) = crate::db::HcomDb::open() {
-                match db.get_instance_tag(&base) {
+                let display = match db.get_instance_tag(&base) {
                     Some(tag) => format!("{}-{}", tag, base),
-                    None => base,
-                }
+                    None => base.clone(),
+                };
+                let (purpose, current) = db
+                    .get_instance_full(&base)
+                    .ok()
+                    .flatten()
+                    .map(|row| (row.purpose.unwrap_or_default(), row.current.unwrap_or_default()))
+                    .unwrap_or_default();
+                (display, purpose, current)
             } else {
-                base
+                (base, String::new(), String::new())
             }
         };
         let current_name = Arc::new(RwLock::new(initial_display_name));
         let current_status = Arc::new(RwLock::new("listening".to_string()));
+        let title_purpose = Arc::new(RwLock::new(initial_purpose));
+        let title_current = Arc::new(RwLock::new(initial_current));
         let (title_notify_read, title_notify_write) = pipe().context("title notify pipe failed")?;
         set_nonblocking(&title_notify_read)?;
         set_nonblocking(&title_notify_write)?;
@@ -765,6 +780,8 @@ impl Proxy {
             notify_port: Arc::new(AtomicU16::new(0)),
             current_name,
             current_status,
+            title_purpose,
+            title_current,
             title_notify_read,
             title_notify_write: Arc::new(title_notify_write),
         })
@@ -786,6 +803,8 @@ impl Proxy {
         // Track last written title to detect changes (delivery thread updates Arcs)
         let mut last_written_name = String::new();
         let mut last_written_status = String::new();
+        let mut last_written_purpose = String::new();
+        let mut last_written_current = String::new();
         // Terminal-title behavior. Read once — a session's config doesn't change
         // under it. In `Off` we neither strip the tool's titles nor write our own;
         // in `Combined` we append the tool's live title (read from `self.screen`,
@@ -937,6 +956,8 @@ impl Proxy {
                             self.notify_port.clone(),
                             self.current_name.clone(),
                             self.current_status.clone(),
+                            self.title_purpose.clone(),
+                            self.title_current.clone(),
                             Some(title_wake_callback(self.title_notify_write.clone())),
                         )? {
                             shared::DeliveryStart::Started(h) => {
@@ -1106,6 +1127,8 @@ impl Proxy {
                                     self.notify_port.clone(),
                                     self.current_name.clone(),
                                     self.current_status.clone(),
+                                    self.title_purpose.clone(),
+                                    self.title_current.clone(),
                                     Some(title_wake_callback(self.title_notify_write.clone())),
                                 )? {
                                     shared::DeliveryStart::Started(h) => {
@@ -1286,7 +1309,7 @@ impl Proxy {
             // (`title_write_safe`) — splitting one would corrupt the stream.
             // pending_utf8/pending_escape carry that state across read boundaries.
             if stdout_is_tty && title_enabled && title_write_safe(pending_utf8, pending_escape) {
-                let (name, status) = {
+                let (name, status, purpose, current) = {
                     let n = self
                         .current_name
                         .read()
@@ -1299,7 +1322,19 @@ impl Proxy {
                         .ok()
                         .map(|s| s.clone())
                         .unwrap_or_default();
-                    (n, s)
+                    let p = self
+                        .title_purpose
+                        .read()
+                        .ok()
+                        .map(|p| p.clone())
+                        .unwrap_or_default();
+                    let c = self
+                        .title_current
+                        .read()
+                        .ok()
+                        .map(|c| c.clone())
+                        .unwrap_or_default();
+                    (n, s, p, c)
                 };
                 // The wrapped tool's live title (Combined only). Owned by this
                 // thread via self.screen, so no lock — read fresh each iteration
@@ -1312,6 +1347,8 @@ impl Proxy {
                 if !name.is_empty()
                     && (name != last_written_name
                         || status != last_written_status
+                        || purpose != last_written_purpose
+                        || current != last_written_current
                         || child != last_written_child)
                 {
                     let child_opt = (!child.is_empty()).then_some(child);
@@ -1321,12 +1358,16 @@ impl Proxy {
                         self.config.target.name(),
                         title_mode,
                         child_opt,
+                        &purpose,
+                        &current,
                     );
                     write_all(&stdout_fd, escape.as_bytes())?;
                     last_written_child.clear();
                     last_written_child.push_str(child);
                     last_written_name = name;
                     last_written_status = status;
+                    last_written_purpose = purpose;
+                    last_written_current = current;
                 }
             }
         }

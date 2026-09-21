@@ -128,10 +128,25 @@ impl TitleMode {
 /// Returns an empty string when `display` or `tool` is empty so callers can
 /// short-circuit before doing terminal IO.
 pub fn format_pane_title(status: &str, display: &str, tool: &str) -> String {
+    format_pane_title_full(status, display, tool, "", "")
+}
+
+/// [`format_pane_title`] with the session's purpose + live subtask: when either
+/// is non-empty they render as `"{icon} {display} — {purpose} · {current}"`
+/// (empty segments omitted) ahead of the `[tool]` tag. Both empty renders
+/// exactly like [`format_pane_title`].
+pub fn format_pane_title_full(
+    status: &str,
+    display: &str,
+    tool: &str,
+    purpose: &str,
+    current: &str,
+) -> String {
     if display.is_empty() || tool.is_empty() {
         return String::new();
     }
-    format!("{} {} [{}]", status_icon(status), display, tool)
+    let infix = crate::title::title_infix(purpose, current);
+    format!("{} {}{infix} [{}]", status_icon(status), display, tool)
 }
 
 /// Build the `TitleMode::Combined` label: `"{icon} {display}"`, with the wrapped
@@ -139,10 +154,25 @@ pub fn format_pane_title(status: &str, display: &str, tool: &str) -> String {
 /// (the passthrough title already identifies the tool's activity). Returns an
 /// empty string when `display` is empty so callers can short-circuit.
 pub fn format_pane_title_combined(status: &str, display: &str, child: Option<&str>) -> String {
+    format_pane_title_combined_full(status, display, "", "", child)
+}
+
+/// [`format_pane_title_combined`] with the session's purpose + live subtask:
+/// `"{icon} {display} — {purpose} · {current}"` (empty segments omitted),
+/// then ` - {child}` as before. Both empty renders exactly like
+/// [`format_pane_title_combined`].
+pub fn format_pane_title_combined_full(
+    status: &str,
+    display: &str,
+    purpose: &str,
+    current: &str,
+    child: Option<&str>,
+) -> String {
     if display.is_empty() {
         return String::new();
     }
-    let base = format!("{} {}", status_icon(status), display);
+    let infix = crate::title::title_infix(purpose, current);
+    let base = format!("{} {}{infix}", status_icon(status), display);
     match child {
         Some(c) if !c.is_empty() => format!("{base} - {c}"),
         _ => base,
@@ -244,5 +274,53 @@ mod tests {
         assert_eq!(STATUS_ORDER.len(), 6);
         assert_eq!(STATUS_ORDER[0], ST_ACTIVE);
         assert_eq!(STATUS_ORDER[5], ST_INACTIVE);
+    }
+
+    #[test]
+    fn pane_title_full_empty_matches_plain() {
+        assert_eq!(
+            format_pane_title_full("listening", "luna", "claude", "", ""),
+            format_pane_title("listening", "luna", "claude")
+        );
+        assert_eq!(
+            format_pane_title_combined_full("active", "luna", "", "", None),
+            format_pane_title_combined("active", "luna", None)
+        );
+    }
+
+    #[test]
+    fn pane_title_full_renders_purpose_and_current() {
+        let icon = status_icon("listening");
+        assert_eq!(
+            format_pane_title_full("listening", "luna", "claude", "zagdb: rc.48 roll", ""),
+            format!("{icon} luna — zagdb: rc.48 roll [claude]")
+        );
+        assert_eq!(
+            format_pane_title_full("listening", "luna", "claude", "zagdb: rc.48 roll", "probing WAL"),
+            format!("{icon} luna — zagdb: rc.48 roll · probing WAL [claude]")
+        );
+        assert_eq!(
+            format_pane_title_full("listening", "luna", "claude", "", "probing WAL"),
+            format!("{icon} luna — probing WAL [claude]")
+        );
+    }
+
+    #[test]
+    fn pane_title_combined_full_keeps_child_suffix() {
+        let icon = status_icon("active");
+        assert_eq!(
+            format_pane_title_combined_full(
+                "active",
+                "luna",
+                "zagdb: rc.48 roll",
+                "probing WAL",
+                Some("⠋ Working")
+            ),
+            format!("{icon} luna — zagdb: rc.48 roll · probing WAL - ⠋ Working")
+        );
+        assert_eq!(
+            format_pane_title_combined_full("active", "luna", "zagdb: rc.48 roll", "", None),
+            format!("{icon} luna — zagdb: rc.48 roll")
+        );
     }
 }
