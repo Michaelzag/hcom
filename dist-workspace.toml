@@ -10,23 +10,28 @@ ci = "github"
 # Target platforms to build apps for (Rust target-triple syntax).
 # Linux only for now (operator ruling) — the fork's devices run Linux.
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
-# The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
+# The installers to generate for each app.
+# No homebrew: the fork can't push formulas to the upstream tap
+# (aannoo/homebrew-hcom) and the fleet is Linux-only.
+installers = ["shell", "powershell"]
 # Use .tar.gz on Unix so curl-installed users on minimal Linux systems
 # don't need a separate `xz` executable just to unpack releases.
 unix-archive = ".tar.gz"
 # Local artifacts jobs to run in CI
 local-artifacts-jobs = ["./build-wheels"]
-# Publish jobs to run in CI
-publish-jobs = ["homebrew", "./publish-pypi"]
+# Publish jobs to run in CI (no homebrew — see above).
+publish-jobs = ["./publish-pypi"]
 # Post-announce jobs to run after the release is published
 post-announce-jobs = ["./post-announce-compare-link"]
 # Extra setup steps to run before dist builds
 github-build-setup = "../build-setup.yml"
 # Custom permissions for reusable workflow jobs
 github-custom-job-permissions = { "publish-pypi" = { id-token = "write", contents = "read" } }
-# A GitHub repo to push Homebrew formulas to
-tap = "aannoo/homebrew-hcom"
+# Sanctioned drift: release.yml's `on:` block carries a hand-maintained
+# `workflow_dispatch` trigger (re-applied after every `cargo dist generate`).
+# Without this, `dist plan` in the Release workflow refuses to run on the
+# dirty file. See the dist-check job in ci.yml.
+allow-dirty = ["ci"]
 # Whether dist should create a Github Release or use an existing draft
 create-release = true
 # Path that installers should place binaries in

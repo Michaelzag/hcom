@@ -83,6 +83,12 @@ jobs:
   # Fails if the checked-in release.yml has drifted from what the pinned
   # cargo-dist would generate. Version must match cargo-dist-version in
   # dist-workspace.toml so the check tracks the exact installer used on tags.
+  # Exception: release.yml carries a hand-maintained `workflow_dispatch`
+  # trigger (push events don't fire on this fork, so tags are released by
+  # hand-dispatch), sanctioned via `allow-dirty = ["ci"]` in
+  # dist-workspace.toml. Since that makes a plain `dist generate` skip the
+  # ci task entirely, the release.yml assertion regenerates with the
+  # exemption lifted and requires exactly the trigger stanza as the diff.
   dist-check:
     runs-on: ubuntu-latest
     permissions:
@@ -93,7 +99,21 @@ jobs:
           persist-credentials: false
       - name: Install pinned cargo-dist
         run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
-      - run: dist generate --check
+      - run: dist generate
+      - run: git diff --exit-code -- . ':!.github/workflows/release.yml'
+      - name: Assert release.yml is dist output plus the dispatch trigger
+        run: |
+          sed -i 's/^allow-dirty = \["ci"\]$/allow-dirty = []/' dist-workspace.toml
+          dist generate
+          git checkout -- dist-workspace.toml
+          git diff -- .github/workflows/release.yml | grep -E '^[+-]' | grep -vE '^[+-]{3}' | sort > /tmp/release-diff.txt
+          diff /tmp/release-diff.txt - <<'EOF'
+          -  # HAND-MAINTAINED (not dist output — re-apply after `cargo dist generate`):
+          -  # push events don't fire on this fork, so a tag push can't start this
+          -  # workflow. Dispatch it by hand: `gh workflow run Release --ref <tag>`.
+          -  workflow_dispatch:
+          EOF
+          git checkout -- .github/workflows/release.yml
 
   real-tool-tests:
     name: Real tool (${{ matrix.tool }}, ${{ matrix.os }})
