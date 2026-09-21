@@ -60,6 +60,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Or (for code/md/backticks) instead of --: --file <path> | --base64 <string> | pipe/heredoc
   Example: send {target_luna} {target_nova} --intent ack --reply-to 82 --name {instance_name} -- 'ok'
 - See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}'] [name]
+- Title: Set `hcom title '<project>: <what you are for>' --name <you>` once you know your task; your tool intents update the live subtask automatically, and `hcom title --now '<phase>'` names a phase explicitly.
 - Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search 'text' [--all]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)

@@ -161,7 +161,7 @@ const LIST_HELP: &[HelpEntry] = &[
         "",
         "  hooks_bound, process_bound, transcript_path, background_log_file,",
     ),
-    ("", "  launch_context"),
+    ("", "  launch_context, purpose, current"),
     ("", ""),
     ("list [self|<name>]", "Single agent details"),
     (
@@ -194,6 +194,13 @@ const LIST_HELP: &[HelpEntry] = &[
         "[claude] [gemini] [codex] [opencode] [kilo] [pi] [omp] [antigravity] [cursor] [kimi] [copilot]  vanilla (hooks only)",
     ),
     ("", "[AD-HOC]                              manual polling"),
+];
+
+const TITLE_HELP: &[HelpEntry] = &[
+    ("title \"<purpose>\"", "Set what this session is for (60 chars max)"),
+    ("title --now \"<subtask>\"", "Set the live subtask"),
+    ("title", "Show purpose and current subtask"),
+    ("title --clear", "Clear both"),
 ];
 
 const SEND_HELP: &[HelpEntry] = &[
@@ -849,6 +856,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "bundle",
     "kill",
     "term",
+    "title",
     "relay",
     "run",
     "update",
@@ -928,6 +936,7 @@ Commands:\n\
   hooks        Add or remove hooks\n\
   status       Installation and diagnostics\n\
   term         View/inject into agent PTY screens\n\
+  title        Show or set what a session is doing\n\
   update       Check and apply updates",
         env!("CARGO_PKG_VERSION"),
     )
@@ -947,8 +956,8 @@ const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--headless", "Run in background"),
     ("--hcom-prompt <text>", "Initial prompt"),
     ("--hcom-system-prompt <text>", "System prompt"),
+    ("--hcom-title <text>", "Session purpose (window title)"),
 ];
-
 /// Shared help body for `hcom r` / `hcom f` (both accept the same target
 /// forms and launch flags; only the header, blurb, and see-also differ).
 fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> String {
@@ -1046,6 +1055,7 @@ pub fn get_command_help(name: &str) -> String {
         "update" => Some(UPDATE_HELP),
         "hooks" => None,
         "term" => Some(TERM_HELP),
+        "title" => Some(TITLE_HELP),
         _ => None,
     };
 

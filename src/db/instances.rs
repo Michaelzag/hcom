@@ -49,6 +49,8 @@ pub struct InstanceRow {
     pub launch_context: Option<String>,
     pub name_announced: i64,
     pub idle_since: Option<String>,
+    pub purpose: Option<String>,
+    pub current: Option<String>,
 }
 
 impl InstanceRow {
@@ -123,6 +125,12 @@ impl InstanceRow {
             idle_since: row
                 .get::<_, Option<String>>("idle_since")?
                 .filter(|s| !s.is_empty()),
+            purpose: row
+                .get::<_, Option<String>>("purpose")?
+                .filter(|s| !s.is_empty()),
+            current: row
+                .get::<_, Option<String>>("current")?
+                .filter(|s| !s.is_empty()),
         })
     }
 }
@@ -136,7 +144,7 @@ pub(super) const INSTANCE_COLUMNS: &str =
      background_log_file, name_announced, agent_id,
      origin_device_id, hints, subagent_timeout, tool, launch_args,
      terminal_preset_requested, terminal_preset_effective,
-     idle_since, pid, launch_context";
+     idle_since, pid, launch_context, purpose, current";
 
 impl HcomDb {
     /// Get instance status by name
@@ -356,7 +364,8 @@ impl HcomDb {
         let mut stmt = self.conn.prepare_cached(
             "SELECT transcript_path, session_id, tool, directory, parent_name, tag,
                     wait_timeout, subagent_timeout, hints, pid, created_at, background,
-                    agent_id, launch_args, origin_device_id, background_log_file, last_event_id
+                    agent_id, launch_args, origin_device_id, background_log_file, last_event_id,
+                    purpose, current
              FROM instances WHERE name = ?",
         )?;
 
@@ -379,6 +388,8 @@ impl HcomDb {
                 "origin_device_id": row.get::<_, String>(14).unwrap_or_default(),
                 "background_log_file": row.get::<_, String>(15).unwrap_or_default(),
                 "last_event_id": row.get::<_, i64>(16).unwrap_or(0),
+                "purpose": row.get::<_, String>(17).unwrap_or_default(),
+                "current": row.get::<_, String>(18).unwrap_or_default(),
             }))
         }) {
             Ok(snapshot) => Ok(Some(snapshot)),
@@ -603,6 +614,8 @@ impl HcomDb {
             "idle_since": row.get::<_, String>(28).unwrap_or_default(),
             "pid": row.get::<_, Option<i64>>(29).unwrap_or(None),
             "launch_context": row.get::<_, String>(30).unwrap_or_default(),
+            "purpose": row.get::<_, String>(31).unwrap_or_default(),
+            "current": row.get::<_, String>(32).unwrap_or_default(),
         }))
     }
 
@@ -903,6 +916,8 @@ impl HcomDb {
             "idle_since",
             "terminal_preset_requested",
             "terminal_preset_effective",
+            "purpose",
+            "current",
         ];
         if VALID_COLUMNS.contains(&key) {
             Ok(key)

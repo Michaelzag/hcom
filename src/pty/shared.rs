@@ -319,6 +319,8 @@ pub(super) fn start_delivery_thread(
     notify_port: Arc<AtomicU16>,
     current_name: Arc<RwLock<String>>,
     current_status: Arc<RwLock<String>>,
+    shared_purpose: Arc<RwLock<String>>,
+    shared_current: Arc<RwLock<String>>,
     title_wake: Option<crate::delivery::TitleWake>,
 ) -> Result<DeliveryStart> {
     let instance_name = match instance_name_cfg {
@@ -430,6 +432,8 @@ pub(super) fn start_delivery_thread(
             &config,
             Some(current_name),
             Some(current_status),
+            Some(shared_purpose),
+            Some(shared_current),
             title_wake,
         );
 
@@ -586,6 +590,10 @@ pub(super) fn finalize_launch_failure_after_exit(
 ///   bytes stripped, whitespace collapsed, length bounded) so it cannot break
 ///   out of the OSC we wrap it in.
 ///
+/// When `purpose`/`current` are non-empty they render as `{icon} name —
+/// {purpose} · {current}` ahead of the mode's usual suffix; both empty keeps
+/// the historical output byte-identical.
+///
 /// [`TitleMode::Off`] never reaches here — the caller skips writing entirely and
 /// lets the tool's own title pass through — so it falls back to the label.
 pub(super) fn build_title_escape(
@@ -594,12 +602,14 @@ pub(super) fn build_title_escape(
     tool_name: &str,
     mode: crate::shared::TitleMode,
     child_title: Option<&str>,
+    purpose: &str,
+    current: &str,
 ) -> String {
     let title = match mode {
         crate::shared::TitleMode::Combined => {
-            crate::shared::format_pane_title_combined(status, name, child_title)
+            crate::shared::format_pane_title_combined_full(status, name, purpose, current, child_title)
         }
-        _ => crate::shared::format_pane_title(status, name, tool_name),
+        _ => crate::shared::format_pane_title_full(status, name, tool_name, purpose, current),
     };
     format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title)
 }
@@ -1250,7 +1260,7 @@ mod tests {
     fn build_title_escape_label_mode_formats_osc_1_and_2() {
         use crate::shared::TitleMode;
         // Label mode keeps the [tool] tag; assert exact OSC framing.
-        let esc = build_title_escape("alpha", "listening", "claude", TitleMode::Label, None);
+        let esc = build_title_escape("alpha", "listening", "claude", TitleMode::Label, None, "", "");
         let icon = status_icon("listening");
         let title = format!("{} alpha [claude]", icon);
         assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
@@ -1263,8 +1273,8 @@ mod tests {
     fn build_title_escape_uses_status_icon() {
         use crate::shared::TitleMode;
         // Different statuses must change the embedded icon.
-        let listening = build_title_escape("a", "listening", "claude", TitleMode::Label, None);
-        let blocked = build_title_escape("a", "blocked", "claude", TitleMode::Label, None);
+        let listening = build_title_escape("a", "listening", "claude", TitleMode::Label, None, "", "");
+        let blocked = build_title_escape("a", "blocked", "claude", TitleMode::Label, None, "", "");
         assert_ne!(listening, blocked);
     }
 
@@ -1279,6 +1289,8 @@ mod tests {
             "codex",
             TitleMode::Combined,
             Some("⠋ Working"),
+            "",
+            "",
         );
         let title = format!("{} luna - ⠋ Working", icon);
         assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
@@ -1290,8 +1302,42 @@ mod tests {
         use crate::shared::TitleMode;
         // No child title → just `{icon} name`, no dangling separator, no tag.
         let icon = status_icon("active");
-        let esc = build_title_escape("luna", "active", "codex", TitleMode::Combined, None);
+        let esc = build_title_escape("luna", "active", "codex", TitleMode::Combined, None, "", "");
         let title = format!("{} luna", icon);
+        assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
+    }
+
+    #[test]
+    fn build_title_escape_label_includes_purpose_and_current() {
+        use crate::shared::TitleMode;
+        let icon = status_icon("listening");
+        let esc = build_title_escape(
+            "luna",
+            "listening",
+            "claude",
+            TitleMode::Label,
+            None,
+            "zagdb: rc.48 roll",
+            "probing WAL",
+        );
+        let title = format!("{icon} luna — zagdb: rc.48 roll · probing WAL [claude]");
+        assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
+    }
+
+    #[test]
+    fn build_title_escape_combined_includes_purpose_before_child() {
+        use crate::shared::TitleMode;
+        let icon = status_icon("active");
+        let esc = build_title_escape(
+            "luna",
+            "active",
+            "codex",
+            TitleMode::Combined,
+            Some("⠋ Working"),
+            "zagdb: rc.48 roll",
+            "",
+        );
+        let title = format!("{icon} luna — zagdb: rc.48 roll - ⠋ Working");
         assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
     }
 

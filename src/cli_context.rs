@@ -20,7 +20,7 @@ use crate::shared::{
 
 /// Commands that should NOT trigger hookless status update.
 /// Handled internally or are lifecycle commands.
-const STATUS_SKIP_COMMANDS: &[&str] = &["listen", "start", "stop", "kill", "reset", "status"];
+const STATUS_SKIP_COMMANDS: &[&str] = &["listen", "start", "stop", "kill", "reset", "status", "title"];
 
 /// Build a CommandContext for a CLI invocation (best-effort identity resolution).
 ///

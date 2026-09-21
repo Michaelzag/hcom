@@ -1759,6 +1759,10 @@ pub fn update_tool_status(
     tool_input: &Value,
 ) {
     let detail = super::family::extract_tool_detail(tool, tool_name, tool_input);
+    // Live subtask: omp/pi tool calls carry the agent's intent as `i` in the
+    // input object (forwarded wholesale by the hcom.ts extension). No-op for
+    // payloads without one, so other tools never clobber an explicit phase.
+    crate::title::record_intent(db, instance_name, tool_input);
     lifecycle::set_status(
         db,
         instance_name,
@@ -1909,6 +1913,28 @@ mod tests {
                 [name],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn test_update_tool_status_records_intent_as_current() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "nova");
+
+        // Payload carrying the omp tool intent updates the live subtask.
+        update_tool_status(
+            &db,
+            "nova",
+            "omp",
+            "read",
+            &serde_json::json!({"i": "Reading model role settings", "path": "/tmp/x"}),
+        );
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.current.as_deref(), Some("Reading model role settings"));
+
+        // Payload without an intent leaves the phase alone.
+        update_tool_status(&db, "nova", "omp", "read", &serde_json::json!({"path": "/tmp/x"}));
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.current.as_deref(), Some("Reading model role settings"));
     }
 
     fn insert_bound_claude_instance(

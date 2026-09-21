@@ -151,6 +151,49 @@ pub(crate) fn refresh_display_name(
     }
 }
 
+/// Refresh the PTY-shared purpose + live subtask from the database row.
+///
+/// Polled the same way status is: the delivery loop owns the DB handle, the
+/// pty loop owns the title write, and the shared Arcs bridge them. Wakes the
+/// title pipe on change so the new `{purpose} · {current}` renders promptly.
+/// Returns true when either value changed.
+pub(crate) fn refresh_title_text(
+    db: &HcomDb,
+    current_name: &str,
+    shared_purpose: &Option<Arc<std::sync::RwLock<String>>>,
+    shared_current: &Option<Arc<std::sync::RwLock<String>>>,
+    title_wake: &Option<TitleWake>,
+) -> bool {
+    let (new_purpose, new_current) = match db.get_instance_full(current_name) {
+        Ok(Some(row)) => (
+            row.purpose.unwrap_or_default(),
+            row.current.unwrap_or_default(),
+        ),
+        _ => return false,
+    };
+    let mut changed = false;
+    if let Some(shared) = shared_purpose
+        && let Ok(mut s) = shared.write()
+        && *s != new_purpose
+    {
+        *s = new_purpose;
+        changed = true;
+    }
+    if let Some(shared) = shared_current
+        && let Ok(mut s) = shared.write()
+        && *s != new_current
+    {
+        *s = new_current;
+        changed = true;
+    }
+    if changed
+        && let Some(wake) = title_wake
+    {
+        wake();
+    }
+    changed
+}
+
 /// Inputs for one delivery-loop title refresh.
 ///
 /// Bundling these lets `refresh_title_state` stay one call inside an already
@@ -162,11 +205,12 @@ struct TitleRefresh<'a> {
     current_status: &'a mut String,
     shared_name: &'a Option<Arc<std::sync::RwLock<String>>>,
     shared_status: &'a Option<Arc<std::sync::RwLock<String>>>,
+    shared_purpose: &'a Option<Arc<std::sync::RwLock<String>>>,
+    shared_current: &'a Option<Arc<std::sync::RwLock<String>>>,
     title_wake: &'a Option<TitleWake>,
     tool: &'a str,
     host_label: &'a mut host_label::HostLabel,
 }
-
 /// Refresh OSC title state and push a matching label to terminals that expose
 /// a programmatic label API (currently only herdr).
 fn refresh_title_state(args: TitleRefresh<'_>) {
@@ -177,6 +221,8 @@ fn refresh_title_state(args: TitleRefresh<'_>) {
         current_status,
         shared_name,
         shared_status,
+        shared_purpose,
+        shared_current,
         title_wake,
         tool,
         host_label,
@@ -184,6 +230,7 @@ fn refresh_title_state(args: TitleRefresh<'_>) {
     refresh_binding(db, process_id, current_name, shared_name);
     refresh_status_and_wake(db, current_name, current_status, shared_status, title_wake);
     refresh_display_name(db, current_name, shared_name);
+    refresh_title_text(db, current_name, shared_purpose, shared_current, title_wake);
     host_label.sync(db, current_name, current_status, tool);
 }
 
@@ -196,7 +243,7 @@ mod host_label {
 
     use crate::db::HcomDb;
     use crate::identity;
-    use crate::shared::format_pane_title;
+    use crate::shared::format_pane_title_full;
 
     /// Long enough to absorb a slow herdr server tick, short enough that a
     /// dead socket doesn't visibly stall the delivery loop.
@@ -521,7 +568,13 @@ mod host_label {
     /// Build the same label hcom writes into OSC 1/2 (`◉ tag-luna [claude]`).
     fn pane_title_label(db: &HcomDb, name: &str, status: &str, tool: &str) -> String {
         let display = identity::get_display_name(db, name);
-        format_pane_title(status, &display, tool)
+        let (purpose, current) = db
+            .get_instance_full(name)
+            .ok()
+            .flatten()
+            .map(|row| (row.purpose.unwrap_or_default(), row.current.unwrap_or_default()))
+            .unwrap_or_default();
+        format_pane_title_full(status, &display, tool, &purpose, &current)
     }
 
     /// Outcome of one socket round-trip, classified so the caller can react
@@ -1563,6 +1616,8 @@ pub fn run_delivery_loop(
     config: &ToolConfig,
     shared_name: Option<Arc<std::sync::RwLock<String>>>,
     shared_status: Option<Arc<std::sync::RwLock<String>>>,
+    shared_purpose: Option<Arc<std::sync::RwLock<String>>>,
+    shared_current: Option<Arc<std::sync::RwLock<String>>>,
     title_wake: Option<TitleWake>,
 ) {
     // Resolve authoritative instance name from process binding.
@@ -1669,6 +1724,8 @@ pub fn run_delivery_loop(
                 current_status: &mut current_status,
                 shared_name: &shared_name,
                 shared_status: &shared_status,
+                shared_purpose: &shared_purpose,
+                shared_current: &shared_current,
                 title_wake: &title_wake,
                 tool: &config.tool,
                 host_label: &mut host_label,
@@ -1765,6 +1822,8 @@ pub fn run_delivery_loop(
                 current_status: &mut current_status,
                 shared_name: &shared_name,
                 shared_status: &shared_status,
+                shared_purpose: &shared_purpose,
+                shared_current: &shared_current,
                 title_wake: &title_wake,
                 tool: &config.tool,
                 host_label: &mut host_label,

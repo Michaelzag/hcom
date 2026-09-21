@@ -92,6 +92,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             "cwd": remote_cwd,
             "initial_prompt": hcom_flags.initial_prompt,
             "system_prompt": hcom_flags.system_prompt,
+            "purpose": hcom_flags.title,
         });
 
         match crate::relay::control::dispatch_remote(
@@ -176,6 +177,8 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             tag,
             system_prompt,
             initial_prompt,
+            purpose: hcom_flags.title.clone(),
+            current: None,
             background,
             cwd: Some(if let Some(ref dir) = dir_override {
                 let path = std::path::Path::new(dir);
@@ -437,6 +440,7 @@ pub(crate) struct HcomLaunchFlags {
     pub headless: bool,
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
+    pub title: Option<String>,
     pub run_here: Option<bool>,
     pub batch_id: Option<String>,
     pub dir: Option<String>,
@@ -602,6 +606,11 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             i += 1;
             continue;
         }
+        if args[i].starts_with("--hcom-title=") {
+            flags.title = Some(args[i][13..].to_string());
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
             "--tag" if i + 1 < args.len() => {
                 flags.tag = Some(args[i + 1].clone());
@@ -633,6 +642,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             }
             "--hcom-prompt" if i + 1 < args.len() => {
                 flags.initial_prompt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--hcom-title" if i + 1 < args.len() => {
+                flags.title = Some(args[i + 1].clone());
                 i += 2;
             }
             "--batch-id" if i + 1 < args.len() => {
@@ -1040,6 +1053,24 @@ mod tests {
         .unwrap();
         assert_eq!(flags.system_prompt, Some("you are helpful".to_string()));
         assert_eq!(args, s(&["--model", "haiku"]));
+    }
+
+    #[test]
+    fn test_parse_launch_argv_hcom_title() {
+        let (_, _, flags, args) = parse_launch_argv(&s(&[
+            "claude",
+            "--hcom-title",
+            "zagdb: rc.48 roll",
+            "--model",
+            "haiku",
+        ]))
+        .unwrap();
+        assert_eq!(flags.title, Some("zagdb: rc.48 roll".to_string()));
+        assert_eq!(args, s(&["--model", "haiku"]));
+
+        let (_, _, flags, _) =
+            parse_launch_argv(&s(&["claude", "--hcom-title=zagdb: rc.48 roll"])).unwrap();
+        assert_eq!(flags.title, Some("zagdb: rc.48 roll".to_string()));
     }
 
     #[test]

@@ -189,6 +189,8 @@ pub struct LaunchParams {
     pub tag: Option<String>,
     pub system_prompt: Option<String>,
     pub initial_prompt: Option<String>,
+    pub purpose: Option<String>,
+    pub current: Option<String>,
     pub background: bool,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
@@ -212,6 +214,8 @@ impl Default for LaunchParams {
             tag: None,
             system_prompt: None,
             initial_prompt: None,
+            purpose: None,
+            current: None,
             background: false,
             cwd: None,
             env: None,
@@ -1960,12 +1964,16 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         } else {
             format!("{}-{}", effective_tag, instance_name)
         };
+        let initial_purpose =
+            params.purpose.as_deref().map(crate::title::sanitize).unwrap_or_default();
         instance_env.insert(
             "HCOM_PANE_TITLE".to_string(),
-            crate::shared::format_pane_title(
+            crate::shared::format_pane_title_full(
                 crate::shared::ST_LISTENING,
                 &display_for_title,
                 tool_type,
+                &initial_purpose,
+                "",
             ),
         );
 
@@ -1996,6 +2004,16 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         })() {
             errors.push(json!({"tool": base_tool, "error": e.to_string()}));
             continue;
+        }
+
+        // Persist the session title: --hcom-title seeds purpose, resume/fork
+        // restore both fields from the stopped snapshot. The pty layer seeds
+        // its first title frame from this row, so this must run before spawn.
+        if let Some(purpose) = &params.purpose {
+            crate::title::set_purpose(db, &instance_name, purpose);
+        }
+        if let Some(current) = &params.current {
+            crate::title::set_current(db, &instance_name, current);
         }
 
         // Dispatch to tool-specific launcher

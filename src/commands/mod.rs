@@ -20,8 +20,8 @@ pub mod events;
 pub mod list;
 pub mod status;
 pub mod term;
+pub mod title;
 pub mod transcript;
-
 // Management
 pub mod archive;
 pub mod config;
