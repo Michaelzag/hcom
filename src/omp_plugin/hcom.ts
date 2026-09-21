@@ -315,14 +315,19 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				if (isIdle) {
 					await pi.sendUserMessage(formatted);
 				} else {
-					// Busy lane: `aside`, not `followUp`. Per omp's
-					// docs/extensions.md:200, `aside` is "injected at the next agent
-					// step boundary without interrupting the current tool batch",
-					// whereas `followUp` is "queued to run after current run" — which
-					// delayed an inbound peer message by 44 s (measured) and paid a
-					// whole extra turn boundary for it. `steer` is wrong here: it
+					// Busy lane: `followUp`. The omp aside channel ("injected at
+					// the next step boundary without interrupting") is internal
+					// only — IRC records, advisor nits, job completions. The
+					// extension API (SendUserMessageHandler in SDK 17.0.6) accepts
+					// just `steer` | `followUp`, so `aside` never typechecked, and
+					// worse, at runtime the session falls an unknown deliverAs
+					// through to prompt(streamingBehavior: "steer") — the old code
+					// steered while claiming not to. `steer` is wrong here: it
 					// interrupts and can abort the rest of the tool batch.
-					await pi.sendUserMessage(formatted, { deliverAs: "aside" });
+					// `followUp` waits for the run to end (one probe measured
+					// 44 s plus a turn boundary) but delivers visibly and never
+					// interrupts. Revisit if the SDK exposes aside to extensions.
+					await pi.sendUserMessage(formatted, { deliverAs: "followUp" });
 				}
 				const sender = String(pending.messages[0]?.from ?? "");
 				await reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver");
@@ -331,7 +336,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 					pending_ack: pending.maxId,
 					idle: isIdle,
 				});
-				await ackPending(isIdle ? "sendUserMessage" : "aside");
+				await ackPending(isIdle ? "sendUserMessage" : "followUp");
 				return true;
 			} catch (error) {
 				if (pendingAckId === pending.maxId) pendingAckId = null;
