@@ -672,6 +672,23 @@ impl HcomDb {
             .optional()
             .map_err(Into::into)
     }
+
+    /// All process_ids bound to an instance, newest first.
+    ///
+    /// The self-bound carrier rule keys off this set: a live process
+    /// carrying any of these ids in `HCOM_PROCESS_ID` holds the instance
+    /// even when it never carried `HCOM_INSTANCE_NAME`.
+    pub fn process_binding_ids(&self, instance_name: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT process_id FROM process_bindings \
+             WHERE instance_name = ? ORDER BY updated_at DESC",
+        )?;
+        let ids = stmt
+            .query_map(params![instance_name], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
 }
 
 #[cfg(test)]

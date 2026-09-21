@@ -10,11 +10,13 @@
 //!
 //! This module owns the three mechanisms that close those gaps:
 //!
-//! - [`processes_with_instance_name`]: enumerate live processes carrying
-//!   `HCOM_INSTANCE_NAME=<name>` (exact entry match; only that variable's
-//!   value is ever read — other environ values are never printed).
-//! - [`reap_instance_tree`]: SIGTERM the whole set (oldest first, so the pty
-//!   wrapper goes before its children), wait up to 5 s, SIGKILL survivors.
+//! - [`processes_for_instance`]: enumerate live processes holding an
+//!   instance — `HCOM_INSTANCE_NAME=<name>` OR `HCOM_PROCESS_ID=<binding>`
+//!   (exact entry match; only those two variables' values are ever read —
+//!   other environ values are never printed).
+//! - [`reap_instance_tree_for`]: SIGTERM the whole carrier set (oldest first,
+//!   so the pty wrapper goes before its children), wait up to 5 s, SIGKILL
+//!   survivors.
 //! - [`check_spawn_allowed`]: refuse to spawn under `<name>` over a live
 //!   holder or an orphan (started before the newest binding).
 //! - [`sweep_vanished_instances`]: daemon-side periodic check that notices
@@ -93,27 +95,65 @@ const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(unix)]
 const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Enumerate live processes whose environ contains exactly
-/// `HCOM_INSTANCE_NAME=<name>` as one NUL-delimited entry.
+/// Enumerate live processes holding an instance: environ contains exactly
+/// `HCOM_INSTANCE_NAME=<name>` as one NUL-delimited entry, or exactly
+/// `HCOM_PROCESS_ID=<id>` for one of the instance's binding ids.
+///
+/// The second arm is the self-bound rule: self-bound sessions (bound at the
+/// first hook from `HCOM_PROCESS_ID=omp-<pid>-…`, never carrying
+/// `HCOM_INSTANCE_NAME`) are held by their process id, not their name.
 ///
 /// Only the `HCOM_INSTANCE_NAME` and `HCOM_PROCESS_ID` entries are ever
 /// inspected; no other environ values are read or reported. The calling
 /// process itself is always excluded (a CLI running inside the session
 /// inherits the name but never owns it).
-pub fn processes_with_instance_name(name: &str) -> Vec<ProcMatch> {
+pub fn processes_for_instance(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
     #[cfg(unix)]
     {
-        enumerate_unix(name)
+        enumerate_unix(name, binding_ids)
     }
     #[cfg(not(unix))]
     {
         let _ = name;
+        let _ = binding_ids;
         Vec::new()
     }
 }
 
+/// Decode the two identity facts from a raw /proc environ block: whether it
+/// carries exactly `want` (`HCOM_INSTANCE_NAME=<name>`) as one NUL-delimited
+/// entry, and its `HCOM_PROCESS_ID` value (empty when absent). Only these two
+/// entries are ever decoded; everything else stays unread bytes.
 #[cfg(unix)]
-fn enumerate_unix(name: &str) -> Vec<ProcMatch> {
+fn identity_facts(env: &[u8], want: &[u8]) -> (bool, String) {
+    let mut carries_name = false;
+    let mut process_id = String::new();
+    for var in env.split(|b| *b == 0) {
+        if var == want {
+            carries_name = true;
+        } else if let Some(rest) = var.strip_prefix(b"HCOM_PROCESS_ID=") {
+            process_id = String::from_utf8_lossy(rest).into_owned();
+        }
+        if carries_name && !process_id.is_empty() {
+            // Both facts known; remaining entries cannot change them.
+            // (A second HCOM_PROCESS_ID entry would be pathological;
+            // first wins.)
+            break;
+        }
+    }
+    (carries_name, process_id)
+}
+
+/// True when a decoded `HCOM_PROCESS_ID` value names one of the instance's
+/// bindings. Empty never matches, so an absent entry (or an empty binding
+/// id) can never hold an instance.
+#[cfg(unix)]
+fn is_bound_process_id(process_id: &str, binding_ids: &[String]) -> bool {
+    !process_id.is_empty() && binding_ids.iter().any(|id| id == process_id)
+}
+
+#[cfg(unix)]
+fn enumerate_unix(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
     let want = format!("HCOM_INSTANCE_NAME={name}");
     let self_pid = std::process::id();
     let btime = system_btime();
@@ -132,27 +172,18 @@ fn enumerate_unix(name: &str) -> Vec<ProcMatch> {
         if pid == self_pid {
             continue;
         }
+        // An unreadable environ (exited, or foreign-owned — a different UID)
+        // reads as absent. Cross-UID carriers are therefore invisible here;
+        // all hcom sessions run as the same user, so that blind spot is a
+        // documented limitation, not a live case.
         let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else {
             continue;
         };
-        let mut carries_name = false;
-        let mut process_id = String::new();
-        for var in env.split(|b| *b == 0) {
-            if var == want.as_bytes() {
-                carries_name = true;
-            } else if let Some(rest) = var.strip_prefix(b"HCOM_PROCESS_ID=") {
-                // Only this variable's value is ever decoded; everything
-                // else in the environ block stays unread bytes.
-                process_id = String::from_utf8_lossy(rest).into_owned();
-            }
-            if carries_name && !process_id.is_empty() {
-                // Both facts known; remaining entries cannot change them.
-                // (A second HCOM_PROCESS_ID entry would be pathological;
-                // first wins.)
-                break;
-            }
-        }
-        if !carries_name {
+        let (carries_name, process_id) = identity_facts(&env, want.as_bytes());
+        // Self-bound arm: the process carries one of the instance's binding
+        // ids even though it never carried the name. Empty binding ids never
+        // match (an absent HCOM_PROCESS_ID reads as empty).
+        if !carries_name && !is_bound_process_id(&process_id, binding_ids) {
             continue;
         }
         // A second pass is unnecessary: process_id defaults to empty when
@@ -229,10 +260,12 @@ fn is_zombie(pid: u32) -> bool {
         .map(|(_, rest)| rest.trim_start().starts_with('Z'))
         .unwrap_or(false)
 }
-/// Reap every live process carrying `HCOM_INSTANCE_NAME=<name>`.
+/// Reap every live process holding the instance: carriers of
+/// `HCOM_INSTANCE_NAME=<name>` plus carriers of any of the instance's
+/// binding process ids (the self-bound tree never carries the name).
 ///
 /// Oldest first (the pty wrapper predates its children), SIGTERM, wait up to
-/// 5 s, SIGKILL survivors, verify. Verification is by NAME, not by pid
+/// 5 s, SIGKILL survivors, verify. Verification is by carrier set, not by pid
 /// snapshot: after each wait the tree is re-enumerated for carriers, so a
 /// child forked between the first enumerate and SIGTERM is still signalled
 /// (in the KILL round) and still blocks success while it lives; conversely a
@@ -241,22 +274,23 @@ fn is_zombie(pid: u32) -> bool {
 /// survival). Returns the surviving pids on failure — callers must not
 /// report success or release the row while any survive.
 ///
-/// The calling process is never signalled (see [`processes_with_instance_name`]).
+/// The calling process is never signalled (see [`processes_for_instance`]).
 /// Zombies are excluded from verification: a SIGKILLed carrier stays visible
 /// in /proc (environ intact) until its parent reaps it, but it is gone for
 /// lifecycle purposes (see [`process_gone`]) — blocking a release on it
 /// would wedge every stop behind an unreaped child.
 ///
 /// Unix only; elsewhere this is a no-op success.
-pub fn reap_instance_tree(name: &str) -> Result<(), Vec<u32>> {
+pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), Vec<u32>> {
     #[cfg(not(unix))]
     {
         let _ = name;
+        let _ = binding_ids;
         return Ok(());
     }
     #[cfg(unix)]
     {
-        let mut matches = live_carriers(name);
+        let mut matches = live_carriers_for(name, binding_ids);
         if matches.is_empty() {
             return Ok(());
         }
@@ -267,9 +301,9 @@ pub fn reap_instance_tree(name: &str) -> Result<(), Vec<u32>> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         for m in &matches {
-            // Pid-reuse guard: only signal a snapshot pid that still carries
-            // the name; a recycled pid belongs to someone else now.
-            if pid_carries_name(m.pid, name) {
+            // Pid-reuse guard: only signal a snapshot pid that still holds
+            // the instance; a recycled pid belongs to someone else now.
+            if pid_carries_instance(m.pid, name, binding_ids) {
                 signal(m.pid, libc::SIGTERM);
             }
         }
@@ -277,10 +311,10 @@ pub fn reap_instance_tree(name: &str) -> Result<(), Vec<u32>> {
             &matches.iter().map(|m| m.pid).collect::<Vec<_>>(),
             TERM_WAIT,
         );
-        // Re-enumerate by name: newly seen carriers (forked after the first
-        // snapshot, so never TERMED) join the KILL round directly — the TERM
-        // round already elapsed, so escalation is immediate.
-        let mut current = live_carriers(name);
+        // Re-enumerate by carrier set: newly seen carriers (forked after the
+        // first snapshot, so never TERMED) join the KILL round directly —
+        // the TERM round already elapsed, so escalation is immediate.
+        let mut current = live_carriers_for(name, binding_ids);
         if current.is_empty() {
             return Ok(());
         }
@@ -290,7 +324,7 @@ pub fn reap_instance_tree(name: &str) -> Result<(), Vec<u32>> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         for m in &current {
-            if pid_carries_name(m.pid, name) {
+            if pid_carries_instance(m.pid, name, binding_ids) {
                 signal(m.pid, libc::SIGKILL);
             }
         }
@@ -298,7 +332,7 @@ pub fn reap_instance_tree(name: &str) -> Result<(), Vec<u32>> {
             &current.iter().map(|m| m.pid).collect::<Vec<_>>(),
             KILL_WAIT,
         );
-        let still: Vec<u32> = live_carriers(name)
+        let still: Vec<u32> = live_carriers_for(name, binding_ids)
             .into_iter()
             .map(|m| m.pid)
             .collect();
@@ -306,25 +340,39 @@ pub fn reap_instance_tree(name: &str) -> Result<(), Vec<u32>> {
     }
 }
 
-/// Live name carriers for reap verification: name enumeration minus zombies.
+
+/// Shell pid behind a self-bound process id: `omp-<pid>-…` → `<pid>`.
+/// Anything else (UUID bindings, empty, malformed) → None.
+fn shell_pid_from_process_id(process_id: &str) -> Option<u32> {
+    process_id
+        .strip_prefix("omp-")
+        .and_then(|rest| rest.split('-').next())
+        .filter(|head| !head.is_empty())
+        .and_then(|head| head.parse::<u32>().ok())
+}
+
+/// Live carriers for reap verification: carrier enumeration minus zombies.
 #[cfg(unix)]
-fn live_carriers(name: &str) -> Vec<ProcMatch> {
-    processes_with_instance_name(name)
+fn live_carriers_for(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
+    processes_for_instance(name, binding_ids)
         .into_iter()
         .filter(|m| !is_zombie(m.pid))
         .collect()
 }
 
-/// Pid-reuse guard: true when `pid` still carries exactly
-/// `HCOM_INSTANCE_NAME=<name>` in its environ. No other environ values are
-/// read. An unreadable environ (exited, or foreign-owned) reads as absent.
-#[cfg(unix)]
-fn pid_carries_name(pid: u32, name: &str) -> bool {
-    let want = format!("HCOM_INSTANCE_NAME={name}");
-    std::fs::read(format!("/proc/{pid}/environ"))
-        .is_ok_and(|env| env.split(|b| *b == 0).any(|var| var == want.as_bytes()))
-}
 
+/// Pid-reuse guard: true when `pid` still holds the instance — exactly
+/// `HCOM_INSTANCE_NAME=<name>` or exactly `HCOM_PROCESS_ID=<id>` for one of
+/// the binding ids — in its environ. No other environ values are read. An
+/// unreadable environ (exited, or foreign-owned) reads as absent.
+#[cfg(unix)]
+fn pid_carries_instance(pid: u32, name: &str, binding_ids: &[String]) -> bool {
+    let want = format!("HCOM_INSTANCE_NAME={name}");
+    std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
+        let (carries_name, process_id) = identity_facts(&env, want.as_bytes());
+        carries_name || is_bound_process_id(&process_id, binding_ids)
+    })
+}
 
 #[cfg(unix)]
 fn signal(pid: u32, sig: libc::c_int) {
@@ -349,6 +397,10 @@ fn wait_for_exit_pids(pids: &[u32], budget: std::time::Duration) {
 
 /// Refuse to spawn under `<name>` over a live holder or an orphan.
 ///
+/// Carriers match by name OR by any of the instance's binding process ids,
+/// so a live self-bound holder (process id only, no name in env) refuses
+/// exactly like a live hcom-launched holder:
+///
 /// - Newest binding's own process_id still carried by a live process → live
 ///   holder, refuse.
 /// - Any other process_id carrying the name, started before the newest
@@ -358,9 +410,13 @@ fn wait_for_exit_pids(pids: &[u32], budget: std::time::Duration) {
 ///   the rebind) is not an orphan → proceed.
 /// - Nothing alive → proceed (a DB-active row is the DB layer's business:
 ///   resume keeps its existing "still active" message for that case).
-/// - No binding at all but live carriers → live holders, refuse.
+/// - No binding at all but live name carriers → live holders, refuse. (A
+///   process carrying only an unknown process_id is unattributable without
+///   bindings, so it never blocks — this keeps `start --as` recovery working
+///   after a row plus its bindings were deleted.)
 pub fn check_spawn_allowed(db: &HcomDb, name: &str) -> Result<(), SpawnRefusal> {
-    let holders = processes_with_instance_name(name);
+    let binding_ids = db.process_binding_ids(name).unwrap_or_default();
+    let holders = processes_for_instance(name, &binding_ids);
     if holders.is_empty() {
         return Ok(());
     }
@@ -448,10 +504,23 @@ const SWEEP_FRESH_GRACE_SECS: i64 = 60;
 /// session): for every active local instance, test whether its harness is
 /// gone.
 ///
-/// Vanished = recorded pid dead (or absent) AND no live process carries
-/// `name` (+ newest process_id when a binding exists). A vanished row gets
-/// `stopped by=daemon reason=vanished` with the instance snapshot, then the
-/// row is released — the notice systemd-oomd kills currently never produce.
+/// Fail-safe inversion: a row is vanished ONLY on positive evidence of death —
+/// every attributable pid is dead AND no live carrier holds the instance. Any
+/// doubt holds the row and logs why at debug:
+///
+/// - no attributable pid at all (empty recorded pid, no parseable shell pid
+///   in the bindings) → HELD. This is the self-bound incident shape: the
+///   snapshot pid is empty and the binding is `omp-<shell pid>-…`.
+/// - any attributable pid alive (recorded snapshot pid, or the shell pid
+///   parsed from a shell-shaped binding) → HELD.
+/// - any live carrier by name (`HCOM_INSTANCE_NAME`) or by binding process id
+///   (`HCOM_PROCESS_ID`) → HELD.
+/// - an unparseable binding process id contributes no pid evidence and never
+///   counts toward death → HELD unless other evidence proves death.
+///
+/// A vanished row gets `stopped by=daemon reason=vanished` with the instance
+/// snapshot, then the row is released — the notice systemd-oomd kills
+/// currently never produce.
 ///
 /// Skips rows already released (they are simply not returned by the live
 /// query, so a normal exit's wrapper-written `stopped` never double-fires),
@@ -488,34 +557,55 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             continue;
         }
         let newest = db.newest_process_binding(&inst.name).unwrap_or(None);
-        if inst.pid.is_none() && newest.is_none() {
-            // Nothing to judge liveness by — neither a recorded pid nor a
-            // binding. Leave the row; deleting blind risks reservation rows.
-            continue;
-        }
-        let pid_alive = inst
+        let binding_ids = db.process_binding_ids(&inst.name).unwrap_or_default();
+        // Positive-evidence pids: the recorded snapshot pid plus every shell
+        // pid parsed from a shell-shaped binding. Unparseable bindings (UUID
+        // harness ids, empty, malformed) contribute nothing — they are not
+        // evidence of life OR death.
+        let mut evidence_pids: Vec<u32> = inst
             .pid
-            .is_some_and(|pid| pid > 0 && !process_gone(pid as u32));
-        if pid_alive {
+            .filter(|pid| *pid > 0)
+            .map(|pid| pid as u32)
+            .into_iter()
+            .collect();
+        evidence_pids.extend(
+            binding_ids
+                .iter()
+                .filter_map(|id| shell_pid_from_process_id(id)),
+        );
+        if evidence_pids.is_empty() {
+            crate::log::log(
+                "DEBUG",
+                "daemon",
+                "sweep.held",
+                &format!("name={} reason=no-pid-evidence", inst.name),
+            );
             continue;
         }
-        let holders = processes_with_instance_name(&inst.name);
-        let held = match &newest {
-            Some((bound_process_id, updated_at)) => holders.iter().any(|h| {
-                h.process_id == *bound_process_id
-                    || h.process_id.is_empty()
-                    // A live carrier with a different non-empty process_id
-                    // started after the binding is a current-subtree holder
-                    // (subagent shape), not a vanished harness — same
-                    // exemption as the spawn gate. An unstat-able carrier
-                    // (unknown start) fails toward held: never sweep blind.
-                    || (!h.process_id.is_empty()
-                        && (h.start_epoch <= 0.0
-                            || h.start_epoch >= updated_at - ORPHAN_GRACE_SECS))
-            }),
-            None => !holders.is_empty(),
-        };
-        if held {
+        if evidence_pids.iter().any(|pid| !process_gone(*pid)) {
+            crate::log::log(
+                "DEBUG",
+                "daemon",
+                "sweep.held",
+                &format!("name={} reason=pid-alive", inst.name),
+            );
+            continue;
+        }
+        // Every attributable pid is dead. Still held while any live carrier
+        // holds the instance by name or by binding process id. Zombies don't
+        // count: a SIGKILLed carrier keeps its environ until its parent
+        // reaps it, but it is gone for lifecycle purposes — same rule as
+        // reap verification (live_carriers_for).
+        if processes_for_instance(&inst.name, &binding_ids)
+            .into_iter()
+            .any(|m| !is_zombie(m.pid))
+        {
+            crate::log::log(
+                "DEBUG",
+                "daemon",
+                "sweep.held",
+                &format!("name={} reason=live-carrier", inst.name),
+            );
             continue;
         }
         // Vanished: snapshot, stopped by=daemon, release.
@@ -596,15 +686,15 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn wait_for_enumerated(name: &str, pid: u32) -> Vec<ProcMatch> {
+    fn wait_for_enumerated(name: &str, binding_ids: &[String], pid: u32) -> Vec<ProcMatch> {
         for _ in 0..50 {
-            let found = processes_with_instance_name(name);
+            let found = processes_for_instance(name, binding_ids);
             if found.iter().any(|m| m.pid == pid) {
                 return found;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        processes_with_instance_name(name)
+        processes_for_instance(name, binding_ids)
     }
 
     #[test]
@@ -613,7 +703,7 @@ mod tests {
         let name = unique_name("enum");
         let mut child = spawn_named_sleeper(&name, "proc-enum-1");
         let pid = child.id();
-        let found = wait_for_enumerated(&name, pid);
+        let found = wait_for_enumerated(&name, &[], pid);
         let hit = found.iter().find(|m| m.pid == pid).expect("sleeper enumerated");
         assert_eq!(hit.process_id, "proc-enum-1");
         assert!(hit.start_epoch > 1_700_000_000.0, "start_epoch sane: {}", hit.start_epoch);
@@ -627,7 +717,7 @@ mod tests {
         let name = unique_name("other");
         let mut child = spawn_named_sleeper("hcom-proctruth-unrelated", "proc-x");
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let found = processes_with_instance_name(&name);
+        let found = processes_for_instance(&name, &[]);
         assert!(found.is_empty(), "unexpected matches: {found:?}");
         child.kill().ok();
         child.wait().ok();
@@ -640,9 +730,9 @@ mod tests {
         let mut a = spawn_named_sleeper(&name, "proc-reap");
         let mut b = spawn_named_sleeper(&name, "proc-reap");
         let (pa, pb) = (a.id(), b.id());
-        wait_for_enumerated(&name, pa);
-        wait_for_enumerated(&name, pb);
-        assert!(reap_instance_tree(&name).is_ok());
+        wait_for_enumerated(&name, &[], pa);
+        wait_for_enumerated(&name, &[], pb);
+        assert!(reap_instance_tree_for(&name, &[]).is_ok());
         // Reap the (zombie) children so bare kill-0 liveness observes them.
         a.wait().ok();
         b.wait().ok();
@@ -653,7 +743,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reap_empty_name_is_noop_ok() {
-        assert!(reap_instance_tree(&unique_name("empty")).is_ok());
+        assert!(reap_instance_tree_for(&unique_name("empty"), &[]).is_ok());
     }
 
     // -- Spawn-gate (B) and release/sweep (C) tests need a DB ---------------
@@ -691,8 +781,8 @@ mod tests {
         let name = unique_name("orphan");
         let mut sleeper = spawn_named_sleeper(&name, "proc-old");
         let pid = sleeper.id();
-        wait_for_enumerated(&name, pid);
-        let start = processes_with_instance_name(&name)
+        wait_for_enumerated(&name, &[], pid);
+        let start = processes_for_instance(&name, &[])
             .into_iter()
             .find(|m| m.pid == pid)
             .expect("sleeper enumerated")
@@ -718,7 +808,7 @@ mod tests {
         // orphan.
         let mut sleeper = spawn_named_sleeper(&name, "proc-old");
         let pid = sleeper.id();
-        wait_for_enumerated(&name, pid);
+        wait_for_enumerated(&name, &[], pid);
         db.set_process_binding("proc-new", "sess", &name).unwrap();
         assert!(
             check_spawn_allowed(&db, &name).is_ok(),
@@ -735,7 +825,7 @@ mod tests {
         let name = unique_name("holder");
         let mut sleeper = spawn_named_sleeper(&name, "proc-cur");
         let pid = sleeper.id();
-        wait_for_enumerated(&name, pid);
+        wait_for_enumerated(&name, &[], pid);
         db.set_process_binding("proc-cur", "sess", &name).unwrap();
         let err = check_spawn_allowed(&db, &name).expect_err("live holder must refuse");
         assert_eq!(err.kind, HolderKind::LiveHolder);
@@ -865,7 +955,7 @@ mod tests {
         let name = unique_name("held");
         insert_row(&db, &name, "active", Some(dead_pid()));
         let mut sleeper = spawn_named_sleeper(&name, "proc-held");
-        wait_for_enumerated(&name, sleeper.id());
+        wait_for_enumerated(&name, &[], sleeper.id());
         let swept = sweep_vanished_instances(&db);
         assert!(!swept.iter().any(|n| n == &name));
         assert!(db.get_instance_full(&name).unwrap().is_some());
@@ -898,7 +988,7 @@ mod tests {
         insert_row(&db, &name, "active", Some(dead_pid()));
         db.set_process_binding("proc-new", "sess", &name).unwrap();
         let mut sleeper = spawn_named_sleeper(&name, "proc-old");
-        wait_for_enumerated(&name, sleeper.id());
+        wait_for_enumerated(&name, &[], sleeper.id());
         let swept = sweep_vanished_instances(&db);
         assert!(!swept.iter().any(|n| n == &name), "held row swept: {swept:?}");
         assert!(db.get_instance_full(&name).unwrap().is_some());
@@ -930,7 +1020,7 @@ mod tests {
         let name = unique_name("latefork");
         let mut first = spawn_named_sleeper(&name, "proc-late");
         let first_pid = first.id();
-        wait_for_enumerated(&name, first_pid);
+        wait_for_enumerated(&name, &[], first_pid);
         // Fork a second carrier mid-reap: it lands after the first snapshot
         // (reap spends 5 s in TERM-wait) and must still be reaped — the old
         // pid-snapshot verification would have missed it and returned Ok
@@ -952,11 +1042,11 @@ mod tests {
             child.wait().ok();
             pid
         });
-        assert!(reap_instance_tree(&name).is_ok(), "late-forked child must be reaped");
+        assert!(reap_instance_tree_for(&name, &[]).is_ok(), "late-forked child must be reaped");
         let late_pid = late.join().expect("late-fork thread");
         first.wait().ok();
         assert!(
-            processes_with_instance_name(&name)
+            processes_for_instance(&name, &[])
                 .iter()
                 .all(|m| m.pid != late_pid),
             "late carrier {late_pid} still enumerated"
@@ -992,6 +1082,147 @@ mod tests {
         .expect_err("unstat-able carrier must refuse");
         assert_eq!(err.kind, HolderKind::LiveHolder);
         assert!(err.pids.contains(&424242));
+    }
+    // -- Self-bound sessions (D-68/D-69): no HCOM_INSTANCE_NAME in env ----
+
+    #[test]
+    fn shell_pid_parses_omp_shape_only() {
+        assert_eq!(shell_pid_from_process_id("omp-123-4-5"), Some(123));
+        assert_eq!(shell_pid_from_process_id("omp-7"), Some(7));
+        assert_eq!(shell_pid_from_process_id("550e8400-e29b-41d4-a716-446655440000"), None);
+        assert_eq!(shell_pid_from_process_id(""), None);
+        assert_eq!(shell_pid_from_process_id("omp-"), None);
+        assert_eq!(shell_pid_from_process_id("omp-abc-1"), None);
+        assert_eq!(shell_pid_from_process_id("omp--1"), None);
+    }
+
+    #[cfg(unix)]
+    fn spawn_pid_only_sleeper(process_id: &str) -> std::process::Child {
+        // Self-bound shape: carries HCOM_PROCESS_ID but never
+        // HCOM_INSTANCE_NAME.
+        std::process::Command::new("sleep")
+            .arg("300")
+            .env_remove("HCOM_INSTANCE_NAME")
+            .env("HCOM_PROCESS_ID", process_id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_keeps_self_bound_incident_shape() {
+        // The incident shape: empty snapshot pid, shell-shaped binding whose
+        // shell (here: the test runner itself, unquestionably alive) is up,
+        // no env carriers at all. The old sweep deleted this row.
+        let db = test_db();
+        let name = unique_name("selfbound");
+        insert_row(&db, &name, "active", None);
+        let binding = format!("omp-{}-1-1", std::process::id());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let swept = sweep_vanished_instances(&db);
+        assert!(!swept.iter().any(|n| n == &name), "live self-bound row swept: {swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_releases_self_bound_when_shell_dead() {
+        // Same shape, but the shell behind the binding is dead and no
+        // carrier holds the instance: positive evidence of death → swept.
+        let db = test_db();
+        let name = unique_name("selfdead");
+        insert_row(&db, &name, "active", None);
+        let binding = format!("omp-{}-1-1", dead_pid());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let swept = sweep_vanished_instances(&db);
+        assert!(swept.contains(&name), "dead self-bound row kept: {swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_keeps_uuid_binding_pid_only_carrier() {
+        // UUID binding, dead recorded pid, one live process carrying ONLY
+        // the binding process id (no name in env): held, not vanished.
+        let db = test_db();
+        let name = unique_name("pidonly");
+        insert_row(&db, &name, "active", Some(dead_pid()));
+        let binding = format!("proc-pidonly-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let mut sleeper = spawn_pid_only_sleeper(&binding);
+        let pid = sleeper.id();
+        wait_for_enumerated(&name, &[binding.clone()], pid);
+        let swept = sweep_vanished_instances(&db);
+        assert!(!swept.iter().any(|n| n == &name), "pid-held row swept: {swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_refuses_pid_only_carrier_of_newest_binding() {
+        // Spawn gate: a live process carrying HCOM_PROCESS_ID=<newest
+        // binding> but no name is a live holder → refusal naming the pid.
+        let db = test_db();
+        let name = unique_name("gatepid");
+        let binding = format!("proc-gate-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let mut sleeper = spawn_pid_only_sleeper(&binding);
+        let pid = sleeper.id();
+        wait_for_enumerated(&name, &[binding], pid);
+        let err = check_spawn_allowed(&db, &name).expect_err("pid-only holder must refuse");
+        assert_eq!(err.kind, HolderKind::LiveHolder);
+        assert!(err.pids.contains(&pid), "refusal names the pid: {err}");
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reap_kills_pid_only_carrier_by_binding() {
+        // Reap: a sleeper carrying only HCOM_PROCESS_ID=<binding> is the
+        // self-bound tree and must die with the instance.
+        let name = unique_name("reappid");
+        let binding = format!("proc-reap-{}", rand_suffix());
+        let mut sleeper = spawn_pid_only_sleeper(&binding);
+        let pid = sleeper.id();
+        wait_for_enumerated(&name, &[binding.clone()], pid);
+        assert!(reap_instance_tree_for(&name, &[binding]).is_ok());
+        sleeper.wait().ok();
+        assert!(!crate::sys::process::is_alive(pid), "pid-only sleeper reaped");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_releases_row_whose_only_carrier_is_zombie() {
+        // Dead recorded pid, dead binding shell, one carrier that is a
+        // zombie (SIGKILLed, parent not yet reaped): gone for lifecycle
+        // purposes, so the row is vanished — same rule as reap
+        // verification, which also ignores zombies.
+        let db = test_db();
+        let name = unique_name("zombie");
+        insert_row(&db, &name, "active", Some(dead_pid()));
+        let binding = format!("proc-zombie-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let mut sleeper = spawn_named_sleeper(&name, &binding);
+        let pid = sleeper.id();
+        wait_for_enumerated(&name, &[], pid);
+        sleeper.kill().ok();
+        for _ in 0..50 {
+            if is_zombie(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(is_zombie(pid), "sleeper never reached zombie state");
+        let swept = sweep_vanished_instances(&db);
+        assert!(swept.contains(&name), "zombie-held row kept: {swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        sleeper.wait().ok();
     }
 
 }

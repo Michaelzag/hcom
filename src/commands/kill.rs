@@ -322,6 +322,35 @@ fn pane_info_str(pane_closed: bool, preset_name: &str, pane_id: &str) -> String 
     }
 }
 
+/// Reap an orphan's carrier set after its process-group signal: every name
+/// it holds, by name or (self-bound trees) by its process id. Returns true
+/// when anything survived — the caller must keep the pidtrack handle so a
+/// retry can rediscover the orphan.
+fn reap_orphan_tree(orphan: &crate::pidtrack::OrphanProcess) -> bool {
+    let ids: &[String] = if orphan.process_id.is_empty() {
+        &[]
+    } else {
+        std::slice::from_ref(&orphan.process_id)
+    };
+    let mut survived = false;
+    for orphan_name in &orphan.names {
+        if let Err(survivors) = crate::proctruth::reap_instance_tree_for(orphan_name, ids) {
+            eprintln!(
+                "Processes still alive for '{}' after SIGKILL: {} — run hcom kill {} first",
+                orphan_name,
+                survivors
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                orphan_name,
+            );
+            survived = true;
+        }
+    }
+    survived
+}
+
 /// Kill all instances.
 fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<i32> {
     let instances = db.iter_instances_full()?;
@@ -428,7 +457,14 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         }
         incomplete +=
             report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-        pidtrack::remove_pid(hcom_dir, orphan.pid);
+        // Verify the whole carrier set, not just the recorded group: a
+        // self-bound tree never carries the orphan's names. Survivors keep
+        // their pidtrack handle for a retry.
+        let reap_failed = reap_orphan_tree(orphan);
+        failed += reap_failed as i32;
+        if !reap_failed {
+            pidtrack::remove_pid(hcom_dir, orphan.pid);
+        }
     }
 
     if killed == 0 && failed == 0 {
@@ -546,7 +582,11 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         }
         incomplete +=
             report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-        pidtrack::remove_pid(hcom_dir, orphan.pid);
+        let reap_failed = reap_orphan_tree(orphan);
+        failed += reap_failed as i32;
+        if !reap_failed {
+            pidtrack::remove_pid(hcom_dir, orphan.pid);
+        }
     }
 
     if tagged.is_empty() && tagged_orphans.is_empty() {
@@ -611,24 +651,10 @@ fn kill_single(
                     }
                 }
                 // The group signal covers the recorded pid; reap any other
-                // live processes still carrying the orphan's names so the
+                // live processes still holding the orphan's names — by name
+                // or, for self-bound trees, by its process id — so the
                 // kill is verified whole-instance, not single-pid.
-                let mut reap_failed = false;
-                for orphan_name in &orphan.names {
-                    if let Err(survivors) = crate::proctruth::reap_instance_tree(orphan_name) {
-                        eprintln!(
-                            "Processes still alive for '{}' after SIGKILL: {} — run hcom kill {} first",
-                            orphan_name,
-                            survivors
-                                .iter()
-                                .map(|p| p.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            orphan_name,
-                        );
-                        reap_failed = true;
-                    }
-                }
+                let reap_failed = reap_orphan_tree(orphan);
                 // Keep the pidtrack handle while survivors live: it is the
                 // only handle by which a retry can rediscover this orphan.
                 // Dropping it on reap failure would force a hand-kill from
@@ -943,7 +969,7 @@ mod tests {
     #[cfg(unix)]
     fn wait_for_enumerated(name: &str, pid: u32) {
         for _ in 0..50 {
-            if crate::proctruth::processes_with_instance_name(name)
+            if crate::proctruth::processes_for_instance(name, &[])
                 .iter()
                 .any(|m| m.pid == pid)
             {
