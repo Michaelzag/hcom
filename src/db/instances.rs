@@ -395,7 +395,16 @@ impl HcomDb {
         Ok(rows > 0)
     }
 
-    /// Atomically publish a stopped event and remove its live instance state.
+    /// Finalize a stop: write the `stopped` life event and delete the row
+    /// plus its control-plane state, atomically.
+    ///
+    /// `expected_process_id` keys the release to one process incarnation:
+    /// when non-empty and the name still carries bindings, the release only
+    /// proceeds if one of them equals it. Otherwise the row is left
+    /// untouched and a `stopped` with reason `stale-harness-exit` is logged
+    /// instead (an orphan harness exiting under a live name must not delete
+    /// the live session's row). `None`/empty skips the check (no bindings
+    /// to contradict, e.g. binding-less rows).
     ///
     /// The instance delete is the ownership CAS. Cleanup and event insertion
     /// share its transaction, so an error restores the row for a later retry.
@@ -406,12 +415,53 @@ impl HcomDb {
         session_id: Option<&str>,
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
+        expected_process_id: Option<&str>,
     ) -> Result<bool> {
         let timestamp = chrono_now_iso();
         let data = serde_json::to_string(event_data)?;
         let mut event_id = None;
+        let expected = expected_process_id.unwrap_or("");
 
         let won = self.with_immediate_transaction(|tx| {
+            if !expected.is_empty() {
+                let total: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM process_bindings WHERE instance_name = ?",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if total > 0 {
+                    let matched: bool = tx
+                        .query_row(
+                            "SELECT 1 FROM process_bindings \
+                             WHERE instance_name = ? AND process_id = ? LIMIT 1",
+                            params![name, expected],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some();
+                    if !matched {
+                        let mut stale = event_data.clone();
+                        if let Some(map) = stale.as_object_mut() {
+                            map.insert(
+                                "reason".to_string(),
+                                serde_json::Value::String("stale-harness-exit".to_string()),
+                            );
+                            map.insert(
+                                "process_id".to_string(),
+                                serde_json::Value::String(expected.to_string()),
+                            );
+                        }
+                        let stale_str = serde_json::to_string(&stale)?;
+                        tx.execute(
+                            "INSERT INTO events (timestamp, type, instance, data) \
+                             VALUES (?, 'life', ?, ?)",
+                            params![timestamp, name, stale_str],
+                        )?;
+                        event_id = Some(tx.last_insert_rowid());
+                        return Ok(false);
+                    }
+                }
+            }
             let deleted = tx.execute(
                 "DELETE FROM instances
                  WHERE name = ? AND created_at = ?

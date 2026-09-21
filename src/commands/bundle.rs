@@ -1547,7 +1547,7 @@ mod tests {
             "transcript_path": transcript_path.to_string_lossy().to_string(),
             "created_at": now_epoch_f64(),
         });
-        db.log_life_event("huno", "stopped", "cli", "killed", Some(snapshot))
+        db.log_life_event("huno", "stopped", "cli", "killed", Some(snapshot), None)
             .unwrap();
 
         let (path, tool, sid) = lookup_bundle_transcript_source(&db, "huno")

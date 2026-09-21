@@ -428,7 +428,12 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Log a life event (started/stopped) to the events table
+    /// Log a life event (started/stopped) to the events table.
+    ///
+    /// `process_id` keys the event to one process incarnation of the
+    /// instance: a `stopped` only releases the row when it equals the row's
+    /// current binding (see `finalize_instance_stop`). `None` records null
+    /// (writer outside any harness, e.g. legacy paths).
     pub fn log_life_event(
         &self,
         instance: &str,
@@ -436,18 +441,21 @@ impl HcomDb {
         by: &str,
         reason: &str,
         snapshot: Option<serde_json::Value>,
+        process_id: Option<&str>,
     ) -> Result<()> {
         let data = match snapshot {
             Some(s) => serde_json::json!({
                 "action": action,
                 "by": by,
                 "reason": reason,
+                "process_id": process_id,
                 "snapshot": s
             }),
             None => serde_json::json!({
                 "action": action,
                 "by": by,
-                "reason": reason
+                "reason": reason,
+                "process_id": process_id
             }),
         };
 

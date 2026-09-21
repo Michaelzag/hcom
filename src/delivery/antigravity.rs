@@ -46,7 +46,7 @@ pub(crate) fn cleanup_antigravity_pty_exit(
                 log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
             }
         } else {
-            super::cleanup_deleted_instance(db, current_name);
+            super::cleanup_deleted_instance(db, current_name, process_id);
         }
     }
 
