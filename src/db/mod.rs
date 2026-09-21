@@ -727,6 +727,26 @@ impl HcomDb {
                     )?;
                 }
             }
+            if next_version == 19 {
+                let columns: std::collections::HashSet<String> = tx
+                    .prepare("PRAGMA table_info(instances)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                for column in ["purpose", "current"] {
+                    if !columns.contains(column) {
+                        tx.execute(
+                            &format!(
+                                "ALTER TABLE instances ADD COLUMN {} TEXT DEFAULT ''",
+                                column
+                            ),
+                            [],
+                        )?;
+                    }
+                }
+                tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
+                continue;
+            }
             let Some((_, sql)) = MIGRATIONS.iter().find(|(v, _)| *v == next_version) else {
                 return Ok(false);
             };
@@ -1702,5 +1722,84 @@ pub(super) mod tests {
         assert_eq!(name, "luna");
 
         cleanup_test_db(db_path);
+    }
+
+    /// Concurrent-runner guard for migration 19: the loser of a rollout race
+    /// sees `purpose`/`current` already present (winner committed first) with
+    /// the stamp still at v18. The re-run must be a no-op success, not an
+    /// Err that drops into the archive-the-live-db fallback.
+    #[test]
+    fn test_migration_19_rerun_against_migrated_columns_is_noop() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(4500);
+
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "test_hcom_migrate19_idem_{}_{}",
+            std::process::id(),
+            test_id
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("hcom.db");
+
+        // v18 fixture where migration 19's columns already landed but the
+        // version stamp was read as 18 before the winner committed.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (
+                     name TEXT PRIMARY KEY,
+                     tool TEXT DEFAULT 'claude',
+                     created_at REAL NOT NULL,
+                     launch_context TEXT DEFAULT '',
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT '',
+                     last_seen INTEGER DEFAULT 0,
+                     purpose TEXT DEFAULT '',
+                     current TEXT DEFAULT ''
+                 );
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 CREATE TABLE process_bindings (process_id TEXT PRIMARY KEY, session_id TEXT, instance_name TEXT, updated_at REAL NOT NULL);
+                 PRAGMA user_version = 18;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO instances (name, tool, created_at, purpose) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["luna", "claude", 1.0f64, "test-purpose"],
+            )
+            .unwrap();
+        }
+
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Second runner re-applying migration 19 must also succeed.
+        assert!(db.try_apply_migrations(18).unwrap());
+
+        // Data survived: no archive fallback ran.
+        let purpose: String = db
+            .conn
+            .query_row(
+                "SELECT purpose FROM instances WHERE name = ?",
+                params!["luna"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(purpose, "test-purpose");
+        assert!(
+            !temp_dir.join("archive").exists(),
+            "migration re-run must not archive the live DB"
+        );
+        cleanup_test_db(db_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

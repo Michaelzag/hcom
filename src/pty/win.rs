@@ -160,6 +160,7 @@ impl Proxy {
 
         // Tie the child to a kill-on-close job so its whole tree is reaped if we
         // die abnormally (the explicit snapshot-kill in Drop covers clean exit).
+        let job = child.process_id().and_then(job::KillOnDropJob::assign);
         let initial_name = config.instance_name.clone().unwrap_or_default();
         // Seed the first title frame from the row so `--hcom-title` shows
         // immediately instead of waiting for the first delivery-loop poll.
