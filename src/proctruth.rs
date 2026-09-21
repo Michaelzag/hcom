@@ -340,7 +340,6 @@ pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), 
     }
 }
 
-
 /// Shell pid behind a self-bound process id: `omp-<pid>-…` → `<pid>`.
 /// Anything else (UUID bindings, empty, malformed) → None.
 fn shell_pid_from_process_id(process_id: &str) -> Option<u32> {
@@ -359,7 +358,6 @@ fn live_carriers_for(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
         .filter(|m| !is_zombie(m.pid))
         .collect()
 }
-
 
 /// Pid-reuse guard: true when `pid` still holds the instance — exactly
 /// `HCOM_INSTANCE_NAME=<name>` or exactly `HCOM_PROCESS_ID=<id>` for one of
@@ -468,8 +466,7 @@ fn classify_holders(
             let orphans: Vec<u32> = holders
                 .iter()
                 .filter(|h| {
-                    h.process_id != bound_process_id
-                        && is_orphan_carrier(h.start_epoch, updated_at)
+                    h.process_id != bound_process_id && is_orphan_carrier(h.start_epoch, updated_at)
                 })
                 .map(|h| h.pid)
                 .collect();
@@ -492,7 +489,6 @@ fn classify_holders(
 fn is_orphan_carrier(start_epoch: f64, binding_updated_at: f64) -> bool {
     start_epoch > 0.0 && start_epoch < binding_updated_at - ORPHAN_GRACE_SECS
 }
-
 
 /// Grace after `last_seen` during which the daemon sweep leaves a row alone.
 /// Covers the wrapper-exit race: the wrapper deletes the row synchronously,
@@ -536,7 +532,11 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
     for inst in &instances {
         // An empty-string origin is local (same convention as start rebind
         // and stop display): only a non-empty device id marks a remote row.
-        if inst.origin_device_id.as_deref().is_some_and(|d| !d.is_empty()) {
+        if inst
+            .origin_device_id
+            .as_deref()
+            .is_some_and(|d| !d.is_empty())
+        {
             continue;
         }
         if matches!(inst.status.as_str(), "stopped" | "dead") {
@@ -659,15 +659,19 @@ mod tests {
     // session on this host) can never collide with them.
 
     fn unique_name(tag: &str) -> String {
-        format!("hcom-proctruth-{}-{}-{}", std::process::id(), tag, rand_suffix())
+        format!(
+            "hcom-proctruth-{}-{}-{}",
+            std::process::id(),
+            tag,
+            rand_suffix()
+        )
     }
 
     fn rand_suffix() -> u32 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut h = DefaultHasher::new();
-        std::time::SystemTime::now()
-            .hash(&mut h);
+        std::time::SystemTime::now().hash(&mut h);
         std::thread::current().id().hash(&mut h);
         (h.finish() % 900000) as u32 + 100000
     }
@@ -704,9 +708,16 @@ mod tests {
         let mut child = spawn_named_sleeper(&name, "proc-enum-1");
         let pid = child.id();
         let found = wait_for_enumerated(&name, &[], pid);
-        let hit = found.iter().find(|m| m.pid == pid).expect("sleeper enumerated");
+        let hit = found
+            .iter()
+            .find(|m| m.pid == pid)
+            .expect("sleeper enumerated");
         assert_eq!(hit.process_id, "proc-enum-1");
-        assert!(hit.start_epoch > 1_700_000_000.0, "start_epoch sane: {}", hit.start_epoch);
+        assert!(
+            hit.start_epoch > 1_700_000_000.0,
+            "start_epoch sane: {}",
+            hit.start_epoch
+        );
         child.kill().ok();
         child.wait().ok();
     }
@@ -878,7 +889,10 @@ mod tests {
             )
             .unwrap();
         let event: serde_json::Value = serde_json::from_str(&event).unwrap();
-        assert_eq!(event.get("action").and_then(|v| v.as_str()), Some("stopped"));
+        assert_eq!(
+            event.get("action").and_then(|v| v.as_str()),
+            Some("stopped")
+        );
         assert_eq!(
             event.get("reason").and_then(|v| v.as_str()),
             Some("stale-harness-exit")
@@ -921,7 +935,10 @@ mod tests {
         let db = test_db();
         insert_row(&db, "gone-row", "active", Some(dead_pid()));
         let swept = sweep_vanished_instances(&db);
-        assert!(swept.contains(&"gone-row".to_string()), "vanished swept: {swept:?}");
+        assert!(
+            swept.contains(&"gone-row".to_string()),
+            "vanished swept: {swept:?}"
+        );
         assert!(db.get_instance_full("gone-row").unwrap().is_none());
         let event: String = db
             .conn()
@@ -933,7 +950,10 @@ mod tests {
             .unwrap();
         let event: serde_json::Value = serde_json::from_str(&event).unwrap();
         assert_eq!(event.get("by").and_then(|v| v.as_str()), Some("daemon"));
-        assert_eq!(event.get("reason").and_then(|v| v.as_str()), Some("vanished"));
+        assert_eq!(
+            event.get("reason").and_then(|v| v.as_str()),
+            Some("vanished")
+        );
     }
 
     #[test]
@@ -973,7 +993,10 @@ mod tests {
         insert_row(&db, &name, "inactive", Some(dead_pid()));
         db.set_process_binding("proc-kept", "sess", &name).unwrap();
         let swept = sweep_vanished_instances(&db);
-        assert!(!swept.iter().any(|n| n == &name), "inactive swept: {swept:?}");
+        assert!(
+            !swept.iter().any(|n| n == &name),
+            "inactive swept: {swept:?}"
+        );
         assert!(db.get_instance_full(&name).unwrap().is_some());
     }
 
@@ -990,7 +1013,10 @@ mod tests {
         let mut sleeper = spawn_named_sleeper(&name, "proc-old");
         wait_for_enumerated(&name, &[], sleeper.id());
         let swept = sweep_vanished_instances(&db);
-        assert!(!swept.iter().any(|n| n == &name), "held row swept: {swept:?}");
+        assert!(
+            !swept.iter().any(|n| n == &name),
+            "held row swept: {swept:?}"
+        );
         assert!(db.get_instance_full(&name).unwrap().is_some());
         sleeper.kill().ok();
         sleeper.wait().ok();
@@ -1010,7 +1036,10 @@ mod tests {
             )
             .unwrap();
         let swept = sweep_vanished_instances(&db);
-        assert!(swept.contains(&"empty-origin-row".to_string()), "local row not swept: {swept:?}");
+        assert!(
+            swept.contains(&"empty-origin-row".to_string()),
+            "local row not swept: {swept:?}"
+        );
         assert!(db.get_instance_full("empty-origin-row").unwrap().is_none());
     }
 
@@ -1042,7 +1071,10 @@ mod tests {
             child.wait().ok();
             pid
         });
-        assert!(reap_instance_tree_for(&name, &[]).is_ok(), "late-forked child must be reaped");
+        assert!(
+            reap_instance_tree_for(&name, &[]).is_ok(),
+            "late-forked child must be reaped"
+        );
         let late_pid = late.join().expect("late-fork thread");
         first.wait().ok();
         assert!(
@@ -1074,12 +1106,8 @@ mod tests {
             process_id: "proc-old".to_string(),
             start_epoch: 0.0,
         }];
-        let err = classify_holders(
-            "unstatable",
-            &holders,
-            Some(("proc-new".to_string(), now)),
-        )
-        .expect_err("unstat-able carrier must refuse");
+        let err = classify_holders("unstatable", &holders, Some(("proc-new".to_string(), now)))
+            .expect_err("unstat-able carrier must refuse");
         assert_eq!(err.kind, HolderKind::LiveHolder);
         assert!(err.pids.contains(&424242));
     }
@@ -1089,7 +1117,10 @@ mod tests {
     fn shell_pid_parses_omp_shape_only() {
         assert_eq!(shell_pid_from_process_id("omp-123-4-5"), Some(123));
         assert_eq!(shell_pid_from_process_id("omp-7"), Some(7));
-        assert_eq!(shell_pid_from_process_id("550e8400-e29b-41d4-a716-446655440000"), None);
+        assert_eq!(
+            shell_pid_from_process_id("550e8400-e29b-41d4-a716-446655440000"),
+            None
+        );
         assert_eq!(shell_pid_from_process_id(""), None);
         assert_eq!(shell_pid_from_process_id("omp-"), None);
         assert_eq!(shell_pid_from_process_id("omp-abc-1"), None);
@@ -1123,7 +1154,10 @@ mod tests {
         let binding = format!("omp-{}-1-1", std::process::id());
         db.set_process_binding(&binding, "sess", &name).unwrap();
         let swept = sweep_vanished_instances(&db);
-        assert!(!swept.iter().any(|n| n == &name), "live self-bound row swept: {swept:?}");
+        assert!(
+            !swept.iter().any(|n| n == &name),
+            "live self-bound row swept: {swept:?}"
+        );
         assert!(db.get_instance_full(&name).unwrap().is_some());
     }
 
@@ -1156,7 +1190,10 @@ mod tests {
         let pid = sleeper.id();
         wait_for_enumerated(&name, &[binding.clone()], pid);
         let swept = sweep_vanished_instances(&db);
-        assert!(!swept.iter().any(|n| n == &name), "pid-held row swept: {swept:?}");
+        assert!(
+            !swept.iter().any(|n| n == &name),
+            "pid-held row swept: {swept:?}"
+        );
         assert!(db.get_instance_full(&name).unwrap().is_some());
         sleeper.kill().ok();
         sleeper.wait().ok();
@@ -1193,7 +1230,10 @@ mod tests {
         wait_for_enumerated(&name, &[binding.clone()], pid);
         assert!(reap_instance_tree_for(&name, &[binding]).is_ok());
         sleeper.wait().ok();
-        assert!(!crate::sys::process::is_alive(pid), "pid-only sleeper reaped");
+        assert!(
+            !crate::sys::process::is_alive(pid),
+            "pid-only sleeper reaped"
+        );
     }
 
     #[test]
@@ -1224,5 +1264,4 @@ mod tests {
         assert!(db.get_instance_full(&name).unwrap().is_none());
         sleeper.wait().ok();
     }
-
 }

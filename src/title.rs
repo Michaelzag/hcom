@@ -73,10 +73,7 @@ pub fn clear(db: &HcomDb, name: &str) {
 /// carries no usable intent, so hook traffic without `i` never clobbers an
 /// explicitly set phase. Latest write wins.
 pub fn record_intent(db: &HcomDb, name: &str, tool_input: &serde_json::Value) {
-    let intent = tool_input
-        .get("i")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let intent = tool_input.get("i").and_then(|v| v.as_str()).unwrap_or("");
     if sanitize(intent).is_empty() {
         return;
     }
@@ -134,7 +131,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(set_purpose(&db, "luna", "  zagdb: rc.48 roll  "), "zagdb: rc.48 roll");
+        assert_eq!(
+            set_purpose(&db, "luna", "  zagdb: rc.48 roll  "),
+            "zagdb: rc.48 roll"
+        );
         assert_eq!(set_current(&db, "luna", "probing WAL"), "probing WAL");
         let row = db.get_instance_full("luna").unwrap().unwrap();
         assert_eq!(row.purpose.as_deref(), Some("zagdb: rc.48 roll"));
@@ -163,7 +163,11 @@ mod tests {
             )
             .unwrap();
 
-        record_intent(&db, "nova", &serde_json::json!({"i": "Reading model role settings"}));
+        record_intent(
+            &db,
+            "nova",
+            &serde_json::json!({"i": "Reading model role settings"}),
+        );
         let row = db.get_instance_full("nova").unwrap().unwrap();
         assert_eq!(row.current.as_deref(), Some("Reading model role settings"));
         assert!(row.purpose.is_none());

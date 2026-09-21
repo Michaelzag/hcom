@@ -606,9 +606,13 @@ pub(super) fn build_title_escape(
     current: &str,
 ) -> String {
     let title = match mode {
-        crate::shared::TitleMode::Combined => {
-            crate::shared::format_pane_title_combined_full(status, name, purpose, current, child_title)
-        }
+        crate::shared::TitleMode::Combined => crate::shared::format_pane_title_combined_full(
+            status,
+            name,
+            purpose,
+            current,
+            child_title,
+        ),
         _ => crate::shared::format_pane_title_full(status, name, tool_name, purpose, current),
     };
     format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title)
@@ -1260,7 +1264,15 @@ mod tests {
     fn build_title_escape_label_mode_formats_osc_1_and_2() {
         use crate::shared::TitleMode;
         // Label mode keeps the [tool] tag; assert exact OSC framing.
-        let esc = build_title_escape("alpha", "listening", "claude", TitleMode::Label, None, "", "");
+        let esc = build_title_escape(
+            "alpha",
+            "listening",
+            "claude",
+            TitleMode::Label,
+            None,
+            "",
+            "",
+        );
         let icon = status_icon("listening");
         let title = format!("{} alpha [claude]", icon);
         assert_eq!(esc, format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title));
@@ -1273,7 +1285,8 @@ mod tests {
     fn build_title_escape_uses_status_icon() {
         use crate::shared::TitleMode;
         // Different statuses must change the embedded icon.
-        let listening = build_title_escape("a", "listening", "claude", TitleMode::Label, None, "", "");
+        let listening =
+            build_title_escape("a", "listening", "claude", TitleMode::Label, None, "", "");
         let blocked = build_title_escape("a", "blocked", "claude", TitleMode::Label, None, "", "");
         assert_ne!(listening, blocked);
     }

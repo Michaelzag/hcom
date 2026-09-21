@@ -461,7 +461,10 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         let name_part = format!("{name}{headless_badge}{remote_badge}{unread_str}");
         let status_text =
             format!("{age_display}{desc_sep}{description}{listening_since}{timeout_marker}");
-        let line_head = format!("{tool_prefix}{icon} {name_part:<width$}{status_text}", width = name_col_width);
+        let line_head = format!(
+            "{tool_prefix}{icon} {name_part:<width$}{status_text}",
+            width = name_col_width
+        );
         let title_suffix = list_title_suffix(data, &line_head);
 
         println!("{line_head}{title_suffix}");

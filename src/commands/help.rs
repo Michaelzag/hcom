@@ -197,7 +197,10 @@ const LIST_HELP: &[HelpEntry] = &[
 ];
 
 const TITLE_HELP: &[HelpEntry] = &[
-    ("title \"<purpose>\"", "Set what this session is for (60 chars max)"),
+    (
+        "title \"<purpose>\"",
+        "Set what this session is for (60 chars max)",
+    ),
     ("title --now \"<subtask>\"", "Set the live subtask"),
     ("title", "Show purpose and current subtask"),
     ("title --clear", "Clear both"),

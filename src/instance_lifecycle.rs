@@ -726,13 +726,7 @@ pub fn cleanup_stale_instances(
 /// deleted. A refusal (live survivors after SIGKILL — the reap gate) leaves
 /// the row and its processes in place, so it surfaces in the log with the
 /// surviving pids instead of inflating the count.
-fn note_stale_stop(
-    db: &HcomDb,
-    name: &str,
-    initiated_by: &str,
-    reason: &str,
-    deleted: i32,
-) -> i32 {
+fn note_stale_stop(db: &HcomDb, name: &str, initiated_by: &str, reason: &str, deleted: i32) -> i32 {
     match crate::hooks::common::stop_instance(db, name, initiated_by, reason) {
         crate::hooks::common::StopOutcome::Stopped => deleted + 1,
         crate::hooks::common::StopOutcome::AlreadyStopped => deleted,

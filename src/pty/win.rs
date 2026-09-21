@@ -170,7 +170,12 @@ impl Proxy {
             db.get_instance_full(&initial_name)
                 .ok()
                 .flatten()
-                .map(|row| (row.purpose.unwrap_or_default(), row.current.unwrap_or_default()))
+                .map(|row| {
+                    (
+                        row.purpose.unwrap_or_default(),
+                        row.current.unwrap_or_default(),
+                    )
+                })
                 .unwrap_or_default()
         } else {
             (String::new(), String::new())

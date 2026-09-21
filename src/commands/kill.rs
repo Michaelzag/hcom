@@ -400,7 +400,8 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
             // The release reaps the whole tree; a failure means live
             // processes remain, so it counts against the kill.
-            if let StopOutcome::RetryableError(e) = stop_instance(db, &inst.name, initiator, "killed")
+            if let StopOutcome::RetryableError(e) =
+                stop_instance(db, &inst.name, initiator, "killed")
             {
                 eprintln!("Error releasing '{}': {e}", inst.name);
                 failed += 1;
@@ -408,7 +409,8 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
             println!("  To resume: hcom r {}", inst.name);
         } else {
             // No PID tracked — just clean up
-            if let StopOutcome::RetryableError(e) = stop_instance(db, &inst.name, initiator, "killed")
+            if let StopOutcome::RetryableError(e) =
+                stop_instance(db, &inst.name, initiator, "killed")
             {
                 eprintln!("Error releasing '{}': {e}", inst.name);
                 failed += 1;
@@ -525,7 +527,8 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
             }
             incomplete +=
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-            if let StopOutcome::RetryableError(e) = stop_instance(db, &inst.name, initiator, "killed")
+            if let StopOutcome::RetryableError(e) =
+                stop_instance(db, &inst.name, initiator, "killed")
             {
                 eprintln!("Error releasing '{}': {e}", inst.name);
                 failed += 1;
@@ -533,7 +536,8 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         } else {
             // No PID tracked — clean up DB entry
             println!("No tracked process for '{}', stopping instance.", inst.name);
-            if let StopOutcome::RetryableError(e) = stop_instance(db, &inst.name, initiator, "killed")
+            if let StopOutcome::RetryableError(e) =
+                stop_instance(db, &inst.name, initiator, "killed")
             {
                 eprintln!("Error releasing '{}': {e}", inst.name);
                 failed += 1;
@@ -815,8 +819,8 @@ fn kill_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use serde_json::json;
+    use serial_test::serial;
 
     #[test]
     fn test_kill_no_target_fails() {

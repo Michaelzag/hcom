@@ -749,7 +749,12 @@ impl Proxy {
                     .get_instance_full(&base)
                     .ok()
                     .flatten()
-                    .map(|row| (row.purpose.unwrap_or_default(), row.current.unwrap_or_default()))
+                    .map(|row| {
+                        (
+                            row.purpose.unwrap_or_default(),
+                            row.current.unwrap_or_default(),
+                        )
+                    })
                     .unwrap_or_default();
                 (display, purpose, current)
             } else {

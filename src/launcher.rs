@@ -1964,8 +1964,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         } else {
             format!("{}-{}", effective_tag, instance_name)
         };
-        let initial_purpose =
-            params.purpose.as_deref().map(crate::title::sanitize).unwrap_or_default();
+        let initial_purpose = params
+            .purpose
+            .as_deref()
+            .map(crate::title::sanitize)
+            .unwrap_or_default();
         instance_env.insert(
             "HCOM_PANE_TITLE".to_string(),
             crate::shared::format_pane_title_full(
