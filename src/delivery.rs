@@ -186,9 +186,7 @@ pub(crate) fn refresh_title_text(
         *s = new_current;
         changed = true;
     }
-    if changed
-        && let Some(wake) = title_wake
-    {
+    if changed && let Some(wake) = title_wake {
         wake();
     }
     changed
@@ -572,7 +570,12 @@ mod host_label {
             .get_instance_full(name)
             .ok()
             .flatten()
-            .map(|row| (row.purpose.unwrap_or_default(), row.current.unwrap_or_default()))
+            .map(|row| {
+                (
+                    row.purpose.unwrap_or_default(),
+                    row.current.unwrap_or_default(),
+                )
+            })
             .unwrap_or_default();
         format_pane_title_full(status, &display, tool, &purpose, &current)
     }
@@ -2586,11 +2589,7 @@ pub fn run_delivery_loop(
 /// current binding no longer names `process_id` (the name was resumed and
 /// rebound while this harness was dying), the row is left untouched and a
 /// `stale-harness-exit` is logged instead of deleting the live session.
-pub(crate) fn cleanup_deleted_instance(
-    db: &mut HcomDb,
-    current_name: &str,
-    process_id: &str,
-) {
+pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str, process_id: &str) {
     // Gate on the current binding: a stale harness exiting under a resumed
     // (rebound) name must not delete the live row. No binding row at all
     // means the release path already cleared it — this exit owns the name.
@@ -2672,9 +2671,14 @@ pub(crate) fn cleanup_deleted_instance(
     } else {
         Some(process_id)
     };
-    if let Err(e) =
-        db.log_life_event(current_name, "stopped", "pty", exit_reason, snapshot, event_process_id)
-    {
+    if let Err(e) = db.log_life_event(
+        current_name,
+        "stopped",
+        "pty",
+        exit_reason,
+        snapshot,
+        event_process_id,
+    ) {
         log_warn(
             "native",
             "delivery.life_event_fail",

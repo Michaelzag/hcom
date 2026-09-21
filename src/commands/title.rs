@@ -44,8 +44,7 @@ pub fn cmd_title(db: &HcomDb, args: &TitleArgs, ctx: Option<&CommandContext>) ->
         eprintln!("Error: Cannot resolve 'self' — no active identity");
         return 1;
     };
-    let name =
-        identity::resolve_display_name(db, &name).unwrap_or_else(|| name.clone());
+    let name = identity::resolve_display_name(db, &name).unwrap_or_else(|| name.clone());
 
     let instance = match db.get_instance_full(&name) {
         Ok(Some(inst)) => inst,
@@ -71,10 +70,7 @@ pub fn cmd_title(db: &HcomDb, args: &TitleArgs, ctx: Option<&CommandContext>) ->
         (None, None) => {
             println!(
                 "{}",
-                render_title_get(
-                    instance.purpose.as_deref(),
-                    instance.current.as_deref()
-                )
+                render_title_get(instance.purpose.as_deref(), instance.current.as_deref())
             );
             0
         }

@@ -687,8 +687,11 @@ impl HcomDb {
             .unwrap_or_default();
 
         // (migration version, a column that migration introduces)
-        const COLUMN_MIGRATIONS: &[(i32, &str)] =
-            &[(17, "terminal_preset_requested"), (18, "last_seen"), (19, "purpose")];
+        const COLUMN_MIGRATIONS: &[(i32, &str)] = &[
+            (17, "terminal_preset_requested"),
+            (18, "last_seen"),
+            (19, "purpose"),
+        ];
         for (migration, column) in COLUMN_MIGRATIONS {
             if !columns.contains(*column) {
                 return migration - 1;

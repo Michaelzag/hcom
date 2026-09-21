@@ -296,7 +296,13 @@ mod tests {
             format!("{icon} luna — zagdb: rc.48 roll [claude]")
         );
         assert_eq!(
-            format_pane_title_full("listening", "luna", "claude", "zagdb: rc.48 roll", "probing WAL"),
+            format_pane_title_full(
+                "listening",
+                "luna",
+                "claude",
+                "zagdb: rc.48 roll",
+                "probing WAL"
+            ),
             format!("{icon} luna — zagdb: rc.48 roll · probing WAL [claude]")
         );
         assert_eq!(

@@ -352,9 +352,7 @@ fn prepare_resume_plan_from_source(
             // newest binding must block the new harness. Forks spawn under
             // a fresh name, so they are exempt here; the launcher's
             // explicit-name check covers their reservation.
-            if !fork
-                && let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name)
-            {
+            if !fork && let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name) {
                 bail!("{refusal}");
             }
             let (tool, sid, largs, tag, bg, leid, snap, purpose, current) = if fork {
@@ -362,7 +360,18 @@ fn prepare_resume_plan_from_source(
             } else {
                 load_stopped_snapshot(db, name)?
             };
-            (tool, sid, largs, tag, bg, leid, snap, purpose, current, name.to_string())
+            (
+                tool,
+                sid,
+                largs,
+                tag,
+                bg,
+                leid,
+                snap,
+                purpose,
+                current,
+                name.to_string(),
+            )
         }
         ResumeSource::Disk {
             session_id,
@@ -909,11 +918,22 @@ fn resume_system_prompt(tool: &str, name: &str, fork: bool, child_name: Option<&
         format!("YOUR SESSION HAS BEEN RESUMED! You are still '{}'.", name)
     }
 }
+/// Loaded instance row for resume: (tool, session_id, launch_args, tag,
+/// background, last_event_id, directory, purpose, current).
+type LoadedInstanceData = (
+    String,
+    String,
+    String,
+    String,
+    bool,
+    i64,
+    String,
+    String,
+    String,
+);
+
 /// Load data from an active or stopped instance.
-fn load_instance_data(
-    db: &HcomDb,
-    name: &str,
-) -> Result<(String, String, String, String, bool, i64, String, String, String)> {
+fn load_instance_data(db: &HcomDb, name: &str) -> Result<LoadedInstanceData> {
     // Try active instance first
     if let Ok(Some(inst)) = db.get_instance_full(name) {
         return Ok((
@@ -934,10 +954,7 @@ fn load_instance_data(
 }
 
 /// Load stopped snapshot from life events.
-fn load_stopped_snapshot(
-    db: &HcomDb,
-    name: &str,
-) -> Result<(String, String, String, String, bool, i64, String, String, String)> {
+fn load_stopped_snapshot(db: &HcomDb, name: &str) -> Result<LoadedInstanceData> {
     // Filter action='stopped' in SQL so we can't miss it past a LIMIT window
     // (old 10-row LIMIT could drop the snapshot after many relaunches).
     let mut stmt = db.conn().prepare(
@@ -3802,7 +3819,8 @@ mod tests {
             .find(|m| m.pid == spid)
             .expect("orphan sleeper enumerated")
             .start_epoch;
-        db.set_process_binding("proc-after", "sess", &orphan_name).unwrap();
+        db.set_process_binding("proc-after", "sess", &orphan_name)
+            .unwrap();
         db.conn()
             .execute(
                 "UPDATE process_bindings SET updated_at = ?1 WHERE process_id = 'proc-after'",
@@ -3813,7 +3831,10 @@ mod tests {
             .err()
             .expect("orphan must refuse resume")
             .to_string();
-        assert!(err.contains(&spid.to_string()), "refusal names the pid: {err}");
+        assert!(
+            err.contains(&spid.to_string()),
+            "refusal names the pid: {err}"
+        );
         assert!(err.contains("hcom kill"), "refusal points at kill: {err}");
         sleeper.kill().ok();
         sleeper.wait().ok();
@@ -3832,7 +3853,8 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        db.set_process_binding("proc-after", "sess", &sub_name).unwrap();
+        db.set_process_binding("proc-after", "sess", &sub_name)
+            .unwrap();
         assert!(
             prepare_resume_plan(&db, &sub_name, false, &[], &GlobalFlags::default()).is_ok(),
             "post-binding same-name process must not block resume"

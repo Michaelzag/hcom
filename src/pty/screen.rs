@@ -114,17 +114,17 @@ pub(crate) fn sanitize_title_capped(title: &str, max_chars: usize) -> String {
     out
 }
 
- /// Normalize a wrapped tool's raw title into a single bounded line safe to embed
- /// inside hcom's own OSC sequence.
- ///
- /// The input is untrusted display text (model output, project paths, etc.). We
- /// drop control characters (which could terminate or reshape our OSC) and other
- /// C0/C1 codepoints, collapse whitespace runs to a single space, trim the ends,
- /// and bound the result to [`MAX_CHILD_TITLE_CHARS`]. Mirrors codex's own
- /// `sanitize_terminal_title` so passthrough matches what the tool would render.
- fn sanitize_child_title(title: &str) -> String {
+/// Normalize a wrapped tool's raw title into a single bounded line safe to embed
+/// inside hcom's own OSC sequence.
+///
+/// The input is untrusted display text (model output, project paths, etc.). We
+/// drop control characters (which could terminate or reshape our OSC) and other
+/// C0/C1 codepoints, collapse whitespace runs to a single space, trim the ends,
+/// and bound the result to [`MAX_CHILD_TITLE_CHARS`]. Mirrors codex's own
+/// `sanitize_terminal_title` so passthrough matches what the tool would render.
+fn sanitize_child_title(title: &str) -> String {
     sanitize_title_capped(title, MAX_CHILD_TITLE_CHARS)
- }
+}
 
 /// Trim whitespace including NBSP (U+00A0) from both ends
 fn trim_with_nbsp(s: &str) -> &str {
