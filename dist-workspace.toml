@@ -19,20 +19,18 @@ installers = ["shell", "powershell"]
 unix-archive = ".tar.gz"
 # Local artifacts jobs to run in CI
 local-artifacts-jobs = ["./build-wheels"]
-# Publish jobs to run in CI (no homebrew — see above).
-publish-jobs = ["./publish-pypi"]
+# Publish jobs to run in CI. Empty: homebrew needs the upstream tap and PyPI
+# has no trusted publisher registered for this fork — same reasoning as above.
+publish-jobs = []
 # Post-announce jobs to run after the release is published
 post-announce-jobs = ["./post-announce-compare-link"]
 # Extra setup steps to run before dist builds
 github-build-setup = "../build-setup.yml"
-# Custom permissions for reusable workflow jobs
-github-custom-job-permissions = { "publish-pypi" = { id-token = "write", contents = "read" } }
 # Sanctioned drift: release.yml's `on:` block carries a hand-maintained
 # `workflow_dispatch` trigger (re-applied after every `cargo dist generate`).
 # Without this, `dist plan` in the Release workflow refuses to run on the
 # dirty file. See the dist-check job in ci.yml.
 allow-dirty = ["ci"]
-# Whether dist should create a Github Release or use an existing draft
 create-release = true
 # Path that installers should place binaries in
 install-path = "~/.local/bin"
