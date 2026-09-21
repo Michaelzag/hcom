@@ -190,6 +190,8 @@ const INSTANCE_KEYS: &[(&str, &str)] = &[
         "subagent_timeout",
         "Instance-specific subagent timeout in seconds",
     ),
+    ("purpose", "What this session is for (shows in title and list)"),
+    ("current", "Live subtask (auto-updates from tool intents)"),
 ];
 
 // ── Flag Parsing ─────────────────────────────────────────────────────────
@@ -630,6 +632,8 @@ fn config_instance(
             "tag" => serde_json::json!({"value": instance.tag.as_deref().unwrap_or("")}),
             "timeout" => serde_json::json!({"value": instance.wait_timeout.unwrap_or(86400)}),
             "hints" => serde_json::json!({"value": instance.hints.as_deref().unwrap_or("")}),
+            "purpose" => serde_json::json!({"value": instance.purpose.as_deref().unwrap_or("")}),
+            "current" => serde_json::json!({"value": instance.current.as_deref().unwrap_or("")}),
             "subagent_timeout" => match instance.subagent_timeout {
                 Some(value) => serde_json::json!({"value": value}),
                 None => serde_json::json!({"value": serde_json::Value::Null}),
@@ -714,6 +718,20 @@ fn config_instance(
                 render_config_instance_set_feedback(inst_name, "hints", value)
             );
         }
+        "purpose" => {
+            let stored = crate::title::set_purpose(db, inst_name, value);
+            println!(
+                "{}",
+                render_config_instance_set_feedback(inst_name, "purpose", &stored)
+            );
+        }
+        "current" => {
+            let stored = crate::title::set_current(db, inst_name, value);
+            println!(
+                "{}",
+                render_config_instance_set_feedback(inst_name, "current", &stored)
+            );
+        }
         "subagent_timeout" => {
             let mut updates = serde_json::Map::new();
             if value.is_empty() || value.eq_ignore_ascii_case("default") {
@@ -781,11 +799,20 @@ pub fn render_config_instance_get(value: &Value, key: Option<&str>, json_mode: b
                 .and_then(|v| v.as_i64())
                 .map(|t| format!("{t}s"))
                 .unwrap_or_else(|| "(default)".to_string());
-            format!(
+            let purpose = value.get("purpose").and_then(|v| v.as_str()).unwrap_or("");
+            let current = value.get("current").and_then(|v| v.as_str()).unwrap_or("");
+            let mut out = format!(
                 "Agent: {display}\n  tag: {}\n  timeout: {timeout}s\n  hints: {}\n  subagent_timeout: {subagent_timeout}",
                 if tag.is_empty() { "(none)" } else { tag },
                 if hints.is_empty() { "(none)" } else { hints },
-            )
+            );
+            if !purpose.is_empty() {
+                out.push_str(&format!("\n  purpose: {purpose}"));
+            }
+            if !current.is_empty() {
+                out.push_str(&format!("\n  current: {current}"));
+            }
+            out
         }
         Some(_) => value
             .get("value")
@@ -828,6 +855,20 @@ pub fn render_config_instance_set_feedback(instance_name: &str, key: &str, value
                 format!("Set subagent_timeout for {instance_name}: {value}s")
             }
         }
+        "purpose" => {
+            if value.is_empty() {
+                format!("Cleared purpose for {instance_name}")
+            } else {
+                format!("Set purpose for {instance_name}: {value}")
+            }
+        }
+        "current" => {
+            if value.is_empty() {
+                format!("Current unchanged for {instance_name} (empty value leaves it)")
+            } else {
+                format!("Set current for {instance_name}: {value}")
+            }
+        }
         _ => format!("Updated {key} for {instance_name}"),
     }
 }
@@ -838,6 +879,7 @@ pub fn render_config_instance_set_feedback(instance_name: &str, key: &str, value
 ///   `name`            — base name
 ///   `full_name`       — tag-prefixed display name
 ///   `tag` / `hints`   — null when unset (not "")
+///   `purpose` / `current` — null when unset (not "")
 ///   `timeout`         — null when unset (server-side default applies elsewhere)
 ///   `subagent_timeout`— null when unset
 fn build_instance_config_json(
@@ -850,6 +892,8 @@ fn build_instance_config_json(
         "tag": instance.tag.as_deref().filter(|s| !s.is_empty()),
         "timeout": instance.wait_timeout,
         "hints": instance.hints.as_deref().filter(|s| !s.is_empty()),
+        "purpose": instance.purpose.as_deref().filter(|s| !s.is_empty()),
+        "current": instance.current.as_deref().filter(|s| !s.is_empty()),
         "subagent_timeout": instance.subagent_timeout,
     })
 }
@@ -872,6 +916,8 @@ pub fn config_instance_get(
             build_instance_config_json(&instance, &full_name)
         }
         Some("tag") => serde_json::json!({"value": instance.tag.as_deref().unwrap_or("")}),
+        Some("purpose") => serde_json::json!({"value": instance.purpose.as_deref().unwrap_or("")}),
+        Some("current") => serde_json::json!({"value": instance.current.as_deref().unwrap_or("")}),
         Some("timeout") => serde_json::json!({"value": instance.wait_timeout.unwrap_or(86400)}),
         Some("hints") => serde_json::json!({"value": instance.hints.as_deref().unwrap_or("")}),
         Some("subagent_timeout") => match instance.subagent_timeout {
@@ -943,6 +989,12 @@ pub fn config_instance_set(
                 updates.insert("hints".into(), serde_json::json!(value));
             }
             instances::update_instance_position(db, inst_name, &updates);
+        }
+        "purpose" => {
+            crate::title::set_purpose(db, inst_name, value);
+        }
+        "current" => {
+            crate::title::set_current(db, inst_name, value);
         }
         "subagent_timeout" => {
             let mut updates = serde_json::Map::new();
@@ -2328,7 +2380,43 @@ mod tests {
         assert!(INSTANCE_KEYS.iter().any(|(k, _)| *k == "timeout"));
         assert!(INSTANCE_KEYS.iter().any(|(k, _)| *k == "hints"));
         assert!(INSTANCE_KEYS.iter().any(|(k, _)| *k == "subagent_timeout"));
+        assert!(INSTANCE_KEYS.iter().any(|(k, _)| *k == "purpose"));
+        assert!(INSTANCE_KEYS.iter().any(|(k, _)| *k == "current"));
         assert!(!INSTANCE_KEYS.iter().any(|(k, _)| *k == "invalid"));
+    }
+
+    #[test]
+    fn test_config_instance_set_purpose_current_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('luna', 'claude', 'listening', 'start', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        config_instance_set(&db, "luna", "purpose", "  zagdb: rc.48 roll  ").unwrap();
+        config_instance_set(&db, "luna", "current", "probing WAL").unwrap();
+        let got = config_instance_get(&db, "luna", Some("purpose")).unwrap();
+        assert_eq!(got["value"], "zagdb: rc.48 roll");
+        let got = config_instance_get(&db, "luna", Some("current")).unwrap();
+        assert_eq!(got["value"], "probing WAL");
+
+        // Full shape carries both, null when unset.
+        let full = config_instance_get(&db, "luna", None).unwrap();
+        assert_eq!(full["purpose"], "zagdb: rc.48 roll");
+        assert_eq!(full["current"], "probing WAL");
+
+        // Empty purpose clears; empty current leaves the phase alone.
+        config_instance_set(&db, "luna", "purpose", "").unwrap();
+        config_instance_set(&db, "luna", "current", "   ").unwrap();
+        let got = config_instance_get(&db, "luna", Some("purpose")).unwrap();
+        assert_eq!(got["value"], "");
+        let full = config_instance_get(&db, "luna", None).unwrap();
+        assert!(full["purpose"].is_null());
+        assert_eq!(full["current"], "probing WAL");
     }
 
     #[test]

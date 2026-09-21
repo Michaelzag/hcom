@@ -687,6 +687,7 @@ struct RemoteLaunchRequest {
     initial_prompt: Option<String>,
     background: bool,
     terminal: Option<String>,
+    purpose: Option<String>,
     cwd: Option<String>,
 }
 
@@ -706,6 +707,7 @@ impl RemoteLaunchRequest {
             initial_prompt: optional_param(params, "initial_prompt").map(ToString::to_string),
             background: bool_param(params, "background", false),
             terminal: optional_param(params, "terminal").map(ToString::to_string),
+            purpose: optional_param(params, "purpose").map(ToString::to_string),
             cwd: optional_param(params, "cwd").map(ToString::to_string),
         })
     }
@@ -781,6 +783,8 @@ fn handle_remote_launch(
             prior_session_id: None,
             tag: request.tag,
             system_prompt: request.system_prompt,
+            purpose: request.purpose,
+            current: None,
             initial_prompt: request.initial_prompt,
             background: prepared.background,
             cwd: Some(cwd.clone()),

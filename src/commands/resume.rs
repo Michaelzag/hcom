@@ -326,7 +326,7 @@ fn prepare_resume_plan_from_source(
 ) -> Result<PreparedResume> {
     let is_adoption = matches!(source, ResumeSource::Disk { .. });
 
-    // Load the (tool, session_id, prior-launch-args, tag, background, last_event_id, cwd_hint, display_name)
+    // Load the (tool, session_id, prior-launch-args, tag, background, last_event_id, cwd_hint, purpose, current, display_name)
     // from either the DB (instance) or the on-disk transcript (adoption).
     let (
         tool,
@@ -336,6 +336,8 @@ fn prepare_resume_plan_from_source(
         background,
         last_event_id,
         snapshot_dir,
+        snapshot_purpose,
+        snapshot_current,
         display_name,
     ) = match source {
         ResumeSource::Instance { name } => {
@@ -355,12 +357,12 @@ fn prepare_resume_plan_from_source(
             {
                 bail!("{refusal}");
             }
-            let (tool, sid, largs, tag, bg, leid, snap) = if fork {
+            let (tool, sid, largs, tag, bg, leid, snap, purpose, current) = if fork {
                 load_instance_data(db, name)?
             } else {
                 load_stopped_snapshot(db, name)?
             };
-            (tool, sid, largs, tag, bg, leid, snap, name.to_string())
+            (tool, sid, largs, tag, bg, leid, snap, purpose, current, name.to_string())
         }
         ResumeSource::Disk {
             session_id,
@@ -376,6 +378,8 @@ fn prepare_resume_plan_from_source(
                 false,
                 0,
                 cwd_hint.unwrap_or_default(),
+                String::new(),
+                String::new(),
                 display,
             )
         }
@@ -496,6 +500,16 @@ fn prepare_resume_plan_from_source(
         None
     };
     let effective_tag = launch_flags.tag.clone().or(inherited_tag.clone());
+    // Restore the session title from the stopped snapshot; an explicit
+    // --hcom-title overrides the stored purpose. Empty snapshot segments
+    // become None so the launcher leaves a fresh row untouched.
+    let non_empty = |s: &str| (!s.trim().is_empty()).then(|| s.to_string());
+    let effective_purpose = launch_flags
+        .title
+        .clone()
+        .and_then(|t| non_empty(&t))
+        .or_else(|| non_empty(&snapshot_purpose));
+    let effective_current = non_empty(&snapshot_current);
 
     let (effective_system_prompt, fork_initial_prompt, append_reply_handoff) =
         build_resume_prompts(ResumePromptInput {
@@ -553,6 +567,8 @@ fn prepare_resume_plan_from_source(
             prior_session_id: (!fork).then(|| session_id.clone()),
             tag: launch_tag,
             system_prompt: effective_system_prompt,
+            purpose: effective_purpose,
+            current: effective_current,
             initial_prompt: fork_initial_prompt,
             background: is_headless,
             cwd: Some(effective_cwd),
@@ -893,12 +909,11 @@ fn resume_system_prompt(tool: &str, name: &str, fork: bool, child_name: Option<&
         format!("YOUR SESSION HAS BEEN RESUMED! You are still '{}'.", name)
     }
 }
-
 /// Load data from an active or stopped instance.
 fn load_instance_data(
     db: &HcomDb,
     name: &str,
-) -> Result<(String, String, String, String, bool, i64, String)> {
+) -> Result<(String, String, String, String, bool, i64, String, String, String)> {
     // Try active instance first
     if let Ok(Some(inst)) = db.get_instance_full(name) {
         return Ok((
@@ -909,6 +924,8 @@ fn load_instance_data(
             inst.background != 0,
             inst.last_event_id,
             inst.directory.clone(),
+            inst.purpose.clone().unwrap_or_default(),
+            inst.current.clone().unwrap_or_default(),
         ));
     }
 
@@ -920,7 +937,7 @@ fn load_instance_data(
 fn load_stopped_snapshot(
     db: &HcomDb,
     name: &str,
-) -> Result<(String, String, String, String, bool, i64, String)> {
+) -> Result<(String, String, String, String, bool, i64, String, String, String)> {
     // Filter action='stopped' in SQL so we can't miss it past a LIMIT window
     // (old 10-row LIMIT could drop the snapshot after many relaunches).
     let mut stmt = db.conn().prepare(
@@ -975,6 +992,16 @@ fn load_stopped_snapshot(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let purpose = snapshot
+                .get("purpose")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let current = snapshot
+                .get("current")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
             return Ok((
                 tool,
@@ -984,6 +1011,8 @@ fn load_stopped_snapshot(
                 background,
                 last_event_id,
                 directory,
+                purpose,
+                current,
             ));
         }
     }
@@ -2869,6 +2898,68 @@ mod tests {
             "expected inactive agy row to be resumable, got: {:?}",
             result.err()
         );
+    }
+
+    fn stopped_db_with_title(purpose: &str, current: &str) -> HcomDb {
+        let db = test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!("sess-title-1"));
+        data.insert("tool".into(), json!("claude"));
+        data.insert("status".into(), json!(ST_INACTIVE));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named("rhea", &data).unwrap();
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "claude",
+                "session_id": "sess-title-1",
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": 0,
+                "directory": "/tmp",
+                "purpose": purpose,
+                "current": current,
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', 'rhea', ?)",
+                rusqlite::params!["2026-01-01T00:00:00Z", snapshot.to_string()],
+            )
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn test_load_stopped_snapshot_restores_purpose_and_current() {
+        let db = stopped_db_with_title("zagdb: rc.48 roll", "probing WAL");
+        let loaded = load_stopped_snapshot(&db, "rhea").unwrap();
+        assert_eq!(loaded.7, "zagdb: rc.48 roll");
+        assert_eq!(loaded.8, "probing WAL");
+    }
+
+    #[test]
+    fn test_resume_plan_restores_purpose_and_current() {
+        let db = stopped_db_with_title("zagdb: rc.48 roll", "probing WAL");
+        let plan = prepare_resume_plan(&db, "rhea", false, &[], &GlobalFlags::default()).unwrap();
+        assert_eq!(plan.launch.purpose.as_deref(), Some("zagdb: rc.48 roll"));
+        assert_eq!(plan.launch.current.as_deref(), Some("probing WAL"));
+    }
+
+    #[test]
+    fn test_resume_hcom_title_overrides_snapshot_purpose() {
+        let db = stopped_db_with_title("zagdb: rc.48 roll", "probing WAL");
+        let plan = prepare_resume_plan(
+            &db,
+            "rhea",
+            false,
+            &s(&["--hcom-title", "new purpose"]),
+            &GlobalFlags::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.launch.purpose.as_deref(), Some("new purpose"));
+        assert_eq!(plan.launch.current.as_deref(), Some("probing WAL"));
     }
 
     #[test]

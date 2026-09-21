@@ -5,6 +5,9 @@
 //! single instance query (self/named), full listing with unread counts.
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
+
+use unicode_width::UnicodeWidthStr;
 
 use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
@@ -157,6 +160,8 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     "parent_name": data.parent_name,
                     "agent_id": data.agent_id,
                     "tool": data.tool,
+                    "purpose": data.purpose.as_deref().filter(|s| !s.is_empty()),
+                    "current": data.current.as_deref().filter(|s| !s.is_empty()),
                 });
 
                 if is_self
@@ -260,6 +265,8 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "tool": data.tool,
                 "base_name": data.name,
                 "hooks_bound": hooks_bound,
+                "purpose": data.purpose.as_deref().filter(|s| !s.is_empty()),
+                "current": data.current.as_deref().filter(|s| !s.is_empty()),
                 "process_bound": process_bound,
                 "launch_context": launch_context,
             });
@@ -451,15 +458,13 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         } else {
             String::new()
         };
-
         let name_part = format!("{name}{headless_badge}{remote_badge}{unread_str}");
         let status_text =
             format!("{age_display}{desc_sep}{description}{listening_since}{timeout_marker}");
+        let line_head = format!("{tool_prefix}{icon} {name_part:<width$}{status_text}", width = name_col_width);
+        let title_suffix = list_title_suffix(data, &line_head);
 
-        println!(
-            "{tool_prefix}{icon} {name_part:<width$}{status_text}",
-            width = name_col_width
-        );
+        println!("{line_head}{title_suffix}");
 
         if verbose_output {
             let session_id = data.session_id.as_deref().unwrap_or("(none)");
@@ -541,6 +546,12 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     data.status_detail.clone()
                 };
                 println!("    detail:       {detail}");
+            }
+            if let Some(purpose) = data.purpose.as_deref().filter(|s| !s.is_empty()) {
+                println!("    purpose:      {purpose}");
+            }
+            if let Some(current) = data.current.as_deref().filter(|s| !s.is_empty()) {
+                println!("    current:      {current}");
             }
             println!();
         }
@@ -637,6 +648,13 @@ fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
         println!("  Tag:         {tag}");
     }
 
+    if let Some(purpose) = data.purpose.as_deref().filter(|s| !s.is_empty()) {
+        println!("  Purpose:     {purpose}");
+    }
+    if let Some(current) = data.current.as_deref().filter(|s| !s.is_empty()) {
+        println!("  Current:     {current}");
+    }
+
     // Status & Connection
     println!("  Status:      {status_line}");
     if !data.status_detail.is_empty() {
@@ -722,6 +740,59 @@ fn extract_field_value(payload: &serde_json::Value, field: &str) -> String {
         Some(other) => other.to_string(),
         None => String::new(),
     }
+}
+
+/// Truncate `s` to `max_w` display columns, appending `…` when cut. Empty
+/// only when `max_w` is 0.
+fn truncate_to_width(s: &str, max_w: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if UnicodeWidthStr::width(s) <= max_w {
+        return s.to_string();
+    }
+    let target = max_w.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > target {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    if out.is_empty() && max_w == 0 {
+        return String::new();
+    }
+    out.push('…');
+    out
+}
+
+/// Dimmed session-title suffix (` — purpose · current`) for the default list
+/// line, truncated so the whole line fits the terminal. Plain and untruncated
+/// when piped; "" when both fields are unset or no room remains.
+fn list_title_suffix(data: &InstanceRow, line_head: &str) -> String {
+    let infix = crate::title::title_infix(
+        data.purpose.as_deref().unwrap_or(""),
+        data.current.as_deref().unwrap_or(""),
+    );
+    if infix.is_empty() {
+        return String::new();
+    }
+    if !std::io::stdout().is_terminal() {
+        return infix;
+    }
+    let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
+    let avail = (cols as usize).saturating_sub(UnicodeWidthStr::width(line_head) + 1);
+    let shown = truncate_to_width(&infix, avail);
+    if shown.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{}{}{}",
+        crate::shared::ansi::DIM,
+        shown,
+        crate::shared::ansi::RESET
+    )
 }
 
 /// Print shell-export format for `hcom list --sh`.
@@ -963,4 +1034,77 @@ fn get_recently_stopped(
         .filter_map(|r| r.ok())
         .filter(|name| !exclude_active.contains(name))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_with_title(purpose: Option<&str>, current: Option<&str>) -> InstanceRow {
+        InstanceRow {
+            name: "luna".to_string(),
+            session_id: None,
+            parent_session_id: None,
+            parent_name: None,
+            agent_id: None,
+            tag: None,
+            last_event_id: 0,
+            last_stop: 0,
+            status: "listening".to_string(),
+            status_time: 0,
+            last_seen: 0,
+            status_context: String::new(),
+            status_detail: String::new(),
+            directory: String::new(),
+            created_at: 0.0,
+            transcript_path: String::new(),
+            tool: "claude".to_string(),
+            background: 0,
+            background_log_file: String::new(),
+            tcp_mode: 0,
+            wait_timeout: None,
+            subagent_timeout: None,
+            hints: None,
+            origin_device_id: None,
+            pid: None,
+            launch_args: None,
+            terminal_preset_requested: None,
+            terminal_preset_effective: None,
+            launch_context: None,
+            name_announced: 0,
+            idle_since: None,
+            purpose: purpose.map(str::to_string),
+            current: current.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn truncate_to_width_keeps_short_strings() {
+        assert_eq!(truncate_to_width("abc", 3), "abc");
+        assert_eq!(truncate_to_width("abc", 10), "abc");
+    }
+
+    #[test]
+    fn truncate_to_width_cuts_with_ellipsis() {
+        assert_eq!(truncate_to_width("abcdef", 5), "abcd…");
+        assert_eq!(truncate_to_width("abcdef", 1), "…");
+        assert_eq!(truncate_to_width("abcdef", 0), "");
+    }
+
+    #[test]
+    fn list_title_suffix_empty_when_unset() {
+        let row = row_with_title(None, None);
+        assert_eq!(list_title_suffix(&row, "◉ luna"), "");
+        let row = row_with_title(Some(""), None);
+        assert_eq!(list_title_suffix(&row, "◉ luna"), "");
+    }
+
+    #[test]
+    fn list_title_suffix_shows_purpose_and_current() {
+        // Piped output (cargo test) is plain and untruncated.
+        let row = row_with_title(Some("zagdb: rc.48 roll"), Some("probing WAL"));
+        let suffix = list_title_suffix(&row, "◉ luna");
+        assert!(suffix.contains("zagdb: rc.48 roll"), "got: {suffix}");
+        assert!(suffix.contains("probing WAL"), "got: {suffix}");
+    }
 }
