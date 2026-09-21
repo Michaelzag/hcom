@@ -654,6 +654,24 @@ impl HcomDb {
         )?;
         Ok(())
     }
+
+    /// Newest process binding for an instance: `(process_id, updated_at)`.
+    ///
+    /// The process-truth gate keys orphans and live holders off this row:
+    /// a same-name process carrying another process_id, started before
+    /// `updated_at`, is an orphan; one carrying this process_id is live.
+    pub fn newest_process_binding(&self, instance_name: &str) -> Result<Option<(String, f64)>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT process_id, updated_at FROM process_bindings \
+                 WHERE instance_name = ? ORDER BY updated_at DESC LIMIT 1",
+                params![instance_name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
 }
 
 #[cfg(test)]

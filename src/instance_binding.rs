@@ -1501,7 +1501,7 @@ mod tests {
             "tool": "antigravity",
             "tag": "work",
         });
-        db.log_life_event("miso", "stopped", "test", "exit", Some(snapshot))
+        db.log_life_event("miso", "stopped", "test", "exit", Some(snapshot), None)
             .unwrap();
 
         db.delete_instance("miso").unwrap();
@@ -1538,7 +1538,7 @@ mod tests {
             "session_id": "ses-opencode-1",
             "tool": "opencode",
         });
-        db.log_life_event("fano", "stopped", "test", "exit", Some(snapshot))
+        db.log_life_event("fano", "stopped", "test", "exit", Some(snapshot), None)
             .unwrap();
 
         let mut mozi_data = serde_json::Map::new();
@@ -1590,6 +1590,7 @@ mod tests {
             "test",
             "exit",
             Some(serde_json::json!({ "session_id": "ses-oc-pid", "tool": "opencode" })),
+            None,
         )
         .unwrap();
 
@@ -1645,6 +1646,7 @@ mod tests {
             "test",
             "exit",
             Some(serde_json::json!({ "session_id": "ses-oc-ready", "tool": "opencode" })),
+            None,
         )
         .unwrap();
 
@@ -1698,6 +1700,7 @@ mod tests {
             "test",
             "exit",
             Some(serde_json::json!({ "session_id": "ses-keep", "tool": "opencode" })),
+            None,
         )
         .unwrap();
 
@@ -1783,7 +1786,7 @@ mod tests {
             "session_id": "ses-opencode-1",
             "tool": "opencode",
         });
-        db.log_life_event("fano", "stopped", "test", "exit", Some(snapshot))
+        db.log_life_event("fano", "stopped", "test", "exit", Some(snapshot), None)
             .unwrap();
 
         let mut mozi_data = serde_json::Map::new();

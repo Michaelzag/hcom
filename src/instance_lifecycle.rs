@@ -650,13 +650,24 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
             }
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
-                crate::hooks::common::stop_placeholder_instance(
+                match crate::hooks::common::stop_placeholder_instance(
                     db,
                     &data.name,
                     "system",
                     "stale_cleanup",
-                );
-                deleted += 1;
+                ) {
+                    crate::hooks::common::StopOutcome::Stopped => {
+                        deleted += 1;
+                    }
+                    crate::hooks::common::StopOutcome::AlreadyStopped => {}
+                    crate::hooks::common::StopOutcome::RetryableError(e) => {
+                        crate::log::log_warn(
+                            "cleanup",
+                            "stale_placeholder_stop_refused",
+                            &format!("name={} err={}", data.name, e),
+                        );
+                    }
+                }
             }
         }
     }
@@ -676,7 +687,7 @@ pub fn cleanup_stale_instances(
 
     cleanup_stale_remote_instances(db);
 
-    let mut deleted = 0;
+    let deleted = 0;
 
     if let Ok(instances) = db.iter_instances_full() {
         for data in &instances {
@@ -694,26 +705,46 @@ pub fn cleanup_stale_instances(
                 "killed" | "closed" | "timeout" | "interrupted" | "session_switch"
             ) && age > 60
             {
-                crate::hooks::common::stop_instance(db, &data.name, "system", "exit_cleanup");
-                deleted += 1;
-                return deleted;
+                return note_stale_stop(db, &data.name, "system", "exit_cleanup", deleted);
             }
 
             if context == "stale" && max_stale_seconds > 0 && age > max_stale_seconds {
-                crate::hooks::common::stop_instance(db, &data.name, "system", "stale_cleanup");
-                deleted += 1;
-                return deleted;
+                return note_stale_stop(db, &data.name, "system", "stale_cleanup", deleted);
             }
 
             if max_inactive_seconds > 0 && age > max_inactive_seconds {
-                crate::hooks::common::stop_instance(db, &data.name, "system", "inactive_cleanup");
-                deleted += 1;
-                return deleted;
+                return note_stale_stop(db, &data.name, "system", "inactive_cleanup", deleted);
             }
         }
     }
 
     deleted
+}
+
+/// Run one stale-cleanup stop and account for it honestly: only a
+/// [`StopOutcome::Stopped`](crate::hooks::common::StopOutcome) counts as
+/// deleted. A refusal (live survivors after SIGKILL — the reap gate) leaves
+/// the row and its processes in place, so it surfaces in the log with the
+/// surviving pids instead of inflating the count.
+fn note_stale_stop(
+    db: &HcomDb,
+    name: &str,
+    initiated_by: &str,
+    reason: &str,
+    deleted: i32,
+) -> i32 {
+    match crate::hooks::common::stop_instance(db, name, initiated_by, reason) {
+        crate::hooks::common::StopOutcome::Stopped => deleted + 1,
+        crate::hooks::common::StopOutcome::AlreadyStopped => deleted,
+        crate::hooks::common::StopOutcome::RetryableError(e) => {
+            crate::log::log_warn(
+                "cleanup",
+                "stale_stop_refused",
+                &format!("name={name} reason={reason} err={e}"),
+            );
+            deleted
+        }
+    }
 }
 
 fn cleanup_stale_remote_instances(db: &HcomDb) {

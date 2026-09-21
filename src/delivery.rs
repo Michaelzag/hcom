@@ -2506,8 +2506,11 @@ pub fn run_delivery_loop(
         "ready_never_observed",
     );
 
-    let owns_instance = instance_owns_process_binding(db, &process_id, &current_name);
-
+    let owns_instance = if process_id.is_empty() {
+        true
+    } else {
+        matches!(db.get_process_binding(&process_id), Ok(Some(b)) if b == current_name)
+    };
     if matches!(
         Tool::from_str(&config.tool),
         Ok(Tool::Antigravity | Tool::Omp)
@@ -2518,20 +2521,46 @@ pub fn run_delivery_loop(
     }
 }
 
-/// True when this delivery thread's process_id still owns `current_name`.
-fn instance_owns_process_binding(db: &HcomDb, process_id: &str, current_name: &str) -> bool {
-    if process_id.is_empty() {
-        return true;
-    }
-    match db.get_process_binding(process_id) {
-        Ok(Some(bound_name)) => bound_name == current_name,
-        Ok(None) => false,
-        Err(_) => false,
-    }
-}
-
 /// Hard PTY exit cleanup: inactive status, life event, delete instance row.
-pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
+///
+/// The delete is keyed to this exiting process incarnation: when the row's
+/// current binding no longer names `process_id` (the name was resumed and
+/// rebound while this harness was dying), the row is left untouched and a
+/// `stale-harness-exit` is logged instead of deleting the live session.
+pub(crate) fn cleanup_deleted_instance(
+    db: &mut HcomDb,
+    current_name: &str,
+    process_id: &str,
+) {
+    // Gate on the current binding: a stale harness exiting under a resumed
+    // (rebound) name must not delete the live row. No binding row at all
+    // means the release path already cleared it — this exit owns the name.
+    if !process_id.is_empty()
+        && let Ok(Some((bound, _))) = db.newest_process_binding(current_name)
+        && bound != process_id
+    {
+        log_info(
+            "native",
+            "delivery.stale_harness_exit",
+            &format!(
+                "stale-harness-exit for {current_name}: exiting process differs from current binding; row untouched"
+            ),
+        );
+        let data = serde_json::json!({
+            "action": "stopped",
+            "by": "pty",
+            "reason": "stale-harness-exit",
+            "process_id": process_id,
+        });
+        if let Err(e) = db.log_event("life", current_name, &data) {
+            log_warn(
+                "native",
+                "delivery.life_event_fail",
+                &format!("Failed to log life event: {}", e),
+            );
+        }
+        return;
+    }
     let snapshot = match db.get_instance_snapshot(current_name) {
         Ok(Some(snap)) => Some(snap),
         Ok(None) => {
@@ -2579,7 +2608,14 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
     if let Err(e) = db.cleanup_subscriptions(current_name) {
         log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
     }
-    if let Err(e) = db.log_life_event(current_name, "stopped", "pty", exit_reason, snapshot) {
+    let event_process_id = if process_id.is_empty() {
+        None
+    } else {
+        Some(process_id)
+    };
+    if let Err(e) =
+        db.log_life_event(current_name, "stopped", "pty", exit_reason, snapshot, event_process_id)
+    {
         log_warn(
             "native",
             "delivery.life_event_fail",
@@ -2617,7 +2653,7 @@ fn cleanup_pty_exit_default(
     owns_instance: bool,
 ) {
     if owns_instance {
-        cleanup_deleted_instance(db, current_name);
+        cleanup_deleted_instance(db, current_name, process_id);
     } else {
         log_pty_cleanup_skipped(db, current_name);
     }
@@ -2725,11 +2761,11 @@ mod tests {
             .unwrap();
 
         let snapshot = db.get_instance_snapshot("buli").unwrap();
-        db.log_life_event("buli", "stopped", "samu", "killed", snapshot)
+        db.log_life_event("buli", "stopped", "samu", "killed", snapshot, None)
             .unwrap();
         db.delete_instance("buli").unwrap();
 
-        cleanup_deleted_instance(&mut db, "buli");
+        cleanup_deleted_instance(&mut db, "buli", "");
 
         let events: Vec<(String, String)> = db
             .conn()

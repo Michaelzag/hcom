@@ -1471,6 +1471,13 @@ fn launch_pty_or_background(
 ///   place, so it must survive — bailing here broke every tracked `hcom f`.
 /// - Name held by anything else (listening/active/blocked) → Err.
 fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
+    // Process truth first: never spawn under a name whose prior subtree is
+    // still alive (orphan) or whose newest binding is live-held — not even
+    // over a free or inactive row. A reservation placeholder carries no
+    // processes, so it passes through untouched.
+    if let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name) {
+        anyhow::bail!("{refusal}");
+    }
     let Some(row) = db.get_instance(name).ok().flatten() else {
         return Ok(());
     };
@@ -3588,7 +3595,40 @@ mod tests {
         assert!(db.get_instance("rune").unwrap().is_some());
     }
 
-    // ── inject_workspace_trust_args ──────────────────────────────────────────
+    #[test]
+    #[cfg(unix)]
+    fn resolve_explicit_name_conflict_refuses_orphan_tree() {
+        // Even with no row at all, a live tree under the requested name
+        // refuses the launch — spawning over it would orphan the holders.
+        let db = launcher_test_db();
+        let name = format!("hcom-launch-orphan-{}", std::process::id());
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("300")
+            .env("HCOM_INSTANCE_NAME", &name)
+            .env("HCOM_PROCESS_ID", "proc-launch-old")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let spid = sleeper.id();
+        for _ in 0..50 {
+            if crate::proctruth::processes_with_instance_name(&name)
+                .iter()
+                .any(|m| m.pid == spid)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let err = resolve_explicit_name_conflict(&db, &name)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&spid.to_string()), "unexpected: {err}");
+        assert!(err.contains("hcom kill"), "unexpected: {err}");
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
 
     #[test]
     fn test_auto_trust_workspace_default_true() {

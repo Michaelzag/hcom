@@ -25,6 +25,7 @@ pub mod messages;
 mod notify;
 mod paths;
 mod pidtrack;
+mod proctruth;
 mod pty;
 pub mod relay;
 pub mod router;

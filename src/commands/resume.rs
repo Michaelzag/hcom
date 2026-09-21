@@ -345,6 +345,16 @@ fn prepare_resume_plan_from_source(
             {
                 bail!("'{}' is still active — run hcom kill {} first", name, name);
             }
+            // Process truth gates the spawn: even with the row stopped, a
+            // still-running prior subtree (orphan) or a live holder of the
+            // newest binding must block the new harness. Forks spawn under
+            // a fresh name, so they are exempt here; the launcher's
+            // explicit-name check covers their reservation.
+            if !fork
+                && let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name)
+            {
+                bail!("{refusal}");
+            }
             let (tool, sid, largs, tag, bg, leid, snap) = if fork {
                 load_instance_data(db, name)?
             } else {
@@ -3629,5 +3639,122 @@ mod tests {
             None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
         }
         assert_eq!(result, None);
+    }
+    #[cfg(unix)]
+    fn spawn_named_sleeper(name: &str, process_id: &str) -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("300")
+            .env("HCOM_INSTANCE_NAME", name)
+            .env("HCOM_PROCESS_ID", process_id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[cfg(unix)]
+    fn resume_fixture_db(name: &str) -> HcomDb {
+        let db = test_db();
+        // Inactive row + stopped snapshot: resumable when nothing holds it.
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!("session-resume-1"));
+        data.insert("tool".into(), json!("codex"));
+        data.insert("status".into(), json!(ST_INACTIVE));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named(name, &data).unwrap();
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "codex",
+                "session_id": "session-resume-1",
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": 0,
+                "directory": "/tmp"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', ?, ?)",
+                rusqlite::params!["2026-01-01T00:00:00Z", name, snapshot.to_string()],
+            )
+            .unwrap();
+        db
+    }
+
+    /// B: resume refuses over an orphan (prior subtree predating the newest
+    /// binding), naming the pid; proceeds for the subagent shape (old
+    /// process_id, started after the binding) and when nothing is alive.
+    #[test]
+    #[cfg(unix)]
+    fn resume_refuses_orphan_but_allows_current_subtree() {
+        let pid_tag = std::process::id();
+        // Orphan: sleeper started first, binding minted after (the resume's
+        // own rebind time) with a newer process_id.
+        let orphan_name = format!("hcom-resume-orphan-{pid_tag}");
+        let db = resume_fixture_db(&orphan_name);
+        let mut sleeper = spawn_named_sleeper(&orphan_name, "proc-before");
+        let spid = sleeper.id();
+        for _ in 0..50 {
+            if crate::proctruth::processes_with_instance_name(&orphan_name)
+                .iter()
+                .any(|m| m.pid == spid)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let start = crate::proctruth::processes_with_instance_name(&orphan_name)
+            .into_iter()
+            .find(|m| m.pid == spid)
+            .expect("orphan sleeper enumerated")
+            .start_epoch;
+        db.set_process_binding("proc-after", "sess", &orphan_name).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE process_bindings SET updated_at = ?1 WHERE process_id = 'proc-after'",
+                rusqlite::params![start + 3600.0],
+            )
+            .unwrap();
+        let err = prepare_resume_plan(&db, &orphan_name, false, &[], &GlobalFlags::default())
+            .err()
+            .expect("orphan must refuse resume")
+            .to_string();
+        assert!(err.contains(&spid.to_string()), "refusal names the pid: {err}");
+        assert!(err.contains("hcom kill"), "refusal points at kill: {err}");
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+
+        // Subagent shape: same old process_id, but the binding came first.
+        let sub_name = format!("hcom-resume-sub-{pid_tag}");
+        let db = resume_fixture_db(&sub_name);
+        let mut sub = spawn_named_sleeper(&sub_name, "proc-before");
+        let subpid = sub.id();
+        for _ in 0..50 {
+            if crate::proctruth::processes_with_instance_name(&sub_name)
+                .iter()
+                .any(|m| m.pid == subpid)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        db.set_process_binding("proc-after", "sess", &sub_name).unwrap();
+        assert!(
+            prepare_resume_plan(&db, &sub_name, false, &[], &GlobalFlags::default()).is_ok(),
+            "post-binding same-name process must not block resume"
+        );
+        sub.kill().ok();
+        sub.wait().ok();
+
+        // Nothing alive: proceeds.
+        let quiet_name = format!("hcom-resume-quiet-{pid_tag}");
+        let db = resume_fixture_db(&quiet_name);
+        assert!(
+            prepare_resume_plan(&db, &quiet_name, false, &[], &GlobalFlags::default()).is_ok(),
+            "resume proceeds with nothing alive"
+        );
     }
 }

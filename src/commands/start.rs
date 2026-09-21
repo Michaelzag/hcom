@@ -421,6 +421,14 @@ fn start_rebind(
         last_event_id = Some(db.get_last_event_id());
     }
 
+    // Process truth gates the rebind: the target row and its bindings are
+    // about to be replaced, so a still-alive prior subtree (orphan) or a
+    // live holder of the target name must refuse first — same rule as
+    // resume and explicit-name launch.
+    if let Err(refusal) = crate::proctruth::check_spawn_allowed(db, &target_name) {
+        anyhow::bail!("{refusal}");
+    }
+
     // Skip delete for remote instances (origin_device_id)
     if let Some(ref td) = target_data
         && (td.origin_device_id.is_none() || td.origin_device_id.as_deref() == Some(""))

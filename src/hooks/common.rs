@@ -1498,6 +1498,36 @@ fn stop_instance_inner(
         }
     }
 
+    // Reap the whole live tree for this name before releasing the row.
+    // Process truth gates the release: the stopped event is only written
+    // (and the row only deleted) once no process carries the name. The pty
+    // wrapper is signalled first via oldest-first ordering inside reap.
+    if let Err(survivors) = crate::proctruth::reap_instance_tree(instance_name) {
+        let pids = survivors
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::log_warn(
+            "hooks",
+            "stop_instance.reap_incomplete",
+            &format!("instance={instance_name} survivors={pids}"),
+        );
+        return StopOutcome::RetryableError(format!(
+            "could not stop {instance_name}: process(es) still alive after SIGKILL: {pids} — run hcom kill {instance_name} first"
+        ));
+    }
+
+    // Key the release to the current process incarnation: the stopped event
+    // carries the newest binding's process_id, and finalize only deletes
+    // when it still matches (a stale harness exiting under a live name
+    // logs stale-harness-exit and leaves the row).
+    let expected_process_id: Option<String> = db
+        .newest_process_binding(instance_name)
+        .ok()
+        .flatten()
+        .map(|(process_id, _)| process_id);
+
     // Publish the winner's pre-delete snapshot in the same transaction that
     // deletes the row and its control-plane state. Event failure rolls the
     // deletion back, so another invocation can retry the whole teardown.
@@ -1505,6 +1535,7 @@ fn stop_instance_inner(
         "action": "stopped",
         "by": initiated_by,
         "reason": reason,
+        "process_id": expected_process_id.as_deref(),
         "snapshot": snapshot,
     });
     if placeholder {
@@ -1516,6 +1547,7 @@ fn stop_instance_inner(
         instance_data.session_id.as_deref(),
         instance_data.agent_id.as_deref(),
         &event_data,
+        expected_process_id.as_deref(),
     ) {
         Ok(true) => {}
         Ok(false) => return StopOutcome::AlreadyStopped,
@@ -1646,6 +1678,9 @@ pub fn soft_finalize_session(
         "session",
         &format!("exit:{}", reason),
         Some(snapshot),
+        // Soft stops preserve the row for resume; no incarnation is
+        // released, so no process_id is claimed.
+        None,
     ) {
         log::log_warn(
             "hooks",
@@ -1657,15 +1692,23 @@ pub fn soft_finalize_session(
 
 /// Set inactive status, persist updates, and stop instance.
 ///
-/// Common to Claude and Gemini SessionEnd handlers. Catches all errors
-/// internally — callers don't need error handling.
+/// Common to Claude and Gemini SessionEnd handlers. Catches DB errors
+/// internally — callers don't need error handling — but returns the
+/// [`StopOutcome`] so tests can observe it.
 ///
+/// When the reap gate refuses (harness survivors after SIGKILL) the session
+/// is NOT cleanly ended: the row lingers and the harness still runs. That
+/// must be visible, so the refusal is logged at warn with the surviving pids
+/// (they ride in the error text) AND printed to hook stderr — the same
+/// channel hook denials use — while the hook exit code stays 0 (SessionEnd
+/// must not block the harness from exiting; the operator reads the warning
+/// and runs `hcom kill <name>`).
 pub fn finalize_session(
     db: &HcomDb,
     instance_name: &str,
     reason: &str,
     updates: Option<&serde_json::Map<String, Value>>,
-) {
+) -> StopOutcome {
     log::log_info(
         "hooks",
         "sessionend",
@@ -1687,7 +1730,18 @@ pub fn finalize_session(
     }
 
     // Full stop_instance chain: snapshot, cleanup bindings, log, delete
-    stop_instance(db, instance_name, "session", &format!("exit:{}", reason));
+    let outcome = stop_instance(db, instance_name, "session", &format!("exit:{}", reason));
+    if let StopOutcome::RetryableError(e) = &outcome {
+        log::log_warn(
+            "hooks",
+            "sessionend.stop_refused",
+            &format!("instance={instance_name} reason={reason} err={e}"),
+        );
+        eprintln!(
+            "[hcom] warn: SessionEnd for '{instance_name}' did not stop the session: {e}"
+        );
+    }
+    outcome
 }
 
 /// Update instance status for tool execution.
@@ -2558,6 +2612,7 @@ mod tests {
                 old.session_id.as_deref(),
                 old.agent_id.as_deref(),
                 &event,
+                None,
             )
             .unwrap();
         assert!(!won, "the stale row incarnation must lose its delete CAS");
@@ -2696,7 +2751,8 @@ mod tests {
             [],
         );
 
-        finalize_session(&db, "inst", "user_quit", None);
+        let outcome = finalize_session(&db, "inst", "user_quit", None);
+        assert_eq!(outcome, StopOutcome::Stopped);
 
         // Instance should be deleted
         let count: i64 = db

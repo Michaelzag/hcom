@@ -221,6 +221,12 @@ fn setup_notify_listener(cmd_tx: &std::sync::mpsc::Sender<RelayCommand>) -> Opti
 /// When relay is enabled and configured, the worker stays alive even with zero
 /// local instances so it can receive remote RPCs (e.g. the first `launch` on a
 /// fresh device).
+///
+/// The same tick also runs the vanished-instance sweep: this worker lives in
+/// its own detached process (outside any session cgroup), so it is the one
+/// place that can notice a harness that died without a `stopped` event —
+/// e.g. a systemd-oomd cgroup kill that takes the in-cgroup event writer
+/// with it. Normal exits release their row first, so they never double-fire.
 fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: Arc<AtomicBool>) {
     let mut consecutive_empty = 0u32;
     let mut db = HcomDb::open().ok();
@@ -238,6 +244,17 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
             db = HcomDb::open().ok();
         }
 
+        if let Some(ref d) = db {
+            let swept = crate::proctruth::sweep_vanished_instances(d);
+            if !swept.is_empty() {
+                log::log_info(
+                    "relay",
+                    "relay_worker.vanished_swept",
+                    &format!("released without stopped event: {}", swept.join(", ")),
+                );
+            }
+        }
+
         let count = match &db {
             Some(d) => local_instance_count(d),
             None => {
@@ -245,7 +262,6 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
                 continue;
             }
         };
-
         if count == 0 {
             // Keep the worker alive when relay is enabled so it can accept
             // remote RPCs (launch, config, etc.) on a device with no agents yet.

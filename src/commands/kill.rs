@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::db::HcomDb;
-use crate::hooks::common::stop_instance;
+use crate::hooks::common::{StopOutcome, stop_instance};
 use crate::identity;
 use crate::log::log_info;
 use crate::paths;
@@ -142,7 +142,13 @@ pub fn kill_tracked_instance(
     let is_headless = inst.background != 0;
     let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
         kill_instance(db, name, pid, &inst, is_headless);
-    stop_instance(db, name, initiator, "killed");
+    // The release reaps the whole live tree and only then writes `stopped`
+    // and deletes the row. A reap failure must fail the kill — reporting
+    // success while name-carrying processes live is the orphan bug.
+    match stop_instance(db, name, initiator, "killed") {
+        StopOutcome::Stopped | StopOutcome::AlreadyStopped => {}
+        StopOutcome::RetryableError(e) => return Err(e),
+    }
 
     Ok(KillTrackedResult {
         target: name.to_string(),
@@ -363,12 +369,21 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
             }
             incomplete +=
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-            // Clean up instance
-            stop_instance(db, &inst.name, initiator, "killed");
+            // The release reaps the whole tree; a failure means live
+            // processes remain, so it counts against the kill.
+            if let StopOutcome::RetryableError(e) = stop_instance(db, &inst.name, initiator, "killed")
+            {
+                eprintln!("Error releasing '{}': {e}", inst.name);
+                failed += 1;
+            }
             println!("  To resume: hcom r {}", inst.name);
         } else {
             // No PID tracked — just clean up
-            stop_instance(db, &inst.name, initiator, "killed");
+            if let StopOutcome::RetryableError(e) = stop_instance(db, &inst.name, initiator, "killed")
+            {
+                eprintln!("Error releasing '{}': {e}", inst.name);
+                failed += 1;
+            }
         }
     }
 
@@ -474,11 +489,19 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
             }
             incomplete +=
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-            stop_instance(db, &inst.name, initiator, "killed");
+            if let StopOutcome::RetryableError(e) = stop_instance(db, &inst.name, initiator, "killed")
+            {
+                eprintln!("Error releasing '{}': {e}", inst.name);
+                failed += 1;
+            }
         } else {
             // No PID tracked — clean up DB entry
             println!("No tracked process for '{}', stopping instance.", inst.name);
-            stop_instance(db, &inst.name, initiator, "killed");
+            if let StopOutcome::RetryableError(e) = stop_instance(db, &inst.name, initiator, "killed")
+            {
+                eprintln!("Error releasing '{}': {e}", inst.name);
+                failed += 1;
+            }
         }
     }
 
@@ -587,9 +610,38 @@ fn kill_single(
                         return Ok(1);
                     }
                 }
-                pidtrack::remove_pid(hcom_dir, orphan.pid);
+                // The group signal covers the recorded pid; reap any other
+                // live processes still carrying the orphan's names so the
+                // kill is verified whole-instance, not single-pid.
+                let mut reap_failed = false;
+                for orphan_name in &orphan.names {
+                    if let Err(survivors) = crate::proctruth::reap_instance_tree(orphan_name) {
+                        eprintln!(
+                            "Processes still alive for '{}' after SIGKILL: {} — run hcom kill {} first",
+                            orphan_name,
+                            survivors
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            orphan_name,
+                        );
+                        reap_failed = true;
+                    }
+                }
+                // Keep the pidtrack handle while survivors live: it is the
+                // only handle by which a retry can rediscover this orphan.
+                // Dropping it on reap failure would force a hand-kill from
+                // the error text.
+                if !reap_failed {
+                    pidtrack::remove_pid(hcom_dir, orphan.pid);
+                }
                 return Ok(
-                    if report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref())
+                    if reap_failed
+                        || report_incomplete_pane_cleanup(
+                            result.into(),
+                            pane_retry_command.as_deref(),
+                        )
                     {
                         1
                     } else {
@@ -737,6 +789,7 @@ fn kill_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use serde_json::json;
 
     #[test]
@@ -872,5 +925,90 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("unexpected kill_result mystery"));
+    }
+
+    #[cfg(unix)]
+    fn spawn_named_sleeper(name: &str, process_id: &str) -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("300")
+            .env("HCOM_INSTANCE_NAME", name)
+            .env("HCOM_PROCESS_ID", process_id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[cfg(unix)]
+    fn wait_for_enumerated(name: &str, pid: u32) {
+        for _ in 0..50 {
+            if crate::proctruth::processes_with_instance_name(name)
+                .iter()
+                .any(|m| m.pid == pid)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("sleeper {pid} never enumerated under {name}");
+    }
+
+    /// A: kill reaps the whole name tree — even processes outside the
+    /// recorded pid — and only then deletes the row. A different-named
+    /// sleeper must survive.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reaps_name_tree_outside_recorded_pid() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+
+        let tag = format!("{}-{}", std::process::id(), 1);
+        let name = format!("hcom-kill-{tag}");
+        let other = format!("hcom-kill-other-{tag}");
+
+        // Recorded pid is already dead; the live tree carries only the name.
+        let mut recorded = std::process::Command::new("true").spawn().unwrap();
+        let recorded_pid = recorded.id() as i64;
+        recorded.wait().unwrap();
+        let now = crate::shared::time::now_epoch_f64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, pid) VALUES (?1, 'active', ?2, 'codex', ?3)",
+                rusqlite::params![name, now, recorded_pid],
+            )
+            .unwrap();
+        db.set_process_binding("proc-kill-cur", "sess-kill", &name)
+            .unwrap();
+
+        let mut sleeper = spawn_named_sleeper(&name, "proc-kill-old");
+        let spid = sleeper.id();
+        wait_for_enumerated(&name, spid);
+        let mut bystander = spawn_named_sleeper(&other, "proc-other");
+        let bpid = bystander.id();
+        wait_for_enumerated(&other, bpid);
+
+        kill_tracked_instance(&db, &name, "test")
+            .unwrap_or_else(|e| panic!("kill must succeed once tree is reaped: {e}"));
+        // Reap the (zombie) child so bare kill-0 liveness observes it.
+        sleeper.wait().ok();
+        assert!(
+            !crate::sys::process::is_alive(spid),
+            "name-carrying sleeper outside the recorded pid is reaped"
+        );
+        assert!(
+            db.get_instance_full(&name).unwrap().is_none(),
+            "row deleted only after the tree is gone"
+        );
+        assert!(
+            crate::sys::process::is_alive(bpid),
+            "different-named sleeper survives"
+        );
+        bystander.kill().ok();
+        bystander.wait().ok();
+        let _ = _guard;
     }
 }
