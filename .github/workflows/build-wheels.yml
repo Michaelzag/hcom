@@ -67,7 +67,13 @@ jobs:
           java-version: '17'
           distribution: temurin
 
+      # Pinned default packages are `tools platform-tools`, but Google
+      # removed the obsolete `tools` package, so `sdkmanager tools` exits 1
+      # and fails the step. The NDK install below is explicit; platform-tools
+      # is all this job needs from the setup action.
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: platform-tools
 
       - name: Install NDK r27d
         run: yes | sdkmanager "ndk;27.3.13750724" > /dev/null
