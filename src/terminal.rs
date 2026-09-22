@@ -941,6 +941,28 @@ fn launch_display_name(tool_id: Option<&str>) -> &'static str {
         .unwrap_or("hcom")
 }
 
+/// Vars cleared from the interactive shell left open after the tool exits.
+///
+/// `HCOM_IDENTITY_VARS` plus the non-identity per-launch vars the generated
+/// script exports. `HCOM_INSTANCE_NAME`/`HCOM_NAME` are the critical two: a
+/// leftover shell carrying a name re-claims the stopped instance for anything
+/// relaunched inside it (hooks read `HCOM_INSTANCE_NAME` first). Entries
+/// already covered are never duplicated.
+fn leftover_shell_vars() -> Vec<&'static str> {
+    let mut vars: Vec<&'static str> = HCOM_IDENTITY_VARS.to_vec();
+    for v in [
+        "HCOM_INSTANCE_NAME",
+        "HCOM_NAME",
+        "HCOM_TAG",
+        "HCOM_CODEX_SANDBOX_MODE",
+    ] {
+        if !vars.contains(&v) {
+            vars.push(v);
+        }
+    }
+    vars
+}
+
 /// Create a bash script for terminal launch.
 ///
 /// Scripts provide uniform execution across all platforms/terminals.
@@ -1034,12 +1056,9 @@ pub fn create_bash_script(
 
     if opens_new_window {
         // Clear hcom state from the interactive shell left open after the tool
-        // exits. Derive from HCOM_IDENTITY_VARS (so new identity/batch vars are
-        // covered automatically) plus the non-identity per-launch vars exported
-        // above that aren't in that list.
-        let mut leftover_vars: Vec<&str> = HCOM_IDENTITY_VARS.to_vec();
-        leftover_vars.extend(["HCOM_TAG", "HCOM_CODEX_SANDBOX_MODE"]);
-        writeln!(f, "unset {}", leftover_vars.join(" "))?;
+        // exits — including name identity, so nothing relaunched here can
+        // re-claim the stopped instance from inherited env.
+        writeln!(f, "unset {}", leftover_shell_vars().join(" "))?;
         writeln!(f, "rm -f {}", shell_quote(&script_file.to_string_lossy()))?;
         writeln!(f, "exec bash -l")?;
     } else if !background {
@@ -1192,13 +1211,15 @@ pub fn create_powershell_script(
     }
 
     writeln!(f, "{final_command}")?;
-
     if opens_new_window {
         // Clear hcom state from the interactive shell left open after the tool
-        // exits (window persists via `powershell -NoExit`).
-        let mut leftover_vars: Vec<&str> = HCOM_IDENTITY_VARS.to_vec();
-        leftover_vars.extend(["HCOM_TAG", "HCOM_CODEX_SANDBOX_MODE"]);
-        let leftover: Vec<String> = leftover_vars.iter().map(|v| format!("Env:{v}")).collect();
+        // exits (window persists via `powershell -NoExit`) — including name
+        // identity, so nothing relaunched here can re-claim the stopped
+        // instance from inherited env.
+        let leftover: Vec<String> = leftover_shell_vars()
+            .iter()
+            .map(|v| format!("Env:{v}"))
+            .collect();
         writeln!(
             f,
             "Remove-Item {} -ErrorAction SilentlyContinue",
@@ -3009,6 +3030,102 @@ mod tests {
         assert!(content.contains("$hcom_status = $LASTEXITCODE"));
         assert!(content.contains("exit $hcom_status"));
         assert!(!content.contains("Set-Location"));
+    }
+
+    #[test]
+    fn test_create_bash_script_window_mode_clears_name_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("launch.sh");
+        let mut env = HashMap::new();
+        env.insert("HCOM_INSTANCE_NAME".to_string(), "mimi".to_string());
+        env.insert("HCOM_NAME".to_string(), "mimi".to_string());
+        create_bash_script(
+            &script,
+            &env,
+            Some("/work/dir"),
+            "mytool --foo",
+            false, // background
+            None,
+            true, // opens_new_window
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        // The post-exit tail unsets name identity so the leftover shell
+        // cannot re-claim the stopped instance.
+        let tail_unset = content
+            .lines()
+            .filter(|l| l.starts_with("unset "))
+            .find(|l| l.contains("HCOM_INSTANCE_NAME"))
+            .expect("tail unset line must clear HCOM_INSTANCE_NAME");
+        assert!(
+            tail_unset.contains("HCOM_NAME"),
+            "tail unset line must clear HCOM_NAME: {tail_unset}"
+        );
+        for v in ["HCOM_INSTANCE_NAME", "HCOM_NAME"] {
+            assert_eq!(
+                tail_unset.match_indices(v).count(),
+                1,
+                "no duplicated entries in tail unset: {tail_unset}"
+            );
+        }
+        assert!(content.contains("exec bash -l"));
+    }
+
+    #[test]
+    fn test_leftover_shell_vars_cover_identity_without_duplicates() {
+        let vars = leftover_shell_vars();
+        for v in crate::shared::constants::HCOM_IDENTITY_VARS {
+            assert!(vars.contains(v), "{v} must stay covered");
+        }
+        for v in [
+            "HCOM_INSTANCE_NAME",
+            "HCOM_NAME",
+            "HCOM_TAG",
+            "HCOM_CODEX_SANDBOX_MODE",
+        ] {
+            assert!(vars.contains(&v), "{v} must be cleared");
+            assert_eq!(
+                vars.iter().filter(|x| **x == v).count(),
+                1,
+                "{v} must appear exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_powershell_script_window_mode_clears_name_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("launch.ps1");
+        let mut env = HashMap::new();
+        env.insert("HCOM_INSTANCE_NAME".to_string(), "mimi".to_string());
+        env.insert("HCOM_NAME".to_string(), "mimi".to_string());
+        create_powershell_script(
+            &script,
+            &env,
+            Some("/work/dir"),
+            "mytool --foo",
+            false, // background
+            None,
+            true, // opens_new_window
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        let tail_clear = content
+            .lines()
+            .filter(|l| l.starts_with("Remove-Item Env:"))
+            .find(|l| l.contains("Env:HCOM_INSTANCE_NAME"))
+            .expect("tail Remove-Item must clear Env:HCOM_INSTANCE_NAME");
+        assert!(
+            tail_clear.contains("Env:HCOM_NAME"),
+            "tail Remove-Item must clear Env:HCOM_NAME: {tail_clear}"
+        );
+        for v in ["Env:HCOM_INSTANCE_NAME", "Env:HCOM_NAME"] {
+            assert_eq!(
+                tail_clear.match_indices(v).count(),
+                1,
+                "no duplicated entries in tail Remove-Item: {tail_clear}"
+            );
+        }
     }
 
     #[test]
