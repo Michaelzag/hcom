@@ -1247,12 +1247,15 @@ pub fn stop_instance(
 /// Stop instance without the process-truth reap gate: the full [`stop_instance`]
 /// DB teardown (snapshot, children, `stopped` event, release) with no signals.
 ///
-/// The kill self-path owns the only call: the caller runs inside the instance
-/// it is killing, so the reap gate (and the headless group kill) would signal
-/// the caller's own session tree. Ordering there is fail-closed — the
-/// non-self carriers are reaped and verified gone BEFORE this teardown runs
-/// (survivors bail the kill with the row and bindings untouched), so the
-/// `stopped` write never lands while an instance process may still be alive.
+/// The `kill` command owns every call (self and foreign paths): it reaps the
+/// carrier set itself and verifies it gone BEFORE this teardown runs
+/// (survivors bail the kill with the row and bindings untouched — fail-closed,
+/// so the `stopped` write never lands while an instance process may still be
+/// alive), and it tears down only the one binding epoch it resolved against:
+/// a row re-registered mid-kill is never read here (the kill's incarnation
+/// CAS skips this call entirely). The self path additionally needs the gate
+/// off because the caller is itself a carrier, and the reap gate's headless
+/// group kill would land on the caller's own session tree.
 pub fn stop_instance_without_reap(
     db: &HcomDb,
     instance_name: &str,
@@ -1327,17 +1330,17 @@ fn stop_instance_inner(
     };
 
     // Kill headless processes (background=true)
-    // Skipped when the reap gate is off (kill self-path): the group signal
-    // could land on the caller's own tree. Kill reaps the non-self carriers
-    // itself BEFORE calling in (fail-closed), so the skip leaves nothing
-    // instance-owned alive.
+    // Skipped when the reap gate is off (the kill paths): kill owns the
+    // signalling — the foreign path signals the process group and both paths
+    // reap the carrier set BEFORE calling in (fail-closed) — and on the self
+    // path this group signal would land on the caller's own tree.
     let pid = instance_data.pid;
     let is_headless = instance_data.background != 0;
     if let Some(pid_val) = pid {
         let pid_u32 = pid_val as u32;
         if is_headless {
-            // Gated with the reap below: skipped on the kill self-path, where
-            // the group signal could land on the caller's own tree.
+            // Gated with the reap below: skipped on the kill paths, where the
+            // group signal could land on the caller's own tree (self path).
             if reap_gate {
                 // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
                 // Windows: forceful process-tree kill) → poll up to 2s for exit →
@@ -1536,9 +1539,10 @@ fn stop_instance_inner(
     // (and the row only deleted) once no process holds the instance — by
     // name or, for self-bound sessions, by binding process id. The pty
     // wrapper is signalled first via oldest-first ordering inside reap.
-    // Skipped when the reap gate is off (kill self-path): the caller is one
-    // of the carriers. Kill has already reaped every non-self carrier and
-    // verified them gone (fail-closed) before this teardown is called.
+    // Skipped when the reap gate is off (the kill paths): the caller may be
+    // one of the carriers. Kill has already reaped the carrier set — every
+    // non-self carrier on the self path — and verified it gone (fail-closed)
+    // before this teardown is called, and only after its own incarnation CAS.
     let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
     if reap_gate
         && let Err(survivors) =
