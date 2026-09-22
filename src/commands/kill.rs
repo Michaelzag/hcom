@@ -34,9 +34,6 @@ pub struct KillTrackedResult {
     /// Carriers spared because they are the caller's own session tree
     /// (kill self-path only; 0 on the foreign path).
     pub self_excluded: usize,
-    /// Non-self carriers still alive after the self-path signal round
-    /// (reported, but the row is already released).
-    pub non_self_survivors: Vec<u32>,
 }
 
 const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
@@ -165,9 +162,10 @@ fn kill_tracked_instance_with_self_pids(
 
     // Self-kill check BEFORE any signal: when the caller runs inside the
     // instance it is killing, the carrier set holds the caller's own session
-    // tree — signalling it first would kill this command mid-run and lose
-    // the `stopped` write. That path tears the DB row down first and only
-    // then signals the carriers outside the caller's tree.
+    // tree — signalling it would kill this command mid-run and lose the
+    // `stopped` write. That path spares the caller's tree (`excluded` below),
+    // reaps every other carrier FIRST, and fails closed: the row and
+    // bindings are torn down only once no non-self carrier remains.
     let binding_ids = db.process_binding_ids(name).map_err(|e| e.to_string())?;
     let self_set: HashSet<u32> = self_pids.iter().copied().collect();
     let excluded: Vec<u32> = crate::proctruth::processes_for_instance(name, &binding_ids)
@@ -176,7 +174,15 @@ fn kill_tracked_instance_with_self_pids(
         .filter(|p| self_set.contains(p))
         .collect();
     if !excluded.is_empty() {
-        return kill_self_tracked_instance(db, name, initiator, pid, &binding_ids, &excluded);
+        return kill_self_tracked_instance(
+            db,
+            name,
+            initiator,
+            pid,
+            &binding_ids,
+            &excluded,
+            crate::proctruth::reap_instance_tree_for_excluding,
+        );
     }
 
     let is_headless = inst.background != 0;
@@ -199,14 +205,22 @@ fn kill_tracked_instance_with_self_pids(
         preset_name,
         pane_id,
         self_excluded: 0,
-        non_self_survivors: Vec::new(),
     })
 }
 
-/// Kill the instance the caller runs inside: DB teardown first (no reap gate
-/// — the gate would signal the caller itself), then signal only the carriers
-/// outside `excluded`. The terminal group kill / pane close is skipped: the
-/// pane is the caller's own, and its group signal would land on this command.
+/// Kill the instance the caller runs inside — fail-closed: reap first, then
+/// teardown. The foreign path's reap gate would signal the caller itself, so
+/// the carriers outside `excluded` (the caller's own session tree) are
+/// reaped here instead — and the row and bindings stay completely untouched
+/// until that reap is verified clean. A non-self survivor after the signal
+/// budget fails the whole kill with the foreign path's error (survivors
+/// listed), so a failed reap is never converted into a successful exit after
+/// ownership state is discarded: a kill never reports stopped or releases
+/// the row/bindings while any instance process may still be alive. Only the
+/// verified-clean reap unlocks the shared teardown
+/// ([`stop_instance_without_reap`]) that writes `stopped` and releases the
+/// bindings. The terminal group kill / pane close is skipped: the pane is
+/// the caller's own, and its group signal would land on this command.
 fn kill_self_tracked_instance(
     db: &HcomDb,
     name: &str,
@@ -214,16 +228,24 @@ fn kill_self_tracked_instance(
     pid: u32,
     binding_ids: &[String],
     excluded: &[u32],
+    reap: impl FnOnce(&str, &[String], &[u32]) -> Result<(), Vec<u32>>,
 ) -> Result<KillTrackedResult, String> {
+    // Signal and verify the non-self carriers FIRST. On survivors: bail
+    // exactly like the foreign path, before touching the row or bindings.
+    if let Err(survivors) = reap(name, binding_ids, excluded) {
+        let pids = survivors
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "could not stop {name}: process(es) still alive after SIGKILL: {pids} — run hcom kill {name} first"
+        ));
+    }
     match stop_instance_without_reap(db, name, initiator, "killed") {
         StopOutcome::Stopped | StopOutcome::AlreadyStopped => {}
         StopOutcome::RetryableError(e) => return Err(e),
     }
-    let non_self_survivors =
-        match crate::proctruth::reap_instance_tree_for_excluding(name, binding_ids, excluded) {
-            Ok(()) => Vec::new(),
-            Err(survivors) => survivors,
-        };
     Ok(KillTrackedResult {
         target: name.to_string(),
         pid,
@@ -233,7 +255,6 @@ fn kill_self_tracked_instance(
         preset_name: String::new(),
         pane_id: String::new(),
         self_excluded: excluded.len(),
-        non_self_survivors,
     })
 }
 
@@ -312,6 +333,19 @@ fn render_remote_kill_feedback(
         ]),
         other => bail!("Remote kill failed for {name}: unexpected kill_result {other}"),
     }
+}
+
+/// Format the self-path report: the plain stopped report plus the resume
+/// hint. Rendered only after a verified-clean non-self reap and the
+/// completed teardown — the pane close is skipped (the pane is the caller's
+/// own), so this is the whole CLI contract of a self kill.
+fn render_self_kill_feedback(name: &str, self_excluded: usize) -> Vec<String> {
+    vec![
+        format!(
+            "{name}: stopped; bindings released. {self_excluded} process(es) in your own session were excluded from the signal (this command is one of them)."
+        ),
+        format!("  To resume: hcom r {name}"),
+    ]
 }
 
 /// Run the kill command.
@@ -785,29 +819,15 @@ fn kill_single(
         );
     }
     let kill_result = kill_tracked_instance(db, &name, initiator).map_err(anyhow::Error::msg)?;
-    // Self-kill: the caller ran inside the instance, so the row was stopped
-    // and released first and only non-self carriers were signalled. The
-    // pane close is skipped (it is the caller's own pane) — plain report,
-    // exit 0.
+    // Self-kill: the caller ran inside the instance. The non-self carriers
+    // were reaped first (fail closed on survivors — that error is returned
+    // before any teardown) and only then was the row stopped and released.
+    // The pane close is skipped (it is the caller's own pane) — plain
+    // report, exit 0.
     if kill_result.self_excluded > 0 {
-        println!(
-            "{}: stopped; bindings released. {} process(es) in your own session were excluded from the signal (this command is one of them).",
-            name, kill_result.self_excluded
-        );
-        if !kill_result.non_self_survivors.is_empty() {
-            println!(
-                "warning: {} process(es) for '{}' still alive after SIGKILL: {}",
-                kill_result.non_self_survivors.len(),
-                name,
-                kill_result
-                    .non_self_survivors
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+        for line in render_self_kill_feedback(&name, kill_result.self_excluded) {
+            println!("{line}");
         }
-        println!("  To resume: hcom r {}", name);
         return Ok(0);
     }
     let pid = kill_result.pid;
@@ -1041,6 +1061,18 @@ mod tests {
     }
 
     #[test]
+    fn test_render_self_kill_feedback_matches_cli_contract() {
+        let lines = render_self_kill_feedback("luna", 1);
+        assert_eq!(
+            lines,
+            vec![
+                "luna: stopped; bindings released. 1 process(es) in your own session were excluded from the signal (this command is one of them).".to_string(),
+                "  To resume: hcom r luna".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn test_handle_remote_kill_response_unknown_result_errors() {
         let err = handle_remote_kill_response(
             "luna:ABCD",
@@ -1156,19 +1188,20 @@ mod tests {
             .unwrap()
     }
 
-    /// Self path: a carrier in the passed-in self set is never signalled, yet
-    /// the `stopped` event is written and the bindings released first — the
-    /// row is gone while a name carrier still lives, which the foreign gate
-    /// would have refused. Ordering proof: the kill runs on a thread while
-    /// this thread polls for the intermediate state — row released, bindings
-    /// freed, foreign carrier STILL RUNNING. That state is only reachable if
-    /// the write precedes the first non-self signal (a signalled `sleep` is
-    /// dead within microseconds, so "still running" means "not yet
-    /// signalled").
+    /// Self path, corrected fail-closed ordering: the non-self carriers are
+    /// signalled and verified gone BEFORE the `stopped` event and the binding
+    /// release, and a carrier in the passed-in self set is never signalled.
+    /// Ordering proof (the inverse of the old write-first poll): the kill
+    /// runs on a thread while this thread polls the invariant — while the
+    /// foreign carrier is alive, the row must never read stopped/released
+    /// and the bindings must stay intact; they only flip after the carrier
+    /// is gone. A release-while-alive state was proven observable at this
+    /// poll granularity by the write-first implementation it replaces, so a
+    /// regression back to release-before-reap fails this loop.
     #[test]
     #[cfg(unix)]
     #[serial]
-    fn kill_self_path_releases_row_first_and_spares_self() {
+    fn kill_self_path_reaps_before_release_and_spares_self() {
         let _guard = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
@@ -1206,12 +1239,11 @@ mod tests {
             kill_tracked_instance_with_self_pids(&db, &kill_name, "test", &self_set)
         });
 
-        // Poll for the write-before-signal intermediate state on the second
-        // connection while the kill thread runs. Transient lock errors read
-        // as "not yet observed".
+        // Invariant poll on a second connection: the release must never be
+        // observable while the foreign carrier runs. Transient lock errors
+        // read as "not yet observed" (never as released).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut wrote_before_signal = false;
-        while std::time::Instant::now() < deadline {
+        loop {
             let carrier_running = foreign_sleeper
                 .try_wait()
                 .expect("try_wait foreign carrier")
@@ -1224,16 +1256,18 @@ mod tests {
                 .process_binding_ids(&name)
                 .map(|ids| ids.is_empty())
                 .unwrap_or(false);
-            if carrier_running && row_released && bindings_freed {
-                wrote_before_signal = true;
+            assert!(
+                !(carrier_running && (row_released || bindings_freed)),
+                "row/bindings released while a non-self carrier is still alive"
+            );
+            if !carrier_running {
                 break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("non-self carrier never reaped");
             }
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
-        assert!(
-            wrote_before_signal,
-            "stopped write + binding release must land before the first non-self signal"
-        );
 
         let result = killer.join().expect("kill thread");
         assert!(
@@ -1245,29 +1279,116 @@ mod tests {
             result.self_excluded, 1,
             "exactly the self carrier is spared"
         );
-        assert!(result.non_self_survivors.is_empty());
 
         assert!(
             db.get_instance_full(&name).unwrap().is_none(),
-            "row released while a name carrier still lives"
+            "row released only after the non-self carrier is gone"
         );
-        assert_eq!(stopped_events(&db, &name), 1, "stopped event written first");
+        assert_eq!(stopped_events(&db, &name), 1, "stopped event written after");
         assert!(
             db.process_binding_ids(&name).unwrap().is_empty(),
-            "process bindings released"
+            "process bindings released after"
         );
-
-        foreign_sleeper.wait().ok();
         assert!(
             !crate::sys::process::is_alive(foreign_pid),
-            "non-self carrier is reaped after the teardown"
+            "non-self carrier is reaped before the teardown"
         );
         assert!(
             crate::sys::process::is_alive(self_pid),
             "self carrier is never signalled"
         );
+        assert_eq!(
+            render_self_kill_feedback(&name, result.self_excluded),
+            vec![
+                format!(
+                    "{name}: stopped; bindings released. 1 process(es) in your own session were excluded from the signal (this command is one of them)."
+                ),
+                format!("  To resume: hcom r {name}"),
+            ],
+            "plain report + resume hint"
+        );
         self_sleeper.kill().ok();
         self_sleeper.wait().ok();
+        let _ = _guard;
+    }
+
+    /// Self path, fail-closed survivor case: when the reap reports non-self
+    /// survivors after the signal budget, the kill bails with the foreign
+    /// path's error (survivors listed, `run hcom kill` hint) and the row and
+    /// bindings stay completely untouched — no stopped event, no release.
+    /// The survivor is forced through the reap seam (`kill_self_tracked_instance`'s
+    /// injectable reap): no same-uid process can outlive SIGTERM+SIGKILL, so
+    /// a real carrier cannot outlive the real budget.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_self_path_fails_closed_on_non_self_survivors() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+
+        let tag = format!("{}-fc", std::process::id());
+        let name = format!("hcom-kill-{tag}");
+
+        let mut recorded = std::process::Command::new("true").spawn().unwrap();
+        let recorded_pid = recorded.id() as i64;
+        recorded.wait().unwrap();
+        let now = crate::shared::time::now_epoch_f64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, pid) VALUES (?1, 'active', ?2, 'codex', ?3)",
+                rusqlite::params![name, now, recorded_pid],
+            )
+            .unwrap();
+        db.set_process_binding("proc-kill-fc", "sess-kill-fc", &name)
+            .unwrap();
+        let binding_ids = db.process_binding_ids(&name).unwrap();
+
+        // A non-self carrier that outlives the signal budget — reported as a
+        // survivor by the injected reap (it is never signalled here).
+        let mut survivor = spawn_named_sleeper(&name, "proc-kill-fc-survivor");
+        let survivor_pid = survivor.id();
+        wait_for_enumerated(&name, survivor_pid);
+
+        let excluded = vec![std::process::id()];
+        let err = kill_self_tracked_instance(
+            &db,
+            &name,
+            "test",
+            recorded_pid as u32,
+            &binding_ids,
+            &excluded,
+            |_, _, _| Err(vec![survivor_pid]),
+        )
+        .err()
+        .expect("a non-self survivor must fail the kill");
+        assert!(
+            err.contains(&survivor_pid.to_string()),
+            "error lists the survivors: {err}"
+        );
+        assert!(
+            err.contains(&format!("run hcom kill {name} first")),
+            "foreign-path failure message: {err}"
+        );
+
+        // Fail-closed: no teardown happened at all.
+        assert!(
+            db.get_instance_full(&name).unwrap().is_some(),
+            "row untouched on survivor"
+        );
+        assert_eq!(stopped_events(&db, &name), 0, "no stopped event written");
+        assert_eq!(
+            db.process_binding_ids(&name).unwrap(),
+            binding_ids,
+            "bindings untouched on survivor"
+        );
+        assert!(
+            crate::sys::process::is_alive(survivor_pid),
+            "survivor left alone"
+        );
+        survivor.kill().ok();
+        survivor.wait().ok();
         let _ = _guard;
     }
 
@@ -1307,7 +1428,6 @@ mod tests {
         let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set)
             .unwrap_or_else(|e| panic!("foreign kill must succeed: {e}"));
         assert_eq!(result.self_excluded, 0, "no self overlap, no self report");
-        assert!(result.non_self_survivors.is_empty());
         sleeper.wait().ok();
         assert!(
             !crate::sys::process::is_alive(spid),

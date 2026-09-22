@@ -1249,9 +1249,10 @@ pub fn stop_instance(
 ///
 /// The kill self-path owns the only call: the caller runs inside the instance
 /// it is killing, so the reap gate (and the headless group kill) would signal
-/// the caller's own session tree — killing this command before it writes
-/// `stopped`. Kill writes the row first through here, then signals only
-/// carriers outside [`crate::proctruth::caller_ancestor_pids`].
+/// the caller's own session tree. Ordering there is fail-closed — the
+/// non-self carriers are reaped and verified gone BEFORE this teardown runs
+/// (survivors bail the kill with the row and bindings untouched), so the
+/// `stopped` write never lands while an instance process may still be alive.
 pub fn stop_instance_without_reap(
     db: &HcomDb,
     instance_name: &str,
@@ -1327,8 +1328,9 @@ fn stop_instance_inner(
 
     // Kill headless processes (background=true)
     // Skipped when the reap gate is off (kill self-path): the group signal
-    // could land on the caller's own tree, and kill signals the non-self
-    // carriers itself after the row is released.
+    // could land on the caller's own tree. Kill reaps the non-self carriers
+    // itself BEFORE calling in (fail-closed), so the skip leaves nothing
+    // instance-owned alive.
     let pid = instance_data.pid;
     let is_headless = instance_data.background != 0;
     if let Some(pid_val) = pid {
@@ -1535,8 +1537,8 @@ fn stop_instance_inner(
     // name or, for self-bound sessions, by binding process id. The pty
     // wrapper is signalled first via oldest-first ordering inside reap.
     // Skipped when the reap gate is off (kill self-path): the caller is one
-    // of the carriers, and kill signals the non-self carriers itself after
-    // this teardown writes `stopped`.
+    // of the carriers. Kill has already reaped every non-self carrier and
+    // verified them gone (fail-closed) before this teardown is called.
     let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
     if reap_gate
         && let Err(survivors) =
