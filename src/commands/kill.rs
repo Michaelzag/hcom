@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::db::HcomDb;
-use crate::hooks::common::{StopOutcome, stop_instance};
+use crate::hooks::common::{StopOutcome, stop_instance, stop_instance_without_reap};
 use crate::identity;
 use crate::log::log_info;
 use crate::paths;
@@ -31,6 +31,12 @@ pub struct KillTrackedResult {
     pub pane_retry_command: Option<String>,
     pub preset_name: String,
     pub pane_id: String,
+    /// Carriers spared because they are the caller's own session tree
+    /// (kill self-path only; 0 on the foreign path).
+    pub self_excluded: usize,
+    /// Non-self carriers still alive after the self-path signal round
+    /// (reported, but the row is already released).
+    pub non_self_survivors: Vec<u32>,
 }
 
 const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
@@ -132,6 +138,23 @@ pub fn kill_tracked_instance(
     name: &str,
     initiator: &str,
 ) -> Result<KillTrackedResult, String> {
+    kill_tracked_instance_with_self_pids(
+        db,
+        name,
+        initiator,
+        &crate::proctruth::caller_ancestor_pids(),
+    )
+}
+
+/// [`kill_tracked_instance`] with an injectable self set: production passes
+/// [`crate::proctruth::caller_ancestor_pids`]; tests pass a fake set holding
+/// a sleeper pid plus the real caller pid.
+fn kill_tracked_instance_with_self_pids(
+    db: &HcomDb,
+    name: &str,
+    initiator: &str,
+    self_pids: &[u32],
+) -> Result<KillTrackedResult, String> {
     let inst = db
         .get_instance_full(name)
         .map_err(|e| e.to_string())?
@@ -139,6 +162,23 @@ pub fn kill_tracked_instance(
     let pid = inst
         .pid
         .ok_or_else(|| format!("No tracked PID for '{}'", name))? as u32;
+
+    // Self-kill check BEFORE any signal: when the caller runs inside the
+    // instance it is killing, the carrier set holds the caller's own session
+    // tree — signalling it first would kill this command mid-run and lose
+    // the `stopped` write. That path tears the DB row down first and only
+    // then signals the carriers outside the caller's tree.
+    let binding_ids = db.process_binding_ids(name).map_err(|e| e.to_string())?;
+    let self_set: HashSet<u32> = self_pids.iter().copied().collect();
+    let excluded: Vec<u32> = crate::proctruth::processes_for_instance(name, &binding_ids)
+        .into_iter()
+        .map(|m| m.pid)
+        .filter(|p| self_set.contains(p))
+        .collect();
+    if !excluded.is_empty() {
+        return kill_self_tracked_instance(db, name, initiator, pid, &binding_ids, &excluded);
+    }
+
     let is_headless = inst.background != 0;
     let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
         kill_instance(db, name, pid, &inst, is_headless);
@@ -158,6 +198,42 @@ pub fn kill_tracked_instance(
         pane_retry_command,
         preset_name,
         pane_id,
+        self_excluded: 0,
+        non_self_survivors: Vec::new(),
+    })
+}
+
+/// Kill the instance the caller runs inside: DB teardown first (no reap gate
+/// — the gate would signal the caller itself), then signal only the carriers
+/// outside `excluded`. The terminal group kill / pane close is skipped: the
+/// pane is the caller's own, and its group signal would land on this command.
+fn kill_self_tracked_instance(
+    db: &HcomDb,
+    name: &str,
+    initiator: &str,
+    pid: u32,
+    binding_ids: &[String],
+    excluded: &[u32],
+) -> Result<KillTrackedResult, String> {
+    match stop_instance_without_reap(db, name, initiator, "killed") {
+        StopOutcome::Stopped | StopOutcome::AlreadyStopped => {}
+        StopOutcome::RetryableError(e) => return Err(e),
+    }
+    let non_self_survivors =
+        match crate::proctruth::reap_instance_tree_for_excluding(name, binding_ids, excluded) {
+            Ok(()) => Vec::new(),
+            Err(survivors) => survivors,
+        };
+    Ok(KillTrackedResult {
+        target: name.to_string(),
+        pid,
+        kill_result: terminal::KillResult::AlreadyDead,
+        pane_closed: false,
+        pane_retry_command: None,
+        preset_name: String::new(),
+        pane_id: String::new(),
+        self_excluded: excluded.len(),
+        non_self_survivors,
     })
 }
 
@@ -709,6 +785,31 @@ fn kill_single(
         );
     }
     let kill_result = kill_tracked_instance(db, &name, initiator).map_err(anyhow::Error::msg)?;
+    // Self-kill: the caller ran inside the instance, so the row was stopped
+    // and released first and only non-self carriers were signalled. The
+    // pane close is skipped (it is the caller's own pane) — plain report,
+    // exit 0.
+    if kill_result.self_excluded > 0 {
+        println!(
+            "{}: stopped; bindings released. {} process(es) in your own session were excluded from the signal (this command is one of them).",
+            name, kill_result.self_excluded
+        );
+        if !kill_result.non_self_survivors.is_empty() {
+            println!(
+                "warning: {} process(es) for '{}' still alive after SIGKILL: {}",
+                kill_result.non_self_survivors.len(),
+                name,
+                kill_result
+                    .non_self_survivors
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        println!("  To resume: hcom r {}", name);
+        return Ok(0);
+    }
     let pid = kill_result.pid;
     let pane_closed = kill_result.pane_closed;
     let preset_name = kill_result.preset_name;
@@ -1040,6 +1141,138 @@ mod tests {
         );
         bystander.kill().ok();
         bystander.wait().ok();
+        let _ = _guard;
+    }
+
+    #[cfg(unix)]
+    fn stopped_events(db: &crate::db::HcomDb, name: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1 \
+                 AND data LIKE '%\"action\":\"stopped\"%'",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Self path: a carrier in the passed-in self set is never signalled, yet
+    /// the `stopped` event is written and the bindings released first — the
+    /// row is gone while a name carrier still lives, which the foreign gate
+    /// would have refused.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_self_path_releases_row_first_and_spares_self() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+
+        let tag = format!("{}-self", std::process::id());
+        let name = format!("hcom-kill-{tag}");
+
+        let mut recorded = std::process::Command::new("true").spawn().unwrap();
+        let recorded_pid = recorded.id() as i64;
+        recorded.wait().unwrap();
+        let now = crate::shared::time::now_epoch_f64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, pid) VALUES (?1, 'active', ?2, 'codex', ?3)",
+                rusqlite::params![name, now, recorded_pid],
+            )
+            .unwrap();
+        db.set_process_binding("proc-kill-self", "sess-kill-self", &name)
+            .unwrap();
+
+        // "Self": a carrier standing in for the caller's own session tree.
+        let mut self_sleeper = spawn_named_sleeper(&name, "proc-kill-self-tree");
+        let self_pid = self_sleeper.id();
+        wait_for_enumerated(&name, self_pid);
+        let mut foreign_sleeper = spawn_named_sleeper(&name, "proc-kill-self-foreign");
+        let foreign_pid = foreign_sleeper.id();
+        wait_for_enumerated(&name, foreign_pid);
+
+        let self_set = vec![std::process::id(), self_pid];
+        let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set)
+            .unwrap_or_else(|e| panic!("self kill must succeed: {e}"));
+        assert_eq!(
+            result.self_excluded, 1,
+            "exactly the self carrier is spared"
+        );
+        assert!(result.non_self_survivors.is_empty());
+
+        assert!(
+            db.get_instance_full(&name).unwrap().is_none(),
+            "row released while a name carrier still lives"
+        );
+        assert_eq!(stopped_events(&db, &name), 1, "stopped event written first");
+        assert!(
+            db.process_binding_ids(&name).unwrap().is_empty(),
+            "process bindings released"
+        );
+
+        foreign_sleeper.wait().ok();
+        assert!(
+            !crate::sys::process::is_alive(foreign_pid),
+            "non-self carrier is reaped after the teardown"
+        );
+        assert!(
+            crate::sys::process::is_alive(self_pid),
+            "self carrier is never signalled"
+        );
+        self_sleeper.kill().ok();
+        self_sleeper.wait().ok();
+        let _ = _guard;
+    }
+
+    /// Foreign path through the injectable entry: with no self overlap the
+    /// whole tree is reaped before the row is released (fail-closed ordering
+    /// unchanged), and the result carries no self report.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_foreign_path_reaps_tree_before_release() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+
+        let tag = format!("{}-foreign", std::process::id());
+        let name = format!("hcom-kill-{tag}");
+
+        let mut recorded = std::process::Command::new("true").spawn().unwrap();
+        let recorded_pid = recorded.id() as i64;
+        recorded.wait().unwrap();
+        let now = crate::shared::time::now_epoch_f64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, pid) VALUES (?1, 'active', ?2, 'codex', ?3)",
+                rusqlite::params![name, now, recorded_pid],
+            )
+            .unwrap();
+        db.set_process_binding("proc-kill-foreign", "sess-kill-foreign", &name)
+            .unwrap();
+
+        let mut sleeper = spawn_named_sleeper(&name, "proc-kill-foreign-tree");
+        let spid = sleeper.id();
+        wait_for_enumerated(&name, spid);
+
+        let self_set = vec![std::process::id()];
+        let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set)
+            .unwrap_or_else(|e| panic!("foreign kill must succeed: {e}"));
+        assert_eq!(result.self_excluded, 0, "no self overlap, no self report");
+        assert!(result.non_self_survivors.is_empty());
+        sleeper.wait().ok();
+        assert!(
+            !crate::sys::process::is_alive(spid),
+            "foreign carrier reaped"
+        );
+        assert!(
+            db.get_instance_full(&name).unwrap().is_none(),
+            "row released after the tree is gone"
+        );
+        assert_eq!(stopped_events(&db, &name), 1, "stopped event written");
         let _ = _guard;
     }
 }

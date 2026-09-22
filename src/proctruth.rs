@@ -260,6 +260,50 @@ fn is_zombie(pid: u32) -> bool {
         .map(|(_, rest)| rest.trim_start().starts_with('Z'))
         .unwrap_or(false)
 }
+/// The calling process's own pid plus its /proc ppid-ancestor chain.
+///
+/// Exists so lifecycle signalling can exclude the caller's own session tree:
+/// a CLI running inside the instance it operates on inherits the name but
+/// must never be signalled for it. Ancestors are read from field 4 (ppid) of
+/// `/proc/<pid>/stat` — the token after the closing `)` of comm, so a comm
+/// containing spaces or parens cannot shift the parse — walking up until pid
+/// 1 (bonded iteration cap guards against a corrupted chain).
+///
+/// Unix only; elsewhere this is just the caller's own pid.
+pub fn caller_ancestor_pids() -> Vec<u32> {
+    #[cfg(not(unix))]
+    {
+        return vec![std::process::id()];
+    }
+    #[cfg(unix)]
+    {
+        let mut out = vec![std::process::id()];
+        let mut pid = std::process::id();
+        while let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let Some(end) = stat.rfind(')') else {
+                break;
+            };
+            let mut fields = stat[end + 1..].split_whitespace();
+            let _state = fields.next();
+            let Some(ppid_str) = fields.next() else {
+                break;
+            };
+            let Ok(ppid) = ppid_str.parse::<u32>() else {
+                break;
+            };
+            if ppid == 0 || ppid == pid {
+                break;
+            }
+            out.push(ppid);
+            if ppid == 1 || out.len() > 1024 {
+                break;
+            }
+            pid = ppid;
+        }
+        out
+    }
+}
+
 /// Reap every live process holding the instance: carriers of
 /// `HCOM_INSTANCE_NAME=<name>` plus carriers of any of the instance's
 /// binding process ids (the self-bound tree never carries the name).
@@ -282,15 +326,34 @@ fn is_zombie(pid: u32) -> bool {
 ///
 /// Unix only; elsewhere this is a no-op success.
 pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), Vec<u32>> {
+    reap_instance_tree_for_excluding(name, binding_ids, &[])
+}
+
+/// [`reap_instance_tree_for`] with an exclusion set: carriers in `exclude`
+/// are never signalled and never count as survivors, at any enumeration
+/// round (initial, KILL re-enumeration, verification).
+///
+/// The kill self-path uses this with [`caller_ancestor_pids`]: the caller
+/// runs inside the instance it is killing, so its own session tree must be
+/// spared while every other carrier is still reaped and still blocks success
+/// while it lives. An empty `exclude` is exactly [`reap_instance_tree_for`].
+///
+/// Unix only; elsewhere this is a no-op success.
+pub fn reap_instance_tree_for_excluding(
+    name: &str,
+    binding_ids: &[String],
+    exclude: &[u32],
+) -> Result<(), Vec<u32>> {
     #[cfg(not(unix))]
     {
         let _ = name;
         let _ = binding_ids;
+        let _ = exclude;
         Ok(())
     }
     #[cfg(unix)]
     {
-        let mut matches = live_carriers_for(name, binding_ids);
+        let mut matches = live_carriers_for(name, binding_ids, exclude);
         if matches.is_empty() {
             return Ok(());
         }
@@ -314,7 +377,7 @@ pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), 
         // Re-enumerate by carrier set: newly seen carriers (forked after the
         // first snapshot, so never TERMED) join the KILL round directly —
         // the TERM round already elapsed, so escalation is immediate.
-        let mut current = live_carriers_for(name, binding_ids);
+        let mut current = live_carriers_for(name, binding_ids, exclude);
         if current.is_empty() {
             return Ok(());
         }
@@ -332,7 +395,7 @@ pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), 
             &current.iter().map(|m| m.pid).collect::<Vec<_>>(),
             KILL_WAIT,
         );
-        let still: Vec<u32> = live_carriers_for(name, binding_ids)
+        let still: Vec<u32> = live_carriers_for(name, binding_ids, exclude)
             .into_iter()
             .map(|m| m.pid)
             .collect();
@@ -350,12 +413,14 @@ fn shell_pid_from_process_id(process_id: &str) -> Option<u32> {
         .and_then(|head| head.parse::<u32>().ok())
 }
 
-/// Live carriers for reap verification: carrier enumeration minus zombies.
+/// Live carriers for reap verification: carrier enumeration minus zombies
+/// minus the exclusion set (the caller's own session tree in the kill
+/// self-path — never signalled, never a survivor).
 #[cfg(unix)]
-fn live_carriers_for(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
+fn live_carriers_for(name: &str, binding_ids: &[String], exclude: &[u32]) -> Vec<ProcMatch> {
     processes_for_instance(name, binding_ids)
         .into_iter()
-        .filter(|m| !is_zombie(m.pid))
+        .filter(|m| !is_zombie(m.pid) && !exclude.contains(&m.pid))
         .collect()
 }
 
@@ -757,6 +822,49 @@ mod tests {
     #[cfg(unix)]
     fn reap_empty_name_is_noop_ok() {
         assert!(reap_instance_tree_for(&unique_name("empty"), &[]).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn caller_ancestors_start_at_self_and_end_at_init() {
+        let chain = caller_ancestor_pids();
+        assert!(!chain.is_empty(), "chain always holds at least self");
+        assert_eq!(chain[0], std::process::id(), "chain starts at the caller");
+        assert!(
+            chain.iter().all(|p| *p > 0),
+            "no null pids in chain: {chain:?}"
+        );
+        assert_eq!(*chain.last().unwrap(), 1, "chain walks to init: {chain:?}");
+        if chain.len() > 1 {
+            let parent = unsafe { libc::getppid() } as u32;
+            assert_eq!(chain[1], parent, "second link is the real parent");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reap_excluding_spares_excluded_carrier() {
+        let name = unique_name("exclude");
+        let mut spared = spawn_named_sleeper(&name, "proc-exclude-spared");
+        let mut reaped = spawn_named_sleeper(&name, "proc-exclude-reaped");
+        let (spared_pid, reaped_pid) = (spared.id(), reaped.id());
+        wait_for_enumerated(&name, &[], spared_pid);
+        wait_for_enumerated(&name, &[], reaped_pid);
+        assert!(
+            reap_instance_tree_for_excluding(&name, &[], std::slice::from_ref(&spared_pid)).is_ok(),
+            "excluded carrier must not count as a survivor"
+        );
+        reaped.wait().ok();
+        assert!(
+            !crate::sys::process::is_alive(reaped_pid),
+            "non-excluded carrier is reaped"
+        );
+        assert!(
+            crate::sys::process::is_alive(spared_pid),
+            "excluded carrier is never signalled"
+        );
+        spared.kill().ok();
+        spared.wait().ok();
     }
 
     // -- Spawn-gate (B) and release/sweep (C) tests need a DB ---------------
