@@ -1241,7 +1241,24 @@ pub fn stop_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0)
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, true)
+}
+
+/// Stop instance without the process-truth reap gate: the full [`stop_instance`]
+/// DB teardown (snapshot, children, `stopped` event, release) with no signals.
+///
+/// The kill self-path owns the only call: the caller runs inside the instance
+/// it is killing, so the reap gate (and the headless group kill) would signal
+/// the caller's own session tree — killing this command before it writes
+/// `stopped`. Kill writes the row first through here, then signals only
+/// carriers outside [`crate::proctruth::caller_ancestor_pids`].
+pub fn stop_instance_without_reap(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+) -> StopOutcome {
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1257,7 +1274,7 @@ pub(crate) fn stop_placeholder_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0)
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, true)
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1282,6 +1299,7 @@ fn stop_instance_inner(
     reason: &str,
     placeholder: bool,
     depth: u32,
+    reap_gate: bool,
 ) -> StopOutcome {
     if depth >= MAX_STOP_DEPTH {
         log::log_warn(
@@ -1308,30 +1326,37 @@ fn stop_instance_inner(
     };
 
     // Kill headless processes (background=true)
+    // Skipped when the reap gate is off (kill self-path): the group signal
+    // could land on the caller's own tree, and kill signals the non-self
+    // carriers itself after the row is released.
     let pid = instance_data.pid;
     let is_headless = instance_data.background != 0;
     if let Some(pid_val) = pid {
         let pid_u32 = pid_val as u32;
         if is_headless {
-            // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
-            // Windows: forceful process-tree kill) → poll up to 2s for exit →
-            // kill_group (Unix: SIGKILL; Windows: tree kill again). The poll also
-            // waits out Windows' asynchronous TerminateProcess.
-            use crate::sys::process::GroupSignal;
-            if crate::sys::process::terminate_group(pid_u32) == GroupSignal::Sent {
-                let mut dead = false;
-                for _ in 0..20 {
-                    std::thread::sleep(Duration::from_millis(100));
-                    if !crate::sys::process::is_alive(pid_u32) {
-                        dead = true;
-                        break;
+            // Gated with the reap below: skipped on the kill self-path, where
+            // the group signal could land on the caller's own tree.
+            if reap_gate {
+                // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
+                // Windows: forceful process-tree kill) → poll up to 2s for exit →
+                // kill_group (Unix: SIGKILL; Windows: tree kill again). The poll also
+                // waits out Windows' asynchronous TerminateProcess.
+                use crate::sys::process::GroupSignal;
+                if crate::sys::process::terminate_group(pid_u32) == GroupSignal::Sent {
+                    let mut dead = false;
+                    for _ in 0..20 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        if !crate::sys::process::is_alive(pid_u32) {
+                            dead = true;
+                            break;
+                        }
+                    }
+                    if !dead {
+                        crate::sys::process::kill_group(pid_u32);
                     }
                 }
-                if !dead {
-                    crate::sys::process::kill_group(pid_u32);
-                }
+                // NotFound/PermissionDenied from initial signal is fine — process already gone or foreign
             }
-            // NotFound/PermissionDenied from initial signal is fine — process already gone or foreign
         } else {
             // Track surviving PTY processes in pidtrack
             let alive = crate::sys::process::is_alive(pid_u32);
@@ -1470,6 +1495,7 @@ fn stop_instance_inner(
             "parent_stopped",
             false,
             depth + 1,
+            reap_gate,
         ) {
             log::log_warn(
                 "hooks",
@@ -1486,9 +1512,15 @@ fn stop_instance_inner(
     // as parent_session_id, so only parent_name links nested children. A row
     // already stopped via the session set is a no-op here.
     for child in native_children {
-        if let StopOutcome::RetryableError(error) =
-            stop_instance_inner(db, &child, initiated_by, "parent_stopped", false, depth + 1)
-        {
+        if let StopOutcome::RetryableError(error) = stop_instance_inner(
+            db,
+            &child,
+            initiated_by,
+            "parent_stopped",
+            false,
+            depth + 1,
+            reap_gate,
+        ) {
             log::log_warn(
                 "hooks",
                 "finalize.child_stop_incomplete",
@@ -1497,14 +1529,19 @@ fn stop_instance_inner(
             return StopOutcome::RetryableError(format!("could not stop child {child}: {error}"));
         }
     }
-
     // Reap the whole live tree for this name before releasing the row.
     // Process truth gates the release: the stopped event is only written
     // (and the row only deleted) once no process holds the instance — by
     // name or, for self-bound sessions, by binding process id. The pty
     // wrapper is signalled first via oldest-first ordering inside reap.
+    // Skipped when the reap gate is off (kill self-path): the caller is one
+    // of the carriers, and kill signals the non-self carriers itself after
+    // this teardown writes `stopped`.
     let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
-    if let Err(survivors) = crate::proctruth::reap_instance_tree_for(instance_name, &binding_ids) {
+    if reap_gate
+        && let Err(survivors) =
+            crate::proctruth::reap_instance_tree_for(instance_name, &binding_ids)
+    {
         let pids = survivors
             .iter()
             .map(|p| p.to_string())
