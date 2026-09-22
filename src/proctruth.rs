@@ -22,7 +22,10 @@
 //!   read fresh in that round, minus the call-start ids (see
 //!   [`carrier_in_reap_scope`]): a brand-new registration started mid-reap
 //!   is spared, a name-only late fork — or a late child carrying a stale id
-//!   of the dying tree — is not.
+//!   of the dying tree — is not. Every round captures its carrier set first
+//!   and reads the binding registry second (read-after-capture, plus a
+//!   pre-signal re-read in the KILL round) — the ordering that makes "read
+//!   fresh" trustworthy (see [`reap_instance_tree_for_excluding`]).
 //! - [`check_spawn_allowed`]: refuse to spawn under `<name>` over a live
 //!   holder or an orphan (started before the newest binding) — the one
 //!   uniform spawn gate, after removing the caller's own identity tree from
@@ -411,14 +414,41 @@ pub fn reap_instance_tree_for(
 /// non-empty id that no current binding claims (a late child of the old
 /// instance inheriting an older era's id) — signalled, and while alive a
 /// survivor (fail-closed), so a dying tree that forks or hands out stale ids
-/// late leaves no unmanaged live descendant behind. A spare decision is
-/// captured once per carrier: a carrier spared in one round stays spared,
-/// never reclassified into scope by later registry changes. Residual: a
-/// fresh registration whose binding lands only AFTER the round that first
-/// sees its process is in scope for that round (the spawn-to-bind window) —
+/// late leaves no unmanaged live descendant behind.
+///
+/// Round ordering — the read-after-capture rule: every classification round
+/// (the KILL re-enumeration and the final verification alike) CAPTURES its
+/// carrier set first ([`live_carriers_for`]) and only THEN reads the binding
+/// registry ([`fresh_epoch_ids`]), classifying exactly the captured set
+/// against that read. This is what makes "read fresh" trustworthy: the
+/// launcher registers a fresh binding BEFORE spawning its process
+/// (`db.set_process_binding` runs in the pre-register block, before the tool
+/// spawn — launcher.rs:2005), so every process a capture sees already has
+/// its binding committed, and a registry read taken after the capture
+/// cannot miss it. The reverse order (read, then capture) left a window: a
+/// concurrent launch committing its binding after the read and spawning
+/// before the capture was classified against a registry without its id and
+/// killed as part of the dying epoch.
+///
+/// The KILL round revalidates once more immediately before its signal
+/// round: it re-reads the registry and re-classifies the captured in-scope
+/// set against the newer read, dropping every carrier that now matches a
+/// fresh-epoch id from the signal set into `spared` (first-snapshot pids
+/// stay in scope by fiat — this reap's own business, already TERMed; the
+/// per-signal [`pid_carries_instance`] pid-reuse re-check is unchanged). A
+/// spare decision is captured once per carrier: a carrier spared in one
+/// round or by that revalidation stays spared, never reclassified into
+/// scope by later registry changes.
+///
+/// Residual: a fresh registration whose binding lands only AFTER the round's
+/// registry read is in scope for that round (the spawn-to-bind window) —
 /// empty for launched instances, whose binding is written at launch
-/// registration before the process spawns (launcher.rs); only the
-/// first-hook binding paths (instance_binding recovery) leave a window.
+/// registration before the process spawns (launcher.rs:2005); only the
+/// first-hook binding paths (instance_binding recovery), whose binding lands
+/// after their process spawns, leave a window — and even that is bounded by
+/// the KILL round's pre-signal re-read: a first-hook binding landing before
+/// the re-read spares its process, one landing after it is signalled and,
+/// while alive, a survivor (fail-closed).
 /// The row itself is torn down only while the incarnation the kill resolved
 /// against is still the row's (the kill command's teardown CAS).
 ///
@@ -475,8 +505,19 @@ pub fn reap_instance_tree_for_excluding(
         // id (or no process id at all) and is caught here; a brand-new
         // registration (an id in the fresh epoch) started mid-reap is spared
         // (never signalled, never a survivor).
+        //
+        // Round ordering — the read-after-capture rule: the carrier set is
+        // CAPTURED FIRST and the registry is read SECOND, so the read that
+        // classifies a captured carrier cannot miss that carrier's
+        // pre-spawn-registered binding (see the round-ordering note on
+        // [`reap_instance_tree_for_excluding`]). A fresh process spawned
+        // after the capture is outside the captured set entirely — never
+        // classified here at all.
+        let captured: Vec<ProcMatch> = live_carriers_for(name, binding_ids, exclude);
+        #[cfg(test)]
+        fire_round_seam(RoundPoint::Captured);
         let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
-        let mut current: Vec<ProcMatch> = live_carriers_for(name, binding_ids, exclude)
+        let mut current: Vec<ProcMatch> = captured
             .into_iter()
             .filter(|m| {
                 started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
@@ -490,6 +531,20 @@ pub fn reap_instance_tree_for_excluding(
                 .partial_cmp(&b.start_epoch)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        // Pre-signal revalidation: immediately before the signal round,
+        // re-read the registry and re-classify the captured in-scope set
+        // against the newer read. A carrier that NOW matches a fresh-epoch
+        // id (its registration landed between classification and the signal
+        // round — the first-hook spawn-to-bind shape) is dropped from the
+        // signal set and joins the spared set, where it stays. First-snapshot
+        // pids stay in scope by fiat (this reap's own business, already
+        // TERMed); the per-signal pid-reuse re-check below is unchanged.
+        #[cfg(test)]
+        fire_round_seam(RoundPoint::Classified);
+        let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
+        current.retain(|m| {
+            started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
+        });
         for m in &current {
             if pid_carries_instance(m.pid, name, binding_ids) {
                 signal(m.pid, libc::SIGKILL);
@@ -499,12 +554,15 @@ pub fn reap_instance_tree_for_excluding(
             &current.iter().map(|m| m.pid).collect::<Vec<_>>(),
             KILL_WAIT,
         );
-        // Verification is scoped exactly like the KILL round (fresh registry
-        // read for this round, same captured spare set): an in-scope carrier
-        // still alive blocks success (fail-closed), while a spared fresh
-        // registration never does.
+        // Verification is scoped exactly like the KILL round (same order:
+        // capture the carrier set first, registry read second, classify the
+        // captured set against that read; same captured spare set): an
+        // in-scope carrier still alive blocks success (fail-closed), while a
+        // spared fresh registration never does — a spared carrier is never
+        // counted as a survivor.
+        let captured: Vec<ProcMatch> = live_carriers_for(name, binding_ids, exclude);
         let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
-        let still: Vec<u32> = live_carriers_for(name, binding_ids, exclude)
+        let still: Vec<u32> = captured
             .into_iter()
             .filter(|m| {
                 started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
@@ -518,8 +576,12 @@ pub fn reap_instance_tree_for_excluding(
 /// The name's fresh binding epoch for one reap round: its CURRENT process
 /// binding ids read from the DB now, MINUS the ids passed at call start. A
 /// binding registered during this kill shows up here — evidence of a newer
-/// epoch (see [`carrier_in_reap_scope`]). A failed read yields an empty
-/// epoch (fail-closed toward scope: nothing gets an unearned spare).
+/// epoch (see [`carrier_in_reap_scope`]). Each round reads it AFTER
+/// capturing its carrier set (the read-after-capture rule, see
+/// [`reap_instance_tree_for_excluding`]); the KILL round reads it again
+/// right before signalling (the pre-signal revalidation). A failed read
+/// yields an empty epoch (fail-closed toward scope: nothing gets an unearned
+/// spare).
 #[cfg(unix)]
 fn fresh_epoch_ids(db: &HcomDb, name: &str, call_start_ids: &[String]) -> Vec<String> {
     db.process_binding_ids(name)
@@ -531,9 +593,10 @@ fn fresh_epoch_ids(db: &HcomDb, name: &str, call_start_ids: &[String]) -> Vec<St
 
 /// Reap scope for a carrier first seen after the reap began (carriers of the
 /// reap's first snapshot are always in scope) — predicate v3, the epoch
-/// rule: IN SCOPE unless the carrier's `HCOM_PROCESS_ID` is non-empty and
-/// registered among `fresh_epoch_ids`, the name's CURRENT binding ids read
-/// fresh in this round MINUS the call-start ids. Instance identity keys to
+/// rule: IN SCOPE unless the carrier's `HCOM_PROCESS_ID` is
+/// non-empty and registered among `fresh_epoch_ids`, the name's CURRENT
+/// binding ids read fresh in this round — after the round's carrier capture
+/// — MINUS the call-start ids. Instance identity keys to
 /// binding epochs (process bindings are the incarnation token), so a
 /// registered id outside the call-start set is a NEWER epoch and is spared —
 /// never signalled, never a survivor. Everything else name-matches the
@@ -544,8 +607,8 @@ fn fresh_epoch_ids(db: &HcomDb, name: &str, call_start_ids: &[String]) -> Vec<St
 /// non-empty id no current binding claims (a stale id inherited from an
 /// older era) are signalled and, while alive, block success (fail-closed).
 /// The spare decision is captured once per carrier in `spared`: a carrier
-/// spared in one round stays spared — later registry changes never
-/// reclassify it into scope.
+/// spared in one round or by the KILL round's pre-signal revalidation stays
+/// spared — later registry changes never reclassify it into scope.
 #[cfg(unix)]
 fn carrier_in_reap_scope(
     m: &ProcMatch,
@@ -560,6 +623,42 @@ fn carrier_in_reap_scope(
         return false;
     }
     true
+}
+
+/// Test-only round seam: a per-thread hook fired at the two boundaries the
+/// round-ordering contract pins in the KILL round — right after its carrier
+/// capture ([`RoundPoint::Captured`]) and right after its classification of
+/// that captured set ([`RoundPoint::Classified`]). A test arms it from its
+/// own reaper thread to land a concurrent registration or spawn at one exact
+/// instruction boundary of the round instead of racing the clock. Unarmed,
+/// firing is a no-op; never compiled outside `cfg(test)`.
+#[cfg(all(test, unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundPoint {
+    /// The KILL round has captured its carrier set; its registry read is next.
+    Captured,
+    /// The KILL round has classified the captured set; the pre-signal
+    /// revalidation and signal loop are next.
+    Classified,
+}
+
+/// The round seam's per-thread slot: an optional hook, armed by the tests
+/// via `arm_round_seam` and fired by [`fire_round_seam`].
+#[cfg(all(test, unix))]
+type RoundSeamSlot = std::cell::RefCell<Option<Box<dyn FnMut(RoundPoint)>>>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static ROUND_SEAM: RoundSeamSlot = std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, unix))]
+fn fire_round_seam(point: RoundPoint) {
+    ROUND_SEAM.with(|seam| {
+        if let Some(hook) = seam.borrow_mut().as_mut() {
+            hook(point);
+        }
+    });
 }
 
 /// Shell pid behind a self-bound process id: `omp-<pid>-…` → `<pid>`.
@@ -997,6 +1096,38 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn sleep")
+    }
+
+    /// Arm this thread's reap round seam (`fire_round_seam`): `hook` runs on
+    /// the calling thread at the named round boundary. The reaper thread
+    /// arms it before its reap call, so a test lands actions at one exact
+    /// instruction boundary of the round instead of racing the clock.
+    #[cfg(unix)]
+    fn arm_round_seam(hook: impl FnMut(RoundPoint) + 'static) {
+        ROUND_SEAM.with(|seam| *seam.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// The round seam as a rendezvous: the reaper blocks at `point` until
+    /// the returned sender is fired, and the returned receiver yields when
+    /// the boundary is reached — so the test's registration/spawn lands at
+    /// one exact instruction boundary of the round.
+    #[cfg(unix)]
+    fn rendezvous_at(
+        point: RoundPoint,
+    ) -> (
+        impl FnMut(RoundPoint) + Send + 'static,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (hit_tx, hit_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let hook = move |p: RoundPoint| {
+            if p == point {
+                hit_tx.send(()).ok();
+                release_rx.recv().ok();
+            }
+        };
+        (hook, hit_rx, release_tx)
     }
 
     #[cfg(unix)]
@@ -1496,6 +1627,10 @@ mod tests {
             .unwrap();
         let mut late = spawn_named_sleeper(&name, &fresh_binding);
         let late_pid = late.id();
+        // Exec barrier: pin the late carrier as an ENUMERATED carrier (a
+        // pre-exec child carries no identity) — the spare must be the scope
+        // rule's doing, never a missed enumeration.
+        wait_for_enumerated(&name, &[], late_pid);
 
         let result = reaper.join().expect("reap thread");
         assert!(
@@ -1507,9 +1642,13 @@ mod tests {
             !crate::sys::process::is_alive(first_pid),
             "in-scope initial carrier is reaped"
         );
+        // try_wait, not is_alive: a SIGKILLed-but-unreaped child is a zombie
+        // and reads alive — None means the carrier never got signalled.
+        let late_status = late.try_wait().unwrap();
         assert!(
-            crate::sys::process::is_alive(late_pid),
-            "newer-epoch carrier is spared"
+            late_status.is_none(),
+            "newer-epoch carrier is spared (pid {late_pid} was signalled: \
+             {late_status:?})"
         );
         late.kill().ok();
         late.wait().ok();
@@ -1690,6 +1829,150 @@ mod tests {
             !crate::sys::process::is_alive(late_pid),
             "stale-id late carrier is signalled despite its non-empty process id"
         );
+    }
+
+    /// Reap scope (round-ordering regression — the read-after-capture rule):
+    /// a fresh registration committed and its process spawned at the
+    /// boundary between the KILL round's carrier capture and its registry
+    /// read — the exact interleaving the old read-before-capture order could
+    /// not survive: binding committed after the read, process spawned before
+    /// the capture, so the fresh id was missing from the captured id set and
+    /// the brand-new process was classified stale (an unclaimed id of the
+    /// dying epoch) and SIGKILLed. Capture first and the fresh process is
+    /// spawned AFTER it — never classified, never signalled (alive after the
+    /// reap), never a survivor (the reap is Ok while it lives). The pair
+    /// lands register-then-spawn, the launcher's pre-spawn registration
+    /// order (`db.set_process_binding` runs before the tool spawn,
+    /// launcher.rs:2005) — which is exactly why a registry read taken after
+    /// the capture must include any captured process's binding.
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_spares_fresh_launch_landing_after_round_capture() {
+        let (_dir, db) = file_test_db();
+        let db_path = db.path().to_path_buf();
+        let name = unique_name("scopeorder");
+        let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_pid = first.id();
+        wait_for_enumerated(&name, &[], first_pid);
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let fresh_binding = format!("proc-fresh-{}", rand_suffix());
+        let (hook, hit, release) = rendezvous_at(RoundPoint::Captured);
+        let reap_name = name.clone();
+        let reap_bindings = binding_ids.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+            arm_round_seam(hook);
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
+        });
+        // Past the full TERM wait (`first` is SIGSTOPped and cannot exit):
+        // the KILL round has captured its carrier set.
+        hit.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("KILL round reaches its capture boundary");
+        // The concurrent launch at that boundary: register the fresh
+        // binding, THEN spawn its process — both after the capture, before
+        // the round's registry read.
+        db.set_process_binding(&fresh_binding, "sess", &name)
+            .unwrap();
+        let mut late = spawn_named_sleeper(&name, &fresh_binding);
+        let late_pid = late.id();
+        // Let the child exec before releasing the round — a pre-exec child
+        // carries no identity yet, so the round's capture only sees it once
+        // it enumerates as a carrier.
+        wait_for_enumerated(&name, &[], late_pid);
+        release.send(()).ok();
+
+        let result = reaper.join().expect("reap thread");
+        first.wait().ok();
+        assert!(
+            result.is_ok(),
+            "the fresh process is never a survivor: {result:?}"
+        );
+        assert!(
+            !crate::sys::process::is_alive(first_pid),
+            "in-scope initial carrier is reaped"
+        );
+        // try_wait, not is_alive: a SIGKILLed-but-unreaped child is a zombie
+        // and reads alive — None means the fresh process never got signalled.
+        let late_status = late.try_wait().unwrap();
+        assert!(
+            late_status.is_none(),
+            "a fresh process spawned after the round's capture is spared \
+             end-to-end (pid {late_pid} was signalled: {late_status:?})"
+        );
+        late.kill().ok();
+        late.wait().ok();
+    }
+
+    /// Reap scope (pre-signal revalidation): a binding landing between the
+    /// KILL round's classification and its signal round — the residual
+    /// first-hook spawn-to-bind shape — is caught by the pre-signal registry
+    /// re-read. The late carrier is captured and classified IN SCOPE against
+    /// the earlier read (its id is registered nowhere yet — the stale-id
+    /// shape), its registration lands at the classification boundary, and
+    /// the revalidation drops it from the signal set into the spared set:
+    /// never signalled (alive after the reap), never a survivor.
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_presignal_recheck_spares_mid_classification_registration() {
+        let (_dir, db) = file_test_db();
+        let db_path = db.path().to_path_buf();
+        let name = unique_name("scoperecheck");
+        let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_pid = first.id();
+        wait_for_enumerated(&name, &[], first_pid);
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let late_binding = format!("proc-fresh-{}", rand_suffix());
+        let (hook, hit, release) = rendezvous_at(RoundPoint::Classified);
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let reap_name = name.clone();
+        let reap_bindings = binding_ids.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+            arm_round_seam(hook);
+            start_tx.send(()).ok();
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
+        });
+        start_rx.recv().unwrap();
+        // Late carrier with a not-yet-registered id, spawned after the reap
+        // began: it is classified (a late carrier), never a first-snapshot
+        // pid.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut late = spawn_named_sleeper(&name, &late_binding);
+        let late_pid = late.id();
+        wait_for_enumerated(&name, &[], late_pid);
+        // The registration lands between classification and the signal
+        // round: the pre-signal re-read must spare the carrier.
+        hit.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("KILL round reaches its classification boundary");
+        db.set_process_binding(&late_binding, "sess", &name)
+            .unwrap();
+        release.send(()).ok();
+
+        let result = reaper.join().expect("reap thread");
+        first.wait().ok();
+        assert!(
+            result.is_ok(),
+            "the revalidation-spared carrier is never a survivor: {result:?}"
+        );
+        assert!(
+            !crate::sys::process::is_alive(first_pid),
+            "in-scope initial carrier is reaped"
+        );
+        // try_wait, not is_alive: a SIGKILLed-but-unreaped child is a zombie
+        // and reads alive — None means the carrier never got signalled.
+        let late_status = late.try_wait().unwrap();
+        assert!(
+            late_status.is_none(),
+            "the pre-signal revalidation drops the mid-classification \
+             registration from the signal set (pid {late_pid} was signalled: \
+             {late_status:?})"
+        );
+        late.kill().ok();
+        late.wait().ok();
     }
 
     #[test]
