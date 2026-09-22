@@ -821,6 +821,7 @@ fn handle_remote_kill(
             crate::terminal::KillResult::AlreadyDead => "already_dead",
             crate::terminal::KillResult::PermissionDenied => "permission_denied",
         },
+        "teardown": result.teardown.as_str(),
         "pane_closed": result.pane_closed,
         "pane_retry_command": result.pane_retry_command,
         "preset_name": result.preset_name,

@@ -423,8 +423,12 @@ fn start_rebind(
 
     // Process truth gates the rebind: the target row and its bindings are
     // about to be replaced, so a still-alive prior subtree (orphan) or a
-    // live holder of the target name must refuse first — same rule as
-    // resume and explicit-name launch.
+    // live holder of the target name must refuse first — the same uniform
+    // rule as resume and explicit-name launch
+    // (proctruth::check_spawn_allowed). The caller's own identity tree is
+    // never a holder there, so a session re-registering its own name
+    // proceeds while a leftover carrier from an older binding refuses as
+    // the pre-binding orphan it is.
     if let Err(refusal) = crate::proctruth::check_spawn_allowed(db, &target_name) {
         anyhow::bail!("{refusal}");
     }
@@ -898,6 +902,11 @@ mod tests {
 
     fn make_ctx(tool_env: &[(&str, &str)], cwd: &str) -> HcomContext {
         let mut env: HashMap<String, String> = std::env::vars().collect();
+        // OMP session markers beat CLAUDECODE in tool detection (see
+        // tool_detection::OMP_NATIVE): strip them so an ambient OMP shell
+        // cannot decide these tests' tool.
+        env.remove("HCOM_OMP");
+        env.remove("OMPCODE");
         for (k, v) in tool_env {
             env.insert((*k).to_string(), (*v).to_string());
         }
@@ -905,11 +914,14 @@ mod tests {
     }
 
     /// Claude context carrying exactly one session-id source, so an ambient
-    /// value from the shell running the tests cannot decide the outcome.
+    /// value from the shell running the tests cannot decide the outcome. The
+    /// OMP session markers go too: they beat CLAUDECODE in tool detection.
     fn make_claude_ctx(session: Option<(&str, &str)>, cwd: &str) -> HcomContext {
         let mut env: HashMap<String, String> = std::env::vars().collect();
         env.remove("HCOM_CLAUDE_UNIX_SESSION_ID");
         env.remove("CLAUDE_CODE_SESSION_ID");
+        env.remove("HCOM_OMP");
+        env.remove("OMPCODE");
         env.insert("CLAUDECODE".to_string(), "1".to_string());
         if let Some((key, value)) = session {
             env.insert(key.to_string(), value.to_string());
@@ -1442,5 +1454,258 @@ mod tests {
             real.to_string_lossy().as_ref(),
             alias.to_string_lossy().as_ref()
         ));
+    }
+
+    #[cfg(unix)]
+    fn spawn_named_sleeper(name: &str) -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("60")
+            .env("HCOM_INSTANCE_NAME", name)
+            .env_remove("HCOM_PROCESS_ID")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[cfg(unix)]
+    fn wait_for_carrier(name: &str, pid: u32) {
+        for _ in 0..50 {
+            if crate::proctruth::processes_for_instance(name, &[])
+                .iter()
+                .any(|m| m.pid == pid)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("sleeper {pid} never enumerated under {name}");
+    }
+    #[cfg(unix)]
+    fn insert_live_row(db: &HcomDb, name: &str, tool: &str, directory: &str) {
+        let now = crate::shared::time::now_epoch_f64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, directory, status, status_time, last_seen, created_at)
+                 VALUES (?1, ?2, ?3, 'active', 0, 0, ?4)",
+                params![name, tool, directory, now],
+            )
+            .unwrap();
+    }
+
+    /// Self-claim past the gate: the caller's identity facts match the
+    /// target's carriers and only its own tree is alive, so the rebind
+    /// proceeds — the uniform self-tree rule in
+    /// `proctruth::check_spawn_allowed`, no short-circuit here.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn test_start_rebind_self_identity_tree_rebinds() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("hcom-start-self-{}", std::process::id());
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _identity = CallerIdentityEnv::pose(Some(&target), None);
+        let ctx = make_ctx(&[("CLAUDECODE", "1")], &cwd);
+        insert_live_row(&db, &target, ctx.tool.as_str(), &cwd);
+
+        let mut sleeper = spawn_named_sleeper(&target);
+        let spid = sleeper.id();
+        wait_for_carrier(&target, spid);
+
+        assert_eq!(start_rebind(&db, &target, &ctx, None).unwrap(), 0);
+        assert!(
+            db.get_instance_full(&target).unwrap().is_some(),
+            "self-claim re-creates the target row"
+        );
+
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    /// Foreign callers still refuse: same live carrier, but the caller
+    /// matches neither the env name nor the newest binding.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn test_start_rebind_foreign_still_refuses_live_holder() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("hcom-start-foreign-{}", std::process::id());
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _identity = CallerIdentityEnv::pose(None, None);
+        let ctx = make_ctx(&[("CLAUDECODE", "1")], &cwd);
+        insert_live_row(&db, &target, ctx.tool.as_str(), &cwd);
+
+        let mut sleeper = spawn_named_sleeper(&target);
+        let spid = sleeper.id();
+        wait_for_carrier(&target, spid);
+
+        let err = start_rebind(&db, &target, &ctx, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("refusing to spawn under '{target}'")),
+            "foreign gate refusal unchanged, got: {err}"
+        );
+        assert!(
+            err.to_string().contains(&format!("hcom kill {target}")),
+            "foreign gate refusal unchanged, got: {err}"
+        );
+        assert!(
+            db.get_instance_full(&target).unwrap().is_some(),
+            "refused rebind leaves the target row alone"
+        );
+
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    /// Poses the caller's identity env — the spawn gate reads these two from
+    /// the live env — and restores whatever was there on drop.
+    #[cfg(unix)]
+    struct CallerIdentityEnv(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl CallerIdentityEnv {
+        fn pose(instance_name: Option<&str>, process_id: Option<&str>) -> Self {
+            let saved = (
+                std::env::var_os("HCOM_INSTANCE_NAME"),
+                std::env::var_os("HCOM_PROCESS_ID"),
+            );
+            unsafe {
+                match instance_name {
+                    Some(v) => std::env::set_var("HCOM_INSTANCE_NAME", v),
+                    None => std::env::remove_var("HCOM_INSTANCE_NAME"),
+                }
+                match process_id {
+                    Some(v) => std::env::set_var("HCOM_PROCESS_ID", v),
+                    None => std::env::remove_var("HCOM_PROCESS_ID"),
+                }
+            }
+            Self(saved.0, saved.1)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CallerIdentityEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("HCOM_INSTANCE_NAME", v),
+                    None => std::env::remove_var("HCOM_INSTANCE_NAME"),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("HCOM_PROCESS_ID", v),
+                    None => std::env::remove_var("HCOM_PROCESS_ID"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn rand_suffix() -> u32 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        std::time::SystemTime::now().hash(&mut h);
+        std::thread::current().id().hash(&mut h);
+        (h.finish() % 900000) as u32 + 100000
+    }
+
+    /// A name-carrying orphan in a tree of its own: `sh` spawns it in the
+    /// background and exits, so the sleeper is reparented to init — its ppid
+    /// chain never passes through the test process. Not our child: kill it
+    /// with `libc::kill`.
+    #[cfg(unix)]
+    fn spawn_detached_named_sleeper(name: &str, process_id: &str) -> u32 {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300 >/dev/null 2>&1 & echo $!")
+            .env("HCOM_INSTANCE_NAME", name)
+            .env("HCOM_PROCESS_ID", process_id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("spawn detached sleeper");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("detached sleeper pid")
+    }
+
+    #[cfg(unix)]
+    fn backdate_binding(db: &HcomDb, process_id: &str, updated_at: f64) {
+        db.conn()
+            .execute(
+                "UPDATE process_bindings SET updated_at = ?1 WHERE process_id = ?2",
+                params![updated_at, process_id],
+            )
+            .unwrap();
+    }
+
+    /// Blocker-A regression: the caller matches the target's newest binding,
+    /// but a pre-binding orphan (name-carrying, started before the binding)
+    /// is alive in a separate tree. The rebind must refuse with the orphan
+    /// classification — reclaiming the name would leave that process alive
+    /// under the reclaimed identity.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn test_start_rebind_refuses_pre_binding_orphan_outside_caller_tree() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("hcom-start-orphan-{}", std::process::id());
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let orphan = spawn_detached_named_sleeper(&target, &format!("proc-old-{}", rand_suffix()));
+        wait_for_carrier(&target, orphan);
+        let start = crate::proctruth::processes_for_instance(&target, &[])
+            .into_iter()
+            .find(|m| m.pid == orphan)
+            .expect("detached orphan enumerated")
+            .start_epoch;
+        // The new harness binds AFTER the orphan started: the orphan predates
+        // it and must refuse the reclaim.
+        let binding = format!("proc-new-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess-orphan", &target)
+            .unwrap();
+        backdate_binding(&db, &binding, start + 3600.0);
+        let _identity = CallerIdentityEnv::pose(None, Some(&binding));
+        let ctx = make_ctx(&[("CLAUDECODE", "1")], &cwd);
+        insert_live_row(&db, &target, ctx.tool.as_str(), &cwd);
+
+        let err = start_rebind(&db, &target, &ctx, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("refusing to spawn under '{target}'")),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("orphan"),
+            "must refuse with the orphan classification: {err}"
+        );
+        assert!(
+            db.get_instance_full(&target).unwrap().is_some(),
+            "refused rebind leaves the target row alone"
+        );
+        assert_eq!(
+            db.newest_process_binding(&target).unwrap().unwrap().0,
+            binding,
+            "refused rebind leaves the bindings alone"
+        );
+        unsafe {
+            libc::kill(orphan as libc::pid_t, libc::SIGKILL);
+        }
     }
 }

@@ -16,14 +16,28 @@
 //!   other environ values are never printed).
 //! - [`reap_instance_tree_for`]: SIGTERM the whole carrier set (oldest first,
 //!   so the pty wrapper goes before its children), wait up to 5 s, SIGKILL
-//!   survivors.
+//!   survivors — fail-closed: success is only reported once no in-scope
+//!   carrier lives. A late carrier is signalled unless its non-empty
+//!   `HCOM_PROCESS_ID` is registered among the name's CURRENT binding ids
+//!   read fresh in that round, minus the call-start ids (see
+//!   [`carrier_in_reap_scope`]): a brand-new registration started mid-reap
+//!   is spared, a name-only late fork — or a late child carrying a stale id
+//!   of the dying tree — is not. Every round captures its carrier set first
+//!   and reads the binding registry second (read-after-capture, plus a
+//!   pre-signal re-read in the KILL round) — the ordering that makes "read
+//!   fresh" trustworthy (see [`reap_instance_tree_for_excluding`]).
 //! - [`check_spawn_allowed`]: refuse to spawn under `<name>` over a live
-//!   holder or an orphan (started before the newest binding).
+//!   holder or an orphan (started before the newest binding) — the one
+//!   uniform spawn gate, after removing the caller's own identity tree from
+//!   the carrier set (a session re-registering its own name is never blocked
+//!   by its own processes).
 //! - [`sweep_vanished_instances`]: daemon-side periodic check that notices
 //!   rows whose harness is gone without a `stopped` event.
 //!
 //! Unix only: `/proc` enumeration is compiled out on other platforms, where
 //! every query reports empty (verified-no-holders) and reap is a no-op.
+
+use std::collections::HashSet;
 
 use crate::db::HcomDb;
 
@@ -144,10 +158,35 @@ fn identity_facts(env: &[u8], want: &[u8]) -> (bool, String) {
     (carries_name, process_id)
 }
 
+/// The two identity facts of `pid` (see [`identity_facts`]) as the spawn
+/// gate reads them. The calling process's own facts come from its LIVE
+/// environment — what it actually carries and passes to its children, the
+/// same source `HcomContext` resolves identity from. Every other pid is
+/// read from `/proc/<pid>/environ`; None when that is unreadable (exited,
+/// or foreign-owned).
+fn identity_facts_of(pid: u32, name: &str) -> Option<(bool, String)> {
+    if pid == std::process::id() {
+        return Some((
+            std::env::var("HCOM_INSTANCE_NAME").is_ok_and(|v| v == name),
+            std::env::var("HCOM_PROCESS_ID").unwrap_or_default(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let want = format!("HCOM_INSTANCE_NAME={name}");
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .ok()
+            .map(|env| identity_facts(&env, want.as_bytes()))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// True when a decoded `HCOM_PROCESS_ID` value names one of the instance's
 /// bindings. Empty never matches, so an absent entry (or an empty binding
 /// id) can never hold an instance.
-#[cfg(unix)]
 fn is_bound_process_id(process_id: &str, binding_ids: &[String]) -> bool {
     !process_id.is_empty() && binding_ids.iter().any(|id| id == process_id)
 }
@@ -260,19 +299,74 @@ fn is_zombie(pid: u32) -> bool {
         .map(|(_, rest)| rest.trim_start().starts_with('Z'))
         .unwrap_or(false)
 }
+/// Field 4 (ppid) of `/proc/<pid>/stat` — the token after the closing `)` of
+/// comm, so a comm containing spaces or parens cannot shift the parse. None
+/// when the process is gone, unparseable, or has no parent (ppid 0).
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next()?;
+    let ppid: u32 = fields.next()?.parse().ok()?;
+    (ppid != 0).then_some(ppid)
+}
+
+/// `pid` plus its /proc ppid-ancestor chain, youngest first, ending at init
+/// (a bonded iteration cap guards against a corrupted chain).
+fn ancestor_or_self_pids(pid: u32) -> Vec<u32> {
+    let mut out = vec![pid];
+    let mut cur = pid;
+    while let Some(ppid) = parent_pid(cur) {
+        if ppid == cur {
+            break;
+        }
+        out.push(ppid);
+        if ppid == 1 || out.len() > 1024 {
+            break;
+        }
+        cur = ppid;
+    }
+    out
+}
+
+/// The calling process's own pid plus its /proc ppid-ancestor chain.
+///
+/// Exists so lifecycle signalling can exclude the caller's own session tree:
+/// a CLI running inside the instance it operates on inherits the name but
+/// must never be signalled for it. Ancestors are read from field 4 (ppid) of
+/// `/proc/<pid>/stat` (see [`parent_pid`]) — walking up until pid 1.
+///
+/// Unix only; elsewhere this is just the caller's own pid.
+pub fn caller_ancestor_pids() -> Vec<u32> {
+    #[cfg(not(unix))]
+    {
+        vec![std::process::id()]
+    }
+    #[cfg(unix)]
+    {
+        ancestor_or_self_pids(std::process::id())
+    }
+}
+
 /// Reap every live process holding the instance: carriers of
 /// `HCOM_INSTANCE_NAME=<name>` plus carriers of any of the instance's
 /// binding process ids (the self-bound tree never carries the name).
 ///
 /// Oldest first (the pty wrapper predates its children), SIGTERM, wait up to
 /// 5 s, SIGKILL survivors, verify. Verification is by carrier set, not by pid
-/// snapshot: after each wait the tree is re-enumerated for carriers, so a
-/// child forked between the first enumerate and SIGTERM is still signalled
-/// (in the KILL round) and still blocks success while it lives; conversely a
-/// snapshot pid recycled by an unrelated process no longer carries the name
-/// and is neither signalled nor counted (an EPERM on such a pid is not
-/// survival). Returns the surviving pids on failure — callers must not
-/// report success or release the row while any survive.
+/// snapshot: after each wait the tree is re-enumerated for carriers. A
+/// late-appearing carrier is signalable only in reap scope (see
+/// [`carrier_in_reap_scope`]): a mid-reap fork carrying one of the call-start
+/// binding ids, one carrying a stale id no current binding claims, or one
+/// with no process id at all (the name-only late fork) is still signalled
+/// (in the KILL round) and still blocks success while it lives, while a
+/// carrier whose `HCOM_PROCESS_ID` is registered among the name's fresh
+/// binding epoch (a brand-new registration of a newer epoch) is spared and
+/// never blocks; conversely a snapshot pid recycled by an unrelated process
+/// no longer carries the name and is neither signalled nor counted (an EPERM
+/// on such a pid is not survival). Returns the surviving pids on failure — callers must
+/// not report success or release the row while any survive (fail-closed: the
+/// reap must reach `Ok(())` before any `stopped` write or binding release).
 ///
 /// The calling process is never signalled (see [`processes_for_instance`]).
 /// Zombies are excluded from verification: a SIGKILLed carrier stays visible
@@ -281,19 +375,111 @@ fn is_zombie(pid: u32) -> bool {
 /// would wedge every stop behind an unreaped child.
 ///
 /// Unix only; elsewhere this is a no-op success.
-pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), Vec<u32>> {
+pub fn reap_instance_tree_for(
+    db: &HcomDb,
+    name: &str,
+    binding_ids: &[String],
+) -> Result<(), Vec<u32>> {
+    reap_instance_tree_for_excluding(db, name, binding_ids, &[])
+}
+
+/// [`reap_instance_tree_for`] with an exclusion set: carriers in `exclude`
+/// are never signalled and never count as survivors, at any enumeration
+/// round (initial, KILL re-enumeration, verification).
+///
+/// The kill self-path uses this with [`caller_ancestor_pids`]: the caller
+/// runs inside the instance it is killing, so its own session tree must be
+/// spared while every other carrier is still reaped and still blocks success
+/// while it lives. Ordering is fail-closed: the kill runs this reap to
+/// `Ok(())` BEFORE writing `stopped` or releasing the row/bindings — a
+/// survivor returns `Err` and leaves ownership state untouched, so a failed
+/// reap can never be converted into a successful exit after the row is
+/// discarded (a kill never reports stopped or releases the row/bindings
+/// while any instance process may still be alive). An empty `exclude` is
+/// exactly [`reap_instance_tree_for`].
+///
+/// Reap scope (the re-enumeration / KILL and verification rounds): a carrier
+/// first seen after the reap began is signalled unless its `HCOM_PROCESS_ID`
+/// is non-empty and registered among the name's CURRENT binding ids read
+/// fresh in that round, MINUS the ids passed at call start (see
+/// [`carrier_in_reap_scope`]) — the epoch rule. The kill tears down exactly
+/// one binding epoch: a fresh registration admitted mid-kill is a newer
+/// epoch (its id is registered but outside the call-start set), its
+/// processes are spared — never signalled, never a survivor — so a
+/// same-identity start/resume admitted mid-kill never has its fresh process
+/// reaped by the old kill's re-enumeration. Everything else name-matches the
+/// dying epoch and is in scope: a late carrier with no process id (a
+/// name-only fork of the dying tree), one carrying a call-start binding id
+/// (a genuine mid-reap fork inherits the old env), and one carrying a stale
+/// non-empty id that no current binding claims (a late child of the old
+/// instance inheriting an older era's id) — signalled, and while alive a
+/// survivor (fail-closed), so a dying tree that forks or hands out stale ids
+/// late leaves no unmanaged live descendant behind.
+///
+/// Round ordering — the read-after-capture rule: every classification round
+/// (the KILL re-enumeration and the final verification alike) CAPTURES its
+/// carrier set first ([`live_carriers_for`]) and only THEN reads the binding
+/// registry ([`fresh_epoch_ids`]), classifying exactly the captured set
+/// against that read. This is what makes "read fresh" trustworthy: the
+/// launcher registers a fresh binding BEFORE spawning its process
+/// (`db.set_process_binding` runs in the pre-register block, before the tool
+/// spawn — launcher.rs:2005), so every process a capture sees already has
+/// its binding committed, and a registry read taken after the capture
+/// cannot miss it. The reverse order (read, then capture) left a window: a
+/// concurrent launch committing its binding after the read and spawning
+/// before the capture was classified against a registry without its id and
+/// killed as part of the dying epoch.
+///
+/// The KILL round revalidates once more immediately before its signal
+/// round: it re-reads the registry and re-classifies the captured in-scope
+/// set against the newer read, dropping every carrier that now matches a
+/// fresh-epoch id from the signal set into `spared` (first-snapshot pids
+/// stay in scope by fiat — this reap's own business, already TERMed; the
+/// per-signal [`pid_carries_instance`] pid-reuse re-check is unchanged). A
+/// spare decision is captured once per carrier: a carrier spared in one
+/// round or by that revalidation stays spared, never reclassified into
+/// scope by later registry changes.
+///
+/// Residual: a fresh registration whose binding lands only AFTER the round's
+/// registry read is in scope for that round (the spawn-to-bind window) —
+/// empty for launched instances, whose binding is written at launch
+/// registration before the process spawns (launcher.rs:2005); only the
+/// first-hook binding paths (instance_binding recovery), whose binding lands
+/// after their process spawns, leave a window — and even that is bounded by
+/// the KILL round's pre-signal re-read: a first-hook binding landing before
+/// the re-read spares its process, one landing after it is signalled and,
+/// while alive, a survivor (fail-closed).
+/// The row itself is torn down only while the incarnation the kill resolved
+/// against is still the row's (the kill command's teardown CAS).
+///
+/// `db` supplies the per-round binding registry read behind the epoch rule.
+/// Unix only; elsewhere this is a no-op success.
+pub fn reap_instance_tree_for_excluding(
+    db: &HcomDb,
+    name: &str,
+    binding_ids: &[String],
+    exclude: &[u32],
+) -> Result<(), Vec<u32>> {
     #[cfg(not(unix))]
     {
+        let _ = db;
         let _ = name;
         let _ = binding_ids;
+        let _ = exclude;
         Ok(())
     }
     #[cfg(unix)]
     {
-        let mut matches = live_carriers_for(name, binding_ids);
+        let mut matches = live_carriers_for(name, binding_ids, exclude);
         if matches.is_empty() {
             return Ok(());
         }
+        // Carriers of the first snapshot are this reap's own business and
+        // stay in scope at every round; only late-appearing carriers go
+        // through the scope rule below. `spared` captures each late
+        // carrier's spare decision once it is observed.
+        let started: Vec<u32> = matches.iter().map(|m| m.pid).collect();
+        let mut spared: HashSet<u32> = HashSet::new();
         // Oldest first: pty wrapper before children.
         matches.sort_by(|a, b| {
             a.start_epoch
@@ -312,9 +498,31 @@ pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), 
             TERM_WAIT,
         );
         // Re-enumerate by carrier set: newly seen carriers (forked after the
-        // first snapshot, so never TERMED) join the KILL round directly —
-        // the TERM round already elapsed, so escalation is immediate.
-        let mut current = live_carriers_for(name, binding_ids);
+        // first snapshot, so never TERMed) join the KILL round directly —
+        // the TERM round already elapsed, so escalation is immediate — but
+        // only in reap scope (predicate v3 against the registry read fresh
+        // for this round). A genuine mid-reap fork carries the old binding
+        // id (or no process id at all) and is caught here; a brand-new
+        // registration (an id in the fresh epoch) started mid-reap is spared
+        // (never signalled, never a survivor).
+        //
+        // Round ordering — the read-after-capture rule: the carrier set is
+        // CAPTURED FIRST and the registry is read SECOND, so the read that
+        // classifies a captured carrier cannot miss that carrier's
+        // pre-spawn-registered binding (see the round-ordering note on
+        // [`reap_instance_tree_for_excluding`]). A fresh process spawned
+        // after the capture is outside the captured set entirely — never
+        // classified here at all.
+        let captured: Vec<ProcMatch> = live_carriers_for(name, binding_ids, exclude);
+        #[cfg(test)]
+        fire_round_seam(RoundPoint::Captured);
+        let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
+        let mut current: Vec<ProcMatch> = captured
+            .into_iter()
+            .filter(|m| {
+                started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
+            })
+            .collect();
         if current.is_empty() {
             return Ok(());
         }
@@ -322,6 +530,20 @@ pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), 
             a.start_epoch
                 .partial_cmp(&b.start_epoch)
                 .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // Pre-signal revalidation: immediately before the signal round,
+        // re-read the registry and re-classify the captured in-scope set
+        // against the newer read. A carrier that NOW matches a fresh-epoch
+        // id (its registration landed between classification and the signal
+        // round — the first-hook spawn-to-bind shape) is dropped from the
+        // signal set and joins the spared set, where it stays. First-snapshot
+        // pids stay in scope by fiat (this reap's own business, already
+        // TERMed); the per-signal pid-reuse re-check below is unchanged.
+        #[cfg(test)]
+        fire_round_seam(RoundPoint::Classified);
+        let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
+        current.retain(|m| {
+            started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
         });
         for m in &current {
             if pid_carries_instance(m.pid, name, binding_ids) {
@@ -332,12 +554,111 @@ pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), 
             &current.iter().map(|m| m.pid).collect::<Vec<_>>(),
             KILL_WAIT,
         );
-        let still: Vec<u32> = live_carriers_for(name, binding_ids)
+        // Verification is scoped exactly like the KILL round (same order:
+        // capture the carrier set first, registry read second, classify the
+        // captured set against that read; same captured spare set): an
+        // in-scope carrier still alive blocks success (fail-closed), while a
+        // spared fresh registration never does — a spared carrier is never
+        // counted as a survivor.
+        let captured: Vec<ProcMatch> = live_carriers_for(name, binding_ids, exclude);
+        let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
+        let still: Vec<u32> = captured
             .into_iter()
+            .filter(|m| {
+                started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
+            })
             .map(|m| m.pid)
             .collect();
         if still.is_empty() { Ok(()) } else { Err(still) }
     }
+}
+
+/// The name's fresh binding epoch for one reap round: its CURRENT process
+/// binding ids read from the DB now, MINUS the ids passed at call start. A
+/// binding registered during this kill shows up here — evidence of a newer
+/// epoch (see [`carrier_in_reap_scope`]). Each round reads it AFTER
+/// capturing its carrier set (the read-after-capture rule, see
+/// [`reap_instance_tree_for_excluding`]); the KILL round reads it again
+/// right before signalling (the pre-signal revalidation). A failed read
+/// yields an empty epoch (fail-closed toward scope: nothing gets an unearned
+/// spare).
+#[cfg(unix)]
+fn fresh_epoch_ids(db: &HcomDb, name: &str, call_start_ids: &[String]) -> Vec<String> {
+    db.process_binding_ids(name)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| !call_start_ids.contains(id))
+        .collect()
+}
+
+/// Reap scope for a carrier first seen after the reap began (carriers of the
+/// reap's first snapshot are always in scope) — predicate v3, the epoch
+/// rule: IN SCOPE unless the carrier's `HCOM_PROCESS_ID` is
+/// non-empty and registered among `fresh_epoch_ids`, the name's CURRENT
+/// binding ids read fresh in this round — after the round's carrier capture
+/// — MINUS the call-start ids. Instance identity keys to
+/// binding epochs (process bindings are the incarnation token), so a
+/// registered id outside the call-start set is a NEWER epoch and is spared —
+/// never signalled, never a survivor. Everything else name-matches the
+/// dying epoch and is this reap's business: a name-only late carrier (empty
+/// process id — a fork of the dying tree, or an old process that became a
+/// carrier mid-reap), a carrier carrying one of the call-start binding ids
+/// (a genuine mid-reap fork inherits the old env), and a carrier whose
+/// non-empty id no current binding claims (a stale id inherited from an
+/// older era) are signalled and, while alive, block success (fail-closed).
+/// The spare decision is captured once per carrier in `spared`: a carrier
+/// spared in one round or by the KILL round's pre-signal revalidation stays
+/// spared — later registry changes never reclassify it into scope.
+#[cfg(unix)]
+fn carrier_in_reap_scope(
+    m: &ProcMatch,
+    fresh_epoch_ids: &[String],
+    spared: &mut HashSet<u32>,
+) -> bool {
+    if spared.contains(&m.pid) {
+        return false;
+    }
+    if is_bound_process_id(&m.process_id, fresh_epoch_ids) {
+        spared.insert(m.pid);
+        return false;
+    }
+    true
+}
+
+/// Test-only round seam: a per-thread hook fired at the two boundaries the
+/// round-ordering contract pins in the KILL round — right after its carrier
+/// capture ([`RoundPoint::Captured`]) and right after its classification of
+/// that captured set ([`RoundPoint::Classified`]). A test arms it from its
+/// own reaper thread to land a concurrent registration or spawn at one exact
+/// instruction boundary of the round instead of racing the clock. Unarmed,
+/// firing is a no-op; never compiled outside `cfg(test)`.
+#[cfg(all(test, unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundPoint {
+    /// The KILL round has captured its carrier set; its registry read is next.
+    Captured,
+    /// The KILL round has classified the captured set; the pre-signal
+    /// revalidation and signal loop are next.
+    Classified,
+}
+
+/// The round seam's per-thread slot: an optional hook, armed by the tests
+/// via `arm_round_seam` and fired by [`fire_round_seam`].
+#[cfg(all(test, unix))]
+type RoundSeamSlot = std::cell::RefCell<Option<Box<dyn FnMut(RoundPoint)>>>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static ROUND_SEAM: RoundSeamSlot = std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, unix))]
+fn fire_round_seam(point: RoundPoint) {
+    ROUND_SEAM.with(|seam| {
+        if let Some(hook) = seam.borrow_mut().as_mut() {
+            hook(point);
+        }
+    });
 }
 
 /// Shell pid behind a self-bound process id: `omp-<pid>-…` → `<pid>`.
@@ -350,12 +671,14 @@ fn shell_pid_from_process_id(process_id: &str) -> Option<u32> {
         .and_then(|head| head.parse::<u32>().ok())
 }
 
-/// Live carriers for reap verification: carrier enumeration minus zombies.
+/// Live carriers for reap verification: carrier enumeration minus zombies
+/// minus the exclusion set (the caller's own session tree in the kill
+/// self-path — never signalled, never a survivor).
 #[cfg(unix)]
-fn live_carriers_for(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
+fn live_carriers_for(name: &str, binding_ids: &[String], exclude: &[u32]) -> Vec<ProcMatch> {
     processes_for_instance(name, binding_ids)
         .into_iter()
-        .filter(|m| !is_zombie(m.pid))
+        .filter(|m| !is_zombie(m.pid) && !exclude.contains(&m.pid))
         .collect()
 }
 
@@ -393,11 +716,79 @@ fn wait_for_exit_pids(pids: &[u32], budget: std::time::Duration) {
     }
 }
 
-/// Refuse to spawn under `<name>` over a live holder or an orphan.
+/// The caller's own identity tree: the slice of the live process table that
+/// is the caller's own session, never a foreign name holder.
+///
+/// Root: the OLDEST ancestor-or-self of `caller_pid` that is itself a
+/// carrier (carries `HCOM_INSTANCE_NAME=<name>` or one of the instance's
+/// binding process ids) AND shares the caller's identity facts — the same
+/// non-empty `HCOM_PROCESS_ID` value, or both carrying the target name. The
+/// tree is that root plus every process whose ppid-ancestor chain passes
+/// through it: a session's carriers sit above and beside the CLI running the
+/// gate, all under one session root.
+///
+/// Topology alone never finds a root: a child of a holder's tree whose env
+/// was stripped of identity must not have that tree treated as its own — it
+/// is a foreign claimant, and the identity match at the root is what says
+/// so. A caller carrying no identity facts therefore finds no root; its tree
+/// is just its own pid (already excluded from [`processes_for_instance`])
+/// and the gate runs full, exactly as before this rule existed.
+///
+/// Returns the tree as far as the gate needs it: the caller's own pid, the
+/// root, and every enumerated carrier inside it — exactly the pids
+/// [`check_spawn_allowed`] removes from the carrier set.
+///
+/// `caller_pid` is [`std::process::id()`] in production; it is a parameter
+/// so tests can model a caller inside an arbitrary tree.
+fn caller_identity_tree(
+    name: &str,
+    binding_ids: &[String],
+    holders: &[ProcMatch],
+    caller_pid: u32,
+) -> Vec<u32> {
+    let Some((caller_carries_name, caller_process_id)) = identity_facts_of(caller_pid, name) else {
+        return vec![caller_pid];
+    };
+    if !caller_carries_name && caller_process_id.is_empty() {
+        return vec![caller_pid];
+    }
+    let root = ancestor_or_self_pids(caller_pid)
+        .into_iter()
+        .rev()
+        .find(|pid| {
+            let Some((carries_name, process_id)) = identity_facts_of(*pid, name) else {
+                return false;
+            };
+            let carrier = carries_name || is_bound_process_id(&process_id, binding_ids);
+            let shares = (carries_name && caller_carries_name)
+                || (!caller_process_id.is_empty() && process_id == caller_process_id);
+            carrier && shares
+        });
+    let Some(root) = root else {
+        return vec![caller_pid];
+    };
+    let mut tree = vec![caller_pid];
+    if root != caller_pid {
+        tree.push(root);
+    }
+    for h in holders {
+        if !tree.contains(&h.pid) && ancestor_or_self_pids(h.pid).contains(&root) {
+            tree.push(h.pid);
+        }
+    }
+    tree
+}
+
+/// Refuse to spawn under `<name>` over a live holder or an orphan — the one
+/// uniform spawn gate (`start --as`, resume, and explicit-name launch all
+/// share this rule).
 ///
 /// Carriers match by name OR by any of the instance's binding process ids,
 /// so a live self-bound holder (process id only, no name in env) refuses
-/// exactly like a live hcom-launched holder:
+/// exactly like a live hcom-launched holder. The caller's own identity tree
+/// ([`caller_identity_tree`]) is removed from the carrier set first: a
+/// session re-registering its own name is never blocked by its own
+/// processes. What remains is classified:
 ///
 /// - Newest binding's own process_id still carried by a live process → live
 ///   holder, refuse.
@@ -406,20 +797,36 @@ fn wait_for_exit_pids(pids: &[u32], budget: std::time::Duration) {
 /// - A same-name process with an old process_id started *after* the binding
 ///   (subagent shape: children inherit the parent's process id and outlive
 ///   the rebind) is not an orphan → proceed.
-/// - Nothing alive → proceed (a DB-active row is the DB layer's business:
+/// - Nothing left alive → proceed (a DB-active row is the DB layer's business:
 ///   resume keeps its existing "still active" message for that case).
 /// - No binding at all but live name carriers → live holders, refuse. (A
 ///   process carrying only an unknown process_id is unattributable without
 ///   bindings, so it never blocks — this keeps `start --as` recovery working
 ///   after a row plus its bindings were deleted.)
+///
+/// Residual: name-carrying impostors with NO process id that sit in the
+/// caller's identity tree are indistinguishable from the caller's own
+/// processes and are excluded with it — accepted because identity leaks into
+/// descendant env are being removed separately (see the post-exit shell fix
+/// already in this base).
 pub fn check_spawn_allowed(db: &HcomDb, name: &str) -> Result<(), SpawnRefusal> {
     let binding_ids = db.process_binding_ids(name).unwrap_or_default();
     let holders = processes_for_instance(name, &binding_ids);
     if holders.is_empty() {
         return Ok(());
     }
+    let self_tree = caller_identity_tree(name, &binding_ids, &holders, std::process::id());
+    let remainder: Vec<ProcMatch> = holders
+        .into_iter()
+        .filter(|h| !self_tree.contains(&h.pid))
+        .collect();
+    // Only carriers outside the caller's own identity tree can refuse the
+    // spawn; with the tree gone the gate is open.
+    if remainder.is_empty() {
+        return Ok(());
+    }
     let newest = db.newest_process_binding(name).unwrap_or(None);
-    classify_holders(name, &holders, newest)
+    classify_holders(name, &remainder, newest)
 }
 
 /// Pure spawn-gate decision over an enumerated carrier set: the part of
@@ -691,6 +1098,38 @@ mod tests {
             .expect("spawn sleep")
     }
 
+    /// Arm this thread's reap round seam (`fire_round_seam`): `hook` runs on
+    /// the calling thread at the named round boundary. The reaper thread
+    /// arms it before its reap call, so a test lands actions at one exact
+    /// instruction boundary of the round instead of racing the clock.
+    #[cfg(unix)]
+    fn arm_round_seam(hook: impl FnMut(RoundPoint) + 'static) {
+        ROUND_SEAM.with(|seam| *seam.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// The round seam as a rendezvous: the reaper blocks at `point` until
+    /// the returned sender is fired, and the returned receiver yields when
+    /// the boundary is reached — so the test's registration/spawn lands at
+    /// one exact instruction boundary of the round.
+    #[cfg(unix)]
+    fn rendezvous_at(
+        point: RoundPoint,
+    ) -> (
+        impl FnMut(RoundPoint) + Send + 'static,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (hit_tx, hit_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let hook = move |p: RoundPoint| {
+            if p == point {
+                hit_tx.send(()).ok();
+                release_rx.recv().ok();
+            }
+        };
+        (hook, hit_rx, release_tx)
+    }
+
     #[cfg(unix)]
     fn wait_for_enumerated(name: &str, binding_ids: &[String], pid: u32) -> Vec<ProcMatch> {
         for _ in 0..50 {
@@ -739,13 +1178,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reap_kills_whole_tree_and_reports_survivors_shape() {
+        let db = test_db();
         let name = unique_name("reap");
         let mut a = spawn_named_sleeper(&name, "proc-reap");
         let mut b = spawn_named_sleeper(&name, "proc-reap");
         let (pa, pb) = (a.id(), b.id());
         wait_for_enumerated(&name, &[], pa);
         wait_for_enumerated(&name, &[], pb);
-        assert!(reap_instance_tree_for(&name, &[]).is_ok());
+        assert!(reap_instance_tree_for(&db, &name, &[]).is_ok());
         // Reap the (zombie) children so bare kill-0 liveness observes them.
         a.wait().ok();
         b.wait().ok();
@@ -756,7 +1196,53 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reap_empty_name_is_noop_ok() {
-        assert!(reap_instance_tree_for(&unique_name("empty"), &[]).is_ok());
+        let db = test_db();
+        assert!(reap_instance_tree_for(&db, &unique_name("empty"), &[]).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn caller_ancestors_start_at_self_and_end_at_init() {
+        let chain = caller_ancestor_pids();
+        assert!(!chain.is_empty(), "chain always holds at least self");
+        assert_eq!(chain[0], std::process::id(), "chain starts at the caller");
+        assert!(
+            chain.iter().all(|p| *p > 0),
+            "no null pids in chain: {chain:?}"
+        );
+        assert_eq!(*chain.last().unwrap(), 1, "chain walks to init: {chain:?}");
+        if chain.len() > 1 {
+            let parent = unsafe { libc::getppid() } as u32;
+            assert_eq!(chain[1], parent, "second link is the real parent");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reap_excluding_spares_excluded_carrier() {
+        let db = test_db();
+        let name = unique_name("exclude");
+        let mut spared = spawn_named_sleeper(&name, "proc-exclude-spared");
+        let mut reaped = spawn_named_sleeper(&name, "proc-exclude-reaped");
+        let (spared_pid, reaped_pid) = (spared.id(), reaped.id());
+        wait_for_enumerated(&name, &[], spared_pid);
+        wait_for_enumerated(&name, &[], reaped_pid);
+        assert!(
+            reap_instance_tree_for_excluding(&db, &name, &[], std::slice::from_ref(&spared_pid))
+                .is_ok(),
+            "excluded carrier must not count as a survivor"
+        );
+        reaped.wait().ok();
+        assert!(
+            !crate::sys::process::is_alive(reaped_pid),
+            "non-excluded carrier is reaped"
+        );
+        assert!(
+            crate::sys::process::is_alive(spared_pid),
+            "excluded carrier is never signalled"
+        );
+        spared.kill().ok();
+        spared.wait().ok();
     }
 
     // -- Spawn-gate (B) and release/sweep (C) tests need a DB ---------------
@@ -765,6 +1251,17 @@ mod tests {
         let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
         db.init_db().unwrap();
         db
+    }
+
+    /// A file-backed test DB two connections can share: for tests that write
+    /// bindings from the main thread while a reap thread reads them on its
+    /// own connection.
+    #[cfg(unix)]
+    fn file_test_db() -> (tempfile::TempDir, crate::db::HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
     }
 
     fn insert_row(db: &crate::db::HcomDb, name: &str, status: &str, pid: Option<i64>) {
@@ -1045,46 +1542,437 @@ mod tests {
         assert!(db.get_instance_full("empty-origin-row").unwrap().is_none());
     }
 
+    /// Reap scope (kill arm): a name-only carrier that appears after the
+    /// reap began is a late fork of the dying tree, not a new registration —
+    /// it carries no binding id of its own (empty process id), so it is in
+    /// scope: signalled in the KILL round, and while alive a survivor
+    /// (fail-closed). The initial carrier is SIGSTOPped, so the reap burns
+    /// its full TERM wait before the KILL re-enumeration and the late fork
+    /// lands squarely inside that round: the kill is the scope rule's doing,
+    /// not a missed enumeration.
     #[test]
     #[cfg(unix)]
-    fn reap_kills_child_forked_after_enumerate() {
-        let name = unique_name("latefork");
-        let mut first = spawn_named_sleeper(&name, "proc-late");
+    fn reap_scope_kills_late_name_only_fork() {
+        let name = unique_name("scopefork");
+        let binding_ids = vec![format!("proc-scope-{}", rand_suffix())];
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        // Fork a second carrier mid-reap: it lands after the first snapshot
-        // (reap spends 5 s in TERM-wait) and must still be reaped — the old
-        // pid-snapshot verification would have missed it and returned Ok
-        // under a live holder.
-        let late_name = name.clone();
-        let late = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let mut child = spawn_named_sleeper(&late_name, "proc-late");
-            let pid = child.id();
-            // Wait until reap kills it (or time out and clean up ourselves so
-            // the test can never hang).
-            for _ in 0..150 {
-                if !crate::sys::process::is_alive(pid) || is_zombie(pid) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            child.kill().ok();
-            child.wait().ok();
-            pid
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reap_name = name.clone();
+        let reap_bindings = binding_ids.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = test_db();
+            tx.send(()).ok();
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
         });
+        rx.recv().unwrap();
+        // Late and name-only: no epoch token of its own (empty process id)
+        // — the mid-reap fork shape of the dying tree.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut late = spawn_named_sleeper(&name, "");
+        let late_pid = late.id();
+
+        let result = reaper.join().expect("reap thread");
+        first.wait().ok();
+        late.wait().ok();
         assert!(
-            reap_instance_tree_for(&name, &[]).is_ok(),
-            "late-forked child must be reaped"
+            result.is_ok(),
+            "the late fork dies within the signal budget: {result:?}"
         );
-        let late_pid = late.join().expect("late-fork thread");
+        assert!(
+            !crate::sys::process::is_alive(first_pid),
+            "in-scope initial carrier is reaped"
+        );
+        assert!(
+            !crate::sys::process::is_alive(late_pid),
+            "name-only late fork is signalled despite starting after the reap"
+        );
+    }
+
+    /// Reap scope (spare arm): a carrier that appears after the reap began
+    /// with a non-empty `HCOM_PROCESS_ID` REGISTERED mid-sequence — a fresh
+    /// binding of a newer epoch, outside the call-start ids — is never
+    /// signalled, never a survivor. Same SIGSTOP choreography as the kill
+    /// arm: the spare is the scope rule's doing, not a missed enumeration.
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_spares_late_new_epoch_carrier() {
+        let (_dir, db) = file_test_db();
+        let db_path = db.path().to_path_buf();
+        let name = unique_name("scopespare");
+        let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_pid = first.id();
+        wait_for_enumerated(&name, &[], first_pid);
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let fresh_binding = format!("proc-fresh-{}", rand_suffix());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reap_name = name.clone();
+        let reap_bindings = binding_ids.clone();
+        let reap_db_path = db_path.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = crate::db::HcomDb::open_raw(&reap_db_path).unwrap();
+            tx.send(()).ok();
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
+        });
+        rx.recv().unwrap();
+        // Late with a fresh binding id outside the call-start set — the
+        // binding is REGISTERED mid-sequence (the newer-epoch evidence).
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        db.set_process_binding(&fresh_binding, "sess", &name)
+            .unwrap();
+        let mut late = spawn_named_sleeper(&name, &fresh_binding);
+        let late_pid = late.id();
+        // Exec barrier: pin the late carrier as an ENUMERATED carrier (a
+        // pre-exec child carries no identity) — the spare must be the scope
+        // rule's doing, never a missed enumeration.
+        wait_for_enumerated(&name, &[], late_pid);
+
+        let result = reaper.join().expect("reap thread");
+        assert!(
+            result.is_ok(),
+            "a newer-epoch carrier is never a survivor: {result:?}"
+        );
         first.wait().ok();
         assert!(
-            processes_for_instance(&name, &[])
-                .iter()
-                .all(|m| m.pid != late_pid),
-            "late carrier {late_pid} still enumerated"
+            !crate::sys::process::is_alive(first_pid),
+            "in-scope initial carrier is reaped"
         );
+        // try_wait, not is_alive: a SIGKILLed-but-unreaped child is a zombie
+        // and reads alive — None means the carrier never got signalled.
+        let late_status = late.try_wait().unwrap();
+        assert!(
+            late_status.is_none(),
+            "newer-epoch carrier is spared (pid {late_pid} was signalled: \
+             {late_status:?})"
+        );
+        late.kill().ok();
+        late.wait().ok();
+    }
+
+    /// Reap scope (epoch arm): a carrier that appears after the reap began
+    /// but carries one of the ORIGINAL binding ids — the genuine mid-reap
+    /// fork shape, whose inherited env keeps the call-start binding id — is
+    /// signalled in the KILL round: same binding epoch as the dying tree.
+    /// Same SIGSTOP timing as the kill arm: the catch is the scope rule's
+    /// doing, not a missed enumeration.
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_kills_late_binding_carrier() {
+        let name = unique_name("scopebind");
+        let binding = format!("proc-scope-{}", rand_suffix());
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_pid = first.id();
+        wait_for_enumerated(&name, &[], first_pid);
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reap_name = name.clone();
+        let reap_binding = binding.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = test_db();
+            tx.send(()).ok();
+            reap_instance_tree_for_excluding(
+                &db,
+                &reap_name,
+                std::slice::from_ref(&reap_binding),
+                &[],
+            )
+        });
+        rx.recv().unwrap();
+        // Late fork shape: no name, only the call-start binding id.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut late = spawn_pid_only_sleeper(&binding);
+        let late_pid = late.id();
+        wait_for_enumerated(&name, std::slice::from_ref(&binding), late_pid);
+
+        let result = reaper.join().expect("reap thread");
+        assert!(
+            result.is_ok(),
+            "binding-id fork is caught, never a survivor: {result:?}"
+        );
+        first.wait().ok();
+        late.wait().ok();
+        assert!(
+            !crate::sys::process::is_alive(first_pid),
+            "initial carrier is reaped"
+        );
+        assert!(
+            !crate::sys::process::is_alive(late_pid),
+            "late binding-id carrier is signalled despite starting after the reap"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_boundary_empty_process_id_is_in_scope() {
+        // The scope boundary is the fresh binding registry, not the clock: a
+        // late carrier with an empty process id is in scope (the name-only
+        // late fork — signalled, and while alive a survivor), and only a
+        // non-empty process id REGISTERED in the fresh epoch reads as a
+        // newer epoch and is spared. start_epoch deliberately never decides.
+        let fresh = vec!["proc-fresh-2".to_string()];
+        let carrier = |pid: u32, process_id: &str| ProcMatch {
+            pid,
+            process_id: process_id.to_string(),
+            start_epoch: 0.0,
+        };
+        let mut spared = HashSet::new();
+        // Name-only (empty process id): in scope, registry or not.
+        assert!(carrier_in_reap_scope(
+            &carrier(424242, ""),
+            &fresh,
+            &mut spared
+        ));
+        assert!(carrier_in_reap_scope(
+            &carrier(424243, ""),
+            &[],
+            &mut spared
+        ));
+        // Fresh registered binding id (newer binding epoch): spared.
+        assert!(!carrier_in_reap_scope(
+            &carrier(424244, "proc-fresh-2"),
+            &fresh,
+            &mut spared
+        ));
+        // Call-start binding id (the dying epoch's own token, subtracted
+        // from the fresh set by construction): in scope.
+        assert!(carrier_in_reap_scope(
+            &carrier(424245, "proc-call-start"),
+            &fresh,
+            &mut spared
+        ));
+        // Stale non-empty id claimed by no binding at all: in scope — name
+        // matching makes the carrier part of the old instance.
+        assert!(carrier_in_reap_scope(
+            &carrier(424246, "proc-stale"),
+            &fresh,
+            &mut spared
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_spared_carrier_stays_spared_across_rounds() {
+        // The spare decision is captured once per carrier: a carrier spared
+        // in one round is never reclassified into scope by a later round
+        // (e.g. its fresh binding released again before verification).
+        let carrier = ProcMatch {
+            pid: 425001,
+            process_id: "proc-fresh-9".to_string(),
+            start_epoch: 0.0,
+        };
+        let mut spared = HashSet::new();
+        let round_one = vec!["proc-fresh-9".to_string()];
+        assert!(
+            !carrier_in_reap_scope(&carrier, &round_one, &mut spared),
+            "the registry round spares the fresh registration"
+        );
+        assert!(
+            !carrier_in_reap_scope(&carrier, &[], &mut spared),
+            "a spared carrier stays spared even after its binding vanishes"
+        );
+        assert!(!carrier_in_reap_scope(
+            &carrier,
+            &["proc-other".to_string()],
+            &mut spared
+        ));
+    }
+
+    /// Reap scope (stale-id arm): a late child carrying a STALE non-empty
+    /// `HCOM_PROCESS_ID` — one no current binding claims, inherited from an
+    /// older era — is name-matched to the dying instance and must be killed,
+    /// not spared. The pre-v3 rule spared every non-empty id outside the
+    /// call-start set, which let such a child outlive its instance's
+    /// teardown.
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_kills_late_stale_unbound_carrier() {
+        let name = unique_name("scopestale");
+        let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_pid = first.id();
+        wait_for_enumerated(&name, &[], first_pid);
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reap_name = name.clone();
+        let reap_bindings = binding_ids.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = test_db();
+            tx.send(()).ok();
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
+        });
+        rx.recv().unwrap();
+        // Late child of the old instance: carries the name plus a stale id
+        // that is in NO binding registry.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut late = spawn_named_sleeper(&name, &format!("proc-stale-{}", rand_suffix()));
+        let late_pid = late.id();
+
+        let result = reaper.join().expect("reap thread");
+        first.wait().ok();
+        late.wait().ok();
+        assert!(
+            result.is_ok(),
+            "a stale-id late carrier dies within the signal budget: {result:?}"
+        );
+        assert!(
+            !crate::sys::process::is_alive(first_pid),
+            "in-scope initial carrier is reaped"
+        );
+        assert!(
+            !crate::sys::process::is_alive(late_pid),
+            "stale-id late carrier is signalled despite its non-empty process id"
+        );
+    }
+
+    /// Reap scope (round-ordering regression — the read-after-capture rule):
+    /// a fresh registration committed and its process spawned at the
+    /// boundary between the KILL round's carrier capture and its registry
+    /// read — the exact interleaving the old read-before-capture order could
+    /// not survive: binding committed after the read, process spawned before
+    /// the capture, so the fresh id was missing from the captured id set and
+    /// the brand-new process was classified stale (an unclaimed id of the
+    /// dying epoch) and SIGKILLed. Capture first and the fresh process is
+    /// spawned AFTER it — never classified, never signalled (alive after the
+    /// reap), never a survivor (the reap is Ok while it lives). The pair
+    /// lands register-then-spawn, the launcher's pre-spawn registration
+    /// order (`db.set_process_binding` runs before the tool spawn,
+    /// launcher.rs:2005) — which is exactly why a registry read taken after
+    /// the capture must include any captured process's binding.
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_spares_fresh_launch_landing_after_round_capture() {
+        let (_dir, db) = file_test_db();
+        let db_path = db.path().to_path_buf();
+        let name = unique_name("scopeorder");
+        let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_pid = first.id();
+        wait_for_enumerated(&name, &[], first_pid);
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let fresh_binding = format!("proc-fresh-{}", rand_suffix());
+        let (hook, hit, release) = rendezvous_at(RoundPoint::Captured);
+        let reap_name = name.clone();
+        let reap_bindings = binding_ids.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+            arm_round_seam(hook);
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
+        });
+        // Past the full TERM wait (`first` is SIGSTOPped and cannot exit):
+        // the KILL round has captured its carrier set.
+        hit.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("KILL round reaches its capture boundary");
+        // The concurrent launch at that boundary: register the fresh
+        // binding, THEN spawn its process — both after the capture, before
+        // the round's registry read.
+        db.set_process_binding(&fresh_binding, "sess", &name)
+            .unwrap();
+        let mut late = spawn_named_sleeper(&name, &fresh_binding);
+        let late_pid = late.id();
+        // Let the child exec before releasing the round — a pre-exec child
+        // carries no identity yet, so the round's capture only sees it once
+        // it enumerates as a carrier.
+        wait_for_enumerated(&name, &[], late_pid);
+        release.send(()).ok();
+
+        let result = reaper.join().expect("reap thread");
+        first.wait().ok();
+        assert!(
+            result.is_ok(),
+            "the fresh process is never a survivor: {result:?}"
+        );
+        assert!(
+            !crate::sys::process::is_alive(first_pid),
+            "in-scope initial carrier is reaped"
+        );
+        // try_wait, not is_alive: a SIGKILLed-but-unreaped child is a zombie
+        // and reads alive — None means the fresh process never got signalled.
+        let late_status = late.try_wait().unwrap();
+        assert!(
+            late_status.is_none(),
+            "a fresh process spawned after the round's capture is spared \
+             end-to-end (pid {late_pid} was signalled: {late_status:?})"
+        );
+        late.kill().ok();
+        late.wait().ok();
+    }
+
+    /// Reap scope (pre-signal revalidation): a binding landing between the
+    /// KILL round's classification and its signal round — the residual
+    /// first-hook spawn-to-bind shape — is caught by the pre-signal registry
+    /// re-read. The late carrier is captured and classified IN SCOPE against
+    /// the earlier read (its id is registered nowhere yet — the stale-id
+    /// shape), its registration lands at the classification boundary, and
+    /// the revalidation drops it from the signal set into the spared set:
+    /// never signalled (alive after the reap), never a survivor.
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_presignal_recheck_spares_mid_classification_registration() {
+        let (_dir, db) = file_test_db();
+        let db_path = db.path().to_path_buf();
+        let name = unique_name("scoperecheck");
+        let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_pid = first.id();
+        wait_for_enumerated(&name, &[], first_pid);
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let late_binding = format!("proc-fresh-{}", rand_suffix());
+        let (hook, hit, release) = rendezvous_at(RoundPoint::Classified);
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let reap_name = name.clone();
+        let reap_bindings = binding_ids.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+            arm_round_seam(hook);
+            start_tx.send(()).ok();
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
+        });
+        start_rx.recv().unwrap();
+        // Late carrier with a not-yet-registered id, spawned after the reap
+        // began: it is classified (a late carrier), never a first-snapshot
+        // pid.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut late = spawn_named_sleeper(&name, &late_binding);
+        let late_pid = late.id();
+        wait_for_enumerated(&name, &[], late_pid);
+        // The registration lands between classification and the signal
+        // round: the pre-signal re-read must spare the carrier.
+        hit.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("KILL round reaches its classification boundary");
+        db.set_process_binding(&late_binding, "sess", &name)
+            .unwrap();
+        release.send(()).ok();
+
+        let result = reaper.join().expect("reap thread");
+        first.wait().ok();
+        assert!(
+            result.is_ok(),
+            "the revalidation-spared carrier is never a survivor: {result:?}"
+        );
+        assert!(
+            !crate::sys::process::is_alive(first_pid),
+            "in-scope initial carrier is reaped"
+        );
+        // try_wait, not is_alive: a SIGKILLed-but-unreaped child is a zombie
+        // and reads alive — None means the carrier never got signalled.
+        let late_status = late.try_wait().unwrap();
+        assert!(
+            late_status.is_none(),
+            "the pre-signal revalidation drops the mid-classification \
+             registration from the signal set (pid {late_pid} was signalled: \
+             {late_status:?})"
+        );
+        late.kill().ok();
+        late.wait().ok();
     }
 
     #[test]
@@ -1225,12 +2113,13 @@ mod tests {
     fn reap_kills_pid_only_carrier_by_binding() {
         // Reap: a sleeper carrying only HCOM_PROCESS_ID=<binding> is the
         // self-bound tree and must die with the instance.
+        let db = test_db();
         let name = unique_name("reappid");
         let binding = format!("proc-reap-{}", rand_suffix());
         let mut sleeper = spawn_pid_only_sleeper(&binding);
         let pid = sleeper.id();
         wait_for_enumerated(&name, std::slice::from_ref(&binding), pid);
-        assert!(reap_instance_tree_for(&name, &[binding]).is_ok());
+        assert!(reap_instance_tree_for(&db, &name, &[binding]).is_ok());
         sleeper.wait().ok();
         assert!(
             !crate::sys::process::is_alive(pid),
@@ -1265,5 +2154,278 @@ mod tests {
         assert!(swept.contains(&name), "zombie-held row kept: {swept:?}");
         assert!(db.get_instance_full(&name).unwrap().is_none());
         sleeper.wait().ok();
+    }
+
+    // -- Caller identity tree: the spawn gate's self rule -------------------
+
+    /// Poses the caller's identity env — the spawn gate reads these two from
+    /// the live env — and restores whatever was there on drop.
+    #[cfg(unix)]
+    struct CallerIdentityEnv(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl CallerIdentityEnv {
+        fn pose(instance_name: Option<&str>, process_id: Option<&str>) -> Self {
+            let saved = (
+                std::env::var_os("HCOM_INSTANCE_NAME"),
+                std::env::var_os("HCOM_PROCESS_ID"),
+            );
+            unsafe {
+                match instance_name {
+                    Some(v) => std::env::set_var("HCOM_INSTANCE_NAME", v),
+                    None => std::env::remove_var("HCOM_INSTANCE_NAME"),
+                }
+                match process_id {
+                    Some(v) => std::env::set_var("HCOM_PROCESS_ID", v),
+                    None => std::env::remove_var("HCOM_PROCESS_ID"),
+                }
+            }
+            Self(saved.0, saved.1)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CallerIdentityEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("HCOM_INSTANCE_NAME", v),
+                    None => std::env::remove_var("HCOM_INSTANCE_NAME"),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("HCOM_PROCESS_ID", v),
+                    None => std::env::remove_var("HCOM_PROCESS_ID"),
+                }
+            }
+        }
+    }
+
+    /// A name/process-id-carrying sleeper in a tree of its own: `sh` spawns
+    /// it in the background and exits, so the sleeper is reparented to init —
+    /// its ppid chain never passes through the test process. Returns its pid
+    /// (it is not our child, so kill it with `libc::kill`).
+    #[cfg(unix)]
+    fn spawn_detached_named_sleeper(name: &str, process_id: &str) -> u32 {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300 >/dev/null 2>&1 & echo $!")
+            .env("HCOM_INSTANCE_NAME", name)
+            .env("HCOM_PROCESS_ID", process_id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("spawn detached sleeper");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("detached sleeper pid")
+    }
+
+    /// A sleeper with no identity env at all: it can sit topologically inside
+    /// another process's tree but has no facts to share.
+    #[cfg(unix)]
+    fn spawn_stripped_sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("300")
+            .env_remove("HCOM_INSTANCE_NAME")
+            .env_remove("HCOM_PROCESS_ID")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn stripped sleep")
+    }
+
+    /// Self-gate, name shape: the caller matches the target's carriers by
+    /// `HCOM_INSTANCE_NAME` and only its own tree is alive. The carrier
+    /// holds the newest binding (a live holder for any foreign caller), so
+    /// this Ok is exactly the identity-tree exclusion.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn spawn_allows_name_carriers_in_caller_identity_tree() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = unique_name("selfname");
+        let binding = format!("proc-new-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let mut sleeper = spawn_named_sleeper(&name, &binding);
+        let pid = sleeper.id();
+        wait_for_enumerated(&name, &[], pid);
+        let _identity = CallerIdentityEnv::pose(Some(&name), None);
+        assert!(
+            check_spawn_allowed(&db, &name).is_ok(),
+            "the caller's own identity tree must never block it"
+        );
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    /// Self-gate, binding shape: the caller matches by
+    /// `HCOM_PROCESS_ID=<binding>` (the self-bound session shape) and only
+    /// its own tree is alive — again over a newest-binding carrier that
+    /// would refuse any foreign caller.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn spawn_allows_binding_carriers_in_caller_identity_tree() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = unique_name("selfbind");
+        let binding = format!("proc-self-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let mut sleeper = spawn_pid_only_sleeper(&binding);
+        let pid = sleeper.id();
+        wait_for_enumerated(&name, std::slice::from_ref(&binding), pid);
+        let _identity = CallerIdentityEnv::pose(None, Some(&binding));
+        assert!(
+            check_spawn_allowed(&db, &name).is_ok(),
+            "the caller's own identity tree must never block it"
+        );
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    /// Foreign gate: a caller with no identity facts finds no root and gets
+    /// the exact pre-existing refusal over a live holder. The self rule never
+    /// opens the gate for a foreign claimant.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn spawn_refuses_stripped_caller_over_live_holder() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = unique_name("foreign");
+        let binding = format!("proc-cur-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let mut sleeper = spawn_named_sleeper(&name, &binding);
+        let pid = sleeper.id();
+        wait_for_enumerated(&name, &[], pid);
+        let _identity = CallerIdentityEnv::pose(None, None);
+        let err = check_spawn_allowed(&db, &name).expect_err("foreign caller must refuse");
+        assert_eq!(err.kind, HolderKind::LiveHolder);
+        assert!(err.pids.contains(&pid), "refusal names the pid: {err}");
+        let shown = err.to_string();
+        assert!(
+            shown.contains(&format!("refusing to spawn under '{name}'")),
+            "exact refusal unchanged: {shown}"
+        );
+        assert!(
+            shown.contains(&format!("hcom kill {name}")),
+            "exact refusal unchanged: {shown}"
+        );
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    /// Blocker-A shape: the caller matches the target's newest binding, but
+    /// a pre-binding orphan is alive in a SEPARATE tree (double-forked,
+    /// reparented to init). Reclaiming the name would leave that process
+    /// alive under the reclaimed identity, so the gate must refuse with the
+    /// orphan classification.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn spawn_refuses_pre_binding_orphan_outside_caller_tree() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = unique_name("orphanout");
+        let orphan = spawn_detached_named_sleeper(&name, &format!("proc-old-{}", rand_suffix()));
+        wait_for_enumerated(&name, &[], orphan);
+        let start = processes_for_instance(&name, &[])
+            .into_iter()
+            .find(|m| m.pid == orphan)
+            .expect("detached sleeper enumerated")
+            .start_epoch;
+        // New harness bound AFTER the orphan started: the orphan predates it.
+        let binding = format!("proc-new-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        backdate_binding(&db, &binding, start + 3600.0);
+        let _identity = CallerIdentityEnv::pose(None, Some(&binding));
+        let err = check_spawn_allowed(&db, &name)
+            .expect_err("pre-binding orphan outside the caller's tree must refuse");
+        assert_eq!(err.kind, HolderKind::Orphan);
+        assert!(err.pids.contains(&orphan), "refusal names the pid: {err}");
+        assert!(err.to_string().contains(&format!("hcom kill {name}")));
+        unsafe {
+            libc::kill(orphan as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
+    /// Blocker-B shape: the kill self-path leaves a name-carrying shell
+    /// standing with the row and bindings gone. A caller sharing its
+    /// identity facts sees only its own tree (resume/relaunch unblocked); a
+    /// caller with stripped identity in that same tree is foreign again.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn spawn_unbound_name_shell_self_ok_stripped_refused() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = unique_name("shellb");
+        // The surviving session shell stand-in: name-carrying, and its
+        // process id is in no binding (row deleted / bindings released).
+        let mut shell = spawn_named_sleeper(&name, &format!("proc-shell-{}", rand_suffix()));
+        let pid = shell.id();
+        wait_for_enumerated(&name, &[], pid);
+        assert!(db.process_binding_ids(&name).unwrap().is_empty());
+
+        let self_claim = CallerIdentityEnv::pose(Some(&name), None);
+        assert!(
+            check_spawn_allowed(&db, &name).is_ok(),
+            "an identity-sharing caller must not be blocked by its own tree"
+        );
+        drop(self_claim);
+
+        let _stripped = CallerIdentityEnv::pose(None, None);
+        let err = check_spawn_allowed(&db, &name)
+            .expect_err("a stripped-identity caller must refuse the surviving shell");
+        assert_eq!(err.kind, HolderKind::LiveHolder);
+        assert!(err.pids.contains(&pid), "refusal names the pid: {err}");
+        shell.kill().ok();
+        shell.wait().ok();
+    }
+
+    /// The root's identity requirement, not topology: the test process is a
+    /// name carrier (posed), so its whole subtree is "the holder's tree". A
+    /// child sharing the caller's identity facts belongs to that tree; a
+    /// child whose env was stripped of identity does NOT — it is a foreign
+    /// claimant and must face the full gate.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn caller_identity_tree_demands_identity_not_just_topology() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let name = unique_name("trap");
+        let mut sharing = spawn_named_sleeper(&name, &format!("proc-share-{}", rand_suffix()));
+        let sharing_pid = sharing.id();
+        let mut stripped = spawn_stripped_sleeper();
+        let stripped_pid = stripped.id();
+        wait_for_enumerated(&name, &[], sharing_pid);
+        let holders = processes_for_instance(&name, &[]);
+        let _identity = CallerIdentityEnv::pose(Some(&name), None);
+
+        let tree = caller_identity_tree(&name, &[], &holders, sharing_pid);
+        assert!(
+            tree.contains(&std::process::id()),
+            "the root climbs to the carrier ancestor: {tree:?}"
+        );
+        assert!(
+            tree.contains(&sharing_pid),
+            "identity-sharing child is self: {tree:?}"
+        );
+
+        let tree = caller_identity_tree(&name, &[], &holders, stripped_pid);
+        assert_eq!(
+            tree,
+            vec![stripped_pid],
+            "a stripped-identity child gets no root — topology alone is not enough"
+        );
+
+        sharing.kill().ok();
+        sharing.wait().ok();
+        stripped.kill().ok();
+        stripped.wait().ok();
     }
 }

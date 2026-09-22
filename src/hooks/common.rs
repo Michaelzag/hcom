@@ -1241,7 +1241,98 @@ pub fn stop_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0)
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, true)
+}
+
+/// External side effects of a stop: subscription notifications, listener
+/// wakes, relay push. On the standalone path they fire inline, exactly as
+/// they always have. On the kill path the whole teardown shares one
+/// transaction, so they queue here and [`Self::fire`] runs them right after
+/// that single commit — never before the writes are durable.
+#[derive(Default)]
+struct PostCommit {
+    /// `(event_id, instance, event_data)` per `stopped` event written.
+    events: Vec<(i64, String, serde_json::Value)>,
+    wake_ports: Vec<u16>,
+    push: bool,
+}
+
+impl PostCommit {
+    fn fire(&self, db: &HcomDb) {
+        for (event_id, instance, event_data) in &self.events {
+            crate::db::subscriptions::process_logged_event(
+                db, *event_id, "life", instance, event_data,
+            );
+        }
+        if !self.wake_ports.is_empty() {
+            crate::notify::wake_ports(&self.wake_ports, crate::notify::WAKE_TARGETED_MS);
+        }
+        if self.push {
+            crate::relay::spawn_background_push();
+        }
+    }
+}
+
+/// Stop instance without the process-truth reap gate — the kill path's
+/// teardown, gated and atomic. The full [`stop_instance`] DB teardown
+/// (snapshot, children, `stopped` event, release) with no signals.
+///
+/// `unchanged` is the kill's incarnation gate. It runs INSIDE the single
+/// `BEGIN IMMEDIATE` transaction that also carries every teardown write
+/// (children first, then this row's `stopped` event and release), so a
+/// re-registration can never land between the check and the use: it either
+/// serializes before the transaction — `unchanged` reads it, NOTHING is
+/// written, and the call returns `false` (the row left intact for the fresh
+/// incarnation) — or it lands after the commit. On `true`, the whole
+/// teardown (children, `stopped` event, release, capability revocation)
+/// committed as one unit and the external side effects fire right after.
+/// Any error rolls the whole teardown back and returns `Err`.
+///
+/// The `kill` command owns every call (self and foreign paths): it reaps the
+/// carrier set itself and verifies it gone BEFORE this teardown runs
+/// (survivors bail the kill with the row and bindings untouched — fail-closed,
+/// so the `stopped` write never lands while an instance process may still be
+/// alive), and it tears down only the one binding epoch it resolved against.
+/// The self path additionally needs the reap gate off because the caller is
+/// itself a carrier, and the reap gate's headless group kill would land on
+/// the caller's own session tree.
+pub fn stop_instance_without_reap(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+    unchanged: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<bool>,
+) -> Result<bool, String> {
+    let queued = db
+        .with_immediate_transaction(|tx| -> Result<Option<PostCommit>> {
+            if !unchanged(tx)? {
+                return Ok(None);
+            }
+            let mut post = PostCommit::default();
+            match stop_instance_inner_scoped(
+                db,
+                instance_name,
+                initiated_by,
+                reason,
+                false,
+                0,
+                false,
+                Some(tx),
+                &mut post,
+            ) {
+                StopOutcome::Stopped | StopOutcome::AlreadyStopped => {}
+                StopOutcome::RetryableError(e) => anyhow::bail!("{e}"),
+            }
+            Ok(Some(post))
+        })
+        .map_err(|e| e.to_string())?;
+    match queued {
+        Some(post) => {
+            post.fire(db);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1257,7 +1348,7 @@ pub(crate) fn stop_placeholder_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0)
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, true)
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1282,6 +1373,38 @@ fn stop_instance_inner(
     reason: &str,
     placeholder: bool,
     depth: u32,
+    reap_gate: bool,
+) -> StopOutcome {
+    stop_instance_inner_scoped(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        placeholder,
+        depth,
+        reap_gate,
+        None,
+        &mut PostCommit::default(),
+    )
+}
+
+/// [`stop_instance_inner`] with the write scope spelled out. `tx: None` is
+/// the standalone path: every node finalizes in its own transaction and
+/// fires its external side effects inline — unchanged historical behavior.
+/// `tx: Some` is the kill path's shared transaction: every write (children
+/// included) joins `tx`, and external effects queue into `post` until the
+/// one commit.
+#[allow(clippy::too_many_arguments)]
+fn stop_instance_inner_scoped(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+    placeholder: bool,
+    depth: u32,
+    reap_gate: bool,
+    tx: Option<&rusqlite::Transaction<'_>>,
+    post: &mut PostCommit,
 ) -> StopOutcome {
     if depth >= MAX_STOP_DEPTH {
         log::log_warn(
@@ -1308,30 +1431,38 @@ fn stop_instance_inner(
     };
 
     // Kill headless processes (background=true)
+    // Skipped when the reap gate is off (the kill paths): kill owns the
+    // signalling — the foreign path signals the process group and both paths
+    // reap the carrier set BEFORE calling in (fail-closed) — and on the self
+    // path this group signal would land on the caller's own tree.
     let pid = instance_data.pid;
     let is_headless = instance_data.background != 0;
     if let Some(pid_val) = pid {
         let pid_u32 = pid_val as u32;
         if is_headless {
-            // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
-            // Windows: forceful process-tree kill) → poll up to 2s for exit →
-            // kill_group (Unix: SIGKILL; Windows: tree kill again). The poll also
-            // waits out Windows' asynchronous TerminateProcess.
-            use crate::sys::process::GroupSignal;
-            if crate::sys::process::terminate_group(pid_u32) == GroupSignal::Sent {
-                let mut dead = false;
-                for _ in 0..20 {
-                    std::thread::sleep(Duration::from_millis(100));
-                    if !crate::sys::process::is_alive(pid_u32) {
-                        dead = true;
-                        break;
+            // Gated with the reap below: skipped on the kill paths, where the
+            // group signal could land on the caller's own tree (self path).
+            if reap_gate {
+                // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
+                // Windows: forceful process-tree kill) → poll up to 2s for exit →
+                // kill_group (Unix: SIGKILL; Windows: tree kill again). The poll also
+                // waits out Windows' asynchronous TerminateProcess.
+                use crate::sys::process::GroupSignal;
+                if crate::sys::process::terminate_group(pid_u32) == GroupSignal::Sent {
+                    let mut dead = false;
+                    for _ in 0..20 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        if !crate::sys::process::is_alive(pid_u32) {
+                            dead = true;
+                            break;
+                        }
+                    }
+                    if !dead {
+                        crate::sys::process::kill_group(pid_u32);
                     }
                 }
-                if !dead {
-                    crate::sys::process::kill_group(pid_u32);
-                }
+                // NotFound/PermissionDenied from initial signal is fine — process already gone or foreign
             }
-            // NotFound/PermissionDenied from initial signal is fine — process already gone or foreign
         } else {
             // Track surviving PTY processes in pidtrack
             let alive = crate::sys::process::is_alive(pid_u32);
@@ -1463,13 +1594,16 @@ fn stop_instance_inner(
     // Concurrent callers may repeat this work; every child has its own atomic
     // event/delete gate.
     for sub_name in session_subagents {
-        if let StopOutcome::RetryableError(error) = stop_instance_inner(
+        if let StopOutcome::RetryableError(error) = stop_instance_inner_scoped(
             db,
             &sub_name,
             initiated_by,
             "parent_stopped",
             false,
             depth + 1,
+            reap_gate,
+            tx,
+            post,
         ) {
             log::log_warn(
                 "hooks",
@@ -1486,9 +1620,17 @@ fn stop_instance_inner(
     // as parent_session_id, so only parent_name links nested children. A row
     // already stopped via the session set is a no-op here.
     for child in native_children {
-        if let StopOutcome::RetryableError(error) =
-            stop_instance_inner(db, &child, initiated_by, "parent_stopped", false, depth + 1)
-        {
+        if let StopOutcome::RetryableError(error) = stop_instance_inner_scoped(
+            db,
+            &child,
+            initiated_by,
+            "parent_stopped",
+            false,
+            depth + 1,
+            reap_gate,
+            tx,
+            post,
+        ) {
             log::log_warn(
                 "hooks",
                 "finalize.child_stop_incomplete",
@@ -1497,14 +1639,20 @@ fn stop_instance_inner(
             return StopOutcome::RetryableError(format!("could not stop child {child}: {error}"));
         }
     }
-
     // Reap the whole live tree for this name before releasing the row.
     // Process truth gates the release: the stopped event is only written
     // (and the row only deleted) once no process holds the instance — by
     // name or, for self-bound sessions, by binding process id. The pty
     // wrapper is signalled first via oldest-first ordering inside reap.
+    // Skipped when the reap gate is off (the kill paths): the caller may be
+    // one of the carriers. Kill has already reaped the carrier set — every
+    // non-self carrier on the self path — and verified it gone (fail-closed)
+    // before this teardown is called, and only after its own incarnation CAS.
     let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
-    if let Err(survivors) = crate::proctruth::reap_instance_tree_for(instance_name, &binding_ids) {
+    if reap_gate
+        && let Err(survivors) =
+            crate::proctruth::reap_instance_tree_for(db, instance_name, &binding_ids)
+    {
         let pids = survivors
             .iter()
             .map(|p| p.to_string())
@@ -1543,14 +1691,35 @@ fn stop_instance_inner(
     if placeholder {
         event_data["placeholder"] = serde_json::json!(true);
     }
-    match db.finalize_instance_stop(
-        instance_name,
-        instance_data.created_at,
-        instance_data.session_id.as_deref(),
-        instance_data.agent_id.as_deref(),
-        &event_data,
-        expected_process_id.as_deref(),
-    ) {
+    let finalized = match tx {
+        Some(tx) => db
+            .finalize_instance_stop_in_txn(
+                tx,
+                instance_name,
+                instance_data.created_at,
+                instance_data.session_id.as_deref(),
+                instance_data.agent_id.as_deref(),
+                &event_data,
+                expected_process_id.as_deref(),
+            )
+            .map(|(won, event_id)| {
+                if let Some(event_id) = event_id {
+                    // Deferred: the shared transaction is not committed yet.
+                    post.events
+                        .push((event_id, instance_name.to_string(), event_data.clone()));
+                }
+                won
+            }),
+        None => db.finalize_instance_stop(
+            instance_name,
+            instance_data.created_at,
+            instance_data.session_id.as_deref(),
+            instance_data.agent_id.as_deref(),
+            &event_data,
+            expected_process_id.as_deref(),
+        ),
+    };
+    match finalized {
         Ok(true) => {}
         Ok(false) => return StopOutcome::AlreadyStopped,
         Err(e) => {
@@ -1574,11 +1743,17 @@ fn stop_instance_inner(
         let _ = db.kv_delete_prefix(&format!("subagent_stop_inflight:{session_id}:"));
     }
 
-    // Notify remaining listeners AFTER delete (so they see the row is gone)
-    crate::notify::wake_ports(&wake_ports, crate::notify::WAKE_TARGETED_MS);
+    if tx.is_some() {
+        // Deferred: the shared transaction is not committed yet.
+        post.wake_ports.extend(wake_ports);
+        post.push = true;
+    } else {
+        // Notify remaining listeners AFTER delete (so they see the row is gone)
+        crate::notify::wake_ports(&wake_ports, crate::notify::WAKE_TARGETED_MS);
 
-    // Trigger relay push (best-effort)
-    crate::relay::spawn_background_push();
+        // Trigger relay push (best-effort)
+        crate::relay::spawn_background_push();
+    }
     StopOutcome::Stopped
 }
 
