@@ -1159,7 +1159,12 @@ mod tests {
     /// Self path: a carrier in the passed-in self set is never signalled, yet
     /// the `stopped` event is written and the bindings released first — the
     /// row is gone while a name carrier still lives, which the foreign gate
-    /// would have refused.
+    /// would have refused. Ordering proof: the kill runs on a thread while
+    /// this thread polls for the intermediate state — row released, bindings
+    /// freed, foreign carrier STILL RUNNING. That state is only reachable if
+    /// the write precedes the first non-self signal (a signalled `sleep` is
+    /// dead within microseconds, so "still running" means "not yet
+    /// signalled").
     #[test]
     #[cfg(unix)]
     #[serial]
@@ -1194,8 +1199,48 @@ mod tests {
         wait_for_enumerated(&name, foreign_pid);
 
         let self_set = vec![std::process::id(), self_pid];
-        let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set)
-            .unwrap_or_else(|e| panic!("self kill must succeed: {e}"));
+        let db_path = dir.path().join("test.db");
+        let kill_name = name.clone();
+        let killer = std::thread::spawn(move || {
+            let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+            kill_tracked_instance_with_self_pids(&db, &kill_name, "test", &self_set)
+        });
+
+        // Poll for the write-before-signal intermediate state on the second
+        // connection while the kill thread runs. Transient lock errors read
+        // as "not yet observed".
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut wrote_before_signal = false;
+        while std::time::Instant::now() < deadline {
+            let carrier_running = foreign_sleeper
+                .try_wait()
+                .expect("try_wait foreign carrier")
+                .is_none();
+            let row_released = db
+                .get_instance_full(&name)
+                .map(|row| row.is_none())
+                .unwrap_or(false);
+            let bindings_freed = db
+                .process_binding_ids(&name)
+                .map(|ids| ids.is_empty())
+                .unwrap_or(false);
+            if carrier_running && row_released && bindings_freed {
+                wrote_before_signal = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        assert!(
+            wrote_before_signal,
+            "stopped write + binding release must land before the first non-self signal"
+        );
+
+        let result = killer.join().expect("kill thread");
+        assert!(
+            result.is_ok(),
+            "kill entry must return Ok (the CLI exit-0 result)"
+        );
+        let result = result.expect("Ok asserted above");
         assert_eq!(
             result.self_excluded, 1,
             "exactly the self carrier is spared"

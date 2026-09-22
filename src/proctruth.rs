@@ -18,7 +18,10 @@
 //!   so the pty wrapper goes before its children), wait up to 5 s, SIGKILL
 //!   survivors.
 //! - [`check_spawn_allowed`]: refuse to spawn under `<name>` over a live
-//!   holder or an orphan (started before the newest binding).
+//!   holder or an orphan (started before the newest binding) — the one
+//!   uniform spawn gate, after removing the caller's own identity tree from
+//!   the carrier set (a session re-registering its own name is never blocked
+//!   by its own processes).
 //! - [`sweep_vanished_instances`]: daemon-side periodic check that notices
 //!   rows whose harness is gone without a `stopped` event.
 //!
@@ -144,10 +147,35 @@ fn identity_facts(env: &[u8], want: &[u8]) -> (bool, String) {
     (carries_name, process_id)
 }
 
+/// The two identity facts of `pid` (see [`identity_facts`]) as the spawn
+/// gate reads them. The calling process's own facts come from its LIVE
+/// environment — what it actually carries and passes to its children, the
+/// same source `HcomContext` resolves identity from. Every other pid is
+/// read from `/proc/<pid>/environ`; None when that is unreadable (exited,
+/// or foreign-owned).
+fn identity_facts_of(pid: u32, name: &str) -> Option<(bool, String)> {
+    if pid == std::process::id() {
+        return Some((
+            std::env::var("HCOM_INSTANCE_NAME").is_ok_and(|v| v == name),
+            std::env::var("HCOM_PROCESS_ID").unwrap_or_default(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let want = format!("HCOM_INSTANCE_NAME={name}");
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .ok()
+            .map(|env| identity_facts(&env, want.as_bytes()))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// True when a decoded `HCOM_PROCESS_ID` value names one of the instance's
 /// bindings. Empty never matches, so an absent entry (or an empty binding
 /// id) can never hold an instance.
-#[cfg(unix)]
 fn is_bound_process_id(process_id: &str, binding_ids: &[String]) -> bool {
     !process_id.is_empty() && binding_ids.iter().any(|id| id == process_id)
 }
@@ -260,47 +288,52 @@ fn is_zombie(pid: u32) -> bool {
         .map(|(_, rest)| rest.trim_start().starts_with('Z'))
         .unwrap_or(false)
 }
+/// Field 4 (ppid) of `/proc/<pid>/stat` — the token after the closing `)` of
+/// comm, so a comm containing spaces or parens cannot shift the parse. None
+/// when the process is gone, unparseable, or has no parent (ppid 0).
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next()?;
+    let ppid: u32 = fields.next()?.parse().ok()?;
+    (ppid != 0).then_some(ppid)
+}
+
+/// `pid` plus its /proc ppid-ancestor chain, youngest first, ending at init
+/// (a bonded iteration cap guards against a corrupted chain).
+fn ancestor_or_self_pids(pid: u32) -> Vec<u32> {
+    let mut out = vec![pid];
+    let mut cur = pid;
+    while let Some(ppid) = parent_pid(cur) {
+        if ppid == cur {
+            break;
+        }
+        out.push(ppid);
+        if ppid == 1 || out.len() > 1024 {
+            break;
+        }
+        cur = ppid;
+    }
+    out
+}
+
 /// The calling process's own pid plus its /proc ppid-ancestor chain.
 ///
 /// Exists so lifecycle signalling can exclude the caller's own session tree:
 /// a CLI running inside the instance it operates on inherits the name but
 /// must never be signalled for it. Ancestors are read from field 4 (ppid) of
-/// `/proc/<pid>/stat` — the token after the closing `)` of comm, so a comm
-/// containing spaces or parens cannot shift the parse — walking up until pid
-/// 1 (bonded iteration cap guards against a corrupted chain).
+/// `/proc/<pid>/stat` (see [`parent_pid`]) — walking up until pid 1.
 ///
 /// Unix only; elsewhere this is just the caller's own pid.
 pub fn caller_ancestor_pids() -> Vec<u32> {
     #[cfg(not(unix))]
     {
-        return vec![std::process::id()];
+        vec![std::process::id()]
     }
     #[cfg(unix)]
     {
-        let mut out = vec![std::process::id()];
-        let mut pid = std::process::id();
-        while let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            let Some(end) = stat.rfind(')') else {
-                break;
-            };
-            let mut fields = stat[end + 1..].split_whitespace();
-            let _state = fields.next();
-            let Some(ppid_str) = fields.next() else {
-                break;
-            };
-            let Ok(ppid) = ppid_str.parse::<u32>() else {
-                break;
-            };
-            if ppid == 0 || ppid == pid {
-                break;
-            }
-            out.push(ppid);
-            if ppid == 1 || out.len() > 1024 {
-                break;
-            }
-            pid = ppid;
-        }
-        out
+        ancestor_or_self_pids(std::process::id())
     }
 }
 
@@ -458,11 +491,79 @@ fn wait_for_exit_pids(pids: &[u32], budget: std::time::Duration) {
     }
 }
 
-/// Refuse to spawn under `<name>` over a live holder or an orphan.
+/// The caller's own identity tree: the slice of the live process table that
+/// is the caller's own session, never a foreign name holder.
+///
+/// Root: the OLDEST ancestor-or-self of `caller_pid` that is itself a
+/// carrier (carries `HCOM_INSTANCE_NAME=<name>` or one of the instance's
+/// binding process ids) AND shares the caller's identity facts — the same
+/// non-empty `HCOM_PROCESS_ID` value, or both carrying the target name. The
+/// tree is that root plus every process whose ppid-ancestor chain passes
+/// through it: a session's carriers sit above and beside the CLI running the
+/// gate, all under one session root.
+///
+/// Topology alone never finds a root: a child of a holder's tree whose env
+/// was stripped of identity must not have that tree treated as its own — it
+/// is a foreign claimant, and the identity match at the root is what says
+/// so. A caller carrying no identity facts therefore finds no root; its tree
+/// is just its own pid (already excluded from [`processes_for_instance`])
+/// and the gate runs full, exactly as before this rule existed.
+///
+/// Returns the tree as far as the gate needs it: the caller's own pid, the
+/// root, and every enumerated carrier inside it — exactly the pids
+/// [`check_spawn_allowed`] removes from the carrier set.
+///
+/// `caller_pid` is [`std::process::id()`] in production; it is a parameter
+/// so tests can model a caller inside an arbitrary tree.
+fn caller_identity_tree(
+    name: &str,
+    binding_ids: &[String],
+    holders: &[ProcMatch],
+    caller_pid: u32,
+) -> Vec<u32> {
+    let Some((caller_carries_name, caller_process_id)) = identity_facts_of(caller_pid, name) else {
+        return vec![caller_pid];
+    };
+    if !caller_carries_name && caller_process_id.is_empty() {
+        return vec![caller_pid];
+    }
+    let root = ancestor_or_self_pids(caller_pid)
+        .into_iter()
+        .rev()
+        .find(|pid| {
+            let Some((carries_name, process_id)) = identity_facts_of(*pid, name) else {
+                return false;
+            };
+            let carrier = carries_name || is_bound_process_id(&process_id, binding_ids);
+            let shares = (carries_name && caller_carries_name)
+                || (!caller_process_id.is_empty() && process_id == caller_process_id);
+            carrier && shares
+        });
+    let Some(root) = root else {
+        return vec![caller_pid];
+    };
+    let mut tree = vec![caller_pid];
+    if root != caller_pid {
+        tree.push(root);
+    }
+    for h in holders {
+        if !tree.contains(&h.pid) && ancestor_or_self_pids(h.pid).contains(&root) {
+            tree.push(h.pid);
+        }
+    }
+    tree
+}
+
+/// Refuse to spawn under `<name>` over a live holder or an orphan — the one
+/// uniform spawn gate (`start --as`, resume, and explicit-name launch all
+/// share this rule).
 ///
 /// Carriers match by name OR by any of the instance's binding process ids,
 /// so a live self-bound holder (process id only, no name in env) refuses
-/// exactly like a live hcom-launched holder:
+/// exactly like a live hcom-launched holder. The caller's own identity tree
+/// ([`caller_identity_tree`]) is removed from the carrier set first: a
+/// session re-registering its own name is never blocked by its own
+/// processes. What remains is classified:
 ///
 /// - Newest binding's own process_id still carried by a live process → live
 ///   holder, refuse.
@@ -471,20 +572,36 @@ fn wait_for_exit_pids(pids: &[u32], budget: std::time::Duration) {
 /// - A same-name process with an old process_id started *after* the binding
 ///   (subagent shape: children inherit the parent's process id and outlive
 ///   the rebind) is not an orphan → proceed.
-/// - Nothing alive → proceed (a DB-active row is the DB layer's business:
+/// - Nothing left alive → proceed (a DB-active row is the DB layer's business:
 ///   resume keeps its existing "still active" message for that case).
 /// - No binding at all but live name carriers → live holders, refuse. (A
 ///   process carrying only an unknown process_id is unattributable without
 ///   bindings, so it never blocks — this keeps `start --as` recovery working
 ///   after a row plus its bindings were deleted.)
+///
+/// Residual: name-carrying impostors with NO process id that sit in the
+/// caller's identity tree are indistinguishable from the caller's own
+/// processes and are excluded with it — accepted because identity leaks into
+/// descendant env are being removed separately (see the post-exit shell fix
+/// already in this base).
 pub fn check_spawn_allowed(db: &HcomDb, name: &str) -> Result<(), SpawnRefusal> {
     let binding_ids = db.process_binding_ids(name).unwrap_or_default();
     let holders = processes_for_instance(name, &binding_ids);
     if holders.is_empty() {
         return Ok(());
     }
+    let self_tree = caller_identity_tree(name, &binding_ids, &holders, std::process::id());
+    let remainder: Vec<ProcMatch> = holders
+        .into_iter()
+        .filter(|h| !self_tree.contains(&h.pid))
+        .collect();
+    // Only carriers outside the caller's own identity tree can refuse the
+    // spawn; with the tree gone the gate is open.
+    if remainder.is_empty() {
+        return Ok(());
+    }
     let newest = db.newest_process_binding(name).unwrap_or(None);
-    classify_holders(name, &holders, newest)
+    classify_holders(name, &remainder, newest)
 }
 
 /// Pure spawn-gate decision over an enumerated carrier set: the part of
@@ -1373,5 +1490,278 @@ mod tests {
         assert!(swept.contains(&name), "zombie-held row kept: {swept:?}");
         assert!(db.get_instance_full(&name).unwrap().is_none());
         sleeper.wait().ok();
+    }
+
+    // -- Caller identity tree: the spawn gate's self rule -------------------
+
+    /// Poses the caller's identity env — the spawn gate reads these two from
+    /// the live env — and restores whatever was there on drop.
+    #[cfg(unix)]
+    struct CallerIdentityEnv(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl CallerIdentityEnv {
+        fn pose(instance_name: Option<&str>, process_id: Option<&str>) -> Self {
+            let saved = (
+                std::env::var_os("HCOM_INSTANCE_NAME"),
+                std::env::var_os("HCOM_PROCESS_ID"),
+            );
+            unsafe {
+                match instance_name {
+                    Some(v) => std::env::set_var("HCOM_INSTANCE_NAME", v),
+                    None => std::env::remove_var("HCOM_INSTANCE_NAME"),
+                }
+                match process_id {
+                    Some(v) => std::env::set_var("HCOM_PROCESS_ID", v),
+                    None => std::env::remove_var("HCOM_PROCESS_ID"),
+                }
+            }
+            Self(saved.0, saved.1)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CallerIdentityEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(v) => std::env::set_var("HCOM_INSTANCE_NAME", v),
+                    None => std::env::remove_var("HCOM_INSTANCE_NAME"),
+                }
+                match &self.1 {
+                    Some(v) => std::env::set_var("HCOM_PROCESS_ID", v),
+                    None => std::env::remove_var("HCOM_PROCESS_ID"),
+                }
+            }
+        }
+    }
+
+    /// A name/process-id-carrying sleeper in a tree of its own: `sh` spawns
+    /// it in the background and exits, so the sleeper is reparented to init —
+    /// its ppid chain never passes through the test process. Returns its pid
+    /// (it is not our child, so kill it with `libc::kill`).
+    #[cfg(unix)]
+    fn spawn_detached_named_sleeper(name: &str, process_id: &str) -> u32 {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300 >/dev/null 2>&1 & echo $!")
+            .env("HCOM_INSTANCE_NAME", name)
+            .env("HCOM_PROCESS_ID", process_id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("spawn detached sleeper");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("detached sleeper pid")
+    }
+
+    /// A sleeper with no identity env at all: it can sit topologically inside
+    /// another process's tree but has no facts to share.
+    #[cfg(unix)]
+    fn spawn_stripped_sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("300")
+            .env_remove("HCOM_INSTANCE_NAME")
+            .env_remove("HCOM_PROCESS_ID")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn stripped sleep")
+    }
+
+    /// Self-gate, name shape: the caller matches the target's carriers by
+    /// `HCOM_INSTANCE_NAME` and only its own tree is alive. The carrier
+    /// holds the newest binding (a live holder for any foreign caller), so
+    /// this Ok is exactly the identity-tree exclusion.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn spawn_allows_name_carriers_in_caller_identity_tree() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = unique_name("selfname");
+        let binding = format!("proc-new-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let mut sleeper = spawn_named_sleeper(&name, &binding);
+        let pid = sleeper.id();
+        wait_for_enumerated(&name, &[], pid);
+        let _identity = CallerIdentityEnv::pose(Some(&name), None);
+        assert!(
+            check_spawn_allowed(&db, &name).is_ok(),
+            "the caller's own identity tree must never block it"
+        );
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    /// Self-gate, binding shape: the caller matches by
+    /// `HCOM_PROCESS_ID=<binding>` (the self-bound session shape) and only
+    /// its own tree is alive — again over a newest-binding carrier that
+    /// would refuse any foreign caller.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn spawn_allows_binding_carriers_in_caller_identity_tree() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = unique_name("selfbind");
+        let binding = format!("proc-self-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let mut sleeper = spawn_pid_only_sleeper(&binding);
+        let pid = sleeper.id();
+        wait_for_enumerated(&name, std::slice::from_ref(&binding), pid);
+        let _identity = CallerIdentityEnv::pose(None, Some(&binding));
+        assert!(
+            check_spawn_allowed(&db, &name).is_ok(),
+            "the caller's own identity tree must never block it"
+        );
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    /// Foreign gate: a caller with no identity facts finds no root and gets
+    /// the exact pre-existing refusal over a live holder. The self rule never
+    /// opens the gate for a foreign claimant.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn spawn_refuses_stripped_caller_over_live_holder() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = unique_name("foreign");
+        let binding = format!("proc-cur-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        let mut sleeper = spawn_named_sleeper(&name, &binding);
+        let pid = sleeper.id();
+        wait_for_enumerated(&name, &[], pid);
+        let _identity = CallerIdentityEnv::pose(None, None);
+        let err = check_spawn_allowed(&db, &name).expect_err("foreign caller must refuse");
+        assert_eq!(err.kind, HolderKind::LiveHolder);
+        assert!(err.pids.contains(&pid), "refusal names the pid: {err}");
+        let shown = err.to_string();
+        assert!(
+            shown.contains(&format!("refusing to spawn under '{name}'")),
+            "exact refusal unchanged: {shown}"
+        );
+        assert!(
+            shown.contains(&format!("hcom kill {name}")),
+            "exact refusal unchanged: {shown}"
+        );
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    /// Blocker-A shape: the caller matches the target's newest binding, but
+    /// a pre-binding orphan is alive in a SEPARATE tree (double-forked,
+    /// reparented to init). Reclaiming the name would leave that process
+    /// alive under the reclaimed identity, so the gate must refuse with the
+    /// orphan classification.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn spawn_refuses_pre_binding_orphan_outside_caller_tree() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = unique_name("orphanout");
+        let orphan = spawn_detached_named_sleeper(&name, &format!("proc-old-{}", rand_suffix()));
+        wait_for_enumerated(&name, &[], orphan);
+        let start = processes_for_instance(&name, &[])
+            .into_iter()
+            .find(|m| m.pid == orphan)
+            .expect("detached sleeper enumerated")
+            .start_epoch;
+        // New harness bound AFTER the orphan started: the orphan predates it.
+        let binding = format!("proc-new-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        backdate_binding(&db, &binding, start + 3600.0);
+        let _identity = CallerIdentityEnv::pose(None, Some(&binding));
+        let err = check_spawn_allowed(&db, &name)
+            .expect_err("pre-binding orphan outside the caller's tree must refuse");
+        assert_eq!(err.kind, HolderKind::Orphan);
+        assert!(err.pids.contains(&orphan), "refusal names the pid: {err}");
+        assert!(err.to_string().contains(&format!("hcom kill {name}")));
+        unsafe {
+            libc::kill(orphan as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
+    /// Blocker-B shape: the kill self-path leaves a name-carrying shell
+    /// standing with the row and bindings gone. A caller sharing its
+    /// identity facts sees only its own tree (resume/relaunch unblocked); a
+    /// caller with stripped identity in that same tree is foreign again.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn spawn_unbound_name_shell_self_ok_stripped_refused() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = unique_name("shellb");
+        // The surviving session shell stand-in: name-carrying, and its
+        // process id is in no binding (row deleted / bindings released).
+        let mut shell = spawn_named_sleeper(&name, &format!("proc-shell-{}", rand_suffix()));
+        let pid = shell.id();
+        wait_for_enumerated(&name, &[], pid);
+        assert!(db.process_binding_ids(&name).unwrap().is_empty());
+
+        let self_claim = CallerIdentityEnv::pose(Some(&name), None);
+        assert!(
+            check_spawn_allowed(&db, &name).is_ok(),
+            "an identity-sharing caller must not be blocked by its own tree"
+        );
+        drop(self_claim);
+
+        let _stripped = CallerIdentityEnv::pose(None, None);
+        let err = check_spawn_allowed(&db, &name)
+            .expect_err("a stripped-identity caller must refuse the surviving shell");
+        assert_eq!(err.kind, HolderKind::LiveHolder);
+        assert!(err.pids.contains(&pid), "refusal names the pid: {err}");
+        shell.kill().ok();
+        shell.wait().ok();
+    }
+
+    /// The root's identity requirement, not topology: the test process is a
+    /// name carrier (posed), so its whole subtree is "the holder's tree". A
+    /// child sharing the caller's identity facts belongs to that tree; a
+    /// child whose env was stripped of identity does NOT — it is a foreign
+    /// claimant and must face the full gate.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn caller_identity_tree_demands_identity_not_just_topology() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let name = unique_name("trap");
+        let mut sharing = spawn_named_sleeper(&name, &format!("proc-share-{}", rand_suffix()));
+        let sharing_pid = sharing.id();
+        let mut stripped = spawn_stripped_sleeper();
+        let stripped_pid = stripped.id();
+        wait_for_enumerated(&name, &[], sharing_pid);
+        let holders = processes_for_instance(&name, &[]);
+        let _identity = CallerIdentityEnv::pose(Some(&name), None);
+
+        let tree = caller_identity_tree(&name, &[], &holders, sharing_pid);
+        assert!(
+            tree.contains(&std::process::id()),
+            "the root climbs to the carrier ancestor: {tree:?}"
+        );
+        assert!(
+            tree.contains(&sharing_pid),
+            "identity-sharing child is self: {tree:?}"
+        );
+
+        let tree = caller_identity_tree(&name, &[], &holders, stripped_pid);
+        assert_eq!(
+            tree,
+            vec![stripped_pid],
+            "a stripped-identity child gets no root — topology alone is not enough"
+        );
+
+        sharing.kill().ok();
+        sharing.wait().ok();
+        stripped.kill().ok();
+        stripped.wait().ok();
     }
 }
