@@ -49,6 +49,26 @@ pub enum TeardownOutcome {
     RowReRegistered,
 }
 
+impl TeardownOutcome {
+    /// Wire token in the remote kill response payload.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TeardownOutcome::Completed => "completed",
+            TeardownOutcome::RowReRegistered => "row_re_registered",
+        }
+    }
+
+    /// Parse a remote payload's teardown token. Absent or unrecognized
+    /// reads as `None` — never as `Completed`.
+    pub fn parse(token: Option<&str>) -> Option<Self> {
+        match token {
+            Some("completed") => Some(TeardownOutcome::Completed),
+            Some("row_re_registered") => Some(TeardownOutcome::RowReRegistered),
+            _ => None,
+        }
+    }
+}
+
 /// The incarnation a kill resolved against: the row as read (its `created_at`
 /// identity plus `session_id`) and its process binding ids — the binding
 /// epoch the kill tears down.
@@ -69,12 +89,16 @@ struct IncarnationToken {
 
 impl IncarnationToken {
     fn capture(row: &crate::db::InstanceRow, binding_ids: &[String]) -> Self {
-        let mut ids = binding_ids.to_vec();
+        Self::new(row.created_at, row.session_id.clone(), binding_ids.to_vec())
+    }
+
+    fn new(created_at: f64, session_id: Option<String>, binding_ids: Vec<String>) -> Self {
+        let mut ids = binding_ids;
         ids.sort();
         ids.dedup();
         Self {
-            created_at: row.created_at,
-            session_id: row.session_id.clone(),
+            created_at,
+            session_id,
             binding_ids: ids,
         }
     }
@@ -184,12 +208,12 @@ pub fn kill_tracked_instance(
         name,
         initiator,
         &crate::proctruth::caller_ancestor_pids(),
-        crate::proctruth::reap_instance_tree_for_excluding,
+        |n, b, e| crate::proctruth::reap_instance_tree_for_excluding(db, n, b, e),
     )
 }
 
 /// [`kill_tracked_instance`] with an injectable self set and reap:
-/// production passes [`crate::proctruth::caller_ancestor_pids`] and
+/// production passes [`crate::proctruth::caller_ancestor_pids`] and the real
 /// [`crate::proctruth::reap_instance_tree_for_excluding`]; tests pass a fake
 /// set holding a sleeper pid plus the real caller pid, and a reap that can
 /// mutate the row mid-kill (the teardown CAS seam).
@@ -280,23 +304,48 @@ fn survivors_error(name: &str, survivors: &[u32]) -> String {
     )
 }
 
-/// Re-read the incarnation token of `name`; None when the row is gone.
-fn read_incarnation(db: &HcomDb, name: &str) -> Result<Option<IncarnationToken>, String> {
-    let Some(row) = db.get_instance_full(name).map_err(|e| e.to_string())? else {
+/// Re-read the incarnation token of `name` through the teardown transaction;
+/// None when the row is gone. The ONLY incarnation read allowed to decide —
+/// any read outside the transaction leaves a check/use gap.
+fn read_incarnation_tx(
+    tx: &rusqlite::Transaction<'_>,
+    name: &str,
+) -> Result<Option<IncarnationToken>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(f64, Option<String>)> = tx
+        .query_row(
+            "SELECT created_at, session_id FROM instances WHERE name = ?1",
+            rusqlite::params![name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((created_at, session_id)) = row else {
         return Ok(None);
     };
-    let binding_ids = db.process_binding_ids(name).map_err(|e| e.to_string())?;
-    Ok(Some(IncarnationToken::capture(&row, &binding_ids)))
+    let mut stmt =
+        tx.prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?1")?;
+    let binding_ids = stmt
+        .query_map(rusqlite::params![name], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Some(IncarnationToken::new(
+        created_at,
+        session_id,
+        binding_ids,
+    )))
 }
 
 /// The kill's teardown write, gated on the incarnation: only the exact
 /// incarnation the kill resolved against is torn down. The reap-to-teardown
 /// window is real — the spawn gate can admit and recreate the same identity
-/// while the reap runs, after which an unconditional teardown would read and
-/// finalize that fresh incarnation — so the token is re-read here, after the
-/// verified-clean reap and immediately before the write. Row recreated,
-/// rebound, vanished, or reappeared (a same-identity `start --as` landing
-/// mid-kill): skip the teardown entirely and report the row left intact. The
+/// while the reap runs — and a comparison OUTIDE the write leaves a
+/// check/use gap a rebind slips through (adopted and finalized as the row to
+/// stop), so the token re-read, the comparison, and the teardown writes
+/// (`stopped` event + binding release) run in ONE `BEGIN IMMEDIATE`
+/// transaction (see [`stop_instance_without_reap`]): whatever the
+/// interleaving, a rebind either serializes before the transaction — the
+/// comparison sees it and NOTHING is written — or lands after the commit.
+/// Row recreated, rebound, vanished, or reappeared (a same-identity
+/// `start --as` landing mid-kill): report the row left intact. The
 /// comparison is row presence + `session_id` + the binding id set together,
 /// so the name-only rebind (bindings stay empty) is caught by `session_id`.
 fn teardown_if_incarnation_unchanged(
@@ -305,13 +354,14 @@ fn teardown_if_incarnation_unchanged(
     initiator: &str,
     incarnation: &IncarnationToken,
 ) -> Result<TeardownOutcome, String> {
-    if read_incarnation(db, name)?.as_ref() != Some(incarnation) {
-        return Ok(TeardownOutcome::RowReRegistered);
-    }
-    match stop_instance_without_reap(db, name, initiator, "killed") {
-        StopOutcome::Stopped | StopOutcome::AlreadyStopped => Ok(TeardownOutcome::Completed),
-        StopOutcome::RetryableError(e) => Err(e),
-    }
+    let committed = stop_instance_without_reap(db, name, initiator, "killed", |tx| {
+        Ok(read_incarnation_tx(tx, name)?.as_ref() == Some(incarnation))
+    })?;
+    Ok(if committed {
+        TeardownOutcome::Completed
+    } else {
+        TeardownOutcome::RowReRegistered
+    })
 }
 
 /// Kill the instance the caller runs inside — fail-closed: reap first, then
@@ -371,12 +421,30 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
     }
     let kill_result = kill_result.unwrap();
 
+    // The teardown outcome is part of the kill contract: an outcome-less (or
+    // unrecognized) response is never read as a successful teardown.
+    let Some(teardown) = TeardownOutcome::parse(result["teardown"].as_str()) else {
+        bail!(
+            "Remote kill returned no valid teardown outcome (got {:?} — a peer that predates outcome reporting cannot confirm the row teardown)",
+            result["teardown"]
+        );
+    };
+
     let pid = result["pid"].as_u64().unwrap_or(0);
     let pane_closed = result["pane_closed"].as_bool().unwrap_or(false);
     let preset_name = result["preset_name"].as_str().unwrap_or("");
     let pane_id = result["pane_id"].as_str().unwrap_or("");
     let pane_retry_command = result["pane_retry_command"].as_str();
     let pane_info = pane_info_str(pane_closed, preset_name, pane_id);
+
+    // CAS-skip first, mirroring the local path (it takes precedence over
+    // every kill_result report there too): plain report, exit 0.
+    if teardown == TeardownOutcome::RowReRegistered {
+        for line in render_remote_kill_feedback(name, pid, kill_result, &pane_info, teardown)? {
+            println!("{line}");
+        }
+        return Ok(0);
+    }
 
     if kill_result == "permission_denied" {
         eprintln!(
@@ -386,7 +454,7 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
         return Ok(1);
     }
 
-    let lines = render_remote_kill_feedback(name, pid, kill_result, &pane_info)?;
+    let lines = render_remote_kill_feedback(name, pid, kill_result, &pane_info, teardown)?;
     for line in lines {
         println!("{line}");
     }
@@ -416,7 +484,12 @@ fn render_remote_kill_feedback(
     pid: u64,
     kill_result: &str,
     pane_info: &str,
+    teardown: TeardownOutcome,
 ) -> Result<Vec<String>> {
+    // The CAS-skip report for remote rows is exactly the local one.
+    if teardown == TeardownOutcome::RowReRegistered {
+        return Ok(render_re_registered_feedback(name));
+    }
     match kill_result {
         "sent" => Ok(vec![
             format!(
@@ -549,7 +622,7 @@ fn pane_info_str(pane_closed: bool, preset_name: &str, pane_id: &str) -> String 
 /// it holds, by name or (self-bound trees) by its process id. Returns true
 /// when anything survived — the caller must keep the pidtrack handle so a
 /// retry can rediscover the orphan.
-fn reap_orphan_tree(orphan: &crate::pidtrack::OrphanProcess) -> bool {
+fn reap_orphan_tree(db: &HcomDb, orphan: &crate::pidtrack::OrphanProcess) -> bool {
     let ids: &[String] = if orphan.process_id.is_empty() {
         &[]
     } else {
@@ -557,7 +630,7 @@ fn reap_orphan_tree(orphan: &crate::pidtrack::OrphanProcess) -> bool {
     };
     let mut survived = false;
     for orphan_name in &orphan.names {
-        if let Err(survivors) = crate::proctruth::reap_instance_tree_for(orphan_name, ids) {
+        if let Err(survivors) = crate::proctruth::reap_instance_tree_for(db, orphan_name, ids) {
             eprintln!(
                 "Processes still alive for '{}' after SIGKILL: {} — run hcom kill {} first",
                 orphan_name,
@@ -685,7 +758,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         // Verify the whole carrier set, not just the recorded group: a
         // self-bound tree never carries the orphan's names. Survivors keep
         // their pidtrack handle for a retry.
-        let reap_failed = reap_orphan_tree(orphan);
+        let reap_failed = reap_orphan_tree(db, orphan);
         failed += reap_failed as i32;
         if !reap_failed {
             pidtrack::remove_pid(hcom_dir, orphan.pid);
@@ -809,7 +882,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         }
         incomplete +=
             report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-        let reap_failed = reap_orphan_tree(orphan);
+        let reap_failed = reap_orphan_tree(db, orphan);
         failed += reap_failed as i32;
         if !reap_failed {
             pidtrack::remove_pid(hcom_dir, orphan.pid);
@@ -881,7 +954,7 @@ fn kill_single(
                 // live processes still holding the orphan's names — by name
                 // or, for self-bound trees, by its process id — so the
                 // kill is verified whole-instance, not single-pid.
-                let reap_failed = reap_orphan_tree(orphan);
+                let reap_failed = reap_orphan_tree(db, orphan);
                 // Keep the pidtrack handle while survivors live: it is the
                 // only handle by which a retry can rediscover this orphan.
                 // Dropping it on reap failure would force a hand-kill from
@@ -1128,6 +1201,7 @@ mod tests {
                 "result": {
                     "pid": 42,
                     "kill_result": "permission_denied",
+                    "teardown": "completed",
                     "pane_closed": false,
                     "preset_name": "",
                     "pane_id": ""
@@ -1147,6 +1221,7 @@ mod tests {
                 "result": {
                     "pid": 42,
                     "kill_result": "already_dead",
+                    "teardown": "completed",
                     "pane_closed": true,
                     "preset_name": "kitty",
                     "pane_id": "@1"
@@ -1159,8 +1234,14 @@ mod tests {
 
     #[test]
     fn test_render_remote_kill_feedback_sent_matches_cli_contract() {
-        let lines = render_remote_kill_feedback("luna:ABCD", 42, "sent", " (closed kitty pane @1)")
-            .unwrap();
+        let lines = render_remote_kill_feedback(
+            "luna:ABCD",
+            42,
+            "sent",
+            " (closed kitty pane @1)",
+            TeardownOutcome::Completed,
+        )
+        .unwrap();
         assert_eq!(
             lines,
             vec![
@@ -1173,7 +1254,14 @@ mod tests {
 
     #[test]
     fn test_render_remote_kill_feedback_already_dead_matches_cli_contract() {
-        let lines = render_remote_kill_feedback("luna:ABCD", 42, "already_dead", "").unwrap();
+        let lines = render_remote_kill_feedback(
+            "luna:ABCD",
+            42,
+            "already_dead",
+            "",
+            TeardownOutcome::Completed,
+        )
+        .unwrap();
         assert_eq!(
             lines,
             vec![
@@ -1215,6 +1303,7 @@ mod tests {
                 "result": {
                     "pid": 42,
                     "kill_result": "mystery",
+                    "teardown": "completed",
                     "pane_closed": false,
                     "preset_name": "",
                     "pane_id": ""
@@ -1224,6 +1313,77 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("unexpected kill_result mystery"));
+    }
+
+    #[test]
+    fn test_render_remote_kill_feedback_row_re_registered_matches_local() {
+        // Remote rows render the CAS-skip report exactly like local ones.
+        let lines = render_remote_kill_feedback(
+            "luna:ABCD",
+            42,
+            "sent",
+            "",
+            TeardownOutcome::RowReRegistered,
+        )
+        .unwrap();
+        assert_eq!(lines, render_re_registered_feedback("luna:ABCD"));
+    }
+
+    #[test]
+    fn test_handle_remote_kill_response_row_re_registered_exits_zero() {
+        let result = handle_remote_kill_response(
+            "luna:ABCD",
+            &json!({
+                "ok": true,
+                "result": {
+                    "pid": 42,
+                    "kill_result": "sent",
+                    "teardown": "row_re_registered",
+                    "pane_closed": false,
+                    "preset_name": "",
+                    "pane_id": ""
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_handle_remote_kill_response_without_teardown_errors() {
+        // An outcome-less response (a peer predating outcome reporting) must
+        // never be read as a successful teardown.
+        let err = handle_remote_kill_response(
+            "luna:ABCD",
+            &json!({
+                "ok": true,
+                "result": {
+                    "pid": 42,
+                    "kill_result": "sent",
+                    "pane_closed": false,
+                    "preset_name": "",
+                    "pane_id": ""
+                }
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("teardown outcome"),
+            "error names the gap: {err}"
+        );
+    }
+
+    #[test]
+    fn test_teardown_outcome_wire_tokens_round_trip() {
+        for outcome in [TeardownOutcome::Completed, TeardownOutcome::RowReRegistered] {
+            assert_eq!(
+                TeardownOutcome::parse(Some(outcome.as_str())),
+                Some(outcome)
+            );
+        }
+        assert_eq!(TeardownOutcome::parse(None), None);
+        assert_eq!(TeardownOutcome::parse(Some("mystery")), None);
     }
 
     #[cfg(unix)]
@@ -1251,6 +1411,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         panic!("sleeper {pid} never enumerated under {name}");
+    }
+
+    /// The incarnation token the kill resolves against for `name` (row
+    /// facts plus binding epoch), captured the way production does.
+    #[cfg(unix)]
+    fn capture_incarnation(db: &crate::db::HcomDb, name: &str) -> IncarnationToken {
+        let row = db.get_instance_full(name).unwrap().expect("row");
+        IncarnationToken::capture(&row, &db.process_binding_ids(name).unwrap())
     }
 
     /// A: kill reaps the whole name tree — even processes outside the
@@ -1371,13 +1539,9 @@ mod tests {
         let kill_name = name.clone();
         let killer = std::thread::spawn(move || {
             let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
-            kill_tracked_instance_with_self_pids(
-                &db,
-                &kill_name,
-                "test",
-                &self_set,
-                crate::proctruth::reap_instance_tree_for_excluding,
-            )
+            kill_tracked_instance_with_self_pids(&db, &kill_name, "test", &self_set, |n, b, e| {
+                crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e)
+            })
         });
 
         // Invariant poll on a second connection: the release must never be
@@ -1488,7 +1652,7 @@ mod tests {
         db.set_process_binding("proc-kill-fc", "sess-kill-fc", &name)
             .unwrap();
         let binding_ids = db.process_binding_ids(&name).unwrap();
-        let incarnation = read_incarnation(&db, &name).unwrap().unwrap();
+        let incarnation = capture_incarnation(&db, &name);
 
         // A name-only carrier that outlives the signal budget — reported as
         // a survivor by the injected reap (it is never signalled here).
@@ -1571,14 +1735,11 @@ mod tests {
         wait_for_enumerated(&name, spid);
 
         let self_set = vec![std::process::id()];
-        let result = kill_tracked_instance_with_self_pids(
-            &db,
-            &name,
-            "test",
-            &self_set,
-            crate::proctruth::reap_instance_tree_for_excluding,
-        )
-        .unwrap_or_else(|e| panic!("foreign kill must succeed: {e}"));
+        let result =
+            kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, b, e| {
+                crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e)
+            })
+            .unwrap_or_else(|e| panic!("foreign kill must succeed: {e}"));
         assert_eq!(result.self_excluded, 0, "no self overlap, no self report");
         sleeper.wait().ok();
         assert!(
@@ -1632,7 +1793,7 @@ mod tests {
         let old_pid = old_sleeper.id();
         wait_for_enumerated(&name, old_pid);
 
-        let incarnation = read_incarnation(&db, &name).unwrap().unwrap();
+        let incarnation = capture_incarnation(&db, &name);
         let excluded = vec![std::process::id()];
         let result = kill_self_tracked_instance(
             &db,
@@ -1645,7 +1806,7 @@ mod tests {
             |n, b, e| {
                 // The real reap, then the mid-kill rebind: same name, new
                 // binding epoch (the `start --as` shape).
-                let out = crate::proctruth::reap_instance_tree_for_excluding(n, b, e);
+                let out = crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e);
                 db.conn()
                     .execute(
                         "DELETE FROM process_bindings WHERE instance_name = ?1",
@@ -1712,7 +1873,7 @@ mod tests {
         db.set_process_binding("proc-keep-cas", "sess-cas", &name)
             .unwrap();
 
-        let incarnation = read_incarnation(&db, &name).unwrap().unwrap();
+        let incarnation = capture_incarnation(&db, &name);
         let outcome = teardown_if_incarnation_unchanged(&db, &name, "test", &incarnation)
             .unwrap_or_else(|e| panic!("teardown must land: {e}"));
         assert_eq!(outcome, TeardownOutcome::Completed);
@@ -1781,6 +1942,157 @@ mod tests {
             )],
             "the plain CAS-skip report is what the CLI prints"
         );
+        let _ = _guard;
+    }
+
+    /// CAS (iv), the atomicity fix: the incarnation comparison and the
+    /// teardown writes share ONE `BEGIN IMMEDIATE` transaction, so a rebind
+    /// can no longer land in the old check/use gap (comparison passed, then
+    /// the write adopted and finalized the rebound row). The rebind here
+    /// commits on a SECOND connection inside exactly that window — it takes
+    /// the write lock at reap end and holds it well past where the old
+    /// comparison ran — and the teardown must still skip, leaving the
+    /// rebound bindings intact. With CAS (i)/(iii) (rebind landing inside
+    /// the reap seam) this pins the skip landing however the rebind times
+    /// relative to the reap.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_teardown_skips_when_rebind_commits_in_the_former_check_use_gap() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+
+        let name = format!("hcom-kill-{}-gap", std::process::id());
+
+        let mut recorded = std::process::Command::new("true").spawn().unwrap();
+        let recorded_pid = recorded.id() as i64;
+        recorded.wait().unwrap();
+        let now = crate::shared::time::now_epoch_f64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, pid) VALUES (?1, 'active', ?2, 'codex', ?3)",
+                rusqlite::params![name, now, recorded_pid],
+            )
+            .unwrap();
+        db.set_process_binding("proc-gap-old", "sess-gap", &name)
+            .unwrap();
+
+        // The concurrent rebind: a second connection holds the write lock
+        // across the old check/use window, then lands the `start --as` shape
+        // (bindings replaced, row kept).
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let rebind_db_path = db_path.clone();
+        let rebind_name = name.clone();
+        let rebinder = std::thread::spawn(move || {
+            let db2 = crate::db::HcomDb::open_raw(&rebind_db_path).unwrap();
+            db2.with_immediate_transaction(|tx| {
+                locked_tx.send(()).ok();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                tx.execute(
+                    "DELETE FROM process_bindings WHERE instance_name = ?1",
+                    rusqlite::params![rebind_name],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at) \
+                     VALUES ('proc-gap-new', 'sess-gap-new', ?1, ?2)",
+                    rusqlite::params![rebind_name, now],
+                )
+                .unwrap();
+                Ok(())
+            })
+        });
+
+        let self_set = vec![std::process::id()];
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            &name,
+            "test",
+            &self_set,
+            move |_n, _b, _e| {
+                // Trigger the concurrent rebind from inside the reap seam
+                // and wait until it HOLDS the write lock: it now owns the
+                // write path until well past where the old comparison ran.
+                locked_rx.recv().unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
+        rebinder
+            .join()
+            .expect("rebind thread")
+            .expect("rebind transaction");
+
+        assert_eq!(
+            result.teardown,
+            TeardownOutcome::RowReRegistered,
+            "a rebind committing in the former check/use gap must skip the teardown"
+        );
+        assert!(
+            db.get_instance_full(&name).unwrap().is_some(),
+            "rebound row left intact"
+        );
+        assert_eq!(
+            db.process_binding_ids(&name).unwrap(),
+            vec!["proc-gap-new".to_string()],
+            "the rebind's binding set is untouched"
+        );
+        assert_eq!(stopped_events(&db, &name), 0, "no stopped event written");
+        let _ = _guard;
+    }
+
+    /// The structural half of the atomicity contract: the incarnation gate
+    /// and the teardown writes are one transaction. While that transaction
+    /// runs (the gate closure is inside it), a second connection cannot
+    /// write at all — nothing can land between the comparison and the write.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn teardown_txn_holds_the_write_lock_across_compare_and_writes() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+
+        let name = format!("hcom-kill-{}-lock", std::process::id());
+
+        let mut recorded = std::process::Command::new("true").spawn().unwrap();
+        let recorded_pid = recorded.id() as i64;
+        recorded.wait().unwrap();
+        let now = crate::shared::time::now_epoch_f64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, pid) VALUES (?1, 'active', ?2, 'codex', ?3)",
+                rusqlite::params![name, now, recorded_pid],
+            )
+            .unwrap();
+        db.set_process_binding("proc-lock", "sess-lock", &name)
+            .unwrap();
+
+        let db2 = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db2.conn().execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        let probe_name = name.clone();
+        let committed = stop_instance_without_reap(&db, &name, "test", "killed", move |_tx| {
+            // Inside the single teardown transaction, between the compare
+            // and the writes: a second writer must find the path locked.
+            let blocked = db2.conn().execute(
+                "UPDATE instances SET session_id = 'gap' WHERE name = ?1",
+                rusqlite::params![probe_name],
+            );
+            assert!(
+                blocked.is_err(),
+                "a second writer must not land between the compare and the write: {blocked:?}"
+            );
+            Ok(true)
+        })
+        .unwrap_or_else(|e| panic!("teardown must land: {e}"));
+        assert!(committed, "the unchanged incarnation is torn down");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert_eq!(stopped_events(&db, &name), 1, "stopped event written");
         let _ = _guard;
     }
 }

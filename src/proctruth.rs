@@ -17,10 +17,12 @@
 //! - [`reap_instance_tree_for`]: SIGTERM the whole carrier set (oldest first,
 //!   so the pty wrapper goes before its children), wait up to 5 s, SIGKILL
 //!   survivors — fail-closed: success is only reported once no in-scope
-//!   carrier lives. A late carrier is signalled unless it belongs to a newer
-//!   binding epoch (non-empty `HCOM_PROCESS_ID` outside the call-start
-//!   binding ids): a brand-new registration started mid-reap is spared, a
-//!   name-only late fork of the dying tree is not.
+//!   carrier lives. A late carrier is signalled unless its non-empty
+//!   `HCOM_PROCESS_ID` is registered among the name's CURRENT binding ids
+//!   read fresh in that round, minus the call-start ids (see
+//!   [`carrier_in_reap_scope`]): a brand-new registration started mid-reap
+//!   is spared, a name-only late fork — or a late child carrying a stale id
+//!   of the dying tree — is not.
 //! - [`check_spawn_allowed`]: refuse to spawn under `<name>` over a live
 //!   holder or an orphan (started before the newest binding) — the one
 //!   uniform spawn gate, after removing the caller's own identity tree from
@@ -31,6 +33,8 @@
 //!
 //! Unix only: `/proc` enumeration is compiled out on other platforms, where
 //! every query reports empty (verified-no-holders) and reap is a no-op.
+
+use std::collections::HashSet;
 
 use crate::db::HcomDb;
 
@@ -350,13 +354,14 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
 /// snapshot: after each wait the tree is re-enumerated for carriers. A
 /// late-appearing carrier is signalable only in reap scope (see
 /// [`carrier_in_reap_scope`]): a mid-reap fork carrying one of the call-start
-/// binding ids — or no process id at all (the name-only late fork) — is
-/// still signalled (in the KILL round) and still blocks success while it
-/// lives, while a carrier whose `HCOM_PROCESS_ID` is a fresh non-empty id
-/// (a brand-new registration of a newer binding epoch) is spared and never
-/// blocks; conversely a snapshot pid recycled by an unrelated process no
-/// longer carries the name and is neither signalled nor counted (an EPERM on
-/// such a pid is not survival). Returns the surviving pids on failure — callers must
+/// binding ids, one carrying a stale id no current binding claims, or one
+/// with no process id at all (the name-only late fork) is still signalled
+/// (in the KILL round) and still blocks success while it lives, while a
+/// carrier whose `HCOM_PROCESS_ID` is registered among the name's fresh
+/// binding epoch (a brand-new registration of a newer epoch) is spared and
+/// never blocks; conversely a snapshot pid recycled by an unrelated process
+/// no longer carries the name and is neither signalled nor counted (an EPERM
+/// on such a pid is not survival). Returns the surviving pids on failure — callers must
 /// not report success or release the row while any survive (fail-closed: the
 /// reap must reach `Ok(())` before any `stopped` write or binding release).
 ///
@@ -367,8 +372,12 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
 /// would wedge every stop behind an unreaped child.
 ///
 /// Unix only; elsewhere this is a no-op success.
-pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), Vec<u32>> {
-    reap_instance_tree_for_excluding(name, binding_ids, &[])
+pub fn reap_instance_tree_for(
+    db: &HcomDb,
+    name: &str,
+    binding_ids: &[String],
+) -> Result<(), Vec<u32>> {
+    reap_instance_tree_for_excluding(db, name, binding_ids, &[])
 }
 
 /// [`reap_instance_tree_for`] with an exclusion set: carriers in `exclude`
@@ -388,29 +397,42 @@ pub fn reap_instance_tree_for(name: &str, binding_ids: &[String]) -> Result<(), 
 ///
 /// Reap scope (the re-enumeration / KILL and verification rounds): a carrier
 /// first seen after the reap began is signalled unless its `HCOM_PROCESS_ID`
-/// is non-empty and outside the ORIGINAL binding ids passed at call start
-/// (see [`carrier_in_reap_scope`]) — the epoch rule. The kill tears down
-/// exactly one binding epoch: a fresh registration admitted mid-kill is a
-/// newer epoch, its processes carry a fresh non-empty binding id, and they
-/// are spared — never signalled, never a survivor — so a same-identity
-/// start/resume admitted mid-kill never has its fresh process reaped by the
-/// old kill's re-enumeration. A late carrier with no process id (a name-only
-/// fork of the dying tree) or with one of the call-start binding ids (a
-/// genuine mid-reap fork inherits the old env) belongs to the dying epoch:
-/// signalled, and while alive a survivor (fail-closed) — a name-only
-/// instance whose tree forks late during its own reap leaves no unmanaged
-/// live descendant behind. The row itself is torn down only while the
-/// incarnation the kill resolved against is still the row's (the kill
-/// command's teardown CAS).
+/// is non-empty and registered among the name's CURRENT binding ids read
+/// fresh in that round, MINUS the ids passed at call start (see
+/// [`carrier_in_reap_scope`]) — the epoch rule. The kill tears down exactly
+/// one binding epoch: a fresh registration admitted mid-kill is a newer
+/// epoch (its id is registered but outside the call-start set), its
+/// processes are spared — never signalled, never a survivor — so a
+/// same-identity start/resume admitted mid-kill never has its fresh process
+/// reaped by the old kill's re-enumeration. Everything else name-matches the
+/// dying epoch and is in scope: a late carrier with no process id (a
+/// name-only fork of the dying tree), one carrying a call-start binding id
+/// (a genuine mid-reap fork inherits the old env), and one carrying a stale
+/// non-empty id that no current binding claims (a late child of the old
+/// instance inheriting an older era's id) — signalled, and while alive a
+/// survivor (fail-closed), so a dying tree that forks or hands out stale ids
+/// late leaves no unmanaged live descendant behind. A spare decision is
+/// captured once per carrier: a carrier spared in one round stays spared,
+/// never reclassified into scope by later registry changes. Residual: a
+/// fresh registration whose binding lands only AFTER the round that first
+/// sees its process is in scope for that round (the spawn-to-bind window) —
+/// empty for launched instances, whose binding is written at launch
+/// registration before the process spawns (launcher.rs); only the
+/// first-hook binding paths (instance_binding recovery) leave a window.
+/// The row itself is torn down only while the incarnation the kill resolved
+/// against is still the row's (the kill command's teardown CAS).
 ///
+/// `db` supplies the per-round binding registry read behind the epoch rule.
 /// Unix only; elsewhere this is a no-op success.
 pub fn reap_instance_tree_for_excluding(
+    db: &HcomDb,
     name: &str,
     binding_ids: &[String],
     exclude: &[u32],
 ) -> Result<(), Vec<u32>> {
     #[cfg(not(unix))]
     {
+        let _ = db;
         let _ = name;
         let _ = binding_ids;
         let _ = exclude;
@@ -424,10 +446,10 @@ pub fn reap_instance_tree_for_excluding(
         }
         // Carriers of the first snapshot are this reap's own business and
         // stay in scope at every round; only late-appearing carriers go
-        // through the scope rule below.
+        // through the scope rule below. `spared` captures each late
+        // carrier's spare decision once it is observed.
         let started: Vec<u32> = matches.iter().map(|m| m.pid).collect();
-        let in_scope =
-            |m: &ProcMatch| started.contains(&m.pid) || carrier_in_reap_scope(m, binding_ids);
+        let mut spared: HashSet<u32> = HashSet::new();
         // Oldest first: pty wrapper before children.
         matches.sort_by(|a, b| {
             a.start_epoch
@@ -448,13 +470,17 @@ pub fn reap_instance_tree_for_excluding(
         // Re-enumerate by carrier set: newly seen carriers (forked after the
         // first snapshot, so never TERMed) join the KILL round directly —
         // the TERM round already elapsed, so escalation is immediate — but
-        // only in reap scope. A genuine mid-reap fork carries the old
-        // binding id (or no process id at all) and is caught here; a
-        // brand-new registration (fresh non-empty binding id) started
-        // mid-reap is spared (never signalled, never a survivor).
+        // only in reap scope (predicate v3 against the registry read fresh
+        // for this round). A genuine mid-reap fork carries the old binding
+        // id (or no process id at all) and is caught here; a brand-new
+        // registration (an id in the fresh epoch) started mid-reap is spared
+        // (never signalled, never a survivor).
+        let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
         let mut current: Vec<ProcMatch> = live_carriers_for(name, binding_ids, exclude)
             .into_iter()
-            .filter(|m| in_scope(m))
+            .filter(|m| {
+                started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
+            })
             .collect();
         if current.is_empty() {
             return Ok(());
@@ -473,33 +499,67 @@ pub fn reap_instance_tree_for_excluding(
             &current.iter().map(|m| m.pid).collect::<Vec<_>>(),
             KILL_WAIT,
         );
-        // Verification is scoped exactly like the KILL round: an in-scope
-        // carrier still alive blocks success (fail-closed), while a spared
-        // fresh registration never does.
+        // Verification is scoped exactly like the KILL round (fresh registry
+        // read for this round, same captured spare set): an in-scope carrier
+        // still alive blocks success (fail-closed), while a spared fresh
+        // registration never does.
+        let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
         let still: Vec<u32> = live_carriers_for(name, binding_ids, exclude)
             .into_iter()
-            .filter(|m| in_scope(m))
+            .filter(|m| {
+                started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
+            })
             .map(|m| m.pid)
             .collect();
         if still.is_empty() { Ok(()) } else { Err(still) }
     }
 }
 
-/// Reap scope for a carrier first seen after the reap began (carriers of the
-/// reap's first snapshot are always in scope): signalable unless its
-/// `HCOM_PROCESS_ID` is non-empty and outside the ORIGINAL binding ids
-/// passed at call start — the epoch rule. Instance identity keys to binding
-/// epochs (process bindings are the incarnation token), so a fresh
-/// registration admitted mid-kill is a NEWER epoch: its processes carry a
-/// fresh non-empty binding id and are spared — never signalled, never
-/// survivors. Everything else belongs to the dying epoch and is still this
-/// reap's business: a name-only late carrier (empty process id — a fork of
-/// the dying tree, or an old process that became a carrier mid-reap) and a
-/// carrier inheriting one of the call-start binding ids are signalled and,
-/// while alive, block success (fail-closed).
+/// The name's fresh binding epoch for one reap round: its CURRENT process
+/// binding ids read from the DB now, MINUS the ids passed at call start. A
+/// binding registered during this kill shows up here — evidence of a newer
+/// epoch (see [`carrier_in_reap_scope`]). A failed read yields an empty
+/// epoch (fail-closed toward scope: nothing gets an unearned spare).
 #[cfg(unix)]
-fn carrier_in_reap_scope(m: &ProcMatch, binding_ids: &[String]) -> bool {
-    m.process_id.is_empty() || is_bound_process_id(&m.process_id, binding_ids)
+fn fresh_epoch_ids(db: &HcomDb, name: &str, call_start_ids: &[String]) -> Vec<String> {
+    db.process_binding_ids(name)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| !call_start_ids.contains(id))
+        .collect()
+}
+
+/// Reap scope for a carrier first seen after the reap began (carriers of the
+/// reap's first snapshot are always in scope) — predicate v3, the epoch
+/// rule: IN SCOPE unless the carrier's `HCOM_PROCESS_ID` is non-empty and
+/// registered among `fresh_epoch_ids`, the name's CURRENT binding ids read
+/// fresh in this round MINUS the call-start ids. Instance identity keys to
+/// binding epochs (process bindings are the incarnation token), so a
+/// registered id outside the call-start set is a NEWER epoch and is spared —
+/// never signalled, never a survivor. Everything else name-matches the
+/// dying epoch and is this reap's business: a name-only late carrier (empty
+/// process id — a fork of the dying tree, or an old process that became a
+/// carrier mid-reap), a carrier carrying one of the call-start binding ids
+/// (a genuine mid-reap fork inherits the old env), and a carrier whose
+/// non-empty id no current binding claims (a stale id inherited from an
+/// older era) are signalled and, while alive, block success (fail-closed).
+/// The spare decision is captured once per carrier in `spared`: a carrier
+/// spared in one round stays spared — later registry changes never
+/// reclassify it into scope.
+#[cfg(unix)]
+fn carrier_in_reap_scope(
+    m: &ProcMatch,
+    fresh_epoch_ids: &[String],
+    spared: &mut HashSet<u32>,
+) -> bool {
+    if spared.contains(&m.pid) {
+        return false;
+    }
+    if is_bound_process_id(&m.process_id, fresh_epoch_ids) {
+        spared.insert(m.pid);
+        return false;
+    }
+    true
 }
 
 /// Shell pid behind a self-bound process id: `omp-<pid>-…` → `<pid>`.
@@ -987,13 +1047,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reap_kills_whole_tree_and_reports_survivors_shape() {
+        let db = test_db();
         let name = unique_name("reap");
         let mut a = spawn_named_sleeper(&name, "proc-reap");
         let mut b = spawn_named_sleeper(&name, "proc-reap");
         let (pa, pb) = (a.id(), b.id());
         wait_for_enumerated(&name, &[], pa);
         wait_for_enumerated(&name, &[], pb);
-        assert!(reap_instance_tree_for(&name, &[]).is_ok());
+        assert!(reap_instance_tree_for(&db, &name, &[]).is_ok());
         // Reap the (zombie) children so bare kill-0 liveness observes them.
         a.wait().ok();
         b.wait().ok();
@@ -1004,7 +1065,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reap_empty_name_is_noop_ok() {
-        assert!(reap_instance_tree_for(&unique_name("empty"), &[]).is_ok());
+        let db = test_db();
+        assert!(reap_instance_tree_for(&db, &unique_name("empty"), &[]).is_ok());
     }
 
     #[test]
@@ -1027,6 +1089,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reap_excluding_spares_excluded_carrier() {
+        let db = test_db();
         let name = unique_name("exclude");
         let mut spared = spawn_named_sleeper(&name, "proc-exclude-spared");
         let mut reaped = spawn_named_sleeper(&name, "proc-exclude-reaped");
@@ -1034,7 +1097,8 @@ mod tests {
         wait_for_enumerated(&name, &[], spared_pid);
         wait_for_enumerated(&name, &[], reaped_pid);
         assert!(
-            reap_instance_tree_for_excluding(&name, &[], std::slice::from_ref(&spared_pid)).is_ok(),
+            reap_instance_tree_for_excluding(&db, &name, &[], std::slice::from_ref(&spared_pid))
+                .is_ok(),
             "excluded carrier must not count as a survivor"
         );
         reaped.wait().ok();
@@ -1056,6 +1120,17 @@ mod tests {
         let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
         db.init_db().unwrap();
         db
+    }
+
+    /// A file-backed test DB two connections can share: for tests that write
+    /// bindings from the main thread while a reap thread reads them on its
+    /// own connection.
+    #[cfg(unix)]
+    fn file_test_db() -> (tempfile::TempDir, crate::db::HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
     }
 
     fn insert_row(db: &crate::db::HcomDb, name: &str, status: &str, pid: Option<i64>) {
@@ -1358,8 +1433,9 @@ mod tests {
         let reap_name = name.clone();
         let reap_bindings = binding_ids.clone();
         let reaper = std::thread::spawn(move || {
+            let db = test_db();
             tx.send(()).ok();
-            reap_instance_tree_for_excluding(&reap_name, &reap_bindings, &[])
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
         });
         rx.recv().unwrap();
         // Late and name-only: no epoch token of its own (empty process id)
@@ -1386,14 +1462,15 @@ mod tests {
     }
 
     /// Reap scope (spare arm): a carrier that appears after the reap began
-    /// with a FRESH non-empty `HCOM_PROCESS_ID` outside the call-start
-    /// binding ids belongs to a newer binding epoch — a brand-new
-    /// registration admitted mid-kill — and is never signalled, never a
-    /// survivor. Same SIGSTOP choreography as the kill arm: the spare is the
-    /// scope rule's doing, not a missed enumeration.
+    /// with a non-empty `HCOM_PROCESS_ID` REGISTERED mid-sequence — a fresh
+    /// binding of a newer epoch, outside the call-start ids — is never
+    /// signalled, never a survivor. Same SIGSTOP choreography as the kill
+    /// arm: the spare is the scope rule's doing, not a missed enumeration.
     #[test]
     #[cfg(unix)]
     fn reap_scope_spares_late_new_epoch_carrier() {
+        let (_dir, db) = file_test_db();
+        let db_path = db.path().to_path_buf();
         let name = unique_name("scopespare");
         let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
@@ -1401,17 +1478,23 @@ mod tests {
         wait_for_enumerated(&name, &[], first_pid);
         unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
 
+        let fresh_binding = format!("proc-fresh-{}", rand_suffix());
         let (tx, rx) = std::sync::mpsc::channel();
         let reap_name = name.clone();
         let reap_bindings = binding_ids.clone();
+        let reap_db_path = db_path.clone();
         let reaper = std::thread::spawn(move || {
+            let db = crate::db::HcomDb::open_raw(&reap_db_path).unwrap();
             tx.send(()).ok();
-            reap_instance_tree_for_excluding(&reap_name, &reap_bindings, &[])
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
         });
         rx.recv().unwrap();
-        // Late with a fresh binding id outside the call-start set.
+        // Late with a fresh binding id outside the call-start set — the
+        // binding is REGISTERED mid-sequence (the newer-epoch evidence).
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let mut late = spawn_named_sleeper(&name, &format!("proc-fresh-{}", rand_suffix()));
+        db.set_process_binding(&fresh_binding, "sess", &name)
+            .unwrap();
+        let mut late = spawn_named_sleeper(&name, &fresh_binding);
         let late_pid = late.id();
 
         let result = reaper.join().expect("reap thread");
@@ -1452,8 +1535,14 @@ mod tests {
         let reap_name = name.clone();
         let reap_binding = binding.clone();
         let reaper = std::thread::spawn(move || {
+            let db = test_db();
             tx.send(()).ok();
-            reap_instance_tree_for_excluding(&reap_name, std::slice::from_ref(&reap_binding), &[])
+            reap_instance_tree_for_excluding(
+                &db,
+                &reap_name,
+                std::slice::from_ref(&reap_binding),
+                &[],
+            )
         });
         rx.recv().unwrap();
         // Late fork shape: no name, only the call-start binding id.
@@ -1480,31 +1569,127 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reap_scope_boundary_empty_process_id_is_in_scope() {
-        // The scope boundary is the process id, not the clock: a late
-        // carrier with an empty process id is in scope (the name-only late
-        // fork — signalled, and while alive a survivor), while only a fresh
-        // non-empty process id outside the call-start bindings reads as a
+        // The scope boundary is the fresh binding registry, not the clock: a
+        // late carrier with an empty process id is in scope (the name-only
+        // late fork — signalled, and while alive a survivor), and only a
+        // non-empty process id REGISTERED in the fresh epoch reads as a
         // newer epoch and is spared. start_epoch deliberately never decides.
-        let bindings = vec!["proc-bound-1".to_string()];
+        let fresh = vec!["proc-fresh-2".to_string()];
         let carrier = |pid: u32, process_id: &str| ProcMatch {
             pid,
             process_id: process_id.to_string(),
             start_epoch: 0.0,
         };
-        // Name-only (empty process id): in scope, bindings or not.
-        assert!(carrier_in_reap_scope(&carrier(424242, ""), &bindings));
-        assert!(carrier_in_reap_scope(&carrier(424243, ""), &[]));
-        // Fresh non-empty process id (newer binding epoch): spared.
-        assert!(!carrier_in_reap_scope(
-            &carrier(424244, "proc-bound-2"),
-            &bindings
-        ));
-        // Call-start binding id (the dying epoch's own token): in scope.
+        let mut spared = HashSet::new();
+        // Name-only (empty process id): in scope, registry or not.
         assert!(carrier_in_reap_scope(
-            &carrier(424245, "proc-bound-1"),
-            &bindings
+            &carrier(424242, ""),
+            &fresh,
+            &mut spared
         ));
+        assert!(carrier_in_reap_scope(
+            &carrier(424243, ""),
+            &[],
+            &mut spared
+        ));
+        // Fresh registered binding id (newer binding epoch): spared.
+        assert!(!carrier_in_reap_scope(
+            &carrier(424244, "proc-fresh-2"),
+            &fresh,
+            &mut spared
+        ));
+        // Call-start binding id (the dying epoch's own token, subtracted
+        // from the fresh set by construction): in scope.
+        assert!(carrier_in_reap_scope(
+            &carrier(424245, "proc-call-start"),
+            &fresh,
+            &mut spared
+        ));
+        // Stale non-empty id claimed by no binding at all: in scope — name
+        // matching makes the carrier part of the old instance.
+        assert!(carrier_in_reap_scope(
+            &carrier(424246, "proc-stale"),
+            &fresh,
+            &mut spared
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_spared_carrier_stays_spared_across_rounds() {
+        // The spare decision is captured once per carrier: a carrier spared
+        // in one round is never reclassified into scope by a later round
+        // (e.g. its fresh binding released again before verification).
+        let carrier = ProcMatch {
+            pid: 425001,
+            process_id: "proc-fresh-9".to_string(),
+            start_epoch: 0.0,
+        };
+        let mut spared = HashSet::new();
+        let round_one = vec!["proc-fresh-9".to_string()];
+        assert!(
+            !carrier_in_reap_scope(&carrier, &round_one, &mut spared),
+            "the registry round spares the fresh registration"
+        );
+        assert!(
+            !carrier_in_reap_scope(&carrier, &[], &mut spared),
+            "a spared carrier stays spared even after its binding vanishes"
+        );
+        assert!(!carrier_in_reap_scope(
+            &carrier,
+            &["proc-other".to_string()],
+            &mut spared
+        ));
+    }
+
+    /// Reap scope (stale-id arm): a late child carrying a STALE non-empty
+    /// `HCOM_PROCESS_ID` — one no current binding claims, inherited from an
+    /// older era — is name-matched to the dying instance and must be killed,
+    /// not spared. The pre-v3 rule spared every non-empty id outside the
+    /// call-start set, which let such a child outlive its instance's
+    /// teardown.
+    #[test]
+    #[cfg(unix)]
+    fn reap_scope_kills_late_stale_unbound_carrier() {
+        let name = unique_name("scopestale");
+        let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_pid = first.id();
+        wait_for_enumerated(&name, &[], first_pid);
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reap_name = name.clone();
+        let reap_bindings = binding_ids.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = test_db();
+            tx.send(()).ok();
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
+        });
+        rx.recv().unwrap();
+        // Late child of the old instance: carries the name plus a stale id
+        // that is in NO binding registry.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut late = spawn_named_sleeper(&name, &format!("proc-stale-{}", rand_suffix()));
+        let late_pid = late.id();
+
+        let result = reaper.join().expect("reap thread");
+        first.wait().ok();
+        late.wait().ok();
+        assert!(
+            result.is_ok(),
+            "a stale-id late carrier dies within the signal budget: {result:?}"
+        );
+        assert!(
+            !crate::sys::process::is_alive(first_pid),
+            "in-scope initial carrier is reaped"
+        );
+        assert!(
+            !crate::sys::process::is_alive(late_pid),
+            "stale-id late carrier is signalled despite its non-empty process id"
+        );
     }
 
     #[test]
@@ -1645,12 +1830,13 @@ mod tests {
     fn reap_kills_pid_only_carrier_by_binding() {
         // Reap: a sleeper carrying only HCOM_PROCESS_ID=<binding> is the
         // self-bound tree and must die with the instance.
+        let db = test_db();
         let name = unique_name("reappid");
         let binding = format!("proc-reap-{}", rand_suffix());
         let mut sleeper = spawn_pid_only_sleeper(&binding);
         let pid = sleeper.id();
         wait_for_enumerated(&name, std::slice::from_ref(&binding), pid);
-        assert!(reap_instance_tree_for(&name, &[binding]).is_ok());
+        assert!(reap_instance_tree_for(&db, &name, &[binding]).is_ok());
         sleeper.wait().ok();
         assert!(
             !crate::sys::process::is_alive(pid),

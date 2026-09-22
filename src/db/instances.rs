@@ -407,7 +407,10 @@ impl HcomDb {
     }
 
     /// Finalize a stop: write the `stopped` life event and delete the row
-    /// plus its control-plane state, atomically.
+    /// plus its control-plane state, atomically. The body lives in
+    /// [`Self::finalize_instance_stop_in_txn`]; this wrapper owns its own
+    /// transaction and fires the subscription notification once the stop is
+    /// durable.
     ///
     /// `expected_process_id` keys the release to one process incarnation:
     /// when non-empty and the name still carries bindings, the release only
@@ -428,93 +431,16 @@ impl HcomDb {
         event_data: &serde_json::Value,
         expected_process_id: Option<&str>,
     ) -> Result<bool> {
-        let timestamp = chrono_now_iso();
-        let data = serde_json::to_string(event_data)?;
-        let mut event_id = None;
-        let expected = expected_process_id.unwrap_or("");
-
-        let won = self.with_immediate_transaction(|tx| {
-            if !expected.is_empty() {
-                let total: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM process_bindings WHERE instance_name = ?",
-                    params![name],
-                    |row| row.get(0),
-                )?;
-                if total > 0 {
-                    let matched: bool = tx
-                        .query_row(
-                            "SELECT 1 FROM process_bindings \
-                             WHERE instance_name = ? AND process_id = ? LIMIT 1",
-                            params![name, expected],
-                            |_| Ok(()),
-                        )
-                        .optional()?
-                        .is_some();
-                    if !matched {
-                        let mut stale = event_data.clone();
-                        if let Some(map) = stale.as_object_mut() {
-                            map.insert(
-                                "reason".to_string(),
-                                serde_json::Value::String("stale-harness-exit".to_string()),
-                            );
-                            map.insert(
-                                "process_id".to_string(),
-                                serde_json::Value::String(expected.to_string()),
-                            );
-                        }
-                        let stale_str = serde_json::to_string(&stale)?;
-                        tx.execute(
-                            "INSERT INTO events (timestamp, type, instance, data) \
-                             VALUES (?, 'life', ?, ?)",
-                            params![timestamp, name, stale_str],
-                        )?;
-                        event_id = Some(tx.last_insert_rowid());
-                        return Ok(false);
-                    }
-                }
-            }
-            let deleted = tx.execute(
-                "DELETE FROM instances
-                 WHERE name = ? AND created_at = ?
-                   AND session_id IS ? AND agent_id IS ?",
-                params![name, created_at, session_id, agent_id],
-            )?;
-            if deleted == 0 {
-                return Ok(false);
-            }
-
-            if let Some(session_id) = session_id {
-                tx.execute(
-                    "DELETE FROM session_bindings WHERE session_id = ?",
-                    params![session_id],
-                )?;
-                tx.execute(
-                    "DELETE FROM process_bindings WHERE session_id = ?",
-                    params![session_id],
-                )?;
-            }
-            tx.execute(
-                "DELETE FROM notify_endpoints WHERE instance = ?",
-                params![name],
-            )?;
-            tx.execute(
-                "DELETE FROM process_bindings WHERE instance_name = ?",
-                params![name],
-            )?;
-            tx.execute(
-                "DELETE FROM kv
-                 WHERE key LIKE 'events_sub:%'
-                   AND json_extract(value, '$.caller') = ?
-                   AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
-                params![name],
-            )?;
-            tx.execute(
-                "INSERT INTO events (timestamp, type, instance, data)
-                 VALUES (?, 'life', ?, ?)",
-                params![timestamp, name, data],
-            )?;
-            event_id = Some(tx.last_insert_rowid());
-            Ok(true)
+        let (won, event_id) = self.with_immediate_transaction(|tx| {
+            self.finalize_instance_stop_in_txn(
+                tx,
+                name,
+                created_at,
+                session_id,
+                agent_id,
+                event_data,
+                expected_process_id,
+            )
         })?;
 
         // Subscription notifications are best-effort external effects. Run
@@ -523,6 +449,112 @@ impl HcomDb {
             subscriptions::process_logged_event(self, event_id, "life", name, event_data);
         }
         Ok(won)
+    }
+
+    /// [`Self::finalize_instance_stop`]'s transactional body under a
+    /// caller-provided transaction (the kill path's atomic CAS+teardown):
+    /// the `expected_process_id` release gate, the ownership CAS delete, the
+    /// control-plane cleanup, and the `stopped` event insert all run as one
+    /// unit in `tx`. Returns `(won, event_id)`; the caller owns the commit
+    /// and must fire the subscription notification for `event_id` only after
+    /// it lands.
+    #[allow(clippy::too_many_arguments)] // verbatim extraction of finalize_instance_stop plus its tx; arity mirrors it
+    pub fn finalize_instance_stop_in_txn(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        event_data: &serde_json::Value,
+        expected_process_id: Option<&str>,
+    ) -> Result<(bool, Option<i64>)> {
+        let timestamp = chrono_now_iso();
+        let data = serde_json::to_string(event_data)?;
+        let mut event_id = None;
+        let expected = expected_process_id.unwrap_or("");
+
+        if !expected.is_empty() {
+            let total: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM process_bindings WHERE instance_name = ?",
+                params![name],
+                |row| row.get(0),
+            )?;
+            if total > 0 {
+                let matched: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM process_bindings \
+                         WHERE instance_name = ? AND process_id = ? LIMIT 1",
+                        params![name, expected],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !matched {
+                    let mut stale = event_data.clone();
+                    if let Some(map) = stale.as_object_mut() {
+                        map.insert(
+                            "reason".to_string(),
+                            serde_json::Value::String("stale-harness-exit".to_string()),
+                        );
+                        map.insert(
+                            "process_id".to_string(),
+                            serde_json::Value::String(expected.to_string()),
+                        );
+                    }
+                    let stale_str = serde_json::to_string(&stale)?;
+                    tx.execute(
+                        "INSERT INTO events (timestamp, type, instance, data) \
+                         VALUES (?, 'life', ?, ?)",
+                        params![timestamp, name, stale_str],
+                    )?;
+                    event_id = Some(tx.last_insert_rowid());
+                    return Ok((false, event_id));
+                }
+            }
+        }
+        let deleted = tx.execute(
+            "DELETE FROM instances
+             WHERE name = ? AND created_at = ?
+               AND session_id IS ? AND agent_id IS ?",
+            params![name, created_at, session_id, agent_id],
+        )?;
+        if deleted == 0 {
+            return Ok((false, event_id));
+        }
+
+        if let Some(session_id) = session_id {
+            tx.execute(
+                "DELETE FROM session_bindings WHERE session_id = ?",
+                params![session_id],
+            )?;
+            tx.execute(
+                "DELETE FROM process_bindings WHERE session_id = ?",
+                params![session_id],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM notify_endpoints WHERE instance = ?",
+            params![name],
+        )?;
+        tx.execute(
+            "DELETE FROM process_bindings WHERE instance_name = ?",
+            params![name],
+        )?;
+        tx.execute(
+            "DELETE FROM kv
+             WHERE key LIKE 'events_sub:%'
+               AND json_extract(value, '$.caller') = ?
+               AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
+            params![name],
+        )?;
+        tx.execute(
+            "INSERT INTO events (timestamp, type, instance, data)
+             VALUES (?, 'life', ?, ?)",
+            params![timestamp, name, data],
+        )?;
+        event_id = Some(tx.last_insert_rowid());
+        Ok((true, event_id))
     }
 
     /// Check whether `name`'s *current* identity is a subagent slot.
