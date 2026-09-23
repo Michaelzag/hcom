@@ -944,8 +944,8 @@ const SWEEP_FRESH_GRACE_SECS: i64 = 60;
 
 /// Daemon-side periodic check (runs on the relay worker's watchdog tick, so
 /// in a different process — and typically a different cgroup — from any
-/// session): for every local instance, active or inactive, test whether its
-/// harness is gone.
+/// session): for every local instance, test whether its harness is gone.
+/// Inactive rows are checked on Linux only.
 ///
 /// Fail-safe inversion: a row is vanished ONLY on positive evidence of death —
 /// every attributable pid is dead AND no live carrier holds the instance. Any
@@ -967,7 +967,8 @@ const SWEEP_FRESH_GRACE_SECS: i64 = 60;
 ///
 /// Skips rows already released (they are simply not returned by the live
 /// query, so a normal exit's wrapper-written `stopped` never double-fires),
-/// remote mirrors, placeholders, and recently-seen rows.
+/// remote mirrors, placeholders, recently-seen rows, and off Linux, inactive
+/// rows.
 /// Returns swept names.
 pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
     let instances = match db.iter_instances_full() {
@@ -992,9 +993,16 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         if inst.status == crate::instance_names::PLACEHOLDER_STATUS {
             continue;
         }
-        // Inactive rows get no pass: they are released once their process is
-        // provably gone, and a resume handle survives release because `hcom r`
-        // reads the stopped snapshot.
+        // Inactive rows are soft-stop resume handles. On Linux they get no
+        // pass: they are released once their process is provably gone, and a
+        // resume handle survives release because `hcom r` reads the stopped
+        // snapshot. Off Linux nothing sees their carriers (no /proc), so a
+        // dead pid alone never releases one: they live out
+        // cleanup_stale_instances' retention tiers.
+        #[cfg(not(target_os = "linux"))]
+        if inst.status == crate::shared::ST_INACTIVE {
+            continue;
+        }
         if inst.last_seen > 0 && now - inst.last_seen < SWEEP_FRESH_GRACE_SECS {
             continue;
         }
@@ -1455,9 +1463,14 @@ mod tests {
         assert!(db.get_instance_full("cur-row").unwrap().is_none());
     }
 
-    #[cfg(unix)]
     fn dead_pid() -> i64 {
+        #[cfg(unix)]
         let mut child = std::process::Command::new("true").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
         let pid = child.id();
         child.wait().unwrap();
         pid as i64
@@ -1518,7 +1531,6 @@ mod tests {
     }
 
     /// Push a row's `last_seen` outside the sweep's fresh grace.
-    #[cfg(unix)]
     fn age_row(db: &crate::db::HcomDb, name: &str) {
         let stale = crate::shared::time::now_epoch_f64() as i64 - SWEEP_FRESH_GRACE_SECS - 60;
         db.conn()
@@ -1529,8 +1541,36 @@ mod tests {
             .unwrap();
     }
 
+    /// Off Linux the sweep sees no carriers, so a dead pid never releases an
+    /// inactive row (a soft-stop resume handle). The active row with the same
+    /// dead pid is released, which proves the pid reads as dead here.
     #[test]
-    #[cfg(unix)]
+    #[cfg(not(target_os = "linux"))]
+    fn sweep_keeps_dead_inactive_row_off_linux() {
+        let db = test_db();
+        let pid = dead_pid();
+        insert_row(&db, "inactive-dead-row", "inactive", Some(pid));
+        insert_row(&db, "active-dead-row", "active", Some(pid));
+        age_row(&db, "inactive-dead-row");
+        age_row(&db, "active-dead-row");
+        let swept = sweep_vanished_instances(&db);
+        assert!(
+            swept.contains(&"active-dead-row".to_string()),
+            "active row with the dead pid kept: {swept:?}"
+        );
+        assert!(
+            !swept.contains(&"inactive-dead-row".to_string()),
+            "inactive row swept off Linux: {swept:?}"
+        );
+        let row = db
+            .get_instance_full("inactive-dead-row")
+            .unwrap()
+            .expect("inactive row released off Linux");
+        assert_eq!(row.status, crate::shared::ST_INACTIVE);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn sweep_releases_dead_inactive_row() {
         let db = test_db();
         // Soft-stopped row whose process is provably gone: dead recorded

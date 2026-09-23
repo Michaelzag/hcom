@@ -1,8 +1,9 @@
 //! `hcom omp-stop` without `--soft` is the omp owner's own exit release: it
 //! runs inside the exiting session's process tree, so that tree is spared
-//! while every other carrier of the instance is reaped.
+//! while every other carrier of the instance is reaped. Linux only: off Linux
+//! the release keeps the row soft-stopped instead (no /proc to reap from).
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 mod support;
 

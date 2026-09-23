@@ -451,9 +451,10 @@ fn soft_stop_keeps_instance_row_and_process_binding() {
     cleanup(path);
 }
 
-/// The omp owner's close: session_shutdown soft-stops (`--soft`), then the
-/// process-exit release runs `omp-stop` without it. The row is gone, and a
-/// resume from the newest stopped snapshot restores the title.
+/// The omp owner's close on Linux: session_shutdown soft-stops (`--soft`),
+/// then the process-exit release runs `omp-stop` without it. The row is gone,
+/// and a resume from the newest stopped snapshot restores the title.
+#[cfg(target_os = "linux")]
 #[test]
 fn omp_owner_close_releases_row_and_resume_restores_title() {
     crate::config::Config::init();
@@ -506,6 +507,55 @@ fn omp_owner_close_releases_row_and_resume_restores_title() {
     .unwrap();
     assert_eq!(plan.launch.purpose.as_deref(), Some("zagdb: rc.48 roll"));
     assert_eq!(plan.launch.current.as_deref(), Some("probing WAL"));
+
+    cleanup(path);
+}
+
+/// The omp owner's close off Linux keeps the row: session_shutdown's `--soft`
+/// stop leaves the resume handle, and the exit release after it changes
+/// nothing (no event, so no second stopped event; binding kept).
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn omp_owner_close_keeps_row_off_linux() {
+    crate::config::Config::init();
+    let (db, path) = setup_test_db();
+    let name = format!("rockeep{}", std::process::id());
+    let process_id = format!("pid-roc-keep-{}", std::process::id());
+    save_test_instance(&db, &name, ST_LISTENING);
+    db.set_process_binding(&process_id, "", &name).unwrap();
+
+    let stop = |soft: bool| {
+        let mut argv = vec![
+            "--name".to_string(),
+            name.clone(),
+            "--reason".to_string(),
+            "shutdown".to_string(),
+        ];
+        if soft {
+            argv.push("--soft".to_string());
+        }
+        handle_stop(&db, &argv)
+    };
+    let events = || -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance = ?1",
+                [&name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(stop(true).0, 0);
+    let after_soft = events();
+    assert_eq!(stop(false).0, 0);
+
+    assert_eq!(events(), after_soft, "the exit release wrote events");
+    let row = db
+        .get_instance_full(&name)
+        .unwrap()
+        .expect("the exit release deleted the row off Linux");
+    assert_eq!(row.status, crate::shared::ST_INACTIVE);
+    assert_eq!(db.get_process_binding(&process_id).unwrap(), Some(name));
 
     cleanup(path);
 }

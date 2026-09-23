@@ -344,7 +344,9 @@ fn handle_beforetool(db: &HcomDb, argv: &[String]) -> (i32, String) {
 
 /// `omp-stop`: `--soft` keeps the row and process binding (the omp owner's
 /// session_shutdown ahead of /restart, which execs the same pid and rebinds).
-/// Without it the row is fully released.
+/// Without it the row is fully released on Linux. Off Linux nothing can see
+/// the session's other carriers, so the row is soft-stopped as with `--soft`
+/// instead, and a row already inactive is left as is.
 ///
 /// omp-stop is only ever invoked by the omp session on itself, so the
 /// caller's ancestry (this hcom child -> omp -> pty wrapper -> terminal) is

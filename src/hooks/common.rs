@@ -1969,7 +1969,11 @@ pub fn finalize_session(
 /// count as survivors. For a session releasing its own row while its own
 /// process tree is still running (the omp owner's exit release). A headless
 /// row's recorded group is signalled only when `exclude` is provably outside
-/// it, which only Linux can prove; elsewhere the release skips that signal.
+/// it, which only Linux can prove.
+///
+/// Off Linux a non-empty `exclude` never deletes the row: without /proc the
+/// reap and the headless check see none of the session's other carriers, so
+/// a release would report success blind (see `keep_own_row_off_linux`).
 pub fn finalize_session_excluding(
     db: &HcomDb,
     instance_name: &str,
@@ -1977,6 +1981,11 @@ pub fn finalize_session_excluding(
     updates: Option<&serde_json::Map<String, Value>>,
     exclude: &[u32],
 ) -> StopOutcome {
+    #[cfg(not(target_os = "linux"))]
+    if !exclude.is_empty() {
+        return keep_own_row_off_linux(db, instance_name, reason, updates);
+    }
+
     log::log_info(
         "hooks",
         "sessionend",
@@ -2017,6 +2026,40 @@ pub fn finalize_session_excluding(
         eprintln!("[hcom] warn: SessionEnd for '{instance_name}' did not stop the session: {e}");
     }
     outcome
+}
+
+/// A session's own release off Linux: soft-stop exactly as `omp-stop --soft`
+/// does (row kept inactive, soft stopped event, process binding kept) and
+/// signal nothing — the pre-release owner-close outcome. A row already
+/// inactive (the graceful path soft-stopped it first) is left as is: no
+/// second stopped event. Returns `Stopped` when this call soft-stopped the
+/// row, `AlreadyStopped` when there was nothing to change.
+#[cfg(not(target_os = "linux"))]
+fn keep_own_row_off_linux(
+    db: &HcomDb,
+    instance_name: &str,
+    reason: &str,
+    updates: Option<&serde_json::Map<String, Value>>,
+) -> StopOutcome {
+    let status = match db.get_instance_full(instance_name) {
+        Ok(Some(row)) => row.status,
+        Ok(None) => return StopOutcome::AlreadyStopped,
+        Err(e) => {
+            return StopOutcome::RetryableError(format!(
+                "could not read instance {instance_name}: {e}"
+            ));
+        }
+    };
+    log::log_info(
+        "hooks",
+        "stop_instance.self_release_kept_off_linux",
+        &format!("instance={instance_name} reason={reason} status={status}"),
+    );
+    if status == ST_INACTIVE {
+        return StopOutcome::AlreadyStopped;
+    }
+    soft_finalize_session(db, instance_name, reason, updates, true);
+    StopOutcome::Stopped
 }
 
 /// Update instance status for tool execution.
@@ -3452,13 +3495,14 @@ mod tests {
         assert!(db.get_instance_full(&name).unwrap().is_none());
     }
 
-    /// Off Linux nothing proves the caller is outside a headless row's
-    /// recorded group (on Windows the tree under the recorded root holds the
-    /// releasing CLI itself), so the session's own release never signals it.
-    /// The row is still released.
+    /// Off Linux nothing sees a session's other carriers, so its own release
+    /// keeps the row instead of deleting it on a blind reap: soft-stopped as
+    /// by `omp-stop --soft` (inactive, one stopped event, process binding
+    /// kept), with no signal to anything, a headless row's recorded group
+    /// included.
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn self_release_never_signals_headless_group_off_linux() {
+    fn self_release_keeps_row_off_linux() {
         crate::config::Config::init();
         let (_dir, db) = make_test_db();
         let name = format!("selfoff{}", std::process::id());
@@ -3482,6 +3526,7 @@ mod tests {
         };
         let pid = root.0.id();
         insert_headless_instance(&db, &name, pid);
+        db.set_process_binding("proc-selfoff", "", &name).unwrap();
 
         let outcome = finalize_session_excluding(
             &db,
@@ -3496,6 +3541,24 @@ mod tests {
             crate::sys::process::is_alive(pid),
             "the session's own release signalled the recorded group"
         );
-        assert!(db.get_instance_full(&name).unwrap().is_none());
+        let row = db
+            .get_instance_full(&name)
+            .unwrap()
+            .expect("the session's own release deleted the row off Linux");
+        assert_eq!(row.status, ST_INACTIVE);
+        assert_eq!(
+            db.process_binding_ids(&name).unwrap(),
+            vec!["proc-selfoff".to_string()]
+        );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1
+                   AND json_extract(data, '$.action') = 'stopped'",
+                [&name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 1);
     }
 }
