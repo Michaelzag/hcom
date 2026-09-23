@@ -149,6 +149,35 @@ function installExitSignalRecorders(reg: OmpIdentityRegistry): void {
 	}
 }
 
+// Full owner release, synchronous. The signal path and the exit listener both
+// run it while this omp process is still alive, which the release relies on:
+// it spares the caller's ancestry, omp included. The 10s budget outlasts the
+// reap's TERM + KILL waits (5s + 2s), so live MCP/LSP carriers cannot get it
+// killed before it commits, as the async hcom() cap (HCOM_TIMEOUT_MS) would.
+function releaseOwnerSync(name: string, reason: string): boolean {
+	try {
+		const result = spawnSync("hcom", ["omp-stop", "--name", name, "--reason", reason], {
+			stdio: "ignore",
+			timeout: 10000,
+		});
+		if (result.status === 0) return true;
+		log("WARN", "plugin.session_shutdown_stop_failed", name, {
+			exit_code: result.status,
+			signal: result.signal,
+			error: result.error ? String(result.error) : undefined,
+			reason,
+			soft: false,
+		});
+	} catch (error) {
+		log("ERROR", "plugin.session_shutdown_stop_error", name, {
+			error: String(error),
+			reason,
+			soft: false,
+		});
+	}
+	return false;
+}
+
 // Arm the full release for process exit. Graceful quits (/exit, /quit, Ctrl-D,
 // double Ctrl-C, print end, RPC EOF) call process.exit, which fires `exit`, so
 // the soft-kept row is released there. /restart execvp's the same pid without
@@ -161,12 +190,7 @@ function armExitRelease(reg: OmpIdentityRegistry, name: string, reason: string):
 		const pending = reg.pendingExitRelease;
 		if (!pending) return;
 		reg.pendingExitRelease = null;
-		try {
-			spawnSync("hcom", ["omp-stop", "--name", pending.name, "--reason", pending.reason], {
-				stdio: "ignore",
-				timeout: 10000,
-			});
-		} catch {}
+		releaseOwnerSync(pending.name, pending.reason);
 	});
 }
 
@@ -554,40 +578,36 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			reg.tearingDown = true;
 			const reason = "shutdown";
 			const stopName = instanceName;
-			const ownerStop = async (soft: boolean): Promise<boolean> => {
-				const args = ["omp-stop", "--name", stopName, "--reason", reason];
-				if (soft) args.push("--soft");
-				try {
-					const result = await hcom(args);
-					if (result.code === 0) return true;
-					log("WARN", "plugin.session_shutdown_stop_failed", stopName, {
-						exit_code: result.code,
-						reason,
-						soft,
-						stderr: result.stderr.slice(0, 300),
-					});
-				} catch (error) {
-					log("ERROR", "plugin.session_shutdown_stop_error", stopName, {
-						error: String(error),
-						reason,
-						soft,
-					});
-				}
-				return false;
-			};
 			// Lets a same-tick signal listener record the signal: omp's postmortem
 			// listener runs first and reaches this handler synchronously.
 			await Promise.resolve();
 			if (reg.exitSignal) {
 				// Signal exit: postmortem runs cleanup, then exits without firing
-				// `exit`. Release the row now.
-				const releaseOk = await ownerStop(false);
-				keepOwner = !releaseOk;
+				// `exit`. Release the row now, while omp is still alive.
+				keepOwner = !releaseOwnerSync(stopName, reason);
 			} else {
 				// No signal: a graceful quit (process.exit follows, `exit` fires) or
 				// /restart (execvp of the same pid, no `exit`). Soft-stop now so the
 				// restarted image can rebind; the full release waits for `exit`.
-				const softStopOk = await ownerStop(true);
+				let softStopOk = false;
+				try {
+					const result = await hcom(["omp-stop", "--name", stopName, "--reason", reason, "--soft"]);
+					softStopOk = result.code === 0;
+					if (!softStopOk) {
+						log("WARN", "plugin.session_shutdown_stop_failed", stopName, {
+							exit_code: result.code,
+							reason,
+							soft: true,
+							stderr: result.stderr.slice(0, 300),
+						});
+					}
+				} catch (error) {
+					log("ERROR", "plugin.session_shutdown_stop_error", stopName, {
+						error: String(error),
+						reason,
+						soft: true,
+					});
+				}
 				armExitRelease(reg, stopName, reason);
 				keepOwner = !softStopOk;
 			}
