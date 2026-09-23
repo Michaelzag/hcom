@@ -43,6 +43,17 @@ fn worker_lock_path() -> PathBuf {
     crate::paths::hcom_dir().join(".tmp").join("relay.lock")
 }
 
+/// Open (creating when missing) the worker singleton lock file with the one
+/// set of open flags every holder shares: create, never truncate, read+write.
+fn open_worker_lock_file() -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(worker_lock_path())
+}
+
 /// Write this process's PID. Only the lock holder calls this.
 fn write_pid_file() {
     crate::paths::atomic_write(&pid_file_path(), &std::process::id().to_string());
@@ -243,6 +254,26 @@ fn acquire_worker_lock(file: &std::fs::File) -> std::io::Result<bool> {
     Ok(false)
 }
 
+/// Take the worker singleton lock for `hcom reset`, exclusively, with the same
+/// file, the same open flags, and the same bounded retry as a worker start —
+/// so it contends with a real worker (or one started mid-reset) on every
+/// platform. The returned file is the guard: the lock is held until it drops.
+/// `ErrorKind::WouldBlock` when a worker holds it.
+pub fn lock_worker_singleton() -> std::io::Result<std::fs::File> {
+    if let Some(parent) = worker_lock_path().parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = open_worker_lock_file()?;
+    if acquire_worker_lock(&file)? {
+        Ok(file)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "relay worker holds the singleton lock",
+        ))
+    }
+}
+
 /// Run the relay-worker process. Called from router dispatch.
 pub fn run() -> i32 {
     let lock_path = worker_lock_path();
@@ -252,13 +283,7 @@ pub fn run() -> i32 {
         eprintln!("Error: Failed to create {}: {e}", parent.display());
         return 1;
     }
-    let lock_file = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-    {
+    let lock_file = match open_worker_lock_file() {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error: Failed to open {}: {e}", lock_path.display());
@@ -577,6 +602,11 @@ pub const MANAGED_START_HINT: &str = "relay worker is managed by a service manag
 pub const MANAGED_STOP_HINT: &str = "relay worker is managed by a service manager (relay_worker_managed=true); stop it there, e.g. systemctl --user stop hcom-relay";
 /// Guidance printed when `hcom reset` refuses to run under a managed worker.
 pub const MANAGED_RESET_HINT: &str = "relay worker is managed by a service manager (relay_worker_managed=true) and is running; stop it there first, e.g. systemctl --user stop hcom-relay, then rerun hcom reset";
+/// Guidance printed when `hcom reset` cannot take the worker singleton lock in
+/// unmanaged mode: a worker is running (one a hook or spawner just started
+/// counts) and must go before the database is touched.
+pub const UNMANAGED_RESET_HINT: &str =
+    "relay worker is running; stop it first, e.g. hcom relay daemon stop, then rerun hcom reset";
 
 /// How long a spawner keeps the spawn lock waiting for its child to take the
 /// worker lock, so a concurrent spawner doesn't launch a redundant child.

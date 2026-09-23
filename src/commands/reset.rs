@@ -39,21 +39,21 @@ pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) ->
         return super::hooks::cmd_hooks_remove(&["all".to_string()]);
     }
 
-    // A running managed worker must be stopped through its service manager
-    // first; refuse before touching anything.
-    if !crate::commands::daemon::reset_permitted() {
+    // Take the worker singleton lock before touching anything and hold it
+    // across every step that touches hcom.db: a worker (running, or started
+    // mid-reset by a service manager or a hook) otherwise races the archive
+    // copy and unlink. Refuses — non-zero, having touched nothing — when the
+    // lock is a worker's. Unmanaged reset also stops the recorded worker
+    // first, inside the gate.
+    let Some(worker_lock) = crate::commands::daemon::lock_worker_for_reset() else {
         return 1;
-    }
+    };
 
     // Stop all instances before clearing database
     let stop_args = crate::commands::stop::StopArgs {
         targets: vec!["all".into()],
     };
     exit_codes.push(crate::commands::stop::cmd_stop(db, &stop_args, ctx));
-
-    // Stop relay daemon if running before clear (managed: none is running, the
-    // gate above refused otherwise)
-    let _ = crate::commands::daemon::stop_worker_for_reset();
 
     // Clean temp files
     super::reset_ops::clean_temp_files();
@@ -72,6 +72,10 @@ pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) ->
 
     // Log reset event to fresh DB
     super::reset_ops::bootstrap_fresh_db();
+
+    // Everything that touches hcom.db is done; release the singleton lock
+    // before respawning the worker, which takes the lock itself.
+    drop(worker_lock);
 
     // Respawn relay worker (was stopped above) and push reset event to remote devices.
     // ensure_worker re-reads config, so this is a no-op when relay is not configured.

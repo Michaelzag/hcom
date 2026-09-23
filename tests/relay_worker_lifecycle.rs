@@ -331,3 +331,388 @@ fn managed_connect_retry_keeps_heartbeat_fresh() {
         "stdout={stdout}"
     );
 }
+
+// ── Singleton-lock safety for `hcom reset` ─────────────────────────────
+//
+// `hcom reset` copies and unlinks hcom.db. A worker — running, or started
+// mid-reset by a service manager or a hook — that opens the database in that
+// window corrupts the archive and the live state. These tests hold
+// `.tmp/relay.lock` the way a worker does and check that reset contends
+// with it: refuses while it is held, and holds it itself across the surgery.
+
+/// The worker singleton lock file.
+fn lock_file(h: &Hcom) -> PathBuf {
+    h.hcom_dir.join(".tmp").join("relay.lock")
+}
+
+/// Open the singleton lock file with the worker's exact open flags (create,
+/// never truncate, read+write). Locks are per open file description (per
+/// handle on Windows), so a fresh open contends like a fresh process.
+fn open_lock_file_at(hcom_dir: &std::path::Path) -> std::fs::File {
+    let path = hcom_dir.join(".tmp").join("relay.lock");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap()
+}
+
+fn open_lock_file(h: &Hcom) -> std::fs::File {
+    open_lock_file_at(&h.hcom_dir)
+}
+
+/// Exclusive whole-file lock, the worker's primitive: flock(LOCK_EX) on Unix,
+/// LockFileEx on Windows. Mirrors `sys::fs::lock_exclusive` — kept here
+/// because integration tests cannot link the hcom binary's internals.
+fn lock_exclusive(file: &std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: flock on a valid fd; return value is checked.
+        let ret = unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX) };
+        assert_eq!(ret, 0, "flock(LOCK_EX) failed");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // SAFETY: valid handle for the file's lifetime; whole-file range.
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as HANDLE,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        assert_ne!(ok, 0, "LockFileEx failed");
+    }
+}
+
+/// Non-blocking exclusive attempt (flock(LOCK_EX|LOCK_NB) / LockFileEx with
+/// FAIL_IMMEDIATELY). True when acquired; false when held elsewhere.
+fn try_lock_exclusive(file: &std::fs::File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            // SAFETY: flock on a valid fd; return value is checked.
+            let ret = unsafe {
+                nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB)
+            };
+            if ret == 0 {
+                return true;
+            }
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(code) if code == nix::libc::EINTR => continue,
+                Some(code) if code == nix::libc::EWOULDBLOCK || code == nix::libc::EAGAIN => {
+                    return false;
+                }
+                _ => panic!("flock(LOCK_EX|LOCK_NB) failed"),
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, HANDLE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+        };
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // SAFETY: valid handle for the file's lifetime; whole-file range.
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as HANDLE,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            return true;
+        }
+        let code = std::io::Error::last_os_error().raw_os_error();
+        assert!(
+            code == Some(ERROR_LOCK_VIOLATION as i32) || code == Some(ERROR_IO_PENDING as i32),
+            "LockFileEx failed"
+        );
+        false
+    }
+}
+
+/// Hold the singleton lock until the returned handle drops, the way a running
+/// worker holds it. Every contender under test runs in another process, so
+/// the contention is real.
+fn hold_singleton_lock(h: &Hcom) -> std::fs::File {
+    let file = open_lock_file(h);
+    lock_exclusive(&file);
+    file
+}
+
+/// Seed one real conversation (a reset event) so "archived / not archived"
+/// assertions bite. The exit code is not asserted: on Windows the db-clear
+/// half of reset cannot work at all (ffc-gt11n), but the fresh-db bootstrap
+/// still logs the event.
+fn seed_conversation(h: &Hcom) {
+    let _ = h.run(["reset"]);
+    let conn = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).expect("open seeded db");
+    let events: i64 = conn
+        .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+        .expect("count seeded events");
+    assert!(events > 0, "setup: conversation not seeded");
+}
+
+/// hcom.db and its sidecars as bytes; None = absent.
+fn db_snapshot(h: &Hcom) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    ["hcom.db", "hcom.db-wal", "hcom.db-shm"]
+        .into_iter()
+        .map(|name| {
+            let path = h.hcom_dir.join(name);
+            let bytes = std::fs::read(&path).ok();
+            (path, bytes)
+        })
+        .collect()
+}
+
+/// Archive session dirs reset created (none = the database was not archived).
+fn session_archives(h: &Hcom) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(h.hcom_dir.join("archive"))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("session-"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Reset must refuse — non-zero, touching nothing — while anything holds the
+/// worker singleton lock, even with no recorded worker: the gap a freshly
+/// restarted worker (or one a hook spawned) sits in. Unmanaged reset used to
+/// ignore the lock entirely and archive the database under it.
+#[test]
+fn unmanaged_reset_refuses_while_singleton_lock_held() {
+    let h = Hcom::new();
+    seed_conversation(&h);
+    assert!(!pid_file(&h).exists(), "setup: a worker is recorded");
+
+    let _held = hold_singleton_lock(&h);
+    let before = db_snapshot(&h);
+
+    let (code, stdout, stderr) = h.run(["reset"]);
+    assert_ne!(
+        code, 0,
+        "reset proceeded while the singleton lock was held: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("relay worker is running") && stderr.contains("rerun hcom reset"),
+        "unclear refusal: stderr={stderr}"
+    );
+    assert_eq!(db_snapshot(&h), before, "refused reset modified hcom.db");
+    assert!(
+        session_archives(&h).is_empty(),
+        "refused reset archived the database"
+    );
+}
+
+/// Same contract in managed mode, with the managed refusal text: the service
+/// manager's worker holds hcom.db open and would be restarted mid-archive, so
+/// reset must refuse and point at the manager.
+#[test]
+fn managed_reset_refuses_while_singleton_lock_held() {
+    let h = Hcom::new();
+    set_managed(&h);
+    seed_conversation(&h);
+
+    let _held = hold_singleton_lock(&h);
+    let before = db_snapshot(&h);
+
+    let (code, stdout, stderr) = h.run(["reset"]);
+    assert_ne!(
+        code, 0,
+        "reset proceeded while the singleton lock was held: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("relay worker is managed by a service manager")
+            && stderr.contains("systemctl --user stop hcom-relay")
+            && stderr.contains("rerun hcom reset"),
+        "unclear refusal: stderr={stderr}"
+    );
+    assert_eq!(db_snapshot(&h), before, "refused reset modified hcom.db");
+    assert!(
+        session_archives(&h).is_empty(),
+        "refused reset archived the database"
+    );
+}
+
+/// The check-then-act race itself: managed reset's one-time free-lock probe
+/// passes, then a replacement worker takes the lock and reopens hcom.db while
+/// reset copies and unlinks it. Reset must hold the lock across the whole
+/// surgery, so a contender fired mid-archive — this test's holder, released
+/// to run when the archive copy starts — can only acquire afterwards and
+/// never see the pre-reset database.
+///
+/// Unix only: clearing hcom.db at all is unix-only for now (ffc-gt11n, same
+/// gate as `managed_reset_proceeds_without_worker`).
+#[cfg(unix)]
+#[test]
+fn managed_reset_holds_singleton_lock_across_db_surgery() {
+    let h = Hcom::new();
+    set_managed(&h);
+    seed_conversation(&h);
+
+    // Widen the archive-copy window so the race is reliably observable: reset
+    // copies hcom.db before unlinking it, and the holder fires when the copy
+    // starts.
+    let db_path = h.hcom_dir.join("hcom.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open seeded db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS race_filler (b BLOB);
+             INSERT INTO race_filler VALUES (zeroblob(67108864));",
+        )
+        .expect("widen seeded db");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("fold widened db into the main file");
+    }
+    let original_len = std::fs::metadata(&db_path).expect("stat widened db").len();
+    assert!(
+        original_len > 64 * 1024 * 1024,
+        "setup: database not widened: {original_len} bytes"
+    );
+
+    // The "service-manager replacement": notice the archive copy starting —
+    // strictly after reset's gate — then take the singleton lock the way a
+    // freshly restarted worker would and look at hcom.db.
+    let hcom_dir = h.hcom_dir.clone();
+    let holder = std::thread::spawn(move || {
+        let archive = hcom_dir.join("archive");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let started = std::fs::read_dir(&archive)
+                .map(|rd| rd.filter_map(|e| e.ok()).next().is_some())
+                .unwrap_or(false);
+            if started {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reset never created an archive");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        // Worker-style bounded retry. Longer than the worker's 3s only so a
+        // loaded box cannot flunk the acquisition the assertions below need;
+        // the property under test is what the lock excludes, not its patience.
+        let file = open_lock_file_at(&hcom_dir);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if try_lock_exclusive(&file) {
+                // None when hcom.db is gone at acquisition.
+                return std::fs::metadata(hcom_dir.join("hcom.db"))
+                    .ok()
+                    .map(|m| m.len());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "singleton lock never became free"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    let (code, stdout, stderr) = h.run(["reset"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        !session_archives(&h).is_empty(),
+        "setup: reset did not archive the database"
+    );
+
+    let len_at_acquisition = holder.join().expect("holder thread panicked");
+    assert_ne!(
+        len_at_acquisition,
+        Some(original_len),
+        "a contender took the singleton lock and found the pre-reset hcom.db in place: \
+         the lock is not held across the archive/unlink"
+    );
+}
+
+/// Reset must never delete or replace the singleton lock file: removing a
+/// held lock's path lets the next worker lock a fresh inode and run as a
+/// second singleton.
+///
+/// Unix only: clearing hcom.db at all is unix-only for now (ffc-gt11n, same
+/// gate as `managed_reset_proceeds_without_worker`).
+#[cfg(unix)]
+#[test]
+fn relay_lock_file_survives_reset() {
+    use std::os::unix::fs::MetadataExt;
+
+    let h = Hcom::new();
+    seed_conversation(&h);
+
+    // Create the lock file the way a running worker does, then let it go.
+    drop(hold_singleton_lock(&h));
+    let meta = std::fs::metadata(lock_file(&h)).expect("stat lock file");
+    let identity = (meta.dev(), meta.ino());
+
+    let (code, stdout, stderr) = h.run(["reset"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+    let meta = std::fs::metadata(lock_file(&h)).expect("reset deleted the singleton lock file");
+    assert_eq!(
+        (meta.dev(), meta.ino()),
+        identity,
+        "reset replaced the singleton lock file"
+    );
+}
+
+/// A worker that cannot take the singleton lock must exit without opening or
+/// creating hcom.db. Real worker binary; the held lock stands in for reset's
+/// hold (a real reset holds it only across its database surgery — too narrow
+/// to time a worker start inside).
+#[test]
+fn worker_start_while_singleton_lock_held_exits_without_touching_db() {
+    let h = Hcom::new();
+    let _held = hold_singleton_lock(&h);
+
+    let mut cmd = h.cmd();
+    let output = cmd
+        .arg("relay-worker")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run relay-worker");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(stderr.contains("already running"), "stderr={stderr}");
+    assert!(
+        !h.hcom_dir.join("hcom.db").exists(),
+        "refused worker start created hcom.db"
+    );
+    assert!(
+        !h.hcom_dir.join("hcom.db-wal").exists(),
+        "refused worker start created hcom.db-wal"
+    );
+    assert!(
+        !pid_file(&h).exists(),
+        "refused worker start wrote a pidfile"
+    );
+}

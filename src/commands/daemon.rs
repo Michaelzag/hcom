@@ -82,25 +82,45 @@ pub(crate) fn daemon_stop() -> i32 {
     stop_unmanaged()
 }
 
-/// Gate for `hcom reset`, checked before it touches anything. A running
-/// managed worker holds hcom.db open, and its service manager would restart
-/// it mid-archive, so reset refuses and points at the manager. False (after
-/// printing why) when reset must not proceed.
-pub(crate) fn reset_permitted() -> bool {
-    if worker::worker_managed() && worker::is_relay_worker_running() {
-        eprintln!("{}", worker::MANAGED_RESET_HINT);
-        return false;
+/// Gate and guard for `hcom reset`: stop the recorded worker (unmanaged only),
+/// then take the worker singleton lock and hold it until the caller drops the
+/// returned file. Every step that touches hcom.db runs under it, so no worker
+/// — one running now, or one a service manager or hook starts mid-reset — can
+/// open the database while reset copies and unlinks it. This replaces the old
+/// one-time free-lock probe, which a replacement worker could slip past while
+/// the managed stop was a no-op.
+///
+/// Unmanaged: the recorded incarnation is stopped first (same as
+/// [`stop_unmanaged`]), then the lock is taken with a starting worker's
+/// bounded retry; a worker that reappears lands on the lock and reset refuses.
+/// Managed: nothing is signalled — a held lock means the service manager's
+/// worker is up and must be stopped there.
+///
+/// None (after printing why) when reset must not proceed: the caller exits
+/// non-zero having touched nothing.
+pub(crate) fn lock_worker_for_reset() -> Option<std::fs::File> {
+    let managed = worker::worker_managed();
+    if !managed {
+        stop_unmanaged();
     }
-    true
-}
-
-/// Stop the worker for `hcom reset`. Unmanaged: same as `daemon stop`.
-/// Managed: nothing to do — [`reset_permitted`] already refused a running one.
-pub(crate) fn stop_worker_for_reset() -> i32 {
-    if worker::worker_managed() {
-        return 0;
+    match worker::lock_worker_singleton() {
+        Ok(lock) => Some(lock),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!(
+                "{}",
+                if managed {
+                    worker::MANAGED_RESET_HINT
+                } else {
+                    worker::UNMANAGED_RESET_HINT
+                }
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("Error: Failed to lock the relay worker singleton lock: {e}");
+            None
+        }
     }
-    stop_unmanaged()
 }
 
 fn stop_unmanaged() -> i32 {

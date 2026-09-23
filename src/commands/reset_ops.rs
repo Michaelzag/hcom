@@ -80,6 +80,11 @@ fn remove_database_files(
 }
 
 /// Clean temp files (launch scripts, prompts, old logs).
+///
+/// Only ever sweeps inside `.tmp/launch`, `.tmp/prompts`, and `.tmp/logs`.
+/// `.tmp/relay.lock` and `.tmp/relay.pid` are worker-lifetime files and are
+/// never touched: deleting a lock file while a handle holds it lets the next
+/// worker lock a fresh inode and run as a second singleton.
 pub(crate) fn clean_temp_files() {
     let base = hcom_dir();
     let cutoff_24h = crate::shared::time::now_epoch_f64() - 86400.0;
