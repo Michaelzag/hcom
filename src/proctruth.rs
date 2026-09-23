@@ -904,8 +904,8 @@ const SWEEP_FRESH_GRACE_SECS: i64 = 60;
 
 /// Daemon-side periodic check (runs on the relay worker's watchdog tick, so
 /// in a different process — and typically a different cgroup — from any
-/// session): for every active local instance, test whether its harness is
-/// gone.
+/// session): for every local instance, active or inactive, test whether its
+/// harness is gone.
 ///
 /// Fail-safe inversion: a row is vanished ONLY on positive evidence of death —
 /// every attributable pid is dead AND no live carrier holds the instance. Any
@@ -927,7 +927,7 @@ const SWEEP_FRESH_GRACE_SECS: i64 = 60;
 ///
 /// Skips rows already released (they are simply not returned by the live
 /// query, so a normal exit's wrapper-written `stopped` never double-fires),
-/// remote mirrors, placeholders, inactive resume rows, and recently-seen rows.
+/// remote mirrors, placeholders, and recently-seen rows.
 /// Returns swept names.
 pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
     let instances = match db.iter_instances_full() {
@@ -952,14 +952,9 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         if inst.status == crate::instance_names::PLACEHOLDER_STATUS {
             continue;
         }
-        // Inactive rows are resume handles, not live sessions: soft-stop
-        // (OMP --soft, agy Stop synthesis) deliberately keeps the row, its
-        // pid, and its process bindings for a later `hcom r`. They live out
-        // cleanup_stale_instances' retention tiers — the sweep must never
-        // release them.
-        if inst.status == crate::shared::ST_INACTIVE {
-            continue;
-        }
+        // Inactive rows get no pass: they are released once their process is
+        // provably gone, and a resume handle survives release because `hcom r`
+        // reads the stopped snapshot.
         if inst.last_seen > 0 && now - inst.last_seen < SWEEP_FRESH_GRACE_SECS {
             continue;
         }
@@ -1482,19 +1477,157 @@ mod tests {
         sleeper.wait().ok();
     }
 
+    /// Push a row's `last_seen` outside the sweep's fresh grace.
+    #[cfg(unix)]
+    fn age_row(db: &crate::db::HcomDb, name: &str) {
+        let stale = crate::shared::time::now_epoch_f64() as i64 - SWEEP_FRESH_GRACE_SECS - 60;
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_seen = ?1 WHERE name = ?2",
+                rusqlite::params![stale, name],
+            )
+            .unwrap();
+    }
+
     #[test]
     #[cfg(unix)]
-    fn sweep_skips_inactive_resume_row() {
+    fn sweep_releases_dead_inactive_row() {
         let db = test_db();
-        // Soft-stop resume handle: inactive, dead pid, kept binding. The
-        // sweep must leave it for cleanup_stale_instances' retention tiers.
-        let name = unique_name("inactive");
+        // Soft-stopped row whose process is provably gone: dead recorded
+        // pid, UUID binding, no carrier, seen long ago → released.
+        let name = unique_name("inactdead");
         insert_row(&db, &name, "inactive", Some(dead_pid()));
-        db.set_process_binding("proc-kept", "sess", &name).unwrap();
+        let binding = format!("proc-inactdead-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        age_row(&db, &name);
+        let swept = sweep_vanished_instances(&db);
+        assert!(swept.contains(&name), "dead inactive row kept: {swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        let event: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type='life' AND instance=?1 ORDER BY id DESC LIMIT 1",
+                [&name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            event.get("action").and_then(|v| v.as_str()),
+            Some("stopped")
+        );
+        assert_eq!(event.get("by").and_then(|v| v.as_str()), Some("daemon"));
+        assert_eq!(
+            event.get("reason").and_then(|v| v.as_str()),
+            Some("vanished")
+        );
+        assert!(
+            event.get("snapshot").is_some_and(|s| s.is_object()),
+            "stopped event carries a snapshot: {event}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_holds_inactive_row_with_live_carrier() {
+        let db = test_db();
+        // Dead recorded pid, but a live process still carries the name and
+        // the bound process id: the harness is around; not vanished.
+        let name = unique_name("inactcarrier");
+        insert_row(&db, &name, "inactive", Some(dead_pid()));
+        let binding = format!("proc-inactcarrier-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        age_row(&db, &name);
+        let mut sleeper = spawn_named_sleeper(&name, &binding);
+        wait_for_enumerated(&name, &[], sleeper.id());
         let swept = sweep_vanished_instances(&db);
         assert!(
             !swept.iter().any(|n| n == &name),
-            "inactive swept: {swept:?}"
+            "carrier-held inactive row swept: {swept:?}"
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_holds_inactive_row_with_live_pid() {
+        let db = test_db();
+        // Soft-stop with a kept binding and a live recorded pid: the
+        // /restart shape, where the same pid comes back into the session.
+        let name = unique_name("inactlive");
+        insert_row(&db, &name, "inactive", Some(std::process::id() as i64));
+        let binding = format!("proc-inactlive-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        age_row(&db, &name);
+        let swept = sweep_vanished_instances(&db);
+        assert!(
+            !swept.iter().any(|n| n == &name),
+            "live-pid inactive row swept: {swept:?}"
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_holds_inactive_row_without_pid_evidence() {
+        let db = test_db();
+        // No recorded pid and only a UUID-style binding: nothing proves
+        // death, so the row is held.
+        let name = unique_name("inactnopid");
+        insert_row(&db, &name, "inactive", None);
+        let binding = format!("proc-inactnopid-{}", rand_suffix());
+        db.set_process_binding(&binding, "sess", &name).unwrap();
+        age_row(&db, &name);
+        let swept = sweep_vanished_instances(&db);
+        assert!(
+            !swept.iter().any(|n| n == &name),
+            "evidence-free inactive row swept: {swept:?}"
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_keeps_inactive_row_inside_fresh_grace() {
+        let db = test_db();
+        let name = unique_name("inactfresh");
+        insert_row(&db, &name, "inactive", Some(dead_pid()));
+        let now = crate::shared::time::now_epoch_f64() as i64;
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_seen = ?1 WHERE name = ?2",
+                rusqlite::params![now, name],
+            )
+            .unwrap();
+        let swept = sweep_vanished_instances(&db);
+        assert!(
+            !swept.iter().any(|n| n == &name),
+            "fresh inactive row swept: {swept:?}"
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_skips_inactive_remote_mirror() {
+        let db = test_db();
+        // A remote mirror's pid means nothing on this host: never swept,
+        // inactive or not.
+        let name = unique_name("inactmirror");
+        insert_row(&db, &name, "inactive", Some(dead_pid()));
+        db.conn()
+            .execute(
+                "UPDATE instances SET origin_device_id = 'remote-dev' WHERE name = ?1",
+                [&name],
+            )
+            .unwrap();
+        age_row(&db, &name);
+        let swept = sweep_vanished_instances(&db);
+        assert!(
+            !swept.iter().any(|n| n == &name),
+            "remote mirror swept: {swept:?}"
         );
         assert!(db.get_instance_full(&name).unwrap().is_some());
     }
