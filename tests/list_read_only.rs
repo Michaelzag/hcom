@@ -4,10 +4,13 @@
 //! Both tests seed the fixture DB directly (rusqlite, real column names)
 //! after letting the binary initialize the schema, then run the real binary
 //! and assert the row and any live carrier survived untouched.
+//!
+//! Unix only: the carriers rely on process groups and /proc environ
+//! enumeration, which hcom's lifecycle code compiles out elsewhere.
+#![cfg(unix)]
 
 mod support;
 
-#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 use std::process::{Child, Command, Stdio};
