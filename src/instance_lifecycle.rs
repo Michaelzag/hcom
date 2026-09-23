@@ -622,11 +622,10 @@ pub fn set_status(
     let _ = db.log_event("status", instance_name, &data);
 }
 
-/// Delete placeholder instances that have been launching too long — unless
-/// their launch may still be alive: a placeholder with a live recorded pid
-/// or a live identity carrier is held (the launch is slow, not dead), and
-/// cleanup never signals a process, so it can only wait it out. Release is
-/// the plain placeholder stop: no reap, no signals.
+/// Delete stale launch placeholders only when no live, non-zombie identity
+/// carrier holds them. A bare recorded PID may have been recycled and cannot
+/// establish ownership. Release rechecks the sampled incarnation and carriers
+/// under one write transaction, without signalling any process.
 pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
     let mut deleted = 0;
     let now = now_epoch_f64();
@@ -638,23 +637,19 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
             }
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
-                let pid_live = data
-                    .pid
-                    .filter(|pid| *pid > 0)
-                    .is_some_and(|pid| !crate::proctruth::process_gone(pid as u32));
                 let binding_ids = db.process_binding_ids(&data.name).unwrap_or_default();
                 let carrier_live = crate::proctruth::has_live_carriers(&data.name, &binding_ids);
-                if pid_live || carrier_live {
+                if carrier_live {
                     crate::log::log_debug(
                         "cleanup",
                         "placeholder_held_live_launch",
-                        &format!("name={} pid_live={}", data.name, data.pid.unwrap_or(0)),
+                        &format!("name={}", data.name),
                     );
                     continue;
                 }
                 match crate::hooks::common::stop_placeholder_instance(
                     db,
-                    &data.name,
+                    data,
                     "system",
                     "stale_cleanup",
                 ) {
@@ -1188,6 +1183,37 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         cleanup(path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_cleanup_stale_placeholder_recycled_pid_does_not_hold() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let name = format!("placeholder-recycled-{}", std::process::id());
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("300")
+            .env_clear()
+            .spawn()
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at, pid, background)
+                 VALUES (?1, 'claude', 'pending', 'new', 1, ?2, 1)",
+                rusqlite::params![name, sleeper.id()],
+            )
+            .unwrap();
+
+        let deleted = cleanup_stale_placeholders(&db);
+        let alive = sleeper.try_wait().unwrap().is_none();
+        let _ = sleeper.kill();
+        sleeper.wait().unwrap();
+        let kept = db.get_instance_full(&name).unwrap().is_some();
+        cleanup(path);
+
+        assert!(alive, "cleanup must never signal an unrelated process");
+        assert_eq!(deleted, 1);
+        assert!(!kept);
+    }
+
     #[test]
     fn test_cleanup_stale_placeholders_keeps_fresh() {
         crate::config::Config::init();
@@ -1231,7 +1257,7 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
 
     #[test]
     #[cfg(unix)]
-    fn test_cleanup_stale_placeholders_holds_live_pid() {
+    fn test_cleanup_stale_placeholders_holds_live_carrier() {
         use std::os::unix::process::CommandExt;
 
         crate::config::Config::init();
@@ -1239,6 +1265,8 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
 
         let mut sleeper = std::process::Command::new("sleep")
             .arg("600")
+            .env_clear()
+            .env("HCOM_INSTANCE_NAME", "slow-launch")
             .process_group(0)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

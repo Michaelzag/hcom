@@ -1342,19 +1342,55 @@ pub enum StopOutcome {
     RetryableError(String),
 }
 
-/// Placeholder cleanup's release: the DB teardown (snapshot, `stopped`
-/// event with `placeholder: true`, row release) with the reap gate OFF —
-/// no headless group kill and no carrier reap, so it never signals. A
-/// placeholder past the age threshold may still belong to a slow-but-live
-/// launch; the caller holds those (see `cleanup_stale_placeholders`) and
-/// this path only ever releases rows no live process claims.
+/// Release only the sampled, still-unclaimed placeholder. The incarnation
+/// check, verify-only carrier gate, and full teardown share one IMMEDIATE
+/// transaction. A live launch rolls back every write; this path never signals.
 pub(crate) fn stop_placeholder_instance(
     db: &HcomDb,
-    instance_name: &str,
+    sampled: &InstanceRow,
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, false)
+    let queued = db.with_immediate_transaction(|tx| -> Result<Option<(StopOutcome, PostCommit)>> {
+        // This read uses the same connection as tx, under its write lock.
+        let unchanged = db.get_instance_full(&sampled.name)?.is_some_and(|current| {
+            instances::is_launching_placeholder(&current)
+                && current.created_at == sampled.created_at
+                && current.pid == sampled.pid
+        });
+        if !unchanged {
+            log::log_debug(
+                "cleanup",
+                "placeholder_claimed_mid_cleanup",
+                &format!("name={}", sampled.name),
+            );
+            return Ok(None);
+        }
+        let mut post = PostCommit::default();
+        let outcome = stop_instance_inner_scoped(
+            db,
+            &sampled.name,
+            initiated_by,
+            reason,
+            true,
+            0,
+            false,
+            Some(tx),
+            &mut post,
+        );
+        if let StopOutcome::RetryableError(error) = &outcome {
+            anyhow::bail!("{error}");
+        }
+        Ok(Some((outcome, post)))
+    });
+    match queued {
+        Ok(Some((outcome, post))) => {
+            post.fire(db);
+            outcome
+        }
+        Ok(None) => StopOutcome::AlreadyStopped,
+        Err(error) => StopOutcome::RetryableError(error.to_string()),
+    }
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1397,9 +1433,9 @@ fn stop_instance_inner(
 /// [`stop_instance_inner`] with the write scope spelled out. `tx: None` is
 /// the standalone path: every node finalizes in its own transaction and
 /// fires its external side effects inline — unchanged historical behavior.
-/// `tx: Some` is the kill path's shared transaction: every write (children
-/// included) joins `tx`, and external effects queue into `post` until the
-/// one commit.
+/// `tx: Some` is the kill/placeholder shared transaction: every write
+/// (children included) joins `tx`, and external effects queue into `post`
+/// until the one commit.
 #[allow(clippy::too_many_arguments)]
 fn stop_instance_inner_scoped(
     db: &HcomDb,
@@ -1654,6 +1690,8 @@ fn stop_instance_inner_scoped(
     // one of the carriers. Kill has already reaped the carrier set — every
     // non-self carrier on the self path — and verified it gone (fail-closed)
     // before this teardown is called, and only after its own incarnation CAS.
+    // Placeholder cleanup instead verifies carriers without reaping below;
+    // its IMMEDIATE transaction keeps bindings fixed through release.
     let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
     if reap_gate
         && let Err(survivors) =
@@ -1671,6 +1709,12 @@ fn stop_instance_inner_scoped(
         );
         return StopOutcome::RetryableError(format!(
             "could not stop {instance_name}: process(es) still alive after SIGKILL: {pids} — run hcom kill {instance_name} first"
+        ));
+    }
+    if !reap_gate && placeholder && crate::proctruth::has_live_carriers(instance_name, &binding_ids)
+    {
+        return StopOutcome::RetryableError(format!(
+            "could not release placeholder {instance_name}: launch is still alive"
         ));
     }
 
@@ -2984,6 +3028,107 @@ mod tests {
             [], |r| r.get(0)
         ).unwrap();
         assert_eq!(count, 1, "stopped life event should be logged");
+    }
+
+    #[test]
+    fn placeholder_release_keeps_claimed_row() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let name = format!("placeholder-claimed-{}", std::process::id());
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at)
+                 VALUES (?1, 'claude', 'pending', 'new', 1)",
+                [&name],
+            )
+            .unwrap();
+        db.set_process_binding("placeholder-binding", "", &name)
+            .unwrap();
+        let sampled = db.get_instance_full(&name).unwrap().unwrap();
+        db.conn()
+            .execute("UPDATE instances SET pid = 12345 WHERE name = ?1", [&name])
+            .unwrap();
+
+        let outcome = stop_placeholder_instance(&db, &sampled, "test", "stale_cleanup");
+
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_eq!(outcome, StopOutcome::AlreadyStopped);
+        assert_eq!(
+            db.get_process_binding("placeholder-binding").unwrap(),
+            Some(name.clone())
+        );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1
+                 AND json_extract(data, '$.action') = 'stopped'",
+                [&name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placeholder_release_refuses_live_carrier() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let name = format!("placeholder-carrier-{}", std::process::id());
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at, background)
+                 VALUES (?1, 'claude', 'pending', 'new', 1, 1)",
+                [&name],
+            )
+            .unwrap();
+        db.set_process_binding("placeholder-live-binding", "", &name)
+            .unwrap();
+        let child_name = format!("{name}-child");
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, parent_name, tool, status, status_context, created_at)
+                 VALUES (?1, ?2, 'claude', 'pending', 'new', 2)",
+                params![child_name, name],
+            )
+            .unwrap();
+        let sampled = db.get_instance_full(&name).unwrap().unwrap();
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("300")
+            .env_clear()
+            .env("HCOM_INSTANCE_NAME", &name)
+            .spawn()
+            .unwrap();
+
+        let outcome = stop_placeholder_instance(&db, &sampled, "test", "stale_cleanup");
+        let alive = sleeper.try_wait().unwrap().is_none();
+        let _ = sleeper.kill();
+        sleeper.wait().unwrap();
+
+        assert!(
+            alive,
+            "placeholder release must never signal its live launch"
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert!(
+            db.get_instance_full(&child_name).unwrap().is_some(),
+            "live parent refusal must roll back child teardown"
+        );
+        assert!(matches!(&outcome, StopOutcome::RetryableError(error) if error.contains(&name)));
+        assert_eq!(
+            db.get_process_binding("placeholder-live-binding").unwrap(),
+            Some(name.clone())
+        );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance IN (?1, ?2)
+                 AND json_extract(data, '$.action') = 'stopped'",
+                params![name, child_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0);
     }
 
     #[test]
