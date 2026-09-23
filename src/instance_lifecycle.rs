@@ -622,10 +622,10 @@ pub fn set_status(
     let _ = db.log_event("status", instance_name, &data);
 }
 
-/// Delete stale launch placeholders only when no live, non-zombie identity
-/// carrier holds them. A bare recorded PID may have been recycled and cannot
-/// establish ownership. Release rechecks the sampled incarnation and carriers
-/// under one write transaction, without signalling any process.
+/// Hold a stale placeholder with a live identity carrier (for example, Claude
+/// waiting on a trust prompt) without signalling its launch. Every other stale
+/// placeholder keeps the reap-verified teardown: release only once no process
+/// holds the instance.
 pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
     let mut deleted = 0;
     let now = now_epoch_f64();
@@ -638,8 +638,7 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
                 let binding_ids = db.process_binding_ids(&data.name).unwrap_or_default();
-                let carrier_live = crate::proctruth::has_live_carriers(&data.name, &binding_ids);
-                if carrier_live {
+                if crate::proctruth::has_live_carriers(&data.name, &binding_ids) {
                     crate::log::log_debug(
                         "cleanup",
                         "placeholder_held_live_launch",
@@ -649,7 +648,7 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
                 }
                 match crate::hooks::common::stop_placeholder_instance(
                     db,
-                    data,
+                    &data.name,
                     "system",
                     "stale_cleanup",
                 ) {
@@ -1197,7 +1196,7 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         db.conn()
             .execute(
                 "INSERT INTO instances (name, tool, status, status_context, created_at, pid, background)
-                 VALUES (?1, 'claude', 'pending', 'new', 1, ?2, 1)",
+                 VALUES (?1, 'claude', 'pending', 'new', 1, ?2, 0)",
                 rusqlite::params![name, sleeper.id()],
             )
             .unwrap();
@@ -1262,11 +1261,12 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
 
         crate::config::Config::init();
         let (db, path) = setup_test_db();
+        let name = format!("slow-launch-{}", std::process::id());
 
         let mut sleeper = std::process::Command::new("sleep")
             .arg("600")
             .env_clear()
-            .env("HCOM_INSTANCE_NAME", "slow-launch")
+            .env("HCOM_INSTANCE_NAME", &name)
             .process_group(0)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1275,23 +1275,25 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
 
         let old_time = now_epoch_f64() - 200.0;
         let mut data = serde_json::Map::new();
-        data.insert("name".into(), serde_json::json!("slow-launch"));
+        data.insert("name".into(), serde_json::json!(name));
         data.insert("status".into(), serde_json::json!("pending"));
         data.insert("status_context".into(), serde_json::json!("new"));
         data.insert("created_at".into(), serde_json::json!(old_time));
         data.insert("pid".into(), serde_json::json!(sleeper.id()));
-        db.save_instance_named("slow-launch", &data).unwrap();
+        db.save_instance_named(&name, &data).unwrap();
 
         let deleted = cleanup_stale_placeholders(&db);
-        assert_eq!(deleted, 0);
-        assert!(db.get_instance_full("slow-launch").unwrap().is_some());
-        assert!(
-            sleeper.try_wait().unwrap().is_none(),
-            "cleanup must never signal the placeholder's launch pid"
-        );
-
-        sleeper.kill().unwrap();
+        let alive = sleeper.try_wait().unwrap().is_none();
+        let _ = sleeper.kill();
         sleeper.wait().unwrap();
+        let kept = db.get_instance_full(&name).unwrap().is_some();
         cleanup(path);
+
+        assert!(
+            alive,
+            "cleanup must never signal the placeholder's live carrier"
+        );
+        assert_eq!(deleted, 0);
+        assert!(kept);
     }
 }
