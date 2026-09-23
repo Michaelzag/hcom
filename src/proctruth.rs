@@ -892,11 +892,22 @@ fn is_launcher_process_id(id: &str) -> bool {
 ///   or — when the row records no pid — some ancestor carries the id in its
 ///   environ. No row → never trusted: the launcher pre-registers the
 ///   binding before spawn, so a launcher id with no row is foreign;
-/// - any other id shape → the same row rule, but with no row the id is
-///   trusted when an ancestor carries it in its environ. Harness, relay and
-///   adhoc ids live here and are created by the hook that presents them, so
-///   a row cannot exist yet; the proof is still this process tree actually
-///   carrying the id, never `HCOM_LAUNCHED`.
+/// - any other id shape → the same row rule; with no row the id is trusted
+///   unless it is launcher-shaped. Harness, relay and adhoc ids live here:
+///   they are created BY the hook that presents them, so no row can exist
+///   yet, and refusing them breaks those flows.
+///
+///   READ BEFORE TRUSTING THIS ARM: `ancestor_carries_id` is carriage, not
+///   proof. `ancestors` is self-inclusive and `carries_process_id` reads the
+///   caller's live environ, which holds the very `HCOM_PROCESS_ID` this
+///   decision was built from — so for the id under test it is always true,
+///   and skipping self would not help either (a leak's exporting shell is
+///   itself an ancestor carrying it). There is no ancestry proof for a
+///   synthetic id, because such an id is just an environment value the
+///   process was handed. The arms below therefore preserve the pre-0.7.30
+///   behaviour for those shapes; the shapes that carry a real proof are
+///   agent-minted ids and launcher ids whose row records a live ancestor
+///   pid.
 ///
 /// [`AncestorProcess::Unknown`] never satisfies the `Omp` clause.
 pub(crate) fn process_id_trusted(
