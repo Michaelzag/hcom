@@ -18,13 +18,25 @@ pub fn identity(pid: u32) -> Option<String> {
 #[cfg(any(target_os = "android", target_os = "linux"))]
 pub fn start_epoch(pid: u32) -> Option<f64> {
     let ticks = process_start_ticks(pid)?;
-    let stat = std::fs::read_to_string("/proc/stat").ok()?;
-    let boot: f64 = stat
-        .lines()
-        .find_map(|line| line.strip_prefix("btime "))?
-        .trim()
-        .parse()
-        .ok()?;
+    // Android app domains cannot read /proc/stat. Sample the same boot epoch
+    // from clocks available on both Android and Linux instead.
+    let mut realtime = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut boottime = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: both pointers name writable timespec buffers. Read the clocks
+    // back to back to keep the boot-epoch estimate within pidfile slack.
+    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut realtime) } != 0
+        || unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut boottime) } != 0
+    {
+        return None;
+    }
+    let boot = (realtime.tv_sec - boottime.tv_sec) as f64
+        + (realtime.tv_nsec - boottime.tv_nsec) as f64 / 1_000_000_000.0;
     // SAFETY: sysconf reads the system clock-tick frequency.
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     (hz > 0).then(|| boot + ticks as f64 / hz as f64)
@@ -775,6 +787,34 @@ mod tests {
     #[test]
     fn test_process_identity_is_absent_for_dead_pid() {
         assert!(identity(u32::MAX).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_epoch_matches_proc_boot_time() {
+        let pid = std::process::id();
+        let boot: f64 = std::fs::read_to_string("/proc/stat")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: sysconf reads the system clock-tick frequency.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        assert!(hz > 0);
+        let expected = boot + process_start_ticks(pid).unwrap() as f64 / hz as f64;
+        let started = start_epoch(pid).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(started <= now, "process start {started} is after {now}");
+        assert!(
+            (started - expected).abs() < 1.0,
+            "clock-based start {started} differs from /proc/stat start {expected}"
+        );
     }
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
