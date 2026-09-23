@@ -28,10 +28,10 @@ pub fn start_epoch(pid: u32) -> Option<f64> {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: both pointers name writable timespec buffers. Read the clocks
-    // back to back to keep the boot-epoch estimate within pidfile slack.
-    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut realtime) } != 0
-        || unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut boottime) } != 0
+    // Boottime first: a pause biases the start later, so authentication fails closed.
+    // SAFETY: both pointers name writable timespec buffers.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut boottime) } != 0
+        || unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut realtime) } != 0
     {
         return None;
     }
