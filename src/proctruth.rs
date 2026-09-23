@@ -314,7 +314,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
 
 /// Field 5 (pgrp) of `/proc/<pid>/stat`, parsed after the closing `)` of
 /// comm like [`parent_pid`]. None when the process is gone or unparseable.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_group_id(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
@@ -348,7 +348,7 @@ fn ancestor_or_self_pids(pid: u32) -> Vec<u32> {
 /// must never be signalled for it. Ancestors are read from field 4 (ppid) of
 /// `/proc/<pid>/stat` (see [`parent_pid`]) — walking up until pid 1.
 ///
-/// Unix only; elsewhere this is just the caller's own pid.
+/// Linux only (/proc); elsewhere this is just the caller's own pid.
 pub fn caller_ancestor_pids() -> Vec<u32> {
     #[cfg(not(unix))]
     {
@@ -700,11 +700,26 @@ fn live_carriers_for(name: &str, binding_ids: &[String], exclude: &[u32]) -> Vec
 /// which leads the group but never carries the identity itself; `hcom pty`
 /// below it does. An unrelated process that reused the pid has none of the
 /// instance's carriers in its group.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn group_holds_instance_carrier(pgid: u32, name: &str, binding_ids: &[String]) -> bool {
     live_carriers_for(name, binding_ids, &[])
         .iter()
         .any(|m| process_group_id(m.pid) == Some(pgid))
+}
+
+/// Whether every pid in `pids` is provably outside process group `pgid`:
+/// none is `pgid` itself, and each one's /proc pgrp names another group. A
+/// gone pid is in no group; a live pid whose pgrp cannot be read proves
+/// nothing, so it counts as inside.
+#[cfg(target_os = "linux")]
+pub(crate) fn pids_outside_group(pgid: u32, pids: &[u32]) -> bool {
+    pids.iter().all(|&pid| {
+        pid != pgid
+            && match process_group_id(pid) {
+                Some(group) => group != pgid,
+                None => process_gone(pid),
+            }
+    })
 }
 
 /// Pid-reuse guard: true when `pid` still holds the instance — exactly
