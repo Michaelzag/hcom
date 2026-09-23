@@ -794,7 +794,11 @@ impl std::fmt::Display for ReapError {
 pub(crate) enum AncestorProcess {
     /// `/proc/<pid>/comm`, trimmed, is exactly `omp`.
     Omp,
-    /// `/proc/<pid>/comm` read fine and is something else.
+    /// `/proc/<pid>/comm` read fine and is something else. Without /proc there
+    /// is no comm to read, so this variant is unreachable off unix — which is
+    /// why the `allow` below is scoped to exactly that case rather than the
+    /// variant being deleted from the platform-neutral table.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Other,
     /// Unreadable /proc, or non-Linux. Never satisfies the `Omp` clause.
     Unknown,
@@ -943,7 +947,7 @@ pub fn trusted_process_id(db: &HcomDb, id: &str) -> bool {
     if id.is_empty() {
         return false;
     }
-    let ancestors = caller_ancestor_pids();
+    let mut ancestors = caller_ancestor_pids();
     let binding_row_pid = match db.get_process_binding(id) {
         Ok(Some(instance_name)) => match db.get_instance_full(&instance_name) {
             Ok(Some(row)) => Some(row.pid.and_then(|p| u32::try_from(p).ok())),
@@ -951,6 +955,18 @@ pub fn trusted_process_id(db: &HcomDb, id: &str) -> bool {
         },
         _ => None,
     };
+    // Off Linux there is no /proc ppid chain, so `ancestors` is just this
+    // process and a launcher id could never be proven — every launched session
+    // would lose its identity. There the launcher's own record is the
+    // equivalent proof: the pty wrapper wrote the launched tool's pid for this
+    // binding (`pty/mod.rs`, `pty/win.rs`), and a live process holding that pid
+    // is that tool.
+    #[cfg(not(target_os = "linux"))]
+    if let Some(Some(pid)) = binding_row_pid
+        && crate::sys::process::is_alive(pid)
+    {
+        ancestors.push(pid);
+    }
     process_id_trusted(
         id,
         &ancestors,
