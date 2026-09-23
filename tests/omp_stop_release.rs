@@ -22,6 +22,16 @@ fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus
     None
 }
 
+/// SIGKILL the whole group `child` leads (spawned with `process_group(0)`),
+/// then reap it. Called only while the leader is unreaped, so its pgid cannot
+/// have been recycled.
+fn kill_group(child: &mut Child) {
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
 #[test]
 fn omp_stop_release_spares_caller_tree_and_reaps_the_rest() {
     let h = Hcom::new();
@@ -72,12 +82,10 @@ fn omp_stop_release_spares_caller_tree_and_reaps_the_rest() {
     let session_status = wait_with_deadline(&mut session, Duration::from_secs(30));
     let sibling_status = wait_with_deadline(&mut sibling, Duration::from_secs(10));
     if session_status.is_none() {
-        let _ = session.kill();
-        let _ = session.wait();
+        kill_group(&mut session);
     }
     if sibling_status.is_none() {
-        let _ = sibling.kill();
-        let _ = sibling.wait();
+        kill_group(&mut sibling);
     }
 
     let session_status = session_status.expect("omp-stop session shell did not exit");
