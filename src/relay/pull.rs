@@ -1155,4 +1155,137 @@ mod tests {
         assert!(db.get_instance_full("luna:ABCD").unwrap().is_none());
         assert_eq!(safe_kv_get(&db, "relay_state_ts_device-1234"), None);
     }
+
+    fn state_payload(short_id: &str, instance_names: &[&str]) -> serde_json::Value {
+        let mut instances = serde_json::Map::new();
+        for name in instance_names {
+            instances.insert(
+                name.to_string(),
+                json!({
+                    "status": "active",
+                    "context": "",
+                    "detail": "",
+                    "status_time": crate::shared::time::now_epoch_f64(),
+                    "parent": serde_json::Value::Null,
+                    "directory": format!("/tmp/{name}"),
+                    "transcript": format!("/tmp/{name}/transcript.jsonl"),
+                    "wait_timeout": 42,
+                    "last_stop": 0.0,
+                    "tcp_mode": false,
+                    "tag": serde_json::Value::Null,
+                    "tool": "codex",
+                    "background": false
+                }),
+            );
+        }
+        json!({
+            "state": {
+                "short_id": short_id,
+                "reset_ts": 0.0,
+                "instances": instances,
+            },
+            "events": []
+        })
+    }
+
+    fn deliver_state(
+        db: &HcomDb,
+        guard: &mut ReplayGuard,
+        psk: &[u8; 32],
+        device_id: &str,
+        payload: &serde_json::Value,
+        ts_secs: u64,
+    ) -> bool {
+        let topic = format!("relay-test/{device_id}");
+        let bytes = serde_json::to_vec(payload).unwrap();
+        let envelope =
+            crate::relay::crypto::seal(psk, "relay-test", &topic, &bytes, ts_secs).unwrap();
+        handle_state_message(
+            db,
+            device_id,
+            &envelope,
+            "own-device-5678",
+            &mut InboundContext {
+                psk,
+                relay_id: "relay-test",
+                topic: &topic,
+                replay_guard: guard,
+            },
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn pull_removes_mirror_the_origin_stopped_publishing() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        let base_ts = crate::shared::time::now_epoch_f64() as u64;
+
+        // A local row (origin_device_id NULL) sharing the base name: pull must
+        // never touch rows it does not mirror.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, status, created_at)
+                 VALUES (?1, NULL, ?2, ?3)",
+                rusqlite::params!["alpha", "running", 1.0],
+            )
+            .unwrap();
+
+        // Device D publishes {alpha, beta}: both rows mirror locally.
+        assert!(!deliver_state(
+            &db,
+            &mut guard,
+            &psk,
+            "device-d",
+            &state_payload("DEVA", &["alpha", "beta"]),
+            base_ts,
+        ));
+        assert!(db.get_instance_full("alpha:DEVA").unwrap().is_some());
+        let beta_before = db
+            .get_instance_full("beta:DEVA")
+            .unwrap()
+            .expect("beta mirror after first snapshot");
+
+        // Device E mirrors its own alpha under a different origin.
+        assert!(!deliver_state(
+            &db,
+            &mut guard,
+            &psk,
+            "device-e",
+            &state_payload("ECHO", &["alpha"]),
+            base_ts,
+        ));
+        assert!(db.get_instance_full("alpha:ECHO").unwrap().is_some());
+
+        // D's next snapshot (later ts) stops publishing alpha.
+        assert!(!deliver_state(
+            &db,
+            &mut guard,
+            &psk,
+            "device-d",
+            &state_payload("DEVA", &["beta"]),
+            base_ts + 1,
+        ));
+
+        assert!(
+            db.get_instance_full("alpha:DEVA").unwrap().is_none(),
+            "mirror of a row the origin stopped publishing must be deleted"
+        );
+        let beta_after = db
+            .get_instance_full("beta:DEVA")
+            .unwrap()
+            .expect("beta mirror must survive D's snapshot");
+        assert_eq!(beta_after.status, beta_before.status);
+        assert_eq!(beta_after.directory, beta_before.directory);
+
+        // E's mirror and the local row are untouched by D's reconciliation.
+        assert!(db.get_instance_full("alpha:ECHO").unwrap().is_some());
+        let local = db
+            .get_instance_full("alpha")
+            .unwrap()
+            .expect("local row must survive");
+        assert_eq!(local.status, "running");
+    }
 }
