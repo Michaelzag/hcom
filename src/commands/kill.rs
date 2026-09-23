@@ -397,10 +397,11 @@ fn teardown_if_incarnation_unchanged(
 ) -> Result<TeardownOutcome, String> {
     let mut lost = TeardownOutcome::RowReRegistered;
     let committed = stop_instance_without_reap(db, name, initiator, "killed", |tx| {
-        if read_incarnation_tx(tx, name)?.as_ref() == Some(&incarnation.token) {
+        let current = read_incarnation_tx(tx, name)?;
+        if current.as_ref() == Some(&incarnation.token) {
             return Ok(true);
         }
-        lost = classify_lost_teardown(tx, name, incarnation)?;
+        lost = classify_lost_teardown(tx, name, incarnation, current)?;
         Ok(false)
     })?;
     Ok(if committed {
@@ -419,11 +420,13 @@ fn teardown_if_incarnation_unchanged(
 /// a gone row was released by the session, and a row with the same
 /// `created_at` + `session_id` whose bindings only shrank was kept by it.
 /// Anything else — no such event, a new identity, or any binding the kill
-/// never resolved — is a genuine re-registration.
+/// never resolved — is a genuine re-registration. `current` is the
+/// incarnation the CAS just read in this transaction.
 fn classify_lost_teardown(
     tx: &rusqlite::Transaction<'_>,
     name: &str,
     incarnation: &ResolvedIncarnation,
+    current: Option<IncarnationToken>,
 ) -> Result<TeardownOutcome> {
     let token = &incarnation.token;
     let mut stmt = tx.prepare(
@@ -446,7 +449,7 @@ fn classify_lost_teardown(
     if !self_stop {
         return Ok(TeardownOutcome::RowReRegistered);
     }
-    Ok(match read_incarnation_tx(tx, name)? {
+    Ok(match current {
         None => TeardownOutcome::SessionStoppedReleasedRow,
         Some(current)
             if current.created_at == token.created_at
@@ -537,8 +540,8 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
 
     // Skipped teardown first, mirroring the local path (it takes precedence
     // over every kill_result report there too): plain report, exit 0.
-    if teardown != TeardownOutcome::Completed {
-        for line in render_remote_kill_feedback(name, pid, kill_result, &pane_info, teardown)? {
+    if let Some(lines) = render_skipped_teardown_feedback(name, teardown) {
+        for line in lines {
             println!("{line}");
         }
         return Ok(0);
@@ -632,35 +635,22 @@ fn render_re_registered_feedback(name: &str) -> Vec<String> {
     )]
 }
 
-/// The self-stop report: the kill reaped the processes, but the session's
-/// own shutdown hook finalized its row during the kill, so the kill's
-/// teardown write was skipped. Nothing re-registered. Rendered instead of the
-/// stopped report on [`TeardownOutcome::SessionStoppedKeptRow`] (soft stop,
-/// row kept) and [`TeardownOutcome::SessionStoppedReleasedRow`] (row
-/// deleted), on both the self and foreign paths — plain success (exit 0).
-fn render_session_self_stop_feedback(name: &str, row_kept: bool) -> Vec<String> {
-    let row = if row_kept {
-        "kept its row as a resume handle"
-    } else {
-        "released its row"
-    };
-    vec![format!(
-        "{name}: processes reaped; the session shut itself down during the kill and {row}"
-    )]
-}
-
 /// The report for a kill whose teardown write did not land, or `None` when
-/// it did. Shared by the local and remote render paths.
+/// it did. Shared by the local and remote render paths; every skip is a
+/// plain success (exit 0). The self-stop reports: the kill reaped the
+/// processes, but the session's own shutdown hook finalized its row during
+/// the kill (soft stop kept it, hard stop deleted it) — nothing
+/// re-registered.
 fn render_skipped_teardown_feedback(name: &str, teardown: TeardownOutcome) -> Option<Vec<String>> {
     match teardown {
         TeardownOutcome::Completed => None,
         TeardownOutcome::RowReRegistered => Some(render_re_registered_feedback(name)),
-        TeardownOutcome::SessionStoppedKeptRow => {
-            Some(render_session_self_stop_feedback(name, true))
-        }
-        TeardownOutcome::SessionStoppedReleasedRow => {
-            Some(render_session_self_stop_feedback(name, false))
-        }
+        TeardownOutcome::SessionStoppedKeptRow => Some(vec![format!(
+            "{name}: processes reaped; the session shut itself down during the kill and kept its row as a resume handle"
+        )]),
+        TeardownOutcome::SessionStoppedReleasedRow => Some(vec![format!(
+            "{name}: processes reaped; the session shut itself down during the kill and released its row"
+        )]),
     }
 }
 
@@ -2214,12 +2204,6 @@ mod tests {
             1,
             "only the session's own stopped event; the kill wrote none"
         );
-        assert_eq!(
-            render_skipped_teardown_feedback(&name, result.teardown),
-            Some(vec![format!(
-                "{name}: processes reaped; the session shut itself down during the kill and kept its row as a resume handle"
-            )])
-        );
         let _ = _guard;
     }
 
@@ -2266,12 +2250,6 @@ mod tests {
             stopped_events(&db, &name),
             1,
             "only the session's own stopped event; the kill wrote none"
-        );
-        assert_eq!(
-            render_skipped_teardown_feedback(&name, result.teardown),
-            Some(vec![format!(
-                "{name}: processes reaped; the session shut itself down during the kill and released its row"
-            )])
         );
         let _ = _guard;
     }
