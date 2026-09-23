@@ -1241,7 +1241,7 @@ pub fn stop_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, true)
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, true, &[])
 }
 
 /// External side effects of a stop: subscription notifications, listener
@@ -1319,6 +1319,7 @@ pub fn stop_instance_without_reap(
                 false,
                 Some(tx),
                 &mut post,
+                &[],
             ) {
                 StopOutcome::Stopped | StopOutcome::AlreadyStopped => {}
                 StopOutcome::RetryableError(e) => anyhow::bail!("{e}"),
@@ -1348,7 +1349,7 @@ pub(crate) fn stop_placeholder_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, true)
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, true, &[])
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1366,6 +1367,7 @@ fn child_instance_names(db: &HcomDb, column: &str, value: &str) -> Result<Vec<St
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stop_instance_inner(
     db: &HcomDb,
     instance_name: &str,
@@ -1374,6 +1376,7 @@ fn stop_instance_inner(
     placeholder: bool,
     depth: u32,
     reap_gate: bool,
+    exclude: &[u32],
 ) -> StopOutcome {
     stop_instance_inner_scoped(
         db,
@@ -1385,6 +1388,7 @@ fn stop_instance_inner(
         reap_gate,
         None,
         &mut PostCommit::default(),
+        exclude,
     )
 }
 
@@ -1394,6 +1398,11 @@ fn stop_instance_inner(
 /// `tx: Some` is the kill path's shared transaction: every write (children
 /// included) joins `tx`, and external effects queue into `post` until the
 /// one commit.
+///
+/// `exclude` is a pid set the stop never signals: the headless group signal
+/// skips a recorded pid in it, and the reap spares carriers in it (they
+/// never count as survivors). Every caller but the omp owner's exit release
+/// passes `&[]`; child stops forward the same set.
 #[allow(clippy::too_many_arguments)]
 fn stop_instance_inner_scoped(
     db: &HcomDb,
@@ -1405,6 +1414,7 @@ fn stop_instance_inner_scoped(
     reap_gate: bool,
     tx: Option<&rusqlite::Transaction<'_>>,
     post: &mut PostCommit,
+    exclude: &[u32],
 ) -> StopOutcome {
     if depth >= MAX_STOP_DEPTH {
         log::log_warn(
@@ -1442,7 +1452,20 @@ fn stop_instance_inner_scoped(
         if is_headless {
             // Gated with the reap below: skipped on the kill paths, where the
             // group signal could land on the caller's own tree (self path).
-            if reap_gate {
+            let skip_reason = if !reap_gate {
+                None
+            } else if exclude.contains(&pid_u32) {
+                Some("excluded")
+            } else {
+                None
+            };
+            if let Some(skip_reason) = skip_reason {
+                log::log_info(
+                    "hooks",
+                    "stop_instance.headless_signal_skipped",
+                    &format!("instance={instance_name} pid={pid_u32} reason={skip_reason}"),
+                );
+            } else if reap_gate {
                 // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
                 // Windows: forceful process-tree kill) → poll up to 2s for exit →
                 // kill_group (Unix: SIGKILL; Windows: tree kill again). The poll also
@@ -1606,6 +1629,7 @@ fn stop_instance_inner_scoped(
             reap_gate,
             tx,
             post,
+            exclude,
         ) {
             log::log_warn(
                 "hooks",
@@ -1632,6 +1656,7 @@ fn stop_instance_inner_scoped(
             reap_gate,
             tx,
             post,
+            exclude,
         ) {
             log::log_warn(
                 "hooks",
@@ -1652,8 +1677,12 @@ fn stop_instance_inner_scoped(
     // before this teardown is called, and only after its own incarnation CAS.
     let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
     if reap_gate
-        && let Err(survivors) =
-            crate::proctruth::reap_instance_tree_for(db, instance_name, &binding_ids)
+        && let Err(survivors) = crate::proctruth::reap_instance_tree_for_excluding(
+            db,
+            instance_name,
+            &binding_ids,
+            exclude,
+        )
     {
         let pids = survivors
             .iter()
@@ -1890,6 +1919,20 @@ pub fn finalize_session(
     reason: &str,
     updates: Option<&serde_json::Map<String, Value>>,
 ) -> StopOutcome {
+    finalize_session_excluding(db, instance_name, reason, updates, &[])
+}
+
+/// [`finalize_session`] with an exclusion set: pids in `exclude` are never
+/// signalled by the stop (headless group signal and reap alike) and never
+/// count as survivors. For a session releasing its own row while its own
+/// process tree is still running (the omp owner's exit release).
+pub fn finalize_session_excluding(
+    db: &HcomDb,
+    instance_name: &str,
+    reason: &str,
+    updates: Option<&serde_json::Map<String, Value>>,
+    exclude: &[u32],
+) -> StopOutcome {
     log::log_info(
         "hooks",
         "sessionend",
@@ -1911,7 +1954,16 @@ pub fn finalize_session(
     }
 
     // Full stop_instance chain: snapshot, cleanup bindings, log, delete
-    let outcome = stop_instance(db, instance_name, "session", &format!("exit:{}", reason));
+    let outcome = stop_instance_inner(
+        db,
+        instance_name,
+        "session",
+        &format!("exit:{}", reason),
+        false,
+        0,
+        true,
+        exclude,
+    );
     if let StopOutcome::RetryableError(e) = &outcome {
         log::log_warn(
             "hooks",

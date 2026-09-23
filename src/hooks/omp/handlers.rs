@@ -14,7 +14,6 @@ use crate::shared::ST_LISTENING;
 use crate::shared::context::HcomContext;
 
 use crate::hooks::common;
-use crate::hooks::common::finalize_session;
 
 fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
     argv.iter()
@@ -343,6 +342,15 @@ fn handle_beforetool(db: &HcomDb, argv: &[String]) -> (i32, String) {
     (0, r#"{"decision":"allow"}"#.to_string())
 }
 
+/// `omp-stop`: `--soft` keeps the row and process binding (the omp owner's
+/// session_shutdown ahead of /restart, which execs the same pid and rebinds).
+/// Without it the row is fully released.
+///
+/// omp-stop is only ever invoked by the omp session on itself, so the
+/// caller's ancestry (this hcom child -> omp -> pty wrapper -> terminal) is
+/// the exiting session's own tree: it is excluded from the stop's signals.
+/// Every other carrier (tool subprocesses, MCP/LSP servers) is still reaped,
+/// and a survivor still blocks the release.
 pub(crate) fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
     let name = match parse_flag(argv, "--name") {
         Some(n) => n,
@@ -353,7 +361,13 @@ pub(crate) fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
         common::soft_finalize_session(db, &name, &reason, None, true);
         (0, r#"{"ok":true,"soft":true}"#.to_string())
     } else {
-        finalize_session(db, &name, &reason, None);
+        common::finalize_session_excluding(
+            db,
+            &name,
+            &reason,
+            None,
+            &crate::proctruth::caller_ancestor_pids(),
+        );
         (0, r#"{"ok":true}"#.to_string())
     }
 }
