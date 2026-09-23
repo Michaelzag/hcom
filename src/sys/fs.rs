@@ -70,6 +70,97 @@ pub fn lock_exclusive(file: &File) -> io::Result<()> {
     }
 }
 
+/// Try to take an exclusive lock on an open file without blocking. Returns
+/// `Ok(true)` when acquired, `Ok(false)` when another handle holds a
+/// conflicting lock. The lock is released when the file handle is closed
+/// (dropped).
+///
+/// Unix: `flock(LOCK_EX|LOCK_NB)`, retrying on `EINTR`. Windows: `LockFileEx`
+/// with `LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY` over the whole file.
+pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    try_lock(file, true)
+}
+
+/// Try to take a shared lock on an open file without blocking. Returns
+/// `Ok(true)` when acquired, `Ok(false)` when another handle holds an
+/// exclusive lock. Shared holders never conflict with each other, so
+/// concurrent liveness probes don't see one another as the holder. The lock
+/// is released when the file handle is closed (dropped).
+///
+/// Unix: `flock(LOCK_SH|LOCK_NB)`, retrying on `EINTR`. Windows: `LockFileEx`
+/// with `LOCKFILE_FAIL_IMMEDIATELY` over the whole file.
+pub fn try_lock_shared(file: &File) -> io::Result<bool> {
+    try_lock(file, false)
+}
+
+fn try_lock(file: &File, exclusive: bool) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let op = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        } | libc::LOCK_NB;
+        loop {
+            // SAFETY: flock on a valid fd; return value is checked.
+            let ret = unsafe { libc::flock(file.as_raw_fd(), op) };
+            if ret == 0 {
+                return Ok(true);
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+                    return Ok(false);
+                }
+                _ => return Err(err),
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, HANDLE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+        };
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let flags = if exclusive {
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
+        } else {
+            LOCKFILE_FAIL_IMMEDIATELY
+        };
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // SAFETY: valid handle for the file's lifetime; whole-file range.
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as HANDLE,
+                flags,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            // FAIL_IMMEDIATELY on a synchronous handle can report IO_PENDING
+            // instead of LOCK_VIOLATION; both mean "held elsewhere".
+            Some(code)
+                if code == ERROR_LOCK_VIOLATION as i32 || code == ERROR_IO_PENDING as i32 =>
+            {
+                Ok(false)
+            }
+            _ => Err(err),
+        }
+    }
+}
+
 /// Whether `path` is a Unix-domain socket. Always false on Windows, which has
 /// no filesystem socket node type.
 pub fn is_socket(path: &Path) -> bool {
@@ -175,4 +266,56 @@ fn file_id_win(path: &Path) -> Option<u64> {
         return None;
     }
     Some(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open(path: &Path) -> File {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn try_lock_exclusive_conflicts_with_held_exclusive_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.lock");
+        let a = open(&path);
+        let b = open(&path);
+        assert!(try_lock_exclusive(&a).unwrap());
+        assert!(!try_lock_exclusive(&b).unwrap());
+        drop(a);
+        assert!(try_lock_exclusive(&b).unwrap());
+    }
+
+    #[test]
+    fn try_lock_shared_holders_do_not_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.lock");
+        let a = open(&path);
+        let b = open(&path);
+        assert!(try_lock_shared(&a).unwrap());
+        assert!(try_lock_shared(&b).unwrap());
+        // A shared holder blocks an exclusive taker.
+        let c = open(&path);
+        assert!(!try_lock_exclusive(&c).unwrap());
+    }
+
+    #[test]
+    fn try_lock_shared_fails_while_exclusive_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.lock");
+        let a = open(&path);
+        let b = open(&path);
+        assert!(try_lock_exclusive(&a).unwrap());
+        assert!(!try_lock_shared(&b).unwrap());
+        drop(a);
+        assert!(try_lock_shared(&b).unwrap());
+    }
 }

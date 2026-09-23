@@ -195,6 +195,9 @@ fn relay_status(db: &HcomDb) -> i32 {
             println!("Status:    {FG_YELLOW}waiting{RESET}");
         }
     }
+    if config.relay_worker_managed {
+        println!("Worker:    managed by service manager");
+    }
 
     // Broker info
     if !config.relay.is_empty() {
@@ -351,6 +354,9 @@ fn relay_push() -> i32 {
 }
 
 fn restart_relay_worker_for_config_change() -> bool {
+    if crate::relay::worker::worker_managed() {
+        return restart_managed_worker_for_cli().unwrap_or(false);
+    }
     if crate::relay::worker::is_relay_worker_running() {
         crate::relay::worker::stop_relay_worker_blocking();
     }
@@ -358,6 +364,18 @@ fn restart_relay_worker_for_config_change() -> bool {
 }
 
 fn ensure_relay_worker_running_for_cli() -> bool {
+    if crate::relay::worker::worker_managed() {
+        // A connected managed worker already has its notify port up; leave it.
+        // An idle one (relay was disabled) needs a restart to pick up config
+        // now rather than on its next reload.
+        if crate::relay::worker::is_relay_worker_running()
+            && crate::relay::worker::poll_until_ready(300)
+        {
+            return true;
+        }
+        return restart_managed_worker_for_cli().is_some();
+    }
+
     if crate::relay::worker::ensure_worker(false) {
         return true;
     }
@@ -374,6 +392,28 @@ fn ensure_relay_worker_running_for_cli() -> bool {
     }
 
     crate::relay::worker::is_relay_worker_running()
+}
+
+/// Managed mode: ask the service manager to restart the worker so it picks up
+/// the new config. Returns Some(notify port ready) after a restart, None when
+/// the restart failed (already reported). A missing notify port is reported,
+/// not a failure — the new worker may still be connecting.
+fn restart_managed_worker_for_cli() -> Option<bool> {
+    match crate::relay::worker::restart_managed_worker(std::time::Duration::from_secs(15)) {
+        Ok(pid) => {
+            let ready = crate::relay::worker::poll_until_ready(500);
+            if ready {
+                println!("Daemon restarted (PID {pid}, managed)");
+            } else {
+                println!("Daemon restarted (PID {pid}, managed) (notify port not yet ready)");
+            }
+            Some(ready)
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            None
+        }
+    }
 }
 
 fn known_remote_device_shorts(db: &HcomDb) -> Vec<String> {
@@ -815,6 +855,10 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
              hcom relay daemon start     Start the relay daemon\n  \
              hcom relay daemon stop      Stop the relay daemon\n  \
              hcom relay daemon restart   Restart the relay daemon\n\n\
+             Managed worker (hcom config relay_worker_managed true):\n  \
+             A service manager (e.g. systemctl --user hcom-relay) runs the worker.\n  \
+             hcom never spawns it; daemon start/stop refuse and point at the\n  \
+             manager; daemon restart signals it and waits for the manager.\n\n\
              Private broker:\n  \
              hcom relay new --broker mqtts://host:port [--password secret]\n  \
              hcom relay connect <token> --broker mqtts://host:port [--password secret]"

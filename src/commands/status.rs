@@ -293,6 +293,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
             "relay": {
                 "configured": relay.configured,
                 "enabled": relay.enabled,
+                "worker_managed": config.relay_worker_managed,
                 "broker": relay.broker,
                 "last_push": relay.last_push,
                 // Canonical effective state — switch on `health.kind`. New consumers
@@ -447,15 +448,20 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     // while the worker process is still alive in backoff (Reported error with
     // pid present), and we want to surface that distinction here so this line
     // doesn't contradict reality.
+    let managed = if config.relay_worker_managed {
+        " (managed)"
+    } else {
+        ""
+    };
     match &relay.health {
         RelayHealth::NotConfigured | RelayHealth::Disabled => {
             // No worker line for these — the "relay:" line above is enough.
         }
-        RelayHealth::Waiting => println!("relay-worker: not running"),
+        RelayHealth::Waiting => println!("relay-worker: not running{managed}"),
         RelayHealth::Connected | RelayHealth::Starting { .. } => {
             let pid = crate::relay::worker::observe_pid_file().map(|(p, _)| p);
             let pid_str = pid.map(|p| format!(" (PID {p})")).unwrap_or_default();
-            println!("relay-worker: running{pid_str}");
+            println!("relay-worker: running{pid_str}{managed}");
         }
         RelayHealth::Stale { .. } => {
             // Relay summary line above already prints "stale (Ns, PID p)" —
@@ -468,7 +474,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         } => match reason {
             RelayErrorReason::StalePidfile => {
                 let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
-                println!("relay-worker: not running (stale pidfile, PID {pid_str})");
+                println!("relay-worker: not running (stale pidfile, PID {pid_str}){managed}");
             }
             // Reported error with a live pid means the worker is up and retrying
             // — usually MQTT backoff after disconnect/auth failure. Show it as
@@ -480,11 +486,11 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                         .as_deref()
                         .map(|d| format!(": {d}"))
                         .unwrap_or_default();
-                    println!("relay-worker: running (PID {p}, retrying after error{why})");
+                    println!("relay-worker: running (PID {p}, retrying after error{why}){managed}");
                 }
-                None => println!("relay-worker: not running"),
+                None => println!("relay-worker: not running{managed}"),
             },
-            RelayErrorReason::Ghost => println!("relay-worker: not running"),
+            RelayErrorReason::Ghost => println!("relay-worker: not running{managed}"),
         },
     }
 

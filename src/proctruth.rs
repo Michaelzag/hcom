@@ -135,6 +135,16 @@ pub fn processes_for_instance(name: &str, binding_ids: &[String]) -> Vec<ProcMat
     }
 }
 
+/// Whether any live (non-zombie) carrier holds the instance by name or by
+/// one of its binding ids. The placeholder janitor's hold rule: a stale
+/// placeholder whose launch is still running is held, never released or
+/// signalled.
+pub(crate) fn has_live_carriers(name: &str, binding_ids: &[String]) -> bool {
+    processes_for_instance(name, binding_ids)
+        .iter()
+        .any(|m| !process_gone(m.pid))
+}
+
 /// Decode the two identity facts from a raw /proc environ block: whether it
 /// carries exactly `want` (`HCOM_INSTANCE_NAME=<name>`) as one NUL-delimited
 /// entry, and its `HCOM_PROCESS_ID` value (empty when absent). Only these two
@@ -278,7 +288,7 @@ fn clock_ticks_per_sec() -> f64 {
 /// zombie (dead but unreaped — `kill(pid, 0)` still succeeds on it, so a
 /// bare liveness check would block a release on an already-dead process
 /// until its parent reaps it).
-fn process_gone(pid: u32) -> bool {
+pub(crate) fn process_gone(pid: u32) -> bool {
     if !crate::sys::process::is_alive(pid) {
         return true;
     }
@@ -993,12 +1003,14 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         if inst.status == crate::instance_names::PLACEHOLDER_STATUS {
             continue;
         }
-        // Inactive rows are soft-stop resume handles. On Linux they get no
-        // pass: they are released once their process is provably gone, and a
-        // resume handle survives release because `hcom r` reads the stopped
-        // snapshot. Off Linux nothing sees their carriers (no /proc), so a
-        // dead pid alone never releases one: they live out
-        // cleanup_stale_instances' retention tiers.
+        // Inactive rows are resume handles, not live sessions: soft-stop
+        // (OMP --soft, agy Stop synthesis) deliberately keeps the row, its
+        // pid, and its process bindings for a later `hcom r`. On Linux they
+        // get no pass: they are released once their process is provably
+        // gone, and a resume handle survives release because `hcom r` reads
+        // the stopped snapshot. Off Linux nothing sees their carriers (no
+        // /proc), so a dead pid alone never releases one: the sweep leaves
+        // them alone.
         #[cfg(not(target_os = "linux"))]
         if inst.status == crate::shared::ST_INACTIVE {
             continue;

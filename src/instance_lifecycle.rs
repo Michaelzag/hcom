@@ -56,8 +56,6 @@ pub struct ComputedStatus {
     pub age_string: String,
     pub description: String,
     pub age_seconds: i64,
-    /// Simple context key (e.g., "stale", "killed", "timeout").
-    pub context: String,
 }
 
 pub use crate::shared::time::format_age;
@@ -174,7 +172,6 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
                 },
                 description: "launching".to_string(),
                 age_seconds: age,
-                context: "new".to_string(),
             };
         }
 
@@ -186,7 +183,6 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
             age_string: format_age(age),
             description: detail,
             age_seconds: age,
-            context: "launch_failed".to_string(),
         };
     }
 
@@ -274,23 +270,11 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
         description
     };
 
-    let simple_context = if current_context.contains(':') {
-        let (prefix, suffix) = current_context.split_once(':').unwrap();
-        if prefix == "exit" {
-            suffix.to_string()
-        } else {
-            prefix.to_string()
-        }
-    } else {
-        current_context.clone()
-    };
-
     ComputedStatus {
         status: current_status,
         age_string: format_age(age),
         description,
         age_seconds: age,
-        context: simple_context,
     }
 }
 
@@ -638,7 +622,10 @@ pub fn set_status(
     let _ = db.log_event("status", instance_name, &data);
 }
 
-/// Delete placeholder instances that have been launching too long.
+/// Hold a stale placeholder with a live identity carrier (for example, Claude
+/// waiting on a trust prompt) without signalling its launch. Every other stale
+/// placeholder keeps the reap-verified teardown: release only once no process
+/// holds the instance.
 pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
     let mut deleted = 0;
     let now = now_epoch_f64();
@@ -650,6 +637,15 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
             }
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
+                let binding_ids = db.process_binding_ids(&data.name).unwrap_or_default();
+                if crate::proctruth::has_live_carriers(&data.name, &binding_ids) {
+                    crate::log::log_debug(
+                        "cleanup",
+                        "placeholder_held_live_launch",
+                        &format!("name={}", data.name),
+                    );
+                    continue;
+                }
                 match crate::hooks::common::stop_placeholder_instance(
                     db,
                     &data.name,
@@ -674,74 +670,9 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
     deleted
 }
 
-/// Delete instances that have been inactive too long.
-/// Three tiers: exit contexts (1 min), stale (1 hr), other inactive (12 hr).
-pub fn cleanup_stale_instances(
-    db: &HcomDb,
-    max_stale_seconds: i64,
-    max_inactive_seconds: i64,
-) -> i32 {
-    if is_in_wake_grace() {
-        return 0;
-    }
-
-    cleanup_stale_remote_instances(db);
-
-    let deleted = 0;
-
-    if let Ok(instances) = db.iter_instances_full() {
-        for data in &instances {
-            let computed = get_instance_status(data, db);
-
-            if computed.status != ST_INACTIVE {
-                continue;
-            }
-
-            let context = &computed.context;
-            let age = computed.age_seconds;
-
-            if matches!(
-                context.as_str(),
-                "killed" | "closed" | "timeout" | "interrupted" | "session_switch"
-            ) && age > 60
-            {
-                return note_stale_stop(db, &data.name, "system", "exit_cleanup", deleted);
-            }
-
-            if context == "stale" && max_stale_seconds > 0 && age > max_stale_seconds {
-                return note_stale_stop(db, &data.name, "system", "stale_cleanup", deleted);
-            }
-
-            if max_inactive_seconds > 0 && age > max_inactive_seconds {
-                return note_stale_stop(db, &data.name, "system", "inactive_cleanup", deleted);
-            }
-        }
-    }
-
-    deleted
-}
-
-/// Run one stale-cleanup stop and account for it honestly: only a
-/// [`StopOutcome::Stopped`](crate::hooks::common::StopOutcome) counts as
-/// deleted. A refusal (live survivors after SIGKILL — the reap gate) leaves
-/// the row and its processes in place, so it surfaces in the log with the
-/// surviving pids instead of inflating the count.
-fn note_stale_stop(db: &HcomDb, name: &str, initiated_by: &str, reason: &str, deleted: i32) -> i32 {
-    match crate::hooks::common::stop_instance(db, name, initiated_by, reason) {
-        crate::hooks::common::StopOutcome::Stopped => deleted + 1,
-        crate::hooks::common::StopOutcome::AlreadyStopped => deleted,
-        crate::hooks::common::StopOutcome::RetryableError(e) => {
-            crate::log::log_warn(
-                "cleanup",
-                "stale_stop_refused",
-                &format!("name={name} reason={reason} err={e}"),
-            );
-            deleted
-        }
-    }
-}
-
-fn cleanup_stale_remote_instances(db: &HcomDb) {
+/// Delete remote mirror rows of relay devices that have stopped syncing
+/// (no push within [`REMOTE_DEVICE_STALE_THRESHOLD`]).
+pub fn cleanup_stale_remote_instances(db: &HcomDb) {
     let now = now_epoch_f64();
     let sync_map: std::collections::HashMap<String, String> = db
         .kv_prefix("relay_sync_time_")
@@ -857,7 +788,6 @@ mod tests {
 
         let result = get_instance_status(&data, &db);
         assert_eq!(result.status, ST_LAUNCHING);
-        assert_eq!(result.context, "new");
         cleanup(path);
     }
 
@@ -876,7 +806,6 @@ mod tests {
 
         let result = get_instance_status(&data, &db);
         assert_eq!(result.status, ST_INACTIVE);
-        assert_eq!(result.context, "launch_failed");
         cleanup(path);
     }
 
@@ -1150,11 +1079,6 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
 
         let result = get_instance_status(&data, &db);
         assert_eq!(result.status, ST_INACTIVE);
-        assert!(
-            result.context.starts_with("stale"),
-            "context should be stale, got: {}",
-            result.context
-        );
         cleanup(path);
     }
 
@@ -1174,7 +1098,6 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
 
         let result = get_instance_status(&data, &db);
         assert_eq!(result.status, ST_INACTIVE);
-        assert!(result.context.starts_with("stale"));
         cleanup(path);
     }
 
@@ -1259,6 +1182,37 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         cleanup(path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_cleanup_stale_placeholder_recycled_pid_does_not_hold() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let name = format!("placeholder-recycled-{}", std::process::id());
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("300")
+            .env_clear()
+            .spawn()
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at, pid, background)
+                 VALUES (?1, 'claude', 'pending', 'new', 1, ?2, 0)",
+                rusqlite::params![name, sleeper.id()],
+            )
+            .unwrap();
+
+        let deleted = cleanup_stale_placeholders(&db);
+        let alive = sleeper.try_wait().unwrap().is_none();
+        let _ = sleeper.kill();
+        sleeper.wait().unwrap();
+        let kept = db.get_instance_full(&name).unwrap().is_some();
+        cleanup(path);
+
+        assert!(alive, "cleanup must never signal an unrelated process");
+        assert_eq!(deleted, 1);
+        assert!(!kept);
+    }
+
     #[test]
     fn test_cleanup_stale_placeholders_keeps_fresh() {
         crate::config::Config::init();
@@ -1298,5 +1252,48 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         assert!(db.get_instance_full("real").unwrap().is_some());
 
         cleanup(path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cleanup_stale_placeholders_holds_live_carrier() {
+        use std::os::unix::process::CommandExt;
+
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let name = format!("slow-launch-{}", std::process::id());
+
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("600")
+            .env_clear()
+            .env("HCOM_INSTANCE_NAME", &name)
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn placeholder launch pid");
+
+        let old_time = now_epoch_f64() - 200.0;
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!(name));
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(old_time));
+        data.insert("pid".into(), serde_json::json!(sleeper.id()));
+        db.save_instance_named(&name, &data).unwrap();
+
+        let deleted = cleanup_stale_placeholders(&db);
+        let alive = sleeper.try_wait().unwrap().is_none();
+        let _ = sleeper.kill();
+        sleeper.wait().unwrap();
+        let kept = db.get_instance_full(&name).unwrap().is_some();
+        cleanup(path);
+
+        assert!(
+            alive,
+            "cleanup must never signal the placeholder's live carrier"
+        );
+        assert_eq!(deleted, 0);
+        assert!(kept);
     }
 }

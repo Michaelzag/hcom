@@ -13,8 +13,8 @@ use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
 use crate::identity::{get_full_name, resolve_display_name};
 use crate::instance_lifecycle::{
-    RECENTLY_STOPPED_WINDOW, cleanup_stale_instances, cleanup_stale_placeholders, format_age,
-    get_instance_status,
+    RECENTLY_STOPPED_WINDOW, cleanup_stale_placeholders, cleanup_stale_remote_instances,
+    format_age, get_instance_status, is_in_wake_grace,
 };
 use crate::instances::is_remote_instance;
 use crate::shared::{
@@ -86,9 +86,14 @@ fn get_unread_counts_batch(db: &HcomDb, instances: &[InstanceRow]) -> HashMap<St
 ///
 /// Returns exit code (0 = success, 1 = error).
 pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i32 {
-    // Clean up stale placeholders and instances
+    // Clean up stale launch placeholders (holding any whose launch is still
+    // alive) and mirrors of relay devices that stopped syncing. Nothing
+    // else: `hcom list` is a read-only view — it never stops, reaps, or
+    // signals a live process.
     cleanup_stale_placeholders(db);
-    let _ = cleanup_stale_instances(db, 3600, 3600);
+    if !is_in_wake_grace() {
+        cleanup_stale_remote_instances(db);
+    }
 
     let explicit_name = ctx.and_then(|c| c.explicit_name.as_deref());
 
