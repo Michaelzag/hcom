@@ -954,9 +954,8 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         }
         // Inactive rows are resume handles, not live sessions: soft-stop
         // (OMP --soft, agy Stop synthesis) deliberately keeps the row, its
-        // pid, and its process bindings for a later `hcom r`. They live out
-        // cleanup_stale_instances' retention tiers — the sweep must never
-        // release them.
+        // pid, and its process bindings for a later `hcom r`. The sweep
+        // leaves them alone.
         if inst.status == crate::shared::ST_INACTIVE {
             continue;
         }
@@ -1486,8 +1485,8 @@ mod tests {
     #[cfg(unix)]
     fn sweep_skips_inactive_resume_row() {
         let db = test_db();
-        // Soft-stop resume handle: inactive, dead pid, kept binding. The
-        // sweep must leave it for cleanup_stale_instances' retention tiers.
+        // Soft-stop resume handle: inactive, dead pid, kept binding for a
+        // later `hcom r`. The sweep leaves it alone.
         let name = unique_name("inactive");
         insert_row(&db, &name, "inactive", Some(dead_pid()));
         db.set_process_binding("proc-kept", "sess", &name).unwrap();

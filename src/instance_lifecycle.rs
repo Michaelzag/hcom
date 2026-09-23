@@ -56,8 +56,6 @@ pub struct ComputedStatus {
     pub age_string: String,
     pub description: String,
     pub age_seconds: i64,
-    /// Simple context key (e.g., "stale", "killed", "timeout").
-    pub context: String,
 }
 
 pub use crate::shared::time::format_age;
@@ -174,7 +172,6 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
                 },
                 description: "launching".to_string(),
                 age_seconds: age,
-                context: "new".to_string(),
             };
         }
 
@@ -186,7 +183,6 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
             age_string: format_age(age),
             description: detail,
             age_seconds: age,
-            context: "launch_failed".to_string(),
         };
     }
 
@@ -274,23 +270,11 @@ pub fn get_instance_status(data: &InstanceRow, db: &HcomDb) -> ComputedStatus {
         description
     };
 
-    let simple_context = if current_context.contains(':') {
-        let (prefix, suffix) = current_context.split_once(':').unwrap();
-        if prefix == "exit" {
-            suffix.to_string()
-        } else {
-            prefix.to_string()
-        }
-    } else {
-        current_context.clone()
-    };
-
     ComputedStatus {
         status: current_status,
         age_string: format_age(age),
         description,
         age_seconds: age,
-        context: simple_context,
     }
 }
 
@@ -674,74 +658,9 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
     deleted
 }
 
-/// Delete instances that have been inactive too long.
-/// Three tiers: exit contexts (1 min), stale (1 hr), other inactive (12 hr).
-pub fn cleanup_stale_instances(
-    db: &HcomDb,
-    max_stale_seconds: i64,
-    max_inactive_seconds: i64,
-) -> i32 {
-    if is_in_wake_grace() {
-        return 0;
-    }
-
-    cleanup_stale_remote_instances(db);
-
-    let deleted = 0;
-
-    if let Ok(instances) = db.iter_instances_full() {
-        for data in &instances {
-            let computed = get_instance_status(data, db);
-
-            if computed.status != ST_INACTIVE {
-                continue;
-            }
-
-            let context = &computed.context;
-            let age = computed.age_seconds;
-
-            if matches!(
-                context.as_str(),
-                "killed" | "closed" | "timeout" | "interrupted" | "session_switch"
-            ) && age > 60
-            {
-                return note_stale_stop(db, &data.name, "system", "exit_cleanup", deleted);
-            }
-
-            if context == "stale" && max_stale_seconds > 0 && age > max_stale_seconds {
-                return note_stale_stop(db, &data.name, "system", "stale_cleanup", deleted);
-            }
-
-            if max_inactive_seconds > 0 && age > max_inactive_seconds {
-                return note_stale_stop(db, &data.name, "system", "inactive_cleanup", deleted);
-            }
-        }
-    }
-
-    deleted
-}
-
-/// Run one stale-cleanup stop and account for it honestly: only a
-/// [`StopOutcome::Stopped`](crate::hooks::common::StopOutcome) counts as
-/// deleted. A refusal (live survivors after SIGKILL — the reap gate) leaves
-/// the row and its processes in place, so it surfaces in the log with the
-/// surviving pids instead of inflating the count.
-fn note_stale_stop(db: &HcomDb, name: &str, initiated_by: &str, reason: &str, deleted: i32) -> i32 {
-    match crate::hooks::common::stop_instance(db, name, initiated_by, reason) {
-        crate::hooks::common::StopOutcome::Stopped => deleted + 1,
-        crate::hooks::common::StopOutcome::AlreadyStopped => deleted,
-        crate::hooks::common::StopOutcome::RetryableError(e) => {
-            crate::log::log_warn(
-                "cleanup",
-                "stale_stop_refused",
-                &format!("name={name} reason={reason} err={e}"),
-            );
-            deleted
-        }
-    }
-}
-
-fn cleanup_stale_remote_instances(db: &HcomDb) {
+/// Delete remote mirror rows of relay devices that have stopped syncing
+/// (no push within [`REMOTE_DEVICE_STALE_THRESHOLD`]).
+pub fn cleanup_stale_remote_instances(db: &HcomDb) {
     let now = now_epoch_f64();
     let sync_map: std::collections::HashMap<String, String> = db
         .kv_prefix("relay_sync_time_")
@@ -857,7 +776,6 @@ mod tests {
 
         let result = get_instance_status(&data, &db);
         assert_eq!(result.status, ST_LAUNCHING);
-        assert_eq!(result.context, "new");
         cleanup(path);
     }
 
@@ -876,7 +794,6 @@ mod tests {
 
         let result = get_instance_status(&data, &db);
         assert_eq!(result.status, ST_INACTIVE);
-        assert_eq!(result.context, "launch_failed");
         cleanup(path);
     }
 
@@ -1150,11 +1067,6 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
 
         let result = get_instance_status(&data, &db);
         assert_eq!(result.status, ST_INACTIVE);
-        assert!(
-            result.context.starts_with("stale"),
-            "context should be stale, got: {}",
-            result.context
-        );
         cleanup(path);
     }
 
@@ -1174,7 +1086,6 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
 
         let result = get_instance_status(&data, &db);
         assert_eq!(result.status, ST_INACTIVE);
-        assert!(result.context.starts_with("stale"));
         cleanup(path);
     }
 
