@@ -1565,6 +1565,8 @@ fn stop_instance_inner_scoped(
         "origin_device_id": instance_data.origin_device_id,
         "background_log_file": instance_data.background_log_file,
         "last_event_id": instance_data.last_event_id,
+        "purpose": instance_data.purpose.as_deref().unwrap_or_default(),
+        "current": instance_data.current.as_deref().unwrap_or_default(),
     });
 
     // Snapshot both child sets before deleting the parent. Only the teardown
@@ -1825,6 +1827,8 @@ pub fn soft_finalize_session(
         "origin_device_id": instance_data.origin_device_id,
         "background_log_file": instance_data.background_log_file,
         "last_event_id": instance_data.last_event_id,
+        "purpose": instance_data.purpose.as_deref().unwrap_or_default(),
+        "current": instance_data.current.as_deref().unwrap_or_default(),
     });
 
     if let Some(ref session_id) = instance_data.session_id {
@@ -3106,5 +3110,55 @@ mod tests {
             db.get_status("luna").unwrap().map(|(s, _)| s),
             Some(ST_INACTIVE.to_string())
         );
+    }
+
+    /// Newest `stopped` life-event snapshot for `name`.
+    fn newest_stopped_snapshot(db: &crate::db::HcomDb, name: &str) -> Value {
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = ?1
+                   AND json_extract(data, '$.action') = 'stopped'
+                 ORDER BY id DESC LIMIT 1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<Value>(&data).unwrap()["snapshot"].clone()
+    }
+
+    fn insert_titled_instance(db: &crate::db::HcomDb, name: &str) {
+        insert_test_instance(db, name);
+        crate::title::set_purpose(db, name, "zagdb: rc.48 roll");
+        crate::title::set_current(db, name, "probing WAL");
+    }
+
+    #[test]
+    fn soft_stop_snapshot_carries_purpose_and_current() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        insert_titled_instance(&db, "tala");
+
+        soft_finalize_session(&db, "tala", "shutdown", None, true);
+
+        let snapshot = newest_stopped_snapshot(&db, "tala");
+        assert_eq!(snapshot["purpose"], "zagdb: rc.48 roll");
+        assert_eq!(snapshot["current"], "probing WAL");
+    }
+
+    #[test]
+    fn hard_stop_snapshot_carries_purpose_and_current() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        insert_titled_instance(&db, "tala");
+
+        assert_eq!(
+            stop_instance(&db, "tala", "test", "exit:shutdown"),
+            StopOutcome::Stopped
+        );
+
+        let snapshot = newest_stopped_snapshot(&db, "tala");
+        assert_eq!(snapshot["purpose"], "zagdb: rc.48 roll");
+        assert_eq!(snapshot["current"], "probing WAL");
     }
 }
