@@ -418,13 +418,16 @@ fn teardown_if_incarnation_unchanged(
 /// `delivery::cleanup_deleted_instance`); that is a self-stop, not a
 /// re-registration. Self-stop: a `life`/`stopped` event by one of those for
 /// this instance written after the kill resolved its target (id above the
-/// watermark), keyed to no process or to one of the resolved bindings, and
-/// not a `stale-harness-exit` (a stale harness declining to touch a rebound
-/// row). Then a gone row was released by the session, and a row with the
-/// same `created_at` + `session_id` whose bindings only shrank was kept by
-/// it. Anything else — no such event, a new identity, or any binding the
-/// kill never resolved — is a genuine re-registration. `current` is the
-/// incarnation the CAS just read in this transaction.
+/// watermark), keyed to one of the resolved bindings — or, when no process
+/// is named, carrying the resolved incarnation's `created_at` in its
+/// snapshot (the same identity the CAS compares, so a re-registered
+/// bindingless incarnation finalizing mid-kill is not mistaken for the
+/// session) — and not a `stale-harness-exit` (a stale harness declining to
+/// touch a rebound row). Then a gone row was released by the session, and a
+/// row with the same `created_at` + `session_id` whose bindings only shrank
+/// was kept by it. Anything else — no such event, a new identity, or any
+/// binding the kill never resolved — is a genuine re-registration.
+/// `current` is the incarnation the CAS just read in this transaction.
 fn classify_lost_teardown(
     tx: &rusqlite::Transaction<'_>,
     name: &str,
@@ -433,7 +436,8 @@ fn classify_lost_teardown(
 ) -> Result<TeardownOutcome> {
     let token = &incarnation.token;
     let mut stmt = tx.prepare(
-        "SELECT json_extract(data, '$.process_id') FROM events \
+        "SELECT json_extract(data, '$.process_id'), \
+                json_extract(data, '$.snapshot.created_at') FROM events \
          WHERE type = 'life' AND instance = ?1 AND id > ?2 \
            AND json_extract(data, '$.action') = 'stopped' \
            AND json_extract(data, '$.by') IN ('session', 'pty') \
@@ -441,11 +445,20 @@ fn classify_lost_teardown(
     )?;
     let mut process_ids = stmt
         .query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
-            r.get::<_, Option<String>>(0)
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<f64>>(1)?))
         })?;
     let mut self_stop = false;
-    for process_id in &mut process_ids {
-        if process_id?.is_none_or(|id| token.binding_ids.contains(&id)) {
+    for row in &mut process_ids {
+        let (process_id, snapshot_created_at) = row?;
+        let matches = match process_id {
+            Some(id) => token.binding_ids.contains(&id),
+            // A null process_id is not proof on its own: the event must
+            // carry the RESOLVED incarnation's created_at. A re-registered
+            // bindingless incarnation snapshots its OWN created_at, so its
+            // exit is a re-registration, not a self-stop.
+            None => snapshot_created_at == Some(token.created_at),
+        };
+        if matches {
             self_stop = true;
             break;
         }
@@ -2439,6 +2452,55 @@ mod tests {
         );
         assert!(db.get_instance_full(&name).unwrap().is_none(), "row gone");
         assert_eq!(outcome, TeardownOutcome::RowReRegistered);
+        let _ = _guard;
+    }
+
+    /// A bindingless re-incarnation finalizing mid-kill is a re-registration,
+    /// not this session's self-stop: a null-process_id stopped event is only
+    /// trusted when its snapshot carries the RESOLVED incarnation's
+    /// created_at (the same identity the CAS compares). The fresh
+    /// incarnation's cleanup snapshots its OWN created_at, so attributing
+    /// its exit to the resolved session misreports a genuine re-registration.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reports_re_registration_when_bindingless_reincarnation_finalizes_mid_kill() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+
+        let name = format!("hcom-kill-{}-reborn", std::process::id());
+        let outcome = kill_mid_pty_exit(&db_path, &name, "proc-kill-reborn", |wrapper, n| {
+            // The row is re-registered bindingless under the same name with
+            // a NEW created_at; that fresh incarnation then finalizes: its
+            // exit cleanup has no binding to key on (process_id=null),
+            // snapshots the new row, and releases it.
+            wrapper
+                .conn()
+                .execute(
+                    "DELETE FROM process_bindings WHERE instance_name = ?1",
+                    rusqlite::params![n],
+                )
+                .unwrap();
+            wrapper
+                .conn()
+                .execute(
+                    "UPDATE instances SET created_at = created_at + 1000 WHERE name = ?1",
+                    rusqlite::params![n],
+                )
+                .unwrap();
+            crate::delivery::cleanup_deleted_instance(wrapper, n, "");
+        });
+
+        assert_eq!(outcome, TeardownOutcome::RowReRegistered);
+        assert!(db.get_instance_full(&name).unwrap().is_none(), "row gone");
+        assert_eq!(
+            stopped_events(&db, &name),
+            1,
+            "only the fresh incarnation's stopped event; the kill wrote none"
+        );
         let _ = _guard;
     }
 
