@@ -311,6 +311,17 @@ fn parent_pid(pid: u32) -> Option<u32> {
     (ppid != 0).then_some(ppid)
 }
 
+/// Field 5 (pgrp) of `/proc/<pid>/stat`, parsed after the closing `)` of
+/// comm like [`parent_pid`]. None when the process is gone or unparseable.
+#[cfg(unix)]
+fn process_group_id(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let _state = fields.next()?;
+    let _ppid = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
 /// `pid` plus its /proc ppid-ancestor chain, youngest first, ending at init
 /// (a bonded iteration cap guards against a corrupted chain).
 fn ancestor_or_self_pids(pid: u32) -> Vec<u32> {
@@ -680,6 +691,19 @@ fn live_carriers_for(name: &str, binding_ids: &[String], exclude: &[u32]) -> Vec
         .into_iter()
         .filter(|m| !is_zombie(m.pid) && !exclude.contains(&m.pid))
         .collect()
+}
+
+/// Pid-reuse guard for a recorded group leader: true when at least one live,
+/// non-zombie identity carrier of the instance (the reap's enumeration) is in
+/// process group `pgid`. A headless launch records the launch-script bash,
+/// which leads the group but never carries the identity itself; `hcom pty`
+/// below it does. An unrelated process that reused the pid has none of the
+/// instance's carriers in its group.
+#[cfg(unix)]
+pub(crate) fn group_holds_instance_carrier(pgid: u32, name: &str, binding_ids: &[String]) -> bool {
+    live_carriers_for(name, binding_ids, &[])
+        .iter()
+        .any(|m| process_group_id(m.pid) == Some(pgid))
 }
 
 /// Pid-reuse guard: true when `pid` still holds the instance — exactly

@@ -1367,6 +1367,22 @@ fn child_instance_names(db: &HcomDb, column: &str, value: &str) -> Result<Vec<St
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Whether the headless row's recorded pid still leads this instance's tree:
+/// some live identity carrier of `instance_name` is in process group `pid`.
+/// The recorded pid is the launch-script bash, which leads the group but
+/// never carries the identity; `hcom pty` below it does.
+#[cfg(unix)]
+fn headless_group_holds_carrier(db: &HcomDb, instance_name: &str, pid: u32) -> bool {
+    let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
+    crate::proctruth::group_holds_instance_carrier(pid, instance_name, &binding_ids)
+}
+
+/// No /proc outside unix: the recorded group is signalled as before.
+#[cfg(not(unix))]
+fn headless_group_holds_carrier(_db: &HcomDb, _instance_name: &str, _pid: u32) -> bool {
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stop_instance_inner(
     db: &HcomDb,
@@ -1452,10 +1468,15 @@ fn stop_instance_inner_scoped(
         if is_headless {
             // Gated with the reap below: skipped on the kill paths, where the
             // group signal could land on the caller's own tree (self path).
+            // The recorded pid is also skipped when it is in `exclude`, or
+            // when its group holds none of this instance's carriers (pid
+            // reuse); the reap below still handles every carrier.
             let skip_reason = if !reap_gate {
                 None
             } else if exclude.contains(&pid_u32) {
                 Some("excluded")
+            } else if !headless_group_holds_carrier(db, instance_name, pid_u32) {
+                Some("no_carrier_in_group")
             } else {
                 None
             };
@@ -3212,5 +3233,114 @@ mod tests {
         let snapshot = newest_stopped_snapshot(&db, "tala");
         assert_eq!(snapshot["purpose"], "zagdb: rc.48 roll");
         assert_eq!(snapshot["current"], "probing WAL");
+    }
+
+    #[cfg(unix)]
+    fn insert_headless_instance(db: &crate::db::HcomDb, name: &str, pid: u32) {
+        insert_test_instance(db, name);
+        db.conn()
+            .execute(
+                "UPDATE instances SET background = 1, pid = ?1 WHERE name = ?2",
+                rusqlite::params![pid as i64, name],
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn process_gone(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_gone(pid: u32) -> bool {
+        for _ in 0..50 {
+            if process_gone(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// A headless row whose recorded pid was reused by an unrelated process
+    /// (own group, no hcom identity anywhere in it): the stop must not signal
+    /// it, and the row is still released.
+    #[cfg(unix)]
+    #[test]
+    fn headless_stop_does_not_signal_reused_pid() {
+        use std::os::unix::process::CommandExt;
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let name = format!("reuse{}", std::process::id());
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("300")
+            .env_remove("HCOM_INSTANCE_NAME")
+            .env_remove("HCOM_PROCESS_ID")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        insert_headless_instance(&db, &name, stranger.id());
+
+        let outcome = stop_instance(&db, &name, "test", "reused_pid");
+
+        let alive = stranger.try_wait().unwrap().is_none();
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(alive, "unrelated process at the recorded pid was signalled");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+    }
+
+    /// The real headless shape: the recorded pid leads the group without
+    /// carrying the identity; a carrier below it does. The stop kills both.
+    #[cfg(unix)]
+    #[test]
+    fn headless_stop_signals_group_holding_a_carrier() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let name = format!("carry{}", std::process::id());
+        let mut leader = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "env HCOM_INSTANCE_NAME={name} sleep 300 >/dev/null 2>&1 & echo $!; wait"
+            ))
+            .env_remove("HCOM_INSTANCE_NAME")
+            .env_remove("HCOM_PROCESS_ID")
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let carrier: u32 = line.trim().parse().unwrap();
+        insert_headless_instance(&db, &name, leader.id());
+
+        let outcome = stop_instance(&db, &name, "test", "headless_stop");
+
+        let mut leader_dead = false;
+        for _ in 0..50 {
+            if leader.try_wait().unwrap().is_some() {
+                leader_dead = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let carrier_dead = wait_gone(carrier);
+        if !leader_dead {
+            let _ = leader.kill();
+            let _ = leader.wait();
+        }
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(leader_dead, "group leader survived the headless stop");
+        assert!(carrier_dead, "carrier {carrier} survived the headless stop");
     }
 }
