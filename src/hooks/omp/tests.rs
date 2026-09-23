@@ -218,6 +218,7 @@ fn plugin_rebinds_identity_on_session_branch() {
 
 #[test]
 fn start_handler_registering_plugin_notify_wakes_pty_delivery_loop() {
+    let _env = isolated_omp_env();
     let (db, path) = setup_test_db();
     let temp = tempfile::TempDir::new().unwrap();
     save_test_instance(&db, "luna", ST_ACTIVE);
@@ -349,6 +350,7 @@ fn status_handler_wakes_plugin_only_when_entering_listening() {
 
 #[test]
 fn start_handler_uses_central_binding_for_existing_session() {
+    let _env = isolated_omp_env();
     let (db, path) = setup_test_db();
     let temp = tempfile::TempDir::new().unwrap();
 
@@ -562,6 +564,7 @@ fn omp_owner_close_keeps_row_off_linux() {
 
 #[test]
 fn start_rebinds_via_process_binding_after_soft_stop() {
+    let _env = isolated_omp_env();
     let (db, path) = setup_test_db();
     let temp = tempfile::TempDir::new().unwrap();
     save_test_instance(&db, "miso", ST_LISTENING);
@@ -627,6 +630,7 @@ fn start_rebinds_via_process_binding_after_soft_stop() {
 
 #[test]
 fn start_recovers_binding_via_instance_name_when_process_binding_cleared() {
+    let _env = isolated_omp_env();
     let (db, path) = setup_test_db();
     let temp = tempfile::TempDir::new().unwrap();
     save_test_instance(&db, "miso", ST_LISTENING);
@@ -668,6 +672,107 @@ fn start_recovers_binding_via_instance_name_when_process_binding_cleared() {
         db.get_session_binding("sid-new").unwrap(),
         Some("miso".to_string())
     );
+
+    cleanup(path);
+}
+
+/// A plain omp session as `handle_start` sees it after entry-point
+/// sanitization: a process id the tree could prove (the plugin minted it),
+/// `HCOM_LAUNCHED=1` inherited from a leaked environment, and `is_launched`
+/// false because no launcher issued the id.
+fn plain_session_ctx(cwd: &std::path::Path) -> HcomContext {
+    let env = std::collections::HashMap::from([
+        ("HCOM_PROCESS_ID".to_string(), "omp-4242-plain-a".to_string()),
+        ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+        ("HCOM_TOOL".to_string(), "omp".to_string()),
+    ]);
+    let mut ctx = HcomContext::from_env(&env, cwd.to_path_buf());
+    ctx.is_launched = false;
+    ctx
+}
+
+fn instance_count(db: &HcomDb) -> i64 {
+    db.conn()
+        .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn plain_session_without_opt_in_does_not_mint() {
+    let (_dir, home, _guard) = isolated_omp_env();
+    let (db, path) = setup_test_db();
+
+    let (code, output) = handle_start(
+        &plain_session_ctx(&home),
+        &db,
+        &["--session-id".to_string(), "sid-plain".to_string()],
+    );
+
+    assert_eq!(code, 0);
+    assert!(output.contains("No instance bound"), "got: {output}");
+    assert_eq!(instance_count(&db), 0);
+    assert_eq!(db.get_process_binding("omp-4242-plain-a").unwrap(), None);
+    assert_eq!(db.get_session_binding("sid-plain").unwrap(), None);
+
+    cleanup(path);
+}
+
+#[test]
+fn plain_session_with_opt_in_mints_identity() {
+    let (_dir, home, _guard) = isolated_omp_env();
+    std::fs::write(
+        crate::paths::config_toml_path(),
+        "[launch.omp]\nplain_sessions = true\n",
+    )
+    .unwrap();
+    let (db, path) = setup_test_db();
+
+    let (code, output) = handle_start(
+        &plain_session_ctx(&home),
+        &db,
+        &["--session-id".to_string(), "sid-plain".to_string()],
+    );
+
+    assert_eq!(code, 0);
+    let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+    let name = response
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("expected a minted name, got: {output}"))
+        .to_string();
+    assert_eq!(
+        db.get_process_binding("omp-4242-plain-a").unwrap(),
+        Some(name.clone())
+    );
+    assert_eq!(
+        db.get_session_binding("sid-plain").unwrap(),
+        Some(name.clone())
+    );
+    let row = db.get_instance_full(&name).unwrap().unwrap();
+    assert_eq!(row.tool, "omp");
+
+    cleanup(path);
+}
+
+#[test]
+fn start_hook_replaces_stale_installed_plugin() {
+    let (_dir, home, _guard) = isolated_omp_env();
+    let plugin = get_omp_plugin_path();
+    assert!(plugin.starts_with(&home), "plugin path escaped the test HOME");
+    std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+    // An older hcom's plugin: carries the ownership marker, differs from source.
+    std::fs::write(&plugin, r#"const x = customType: "hcom-bootstrap";"#).unwrap();
+    let (db, path) = setup_test_db();
+
+    // Refused start (plain session, no opt-in): the refresh still happens.
+    let (code, _) = handle_start(
+        &plain_session_ctx(&home),
+        &db,
+        &["--session-id".to_string(), "sid-refresh".to_string()],
+    );
+
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read_to_string(&plugin).unwrap(), PLUGIN_SOURCE);
 
     cleanup(path);
 }
@@ -745,14 +850,24 @@ fn omp_nested_task_identity_survives_soft_stop() {
 
 // ── Plugin install/remove safety ──────────────────────────────────
 
-/// Helper: run a closure with a temp HOME + HCOM_DIR (via isolated_test_env),
-/// Runs a test with isolated HCOM_DIR and HOME, Config reset,
-/// and PI_CODING_AGENT_DIR explicitly unset so the default ~/.omp path is used.
-fn with_isolated_omp_env(f: impl FnOnce(&std::path::Path)) {
-    let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+/// Isolated HCOM_DIR and HOME (via `isolated_test_env`), Config reset, and
+/// PI_CODING_AGENT_DIR unset so the default ~/.omp plugin path is used. Hold
+/// the returned values for the test's lifetime. Required by anything that runs
+/// `handle_start`: it rewrites the installed plugin file.
+fn isolated_omp_env() -> (
+    tempfile::TempDir,
+    PathBuf,
+    crate::hooks::test_helpers::EnvGuard,
+) {
+    let (dir, _hcom, home, guard) = crate::hooks::test_helpers::isolated_test_env();
     unsafe {
         std::env::remove_var("PI_CODING_AGENT_DIR");
     }
+    (dir, home, guard)
+}
+
+fn with_isolated_omp_env(f: impl FnOnce(&std::path::Path)) {
+    let (_dir, home, _guard) = isolated_omp_env();
     f(&home);
 }
 #[test]

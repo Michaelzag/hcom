@@ -332,7 +332,7 @@ fn carrier_tree_scope(row_pid: Option<i64>, binding_ids: &[String]) -> CarrierTr
         // Only the minted omp-<pid>-... shape identifies an owner. A live
         // process with another comm must not become a root on the strength of
         // a borrowed or stale binding id.
-        if let Some(pid) = shell_pid_from_process_id(id)
+        if let Some(pid) = omp_minted_pid(id)
             && id
                 .strip_prefix("omp-")
                 .is_some_and(|rest| rest.contains('-'))
@@ -789,6 +789,130 @@ impl std::fmt::Display for ReapError {
     }
 }
 
+/// Which program an ancestor pid is running, as far as the platform will say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AncestorProcess {
+    /// `/proc/<pid>/comm`, trimmed, is exactly `omp`.
+    Omp,
+    /// `/proc/<pid>/comm` read fine and is something else.
+    Other,
+    /// Unreadable /proc, or non-Linux. Never satisfies the `Omp` clause.
+    Unknown,
+}
+
+/// `omp-<pid>-<rest>` → Some(pid). Agent-minted ids only (plugin / D-69
+/// shape); launcher ids are UUIDs and parse to None. Anything else (empty,
+/// malformed) → None.
+pub(crate) fn omp_minted_pid(id: &str) -> Option<u32> {
+    id.strip_prefix("omp-")
+        .and_then(|rest| rest.split('-').next())
+        .filter(|head| !head.is_empty())
+        .and_then(|head| head.parse::<u32>().ok())
+}
+
+/// What `pid` is running: [`AncestorProcess::Omp`] exactly when
+/// `/proc/<pid>/comm`, trimmed, is `omp`. An unreadable comm (gone process,
+/// foreign-owned, non-Linux) is [`AncestorProcess::Unknown`], which never
+/// satisfies the `Omp` clause.
+fn ancestor_process_kind(pid: u32) -> AncestorProcess {
+    #[cfg(unix)]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            Ok(comm) => {
+                if comm.trim() == "omp" {
+                    AncestorProcess::Omp
+                } else {
+                    AncestorProcess::Other
+                }
+            }
+            Err(_) => AncestorProcess::Unknown,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        AncestorProcess::Unknown
+    }
+}
+
+/// True when `pid` carries exactly `HCOM_PROCESS_ID=<id>` in its environ —
+/// the NULL-pid binding-row fallback's proof of provenance. The calling
+/// process's own facts come from its LIVE environment (same source
+/// `HcomContext` resolves identity from); every other pid is read from
+/// `/proc/<pid>/environ`, reusing [`identity_facts`]'s decoding via
+/// [`identity_facts_of`] (only the `HCOM_PROCESS_ID` fact is used here). An
+/// unreadable environ reads as absent. Empty `id` never matches.
+pub(crate) fn carries_process_id(pid: u32, id: &str) -> bool {
+    !id.is_empty()
+        && identity_facts_of(pid, "") // name fact unused; only the process id matters
+            .is_some_and(|(_, process_id)| process_id == id)
+}
+
+/// Pure decision core for process-identity trust — NO io. `ancestors` is
+/// self-inclusive ([`caller_ancestor_pids`]); `binding_row_pid` is `None`
+/// for no binding row and `Some(None)` for a row whose bound instance
+/// records no pid. The trust table, in order:
+///
+/// - empty id → refused;
+/// - `omp-<pid>-…` (agent-minted) → trusted iff `<pid>` is in `ancestors`
+///   AND that ancestor is [`AncestorProcess::Omp`] — ancestry alone does
+///   not reject a D-69 leak, whose `$$`-minted id can sit under a live
+///   login-shell ancestor, so the ancestor must actually run `omp`;
+/// - otherwise a binding row must exist: trusted iff its recorded instance
+///   pid is in `ancestors`, or — when the row records no pid — some
+///   ancestor carries the id in its environ. No row → never trusted (the
+///   launcher pre-registers the binding before spawn).
+///
+/// [`AncestorProcess::Unknown`] never satisfies the `Omp` clause.
+pub(crate) fn process_id_trusted(
+    id: &str,
+    ancestors: &[u32],
+    ancestor_kind: &dyn Fn(u32) -> AncestorProcess,
+    binding_row_pid: Option<Option<u32>>,
+    ancestor_carries_id: &dyn Fn(&str) -> bool,
+) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    if let Some(pid) = omp_minted_pid(id) {
+        return ancestors.contains(&pid) && ancestor_kind(pid) == AncestorProcess::Omp;
+    }
+    match binding_row_pid {
+        // No binding row (or unreadable/dangling one): never trusted.
+        None => false,
+        // Row with a recorded instance pid: that pid must be in this tree.
+        Some(Some(pid)) => ancestors.contains(&pid),
+        // Row with no recorded pid: an ancestor carrying the id proves it.
+        Some(None) => ancestor_carries_id(id),
+    }
+}
+
+/// IO wrapper for [`process_id_trusted`]: reads the caller's ancestry,
+/// `/proc` comm + environ, and the binding row (`get_process_binding` →
+/// `get_instance_full` for the recorded `instances.pid`). A DB read error,
+/// a binding whose instance row is gone, or a recorded pid that cannot be a
+/// pid all yield "no row" — fail closed.
+pub fn trusted_process_id(db: &HcomDb, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let ancestors = caller_ancestor_pids();
+    let binding_row_pid = match db.get_process_binding(id) {
+        Ok(Some(instance_name)) => match db.get_instance_full(&instance_name) {
+            Ok(Some(row)) => Some(row.pid.and_then(|p| u32::try_from(p).ok())),
+            _ => None,
+        },
+        _ => None,
+    };
+    process_id_trusted(
+        id,
+        &ancestors,
+        &ancestor_process_kind,
+        binding_row_pid,
+        &|want| ancestors.iter().any(|&pid| carries_process_id(pid, want)),
+    )
+}
+
 /// Reap every proven in-scope process holding the instance: descendants of
 /// an owning root carrying `HCOM_INSTANCE_NAME=<name>` or one of its binding
 /// process ids (the self-bound tree never carries the name).
@@ -1157,16 +1281,6 @@ fn fire_round_seam(point: RoundPoint) {
 #[cfg(all(test, unix))]
 pub(crate) fn arm_round_seam(hook: impl FnMut(RoundPoint) + 'static) {
     ROUND_SEAM.with(|seam| *seam.borrow_mut() = Some(Box::new(hook)));
-}
-
-/// Shell pid behind a self-bound process id: `omp-<pid>-…` → `<pid>`.
-/// Anything else (UUID bindings, empty, malformed) → None.
-fn shell_pid_from_process_id(process_id: &str) -> Option<u32> {
-    process_id
-        .strip_prefix("omp-")
-        .and_then(|rest| rest.split('-').next())
-        .filter(|head| !head.is_empty())
-        .and_then(|head| head.parse::<u32>().ok())
 }
 
 /// Live carriers for reap verification: carrier enumeration minus zombies
@@ -1548,7 +1662,7 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         evidence_pids.extend(
             binding_ids
                 .iter()
-                .filter_map(|id| shell_pid_from_process_id(id)),
+                .filter_map(|id| omp_minted_pid(id)),
         );
         if evidence_pids.is_empty() {
             crate::log::log(
@@ -3337,17 +3451,136 @@ mod tests {
     // -- Self-bound sessions (D-68/D-69): no HCOM_INSTANCE_NAME in env ----
 
     #[test]
-    fn shell_pid_parses_omp_shape_only() {
-        assert_eq!(shell_pid_from_process_id("omp-123-4-5"), Some(123));
-        assert_eq!(shell_pid_from_process_id("omp-7"), Some(7));
-        assert_eq!(
-            shell_pid_from_process_id("550e8400-e29b-41d4-a716-446655440000"),
-            None
-        );
-        assert_eq!(shell_pid_from_process_id(""), None);
-        assert_eq!(shell_pid_from_process_id("omp-"), None);
-        assert_eq!(shell_pid_from_process_id("omp-abc-1"), None);
-        assert_eq!(shell_pid_from_process_id("omp--1"), None);
+    fn omp_minted_pid_parses_omp_shape_only() {
+        assert_eq!(omp_minted_pid("omp-123-4-5"), Some(123));
+        assert_eq!(omp_minted_pid("omp-7"), Some(7));
+        assert_eq!(omp_minted_pid("550e8400-e29b-41d4-a716-446655440000"), None);
+        assert_eq!(omp_minted_pid(""), None);
+        assert_eq!(omp_minted_pid("omp-"), None);
+        assert_eq!(omp_minted_pid("omp-abc-1"), None);
+        assert_eq!(omp_minted_pid("omp--1"), None);
+    }
+
+    // === process_id_trusted: the §1 trust table (pure, injected facts) ===
+
+    #[test]
+    fn process_id_trusted_empty_id_refused() {
+        assert!(!process_id_trusted(
+            "",
+            &[7],
+            &|_| AncestorProcess::Omp,
+            Some(Some(7)),
+            &|_| true
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_omp_id_non_ancestor_pid_refused() {
+        // omp-99-… but 99 is not in the ancestor chain, even though 99 runs omp.
+        assert!(!process_id_trusted(
+            "omp-99-1-2",
+            &[7, 3],
+            &|_| AncestorProcess::Omp,
+            None,
+            &|_| true
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_omp_id_shell_ancestor_refused() {
+        // The lotso case: D-69 mints from the login shell's $$; the shell is a
+        // live ancestor but runs `sh`, not `omp`.
+        assert!(!process_id_trusted(
+            "omp-3-1-2",
+            &[7, 3],
+            &|pid| if pid == 3 { AncestorProcess::Other } else { AncestorProcess::Omp },
+            None,
+            &|_| true
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_omp_id_unknown_ancestor_kind_refused() {
+        // Unreadable /proc comm proves nothing: Unknown never satisfies Omp.
+        assert!(!process_id_trusted(
+            "omp-3-1-2",
+            &[7, 3],
+            &|pid| if pid == 3 { AncestorProcess::Unknown } else { AncestorProcess::Omp },
+            None,
+            &|_| true
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_omp_id_omp_ancestor_trusted() {
+        // Nested omp: the minting pid is an ancestor running `omp`. No binding
+        // row needed — rule 1 judges purely by ancestry and comm.
+        assert!(process_id_trusted(
+            "omp-3-1-2",
+            &[7, 3],
+            &|pid| if pid == 3 { AncestorProcess::Omp } else { AncestorProcess::Other },
+            None,
+            &|_| false
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_uuid_row_pid_in_ancestors_trusted() {
+        // Launcher UUID: row exists, bound instance's recorded pid is in the
+        // tree. No comm requirement on this branch.
+        assert!(process_id_trusted(
+            "550e8400-e29b-41d4-a716-446655440000",
+            &[7, 3],
+            &|_| AncestorProcess::Other,
+            Some(Some(3)),
+            &|_| false
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_uuid_row_pid_outside_ancestors_refused() {
+        assert!(!process_id_trusted(
+            "550e8400-e29b-41d4-a716-446655440000",
+            &[7, 3],
+            &|_| AncestorProcess::Omp,
+            Some(Some(99)),
+            &|_| true
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_uuid_no_row_refused() {
+        // The launcher always pre-registers the binding before spawn, so a
+        // live launcher id with no row is foreign.
+        assert!(!process_id_trusted(
+            "550e8400-e29b-41d4-a716-446655440000",
+            &[7, 3],
+            &|_| AncestorProcess::Omp,
+            None,
+            &|_| true
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_uuid_null_pid_ancestor_carries_id_trusted() {
+        assert!(process_id_trusted(
+            "550e8400-e29b-41d4-a716-446655440000",
+            &[7, 3],
+            &|_| AncestorProcess::Other,
+            Some(None),
+            &|want| want == "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_uuid_null_pid_no_carrier_refused() {
+        assert!(!process_id_trusted(
+            "550e8400-e29b-41d4-a716-446655440000",
+            &[7, 3],
+            &|_| AncestorProcess::Omp,
+            Some(None),
+            &|_| false
+        ));
     }
 
     #[cfg(unix)]

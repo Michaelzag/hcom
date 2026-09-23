@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, InputEvent } from "@oh-my-pi/pi-coding-agent";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -35,6 +36,84 @@ function log(
 }
 
 const HCOM_TIMEOUT_MS = 1800;
+const OMP_ID_PATTERN = /^omp-(\d+)-/;
+
+function ompIdPid(id: string): number | null {
+	const match = OMP_ID_PATTERN.exec(id);
+	if (!match) return null;
+	const pid = Number(match[1]);
+	return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+function procComm(pid: number): string | null {
+	try {
+		return readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+	} catch {
+		return null;
+	}
+}
+
+function ppidOf(pid: number): number | null {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close < 0) return null;
+		const ppid = Number(stat.slice(close + 1).trim().split(/\s+/)[1]);
+		return Number.isSafeInteger(ppid) && ppid > 0 ? ppid : null;
+	} catch {
+		return null;
+	}
+}
+
+function ancestorPids(): Set<number> {
+	const pids = new Set<number>();
+	let pid: number | null = process.pid;
+	for (let depth = 0; pid !== null && !pids.has(pid) && depth < 4096; depth++) {
+		pids.add(pid);
+		pid = ppidOf(pid);
+	}
+	return pids;
+}
+
+function mintProcessId(): string {
+	return `omp-${process.pid}-${randomBytes(4).toString("hex")}-${randomBytes(4).toString("hex")}`;
+}
+
+function resolveProcessId(): { id: string; minted: boolean; reason: string } {
+	const existing = process.env.HCOM_PROCESS_ID;
+	if (!existing) return { id: mintProcessId(), minted: true, reason: "missing" };
+	if (ompIdPid(existing) === null) {
+		return { id: existing, minted: false, reason: "launcher_shape" };
+	}
+	if (process.platform !== "linux") {
+		return { id: mintProcessId(), minted: true, reason: "non_linux" };
+	}
+	const pid = ompIdPid(existing);
+	if (pid === null || !ancestorPids().has(pid)) {
+		return { id: mintProcessId(), minted: true, reason: "non_ancestor" };
+	}
+	if (procComm(pid) !== "omp") {
+		return { id: mintProcessId(), minted: true, reason: "ancestor_not_omp" };
+	}
+	return { id: existing, minted: false, reason: "trusted_omp_ancestor" };
+}
+
+const resolvedIdentity = resolveProcessId();
+process.env.HCOM_PROCESS_ID = resolvedIdentity.id;
+log("INFO", "identity_resolved", null, {
+	minted: resolvedIdentity.minted,
+	reason: resolvedIdentity.reason,
+});
+
+let plainSessionsPromise: Promise<boolean> | null = null;
+function plainSessionsEnabled(): Promise<boolean> {
+	plainSessionsPromise ??= hcom(["config", "plain_sessions"]).then((result) => {
+		if (result.code !== 0) return false;
+		const value = result.stdout.trim();
+		return value === "true" || value === "1";
+	}).catch(() => false);
+	return plainSessionsPromise;
+}
 
 function hcom(args: string[]): Promise<HcomResult> {
 	return new Promise((resolve) => {
@@ -276,7 +355,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	async function bindIdentity(ctx: ExtensionContext): Promise<void> {
 		currentCtx = ctx;
 		if (instanceName || bindingPromise) return bindingPromise ?? Promise.resolve();
-		if (process.env.HCOM_LAUNCHED !== "1") return;
+		if (process.env.HCOM_LAUNCHED !== "1" && !(await plainSessionsEnabled())) return;
 		const skipReason = nestedSkipReason();
 		if (skipReason) {
 			nestedOptOut = true;

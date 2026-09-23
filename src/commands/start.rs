@@ -77,7 +77,8 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let db = HcomDb::open()?;
     let hcom_dir = paths::hcom_dir();
 
-    let ctx = HcomContext::from_os();
+    let mut ctx = HcomContext::from_os();
+    ctx.trust_process_id(&db);
     let verified_actor = claude_actor::resolve_env_actor(&db).map_err(anyhow::Error::new)?;
     if let (Some(actor), Some(name)) = (verified_actor.as_ref(), flags.name.as_deref()) {
         claude_actor::ensure_explicit_matches(&db, actor, name).map_err(anyhow::Error::new)?;

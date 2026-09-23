@@ -533,8 +533,8 @@ pub fn dispatch_copilot_hook_native(hook_name: &str) -> i32 {
             return 0;
         }
     };
-    let ctx = HcomContext::from_os();
-    if !common::hook_gate_check(&ctx, &db) {
+    let mut ctx = HcomContext::from_os();
+    if !common::hook_gate_check(&mut ctx, &db) {
         return 0;
     }
     let payload = HookPayload::from_copilot_native(hook_type_for_command(hook_name), raw);

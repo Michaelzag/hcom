@@ -137,6 +137,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("kilo_args", "launch.kilo.args"),
     ("pi_args", "launch.pi.args"),
     ("omp_args", "launch.omp.args"),
+    ("plain_sessions", "launch.omp.plain_sessions"),
     ("cursor_args", "launch.cursor.args"),
     ("kimi_args", "launch.kimi.args"),
     ("copilot_args", "launch.copilot.args"),
@@ -171,6 +172,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("kilo_args", "HCOM_KILO_ARGS"),
     ("pi_args", "HCOM_PI_ARGS"),
     ("omp_args", "HCOM_OMP_ARGS"),
+    ("plain_sessions", "HCOM_PLAIN_SESSIONS"),
     ("cursor_args", "HCOM_CURSOR_ARGS"),
     ("kimi_args", "HCOM_KIMI_ARGS"),
     ("copilot_args", "HCOM_COPILOT_ARGS"),
@@ -287,6 +289,9 @@ pub struct HcomConfig {
     pub pi_args: String,
     /// Oh My Pi specific launch arguments
     pub omp_args: String,
+    /// Let plain (non-hcom-launched) omp sessions join hcom. Off by default:
+    /// a bare inherited `HCOM_LAUNCHED=1` must not make a session join.
+    pub plain_sessions: bool,
     pub cursor_args: String,
     pub kimi_args: String,
     pub copilot_args: String,
@@ -328,6 +333,7 @@ impl Default for HcomConfig {
             kilo_args: String::new(),
             pi_args: String::new(),
             omp_args: String::new(),
+            plain_sessions: false,
             cursor_args: String::new(),
             kimi_args: String::new(),
             copilot_args: String::new(),
@@ -513,6 +519,7 @@ impl HcomConfig {
             "kilo_args" => Some(self.kilo_args.clone()),
             "pi_args" => Some(self.pi_args.clone()),
             "omp_args" => Some(self.omp_args.clone()),
+            "plain_sessions" => Some(if self.plain_sessions { "1" } else { "0" }.into()),
             "cursor_args" => Some(self.cursor_args.clone()),
             "kimi_args" => Some(self.kimi_args.clone()),
             "copilot_args" => Some(self.copilot_args.clone()),
@@ -562,6 +569,7 @@ impl HcomConfig {
             "kilo_args" => self.kilo_args = value.to_string(),
             "pi_args" => self.pi_args = value.to_string(),
             "omp_args" => self.omp_args = value.to_string(),
+            "plain_sessions" => self.plain_sessions = !is_falsy(value),
             "cursor_args" => self.cursor_args = value.to_string(),
             "kimi_args" => self.kimi_args = value.to_string(),
             "copilot_args" => self.copilot_args = value.to_string(),
@@ -722,6 +730,7 @@ impl HcomConfig {
             "relay_worker_managed",
             "auto_approve",
             "auto_trust_workspace",
+            "plain_sessions",
         ] {
             if let Some(val) = get_var(bool_field) {
                 match val {
@@ -1061,6 +1070,7 @@ args = ""
 
 [launch.omp]
 args = ""
+plain_sessions = false
 
 [launch.cursor]
 args = ""

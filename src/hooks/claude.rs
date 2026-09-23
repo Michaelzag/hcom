@@ -141,7 +141,7 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
     // Build context and payload before the participation gate. SessionStart
     // must quietly export the vanilla Claude session id even when hcom has no
     // active rows yet, or the first `hcom start` cannot bind immediately.
-    let ctx = HcomContext::from_os();
+    let mut ctx = HcomContext::from_os();
     let mut payload = HookPayload::from_claude(raw);
     if hook_type == HOOK_SESSIONSTART {
         let use_fork_env_session = should_use_fork_env_session_id(&db, &ctx, &payload.raw);
@@ -157,7 +157,7 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
     // a visible hcom attempt from a child: let it reach routing so it receives
     // the actionable "start hcom in the parent first" denial even with an
     // otherwise empty database.
-    if !(common::hook_gate_check(&ctx, &db)
+    if !(common::hook_gate_check(&mut ctx, &db)
         || (hook_type == HOOK_PRE && child_visibly_invokes_hcom(&payload)))
     {
         return 0;

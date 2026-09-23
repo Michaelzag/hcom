@@ -79,7 +79,10 @@ pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
 /// - Otherwise: check if DB has any instances → if not, skip (exit 0, empty output)
 ///
 /// This prevents outputting hints/errors when hcom is installed but not actively used.
-pub fn hook_gate_check(ctx: &HcomContext, db: &HcomDb) -> bool {
+pub fn hook_gate_check(ctx: &mut HcomContext, db: &HcomDb) -> bool {
+    // A process id this process tree cannot prove is treated as ABSENT for
+    // every tool (design §2.2) — sanitize before the gate reads identity.
+    ctx.trust_process_id(db);
     if ctx.process_id.is_some() || ctx.is_launched {
         return true;
     }

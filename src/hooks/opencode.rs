@@ -474,7 +474,7 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
     let start = Instant::now();
 
     // Build context
-    let ctx = HcomContext::from_os();
+    let mut ctx = HcomContext::from_os();
 
     // Ensure hcom directories exist before opening DB.
     // On clean HOME/HCOM_DIR the DB parent dir won't exist yet.
@@ -497,7 +497,7 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
     };
 
     // Pre-gate: non-participants with empty DB → exit 0, no output
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&mut ctx, &db) {
         return (0, String::new());
     }
 
