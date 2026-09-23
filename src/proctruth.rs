@@ -854,6 +854,29 @@ pub(crate) fn carries_process_id(pid: u32, id: &str) -> bool {
             .is_some_and(|(_, process_id)| process_id == id)
 }
 
+/// True for the launcher's own id shape ([`launcher::generate_process_id`]):
+/// five lowercase-hex groups sized 8-4-4-4-12.
+fn is_launcher_process_id(id: &str) -> bool {
+    let mut sizes = [0usize; 5];
+    let mut groups = 0usize;
+    for part in id.split('-') {
+        if groups == sizes.len() {
+            return false;
+        }
+        let bytes = part.as_bytes();
+        if bytes.is_empty()
+            || !bytes
+                .iter()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+        {
+            return false;
+        }
+        sizes[groups] = bytes.len();
+        groups += 1;
+    }
+    groups == sizes.len() && sizes == [8, 4, 4, 4, 12]
+}
+
 /// Pure decision core for process-identity trust — NO io. `ancestors` is
 /// self-inclusive ([`caller_ancestor_pids`]); `binding_row_pid` is `None`
 /// for no binding row and `Some(None)` for a row whose bound instance
@@ -864,10 +887,16 @@ pub(crate) fn carries_process_id(pid: u32, id: &str) -> bool {
 ///   AND that ancestor is [`AncestorProcess::Omp`] — ancestry alone does
 ///   not reject a D-69 leak, whose `$$`-minted id can sit under a live
 ///   login-shell ancestor, so the ancestor must actually run `omp`;
-/// - otherwise a binding row must exist: trusted iff its recorded instance
-///   pid is in `ancestors`, or — when the row records no pid — some
-///   ancestor carries the id in its environ. No row → never trusted (the
-///   launcher pre-registers the binding before spawn).
+/// - a launcher-shaped id (see [`is_launcher_process_id`]) → a binding row
+///   must exist: trusted iff its recorded instance pid is in `ancestors`,
+///   or — when the row records no pid — some ancestor carries the id in its
+///   environ. No row → never trusted: the launcher pre-registers the
+///   binding before spawn, so a launcher id with no row is foreign;
+/// - any other id shape → the same row rule, but with no row the id is
+///   trusted when an ancestor carries it in its environ. Harness, relay and
+///   adhoc ids live here and are created by the hook that presents them, so
+///   a row cannot exist yet; the proof is still this process tree actually
+///   carrying the id, never `HCOM_LAUNCHED`.
 ///
 /// [`AncestorProcess::Unknown`] never satisfies the `Omp` clause.
 pub(crate) fn process_id_trusted(
@@ -884,8 +913,9 @@ pub(crate) fn process_id_trusted(
         return ancestors.contains(&pid) && ancestor_kind(pid) == AncestorProcess::Omp;
     }
     match binding_row_pid {
-        // No binding row (or unreadable/dangling one): never trusted.
-        None => false,
+        // No binding row (or unreadable/dangling one): only a launcher id is
+        // refused outright, because only a launcher promises a row up front.
+        None => !is_launcher_process_id(id) && ancestor_carries_id(id),
         // Row with a recorded instance pid: that pid must be in this tree.
         Some(Some(pid)) => ancestors.contains(&pid),
         // Row with no recorded pid: an ancestor carrying the id proves it.
@@ -3598,6 +3628,67 @@ mod tests {
             Some(None),
             &|_| false
         ));
+    }
+
+    #[test]
+    fn process_id_trusted_non_launcher_no_row_carried_trusted() {
+        // Harness / relay / adhoc shapes are created by the hook presenting
+        // them, so no row can exist yet; the tree carrying the id is the proof.
+        for id in ["pid-agy-123", "pid-cop-123", "hcom-codex-recipient-42"] {
+            assert!(
+                process_id_trusted(id, &[7, 3], &|_| AncestorProcess::Omp, None, &|want| want
+                    == id),
+                "{id} should be trusted when this tree carries it"
+            );
+        }
+    }
+
+    #[test]
+    fn process_id_trusted_non_launcher_no_row_uncarried_refused() {
+        assert!(!process_id_trusted(
+            "pid-agy-123",
+            &[7, 3],
+            &|_| AncestorProcess::Omp,
+            None,
+            &|_| false
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_non_launcher_row_pid_outside_ancestors_refused() {
+        // A row that exists still gags the id: only the recorded pid proves it.
+        assert!(!process_id_trusted(
+            "pid-agy-123",
+            &[7, 3],
+            &|_| AncestorProcess::Omp,
+            Some(Some(99)),
+            &|_| true
+        ));
+    }
+
+    #[test]
+    fn launcher_shape_detects_uuid_v4() {
+        assert!(is_launcher_process_id(
+            "550e8400-e29b-41d4-a716-446655440000"
+        ));
+        assert!(is_launcher_process_id(
+            "0cfec9a4-ddff-45cc-b0bf-c45e6ab65bb2"
+        ));
+        for other in [
+            "",
+            "omp-7-1-2",
+            "pid-123",
+            "hcom-codex-recipient-42",
+            "550e8400-e29b-41d4-a716-44665544000",
+            "550e8400-e29b-41d4-a716-4466554400000",
+            "550e8400-e29b-41d4-a716-44665544000g",
+            "550E8400-E29B-41D4-A716-446655440000",
+        ] {
+            assert!(
+                !is_launcher_process_id(other),
+                "{other} is not a launcher id"
+            );
+        }
     }
 
     #[cfg(unix)]
