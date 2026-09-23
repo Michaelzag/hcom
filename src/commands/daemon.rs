@@ -5,7 +5,8 @@
 //!
 //! With `relay_worker_managed=true` a service manager (systemd) owns the
 //! worker: `start`/`stop` refuse and point at it, `restart` SIGTERMs the
-//! worker and waits for the manager to bring up a new one.
+//! worker and waits for the manager to bring up a new one, and `hcom reset`
+//! refuses while it runs.
 
 use std::thread;
 use std::time::Duration;
@@ -81,47 +82,49 @@ pub(crate) fn daemon_stop() -> i32 {
     stop_unmanaged()
 }
 
+/// Gate for `hcom reset`, checked before it touches anything. A running
+/// managed worker holds hcom.db open, and its service manager would restart
+/// it mid-archive, so reset refuses and points at the manager. False (after
+/// printing why) when reset must not proceed.
+pub(crate) fn reset_permitted() -> bool {
+    if worker::worker_managed() && worker::is_relay_worker_running() {
+        eprintln!("{}", worker::MANAGED_RESET_HINT);
+        return false;
+    }
+    true
+}
+
 /// Stop the worker for `hcom reset`. Unmanaged: same as `daemon stop`.
-/// Managed: SIGTERM only — the service manager restarts it — and never the
-/// managed refusal, so reset neither fails nor prints it.
+/// Managed: nothing to do — [`reset_permitted`] already refused a running one.
 pub(crate) fn stop_worker_for_reset() -> i32 {
     if worker::worker_managed() {
-        worker::stop_relay_worker();
         return 0;
     }
     stop_unmanaged()
 }
 
 fn stop_unmanaged() -> i32 {
-    let pid = match worker::wait_for_worker_pid() {
-        Some(p) => p,
-        None => {
-            println!("Daemon not running");
-            return 0;
-        }
-    };
-
-    crate::sys::process::terminate(pid);
-    println!("Requested daemon shutdown (PID {pid})");
-
-    if worker::wait_for_worker_exit(Duration::from_secs(5)) {
-        println!("Daemon stopped");
-        worker::remove_relay_pid_file();
+    let Some(daemon) = worker::WorkerProcess::running() else {
+        println!("Daemon not running");
         return 0;
+    };
+    let pid = daemon.pid();
+    println!("Requested daemon shutdown (PID {pid})");
+    match daemon.stop() {
+        worker::WorkerStop::AlreadyGone | worker::WorkerStop::Stopped => {
+            println!("Daemon stopped");
+            0
+        }
+        worker::WorkerStop::Killed => {
+            println!("Daemon did not exit in time, forcing termination");
+            println!("Daemon killed");
+            0
+        }
+        worker::WorkerStop::Survived => {
+            eprintln!("Force-kill failed: daemon (PID {pid}) still running, PID file retained");
+            1
+        }
     }
-
-    println!("Daemon did not exit in time, forcing termination");
-    if !crate::sys::process::kill(pid) {
-        eprintln!(
-            "Force-kill failed (errno {}), PID file retained",
-            std::io::Error::last_os_error()
-        );
-        return 1;
-    }
-    println!("Daemon killed");
-    worker::wait_for_worker_exit(Duration::from_secs(1));
-    worker::remove_relay_pid_file();
-    0
 }
 
 fn daemon_restart() -> i32 {

@@ -39,14 +39,20 @@ pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) ->
         return super::hooks::cmd_hooks_remove(&["all".to_string()]);
     }
 
+    // A running managed worker must be stopped through its service manager
+    // first; refuse before touching anything.
+    if !crate::commands::daemon::reset_permitted() {
+        return 1;
+    }
+
     // Stop all instances before clearing database
     let stop_args = crate::commands::stop::StopArgs {
         targets: vec!["all".into()],
     };
     exit_codes.push(crate::commands::stop::cmd_stop(db, &stop_args, ctx));
 
-    // Stop relay daemon if running before clear (managed: SIGTERM only, the
-    // service manager restarts it)
+    // Stop relay daemon if running before clear (managed: none is running, the
+    // gate above refused otherwise)
     let _ = crate::commands::daemon::stop_worker_for_reset();
 
     // Clean temp files

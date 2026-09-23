@@ -280,6 +280,15 @@ pub fn run() -> i32 {
         }
     }
 
+    // Install shutdown-signal handlers (set AtomicBool on terminate/interrupt)
+    // before the pidfile names us — a SIGTERM sent as soon as it appears must
+    // not hit the default disposition — and before config load / connect so
+    // the managed idle phase honours them too. The watchdog thread checks
+    // this flag every second once connected.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    crate::sys::signal::register_term(&shutdown);
+    crate::sys::signal::register_int(&shutdown);
+
     // Only the lock holder writes the pidfile. `_pid_guard` is declared after
     // `lock_file`, so drop order (reverse of declaration) removes the pidfile
     // first and releases the lock last — a new worker can never lock while our
@@ -288,13 +297,6 @@ pub fn run() -> i32 {
     let _pid_guard = PidFileGuard;
 
     let binary = BinaryIdentity::capture();
-
-    // Install shutdown-signal handlers (set AtomicBool on terminate/interrupt)
-    // before config load / connect so the managed idle phase honours them too.
-    // The watchdog thread checks this flag every second once connected.
-    let shutdown = Arc::new(AtomicBool::new(false));
-    crate::sys::signal::register_term(&shutdown);
-    crate::sys::signal::register_int(&shutdown);
 
     log::log_info(
         "relay",
@@ -374,8 +376,10 @@ pub fn run() -> i32 {
 }
 
 /// Managed-mode wait: tick every second checking the shutdown flag and binary
-/// replacement; re-read config every few seconds. Returns the fresh config to
-/// (re)try connecting with, or None when the worker should exit cleanly.
+/// replacement, and write the heartbeat — this worker is alive and holds the
+/// lock, so status must not read it as stale while it idles or retries a
+/// failed connect. Re-read config every few seconds. Returns the fresh config
+/// to (re)try connecting with, or None when the worker should exit cleanly.
 ///
 /// `until_enabled` — return as soon as a reload shows relay enabled (idle
 /// because disabled). When false (retrying a failed connect) the fresh config
@@ -386,6 +390,7 @@ fn managed_idle(
     until_enabled: bool,
 ) -> Option<HcomConfig> {
     let mut tick = 0u32;
+    let mut db = HcomDb::open().ok();
     loop {
         std::thread::sleep(Duration::from_secs(1));
         if shutdown.load(Ordering::Relaxed) {
@@ -394,6 +399,13 @@ fn managed_idle(
         }
         if binary_replaced(binary) {
             return None;
+        }
+        // Best-effort, like the main loop's heartbeat.
+        if db.is_none() {
+            db = HcomDb::open().ok();
+        }
+        if let Some(d) = &db {
+            super::write_worker_heartbeat(d);
         }
         tick += 1;
         if !tick.is_multiple_of(IDLE_CONFIG_RELOAD_TICKS) {
@@ -563,6 +575,8 @@ fn local_instance_count(db: &HcomDb) -> i64 {
 pub const MANAGED_START_HINT: &str = "relay worker is managed by a service manager (relay_worker_managed=true); start it there, e.g. systemctl --user start hcom-relay";
 /// Guidance printed when hcom refuses to stop a managed worker itself.
 pub const MANAGED_STOP_HINT: &str = "relay worker is managed by a service manager (relay_worker_managed=true); stop it there, e.g. systemctl --user stop hcom-relay";
+/// Guidance printed when `hcom reset` refuses to run under a managed worker.
+pub const MANAGED_RESET_HINT: &str = "relay worker is managed by a service manager (relay_worker_managed=true) and is running; stop it there first, e.g. systemctl --user stop hcom-relay, then rerun hcom reset";
 
 /// How long a spawner keeps the spawn lock waiting for its child to take the
 /// worker lock, so a concurrent spawner doesn't launch a redundant child.
@@ -803,24 +817,113 @@ pub fn wait_for_worker_pid() -> Option<u32> {
     read_pid_file()
 }
 
-/// Poll every 100ms until no worker holds the lock. True if it was released
-/// within `timeout`.
-pub fn wait_for_worker_exit(timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if !is_relay_worker_running() {
-            return true;
+/// Grace a worker gets to exit on the graceful request before a force-kill.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+/// How long a force-killed worker gets to disappear.
+const KILL_GRACE: Duration = Duration::from_secs(1);
+
+/// How [`WorkerProcess::stop`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerStop {
+    /// It was already gone: nothing was signalled.
+    AlreadyGone,
+    /// It exited on the graceful request.
+    Stopped,
+    /// It outlived the grace and was force-killed.
+    Killed,
+    /// The same incarnation is still alive after the force-kill.
+    Survived,
+}
+
+/// One worker process incarnation: its PID plus its start identity, so a
+/// reused PID is never waited on or signalled in its place.
+pub struct WorkerProcess {
+    pid: u32,
+    /// None where the platform reports no identity: liveness by PID alone.
+    identity: Option<String>,
+}
+
+impl WorkerProcess {
+    /// The worker currently holding the lock, or None when none runs.
+    pub fn running() -> Option<Self> {
+        let pid = wait_for_worker_pid()?;
+        let worker = Self {
+            pid,
+            identity: crate::sys::process::identity(pid),
+        };
+        (!worker.gone()).then_some(worker)
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Exited, a zombie, or its PID now names a different process.
+    fn gone(&self) -> bool {
+        crate::proctruth::process_gone(self.pid)
+            || self
+                .identity
+                .as_deref()
+                .is_some_and(|id| !crate::sys::process::has_identity(self.pid, id))
+    }
+
+    /// Poll every 100ms until gone. True if it went within `timeout`.
+    fn wait_gone(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.gone() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        if std::time::Instant::now() >= deadline {
-            return false;
+    }
+
+    /// Ask this worker to exit, wait for *this process* to go, and force-kill
+    /// it only if the same incarnation is still alive after the grace. Never
+    /// waits on the lock: a replacement that takes it meanwhile (auto-spawn,
+    /// service manager) neither delays the stop nor gets signalled. Removes
+    /// a stale pidfile once the worker is gone.
+    pub fn stop(&self) -> WorkerStop {
+        self.stop_within(STOP_GRACE)
+    }
+
+    fn stop_within(&self, grace: Duration) -> WorkerStop {
+        if self.gone() {
+            return WorkerStop::AlreadyGone;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        let pid = self.pid;
+        if crate::sys::process::terminate(pid) {
+            log::log_info("relay", "relay_worker.stopped", &format!("pid={pid}"));
+        }
+        let outcome = if self.wait_gone(grace) {
+            WorkerStop::Stopped
+        } else {
+            // Re-checked right before the kill, so a PID that turned over at
+            // the deadline is never force-killed.
+            let killed = !self.gone() && crate::sys::process::kill(pid);
+            if !self.wait_gone(KILL_GRACE) {
+                log::log_warn("relay", "relay_worker.kill_survived", &format!("pid={pid}"));
+                return WorkerStop::Survived;
+            }
+            if killed {
+                log::log_info("relay", "relay_worker.force_killed", &format!("pid={pid}"));
+                WorkerStop::Killed
+            } else {
+                // It exited on its own just as the grace ran out.
+                WorkerStop::Stopped
+            }
+        };
+        remove_relay_pid_file();
+        outcome
     }
 }
 
-/// Remove a stale relay worker PID file (for post-SIGKILL cleanup). A no-op
+/// Remove a stale relay worker PID file once its worker is gone. A no-op
 /// while a worker holds the lock: the pidfile is then its, not stale.
-pub fn remove_relay_pid_file() {
+fn remove_relay_pid_file() {
     if !worker_lock_held() {
         remove_pid_file();
     }
@@ -845,8 +948,8 @@ pub fn worker_managed() -> bool {
 }
 
 /// Stop the relay worker and block until it exits, escalating to a force-kill
-/// if the graceful request does not take effect within ~5s. Removes a stale
-/// PID file once the worker is gone.
+/// if the graceful request does not take effect within ~5s (see
+/// [`WorkerProcess::stop`]).
 ///
 /// Unlike [`stop_relay_worker`], this *guarantees* termination. Callers with no
 /// other backstop must use this: [`terminate`](crate::sys::process::terminate)
@@ -863,24 +966,9 @@ pub fn stop_relay_worker_blocking() {
         let _ = stop_relay_worker();
         return;
     }
-
-    let Some(pid) = wait_for_worker_pid() else {
-        return;
-    };
-
-    if crate::sys::process::terminate(pid) {
-        log::log_info("relay", "relay_worker.stopped", &format!("pid={}", pid));
+    if let Some(worker) = WorkerProcess::running() {
+        worker.stop();
     }
-    if wait_for_worker_exit(Duration::from_secs(5)) {
-        remove_relay_pid_file();
-        return;
-    }
-
-    // Graceful request did not take effect in time; force-kill so a wedged
-    // worker cannot survive a relay reset/off.
-    crate::sys::process::kill(pid);
-    wait_for_worker_exit(Duration::from_secs(1));
-    remove_relay_pid_file();
 }
 
 /// Restart a service-managed worker: SIGTERM the lock holder and wait for the
@@ -968,5 +1056,100 @@ mod tests {
         assert!(!is_relay_worker_running());
         remove_relay_pid_file();
         assert!(!pid_file_path().exists());
+    }
+
+    #[cfg(unix)]
+    fn spawn_sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    /// The stop waits on the PID it signalled, not on the lock: a different
+    /// holder (here this test, standing in for a concurrent auto-spawn) keeps
+    /// the lock while the signalled worker exits, and the stop still returns
+    /// promptly without escalating. Linux: the signalled child stays a zombie
+    /// until reaped, and only /proc tells a zombie from a live process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial]
+    fn blocking_stop_waits_on_signalled_pid_not_lock() {
+        use std::os::unix::process::ExitStatusExt;
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let mut sleeper = spawn_sleeper();
+        let _lock = hold_worker_lock();
+        std::fs::write(pid_file_path(), sleeper.id().to_string()).unwrap();
+
+        let started = std::time::Instant::now();
+        stop_relay_worker_blocking();
+        let elapsed = started.elapsed();
+
+        let status = sleeper.try_wait().unwrap();
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "stop waited {elapsed:?} for the lock instead of the signalled PID"
+        );
+        assert_eq!(
+            status.and_then(|s| s.signal()),
+            Some(libc::SIGTERM),
+            "worker must exit on SIGTERM, not be escalated"
+        );
+    }
+
+    /// A PID whose start identity no longer matches is a different process:
+    /// it is never signalled.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn changed_identity_is_never_signalled() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let mut sleeper = spawn_sleeper();
+        let stale = WorkerProcess {
+            pid: sleeper.id(),
+            identity: Some("linux:earlier-boot:1".to_string()),
+        };
+
+        let outcome = stale.stop_within(Duration::from_millis(200));
+        let status = sleeper.try_wait().unwrap();
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        assert_eq!(outcome, WorkerStop::AlreadyGone);
+        assert!(status.is_none(), "reused PID was signalled: {status:?}");
+    }
+
+    /// The same incarnation still alive after the grace is force-killed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial]
+    fn worker_ignoring_sigterm_is_force_killed() {
+        use std::os::unix::process::ExitStatusExt;
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let mut stubborn = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .spawn()
+            .expect("spawn sh");
+        let pid = stubborn.id();
+        // The ignored disposition survives exec: once `sleep` runs, it holds.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .is_ok_and(|c| c.trim() != "sleep")
+        {
+            assert!(std::time::Instant::now() < deadline, "sleep never exec'd");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let worker = WorkerProcess {
+            pid,
+            identity: crate::sys::process::identity(pid),
+        };
+
+        let outcome = worker.stop_within(Duration::from_millis(300));
+        let status = stubborn.try_wait().unwrap();
+        let _ = stubborn.kill();
+        let _ = stubborn.wait();
+        assert_eq!(outcome, WorkerStop::Killed);
+        assert_eq!(status.and_then(|s| s.signal()), Some(libc::SIGKILL));
     }
 }

@@ -1,7 +1,7 @@
 //! Relay-worker lifetime: the lock-held singleton, prompt shutdown, managed
-//! mode, and binary-replacement exit. No broker: every test puts the worker in
-//! managed mode on a fresh HCOM_DIR with relay unconfigured, so it idles while
-//! holding the singleton lock instead of connecting.
+//! mode, and binary-replacement exit. No broker: every worker starts in
+//! managed mode on a fresh HCOM_DIR, so with relay unconfigured (or a connect
+//! that cannot succeed) it idles while holding the singleton lock.
 
 mod support;
 
@@ -28,7 +28,6 @@ impl Worker {
         self.child.try_wait().expect("poll worker").is_none()
     }
 
-    #[cfg(unix)]
     fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -74,11 +73,24 @@ fn start_worker(h: &Hcom, mut cmd: Command) -> Worker {
     // Own process group, so the fixture's group sweep also reaps it.
     #[cfg(unix)]
     cmd.process_group(0);
-    let child = cmd.spawn().expect("spawn relay-worker");
+    let deadline = Instant::now() + READY_TIMEOUT;
+    // A binary copied moments ago can briefly read as busy: a concurrent
+    // test's fork may hold the copy's write fd until that child execs.
+    let child = loop {
+        match cmd.spawn() {
+            Ok(child) => break child,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("spawn relay-worker: {e}"),
+        }
+    };
     h.track_cleanup_pid(i64::from(child.id()));
     let mut worker = Worker { child };
 
-    let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         if read_pid_file(h) == Some(worker.pid()) {
             return worker;
@@ -211,4 +223,105 @@ fn replaced_binary_makes_worker_exit() {
         .expect("relay-worker did not exit within 3s of binary replacement");
     assert!(status.success(), "status={status}");
     assert!(!pid_file(&h).exists(), "pidfile left behind after exit");
+}
+
+#[test]
+fn managed_reset_refuses_while_worker_runs() {
+    let h = Hcom::new();
+    set_managed(&h);
+    let mut worker = start_worker(&h, h.cmd());
+    let db = h.hcom_dir.join("hcom.db");
+    assert!(db.exists(), "worker never created hcom.db");
+
+    let (code, stdout, stderr) = h.run(["reset"]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("relay worker is managed by a service manager")
+            && stderr.contains("systemctl --user stop hcom-relay")
+            && stderr.contains("rerun hcom reset"),
+        "stderr={stderr}"
+    );
+    assert!(db.exists(), "refused reset archived hcom.db");
+    assert!(
+        worker.wait_exit(Duration::from_secs(2)).is_none(),
+        "refused reset stopped the managed worker"
+    );
+    let (code, stdout, stderr) = h.run(["relay", "daemon", "status"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains(&format!("Daemon: running (PID {}, managed)", worker.pid())),
+        "worker no longer holds the lock: stdout={stdout}"
+    );
+}
+
+#[test]
+fn managed_reset_proceeds_without_worker() {
+    let h = Hcom::new();
+    set_managed(&h);
+
+    let (code, stdout, stderr) = h.run(["reset"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        !stderr.contains("relay worker is managed"),
+        "stderr={stderr}"
+    );
+    assert!(!pid_file(&h).exists(), "managed reset spawned a worker");
+}
+
+/// Linux only. Windows' graceful request rarely reaches a console-less worker,
+/// so there the stop legitimately waits out the grace and force-kills; and
+/// this test is the worker's parent, so the exited worker stays a zombie that
+/// only /proc distinguishes from a live process.
+#[cfg(target_os = "linux")]
+#[test]
+fn unmanaged_daemon_stop_stops_running_worker() {
+    let h = Hcom::new();
+    // Start managed so the worker idles without a broker, then hand it to hcom.
+    set_managed(&h);
+    let mut worker = start_worker(&h, h.cmd());
+    let (code, stdout, stderr) = h.run(["config", "relay_worker_managed", "false"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+    let started = Instant::now();
+    let (code, stdout, stderr) = h.run(["relay", "daemon", "stop"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("Daemon stopped"), "stdout={stdout}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "stop took {:?}: it waited out the grace period",
+        started.elapsed()
+    );
+    let status = worker
+        .wait_exit(Duration::from_secs(1))
+        .expect("worker still running after daemon stop");
+    assert!(status.success(), "status={status}");
+    assert!(!pid_file(&h).exists(), "pidfile left behind after stop");
+}
+
+/// A managed worker whose connect keeps failing retries in its idle loop; it
+/// is alive and holds the lock, so status must not call it stale.
+#[test]
+fn managed_connect_retry_keeps_heartbeat_fresh() {
+    let h = Hcom::new();
+    set_managed(&h);
+    // Enabled with no PSK: every connect attempt fails before any network I/O.
+    for (key, value) in [("relay_id", "retry-test"), ("relay_enabled", "true")] {
+        let (code, stdout, stderr) = h.run(["config", key, value]);
+        assert_eq!(code, 0, "{key}: stdout={stdout} stderr={stderr}");
+    }
+    let mut worker = start_worker(&h, h.cmd());
+
+    // Past HEARTBEAT_STALE_SECS (10s) since the startup heartbeat.
+    std::thread::sleep(Duration::from_secs(12));
+    assert!(worker.is_running(), "worker exited while retrying connect");
+
+    let (code, stdout, stderr) = h.run(["relay", "status"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(!stdout.contains("stale"), "stdout={stdout}");
+    // The state word is colored; match it and the detail separately.
+    assert!(
+        stdout.contains("starting")
+            && stdout.contains(&format!("(PID {}, awaiting connect)", worker.pid())),
+        "stdout={stdout}"
+    );
 }
