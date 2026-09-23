@@ -86,9 +86,10 @@ fn get_unread_counts_batch(db: &HcomDb, instances: &[InstanceRow]) -> HashMap<St
 ///
 /// Returns exit code (0 = success, 1 = error).
 pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i32 {
-    // Clean up stale launch placeholders and mirrors of relay devices that
-    // stopped syncing. Nothing else: `hcom list` is a read-only view of
-    // instance lifecycle — it never stops, reaps, or signals an instance.
+    // Clean up stale launch placeholders (holding any whose launch is still
+    // alive) and mirrors of relay devices that stopped syncing. Nothing
+    // else: `hcom list` is a read-only view — it never stops, reaps, or
+    // signals a live process.
     cleanup_stale_placeholders(db);
     if !is_in_wake_grace() {
         cleanup_stale_remote_instances(db);

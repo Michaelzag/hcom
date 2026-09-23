@@ -134,6 +134,16 @@ pub fn processes_for_instance(name: &str, binding_ids: &[String]) -> Vec<ProcMat
     }
 }
 
+/// Whether any live (non-zombie) carrier holds the instance by name or by
+/// one of its binding ids. The placeholder janitor's hold rule: a stale
+/// placeholder whose launch is still running is held, never released or
+/// signalled.
+pub(crate) fn has_live_carriers(name: &str, binding_ids: &[String]) -> bool {
+    processes_for_instance(name, binding_ids)
+        .iter()
+        .any(|m| !process_gone(m.pid))
+}
+
 /// Decode the two identity facts from a raw /proc environ block: whether it
 /// carries exactly `want` (`HCOM_INSTANCE_NAME=<name>`) as one NUL-delimited
 /// entry, and its `HCOM_PROCESS_ID` value (empty when absent). Only these two
@@ -277,7 +287,7 @@ fn clock_ticks_per_sec() -> f64 {
 /// zombie (dead but unreaped — `kill(pid, 0)` still succeeds on it, so a
 /// bare liveness check would block a release on an already-dead process
 /// until its parent reaps it).
-fn process_gone(pid: u32) -> bool {
+pub(crate) fn process_gone(pid: u32) -> bool {
     if !crate::sys::process::is_alive(pid) {
         return true;
     }

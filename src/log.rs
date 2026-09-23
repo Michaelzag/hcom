@@ -134,6 +134,11 @@ pub fn log_info(subsystem: &str, event: &str, message: &str) {
     log("INFO", subsystem, event, message);
 }
 
+/// Log debug message.
+pub fn log_debug(subsystem: &str, event: &str, message: &str) {
+    log("DEBUG", subsystem, event, message);
+}
+
 /// Log warning message.
 pub fn log_warn(subsystem: &str, event: &str, message: &str) {
     log("WARN", subsystem, event, message);

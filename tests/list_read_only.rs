@@ -196,3 +196,64 @@ fn list_leaves_dead_inactive_row_in_place() {
         "`hcom list` deleted a dead inactive session's row"
     );
 }
+
+/// Seed a LOCAL launch placeholder: session_id NULL, status `pending`,
+/// context `new` — exactly `is_launching_placeholder`'s check — created ten
+/// minutes ago, so it is stale for the placeholder threshold while its
+/// launch carrier is still live.
+fn seed_launch_placeholder(h: &Hcom, name: &str) {
+    let ten_minutes_ago = now_epoch_f64() - 600.0;
+    fixture_db(h)
+        .execute(
+            "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, last_stop, created_at, background)
+             VALUES (?1, 'codex', 'pending', 'new', ?2, ?2, ?3, 0)",
+            rusqlite::params![
+                name,
+                ten_minutes_ago as i64,
+                ten_minutes_ago
+            ],
+        )
+        .expect("seed launch placeholder row");
+}
+
+#[test]
+#[cfg(unix)]
+fn list_does_not_touch_live_launch_placeholder() {
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["list"]);
+    assert_eq!(code, 0, "schema-init `hcom list` failed: {stderr}");
+
+    let name = format!("live-placeholder-{}", std::process::id());
+    let process_id = format!("proc-live-placeholder-{}", std::process::id());
+    seed_launch_placeholder(&h, &name);
+    seed_binding(&h, &process_id, "sess-live-placeholder", &name);
+
+    let mut carrier = spawn_carrier(&h, &name, &process_id);
+
+    let (code, stdout, stderr) = h.run(["list"]);
+    assert_eq!(
+        code, 0,
+        "`hcom list` failed:\n-- stdout --\n{stdout}\n-- stderr --\n{stderr}"
+    );
+    let (code, json, stderr) = h.run(["list", "--json"]);
+    assert_eq!(
+        code, 0,
+        "`hcom list --json` failed:\n-- stdout --\n{json}\n-- stderr --\n{stderr}"
+    );
+
+    let row_exists = instance_row_exists(&h, &name);
+    let carrier_alive = carrier.try_wait().expect("poll carrier").is_none();
+    assert!(
+        row_exists && carrier_alive,
+        "`hcom list` must never touch a live launch placeholder, but did: \
+         row_exists={row_exists}, carrier_alive={carrier_alive}"
+    );
+    assert!(
+        json.contains(&name),
+        "live launch placeholder missing from `hcom list --json` output:\n{json}"
+    );
+
+    carrier.kill().expect("kill carrier");
+    carrier.wait().expect("reap carrier");
+}

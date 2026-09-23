@@ -1342,13 +1342,19 @@ pub enum StopOutcome {
     RetryableError(String),
 }
 
+/// Placeholder cleanup's release: the DB teardown (snapshot, `stopped`
+/// event with `placeholder: true`, row release) with the reap gate OFF —
+/// no headless group kill and no carrier reap, so it never signals. A
+/// placeholder past the age threshold may still belong to a slow-but-live
+/// launch; the caller holds those (see `cleanup_stale_placeholders`) and
+/// this path only ever releases rows no live process claims.
 pub(crate) fn stop_placeholder_instance(
     db: &HcomDb,
     instance_name: &str,
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, true)
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, false)
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB

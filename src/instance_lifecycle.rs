@@ -622,7 +622,11 @@ pub fn set_status(
     let _ = db.log_event("status", instance_name, &data);
 }
 
-/// Delete placeholder instances that have been launching too long.
+/// Delete placeholder instances that have been launching too long — unless
+/// their launch may still be alive: a placeholder with a live recorded pid
+/// or a live identity carrier is held (the launch is slow, not dead), and
+/// cleanup never signals a process, so it can only wait it out. Release is
+/// the plain placeholder stop: no reap, no signals.
 pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
     let mut deleted = 0;
     let now = now_epoch_f64();
@@ -634,6 +638,20 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
             }
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
+                let pid_live = data
+                    .pid
+                    .filter(|pid| *pid > 0)
+                    .is_some_and(|pid| !crate::proctruth::process_gone(pid as u32));
+                let binding_ids = db.process_binding_ids(&data.name).unwrap_or_default();
+                let carrier_live = crate::proctruth::has_live_carriers(&data.name, &binding_ids);
+                if pid_live || carrier_live {
+                    crate::log::log_debug(
+                        "cleanup",
+                        "placeholder_held_live_launch",
+                        &format!("name={} pid_live={}", data.name, data.pid.unwrap_or(0)),
+                    );
+                    continue;
+                }
                 match crate::hooks::common::stop_placeholder_instance(
                     db,
                     &data.name,
@@ -1208,6 +1226,44 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         assert_eq!(deleted, 0);
         assert!(db.get_instance_full("real").unwrap().is_some());
 
+        cleanup(path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cleanup_stale_placeholders_holds_live_pid() {
+        use std::os::unix::process::CommandExt;
+
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("600")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn placeholder launch pid");
+
+        let old_time = now_epoch_f64() - 200.0;
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("slow-launch"));
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(old_time));
+        data.insert("pid".into(), serde_json::json!(sleeper.id()));
+        db.save_instance_named("slow-launch", &data).unwrap();
+
+        let deleted = cleanup_stale_placeholders(&db);
+        assert_eq!(deleted, 0);
+        assert!(db.get_instance_full("slow-launch").unwrap().is_some());
+        assert!(
+            sleeper.try_wait().unwrap().is_none(),
+            "cleanup must never signal the placeholder's launch pid"
+        );
+
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
         cleanup(path);
     }
 }
