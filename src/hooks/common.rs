@@ -3322,6 +3322,22 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         let carrier: u32 = line.trim().parse().unwrap();
+        // `$!` is echoed while the job may still be `env`, before it execs
+        // `sleep` with the name; stopping earlier would find no carrier.
+        let enumerated = (0..50).any(|_| {
+            let found = crate::proctruth::processes_for_instance(&name, &[])
+                .iter()
+                .any(|m| m.pid == carrier);
+            if !found {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            found
+        });
+        if !enumerated {
+            let _ = leader.kill();
+            let _ = leader.wait();
+            panic!("carrier {carrier} never enumerated as a carrier of {name}");
+        }
         insert_headless_instance(&db, &name, leader.id());
 
         let outcome = stop_instance(&db, &name, "test", "headless_stop");
