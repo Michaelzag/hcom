@@ -45,8 +45,9 @@ pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) ->
     };
     exit_codes.push(crate::commands::stop::cmd_stop(db, &stop_args, ctx));
 
-    // Stop relay daemon if running before clear
-    let _ = crate::commands::daemon::daemon_stop();
+    // Stop relay daemon if running before clear (managed: SIGTERM only, the
+    // service manager restarts it)
+    let _ = crate::commands::daemon::stop_worker_for_reset();
 
     // Clean temp files
     super::reset_ops::clean_temp_files();

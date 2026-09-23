@@ -179,6 +179,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "Enable relay sync (config file only)",
         "boolean",
     ),
+    (
+        "HCOM_RELAY_WORKER_MANAGED",
+        "Relay worker is run by a service manager (systemd); hcom never spawns it",
+        "boolean",
+    ),
 ];
 
 /// Instance-level config keys.
@@ -229,6 +234,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "relay_id" => Some("relay.id"),
         "relay_token" => Some("relay.token"),
         "relay_enabled" => Some("relay.enabled"),
+        "relay_worker_managed" => Some("relay.worker_managed"),
         "timeout" => Some("preferences.timeout"),
         "auto_approve" => Some("preferences.auto_approve"),
         "name_export" => Some("preferences.name_export"),
@@ -1717,6 +1723,24 @@ Usage:
   hcom config relay_enabled true     Re-enable relay sync
 
 Temporarily disables MQTT sync without removing relay configuration.",
+        ),
+
+        "HCOM_RELAY_WORKER_MANAGED" => Some(
+            "\
+HCOM_RELAY_WORKER_MANAGED - Relay worker is run by a service manager
+
+Default: false
+Stored in [relay] in config.toml. Environment overrides are ignored for relay fields.
+
+Usage:
+  hcom config relay_worker_managed true     A service manager owns the worker
+  hcom config relay_worker_managed false    hcom spawns the worker on demand
+
+Set this when a systemd unit (e.g. `systemctl --user` hcom-relay) runs
+`hcom relay-worker`. hcom then never spawns a worker itself; `relay daemon
+start/stop` refuse and point at the service manager, and relay off/reset only
+SIGTERM the worker so the manager restarts it. A managed worker idles instead
+of exiting while relay is disabled or the broker is unreachable.",
         ),
 
         _ => None,
