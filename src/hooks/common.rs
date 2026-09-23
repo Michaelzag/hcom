@@ -1473,6 +1473,13 @@ fn stop_instance_inner_scoped(
         }
     };
 
+    // The headless group step may kill the recorded root before the reap
+    // snapshots its descendants. Capture proven carrier identities first so
+    // reparenting cannot erase that ownership evidence.
+    let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
+    let capture = reap_gate
+        .then(|| crate::proctruth::capture_reap_carriers(db, instance_name, &binding_ids, exclude));
+
     // Kill headless processes (background=true)
     // Skipped when the reap gate is off (the kill paths): kill owns the
     // signalling — the foreign path signals the process group and both paths
@@ -1708,22 +1715,21 @@ fn stop_instance_inner_scoped(
             return StopOutcome::RetryableError(format!("could not stop child {child}: {error}"));
         }
     }
-    // Reap the whole live tree for this name before releasing the row.
+    // Reap the proven in-scope tree for this name before releasing the row.
     // Process truth gates the release: the stopped event is only written
-    // (and the row only deleted) once no process holds the instance — by
-    // name or, for self-bound sessions, by binding process id. The pty
-    // wrapper is signalled first via oldest-first ordering inside reap.
-    // Skipped when the reap gate is off (the kill paths): the caller may be
-    // one of the carriers. Kill has already reaped the carrier set — every
-    // non-self carrier on the self path — and verified it gone (fail-closed)
-    // before this teardown is called, and only after its own incarnation CAS.
-    let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
-    if reap_gate
-        && let Err(survivors) = crate::proctruth::reap_instance_tree_for_excluding(
+    // (and the row only deleted) once no in-scope process holds the instance
+    // by name or binding process id. A foreign holder is excluded and logged
+    // without being signalled. The pty wrapper goes first within the reap.
+    // Skipped when the reap gate is off (the kill paths): kill has already
+    // reaped and verified the eligible carrier set before this teardown,
+    // and only after its own incarnation CAS.
+    if let Some(capture) = capture
+        && let Err(survivors) = crate::proctruth::reap_instance_tree_for_excluding_captured(
             db,
             instance_name,
             &binding_ids,
             exclude,
+            capture,
         )
     {
         let pids = survivors

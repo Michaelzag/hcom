@@ -14,6 +14,8 @@
 //!   instance — `HCOM_INSTANCE_NAME=<name>` OR `HCOM_PROCESS_ID=<binding>`
 //!   (exact entry match; only those two variables' values are ever read —
 //!   other environ values are never printed).
+//!   Linux also excludes shared broker daemons unless a nested `omp` owns the
+//!   candidate subtree.
 //! - [`reap_instance_tree_for`]: SIGTERM the whole carrier set (oldest first,
 //!   so the pty wrapper goes before its children), wait up to 5 s, SIGKILL
 //!   survivors — fail-closed: success is only reported once no in-scope
@@ -38,7 +40,7 @@
 //! every query reports empty (verified-no-holders) and reap is a no-op.
 
 #[cfg(unix)]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::db::HcomDb;
 
@@ -118,6 +120,10 @@ const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// first hook from `HCOM_PROCESS_ID=omp-<pid>-…`, never carrying
 /// `HCOM_INSTANCE_NAME`) are held by their process id, not their name.
 ///
+/// On Linux a broker (`/proc/<pid>/comm` exactly `omp daemon brok`) is never
+/// a carrier. Its descendants need a nested `omp` between them and their
+/// nearest broker, including the candidate itself.
+///
 /// Only the `HCOM_INSTANCE_NAME` and `HCOM_PROCESS_ID` entries are ever
 /// inspected; no other environ values are read or reported. The calling
 /// process itself is always excluded (a CLI running inside the session
@@ -125,7 +131,7 @@ const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 pub fn processes_for_instance(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
     #[cfg(unix)]
     {
-        enumerate_unix(name, binding_ids)
+        enumerate_unix(name, binding_ids, None)
     }
     #[cfg(not(unix))]
     {
@@ -202,8 +208,227 @@ fn is_bound_process_id(process_id: &str, binding_ids: &[String]) -> bool {
     !process_id.is_empty() && binding_ids.iter().any(|id| id == process_id)
 }
 
+/// Broker-owned daemons inherit the first session's identity but do not belong
+/// to it. Only a nested `omp` below the nearest broker starts a new carrier
+/// subtree. Off Linux there is no `/proc/<pid>/comm` to distinguish them, so
+/// keep the existing identity-only rule.
+pub(crate) fn carrier_eligible(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        carrier_eligible_with(
+            pid,
+            |pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok(),
+            parent_pid,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn carrier_eligible_with(
+    pid: u32,
+    comm_of: impl Fn(u32) -> Option<String>,
+    parent_of: impl Fn(u32) -> Option<u32>,
+) -> bool {
+    let mut current = pid;
+    let mut passed_omp = false;
+    // A missing link cannot establish broker ancestry. Bound the walk like
+    // ancestor_or_self_pids in case /proc changes under us.
+    for _ in 0..1024 {
+        let comm = comm_of(current);
+        let comm = comm
+            .as_deref()
+            .map(|value| value.strip_suffix('\n').unwrap_or(value));
+        if comm == Some("omp daemon brok") {
+            return passed_omp;
+        }
+        if comm == Some("omp") {
+            passed_omp = true;
+        }
+        let Some(parent) = parent_of(current) else {
+            return true;
+        };
+        if parent == current {
+            return true;
+        }
+        current = parent;
+    }
+    true
+}
+
+/// Roots and the original PID incarnations are captured before the first
+/// signal of a teardown. A descendant stays in scope if an earlier signal
+/// kills its parent and the kernel reparents it; a reused pid does not.
 #[cfg(unix)]
-fn enumerate_unix(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
+struct CarrierTreeScope {
+    roots: Vec<u32>,
+    caller_ancestors: Vec<u32>,
+    known: HashMap<u32, (ProcMatch, String)>,
+}
+
+/// The owning roots and proven carriers from before the operation's first
+/// signal. Callers with a headless group signal capture this before that
+/// signal; callers with no pre-step capture at reap entry.
+pub(crate) struct ReapCapture {
+    #[cfg(unix)]
+    scope: CarrierTreeScope,
+}
+
+#[cfg(unix)]
+fn carrier_tree_scope(db: &HcomDb, name: &str, binding_ids: &[String]) -> CarrierTreeScope {
+    let mut roots = vec![std::process::id()];
+    if let Ok(Some(row)) = db.get_instance_full(name)
+        && let Some(pid) = row.pid.and_then(|pid| u32::try_from(pid).ok())
+        && pid != 0
+        && !roots.contains(&pid)
+    {
+        roots.push(pid);
+    }
+    #[cfg(target_os = "linux")]
+    for id in binding_ids {
+        // Only the minted omp-<pid>-... shape identifies an owner. A live
+        // process with another comm must not become a root on the strength of
+        // a borrowed or stale binding id.
+        if let Some(pid) = shell_pid_from_process_id(id)
+            && id
+                .strip_prefix("omp-")
+                .is_some_and(|rest| rest.contains('-'))
+            && !process_gone(pid)
+            && std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|comm| comm.trim_end_matches('\n') == "omp")
+            && !roots.contains(&pid)
+        {
+            roots.push(pid);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = binding_ids;
+    CarrierTreeScope {
+        roots,
+        caller_ancestors: caller_ancestor_pids(),
+        known: HashMap::new(),
+    }
+}
+
+pub(crate) fn capture_reap_carriers(
+    db: &HcomDb,
+    name: &str,
+    binding_ids: &[String],
+    exclude: &[u32],
+) -> ReapCapture {
+    #[cfg(unix)]
+    {
+        let mut scope = carrier_tree_scope(db, name, binding_ids);
+        snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
+        ReapCapture { scope }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (db, name, binding_ids, exclude);
+        ReapCapture {}
+    }
+}
+
+/// Build a round's live carrier set. Proven members from an earlier snapshot
+/// survive reparenting only with the same OS process identity; new carriers
+/// must pass ancestry and the broker rule at their first snapshot.
+#[cfg(unix)]
+fn snapshot_reap_carriers(
+    name: &str,
+    binding_ids: &[String],
+    exclude: &[u32],
+    scope: &mut CarrierTreeScope,
+) -> Vec<ProcMatch> {
+    let mut matches = live_carriers_for(name, binding_ids, exclude, Some(scope));
+    matches.retain(|m| {
+        let Some(identity) = crate::sys::process::identity(m.pid) else {
+            log_carrier_out_of_scope(m.pid, name, scope);
+            return false;
+        };
+        match scope.known.get(&m.pid) {
+            Some((_, original)) => {
+                if original != &identity {
+                    log_carrier_out_of_scope(m.pid, name, scope);
+                    return false;
+                }
+                true
+            }
+            None => {
+                scope.known.insert(m.pid, (m.clone(), identity));
+                true
+            }
+        }
+    });
+    matches
+}
+
+/// An identity holder is signalable only when its parent chain reaches one
+/// of the captured roots. An unreadable or changing chain never proves
+/// ownership. A root itself counts, except if it is a caller ancestor.
+#[cfg(target_os = "linux")]
+fn carrier_in_owner_tree_with(
+    pid: u32,
+    scope: &CarrierTreeScope,
+    parent_of: impl Fn(u32) -> Option<u32>,
+) -> bool {
+    if scope.caller_ancestors.last() != Some(&1) {
+        return false;
+    }
+    if scope.caller_ancestors.contains(&pid) {
+        return false;
+    }
+    let mut current = pid;
+    for _ in 0..1024 {
+        if scope.roots.contains(&current) {
+            return true;
+        }
+        let Some(parent) = parent_of(current) else {
+            return false;
+        };
+        if parent == current {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+#[cfg(unix)]
+fn log_carrier_out_of_scope(pid: u32, name: &str, scope: &CarrierTreeScope) {
+    crate::log::log_info(
+        "proctruth",
+        "carrier_out_of_scope",
+        &format!("pid={pid} instance={name} roots={:?}", scope.roots),
+    );
+}
+
+#[cfg(unix)]
+fn carrier_in_signal_scope(pid: u32, name: &str, scope: &CarrierTreeScope) -> bool {
+    if scope
+        .known
+        .get(&pid)
+        .is_some_and(|(_, identity)| crate::sys::process::has_identity(pid, identity))
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if carrier_in_owner_tree_with(pid, scope, parent_pid) {
+        return true;
+    }
+    log_carrier_out_of_scope(pid, name, scope);
+    false
+}
+
+#[cfg(unix)]
+fn enumerate_unix(
+    name: &str,
+    binding_ids: &[String],
+    scope: Option<&CarrierTreeScope>,
+) -> Vec<ProcMatch> {
     let want = format!("HCOM_INSTANCE_NAME={name}");
     let self_pid = std::process::id();
     let btime = system_btime();
@@ -234,6 +459,35 @@ fn enumerate_unix(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
         // ids even though it never carried the name. Empty binding ids never
         // match (an absent HCOM_PROCESS_ID reads as empty).
         if !carries_name && !is_bound_process_id(&process_id, binding_ids) {
+            continue;
+        }
+        let frozen = scope.and_then(|scope| scope.known.get(&pid));
+        if frozen.is_some_and(|(_, identity)| !crate::sys::process::has_identity(pid, identity)) {
+            if let Some(scope) = scope {
+                log_carrier_out_of_scope(pid, name, scope);
+            }
+            continue;
+        }
+        // A previously scoped descendant may have been reparented by an
+        // earlier signal. Keep its broker decision, but never signal a pid
+        // that has itself become the shared broker.
+        if frozen.is_some() {
+            #[cfg(target_os = "linux")]
+            if std::fs::read_to_string(format!("/proc/{pid}/comm")).map_or(true, |comm| {
+                comm.trim_end_matches('\n') == "omp daemon brok"
+            }) {
+                if let Some(scope) = scope {
+                    log_carrier_out_of_scope(pid, name, scope);
+                }
+                continue;
+            }
+        } else if !carrier_eligible(pid) {
+            if let Some(scope) = scope {
+                log_carrier_out_of_scope(pid, name, scope);
+            }
+            continue;
+        }
+        if scope.is_some_and(|scope| !carrier_in_signal_scope(pid, name, scope)) {
             continue;
         }
         // A second pass is unnecessary: process_id defaults to empty when
@@ -370,14 +624,14 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
     }
 }
 
-/// Reap every live process holding the instance: carriers of
-/// `HCOM_INSTANCE_NAME=<name>` plus carriers of any of the instance's
-/// binding process ids (the self-bound tree never carries the name).
+/// Reap every proven in-scope process holding the instance: descendants of
+/// an owning root carrying `HCOM_INSTANCE_NAME=<name>` or one of its binding
+/// process ids (the self-bound tree never carries the name).
 ///
 /// Oldest first (the pty wrapper predates its children), SIGTERM, wait up to
-/// 5 s, SIGKILL survivors, verify. Verification is by carrier set, not by pid
-/// snapshot: after each wait the tree is re-enumerated for carriers. A
-/// late-appearing carrier is signalable only in reap scope (see
+/// 5 s, SIGKILL survivors, verify. Verification re-enumerates carriers while
+/// retaining earlier proven PID incarnations after reparenting. A late
+/// carrier is signalable only when newly proven in scope (see
 /// [`carrier_in_reap_scope`]): a mid-reap fork carrying one of the call-start
 /// binding ids, one carrying a stale id no current binding claims, or one
 /// with no process id at all (the name-only late fork) is still signalled
@@ -409,15 +663,21 @@ pub fn reap_instance_tree_for(
 /// are never signalled and never count as survivors, at any enumeration
 /// round (initial, KILL re-enumeration, verification).
 ///
+/// In every round a carrier must also be a descendant of the recorded pid,
+/// caller pid, or live minted `omp-<pid>-...` binding owner with comm exactly
+/// `omp`. Roots are fixed at entry; the same roots gate pre-signal rechecks.
+/// Caller ancestors are never signalled, even if also recorded roots. Other
+/// Unix systems cannot prove /proc ancestry and signal no carriers here.
+///
 /// The kill self-path uses this with [`caller_ancestor_pids`]: the caller
-/// runs inside the instance it is killing, so its own session tree must be
-/// spared while every other carrier is still reaped and still blocks success
-/// while it lives. Ordering is fail-closed: the kill runs this reap to
+/// runs inside the instance it is killing, so its own session ancestors
+/// are spared while other eligible carriers are reaped. Ordering is
+/// fail-closed: the kill runs this reap to
 /// `Ok(())` BEFORE writing `stopped` or releasing the row/bindings — a
 /// survivor returns `Err` and leaves ownership state untouched, so a failed
 /// reap can never be converted into a successful exit after the row is
 /// discarded (a kill never reports stopped or releases the row/bindings
-/// while any instance process may still be alive). An empty `exclude` is
+/// while an in-scope instance process may still be alive). An empty `exclude` is
 /// exactly [`reap_instance_tree_for`].
 ///
 /// Reap scope (the re-enumeration / KILL and verification rounds): a carrier
@@ -435,8 +695,8 @@ pub fn reap_instance_tree_for(
 /// (a genuine mid-reap fork inherits the old env), and one carrying a stale
 /// non-empty id that no current binding claims (a late child of the old
 /// instance inheriting an older era's id) — signalled, and while alive a
-/// survivor (fail-closed), so a dying tree that forks or hands out stale ids
-/// late leaves no unmanaged live descendant behind.
+/// survivor (fail-closed), provided its ancestry still reaches an owning
+/// root.
 ///
 /// Round ordering — the read-after-capture rule: every classification round
 /// (the KILL re-enumeration and the final verification alike) CAPTURES its
@@ -482,17 +742,29 @@ pub fn reap_instance_tree_for_excluding(
     binding_ids: &[String],
     exclude: &[u32],
 ) -> Result<(), Vec<u32>> {
+    let capture = capture_reap_carriers(db, name, binding_ids, exclude);
+    reap_instance_tree_for_excluding_captured(db, name, binding_ids, exclude, capture)
+}
+
+pub(crate) fn reap_instance_tree_for_excluding_captured(
+    db: &HcomDb,
+    name: &str,
+    binding_ids: &[String],
+    exclude: &[u32],
+    capture: ReapCapture,
+) -> Result<(), Vec<u32>> {
     #[cfg(not(unix))]
     {
-        let _ = db;
-        let _ = name;
-        let _ = binding_ids;
-        let _ = exclude;
+        let _ = (db, name, binding_ids, exclude, capture);
         Ok(())
     }
     #[cfg(unix)]
     {
-        let mut matches = live_carriers_for(name, binding_ids, exclude);
+        let mut scope = capture.scope;
+        // The first round uses the pre-signal capture itself. Re-enumerating
+        // here would wrongly TERM a carrier that arrived after that capture
+        // (and, on headless paths, after the group signal).
+        let mut matches: Vec<ProcMatch> = scope.known.values().map(|(m, _)| m.clone()).collect();
         if matches.is_empty() {
             return Ok(());
         }
@@ -511,7 +783,7 @@ pub fn reap_instance_tree_for_excluding(
         for m in &matches {
             // Pid-reuse guard: only signal a snapshot pid that still holds
             // the instance; a recycled pid belongs to someone else now.
-            if pid_carries_instance(m.pid, name, binding_ids) {
+            if pid_carries_instance(m.pid, name, binding_ids, &scope) {
                 signal(m.pid, libc::SIGTERM);
             }
         }
@@ -535,7 +807,8 @@ pub fn reap_instance_tree_for_excluding(
         // [`reap_instance_tree_for_excluding`]). A fresh process spawned
         // after the capture is outside the captured set entirely — never
         // classified here at all.
-        let captured: Vec<ProcMatch> = live_carriers_for(name, binding_ids, exclude);
+        let captured: Vec<ProcMatch> =
+            snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
         #[cfg(test)]
         fire_round_seam(RoundPoint::Captured);
         let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
@@ -568,7 +841,7 @@ pub fn reap_instance_tree_for_excluding(
             started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
         });
         for m in &current {
-            if pid_carries_instance(m.pid, name, binding_ids) {
+            if pid_carries_instance(m.pid, name, binding_ids, &scope) {
                 signal(m.pid, libc::SIGKILL);
             }
         }
@@ -582,7 +855,8 @@ pub fn reap_instance_tree_for_excluding(
         // in-scope carrier still alive blocks success (fail-closed), while a
         // spared fresh registration never does — a spared carrier is never
         // counted as a survivor.
-        let captured: Vec<ProcMatch> = live_carriers_for(name, binding_ids, exclude);
+        let captured: Vec<ProcMatch> =
+            snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
         let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
         let still: Vec<u32> = captured
             .into_iter()
@@ -697,8 +971,13 @@ fn shell_pid_from_process_id(process_id: &str) -> Option<u32> {
 /// minus the exclusion set (the caller's own session tree in the kill
 /// self-path — never signalled, never a survivor).
 #[cfg(unix)]
-fn live_carriers_for(name: &str, binding_ids: &[String], exclude: &[u32]) -> Vec<ProcMatch> {
-    processes_for_instance(name, binding_ids)
+fn live_carriers_for(
+    name: &str,
+    binding_ids: &[String],
+    exclude: &[u32],
+    scope: Option<&CarrierTreeScope>,
+) -> Vec<ProcMatch> {
+    enumerate_unix(name, binding_ids, scope)
         .into_iter()
         .filter(|m| !is_zombie(m.pid) && !exclude.contains(&m.pid))
         .collect()
@@ -712,7 +991,7 @@ fn live_carriers_for(name: &str, binding_ids: &[String], exclude: &[u32]) -> Vec
 /// instance's carriers in its group.
 #[cfg(target_os = "linux")]
 pub(crate) fn group_holds_instance_carrier(pgid: u32, name: &str, binding_ids: &[String]) -> bool {
-    live_carriers_for(name, binding_ids, &[])
+    live_carriers_for(name, binding_ids, &[], None)
         .iter()
         .any(|m| process_group_id(m.pid) == Some(pgid))
 }
@@ -732,17 +1011,41 @@ pub(crate) fn pids_outside_group(pgid: u32, pids: &[u32]) -> bool {
     })
 }
 
-/// Pid-reuse guard: true when `pid` still holds the instance — exactly
-/// `HCOM_INSTANCE_NAME=<name>` or exactly `HCOM_PROCESS_ID=<id>` for one of
-/// the binding ids — in its environ. No other environ values are read. An
-/// unreadable environ (exited, or foreign-owned) reads as absent.
+/// Recheck identity and the captured process incarnation before signalling.
+/// Captured carriers keep their scope after their parents die; a pid not yet
+/// captured must still satisfy broker ownership and current root ancestry.
 #[cfg(unix)]
-fn pid_carries_instance(pid: u32, name: &str, binding_ids: &[String]) -> bool {
+fn pid_carries_instance(
+    pid: u32,
+    name: &str,
+    binding_ids: &[String],
+    scope: &CarrierTreeScope,
+) -> bool {
     let want = format!("HCOM_INSTANCE_NAME={name}");
-    std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
+    let carries = std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
         let (carries_name, process_id) = identity_facts(&env, want.as_bytes());
         carries_name || is_bound_process_id(&process_id, binding_ids)
-    })
+    });
+    if !carries {
+        return false;
+    }
+    if let Some((_, identity)) = scope.known.get(&pid) {
+        if !crate::sys::process::has_identity(pid, identity) {
+            log_carrier_out_of_scope(pid, name, scope);
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if std::fs::read_to_string(format!("/proc/{pid}/comm")).map_or(true, |comm| {
+            comm.trim_end_matches('\n') == "omp daemon brok"
+        }) {
+            log_carrier_out_of_scope(pid, name, scope);
+            return false;
+        }
+    } else if !carrier_eligible(pid) {
+        log_carrier_out_of_scope(pid, name, scope);
+        return false;
+    }
+    carrier_in_signal_scope(pid, name, scope)
 }
 
 #[cfg(unix)]
@@ -1138,6 +1441,102 @@ mod tests {
         std::time::SystemTime::now().hash(&mut h);
         std::thread::current().id().hash(&mut h);
         (h.finish() % 900000) as u32 + 100000
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn broker_carrier_eligibility_decision_table() {
+        let facts = [
+            (10, "omp", 1),
+            (20, "omp daemon brok\n", 10),
+            (21, "chromium", 20),
+            (22, "omp", 20),
+            (23, "sh", 22),
+            (24, "omp daemon brok", 22),
+            (25, "sh", 24),
+            (26, "sh", 10),
+            (27, "omp daemon broker", 10),
+            (28, "omp", 24),
+            (29, "omp daemon bro", 10),
+            (30, "chromium", 9999),
+        ];
+        for (pid, eligible) in [
+            (10, true),  // Owner above the broker.
+            (20, false), // Broker itself, even below an omp.
+            (21, false), // Shared daemon immediately below broker.
+            (22, true),  // Nested omp itself counts.
+            (23, true),  // Nested omp's tool shell.
+            (24, false), // Nearest broker wins over an outer nested omp.
+            (25, false), // Inner broker's daemon.
+            (26, true),  // Ordinary owner child, no broker.
+            (27, true),  // Exact comm match, not prefix match.
+            (28, true),  // A new omp below the inner broker.
+            (29, true),  // Shorter lookalike is not a broker.
+            (30, true),  // Unknown ancestry preserves the existing rule.
+        ] {
+            assert_eq!(
+                carrier_eligible_with(
+                    pid,
+                    |id| facts
+                        .iter()
+                        .find(|(p, _, _)| *p == id)
+                        .map(|(_, c, _)| c.to_string()),
+                    |id| facts
+                        .iter()
+                        .find(|(p, _, _)| *p == id)
+                        .map(|(_, _, parent)| *parent)
+                ),
+                eligible,
+                "pid {pid}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn carrier_tree_scope_requires_descendance_and_never_signals_ancestors() {
+        let scope = CarrierTreeScope {
+            // Caller, recorded instance pid, verified minted omp owner.
+            roots: vec![10, 20, 30],
+            caller_ancestors: vec![10, 2, 1],
+            known: HashMap::new(),
+        };
+        let parents = [
+            (10, 2),
+            (20, 1),
+            (21, 20),
+            (22, 21),
+            (30, 1),
+            (31, 30),
+            (40, 1),
+            (41, 40),
+            (50, 50),
+            (2, 1),
+        ];
+        for (pid, eligible) in [
+            (10, false), // Caller root is never signalled.
+            (2, false),  // Nor an ancestor, even if it carried the identity.
+            (20, true),  // Recorded root itself.
+            (21, true),  // Recorded root descendant.
+            (22, true),  // Grandchild.
+            (30, true),  // Verified minted-omp root itself.
+            (31, true),  // Verified minted-omp root descendant.
+            (40, false), // Unrelated process beside the owner.
+            (41, false), // Descendant of that unrelated process.
+            (50, false), // Malformed cyclic ancestry.
+            (60, false), // Missing /proc link.
+        ] {
+            assert_eq!(
+                carrier_in_owner_tree_with(pid, &scope, |current| {
+                    parents
+                        .iter()
+                        .find(|(id, _)| *id == current)
+                        .map(|(_, parent)| *parent)
+                }),
+                eligible,
+                "pid {pid}"
+            );
+        }
     }
 
     #[cfg(unix)]
