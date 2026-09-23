@@ -37,6 +37,7 @@
 //! Unix only: `/proc` enumeration is compiled out on other platforms, where
 //! every query reports empty (verified-no-holders) and reap is a no-op.
 
+#[cfg(unix)]
 use std::collections::HashSet;
 
 use crate::db::HcomDb;
