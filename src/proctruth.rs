@@ -800,14 +800,20 @@ pub(crate) enum AncestorProcess {
     Unknown,
 }
 
-/// `omp-<pid>-<rest>` → Some(pid). Agent-minted ids only (plugin / D-69
-/// shape); launcher ids are UUIDs and parse to None. Anything else (empty,
-/// malformed) → None.
+/// `omp-<pid>-<rest>` → Some(pid), where `<rest>` must be non-empty. Agent-minted
+/// ids only (plugin / D-69 shape); launcher ids are UUIDs and parse to None.
+/// Anything else (empty, malformed, a bare `omp-<pid>`) → None.
+///
+/// The shape is deliberately the same one the plugin applies when it decides
+/// whether to keep an inherited id (`OMP_ID_PATTERN` in
+/// `src/omp_plugin/hcom.ts`), so minter and verifier cannot disagree about which
+/// ids are agent-minted.
 pub(crate) fn omp_minted_pid(id: &str) -> Option<u32> {
-    id.strip_prefix("omp-")
-        .and_then(|rest| rest.split('-').next())
-        .filter(|head| !head.is_empty())
-        .and_then(|head| head.parse::<u32>().ok())
+    let (head, rest) = id.strip_prefix("omp-")?.split_once('-')?;
+    if rest.is_empty() || head.is_empty() {
+        return None;
+    }
+    head.parse::<u32>().ok()
 }
 
 /// What `pid` is running: [`AncestorProcess::Omp`] exactly when
@@ -3449,12 +3455,15 @@ mod tests {
     #[test]
     fn omp_minted_pid_parses_omp_shape_only() {
         assert_eq!(omp_minted_pid("omp-123-4-5"), Some(123));
-        assert_eq!(omp_minted_pid("omp-7"), Some(7));
         assert_eq!(omp_minted_pid("550e8400-e29b-41d4-a716-446655440000"), None);
         assert_eq!(omp_minted_pid(""), None);
         assert_eq!(omp_minted_pid("omp-"), None);
         assert_eq!(omp_minted_pid("omp-abc-1"), None);
         assert_eq!(omp_minted_pid("omp--1"), None);
+        // A bare `omp-<pid>` is not the minted shape on either side of the
+        // contract: the plugin's OMP_ID_PATTERN also demands the trailing group.
+        assert_eq!(omp_minted_pid("omp-7"), None);
+        assert_eq!(omp_minted_pid("omp-7-"), None);
     }
 
     // === process_id_trusted: the §1 trust table (pure, injected facts) ===

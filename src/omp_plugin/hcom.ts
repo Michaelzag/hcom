@@ -82,14 +82,14 @@ function mintProcessId(): string {
 function resolveProcessId(): { id: string; minted: boolean; reason: string } {
 	const existing = process.env.HCOM_PROCESS_ID;
 	if (!existing) return { id: mintProcessId(), minted: true, reason: "missing" };
-	if (ompIdPid(existing) === null) {
+	const pid = ompIdPid(existing);
+	if (pid === null) {
 		return { id: existing, minted: false, reason: "launcher_shape" };
 	}
 	if (process.platform !== "linux") {
 		return { id: mintProcessId(), minted: true, reason: "non_linux" };
 	}
-	const pid = ompIdPid(existing);
-	if (pid === null || !ancestorPids().has(pid)) {
+	if (!ancestorPids().has(pid)) {
 		return { id: mintProcessId(), minted: true, reason: "non_ancestor" };
 	}
 	if (procComm(pid) !== "omp") {
