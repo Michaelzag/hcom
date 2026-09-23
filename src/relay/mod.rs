@@ -368,8 +368,9 @@ pub enum RelayErrorReason {
     /// Worker wrote `relay_status=error` itself — most commonly an MQTT auth or
     /// broker disconnect. `detail` carries the message the worker stored.
     Reported,
-    /// Pidfile points at a PID that is no longer alive. Worker crashed without
-    /// running PidFileGuard::drop (SIGKILL, OOM, panic during Drop).
+    /// Pidfile exists but no worker holds the relay lock. Worker crashed
+    /// without running PidFileGuard::drop (SIGKILL, OOM, panic during Drop).
+    /// The PID it names may since have been reused by an unrelated process.
     StalePidfile,
     /// No worker process, no heartbeat, but `relay_status=ok` is still in KV.
     /// The worker was reaped and nothing flipped the status — the "false-green"
@@ -387,7 +388,7 @@ impl RelayErrorReason {
                 .map(str::to_string)
                 .unwrap_or_else(|| "unknown error".to_string()),
             RelayErrorReason::StalePidfile => match pid {
-                Some(p) => format!("stale pidfile (PID {p} not running)"),
+                Some(p) => format!("stale pidfile (PID {p}, no worker holds the lock)"),
                 None => "stale pidfile".to_string(),
             },
             RelayErrorReason::Ghost => {
@@ -409,7 +410,7 @@ pub enum RelayHealth {
     /// Enabled but nothing is running and nothing is wrong — cold-start before
     /// first auto-spawn, or quiescent after a clean shutdown.
     Waiting,
-    /// Worker process exists and is alive but hasn't produced a heartbeat yet
+    /// A worker holds the relay lock but hasn't produced a heartbeat yet
     /// (startup window between `write_pid_file` and the first main-loop tick).
     Starting { pid: u32 },
     /// Worker is alive, heartbeat is fresh, and the worker last self-reported
@@ -418,8 +419,9 @@ pub enum RelayHealth {
     /// here would defeat enum-equality short-circuiting in render diffing.
     /// Forensic age is in JSON's `raw.heartbeat_age_s`.
     Connected,
-    /// Worker process alive but heartbeat is older than `HEARTBEAT_STALE_SECS`
-    /// — main loop is wedged (DB contention, deadlock) but hasn't died.
+    /// Worker holds the relay lock but heartbeat is older than
+    /// `HEARTBEAT_STALE_SECS` — main loop is wedged (DB contention, deadlock)
+    /// but hasn't died.
     Stale { age_s: f64, pid: u32 },
     /// Something's wrong; see `reason` and `detail` for why.
     Error {
@@ -440,9 +442,11 @@ pub struct RelayObservation {
     pub raw_status: Option<String>,
     pub raw_error: Option<String>,
     pub heartbeat_age_s: Option<f64>,
-    /// `(pid, is_alive)` when a pidfile exists, else `None`. Split so the
-    /// derivation can distinguish "no pidfile" (legitimate idle) from "pidfile
-    /// points at dead PID" (worker crashed without cleanup).
+    /// `(pid, lock_held)` when a pidfile exists, else `None`. `lock_held` is
+    /// true when a worker holds the relay lock — liveness is decided by the
+    /// lock, never by whether the pidfile's PID exists. Split so the
+    /// derivation can distinguish "no pidfile" (legitimate idle) from
+    /// "pidfile but no lock holder" (worker crashed without cleanup).
     pub pidfile: Option<(u32, bool)>,
     pub last_push: f64,
     pub broker: Option<String>,
@@ -476,11 +480,11 @@ pub fn observe_relay(config: &HcomConfig, db: &HcomDb) -> RelayObservation {
 ///   1. not configured                                       → NotConfigured
 ///   2. !enabled                                             → Disabled
 ///   3. raw_status="error"                                   → Error(Reported, raw_error)
-///   4. pidfile present, pid dead                            → Error(StalePidfile, pid)
-///   5. pidfile present, pid alive, heartbeat missing        → Starting { pid }
-///   6. pidfile present, pid alive, heartbeat stale          → Stale { age, pid }
-///   7. pidfile present, pid alive, heartbeat fresh, ok      → Connected { age }
-///   8. pidfile present, pid alive, heartbeat fresh, !ok     → Starting { pid }
+///   4. pidfile present, lock free                           → Error(StalePidfile, pid)
+///   5. pidfile present, lock held, heartbeat missing        → Starting { pid }
+///   6. pidfile present, lock held, heartbeat stale          → Stale { age, pid }
+///   7. pidfile present, lock held, heartbeat fresh, ok      → Connected { age }
+///   8. pidfile present, lock held, heartbeat fresh, !ok     → Starting { pid }
 ///   9. no pidfile, raw_status="ok" (or fresh heartbeat)     → Error(Ghost)
 ///   10. no pidfile, anything else                           → Waiting
 pub fn derive_relay_health(obs: &RelayObservation) -> RelayHealth {

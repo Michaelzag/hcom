@@ -278,7 +278,7 @@ fn clock_ticks_per_sec() -> f64 {
 /// zombie (dead but unreaped — `kill(pid, 0)` still succeeds on it, so a
 /// bare liveness check would block a release on an already-dead process
 /// until its parent reaps it).
-fn process_gone(pid: u32) -> bool {
+pub(crate) fn process_gone(pid: u32) -> bool {
     if !crate::sys::process::is_alive(pid) {
         return true;
     }

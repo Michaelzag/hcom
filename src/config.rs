@@ -145,6 +145,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("relay_token", "relay.token"),
     ("relay_psk", "relay.psk"),
     ("relay_enabled", "relay.enabled"),
+    ("relay_worker_managed", "relay.worker_managed"),
     ("timeout", "preferences.timeout"),
     ("auto_approve", "preferences.auto_approve"),
     ("name_export", "preferences.name_export"),
@@ -183,6 +184,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     // file-only on load already (see `is_relay_field` in `load_from_sources`),
     // so env-var override was never the mechanism for configuring the PSK.
     ("relay_enabled", "HCOM_RELAY_ENABLED"),
+    ("relay_worker_managed", "HCOM_RELAY_WORKER_MANAGED"),
     ("auto_approve", "HCOM_AUTO_APPROVE"),
     ("auto_subscribe", "HCOM_AUTO_SUBSCRIBE"),
     ("name_export", "HCOM_NAME_EXPORT"),
@@ -197,6 +199,7 @@ const RELAY_FIELDS: &[&str] = &[
     "relay_token",
     "relay_psk",
     "relay_enabled",
+    "relay_worker_managed",
 ];
 
 /// Characters that are dangerous in terminal preset values (injection risk).
@@ -295,6 +298,9 @@ pub struct HcomConfig {
     pub relay_token: String,
     pub relay_psk: String,
     pub relay_enabled: bool,
+    /// The relay worker is run by a service manager (systemd): hcom never
+    /// spawns it, and stop paths only SIGTERM it so the manager restarts it.
+    pub relay_worker_managed: bool,
     pub auto_approve: bool,
     pub auto_subscribe: String,
     pub name_export: String,
@@ -333,6 +339,7 @@ impl Default for HcomConfig {
             relay_token: String::new(),
             relay_psk: String::new(),
             relay_enabled: true,
+            relay_worker_managed: false,
             auto_approve: true,
             auto_subscribe: "collision".to_string(),
             name_export: String::new(),
@@ -517,6 +524,9 @@ impl HcomConfig {
             "relay_token" => Some(self.relay_token.clone()),
             "relay_psk" => Some(self.relay_psk.clone()),
             "relay_enabled" => Some(if self.relay_enabled { "1" } else { "0" }.into()),
+            "relay_worker_managed" => {
+                Some(if self.relay_worker_managed { "1" } else { "0" }.into())
+            }
             "auto_approve" => Some(if self.auto_approve { "1" } else { "0" }.into()),
             "auto_subscribe" => Some(self.auto_subscribe.clone()),
             "name_export" => Some(self.name_export.clone()),
@@ -570,6 +580,7 @@ impl HcomConfig {
             "relay_token" => self.relay_token = value.to_string(),
             "relay_psk" => self.relay_psk = value.to_string(),
             "relay_enabled" => self.relay_enabled = !is_falsy(value),
+            "relay_worker_managed" => self.relay_worker_managed = !is_falsy(value),
             "auto_approve" => self.auto_approve = !is_falsy(value),
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
             "name_export" => self.name_export = value.to_string(),
@@ -706,7 +717,12 @@ impl HcomConfig {
         }
 
         // Load boolean fields
-        for bool_field in &["relay_enabled", "auto_approve", "auto_trust_workspace"] {
+        for bool_field in &[
+            "relay_enabled",
+            "relay_worker_managed",
+            "auto_approve",
+            "auto_trust_workspace",
+        ] {
             if let Some(val) = get_var(bool_field) {
                 match val {
                     TomlFieldValue::Bool(b) => {
@@ -1012,6 +1028,7 @@ id = ""
 token = ""
 psk = ""
 enabled = true
+worker_managed = false
 
 [launch]
 tag = ""
@@ -1848,6 +1865,7 @@ mod tests {
         assert_eq!(config.tag, "");
         assert_eq!(config.codex_sandbox_mode, "workspace");
         assert!(config.relay_enabled);
+        assert!(!config.relay_worker_managed);
         assert!(config.auto_approve);
         assert_eq!(config.auto_subscribe, "collision");
         assert!(config.collect_errors().is_empty());
@@ -2032,6 +2050,12 @@ mod tests {
 
         config.set_field("relay_enabled", "on").unwrap();
         assert!(config.relay_enabled);
+
+        config.set_field("relay_worker_managed", "true").unwrap();
+        assert!(config.relay_worker_managed);
+
+        config.set_field("relay_worker_managed", "0").unwrap();
+        assert!(!config.relay_worker_managed);
     }
 
     #[test]
@@ -2097,6 +2121,10 @@ mod tests {
         file_config.insert("timeout".to_string(), TomlFieldValue::Int(3600));
         file_config.insert("tag".to_string(), TomlFieldValue::Str("test".to_string()));
         file_config.insert("relay_enabled".to_string(), TomlFieldValue::Bool(false));
+        file_config.insert(
+            "relay_worker_managed".to_string(),
+            TomlFieldValue::Bool(true),
+        );
 
         let env = HashMap::new();
         let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
@@ -2104,6 +2132,7 @@ mod tests {
         assert_eq!(config.timeout, 3600);
         assert_eq!(config.tag, "test");
         assert!(!config.relay_enabled);
+        assert!(config.relay_worker_managed);
     }
 
     #[test]
