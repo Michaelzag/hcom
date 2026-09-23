@@ -451,6 +451,115 @@ fn soft_stop_keeps_instance_row_and_process_binding() {
     cleanup(path);
 }
 
+/// The omp owner's close on Linux: session_shutdown soft-stops (`--soft`),
+/// then the process-exit release runs `omp-stop` without it. The row is gone,
+/// and a resume from the newest stopped snapshot restores the title.
+#[cfg(target_os = "linux")]
+#[test]
+fn omp_owner_close_releases_row_and_resume_restores_title() {
+    crate::config::Config::init();
+    let (db, path) = setup_test_db();
+    let name = format!("rocclose{}", std::process::id());
+    let process_id = format!("pid-roc-close-{}", std::process::id());
+    save_test_instance(&db, &name, ST_LISTENING);
+    db.conn()
+        .execute(
+            "UPDATE instances SET session_id = 'sid-roc-close', directory = '/tmp' WHERE name = ?1",
+            rusqlite::params![name],
+        )
+        .unwrap();
+    db.set_process_binding(&process_id, "sid-roc-close", &name)
+        .unwrap();
+    db.rebind_session("sid-roc-close", &name).unwrap();
+    crate::title::set_purpose(&db, &name, "zagdb: rc.48 roll");
+    crate::title::set_current(&db, &name, "probing WAL");
+
+    let stop = |soft: bool| {
+        let mut argv = vec![
+            "--name".to_string(),
+            name.clone(),
+            "--reason".to_string(),
+            "shutdown".to_string(),
+        ];
+        if soft {
+            argv.push("--soft".to_string());
+        }
+        handle_stop(&db, &argv)
+    };
+    assert_eq!(stop(true).0, 0);
+    assert!(db.get_instance_full(&name).unwrap().is_some());
+    assert_eq!(stop(false).0, 0);
+
+    assert!(
+        db.get_instance_full(&name).unwrap().is_none(),
+        "exit release must remove the row"
+    );
+    let loaded = crate::commands::resume::load_stopped_snapshot(&db, &name).unwrap();
+    assert_eq!(loaded.7, "zagdb: rc.48 roll");
+    assert_eq!(loaded.8, "probing WAL");
+    let plan = crate::commands::resume::prepare_resume_plan(
+        &db,
+        &name,
+        false,
+        &[],
+        &crate::router::GlobalFlags::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.launch.purpose.as_deref(), Some("zagdb: rc.48 roll"));
+    assert_eq!(plan.launch.current.as_deref(), Some("probing WAL"));
+
+    cleanup(path);
+}
+
+/// The omp owner's close off Linux keeps the row: session_shutdown's `--soft`
+/// stop leaves the resume handle, and the exit release after it changes
+/// nothing (no event, so no second stopped event; binding kept).
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn omp_owner_close_keeps_row_off_linux() {
+    crate::config::Config::init();
+    let (db, path) = setup_test_db();
+    let name = format!("rockeep{}", std::process::id());
+    let process_id = format!("pid-roc-keep-{}", std::process::id());
+    save_test_instance(&db, &name, ST_LISTENING);
+    db.set_process_binding(&process_id, "", &name).unwrap();
+
+    let stop = |soft: bool| {
+        let mut argv = vec![
+            "--name".to_string(),
+            name.clone(),
+            "--reason".to_string(),
+            "shutdown".to_string(),
+        ];
+        if soft {
+            argv.push("--soft".to_string());
+        }
+        handle_stop(&db, &argv)
+    };
+    let events = || -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance = ?1",
+                [&name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(stop(true).0, 0);
+    let after_soft = events();
+    assert_eq!(stop(false).0, 0);
+
+    assert_eq!(events(), after_soft, "the exit release wrote events");
+    let row = db
+        .get_instance_full(&name)
+        .unwrap()
+        .expect("the exit release deleted the row off Linux");
+    assert_eq!(row.status, crate::shared::ST_INACTIVE);
+    assert_eq!(db.get_process_binding(&process_id).unwrap(), Some(name));
+
+    cleanup(path);
+}
+
 #[test]
 fn start_rebinds_via_process_binding_after_soft_stop() {
     let (db, path) = setup_test_db();
@@ -696,8 +805,6 @@ fn plugin_source_matches_omp_input_result_shape() {
 fn plugin_source_handles_omp_session_switch_and_shutdown_shape() {
     assert!(PLUGIN_SOURCE.contains("pi.on(\"session_switch\""));
     assert!(PLUGIN_SOURCE.contains("pi.on(\"session_shutdown\""));
-    // Soft-finalize on bound shutdown; never hard-delete from this path.
-    assert!(PLUGIN_SOURCE.contains("\"--soft\""));
     assert!(PLUGIN_SOURCE.contains("plugin.session_shutdown_skipped"));
     assert!(PLUGIN_SOURCE.contains("nested_session"));
     assert!(PLUGIN_SOURCE.contains("HCOM_OMP_IDENTITY_OWNER"));
@@ -717,14 +824,6 @@ fn plugin_source_handles_omp_session_switch_and_shutdown_shape() {
     assert!(!PLUGIN_SOURCE.contains("rootSessionId"));
     assert!(!PLUGIN_SOURCE.contains("shutdownSessionIdFromEvent"));
     assert!(!PLUGIN_SOURCE.contains("shutdownReasonFromEvent"));
-    // Hard stop without --soft must not be the session_shutdown path.
-    let idx = PLUGIN_SOURCE
-        .find("pi.on(\"session_shutdown\"")
-        .expect("session_shutdown handler present");
-    let handler = &PLUGIN_SOURCE[idx..];
-    let soft = handler.find("\"--soft\"").expect("soft stop in shutdown");
-    let stop = handler.find("[\"omp-stop\"").expect("omp-stop in shutdown");
-    assert!(stop < soft, "omp-stop invocation must include --soft");
 }
 
 #[test]

@@ -1170,11 +1170,14 @@ mod tests {
         );
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         let first = db.get_session_binding("sess-rebind").unwrap().unwrap();
+        // The first start draws its name at random and "nova" is one of the
+        // likeliest draws; reclaiming the drawn name would rebind to itself.
+        let target = if first == "nova" { "luna" } else { "nova" };
 
-        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(start_rebind(&db, target, &ctx, None).unwrap(), 0);
         assert_eq!(
             db.get_session_binding("sess-rebind").unwrap().as_deref(),
-            Some("nova"),
+            Some(target),
             "a reclaimed name must own the session that reclaimed it"
         );
         assert!(
@@ -1185,14 +1188,14 @@ mod tests {
             db.get_validated_claude_session_owner("sess-rebind")
                 .unwrap()
                 .as_deref(),
-            Some("nova"),
+            Some(target),
             "hooks must resolve the reclaimed name, not reject the session"
         );
 
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         assert_eq!(
             db.get_session_binding("sess-rebind").unwrap().as_deref(),
-            Some("nova"),
+            Some(target),
             "a start after the rebind returns the reclaimed identity"
         );
     }

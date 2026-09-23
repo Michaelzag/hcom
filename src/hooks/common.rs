@@ -1241,7 +1241,7 @@ pub fn stop_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, true)
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, true, &[])
 }
 
 /// External side effects of a stop: subscription notifications, listener
@@ -1319,6 +1319,7 @@ pub fn stop_instance_without_reap(
                 false,
                 Some(tx),
                 &mut post,
+                &[],
             ) {
                 StopOutcome::Stopped | StopOutcome::AlreadyStopped => {}
                 StopOutcome::RetryableError(e) => anyhow::bail!("{e}"),
@@ -1348,7 +1349,7 @@ pub(crate) fn stop_placeholder_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, true)
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, true, &[])
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1366,6 +1367,39 @@ fn child_instance_names(db: &HcomDb, column: &str, value: &str) -> Result<Vec<St
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Whether the headless row's recorded pid still leads this instance's tree:
+/// some live identity carrier of `instance_name` is in process group `pid`.
+/// The recorded pid is the launch-script bash, which leads the group but
+/// never carries the identity; `hcom pty` below it does.
+#[cfg(target_os = "linux")]
+fn headless_group_holds_carrier(db: &HcomDb, instance_name: &str, pid: u32) -> bool {
+    let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
+    crate::proctruth::group_holds_instance_carrier(pid, instance_name, &binding_ids)
+}
+
+/// No /proc outside Linux: the recorded group is signalled as before.
+#[cfg(not(target_os = "linux"))]
+fn headless_group_holds_carrier(_db: &HcomDb, _instance_name: &str, _pid: u32) -> bool {
+    true
+}
+
+/// Whether the caller's own tree (`exclude`: the caller and its ancestors) is
+/// provably outside the recorded group `pid`, so a session releasing its own
+/// row may signal that group. Linux proves it from each pid's /proc pgrp.
+#[cfg(target_os = "linux")]
+fn caller_tree_outside_group(pid: u32, exclude: &[u32]) -> bool {
+    crate::proctruth::pids_outside_group(pid, exclude)
+}
+
+/// Nothing proves it off Linux: no /proc pgrp, and `exclude` holds only the
+/// caller's own pid. On Windows the group signal kills the whole tree under
+/// the recorded root, and a headless session's releasing CLI is in that tree.
+#[cfg(not(target_os = "linux"))]
+fn caller_tree_outside_group(_pid: u32, _exclude: &[u32]) -> bool {
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stop_instance_inner(
     db: &HcomDb,
     instance_name: &str,
@@ -1374,6 +1408,7 @@ fn stop_instance_inner(
     placeholder: bool,
     depth: u32,
     reap_gate: bool,
+    exclude: &[u32],
 ) -> StopOutcome {
     stop_instance_inner_scoped(
         db,
@@ -1385,6 +1420,7 @@ fn stop_instance_inner(
         reap_gate,
         None,
         &mut PostCommit::default(),
+        exclude,
     )
 }
 
@@ -1394,6 +1430,12 @@ fn stop_instance_inner(
 /// `tx: Some` is the kill path's shared transaction: every write (children
 /// included) joins `tx`, and external effects queue into `post` until the
 /// one commit.
+///
+/// `exclude` is a pid set the stop never signals: the headless group signal
+/// runs only when every pid in it is provably outside the recorded group
+/// (Linux; skipped elsewhere), and the reap spares carriers in it (they never
+/// count as survivors). Every caller but the omp owner's exit release passes
+/// `&[]`; child stops forward the same set.
 #[allow(clippy::too_many_arguments)]
 fn stop_instance_inner_scoped(
     db: &HcomDb,
@@ -1405,6 +1447,7 @@ fn stop_instance_inner_scoped(
     reap_gate: bool,
     tx: Option<&rusqlite::Transaction<'_>>,
     post: &mut PostCommit,
+    exclude: &[u32],
 ) -> StopOutcome {
     if depth >= MAX_STOP_DEPTH {
         log::log_warn(
@@ -1442,26 +1485,48 @@ fn stop_instance_inner_scoped(
         if is_headless {
             // Gated with the reap below: skipped on the kill paths, where the
             // group signal could land on the caller's own tree (self path).
+            // A session releasing its own row (non-empty `exclude`) signals
+            // only a group its tree is provably outside of, which only Linux
+            // can prove; elsewhere that release skips the signal. Any stop
+            // skips a group holding none of this instance's carriers (pid
+            // reuse). The reap below still handles every carrier not in
+            // `exclude`.
             if reap_gate {
-                // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
-                // Windows: forceful process-tree kill) → poll up to 2s for exit →
-                // kill_group (Unix: SIGKILL; Windows: tree kill again). The poll also
-                // waits out Windows' asynchronous TerminateProcess.
-                use crate::sys::process::GroupSignal;
-                if crate::sys::process::terminate_group(pid_u32) == GroupSignal::Sent {
-                    let mut dead = false;
-                    for _ in 0..20 {
-                        std::thread::sleep(Duration::from_millis(100));
-                        if !crate::sys::process::is_alive(pid_u32) {
-                            dead = true;
-                            break;
+                if !exclude.is_empty() && !caller_tree_outside_group(pid_u32, exclude) {
+                    log::log_info(
+                        "hooks",
+                        "stop_instance.headless_self_skip",
+                        &format!("instance={instance_name} pid={pid_u32}"),
+                    );
+                } else if !headless_group_holds_carrier(db, instance_name, pid_u32) {
+                    log::log_info(
+                        "hooks",
+                        "stop_instance.headless_signal_skipped",
+                        &format!(
+                            "instance={instance_name} pid={pid_u32} reason=no_carrier_in_group"
+                        ),
+                    );
+                } else {
+                    // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
+                    // Windows: forceful process-tree kill) → poll up to 2s for exit →
+                    // kill_group (Unix: SIGKILL; Windows: tree kill again). The poll also
+                    // waits out Windows' asynchronous TerminateProcess.
+                    use crate::sys::process::GroupSignal;
+                    if crate::sys::process::terminate_group(pid_u32) == GroupSignal::Sent {
+                        let mut dead = false;
+                        for _ in 0..20 {
+                            std::thread::sleep(Duration::from_millis(100));
+                            if !crate::sys::process::is_alive(pid_u32) {
+                                dead = true;
+                                break;
+                            }
+                        }
+                        if !dead {
+                            crate::sys::process::kill_group(pid_u32);
                         }
                     }
-                    if !dead {
-                        crate::sys::process::kill_group(pid_u32);
-                    }
+                    // NotFound/PermissionDenied from initial signal is fine — process already gone or foreign
                 }
-                // NotFound/PermissionDenied from initial signal is fine — process already gone or foreign
             }
         } else {
             // Track surviving PTY processes in pidtrack
@@ -1565,6 +1630,8 @@ fn stop_instance_inner_scoped(
         "origin_device_id": instance_data.origin_device_id,
         "background_log_file": instance_data.background_log_file,
         "last_event_id": instance_data.last_event_id,
+        "purpose": instance_data.purpose.as_deref().unwrap_or_default(),
+        "current": instance_data.current.as_deref().unwrap_or_default(),
     });
 
     // Snapshot both child sets before deleting the parent. Only the teardown
@@ -1604,6 +1671,7 @@ fn stop_instance_inner_scoped(
             reap_gate,
             tx,
             post,
+            exclude,
         ) {
             log::log_warn(
                 "hooks",
@@ -1630,6 +1698,7 @@ fn stop_instance_inner_scoped(
             reap_gate,
             tx,
             post,
+            exclude,
         ) {
             log::log_warn(
                 "hooks",
@@ -1650,8 +1719,12 @@ fn stop_instance_inner_scoped(
     // before this teardown is called, and only after its own incarnation CAS.
     let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
     if reap_gate
-        && let Err(survivors) =
-            crate::proctruth::reap_instance_tree_for(db, instance_name, &binding_ids)
+        && let Err(survivors) = crate::proctruth::reap_instance_tree_for_excluding(
+            db,
+            instance_name,
+            &binding_ids,
+            exclude,
+        )
     {
         let pids = survivors
             .iter()
@@ -1825,6 +1898,8 @@ pub fn soft_finalize_session(
         "origin_device_id": instance_data.origin_device_id,
         "background_log_file": instance_data.background_log_file,
         "last_event_id": instance_data.last_event_id,
+        "purpose": instance_data.purpose.as_deref().unwrap_or_default(),
+        "current": instance_data.current.as_deref().unwrap_or_default(),
     });
 
     if let Some(ref session_id) = instance_data.session_id {
@@ -1886,6 +1961,31 @@ pub fn finalize_session(
     reason: &str,
     updates: Option<&serde_json::Map<String, Value>>,
 ) -> StopOutcome {
+    finalize_session_excluding(db, instance_name, reason, updates, &[])
+}
+
+/// [`finalize_session`] with an exclusion set: pids in `exclude` are never
+/// signalled by the stop (headless group signal and reap alike) and never
+/// count as survivors. For a session releasing its own row while its own
+/// process tree is still running (the omp owner's exit release). A headless
+/// row's recorded group is signalled only when `exclude` is provably outside
+/// it, which only Linux can prove.
+///
+/// Off Linux a non-empty `exclude` never deletes the row: without /proc the
+/// reap and the headless check see none of the session's other carriers, so
+/// a release would report success blind (see `keep_own_row_off_linux`).
+pub fn finalize_session_excluding(
+    db: &HcomDb,
+    instance_name: &str,
+    reason: &str,
+    updates: Option<&serde_json::Map<String, Value>>,
+    exclude: &[u32],
+) -> StopOutcome {
+    #[cfg(not(target_os = "linux"))]
+    if !exclude.is_empty() {
+        return keep_own_row_off_linux(db, instance_name, reason, updates);
+    }
+
     log::log_info(
         "hooks",
         "sessionend",
@@ -1907,7 +2007,16 @@ pub fn finalize_session(
     }
 
     // Full stop_instance chain: snapshot, cleanup bindings, log, delete
-    let outcome = stop_instance(db, instance_name, "session", &format!("exit:{}", reason));
+    let outcome = stop_instance_inner(
+        db,
+        instance_name,
+        "session",
+        &format!("exit:{}", reason),
+        false,
+        0,
+        true,
+        exclude,
+    );
     if let StopOutcome::RetryableError(e) = &outcome {
         log::log_warn(
             "hooks",
@@ -1917,6 +2026,40 @@ pub fn finalize_session(
         eprintln!("[hcom] warn: SessionEnd for '{instance_name}' did not stop the session: {e}");
     }
     outcome
+}
+
+/// A session's own release off Linux: soft-stop exactly as `omp-stop --soft`
+/// does (row kept inactive, soft stopped event, process binding kept) and
+/// signal nothing — the pre-release owner-close outcome. A row already
+/// inactive (the graceful path soft-stopped it first) is left as is: no
+/// second stopped event. Returns `Stopped` when this call soft-stopped the
+/// row, `AlreadyStopped` when there was nothing to change.
+#[cfg(not(target_os = "linux"))]
+fn keep_own_row_off_linux(
+    db: &HcomDb,
+    instance_name: &str,
+    reason: &str,
+    updates: Option<&serde_json::Map<String, Value>>,
+) -> StopOutcome {
+    let status = match db.get_instance_full(instance_name) {
+        Ok(Some(row)) => row.status,
+        Ok(None) => return StopOutcome::AlreadyStopped,
+        Err(e) => {
+            return StopOutcome::RetryableError(format!(
+                "could not read instance {instance_name}: {e}"
+            ));
+        }
+    };
+    log::log_info(
+        "hooks",
+        "stop_instance.self_release_kept_off_linux",
+        &format!("instance={instance_name} reason={reason} status={status}"),
+    );
+    if status == ST_INACTIVE {
+        return StopOutcome::AlreadyStopped;
+    }
+    soft_finalize_session(db, instance_name, reason, updates, true);
+    StopOutcome::Stopped
 }
 
 /// Update instance status for tool execution.
@@ -3106,5 +3249,316 @@ mod tests {
             db.get_status("luna").unwrap().map(|(s, _)| s),
             Some(ST_INACTIVE.to_string())
         );
+    }
+
+    /// Newest `stopped` life-event snapshot for `name`.
+    fn newest_stopped_snapshot(db: &crate::db::HcomDb, name: &str) -> Value {
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = ?1
+                   AND json_extract(data, '$.action') = 'stopped'
+                 ORDER BY id DESC LIMIT 1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<Value>(&data).unwrap()["snapshot"].clone()
+    }
+
+    fn insert_titled_instance(db: &crate::db::HcomDb, name: &str) {
+        insert_test_instance(db, name);
+        crate::title::set_purpose(db, name, "zagdb: rc.48 roll");
+        crate::title::set_current(db, name, "probing WAL");
+    }
+
+    #[test]
+    fn soft_stop_snapshot_carries_purpose_and_current() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        insert_titled_instance(&db, "tala");
+
+        soft_finalize_session(&db, "tala", "shutdown", None, true);
+
+        let snapshot = newest_stopped_snapshot(&db, "tala");
+        assert_eq!(snapshot["purpose"], "zagdb: rc.48 roll");
+        assert_eq!(snapshot["current"], "probing WAL");
+    }
+
+    #[test]
+    fn hard_stop_snapshot_carries_purpose_and_current() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        insert_titled_instance(&db, "tala");
+
+        assert_eq!(
+            stop_instance(&db, "tala", "test", "exit:shutdown"),
+            StopOutcome::Stopped
+        );
+
+        let snapshot = newest_stopped_snapshot(&db, "tala");
+        assert_eq!(snapshot["purpose"], "zagdb: rc.48 roll");
+        assert_eq!(snapshot["current"], "probing WAL");
+    }
+
+    fn insert_headless_instance(db: &crate::db::HcomDb, name: &str, pid: u32) {
+        insert_test_instance(db, name);
+        db.conn()
+            .execute(
+                "UPDATE instances SET background = 1, pid = ?1 WHERE name = ?2",
+                rusqlite::params![pid as i64, name],
+            )
+            .unwrap();
+    }
+
+    /// Test-owned process group: Drop SIGKILLs the whole group the spawned
+    /// leader leads (Windows: its tree), then reaps the leader. The leader is
+    /// never reaped before that, so its pgid cannot be recycled under the
+    /// signal, and no failure path, panics included, leaves a member running.
+    struct OwnedGroup(std::process::Child);
+
+    impl Drop for OwnedGroup {
+        fn drop(&mut self) {
+            crate::sys::process::kill_child_group(&mut self.0);
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_gone(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_gone(pid: u32) -> bool {
+        for _ in 0..50 {
+            if process_gone(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// The headless shape in a group the test owns: a `sh` leader (the
+    /// recorded pid, carrying no identity) over a carrier of `name` and a
+    /// member carrying nothing, which only a group signal reaches. Returns
+    /// (group, carrier, member) once the carrier is enumerable.
+    #[cfg(target_os = "linux")]
+    fn spawn_headless_group(name: &str) -> (OwnedGroup, u32, u32) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut group = OwnedGroup(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "env HCOM_INSTANCE_NAME={name} sleep 300 >/dev/null 2>&1 & echo $!; \
+                     sleep 300 >/dev/null 2>&1 & echo $!; wait"
+                ))
+                .env_remove("HCOM_INSTANCE_NAME")
+                .env_remove("HCOM_PROCESS_ID")
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let mut pids = std::io::BufReader::new(group.0.stdout.take().unwrap())
+            .lines()
+            .map(|line| line.unwrap().trim().parse::<u32>().unwrap());
+        let carrier = pids.next().unwrap();
+        let member = pids.next().unwrap();
+        // `$!` is echoed while the job may still be `env`, before it execs
+        // `sleep` with the name; stopping earlier would find no carrier.
+        let enumerated = (0..50).any(|_| {
+            let found = crate::proctruth::processes_for_instance(name, &[])
+                .iter()
+                .any(|m| m.pid == carrier);
+            if !found {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            found
+        });
+        assert!(
+            enumerated,
+            "carrier {carrier} never enumerated as a carrier of {name}"
+        );
+        (group, carrier, member)
+    }
+
+    /// A headless row whose recorded pid was reused by an unrelated process
+    /// (own group, no hcom identity anywhere in it): the stop must not signal
+    /// it, and the row is still released.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_stop_does_not_signal_reused_pid() {
+        use std::os::unix::process::CommandExt;
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let name = format!("reuse{}", std::process::id());
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("300")
+            .env_remove("HCOM_INSTANCE_NAME")
+            .env_remove("HCOM_PROCESS_ID")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        insert_headless_instance(&db, &name, stranger.id());
+
+        let outcome = stop_instance(&db, &name, "test", "reused_pid");
+
+        let alive = stranger.try_wait().unwrap().is_none();
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(alive, "unrelated process at the recorded pid was signalled");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+    }
+
+    /// The real headless shape: the recorded pid leads the group without
+    /// carrying the identity; a carrier below it does. The stop signals the
+    /// whole group, so the member no reap would find dies too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_stop_signals_group_holding_a_carrier() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let name = format!("carry{}", std::process::id());
+        let (group, carrier, member) = spawn_headless_group(&name);
+        let leader = group.0.id();
+        insert_headless_instance(&db, &name, leader);
+
+        let outcome = stop_instance(&db, &name, "test", "headless_stop");
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(wait_gone(leader), "group leader survived the headless stop");
+        assert!(
+            wait_gone(carrier),
+            "carrier {carrier} survived the headless stop"
+        );
+        assert!(
+            wait_gone(member),
+            "member {member} survived the headless stop"
+        );
+    }
+
+    /// The session's own release (non-empty `exclude`) never signals a
+    /// recorded group holding a pid of its own tree, even when the recorded
+    /// pid itself is not excluded. The reap still takes every other carrier,
+    /// and the row is released.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn self_release_spares_group_holding_its_own_tree() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let name = format!("selfin{}", std::process::id());
+        let (group, carrier, member) = spawn_headless_group(&name);
+        insert_headless_instance(&db, &name, group.0.id());
+
+        // `member` stands in for the releasing CLI: inside the group, excluded.
+        let outcome = finalize_session_excluding(&db, &name, "shutdown", None, &[member]);
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(wait_gone(carrier), "carrier {carrier} survived the release");
+        assert!(
+            !process_gone(member),
+            "the release signalled a group holding its own tree"
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+    }
+
+    /// Linux proves from /proc that the caller's tree is outside a recorded
+    /// group, so the session's own release still signals that group.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn self_release_signals_headless_group_outside_its_tree() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let name = format!("selfout{}", std::process::id());
+        let (group, _carrier, member) = spawn_headless_group(&name);
+        insert_headless_instance(&db, &name, group.0.id());
+
+        let outcome = finalize_session_excluding(
+            &db,
+            &name,
+            "shutdown",
+            None,
+            &crate::proctruth::caller_ancestor_pids(),
+        );
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(wait_gone(member), "member {member} survived the release");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+    }
+
+    /// Off Linux nothing sees a session's other carriers, so its own release
+    /// keeps the row instead of deleting it on a blind reap: soft-stopped as
+    /// by `omp-stop --soft` (inactive, one stopped event, process binding
+    /// kept), with no signal to anything, a headless row's recorded group
+    /// included.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn self_release_keeps_row_off_linux() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let name = format!("selfoff{}", std::process::id());
+        #[cfg(windows)]
+        let root = OwnedGroup(
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 300"])
+                .spawn()
+                .unwrap(),
+        );
+        #[cfg(unix)]
+        let root = {
+            use std::os::unix::process::CommandExt;
+            OwnedGroup(
+                std::process::Command::new("sleep")
+                    .arg("300")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let pid = root.0.id();
+        insert_headless_instance(&db, &name, pid);
+        db.set_process_binding("proc-selfoff", "", &name).unwrap();
+
+        let outcome = finalize_session_excluding(
+            &db,
+            &name,
+            "shutdown",
+            None,
+            &crate::proctruth::caller_ancestor_pids(),
+        );
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(
+            crate::sys::process::is_alive(pid),
+            "the session's own release signalled the recorded group"
+        );
+        let row = db
+            .get_instance_full(&name)
+            .unwrap()
+            .expect("the session's own release deleted the row off Linux");
+        assert_eq!(row.status, ST_INACTIVE);
+        assert_eq!(
+            db.process_binding_ids(&name).unwrap(),
+            vec!["proc-selfoff".to_string()]
+        );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1
+                   AND json_extract(data, '$.action') = 'stopped'",
+                [&name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 1);
     }
 }

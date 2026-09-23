@@ -34,9 +34,9 @@ enum ResumeSource<'a> {
     },
 }
 
-struct PreparedResume {
+pub(crate) struct PreparedResume {
     output: ResumeOutputContext,
-    launch: LaunchParams,
+    pub(crate) launch: LaunchParams,
     last_event_id: i64,
     session_id: String,
     tracked_fork_identity: Option<TrackedForkIdentity>,
@@ -307,7 +307,7 @@ fn resolve_name_to_plan(
     );
 }
 
-fn prepare_resume_plan(
+pub(crate) fn prepare_resume_plan(
     db: &HcomDb,
     name: &str,
     fork: bool,
@@ -954,7 +954,7 @@ fn load_instance_data(db: &HcomDb, name: &str) -> Result<LoadedInstanceData> {
 }
 
 /// Load stopped snapshot from life events.
-fn load_stopped_snapshot(db: &HcomDb, name: &str) -> Result<LoadedInstanceData> {
+pub(crate) fn load_stopped_snapshot(db: &HcomDb, name: &str) -> Result<LoadedInstanceData> {
     // Filter action='stopped' in SQL so we can't miss it past a LIMIT window
     // (old 10-row LIMIT could drop the snapshot after many relaunches).
     let mut stmt = db.conn().prepare(
