@@ -451,10 +451,10 @@ fn soft_stop_keeps_instance_row_and_process_binding() {
     cleanup(path);
 }
 
-/// The omp owner's close on Linux: session_shutdown soft-stops (`--soft`),
-/// then the process-exit release runs `omp-stop` without it. The row is gone,
-/// and a resume from the newest stopped snapshot restores the title.
-#[cfg(target_os = "linux")]
+/// A non-headless omp owner's close, on every platform: session_shutdown
+/// soft-stops (`--soft`), then the process-exit release runs `omp-stop`
+/// without it. The row is gone, and a resume from the newest stopped snapshot
+/// restores the title.
 #[test]
 fn omp_owner_close_releases_row_and_resume_restores_title() {
     crate::config::Config::init();
@@ -511,17 +511,24 @@ fn omp_owner_close_releases_row_and_resume_restores_title() {
     cleanup(path);
 }
 
-/// The omp owner's close off Linux keeps the row: session_shutdown's `--soft`
-/// stop leaves the resume handle, and the exit release after it changes
-/// nothing (no event, so no second stopped event; binding kept).
+/// A headless omp owner's close off Linux keeps the row: session_shutdown's
+/// `--soft` stop leaves the resume handle, and the exit release after it
+/// changes nothing (no event, so no second stopped event; binding kept).
+/// Nothing off Linux can tear down the headless group from inside it.
 #[cfg(not(target_os = "linux"))]
 #[test]
-fn omp_owner_close_keeps_row_off_linux() {
+fn headless_omp_owner_close_keeps_row_off_linux() {
     crate::config::Config::init();
     let (db, path) = setup_test_db();
     let name = format!("rockeep{}", std::process::id());
     let process_id = format!("pid-roc-keep-{}", std::process::id());
     save_test_instance(&db, &name, ST_LISTENING);
+    db.conn()
+        .execute(
+            "UPDATE instances SET background = 1 WHERE name = ?1",
+            rusqlite::params![name],
+        )
+        .unwrap();
     db.set_process_binding(&process_id, "", &name).unwrap();
 
     let stop = |soft: bool| {

@@ -1971,9 +1971,10 @@ pub fn finalize_session(
 /// row's recorded group is signalled only when `exclude` is provably outside
 /// it, which only Linux can prove.
 ///
-/// Off Linux a non-empty `exclude` never deletes the row: without /proc the
-/// reap and the headless check see none of the session's other carriers, so
-/// a release would report success blind (see `keep_own_row_off_linux`).
+/// Off Linux a headless row's own release keeps the row instead (see
+/// `keep_headless_row_off_linux`): nothing there can tear down its recorded
+/// group from inside it or see that group's carriers. Every other row is
+/// released exactly as on Linux.
 pub fn finalize_session_excluding(
     db: &HcomDb,
     instance_name: &str,
@@ -1982,8 +1983,10 @@ pub fn finalize_session_excluding(
     exclude: &[u32],
 ) -> StopOutcome {
     #[cfg(not(target_os = "linux"))]
-    if !exclude.is_empty() {
-        return keep_own_row_off_linux(db, instance_name, reason, updates);
+    if !exclude.is_empty()
+        && let Some(kept) = keep_headless_row_off_linux(db, instance_name, reason, updates)
+    {
+        return kept;
     }
 
     log::log_info(
@@ -2028,38 +2031,50 @@ pub fn finalize_session_excluding(
     outcome
 }
 
-/// A session's own release off Linux: soft-stop exactly as `omp-stop --soft`
-/// does (row kept inactive, soft stopped event, process binding kept) and
-/// signal nothing — the pre-release owner-close outcome. A row already
-/// inactive (the graceful path soft-stopped it first) is left as is: no
-/// second stopped event. Returns `Stopped` when this call soft-stopped the
-/// row, `AlreadyStopped` when there was nothing to change.
+/// A headless session's own release off Linux keeps its row. The release may
+/// not signal the row's recorded group there (nothing proves the caller
+/// outside it; on Windows the group's tree holds the releasing CLI), and
+/// without /proc the reap sees none of the group's carriers, so nothing would
+/// tear the group down: deleting the row would report success blind while the
+/// headless tree runs on. The row is soft-stopped exactly as `omp-stop --soft`
+/// does it instead (kept inactive, soft stopped event, process binding kept),
+/// signalling nothing. A row already inactive (the graceful path soft-stopped
+/// it first) is left as is: no second stopped event. `Stopped` when this call
+/// soft-stopped the row, `AlreadyStopped` when there was nothing to change.
+///
+/// `None` for a non-headless row: no group signal applies to it on any
+/// platform, and its release off Linux is the same blind reap then delete as
+/// every other off-Linux stop (`hcom stop`, `hcom kill`), so it goes ahead as
+/// on Linux.
 #[cfg(not(target_os = "linux"))]
-fn keep_own_row_off_linux(
+fn keep_headless_row_off_linux(
     db: &HcomDb,
     instance_name: &str,
     reason: &str,
     updates: Option<&serde_json::Map<String, Value>>,
-) -> StopOutcome {
-    let status = match db.get_instance_full(instance_name) {
-        Ok(Some(row)) => row.status,
-        Ok(None) => return StopOutcome::AlreadyStopped,
+) -> Option<StopOutcome> {
+    let (status, background) = match db.get_instance_full(instance_name) {
+        Ok(Some(row)) => (row.status, row.background),
+        Ok(None) => return Some(StopOutcome::AlreadyStopped),
         Err(e) => {
-            return StopOutcome::RetryableError(format!(
+            return Some(StopOutcome::RetryableError(format!(
                 "could not read instance {instance_name}: {e}"
-            ));
+            )));
         }
     };
+    if background == 0 {
+        return None;
+    }
     log::log_info(
         "hooks",
         "stop_instance.self_release_kept_off_linux",
         &format!("instance={instance_name} reason={reason} status={status}"),
     );
     if status == ST_INACTIVE {
-        return StopOutcome::AlreadyStopped;
+        return Some(StopOutcome::AlreadyStopped);
     }
     soft_finalize_session(db, instance_name, reason, updates, true);
-    StopOutcome::Stopped
+    Some(StopOutcome::Stopped)
 }
 
 /// Update instance status for tool execution.
@@ -3495,14 +3510,14 @@ mod tests {
         assert!(db.get_instance_full(&name).unwrap().is_none());
     }
 
-    /// Off Linux nothing sees a session's other carriers, so its own release
-    /// keeps the row instead of deleting it on a blind reap: soft-stopped as
-    /// by `omp-stop --soft` (inactive, one stopped event, process binding
-    /// kept), with no signal to anything, a headless row's recorded group
-    /// included.
+    /// Off Linux a headless session's own release keeps its row: it may not
+    /// signal the recorded group, and nothing else sees that group's
+    /// carriers, so a delete would report success blind. Soft-stopped as by
+    /// `omp-stop --soft` (inactive, one stopped event, process binding kept),
+    /// with no signal to the recorded group.
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn self_release_keeps_row_off_linux() {
+    fn headless_self_release_keeps_row_off_linux() {
         crate::config::Config::init();
         let (_dir, db) = make_test_db();
         let name = format!("selfoff{}", std::process::id());
