@@ -682,7 +682,10 @@ fn start_recovers_binding_via_instance_name_when_process_binding_cleared() {
 /// false because no launcher issued the id.
 fn plain_session_ctx(cwd: &std::path::Path) -> HcomContext {
     let env = std::collections::HashMap::from([
-        ("HCOM_PROCESS_ID".to_string(), "omp-4242-plain-a".to_string()),
+        (
+            "HCOM_PROCESS_ID".to_string(),
+            "omp-4242-plain-a".to_string(),
+        ),
         ("HCOM_LAUNCHED".to_string(), "1".to_string()),
         ("HCOM_TOOL".to_string(), "omp".to_string()),
     ]);
@@ -758,7 +761,10 @@ fn plain_session_with_opt_in_mints_identity() {
 fn start_hook_replaces_stale_installed_plugin() {
     let (_dir, home, _guard) = isolated_omp_env();
     let plugin = get_omp_plugin_path();
-    assert!(plugin.starts_with(&home), "plugin path escaped the test HOME");
+    assert!(
+        plugin.starts_with(&home),
+        "plugin path escaped the test HOME"
+    );
     std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
     // An older hcom's plugin: carries the ownership marker, differs from source.
     std::fs::write(&plugin, r#"const x = customType: "hcom-bootstrap";"#).unwrap();

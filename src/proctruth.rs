@@ -1659,11 +1659,7 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             .map(|pid| pid as u32)
             .into_iter()
             .collect();
-        evidence_pids.extend(
-            binding_ids
-                .iter()
-                .filter_map(|id| omp_minted_pid(id)),
-        );
+        evidence_pids.extend(binding_ids.iter().filter_map(|id| omp_minted_pid(id)));
         if evidence_pids.is_empty() {
             crate::log::log(
                 "DEBUG",
@@ -3493,7 +3489,11 @@ mod tests {
         assert!(!process_id_trusted(
             "omp-3-1-2",
             &[7, 3],
-            &|pid| if pid == 3 { AncestorProcess::Other } else { AncestorProcess::Omp },
+            &|pid| if pid == 3 {
+                AncestorProcess::Other
+            } else {
+                AncestorProcess::Omp
+            },
             None,
             &|_| true
         ));
@@ -3505,7 +3505,11 @@ mod tests {
         assert!(!process_id_trusted(
             "omp-3-1-2",
             &[7, 3],
-            &|pid| if pid == 3 { AncestorProcess::Unknown } else { AncestorProcess::Omp },
+            &|pid| if pid == 3 {
+                AncestorProcess::Unknown
+            } else {
+                AncestorProcess::Omp
+            },
             None,
             &|_| true
         ));
@@ -3518,7 +3522,11 @@ mod tests {
         assert!(process_id_trusted(
             "omp-3-1-2",
             &[7, 3],
-            &|pid| if pid == 3 { AncestorProcess::Omp } else { AncestorProcess::Other },
+            &|pid| if pid == 3 {
+                AncestorProcess::Omp
+            } else {
+                AncestorProcess::Other
+            },
             None,
             &|_| false
         ));

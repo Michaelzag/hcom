@@ -530,7 +530,10 @@ mod tests {
             .execute(
                 "INSERT INTO instances (name, status, created_at, tool, pid) \
                  VALUES ('luna', 'active', ?1, 'claude', ?2)",
-                rusqlite::params![chrono::Utc::now().timestamp() as f64, std::process::id() as i64],
+                rusqlite::params![
+                    chrono::Utc::now().timestamp() as f64,
+                    std::process::id() as i64
+                ],
             )
             .unwrap();
         db.set_process_binding(id, "", "luna").unwrap();
