@@ -71,19 +71,45 @@ fn parse_pid_file() -> Option<u32> {
     content.trim().parse().ok()
 }
 
+/// A reused PID cannot own a pidfile written before that process started.
+/// Read the contents and mtime from one handle so an atomic replacement
+/// cannot pair the old PID with the replacement worker's timestamp.
+fn authenticated_pid_file() -> Option<u32> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(pid_file_path()).ok()?;
+    let written = file
+        .metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    let mut content = String::new();
+    file.read_to_string(&mut content).ok()?;
+    let pid = content.trim().parse().ok()?;
+    if crate::proctruth::process_gone(pid) {
+        return None;
+    }
+    let started = crate::sys::process::start_epoch(pid)?;
+    // Filesystem and process clocks may only resolve whole seconds.
+    (started <= written + 1.0).then_some(pid)
+}
+
 /// PID of the lock holder, or None when no worker holds the lock (a pidfile
 /// left behind then is just stale; the next worker overwrites it). Also None
-/// in the holder's startup window before it writes the pidfile. Never deletes
-/// the pidfile.
+/// in the holder's startup window before it writes an authenticated pidfile.
+/// Never deletes the pidfile.
 fn read_pid_file() -> Option<u32> {
     if worker_lock_held() {
-        parse_pid_file()
+        authenticated_pid_file()
     } else {
         None
     }
 }
 
-/// Remove PID file and clear heartbeat KV.
+/// Remove PID file and clear heartbeat KV. Caller must hold the singleton lock.
 fn remove_pid_file() {
     let _ = std::fs::remove_file(pid_file_path());
     if let Ok(db) = HcomDb::open() {
@@ -831,15 +857,15 @@ pub fn relay_worker_pid() -> Option<u32> {
     read_pid_file()
 }
 
-/// PID of the lock holder, waiting up to 1s for it to write its pidfile when
-/// the lock is held but the pidfile isn't there yet (startup window). None
-/// when no worker holds the lock.
+/// Authenticated PID of the lock holder, waiting up to 1s for it to replace
+/// a missing or stale pidfile during startup. None when no worker holds the
+/// lock or the holder has not published its PID within that bound.
 pub fn wait_for_worker_pid() -> Option<u32> {
     for _ in 0..20 {
         if !is_relay_worker_running() {
             return None;
         }
-        if let Some(pid) = parse_pid_file() {
+        if let Some(pid) = authenticated_pid_file() {
             return Some(pid);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -954,7 +980,9 @@ impl WorkerProcess {
 /// Remove a stale relay worker PID file once its worker is gone. A no-op
 /// while a worker holds the lock: the pidfile is then its, not stale.
 fn remove_relay_pid_file() {
-    if !worker_lock_held() {
+    if let Ok(file) = open_worker_lock_file()
+        && matches!(crate::sys::fs::try_lock_exclusive(&file), Ok(true))
+    {
         remove_pid_file();
     }
 }
@@ -1086,6 +1114,69 @@ mod tests {
         assert!(!is_relay_worker_running());
         remove_relay_pid_file();
         assert!(!pid_file_path().exists());
+    }
+
+    #[test]
+    #[serial]
+    fn removal_preserves_lock_holders_pidfile_and_heartbeat() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let lock = hold_worker_lock();
+        write_pid_file();
+        let db = HcomDb::open().unwrap();
+        let heartbeat = db.kv_get(super::super::HEARTBEAT_KEY).unwrap();
+        assert!(heartbeat.is_some());
+
+        remove_relay_pid_file();
+        assert_eq!(parse_pid_file(), Some(std::process::id()));
+        assert_eq!(db.kv_get(super::super::HEARTBEAT_KEY).unwrap(), heartbeat);
+
+        drop(lock);
+        remove_relay_pid_file();
+        assert!(!pid_file_path().exists());
+        assert_eq!(db.kv_get(super::super::HEARTBEAT_KEY).unwrap(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn pidfile_authentication_tolerates_clock_granularity() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let _lock = hold_worker_lock();
+        write_pid_file();
+        let started = crate::sys::process::start_epoch(std::process::id()).unwrap();
+        let file = std::fs::File::options()
+            .write(true)
+            .open(pid_file_path())
+            .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs_f64(started - 0.5))
+            .unwrap();
+        assert_eq!(read_pid_file(), Some(std::process::id()));
+
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs_f64(started - 2.0))
+            .unwrap();
+        assert_eq!(read_pid_file(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn wait_for_worker_pid_waits_for_stale_pidfile_replacement() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let _lock = hold_worker_lock();
+        write_pid_file();
+        std::fs::File::options()
+            .write(true)
+            .open(pid_file_path())
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(read_pid_file(), None);
+        let path = pid_file_path();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            crate::paths::atomic_write(&path, &std::process::id().to_string());
+        });
+        let pid = wait_for_worker_pid();
+        writer.join().unwrap();
+        assert_eq!(pid, Some(std::process::id()));
     }
 
     #[cfg(unix)]

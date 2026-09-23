@@ -13,23 +13,83 @@ pub fn identity(pid: u32) -> Option<String> {
     process_identity_platform(pid)
 }
 
+/// Process creation time as Unix epoch seconds. Unknown start times fail
+/// closed when authenticating an on-disk ownership record.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub fn start_epoch(pid: u32) -> Option<f64> {
+    let ticks = process_start_ticks(pid)?;
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let boot: f64 = stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf reads the system clock-tick frequency.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (hz > 0).then(|| boot + ticks as f64 / hz as f64)
+}
+
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+pub fn start_epoch(pid: u32) -> Option<f64> {
+    let info = process_info_apple(pid)?;
+    Some(info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1_000_000.0)
+}
+
+#[cfg(windows)]
+pub fn start_epoch(pid: u32) -> Option<f64> {
+    // FILETIME counts 100ns ticks since 1601, not the Unix epoch.
+    let ticks = creation_ticks_win(pid)?.checked_sub(116_444_736_000_000_000)?;
+    Some(ticks as f64 / 10_000_000.0)
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "ios",
+    target_os = "macos",
+    windows
+)))]
+pub fn start_epoch(_pid: u32) -> Option<f64> {
+    None
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the final `) ` begin at field 3 (`state`). The process
+    // start time is field 22, hence index 19 in this slice.
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn process_identity_platform(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let start_ticks = process_start_ticks(pid)?;
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     let boot_id = boot_id.trim();
     if boot_id.is_empty() {
         return None;
     }
-    // Fields after the final `) ` begin at field 3 (`state`). Linux's process
-    // start time is field 22, hence index 19 in this slice. Boot ID keeps the
-    // boot-relative tick count unique across restarts.
-    let start_ticks = stat.rsplit_once(") ")?.1.split_whitespace().nth(19)?;
+    // Boot ID keeps the boot-relative tick count unique across restarts.
     Some(format!("linux:{boot_id}:{start_ticks}"))
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 fn process_identity_platform(pid: u32) -> Option<String> {
+    let info = process_info_apple(pid)?;
+    Some(format!(
+        "apple:{}:{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn process_info_apple(pid: u32) -> Option<libc::proc_bsdinfo> {
     // SAFETY: `info` is a correctly sized writable proc_bsdinfo buffer and
     // proc_pidinfo only fills it for the queried PID.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -43,7 +103,7 @@ fn process_identity_platform(pid: u32) -> Option<String> {
             size,
         )
     };
-    (read == size).then(|| format!("apple:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+    (read == size).then_some(info)
 }
 
 #[cfg(windows)]
