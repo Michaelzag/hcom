@@ -1847,10 +1847,17 @@ fn test_relay_roundtrip() {
     ensure_relay_worker(&path_a);
     let kill_output = check("A", &format!("kill {remote_name}"), &path_a);
     logln!(log, "{}", kill_output.trim_end());
+    // The remote PTY wrapper's own exit cleanup can finalize the row while
+    // the kill runs; that is reported as a self-stop, never a re-registration.
+    assert!(
+        !kill_output.contains("re-registered"),
+        "Remote kill misreported the session's own exit as a re-registration:\n{kill_output}"
+    );
     assert!(
         kill_output.contains("Sent SIGTERM")
             || kill_output.contains("already terminated")
-            || kill_output.contains("already_dead"),
+            || kill_output.contains("already_dead")
+            || kill_output.contains("shut itself down during the kill"),
         "Unexpected remote kill output:\n{kill_output}"
     );
     logln!(log, "  OK: Remote kill RPC acknowledged for {remote_name}");

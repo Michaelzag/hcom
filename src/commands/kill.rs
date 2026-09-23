@@ -412,15 +412,18 @@ fn teardown_if_incarnation_unchanged(
 }
 
 /// Why the teardown CAS lost, read-only inside the same teardown
-/// transaction. A harness's own shutdown hook (SIGTERM → SessionEnd)
-/// routinely finalizes the row while the kill runs; that is a self-stop, not
-/// a re-registration. Self-stop: a `life`/`stopped` event by `session` for
+/// transaction. The session's own exit routinely finalizes the row while the
+/// kill runs — the harness's SessionEnd hook (`by = session`) or the PTY
+/// wrapper's exit cleanup (`by = pty`, see
+/// `delivery::cleanup_deleted_instance`); that is a self-stop, not a
+/// re-registration. Self-stop: a `life`/`stopped` event by one of those for
 /// this instance written after the kill resolved its target (id above the
-/// watermark), keyed to no process or to one of the resolved bindings. Then
-/// a gone row was released by the session, and a row with the same
-/// `created_at` + `session_id` whose bindings only shrank was kept by it.
-/// Anything else — no such event, a new identity, or any binding the kill
-/// never resolved — is a genuine re-registration. `current` is the
+/// watermark), keyed to no process or to one of the resolved bindings, and
+/// not a `stale-harness-exit` (a stale harness declining to touch a rebound
+/// row). Then a gone row was released by the session, and a row with the
+/// same `created_at` + `session_id` whose bindings only shrank was kept by
+/// it. Anything else — no such event, a new identity, or any binding the
+/// kill never resolved — is a genuine re-registration. `current` is the
 /// incarnation the CAS just read in this transaction.
 fn classify_lost_teardown(
     tx: &rusqlite::Transaction<'_>,
@@ -433,7 +436,8 @@ fn classify_lost_teardown(
         "SELECT json_extract(data, '$.process_id') FROM events \
          WHERE type = 'life' AND instance = ?1 AND id > ?2 \
            AND json_extract(data, '$.action') = 'stopped' \
-           AND json_extract(data, '$.by') = 'session'",
+           AND json_extract(data, '$.by') IN ('session', 'pty') \
+           AND COALESCE(json_extract(data, '$.reason'), '') != 'stale-harness-exit'",
     )?;
     let mut process_ids = stmt
         .query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
@@ -2289,6 +2293,152 @@ mod tests {
             vec!["proc-kill-sr-new".to_string()],
             "the rebind's binding set is untouched"
         );
+        let _ = _guard;
+    }
+
+    /// Kill a bound row whose PTY wrapper exits mid-kill: the real reap,
+    /// then `exit` runs on a second connection (the wrapper is another
+    /// process) — typically the wrapper's own exit cleanup. Returns the
+    /// kill's teardown outcome.
+    #[cfg(unix)]
+    fn kill_mid_pty_exit(
+        db_path: &std::path::Path,
+        name: &str,
+        process_id: &str,
+        exit: impl FnOnce(&mut crate::db::HcomDb, &str),
+    ) -> TeardownOutcome {
+        let db = crate::db::HcomDb::open_raw(db_path).unwrap();
+        let mut sleeper = seed_bound_row_with_sleeper(&db, name, process_id, "sess-kill-pty");
+        let spid = sleeper.id();
+        let mut wrapper_db = crate::db::HcomDb::open_raw(db_path).unwrap();
+        let self_set = vec![std::process::id()];
+        let result =
+            kill_tracked_instance_with_self_pids(&db, name, "test", &self_set, |n, b, e| {
+                let out = crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e);
+                exit(&mut wrapper_db, n);
+                out
+            })
+            .unwrap_or_else(|e| panic!("a PTY exit is not a kill failure: {e}"));
+        sleeper.wait().ok();
+        assert!(!crate::sys::process::is_alive(spid), "sleeper reaped");
+        result.teardown
+    }
+
+    /// Self-stop, PTY: the wrapper's own exit cleanup (`by = pty`, keyed to
+    /// the bound process id) deletes the row mid-kill — the remote-kill
+    /// shape the relay roundtrip hits. Released by the session, not
+    /// re-registered.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reports_session_self_stop_when_pty_exit_cleanup_deletes_row_mid_kill() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+
+        let name = format!("hcom-kill-{}-ptyexit", std::process::id());
+        let outcome = kill_mid_pty_exit(&db_path, &name, "proc-kill-pty", |wrapper, n| {
+            crate::delivery::cleanup_deleted_instance(wrapper, n, "proc-kill-pty");
+        });
+
+        assert_eq!(outcome, TeardownOutcome::SessionStoppedReleasedRow);
+        assert!(db.get_instance_full(&name).unwrap().is_none(), "row gone");
+        assert_eq!(
+            stopped_events(&db, &name),
+            1,
+            "only the wrapper's stopped event; the kill wrote none"
+        );
+        let _ = _guard;
+    }
+
+    /// A PTY `stale-harness-exit` is a stale wrapper declining to touch a
+    /// rebound row, never a self-stop — even when the row then vanishes and
+    /// the event names a binding the kill resolved.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reports_re_registration_when_pty_exit_is_stale_harness() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+
+        let name = format!("hcom-kill-{}-ptystale", std::process::id());
+        let outcome = kill_mid_pty_exit(&db_path, &name, "proc-kill-stale", |wrapper, n| {
+            // Rebound to a fresh process, so the old wrapper's exit logs
+            // stale-harness-exit (keyed to the resolved binding) and leaves
+            // the row; then the row vanishes.
+            wrapper
+                .conn()
+                .execute(
+                    "DELETE FROM process_bindings WHERE instance_name = ?1",
+                    rusqlite::params![n],
+                )
+                .unwrap();
+            wrapper
+                .set_process_binding("proc-kill-stale-new", "sess-kill-pty-new", n)
+                .unwrap();
+            crate::delivery::cleanup_deleted_instance(wrapper, n, "proc-kill-stale");
+            wrapper
+                .conn()
+                .execute(
+                    "DELETE FROM instances WHERE name = ?1",
+                    rusqlite::params![n],
+                )
+                .unwrap();
+        });
+
+        let stale: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1 \
+                 AND json_extract(data, '$.reason') = 'stale-harness-exit' \
+                 AND json_extract(data, '$.process_id') = 'proc-kill-stale'",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 1, "the wrapper logged its stale-harness-exit");
+        assert_eq!(outcome, TeardownOutcome::RowReRegistered);
+        let _ = _guard;
+    }
+
+    /// A PTY stopped event keyed to a process the kill never resolved is
+    /// another incarnation's exit, not this session's self-stop.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reports_re_registration_when_pty_exit_names_foreign_process() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+
+        let name = format!("hcom-kill-{}-ptyforeign", std::process::id());
+        let outcome = kill_mid_pty_exit(&db_path, &name, "proc-kill-own", |wrapper, n| {
+            // No binding left to gate on, so the foreign wrapper's cleanup
+            // runs in full: stopped by pty for its own process id, row gone.
+            wrapper
+                .conn()
+                .execute(
+                    "DELETE FROM process_bindings WHERE instance_name = ?1",
+                    rusqlite::params![n],
+                )
+                .unwrap();
+            crate::delivery::cleanup_deleted_instance(wrapper, n, "proc-kill-foreign");
+        });
+
+        assert_eq!(
+            stopped_events(&db, &name),
+            1,
+            "the foreign wrapper's stopped event landed"
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_none(), "row gone");
+        assert_eq!(outcome, TeardownOutcome::RowReRegistered);
         let _ = _guard;
     }
 
