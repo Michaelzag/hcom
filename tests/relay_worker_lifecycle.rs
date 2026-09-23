@@ -145,6 +145,29 @@ fn stale_pidfile_with_live_unrelated_pid_does_not_block_start() {
     );
 }
 
+/// A replacement holds the lock but has not overwritten a crashed worker's
+/// pidfile yet. The stale PID now belongs to an unrelated process.
+#[cfg(unix)]
+#[test]
+fn stale_pidfile_with_live_unrelated_pid_is_never_signalled() {
+    let h = Hcom::new();
+    let _lock = hold_singleton_lock(&h);
+    let mut sleeper = Worker {
+        child: Command::new("sleep").arg("30").spawn().unwrap(),
+    };
+    std::fs::write(pid_file(&h), sleeper.pid().to_string()).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(pid_file(&h))
+        .unwrap()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+        .unwrap();
+
+    let (code, stdout, stderr) = h.run(["relay", "daemon", "stop"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(sleeper.is_running(), "stop signalled the unrelated sleeper");
+}
+
 #[cfg(unix)]
 #[test]
 fn sigterm_exits_promptly_and_removes_pidfile() {
