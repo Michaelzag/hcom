@@ -135,6 +135,16 @@ pub fn processes_for_instance(name: &str, binding_ids: &[String]) -> Vec<ProcMat
     }
 }
 
+/// Whether any live (non-zombie) carrier holds the instance by name or by
+/// one of its binding ids. The placeholder janitor's hold rule: a stale
+/// placeholder whose launch is still running is held, never released or
+/// signalled.
+pub(crate) fn has_live_carriers(name: &str, binding_ids: &[String]) -> bool {
+    processes_for_instance(name, binding_ids)
+        .iter()
+        .any(|m| !process_gone(m.pid))
+}
+
 /// Decode the two identity facts from a raw /proc environ block: whether it
 /// carries exactly `want` (`HCOM_INSTANCE_NAME=<name>`) as one NUL-delimited
 /// entry, and its `HCOM_PROCESS_ID` value (empty when absent). Only these two
@@ -955,9 +965,8 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         }
         // Inactive rows are resume handles, not live sessions: soft-stop
         // (OMP --soft, agy Stop synthesis) deliberately keeps the row, its
-        // pid, and its process bindings for a later `hcom r`. They live out
-        // cleanup_stale_instances' retention tiers — the sweep must never
-        // release them.
+        // pid, and its process bindings for a later `hcom r`. The sweep
+        // leaves them alone.
         if inst.status == crate::shared::ST_INACTIVE {
             continue;
         }
@@ -1487,8 +1496,8 @@ mod tests {
     #[cfg(unix)]
     fn sweep_skips_inactive_resume_row() {
         let db = test_db();
-        // Soft-stop resume handle: inactive, dead pid, kept binding. The
-        // sweep must leave it for cleanup_stale_instances' retention tiers.
+        // Soft-stop resume handle: inactive, dead pid, kept binding for a
+        // later `hcom r`. The sweep leaves it alone.
         let name = unique_name("inactive");
         insert_row(&db, &name, "inactive", Some(dead_pid()));
         db.set_process_binding("proc-kept", "sess", &name).unwrap();
