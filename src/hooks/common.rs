@@ -1838,6 +1838,76 @@ fn stop_instance_inner_scoped(
     StopOutcome::Stopped
 }
 
+#[derive(serde::Deserialize)]
+struct TeardownOwner {
+    pid: u32,
+    process_start: String,
+}
+
+/// An in-flight kill owns the stopped record before it sends any signal.
+/// Session hooks yield to its live OS identity; a crashed killer's claim
+/// cannot block the next session end or kill.
+pub(crate) struct TeardownClaim<'a> {
+    db: &'a HcomDb,
+    key: String,
+    value: String,
+}
+
+impl<'a> TeardownClaim<'a> {
+    pub(crate) fn register(db: &'a HcomDb, instance_name: &str) -> Option<Self> {
+        let pid = std::process::id();
+        let Some(process_start) = crate::sys::process::identity(pid) else {
+            log::log_warn(
+                "kill",
+                "teardown.claim_identity_failed",
+                &format!("pid={pid}"),
+            );
+            return None;
+        };
+        let key = format!("teardown_claim:{instance_name}");
+        let value = serde_json::json!({"pid": pid, "process_start": process_start}).to_string();
+        // The latest killer owns the claim, including when replacing a dead
+        // owner. Earlier guards cannot clear another process's ownership.
+        if let Err(e) = db.kv_set(&key, Some(&value)) {
+            log::log_warn(
+                "kill",
+                "teardown.claim_write_failed",
+                &format!("instance={instance_name} err={e}"),
+            );
+            return None;
+        }
+        Some(Self { db, key, value })
+    }
+}
+
+impl Drop for TeardownClaim<'_> {
+    fn drop(&mut self) {
+        // Compare and delete in one statement: a second killer may have
+        // replaced the claim while this one was signalling.
+        let _ = self.db.conn().execute(
+            "DELETE FROM kv WHERE key = ? AND value = ?",
+            params![self.key, self.value],
+        );
+    }
+}
+
+fn yield_to_teardown(db: &HcomDb, instance_name: &str) -> bool {
+    let live = db
+        .kv_get(&format!("teardown_claim:{instance_name}"))
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<TeardownOwner>(&value).ok())
+        .is_some_and(|owner| crate::sys::process::has_identity(owner.pid, &owner.process_start));
+    if live {
+        log::log_info(
+            "hooks",
+            "sessionend.yielded_to_teardown",
+            &format!("instance={instance_name}"),
+        );
+    }
+    live
+}
+
 /// Soft session end for Antigravity: mark inactive without deleting the `instances` row.
 ///
 /// agy has no process-death hook — its hook set is only PreToolUse/PostToolUse/
@@ -1854,6 +1924,7 @@ fn stop_instance_inner_scoped(
 ///
 /// OMP soft-stop passes `keep_process_binding: true` so the live process can rebind
 /// via `bind_session_to_process` on the next turn. Antigravity passes `false`.
+/// A live kill claim leaves status, metadata, bindings, and events untouched.
 pub fn soft_finalize_session(
     db: &HcomDb,
     instance_name: &str,
@@ -1861,6 +1932,9 @@ pub fn soft_finalize_session(
     updates: Option<&serde_json::Map<String, Value>>,
     keep_process_binding: bool,
 ) {
+    if yield_to_teardown(db, instance_name) {
+        return;
+    }
     log::log_info(
         "hooks",
         "sessionend.soft",
@@ -1982,6 +2056,8 @@ pub fn finalize_session(
 /// Off Linux a non-empty `exclude` never deletes the row: without /proc the
 /// reap and the headless check see none of the session's other carriers, so
 /// a release would report success blind (see `keep_own_row_off_linux`).
+/// A live kill claim yields without writes and returns `AlreadyStopped`;
+/// the kill owns the pending stop and hook callers need no further action.
 pub fn finalize_session_excluding(
     db: &HcomDb,
     instance_name: &str,
@@ -1989,6 +2065,9 @@ pub fn finalize_session_excluding(
     updates: Option<&serde_json::Map<String, Value>>,
     exclude: &[u32],
 ) -> StopOutcome {
+    if yield_to_teardown(db, instance_name) {
+        return StopOutcome::AlreadyStopped;
+    }
     #[cfg(not(target_os = "linux"))]
     if !exclude.is_empty() {
         return keep_own_row_off_linux(db, instance_name, reason, updates);
@@ -3166,6 +3245,121 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped, 1, "the retry winner publishes exactly once");
+    }
+
+    #[test]
+    #[serial]
+    fn session_finalizers_yield_to_live_teardown_claim() {
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        for soft in [false, true] {
+            let name = if soft { "claim-soft" } else { "claim-hard" };
+            insert_test_instance(&db, name);
+            db.set_process_binding("claim-process", "claim-session", name)
+                .unwrap();
+            let value = serde_json::json!({
+                "pid": std::process::id(),
+                "process_start": crate::sys::process::identity(std::process::id()).unwrap(),
+            })
+            .to_string();
+            db.kv_set(&format!("teardown_claim:{name}"), Some(&value))
+                .unwrap();
+            let updates = serde_json::json!({"transcript_path": "/should-not-write"});
+            if soft {
+                soft_finalize_session(&db, name, "shutdown", updates.as_object(), false);
+            } else {
+                assert_eq!(
+                    finalize_session(&db, name, "shutdown", updates.as_object()),
+                    StopOutcome::AlreadyStopped,
+                );
+            }
+            let row = db
+                .get_instance_full(name)
+                .unwrap()
+                .expect("claimed row retained");
+            assert_eq!(row.status, ST_LISTENING);
+            assert_eq!(row.status_context, "start");
+            assert_ne!(row.transcript_path, "/should-not-write");
+            assert_eq!(db.process_binding_ids(name).unwrap(), vec!["claim-process"]);
+            let events: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE instance = ?",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(events, 0, "yield writes no status or life event");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn session_finalizers_ignore_stale_and_malformed_teardown_claims() {
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        for value in [
+            "not-json".to_string(),
+            serde_json::json!({"pid": std::process::id(), "process_start": "wrong-start"})
+                .to_string(),
+            serde_json::json!({"pid": u32::MAX, "process_start": "dead"}).to_string(),
+        ] {
+            for soft in [false, true] {
+                let name = "stale-claim";
+                insert_test_instance(&db, name);
+                db.set_process_binding("stale-process", "stale-session", name)
+                    .unwrap();
+                db.kv_set(&format!("teardown_claim:{name}"), Some(&value))
+                    .unwrap();
+                if soft {
+                    soft_finalize_session(&db, name, "shutdown", None, false);
+                    assert_eq!(
+                        db.get_instance_full(name).unwrap().unwrap().status,
+                        ST_INACTIVE
+                    );
+                    db.delete_instance(name).unwrap();
+                } else {
+                    assert_eq!(
+                        finalize_session(&db, name, "shutdown", None),
+                        StopOutcome::Stopped
+                    );
+                    assert!(db.get_instance_full(name).unwrap().is_none());
+                }
+                assert!(db.process_binding_ids(name).unwrap().is_empty());
+                let reason: String = db.conn().query_row(
+                    "SELECT json_extract(data, '$.reason') FROM events WHERE instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
+                    [name], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(reason, "exit:shutdown");
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn teardown_claim_drop_clears_only_its_own_owner() {
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        let key = "teardown_claim:claim-owner";
+        db.kv_set(key, Some(r#"{"pid":1,"process_start":"stale"}"#))
+            .unwrap();
+        let claim = TeardownClaim::register(&db, "claim-owner").unwrap();
+        assert!(
+            yield_to_teardown(&db, "claim-owner"),
+            "stale owner replaced"
+        );
+        drop(claim);
+        assert!(db.kv_get(key).unwrap().is_none());
+
+        let claim = TeardownClaim::register(&db, "claim-owner").unwrap();
+        let foreign = serde_json::json!({
+            "pid": std::process::id().wrapping_add(1),
+            "process_start": "another-killer",
+        })
+        .to_string();
+        db.kv_set(key, Some(&foreign)).unwrap();
+        drop(claim);
+        assert_eq!(db.kv_get(key).unwrap().as_deref(), Some(foreign.as_str()));
     }
 
     #[test]

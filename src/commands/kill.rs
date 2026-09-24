@@ -278,6 +278,7 @@ fn kill_tracked_instance_with_self_pids(
     // is still the row's.
     let incarnation =
         ResolvedIncarnation::capture(db, &inst, &binding_ids).map_err(|e| e.to_string())?;
+    let _teardown_claim = crate::hooks::common::TeardownClaim::register(db, name);
 
     // Self-kill check BEFORE any signal: when the caller runs inside the
     // instance it is killing, the carrier set holds the caller's own session
@@ -418,11 +419,11 @@ fn teardown_if_incarnation_unchanged(
 }
 
 /// Why the teardown CAS lost, read-only inside the same teardown
-/// transaction. The session's own exit routinely finalizes the row while the
-/// kill runs — the harness's SessionEnd hook (`by = session`) or the PTY
-/// wrapper's exit cleanup (`by = pty`, see
-/// `delivery::cleanup_deleted_instance`); that is a self-stop, not a
-/// re-registration. Self-stop: a `life`/`stopped` event by one of those for
+/// transaction. A session hook already running before the claim, or the
+/// PTY wrapper's exit cleanup (`by = pty`, see
+/// `delivery::cleanup_deleted_instance`), may finalize the row while the
+/// kill runs. That is a self-stop, not a re-registration: a `life`/`stopped`
+/// event by one of those for
 /// this instance written after the kill resolved its target (id above the
 /// watermark), keyed to one of the resolved bindings — or, when no process
 /// is named, carrying the resolved incarnation's `created_at` in its
@@ -2179,6 +2180,15 @@ mod tests {
         let _ = _guard;
     }
 
+    #[cfg(unix)]
+    fn assert_killed_by(db: &HcomDb, name: &str, initiator: &str) {
+        let records: Vec<(String, String)> = db.conn().prepare(
+            "SELECT json_extract(data, '$.reason'), json_extract(data, '$.by') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped'",
+        ).unwrap().query_map(rusqlite::params![name], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(records, vec![("killed".to_string(), initiator.to_string())]);
+    }
+
     /// Insert a bound row (recorded pid already dead) with a live
     /// name-carrying sleeper, the shape the self-stop tests kill.
     #[cfg(unix)]
@@ -2205,16 +2215,12 @@ mod tests {
         sleeper
     }
 
-    /// Self-stop, soft: the harness's own shutdown hook (SIGTERM →
-    /// `soft_finalize_session`, the omp/agy path) finalizes the row while the
-    /// kill runs — bindings released, row kept for resume, `stopped` written
-    /// by the session. The kill's CAS genuinely loses (the binding set
-    /// shrank), but nothing re-registered: the report must say the session
-    /// shut itself down and kept its row, not that the row was re-registered.
+    /// The soft shutdown hook yields to the kill's claim, leaving the kill
+    /// to publish the stopped record under its initiator.
     #[test]
     #[cfg(unix)]
     #[serial]
-    fn kill_reports_session_self_stop_when_harness_soft_finalizes_mid_kill() {
+    fn kill_owns_teardown_when_harness_soft_finalizes_mid_kill() {
         let _guard = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
@@ -2224,7 +2230,6 @@ mod tests {
         let mut sleeper =
             seed_bound_row_with_sleeper(&db, &name, "proc-kill-soft", "sess-kill-soft");
         let spid = sleeper.id();
-        let created_at = db.get_instance_full(&name).unwrap().unwrap().created_at;
 
         let self_set = vec![std::process::id()];
         let result = kill_tracked_instance_with_self_pids(
@@ -2233,8 +2238,7 @@ mod tests {
             "test",
             &self_set,
             |n, b, e, capture| {
-                // The real reap, then the harness's own shutdown hook firing
-                // on the SIGTERM: soft finalize, process bindings released.
+                // The real reap, then the harness's own shutdown hook.
                 let out = crate::proctruth::reap_instance_tree_for_excluding_captured(
                     &db, n, b, e, capture,
                 );
@@ -2245,29 +2249,19 @@ mod tests {
         .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
 
         sleeper.wait().ok();
-        assert_eq!(result.teardown, TeardownOutcome::SessionStoppedKeptRow);
+        assert_eq!(result.teardown, TeardownOutcome::Completed);
         assert!(!crate::sys::process::is_alive(spid), "sleeper reaped");
-        let row = db
-            .get_instance_full(&name)
-            .unwrap()
-            .expect("the soft stop keeps the row as a resume handle");
-        assert_eq!(row.created_at, created_at, "same incarnation kept");
-        assert_eq!(
-            stopped_events(&db, &name),
-            1,
-            "only the session's own stopped event; the kill wrote none"
-        );
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert_killed_by(&db, &name, "test");
         let _ = _guard;
     }
 
-    /// Self-stop, hard: the harness's own shutdown hook runs the full
-    /// `finalize_session` mid-kill and deletes the row. The kill's CAS loses
-    /// (row gone), but nothing re-registered: the report must say the session
-    /// shut itself down and released its row.
+    /// The hard SessionEnd hook also yields: the kill owns the stopped
+    /// record rather than reporting a session-initiated teardown.
     #[test]
     #[cfg(unix)]
     #[serial]
-    fn kill_reports_session_self_stop_when_harness_finalizes_row_mid_kill() {
+    fn kill_owns_teardown_when_harness_finalizes_row_mid_kill() {
         let _guard = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
@@ -2285,14 +2279,13 @@ mod tests {
             "test",
             &self_set,
             |n, b, e, capture| {
-                // The real reap, then the harness's own SessionEnd: full
-                // finalize, row and bindings deleted.
+                // The real reap, then the harness's own SessionEnd.
                 let out = crate::proctruth::reap_instance_tree_for_excluding_captured(
                     &db, n, b, e, capture,
                 );
                 assert_eq!(
                     crate::hooks::common::finalize_session(&db, n, "shutdown", None),
-                    StopOutcome::Stopped
+                    StopOutcome::AlreadyStopped
                 );
                 out
             },
@@ -2300,24 +2293,15 @@ mod tests {
         .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
 
         sleeper.wait().ok();
-        assert_eq!(result.teardown, TeardownOutcome::SessionStoppedReleasedRow);
+        assert_eq!(result.teardown, TeardownOutcome::Completed);
         assert!(!crate::sys::process::is_alive(spid), "sleeper reaped");
-        assert!(
-            db.get_instance_full(&name).unwrap().is_none(),
-            "the session released its row"
-        );
-        assert_eq!(
-            stopped_events(&db, &name),
-            1,
-            "only the session's own stopped event; the kill wrote none"
-        );
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert_killed_by(&db, &name, "test");
         let _ = _guard;
     }
 
-    /// Precedence: the session soft-stops itself mid-kill AND a fresh process
-    /// then binds to the kept row (the omp resume shape). The self-stop event
-    /// exists, but a binding the kill never resolved is a genuine
-    /// re-registration — today's report, not the self-stop one.
+    /// Precedence: a PTY stop lands mid-kill, then a fresh process binds to
+    /// the kept row. The new binding is still a genuine re-registration.
     #[test]
     #[cfg(unix)]
     #[serial]
@@ -2341,7 +2325,21 @@ mod tests {
                 let out = crate::proctruth::reap_instance_tree_for_excluding_captured(
                     &db, n, b, e, capture,
                 );
-                crate::hooks::common::soft_finalize_session(&db, n, "shutdown", None, false);
+                db.log_life_event(
+                    n,
+                    "stopped",
+                    "pty",
+                    "killed",
+                    None,
+                    Some("proc-kill-sr-old"),
+                )
+                .unwrap();
+                db.conn()
+                    .execute(
+                        "DELETE FROM process_bindings WHERE instance_name = ?",
+                        rusqlite::params![n],
+                    )
+                    .unwrap();
                 db.set_process_binding("proc-kill-sr-new", "sess-kill-sr", n)
                     .unwrap();
                 out
@@ -2392,6 +2390,34 @@ mod tests {
         sleeper.wait().ok();
         assert!(!crate::sys::process::is_alive(spid), "sleeper reaped");
         result.teardown
+    }
+
+    /// A PTY soft exit can still win teardown while a kill claim is live.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reports_session_self_stop_when_pty_keeps_row_mid_kill() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        let name = format!("hcom-kill-{}-pty-kept", std::process::id());
+        let outcome = kill_mid_pty_exit(&db_path, &name, "proc-pty-kept", |wrapper, n| {
+            wrapper
+                .log_life_event(n, "stopped", "pty", "killed", None, Some("proc-pty-kept"))
+                .unwrap();
+            wrapper
+                .conn()
+                .execute(
+                    "DELETE FROM process_bindings WHERE instance_name = ?",
+                    rusqlite::params![n],
+                )
+                .unwrap();
+        });
+        assert_eq!(outcome, TeardownOutcome::SessionStoppedKeptRow);
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_killed_by(&db, &name, "pty");
     }
 
     /// Self-stop, PTY: the wrapper's own exit cleanup (`by = pty`, keyed to
