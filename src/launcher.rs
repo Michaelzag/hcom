@@ -1022,7 +1022,7 @@ fn create_runner_script_windows(
     let reroot_option = if answer_omp_reroot_prompt {
         format!(" {} ", crate::pty::ANSWER_OMP_REROOT_PROMPT_OPTION)
     } else {
-        String::new()
+        " ".to_string()
     };
     let run_line = if tool_args.is_empty() {
         format!(
@@ -1439,6 +1439,7 @@ fn finalize_background_launch(
     }));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_background_runner(
     tool: &str,
     cwd: &str,
