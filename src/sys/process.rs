@@ -101,7 +101,7 @@ fn process_identity_platform(pid: u32) -> Option<String> {
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
-fn process_info_apple(pid: u32) -> Option<libc::proc_bsdinfo> {
+pub(crate) fn process_info_apple(pid: u32) -> Option<libc::proc_bsdinfo> {
     // SAFETY: `info` is a correctly sized writable proc_bsdinfo buffer and
     // proc_pidinfo only fills it for the queried PID.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -130,7 +130,7 @@ fn process_identity_platform(pid: u32) -> Option<String> {
 /// creation time of the incarnation holding it) and the parent/child link check
 /// in [`kill_tree_win_checked`].
 #[cfg(windows)]
-fn creation_ticks_win(pid: u32) -> Option<u64> {
+pub(crate) fn creation_ticks_win(pid: u32) -> Option<u64> {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -453,12 +453,21 @@ fn terminate_win(pid: u32) -> bool {
     }
 }
 
-/// Snapshot every live process's pid -> parent_pid link via
-/// `CreateToolhelp32Snapshot`, retrying once on transient failure.
+/// Snapshot every live process's parent link via `CreateToolhelp32Snapshot`,
+/// retrying once on transient failure. Read executable names only for identity
+/// proof (`with_exe_names`); kill-tree rescans need links but not names.
 ///
 /// Returns `None` if the snapshot could not be taken even after the retry.
 #[cfg(windows)]
-fn snapshot_parents() -> Option<std::collections::HashMap<u32, u32>> {
+pub(crate) struct ProcessSnapshot {
+    pub parent_pid: u32,
+    pub exe_name: Option<String>,
+}
+
+#[cfg(windows)]
+pub(crate) fn snapshot_parents(
+    with_exe_names: bool,
+) -> Option<std::collections::HashMap<u32, ProcessSnapshot>> {
     use std::collections::HashMap;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -466,7 +475,7 @@ fn snapshot_parents() -> Option<std::collections::HashMap<u32, u32>> {
         TH32CS_SNAPPROCESS,
     };
 
-    let mut parents: HashMap<u32, u32> = HashMap::new();
+    let mut parents: HashMap<u32, ProcessSnapshot> = HashMap::new();
     // SAFETY: snapshot handle is closed before returning; the PROCESSENTRY32W is
     // fully initialized (dwSize set) before the enumeration calls.
     unsafe {
@@ -482,7 +491,25 @@ fn snapshot_parents() -> Option<std::collections::HashMap<u32, u32>> {
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         if Process32FirstW(snapshot, &mut entry) != 0 {
             loop {
-                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+                let exe_name = if with_exe_names {
+                    let name_end = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&ch| ch == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    String::from_utf16(&entry.szExeFile[..name_end])
+                        .ok()
+                        .filter(|name| !name.is_empty())
+                } else {
+                    None
+                };
+                parents.insert(
+                    entry.th32ProcessID,
+                    ProcessSnapshot {
+                        parent_pid: entry.th32ParentProcessID,
+                        exe_name,
+                    },
+                );
                 if Process32NextW(snapshot, &mut entry) == 0 {
                     break;
                 }
@@ -569,8 +596,8 @@ pub fn spawn_detached(command: &mut Command) -> std::io::Result<std::process::Ch
 /// leaves the pre-existing behaviour untouched wherever this check has nothing
 /// to say. A process we cannot query is one we generally cannot terminate
 /// either.
-#[cfg(windows)]
-fn child_link_is_plausible(parent_ticks: Option<u64>, child_ticks: Option<u64>) -> bool {
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) fn child_link_is_plausible(parent_ticks: Option<u64>, child_ticks: Option<u64>) -> bool {
     match (parent_ticks, child_ticks) {
         (Some(parent), Some(child)) => child >= parent,
         _ => true,
@@ -631,7 +658,7 @@ fn kill_tree_win(root: u32) -> GroupSignal {
 /// snapshot can still escape.
 #[cfg(windows)]
 fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
-    let Some(parents) = snapshot_parents() else {
+    let Some(parents) = snapshot_parents(false) else {
         // Still can't enumerate descendants; kill only the root. Any
         // surviving descendants will be reaped when the job object
         // closes. This still reports `Sent` (not a distinct "partial"
@@ -681,7 +708,8 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
         let parent_ticks = *ticks
             .entry(current)
             .or_insert_with(|| creation_ticks_win(current));
-        for (&pid, &ppid) in &parents {
+        for (&pid, entry) in &parents {
+            let ppid = entry.parent_pid;
             if ppid != current || tree.contains(&pid) {
                 continue;
             }
@@ -727,13 +755,14 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
     // order.
     for _ in 0..RESCAN_ROUNDS {
         std::thread::sleep(RESCAN_DELAY);
-        let Some(parents) = snapshot_parents() else {
+        let Some(parents) = snapshot_parents(false) else {
             break;
         };
         let before = tree.len();
         loop {
             let start_len = tree.len();
-            for (&pid, &ppid) in &parents {
+            for (&pid, entry) in &parents {
+                let ppid = entry.parent_pid;
                 if !tree.contains(&ppid) || tree.contains(&pid) {
                     continue;
                 }

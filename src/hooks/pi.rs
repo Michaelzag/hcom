@@ -278,7 +278,7 @@ fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
 
 pub fn dispatch_pi_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
     let start = Instant::now();
-    let ctx = HcomContext::from_os();
+    let mut ctx = HcomContext::from_os();
     crate::paths::ensure_hcom_directories_at(&ctx.hcom_dir);
     let db = match HcomDb::open() {
         Ok(db) => db,
@@ -294,7 +294,7 @@ pub fn dispatch_pi_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
             );
         }
     };
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&mut ctx, &db) {
         return (0, String::new());
     }
     let handler_argv: Vec<String> = if !argv.is_empty() && argv[0] == hook_name {

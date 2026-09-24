@@ -132,6 +132,8 @@ pub enum Action {
     NewTerminal,
     /// Run relay-worker process
     RelayWorker,
+    /// Record a launch script's pid as its row's anchor (internal)
+    LaunchAnchor { args: Vec<String> },
 }
 
 /// Global flags extracted from argv before dispatch.
@@ -288,6 +290,13 @@ pub fn resolve_action(argv: &[String]) -> Action {
     // Relay worker mode: `hcom relay-worker`
     if first == "relay-worker" {
         return Action::RelayWorker;
+    }
+
+    // Launch anchor: `hcom launch-anchor`, run by generated launch scripts
+    if first == "launch-anchor" {
+        return Action::LaunchAnchor {
+            args: argv[1..].to_vec(),
+        };
     }
 
     // PTY mode: `hcom pty <tool> [args...]`
@@ -531,6 +540,12 @@ pub fn dispatch() -> anyhow::Result<()> {
         }
         Action::RelayWorker => {
             let exit_code = crate::relay::worker::run();
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Action::LaunchAnchor { args } => {
+            let exit_code = crate::commands::launch_anchor::run(&args);
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }

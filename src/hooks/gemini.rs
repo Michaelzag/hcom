@@ -814,7 +814,7 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
     let start = Instant::now();
 
     // Build context from environment
-    let ctx = HcomContext::from_os();
+    let mut ctx = HcomContext::from_os();
 
     // Read stdin JSON
     let stdin_json: Value = match serde_json::from_reader(std::io::stdin().lock()) {
@@ -873,7 +873,7 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
     };
 
     // Pre-gate: non-participants with empty DB → exit 0, no output
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&mut ctx, &db) {
         return 0;
     }
 

@@ -3806,7 +3806,7 @@ mod tests {
         let mut sleeper = spawn_named_sleeper(&orphan_name, "proc-before");
         let spid = sleeper.id();
         for _ in 0..50 {
-            if crate::proctruth::processes_for_instance(&orphan_name, &[])
+            if crate::proctruth::processes_for_instance(&orphan_name, &[], &[])
                 .iter()
                 .any(|m| m.pid == spid)
             {
@@ -3814,7 +3814,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let start = crate::proctruth::processes_for_instance(&orphan_name, &[])
+        let start = crate::proctruth::processes_for_instance(&orphan_name, &[], &[])
             .into_iter()
             .find(|m| m.pid == spid)
             .expect("orphan sleeper enumerated")
@@ -3845,7 +3845,7 @@ mod tests {
         let mut sub = spawn_named_sleeper(&sub_name, "proc-before");
         let subpid = sub.id();
         for _ in 0..50 {
-            if crate::proctruth::processes_for_instance(&sub_name, &[])
+            if crate::proctruth::processes_for_instance(&sub_name, &[], &[])
                 .iter()
                 .any(|m| m.pid == subpid)
             {

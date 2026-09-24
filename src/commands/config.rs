@@ -100,6 +100,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
     ("HCOM_PI_ARGS", "Default args for pi on launch", "string"),
     ("HCOM_OMP_ARGS", "Default args for omp on launch", "string"),
     (
+        "HCOM_PLAIN_SESSIONS",
+        "Let plain (non-hcom-launched) omp sessions join hcom (true/false)",
+        "boolean",
+    ),
+    (
         "HCOM_CURSOR_ARGS",
         "Default args for cursor-agent on launch",
         "string",
@@ -227,6 +232,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "kilo_args" => Some("launch.kilo.args"),
         "pi_args" => Some("launch.pi.args"),
         "omp_args" => Some("launch.omp.args"),
+        "plain_sessions" => Some("launch.omp.plain_sessions"),
         "cursor_args" => Some("launch.cursor.args"),
         "kimi_args" => Some("launch.kimi.args"),
         "copilot_args" => Some("launch.copilot.args"),
@@ -460,6 +466,7 @@ pub fn config_get(key: &str) -> (String, &'static str) {
         "HCOM_SUBAGENT_TIMEOUT" => "30",
         "HCOM_AUTO_APPROVE" => "true",
         "HCOM_AUTO_TRUST_WORKSPACE" => "true",
+        "HCOM_PLAIN_SESSIONS" => "false",
         "HCOM_TITLE_MODE" => "combined",
         _ => "",
     };

@@ -326,12 +326,10 @@ pub(crate) fn finalize_launch_failure_detail(
     } else {
         0
     };
-    // Name what the pid actually is. For a background launch this is the
-    // wrapper shell hcom spawned, not the tool: the tool is its grandchild, and
-    // a wrapper that is alive says nothing about whether the tool ever started.
-    // The old wording ("process alive Ns, never bound") read as "the tool is
-    // running but won't bind" and sent a Windows launch-chain stall investigation
-    // after the tool instead of the chain.
+    // The launcher records a background runner pid only while the row's pid
+    // is NULL; a PTY wrapper can record itself or its child first and wins.
+    // This diagnostic checks liveness, not which process in that ancestry
+    // is named; an alive runner or wrapper does not prove tool startup.
     let process_state = data.pid.and_then(|pid| {
         let alive = crate::sys::process::is_alive(pid as u32);
         let what = if data.background != 0 {
@@ -649,7 +647,8 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
             }
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
-                if crate::proctruth::has_live_carriers(&data.name, binding_ids) {
+                let owners = crate::proctruth::omp_owner_bindings(db, &data.name);
+                if crate::proctruth::has_live_carriers(&data.name, binding_ids, &owners) {
                     crate::log::log_debug(
                         "cleanup",
                         "placeholder_held_live_launch",
@@ -665,6 +664,7 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
                     &data.name,
                     Some(data),
                     binding_ids,
+                    &owners,
                     &[],
                 );
                 match crate::hooks::common::stop_placeholder_instance(

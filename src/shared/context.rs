@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
+use crate::db::HcomDb;
 use crate::tool::Tool;
 
 /// Per-request execution context.
@@ -129,6 +130,42 @@ impl HcomContext {
         self.stdin_is_tty = stdin_is_tty;
         self.stdout_is_tty = stdout_is_tty;
         self
+    }
+
+    /// Drop a process id this hook cannot prove, together with the derived
+    /// `is_launched` claim. OMP hooks require a proven launcher UUID or an
+    /// OMP-minted ancestor id; other tools retain synthetic-id carriage.
+    /// Idempotent — a cleared id is never re-refused.
+    ///
+    /// `HCOM_LAUNCHED=1` alone proves nothing. For OMP, only a trusted
+    /// launcher UUID backed by a recorded ancestor pid establishes a launch;
+    /// a proven OMP-minted id belongs to a plain or nested session. Other
+    /// tools keep their existing synthetic-id carriage and launch claims.
+    pub fn trust_process_id(&mut self, db: &HcomDb) {
+        let Some(id) = self.process_id.clone() else {
+            self.is_launched = false;
+            return;
+        };
+        let trusted = if self.tool == Tool::Omp {
+            crate::proctruth::trusted_process_id_for_omp(db, &id)
+        } else {
+            crate::proctruth::trusted_process_id(db, &id)
+        };
+        if !trusted {
+            self.process_id = None;
+            crate::log::log_info(
+                "hooks",
+                "identity.foreign_refused",
+                &format!("tool={} refused process id {id}", self.tool.as_str()),
+            );
+        }
+        self.is_launched = self.is_launched
+            && trusted
+            && if self.tool == Tool::Omp {
+                crate::proctruth::is_launcher_process_id(&id)
+            } else {
+                crate::proctruth::omp_minted_pid(&id).is_none()
+            };
     }
 
     // === Derived paths ===
@@ -442,5 +479,137 @@ mod tests {
 
         assert_eq!(ctx.raw_env.get("HCOM_TAG").unwrap(), "test-tag");
         assert_eq!(ctx.raw_env.get("CUSTOM_VAR").unwrap(), "custom-val");
+    }
+
+    // === trust_process_id (§1.1) ===
+
+    fn make_test_db() -> (HcomDb, tempfile::TempDir) {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (db, dir)
+    }
+
+    /// Context claiming a launch the way a real one arrives: `HCOM_LAUNCHED=1`
+    /// together with a process id.
+    fn launched_ctx(process_id: &str) -> HcomContext {
+        HcomContext::from_env(
+            &make_env(&[("HCOM_PROCESS_ID", process_id), ("HCOM_LAUNCHED", "1")]),
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    #[test]
+    fn trust_process_id_refuses_unproven_id() {
+        let (db, _dir) = make_test_db();
+        // Launcher UUID with no binding row: provenance unprovable.
+        let mut ctx = launched_ctx("550e8400-e29b-41d4-a716-446655440000");
+        assert!(ctx.is_launched);
+        ctx.trust_process_id(&db);
+        assert_eq!(ctx.process_id, None);
+        assert!(!ctx.is_launched);
+
+        // Idempotent: nothing left to refuse.
+        ctx.trust_process_id(&db);
+        assert_eq!(ctx.process_id, None);
+        assert!(!ctx.is_launched);
+    }
+
+    #[test]
+    fn trust_process_id_clears_launch_claim_without_id() {
+        let (db, _dir) = make_test_db();
+        // §1.1: a bare inherited HCOM_LAUNCHED=1 never makes a plain session join.
+        let env = make_env(&[("HCOM_LAUNCHED", "1"), ("HOME", "/home/test")]);
+        let mut ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        assert!(ctx.is_launched);
+        ctx.trust_process_id(&db);
+        assert_eq!(ctx.process_id, None);
+        assert!(!ctx.is_launched);
+    }
+
+    #[test]
+    fn trust_process_id_keeps_trusted_launcher_id() {
+        let (db, _dir) = make_test_db();
+        let id = "550e8400-e29b-41d4-a716-446655440001";
+        // Binding row whose instance records OUR pid — self is always in the
+        // self-inclusive ancestor set, so this is a provable launcher id.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, pid) \
+                 VALUES ('luna', 'active', ?1, 'claude', ?2)",
+                rusqlite::params![
+                    chrono::Utc::now().timestamp() as f64,
+                    std::process::id() as i64
+                ],
+            )
+            .unwrap();
+        db.set_process_binding(id, "", "luna").unwrap();
+
+        let mut ctx = launched_ctx(id);
+        ctx.trust_process_id(&db);
+        assert_eq!(ctx.process_id.as_deref(), Some(id));
+        assert!(ctx.is_launched);
+
+        // §1.1 keeps the env conjunct: a trusted id alone is not a launch.
+        let env = make_env(&[("HCOM_PROCESS_ID", id), ("HOME", "/home/test")]);
+        let mut ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        ctx.trust_process_id(&db);
+        assert_eq!(ctx.process_id.as_deref(), Some(id));
+        assert!(!ctx.is_launched);
+    }
+
+    /// RAII guard over `/proc/self/comm`: renames this process for the
+    /// duration of a test and restores the original name on drop (panic-safe),
+    /// so the `comm == "omp"` ancestry clause can be exercised in-process.
+    #[cfg(target_os = "linux")]
+    struct CommGuard(String);
+
+    #[cfg(target_os = "linux")]
+    impl CommGuard {
+        fn set(name: &str) -> Self {
+            let path = format!("/proc/{}/comm", std::process::id());
+            let original = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, name).unwrap();
+            CommGuard(original)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for CommGuard {
+        fn drop(&mut self) {
+            let path = format!("/proc/{}/comm", std::process::id());
+            let _ = std::fs::write(&path, &self.0);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn trust_process_id_omp_shaped_never_proves_launch() {
+        let (db, _dir) = make_test_db();
+        // D-69 shape: minted from our own pid, so the minting pid IS in the
+        // self-inclusive ancestor set — but nothing here runs `omp`.
+        let id = format!("omp-{}-11-22", std::process::id());
+
+        {
+            let _comm = CommGuard::set("shell");
+            let mut ctx = launched_ctx(&id);
+            ctx.trust_process_id(&db);
+            // Unproven: refused outright (the lotso leak shape).
+            assert_eq!(ctx.process_id, None);
+            assert!(!ctx.is_launched);
+        }
+
+        {
+            // A genuine plugin mint: the minting ancestor runs `omp`, so the
+            // id IS trusted and is kept as this tree's identity — but an
+            // omp-shaped id must never prove a launch (§1.1 shape clause):
+            // the leaked HCOM_LAUNCHED=1 would otherwise let a plain session join.
+            let _comm = CommGuard::set("omp");
+            let mut ctx = launched_ctx(&id);
+            ctx.trust_process_id(&db);
+            assert_eq!(ctx.process_id.as_deref(), Some(id.as_str()));
+            assert!(!ctx.is_launched);
+        }
     }
 }

@@ -753,7 +753,7 @@ fn get_handler(hook_name: &str) -> Option<fn(&HcomDb, &HcomContext, &HookPayload
 pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
     let start = Instant::now();
 
-    let ctx = HcomContext::from_os();
+    let mut ctx = HcomContext::from_os();
 
     let mut input = Vec::new();
     if let Err(e) = std::io::stdin().read_to_end(&mut input) {
@@ -806,7 +806,7 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
         }
     };
 
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&mut ctx, &db) {
         return 0;
     }
 

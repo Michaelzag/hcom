@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, InputEvent } from "@oh-my-pi/pi-coding-agent";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -35,6 +36,102 @@ function log(
 }
 
 const HCOM_TIMEOUT_MS = 1800;
+const OMP_ID_PATTERN = /^omp-(\d+)-.+$/;
+const LAUNCHER_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function ompIdPid(id: string): number | null {
+	const match = OMP_ID_PATTERN.exec(id);
+	if (!match) return null;
+	const pid = Number(match[1]);
+	return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+function procComm(pid: number): string | null {
+	try {
+		return readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+	} catch {
+		return null;
+	}
+}
+
+function ppidOf(pid: number): number | null {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close < 0) return null;
+		const ppid = Number(stat.slice(close + 1).trim().split(/\s+/)[1]);
+		return Number.isSafeInteger(ppid) && ppid > 0 ? ppid : null;
+	} catch {
+		return null;
+	}
+}
+
+function ancestorPids(): Set<number> {
+	const pids = new Set<number>();
+	let pid: number | null = process.pid;
+	for (let depth = 0; pid !== null && !pids.has(pid) && depth < 4096; depth++) {
+		pids.add(pid);
+		pid = ppidOf(pid);
+	}
+	return pids;
+}
+
+function mintProcessId(): string {
+	return `omp-${process.pid}-${randomBytes(4).toString("hex")}-${randomBytes(4).toString("hex")}`;
+}
+
+function resolveProcessId(): { id: string; minted: boolean; reason: string } {
+	const existing = process.env.HCOM_PROCESS_ID;
+	if (!existing) return { id: mintProcessId(), minted: true, reason: "missing" };
+	const pid = ompIdPid(existing);
+	if (pid === null) {
+		// Only a launcher UUID can retain its inherited identity. The Rust
+		// hook, not this shape check, proves its row and ancestor pid.
+		if (inheritedLauncherCandidate) return { id: existing, minted: false, reason: "launcher_candidate" };
+		return { id: mintProcessId(), minted: true, reason: "inherited_non_launcher" };
+	}
+	if (process.platform !== "linux") {
+		return { id: mintProcessId(), minted: true, reason: "non_linux" };
+	}
+	if (!ancestorPids().has(pid)) {
+		return { id: mintProcessId(), minted: true, reason: "non_ancestor" };
+	}
+	if (procComm(pid) !== "omp") {
+		return { id: mintProcessId(), minted: true, reason: "ancestor_not_omp" };
+	}
+	return { id: existing, minted: false, reason: "trusted_omp_ancestor" };
+}
+
+const inheritedLauncherCandidate =
+	process.env.HCOM_LAUNCHED === "1" &&
+	!!process.env.HCOM_PROCESS_ID &&
+	LAUNCHER_ID_PATTERN.test(process.env.HCOM_PROCESS_ID);
+const resolvedIdentity = resolveProcessId();
+process.env.HCOM_PROCESS_ID = resolvedIdentity.id;
+log("INFO", "identity_resolved", null, {
+	minted: resolvedIdentity.minted,
+	reason: resolvedIdentity.reason,
+});
+
+// The Rust gate reads `plain_sessions` as `!is_falsy(value)` (src/config.rs
+// `is_falsy`, applied by `HcomConfig::set_field`): exactly these six values
+// are false, case-sensitive and untrimmed; everything else is true.
+const RUST_FALSY_VALUES: Record<string, true> = { "0": true, false: true, False: true, no: true, off: true, "": true };
+export function plainSessionsValueEnabled(value: string): boolean {
+	return !Object.hasOwn(RUST_FALSY_VALUES, value);
+}
+
+let plainSessionsPromise: Promise<boolean> | null = null;
+function plainSessionsEnabled(): Promise<boolean> {
+	// `--json` carries the raw value; the plain form prints "(not set)" for an
+	// empty one instead of the value itself.
+	plainSessionsPromise ??= hcom(["config", "--json", "plain_sessions"]).then((result) => {
+		if (result.code !== 0) return false;
+		const value = JSON.parse(result.stdout).HCOM_PLAIN_SESSIONS;
+		return typeof value === "string" && plainSessionsValueEnabled(value);
+	}).catch(() => false);
+	return plainSessionsPromise;
+}
 
 function hcom(args: string[]): Promise<HcomResult> {
 	return new Promise((resolve) => {
@@ -276,7 +373,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	async function bindIdentity(ctx: ExtensionContext): Promise<void> {
 		currentCtx = ctx;
 		if (instanceName || bindingPromise) return bindingPromise ?? Promise.resolve();
-		if (process.env.HCOM_LAUNCHED !== "1") return;
+		if (!inheritedLauncherCandidate && !(await plainSessionsEnabled())) return;
 		const skipReason = nestedSkipReason();
 		if (skipReason) {
 			nestedOptOut = true;
@@ -304,16 +401,29 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				const args = ["omp-start", "--session-id", sid, "--cwd", ctx.cwd];
 				if (transcriptPath) args.push("--transcript-path", transcriptPath);
 				if (port) args.push("--notify-port", String(port));
-				const result = await hcom(args);
+				let result = await hcom(args);
 				if (result.code !== 0) {
 					stopNotifyServer();
 					log("WARN", "plugin.bind_failed", null, { exit_code: result.code, stderr: result.stderr.slice(0, 300) });
 					return;
 				}
-				const json = JSON.parse(result.stdout || "{}");
-				if (json.error) {
+				let json = JSON.parse(result.stdout || "{}");
+				if (inheritedLauncherCandidate && json.error === "HCOM_PROCESS_ID not set" && (await plainSessionsEnabled())) {
+					// The hook refused the inherited UUID. With the plain-session
+					// opt-in, give this OMP process its own id and try only once.
+					process.env.HCOM_PROCESS_ID = mintProcessId();
+					log("INFO", "identity_resolved", null, { minted: true, reason: "unproven_launcher" });
+					result = await hcom(args);
+					if (result.code !== 0) {
+						stopNotifyServer();
+						log("WARN", "plugin.bind_failed", null, { exit_code: result.code, stderr: result.stderr.slice(0, 300) });
+						return;
+					}
+					json = JSON.parse(result.stdout || "{}");
+				}
+				if (json.error || !json.name) {
 					stopNotifyServer();
-					log("WARN", "plugin.bind_failed", null, { error: json.error });
+					log("WARN", "plugin.bind_failed", null, { error: json.error || "No instance bound to this process" });
 					return;
 				}
 				instanceName = json.name;

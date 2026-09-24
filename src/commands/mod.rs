@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod fork;
 pub mod kill;
 pub mod launch;
+pub mod launch_anchor;
 pub mod resume;
 pub mod start;
 pub mod stop;

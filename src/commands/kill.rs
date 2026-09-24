@@ -331,7 +331,8 @@ fn kill_tracked_instance_with_self_pids(
     // reaps every other eligible carrier FIRST, and fails closed: the row and
     // bindings are torn down only once no in-scope non-self carrier remains.
     let self_set: HashSet<u32> = self_pids.iter().copied().collect();
-    let excluded: Vec<u32> = crate::proctruth::processes_for_instance(name, &binding_ids)
+    let owners = crate::proctruth::omp_owner_bindings(db, name);
+    let excluded: Vec<u32> = crate::proctruth::processes_for_instance(name, &binding_ids, &owners)
         .into_iter()
         .map(|m| m.pid)
         .filter(|p| self_set.contains(p))
@@ -340,8 +341,13 @@ fn kill_tracked_instance_with_self_pids(
     // kill_instance signals the recorded process group. Its root may die and
     // reparent eligible descendants before reap begins. Built from the same
     // snapshot as the incarnation above.
-    let capture =
-        crate::proctruth::capture_reap_carriers(name, Some(&inst), &binding_ids, &excluded);
+    let capture = crate::proctruth::capture_reap_carriers(
+        name,
+        Some(&inst),
+        &binding_ids,
+        &owners,
+        &excluded,
+    );
     if !excluded.is_empty() {
         return kill_self_tracked_instance(
             db,
@@ -888,9 +894,16 @@ fn capture_orphan_carriers(
         .iter()
         .map(|name| {
             let (row, binding_ids) = db.get_instance_with_bindings(name).unwrap_or_default();
+            let owners = crate::proctruth::omp_owner_bindings(db, name);
             (
                 name.clone(),
-                crate::proctruth::capture_reap_carriers(name, row.as_ref(), &binding_ids, &[]),
+                crate::proctruth::capture_reap_carriers(
+                    name,
+                    row.as_ref(),
+                    &binding_ids,
+                    &owners,
+                    &[],
+                ),
             )
         })
         .collect()
@@ -935,8 +948,14 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
 
         // Before any signal, from the snapshot: binds the release below to
         // this incarnation, pid-less rows included.
-        let pre_capture =
-            crate::proctruth::capture_reap_carriers(&inst.name, Some(inst), binding_ids, &[]);
+        let owners = crate::proctruth::omp_owner_bindings(db, &inst.name);
+        let pre_capture = crate::proctruth::capture_reap_carriers(
+            &inst.name,
+            Some(inst),
+            binding_ids,
+            &owners,
+            &[],
+        );
         if let Some(pid) = inst.pid {
             active_pids.insert(pid as u32);
             let is_headless = inst.background != 0;
@@ -1074,8 +1093,14 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     // Kill active instances with this tag
     for (inst, binding_ids) in &tagged {
         // Before any signal, from the snapshot (see `kill_all`).
-        let pre_capture =
-            crate::proctruth::capture_reap_carriers(&inst.name, Some(inst), binding_ids, &[]);
+        let owners = crate::proctruth::omp_owner_bindings(db, &inst.name);
+        let pre_capture = crate::proctruth::capture_reap_carriers(
+            &inst.name,
+            Some(inst),
+            binding_ids,
+            &owners,
+            &[],
+        );
         if let Some(pid) = inst.pid {
             let is_headless = inst.background != 0;
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
@@ -1759,7 +1784,7 @@ mod tests {
     #[cfg(unix)]
     fn wait_for_enumerated(name: &str, pid: u32) {
         for _ in 0..50 {
-            if crate::proctruth::processes_for_instance(name, &[])
+            if crate::proctruth::processes_for_instance(name, &[], &[])
                 .iter()
                 .any(|m| m.pid == pid)
             {
@@ -2034,7 +2059,13 @@ mod tests {
             &binding_ids,
             &excluded,
             &incarnation,
-            crate::proctruth::capture_reap_carriers(&name, row.as_ref(), &binding_ids, &excluded),
+            crate::proctruth::capture_reap_carriers(
+                &name,
+                row.as_ref(),
+                &binding_ids,
+                &[],
+                &excluded,
+            ),
             |_, _, _, _capture| Err(crate::proctruth::ReapError::Survivors(vec![survivor_pid])),
         )
         .err()
@@ -2174,7 +2205,13 @@ mod tests {
             &binding_ids,
             &excluded,
             &incarnation,
-            crate::proctruth::capture_reap_carriers(&name, row.as_ref(), &binding_ids, &excluded),
+            crate::proctruth::capture_reap_carriers(
+                &name,
+                row.as_ref(),
+                &binding_ids,
+                &[],
+                &excluded,
+            ),
             |n, b, e, capture| {
                 // The real reap, then the mid-kill rebind: same name, new
                 // binding epoch (the `start --as` shape).

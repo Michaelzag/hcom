@@ -982,9 +982,18 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         stopped_code, 0,
         "stopped snapshot lookup failed: {stopped_stderr}"
     );
+    let stopped_session = stopped_stdout
+        .lines()
+        .any(|line| line.trim() == format!("Session:    {session_id}"));
+    let stopped_reason = stopped_stdout.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("Reason:")
+            .map(str::trim)
+            .filter(|reason| matches!(*reason, "killed" | "closed"))
+    });
     assert!(
-        stopped_stdout.contains(&session_id) && stopped_stdout.contains("killed"),
-        "killed snapshot did not preserve session {session_id} and reason: {stopped_stdout}"
+        stopped_session && stopped_reason.is_some(),
+        "kill must preserve session {session_id} and record a killed/closed outcome: {stopped_stdout}"
     );
 
     // --- Phase 8: resume parent under the same identity -----------------------

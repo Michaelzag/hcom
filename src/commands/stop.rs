@@ -420,7 +420,9 @@ fn stop_read_instance(
     initiator: &str,
     reason: &str,
 ) -> crate::hooks::common::StopOutcome {
-    let capture = crate::proctruth::capture_reap_carriers(&inst.name, Some(inst), binding_ids, &[]);
+    let owners = crate::proctruth::omp_owner_bindings(db, &inst.name);
+    let capture =
+        crate::proctruth::capture_reap_carriers(&inst.name, Some(inst), binding_ids, &owners, &[]);
     crate::hooks::common::stop_instance_with_capture(db, &inst.name, initiator, reason, capture)
 }
 

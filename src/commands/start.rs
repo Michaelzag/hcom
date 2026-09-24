@@ -77,7 +77,8 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let db = HcomDb::open()?;
     let hcom_dir = paths::hcom_dir();
 
-    let ctx = HcomContext::from_os();
+    let mut ctx = HcomContext::from_os();
+    ctx.trust_process_id(&db);
     let verified_actor = claude_actor::resolve_env_actor(&db).map_err(anyhow::Error::new)?;
     if let (Some(actor), Some(name)) = (verified_actor.as_ref(), flags.name.as_deref()) {
         claude_actor::ensure_explicit_matches(&db, actor, name).map_err(anyhow::Error::new)?;
@@ -1475,7 +1476,7 @@ mod tests {
     #[cfg(unix)]
     fn wait_for_carrier(name: &str, pid: u32) {
         for _ in 0..50 {
-            if crate::proctruth::processes_for_instance(name, &[])
+            if crate::proctruth::processes_for_instance(name, &[], &[])
                 .iter()
                 .any(|m| m.pid == pid)
             {
@@ -1673,7 +1674,7 @@ mod tests {
             .to_string();
         let orphan = spawn_detached_named_sleeper(&target, &format!("proc-old-{}", rand_suffix()));
         wait_for_carrier(&target, orphan);
-        let start = crate::proctruth::processes_for_instance(&target, &[])
+        let start = crate::proctruth::processes_for_instance(&target, &[], &[])
             .into_iter()
             .find(|m| m.pid == orphan)
             .expect("detached orphan enumerated")

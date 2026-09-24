@@ -96,6 +96,21 @@ fn bootstrap_for(ctx: &HcomContext, db: &HcomDb, instance_name: &str) -> String 
 }
 
 pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String) {
+    // Refresh a stale installed plugin (older hcom's hcom.ts) so the next omp
+    // session loads the one this binary embeds. Best effort: the running
+    // session already has its plugin loaded, so a failure here must never
+    // fail the start hook.
+    if !crate::hooks::omp::ensure_omp_plugin_installed() {
+        log_info(
+            "hooks",
+            "omp-start.plugin_refresh_failed",
+            &format!(
+                "could not install current plugin at {}",
+                crate::hooks::omp::get_omp_plugin_path().display()
+            ),
+        );
+    }
+
     // Plugin RPC returns JSON errors on exit 0 so the extension can handle
     // setup failures without Pi treating the hook itself as failed.
     let session_id = match parse_flag(argv, "--session-id") {
@@ -127,18 +142,16 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
         }) {
             Some(name) => name,
             None => {
-                // Launcher-less first bind. `HCOM_LAUNCHED=1` with a fresh
-                // `HCOM_PROCESS_ID` and no launcher-created row means this
-                // session was started outside hcom (e.g. a plain `omp -p`)
-                // and is asking to participate. Mint an identity the same way
+                // Launcher-less first bind: no launcher-created row for this
+                // `HCOM_PROCESS_ID`. Mint an identity the same way
                 // Claude/Gemini/Kimi do for orphaned PTY sessions: generate a
                 // name, create the row, and bind session+process to it.
-                //
-                // Gated on `HCOM_LAUNCHED` so launcher-managed sessions keep
-                // their launcher-created bindings untouched: a launcher always
-                // pre-registers the row, so it never reaches this arm, and a
-                // session without the flag keeps the previous refusal.
-                if ctx.is_launched {
+                // `ctx.is_launched` requires a proven launcher UUID whose
+                // recorded pid is an ancestor; inherited HCOM_LAUNCHED=1 or
+                // a provable OMP-minted id does not claim a launch. A plain
+                // session joins only with `[launch.omp].plain_sessions`.
+                let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
+                if ctx.is_launched || hcom_config.plain_sessions {
                     match instance_binding::create_orphaned_pty_identity(
                         db,
                         &session_id,
@@ -176,7 +189,8 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
                         "hooks",
                         "omp-start.unbound_no_launch",
                         &format!(
-                            "no instance bound and HCOM_LAUNCHED != 1; session_id={} process_id={}",
+                            "no instance bound, not hcom-launched, and [launch.omp].plain_sessions is off \
+                             (enable with `hcom config plain_sessions true`); session_id={} process_id={}",
                             session_id, process_id
                         ),
                     );
@@ -376,7 +390,10 @@ pub(crate) fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
 
 pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
     let start = Instant::now();
-    let ctx = HcomContext::from_os();
+    let mut ctx = HcomContext::from_os();
+    // This dispatcher is authoritative about its presenter even when an
+    // inherited HCOM_TOOL points at a different tool.
+    ctx.tool = crate::tool::Tool::Omp;
     crate::paths::ensure_hcom_directories_at(&ctx.hcom_dir);
     let db = match HcomDb::open() {
         Ok(db) => db,
@@ -392,7 +409,7 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
             );
         }
     };
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&mut ctx, &db) && hook_name != "omp-start" {
         return (0, String::new());
     }
     let handler_argv: Vec<String> = if !argv.is_empty() && argv[0] == hook_name {

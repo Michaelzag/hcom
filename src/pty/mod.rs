@@ -642,6 +642,15 @@ pub struct Proxy {
 impl Proxy {
     /// Spawn a new PTY process
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
+        // Anchor the launcher UUID before its tool exists. Foreground terminal
+        // launches do not return this wrapper's pid to the launcher, so the
+        // wrapper records itself on entry and replaces it with the child pid
+        // below as soon as spawn succeeds.
+        if let Some(instance_name) = &config.instance_name
+            && let Ok(db) = crate::db::HcomDb::open()
+        {
+            let _ = db.update_instance_pid(instance_name, std::process::id());
+        }
         let winsize = terminal::get_terminal_size()?;
         let pty = openpty(&winsize, None).context("openpty failed")?;
 

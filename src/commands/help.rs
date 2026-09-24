@@ -500,6 +500,10 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "  auto_trust_workspace",
         "Auto-trust launch dir (skip folder-trust prompt)",
     ),
+    (
+        "  plain_sessions",
+        "Let plain (non-hcom-launched) omp sessions join hcom",
+    ),
     ("  name_export", "Export agent name to custom env var"),
     (
         "  title_mode",
