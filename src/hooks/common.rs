@@ -1776,6 +1776,7 @@ fn stop_instance_inner_scoped(
                 tx,
                 instance_name,
                 instance_data.created_at,
+                instance_data.pid,
                 instance_data.session_id.as_deref(),
                 instance_data.agent_id.as_deref(),
                 &event_data,
@@ -1792,6 +1793,7 @@ fn stop_instance_inner_scoped(
         None => db.finalize_instance_stop(
             instance_name,
             instance_data.created_at,
+            instance_data.pid,
             instance_data.session_id.as_deref(),
             instance_data.agent_id.as_deref(),
             &event_data,
@@ -2938,6 +2940,76 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    #[serial]
+    fn stop_keeps_row_when_launch_persists_pid_mid_reap() {
+        use crate::proctruth::{RoundPoint, arm_round_seam};
+        use std::os::unix::process::CommandExt;
+
+        let _env = isolated_test_env();
+        let (dir, db) = make_test_db();
+        let name = format!("launch-race-{}", std::process::id());
+        insert_test_instance(&db, &name);
+        db.set_process_binding("proc-launch-race", "session-race", &name)
+            .unwrap();
+        // An old carrier ensures the KILL-round seam fires even though the
+        // pre-registered row has no pid yet.
+        let _old = OwnedGroup(
+            std::process::Command::new("sleep")
+                .arg("300")
+                .env("HCOM_INSTANCE_NAME", &name)
+                .env_remove("HCOM_PROCESS_ID")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let launched = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = launched.clone();
+        let launch_db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        let launch_name = name.clone();
+        arm_round_seam(move |point| {
+            if point == RoundPoint::Captured && observed.borrow().is_none() {
+                let child = OwnedGroup(
+                    std::process::Command::new("sleep")
+                        .arg("300")
+                        .env_remove("HCOM_INSTANCE_NAME")
+                        .env_remove("HCOM_PROCESS_ID")
+                        .process_group(0)
+                        .spawn()
+                        .unwrap(),
+                );
+                launch_db
+                    .update_instance_pid(&launch_name, child.0.id())
+                    .unwrap();
+                *observed.borrow_mut() = Some(child);
+            }
+        });
+
+        let outcome = stop_instance(&db, &name, "test", "stop");
+        // Clear the thread-local hook before any assertion can unwind.
+        arm_round_seam(|_| {});
+        assert!(
+            matches!(&outcome, StopOutcome::RetryableError(e) if e.contains("persisted its pid")),
+            "{outcome:?}"
+        );
+        let pid = launched.borrow().as_ref().expect("seam fired").0.id();
+        assert!(crate::sys::process::is_alive(pid));
+        assert_eq!(
+            db.get_instance_full(&name).unwrap().unwrap().pid,
+            Some(pid as i64)
+        );
+        assert_eq!(
+            db.process_binding_ids(&name).unwrap(),
+            vec!["proc-launch-race"]
+        );
+        let stopped: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped'",
+            params![name], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(stopped, 0);
+    }
+
+    #[test]
     fn test_stale_stop_cannot_delete_reused_name() {
         crate::config::Config::init();
         let (_dir, db) = make_test_db();
@@ -2965,6 +3037,7 @@ mod tests {
             .finalize_instance_stop(
                 "inst",
                 old.created_at,
+                old.pid,
                 old.session_id.as_deref(),
                 old.agent_id.as_deref(),
                 &event,

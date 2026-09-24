@@ -931,7 +931,7 @@ fn carrier_in_reap_scope(
 /// firing is a no-op; never compiled outside `cfg(test)`.
 #[cfg(all(test, unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoundPoint {
+pub(crate) enum RoundPoint {
     /// The KILL round has captured its carrier set; its registry read is next.
     Captured,
     /// The KILL round has classified the captured set; the pre-signal
@@ -956,6 +956,12 @@ fn fire_round_seam(point: RoundPoint) {
             hook(point);
         }
     });
+}
+
+/// Arm this thread's reap round seam at an exact round boundary.
+#[cfg(all(test, unix))]
+pub(crate) fn arm_round_seam(hook: impl FnMut(RoundPoint) + 'static) {
+    ROUND_SEAM.with(|seam| *seam.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// Shell pid behind a self-bound process id: `omp-<pid>-…` → `<pid>`.
@@ -1387,6 +1393,7 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         match db.finalize_instance_stop(
             &inst.name,
             inst.created_at,
+            inst.pid,
             inst.session_id.as_deref(),
             inst.agent_id.as_deref(),
             &data,
@@ -1551,15 +1558,6 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn sleep")
-    }
-
-    /// Arm this thread's reap round seam (`fire_round_seam`): `hook` runs on
-    /// the calling thread at the named round boundary. The reaper thread
-    /// arms it before its reap call, so a test lands actions at one exact
-    /// instruction boundary of the round instead of racing the clock.
-    #[cfg(unix)]
-    fn arm_round_seam(hook: impl FnMut(RoundPoint) + 'static) {
-        ROUND_SEAM.with(|seam| *seam.borrow_mut() = Some(Box::new(hook)));
     }
 
     /// The round seam as a rendezvous: the reaper blocks at `point` until
@@ -1827,7 +1825,15 @@ mod tests {
             "process_id": "proc-old", "snapshot": null,
         });
         let won = db
-            .finalize_instance_stop("stale-row", created, None, None, &data, Some("proc-old"))
+            .finalize_instance_stop(
+                "stale-row",
+                created,
+                None,
+                None,
+                None,
+                &data,
+                Some("proc-old"),
+            )
             .unwrap();
         assert!(!won, "stale process_id must not win the release");
         assert!(
@@ -1869,7 +1875,15 @@ mod tests {
             "process_id": "proc-current", "snapshot": null,
         });
         let won = db
-            .finalize_instance_stop("cur-row", created, None, None, &data, Some("proc-current"))
+            .finalize_instance_stop(
+                "cur-row",
+                created,
+                None,
+                None,
+                None,
+                &data,
+                Some("proc-current"),
+            )
             .unwrap();
         assert!(won, "current process_id releases the row");
         assert!(db.get_instance_full("cur-row").unwrap().is_none());

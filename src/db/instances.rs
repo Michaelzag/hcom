@@ -420,12 +420,17 @@ impl HcomDb {
     /// the live session's row). `None`/empty skips the check (no bindings
     /// to contradict, e.g. binding-less rows).
     ///
+    /// `expected_pid` is the caller's entry-read pid. A concurrent launch
+    /// persisting a different pid refuses the release before any event write.
+    ///
     /// The instance delete is the ownership CAS. Cleanup and event insertion
     /// share its transaction, so an error restores the row for a later retry.
+    #[allow(clippy::too_many_arguments)]
     pub fn finalize_instance_stop(
         &self,
         name: &str,
         created_at: f64,
+        expected_pid: Option<i64>,
         session_id: Option<&str>,
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
@@ -436,6 +441,7 @@ impl HcomDb {
                 tx,
                 name,
                 created_at,
+                expected_pid,
                 session_id,
                 agent_id,
                 event_data,
@@ -464,11 +470,24 @@ impl HcomDb {
         tx: &rusqlite::Transaction<'_>,
         name: &str,
         created_at: f64,
+        expected_pid: Option<i64>,
         session_id: Option<&str>,
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
         expected_process_id: Option<&str>,
     ) -> Result<(bool, Option<i64>)> {
+        // The same write transaction guards both this read and the delete:
+        // a pre-registered launch must not lose its row after spawning.
+        let current_pid: Option<Option<i64>> = tx
+            .query_row(
+                "SELECT pid FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_pid.is_some_and(|pid| pid != expected_pid) {
+            anyhow::bail!("a launch persisted its pid mid-stop; row left intact");
+        }
         let timestamp = chrono_now_iso();
         let data = serde_json::to_string(event_data)?;
         let mut event_id = None;
