@@ -2545,7 +2545,11 @@ mod tests {
         let gone = gone.to_str().unwrap();
         assert!(omp_reroot_flag("omp", gone, false));
         assert!(!omp_reroot_flag("omp", gone, true));
-        assert!(!omp_reroot_flag("omp", existing.path().to_str().unwrap(), false));
+        assert!(!omp_reroot_flag(
+            "omp",
+            existing.path().to_str().unwrap(),
+            false
+        ));
         assert!(!omp_reroot_flag("claude", gone, false));
     }
 
