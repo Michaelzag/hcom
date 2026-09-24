@@ -128,6 +128,7 @@ impl Proxy {
             c.args(args);
             c
         };
+        cmd.env_remove("HCOM_ANSWER_OMP_REROOT_PROMPT");
         for (k, v) in &config.env_vars {
             cmd.env(k, v);
         }
@@ -514,6 +515,8 @@ impl Proxy {
         let screen_snapshot = self.screen_snapshot.clone();
         let writer = self.writer.clone();
         let (rows, cols) = (self.rows, self.cols);
+        let startup_time = Instant::now();
+        let answer_omp_reroot_prompt = self.config.answer_omp_reroot_prompt;
 
         // Producer: owns the ConPTY reader and blocks in read(), forwarding raw
         // chunks over a channel. This exists so the consumer loop below can wait
@@ -556,6 +559,7 @@ impl Proxy {
             let mut stdout = std::io::stdout();
             let mut filter = shared::OutputModeFilter::default();
             let mut scratch: Vec<u8> = Vec::with_capacity(8192);
+            let mut omp_reroot_answered = false;
 
             // In interactive mode stdout is a real console, so the outer terminal
             // answers the child's cursor-position query itself — we must not also
@@ -679,6 +683,17 @@ impl Proxy {
                         }
 
                         screen.process(data);
+                        if super::omp_reroot_should_answer(
+                            answer_omp_reroot_prompt,
+                            screen.is_omp_reroot_prompt_visible(),
+                            startup_time.elapsed(),
+                            omp_reroot_answered,
+                        ) && let Ok(mut w) = writer.lock()
+                        {
+                            let _ = w.write_all(b"y\r");
+                            let _ = w.flush();
+                            omp_reroot_answered = true;
+                        }
 
                         // Refresh the `hcom term` snapshot, throttled to ≤10Hz so
                         // heavy output doesn't spend the reader in screen dumps

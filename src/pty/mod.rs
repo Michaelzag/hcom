@@ -195,6 +195,10 @@ fn strip_focus_events(buf: &[u8]) -> Option<Vec<u8>> {
 }
 /// Window in which a newly resumed omp may ask to re-root its missing cwd.
 pub const OMP_REROOT_PROMPT_WINDOW: Duration = Duration::from_secs(30);
+
+/// Proxy-only option consumed before the wrapped tool's argument vector is built.
+pub const ANSWER_OMP_REROOT_PROMPT_OPTION: &str = "--hcom-answer-omp-reroot-prompt";
+
 pub fn omp_reroot_should_answer(
     enabled: bool,
     screen_visible: bool,
@@ -687,6 +691,7 @@ impl Proxy {
                         .iter()
                         .map(|(k, v)| (k.as_str(), v.as_str())),
                 )
+                .env_remove("HCOM_ANSWER_OMP_REROOT_PROMPT")
                 .pre_exec(move || {
                     // Create new session
                     if libc::setsid() == -1 {

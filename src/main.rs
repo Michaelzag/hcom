@@ -109,24 +109,26 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     }
 
     let tool_str = &args[0];
+    let (answer_omp_reroot_prompt, tool_arg_start) = consume_reroot_option(&args[1..]);
 
     // Windows runner scripts pass tool args via a JSON sidecar file instead of
     // inline argv (see create_runner_script_windows): the PowerShell →
     // native-exe boundary corrupts arguments with embedded double quotes.
     let sidecar_args: Vec<String>;
-    let tool_args: Vec<&str> = if args.get(1).map(String::as_str) == Some("--hcom-args-file") {
-        let Some(path) = args.get(2) else {
-            bail!("--hcom-args-file requires a path");
+    let tool_args: Vec<&str> =
+        if args.get(tool_arg_start).map(String::as_str) == Some("--hcom-args-file") {
+            let Some(path) = args.get(tool_arg_start + 1) else {
+                bail!("--hcom-args-file requires a path");
+            };
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read args file {path}"))?;
+            let _ = std::fs::remove_file(path);
+            sidecar_args = serde_json::from_str(&content)
+                .with_context(|| format!("Invalid JSON in args file {path}"))?;
+            sidecar_args.iter().map(|s| s.as_str()).collect()
+        } else {
+            args[tool_arg_start..].iter().map(|s| s.as_str()).collect()
         };
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read args file {path}"))?;
-        let _ = std::fs::remove_file(path);
-        sidecar_args = serde_json::from_str(&content)
-            .with_context(|| format!("Invalid JSON in args file {path}"))?;
-        sidecar_args.iter().map(|s| s.as_str()).collect()
-    } else {
-        args[1..].iter().map(|s| s.as_str()).collect()
-    };
 
     // Keep arbitrary commands explicit so they cannot inherit a known tool's
     // delivery behavior merely because parsing failed.
@@ -178,7 +180,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
             instance_name,
             target,
             env_vars: pty_child_env(),
-            answer_omp_reroot_prompt: std::env::var("HCOM_ANSWER_OMP_REROOT_PROMPT").is_ok(),
+            answer_omp_reroot_prompt,
         },
     ) {
         Ok(proxy) => proxy,
@@ -228,6 +230,13 @@ fn pty_child_env() -> Vec<(String, String)> {
     vec![("HCOM_LAUNCHED".to_string(), "1".to_string())]
 }
 
+fn consume_reroot_option(args: &[String]) -> (bool, usize) {
+    let enabled = args
+        .first()
+        .is_some_and(|arg| arg == pty::ANSWER_OMP_REROOT_PROMPT_OPTION);
+    (enabled, usize::from(enabled))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::router::{self, Action};
@@ -275,6 +284,19 @@ mod tests {
                 args: args(&["claude", "--arg1", "--arg2"])
             }
         );
+    }
+
+    #[test]
+    fn test_reroot_option_is_proxy_only() {
+        let tool_args = args(&[
+            crate::pty::ANSWER_OMP_REROOT_PROMPT_OPTION,
+            "--hcom-args-file",
+            "args.json",
+        ]);
+        let (enabled, consumed) = super::consume_reroot_option(&tool_args);
+        assert!(enabled);
+        assert_eq!(consumed, 1);
+        assert_eq!(&tool_args[consumed..], &["--hcom-args-file", "args.json"]);
     }
 
     #[test]
