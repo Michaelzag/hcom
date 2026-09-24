@@ -360,6 +360,13 @@ fn restore_child_links_after_root_rebind(
     })
 }
 
+// Test seam: runs between a rebind clearing its target and recreating the
+// row, so a test can land a concurrent reclaim of the same name in that gap.
+#[cfg(test)]
+thread_local! {
+    static REBIND_CREATE_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
+}
+
 /// Rebind session identity (`--as <name>`), preserving last_event_id and any
 /// live Claude child hierarchy owned by the current root actor.
 ///
@@ -535,25 +542,74 @@ fn start_rebind(
         eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
     }
 
-    // Create fresh instance with the target name
+    // Test seam: a concurrent reclaim of the same name lands here, after this
+    // one cleared the target and before it recreates the row.
+    #[cfg(test)]
+    if let Some(hook) = REBIND_CREATE_GAP_HOOK.with(std::cell::Cell::take) {
+        hook(db, &target_name);
+    }
+
+    // Create the row, restore its anchor pid and bind the process id in ONE
+    // write transaction. A row found here that this rebind did not keep is a
+    // concurrent reclaim's (it recreated the name after this one cleared
+    // it): refuse and write nothing, so neither this anchor pid nor this
+    // binding lands on a row this call did not create. A kept remote row is
+    // updated in place as before and never takes a local anchor.
+    let kept_remote_row = target_data
+        .as_ref()
+        .and_then(|td| td.origin_device_id.as_deref())
+        .is_some_and(|device| !device.is_empty());
     let tool = ctx.tool.as_str();
     let cwd_override = ctx.cwd.to_string_lossy().to_string();
-    instance_binding::initialize_instance_in_position_file(
-        db,
-        &target_name,
-        session_id.as_deref(),
-        None, // parent_session_id
-        None, // parent_name
-        None, // agent_id
-        None, // transcript_path
-        Some(tool),
-        false, // background
-        None,  // tag
-        None,  // wait_timeout
-        None,  // subagent_timeout
-        None,  // hints
-        Some(&cwd_override),
-    );
+    let binding_sid = session_id.as_deref().unwrap_or("");
+    let created = db.with_immediate_transaction(|_tx| {
+        if !kept_remote_row && db.get_instance_full(&target_name)?.is_some() {
+            return Ok(None);
+        }
+        if !instance_binding::initialize_instance_in_position_file(
+            db,
+            &target_name,
+            session_id.as_deref(),
+            None, // parent_session_id
+            None, // parent_name
+            None, // agent_id
+            None, // transcript_path
+            Some(tool),
+            false, // background
+            None,  // tag
+            None,  // wait_timeout
+            None,  // subagent_timeout
+            None,  // hints
+            Some(&cwd_override),
+        ) {
+            bail!("could not create the instance row for '{target_name}'");
+        }
+        let restored_pid = match &anchor {
+            Ok(matched) if !kept_remote_row => db
+                .set_instance_pid_if_unset(&target_name, matched.pid)?
+                .then_some(matched.pid),
+            _ => None,
+        };
+        let created_refused_binding = if let Some(process_id) = &ctx.process_id {
+            db.set_process_binding(process_id, binding_sid, &target_name)?;
+            false
+        } else if restored_pid.is_some()
+            && let Some(process_id) = claimable_refused_id
+        {
+            claim_unbound_process_id(db, process_id, binding_sid, &target_name)?
+        } else {
+            false
+        };
+        Ok(Some((restored_pid, created_refused_binding)))
+    })?;
+    let Some((restored_pid, created_refused_binding)) = created else {
+        eprintln!(
+            "Error: '{target_name}' was recreated by a concurrent reclaim while this one ran; \
+             nothing was written to it.\n\
+             If this session should hold '{target_name}', run 'hcom start --as {target_name}' again."
+        );
+        return Ok(1);
+    };
 
     if let Some(ref sid) = session_id {
         let old_root = if current_name.is_empty() {
@@ -579,18 +635,6 @@ fn start_rebind(
         }
     }
 
-    let restored_pid = match &anchor {
-        Ok(matched) => match db.set_instance_pid_if_unset(&target_name, matched.pid) {
-            Ok(true) => Some(matched.pid),
-            Ok(false) => None,
-            Err(e) => {
-                eprintln!("[hcom] warn: anchor pid restore failed for {target_name}: {e}");
-                None
-            }
-        },
-        Err(_) => None,
-    };
-
     // Create bindings
     if let Some(ref sid) = session_id {
         if let Err(e) = db.set_session_binding(sid, &target_name) {
@@ -607,21 +651,8 @@ fn start_rebind(
         }
     }
     let mut bound_process_id = ctx.process_id.clone();
-    if let Some(process_id) = &ctx.process_id {
-        let sid = session_id.as_deref().unwrap_or("");
-        if let Err(e) = db.set_process_binding(process_id, sid, &target_name) {
-            eprintln!("[hcom] warn: set_process_binding failed for {target_name}: {e}");
-        }
-    } else if restored_pid.is_some()
-        && let Some(process_id) = claimable_refused_id
-    {
-        bound_process_id = bind_behind_restored_anchor(
-            db,
-            ctx,
-            process_id,
-            session_id.as_deref().unwrap_or(""),
-            &target_name,
-        );
+    if created_refused_binding && let Some(process_id) = claimable_refused_id {
+        bound_process_id = trust_restored_binding(db, ctx, process_id, &target_name);
     }
     if bound_process_id.is_some() {
         // Migrate notify endpoints before notify so wake reaches correct port
@@ -793,41 +824,41 @@ fn match_reclaim_anchor(db: &HcomDb, name: &str) -> Result<ReclaimAnchor, Anchor
     })
 }
 
-/// Bind a refused `process_id` to `target_name`, whose row now carries the
-/// restored anchor pid, then evaluate trust again: the verified anchor is the
-/// proof. The binding is created only while no binding holds the id, and a
-/// failed recheck removes only that binding. Returns the id when trusted.
-fn bind_behind_restored_anchor(
+/// Bind the refused `process_id` to `target_name` only while no binding holds
+/// it. Runs inside the rebind's create transaction, right after the row took
+/// its restored anchor pid. Returns whether this call created the binding.
+fn claim_unbound_process_id(
     db: &HcomDb,
-    ctx: &HcomContext,
     process_id: &str,
     session_id: &str,
     target_name: &str,
-) -> Option<String> {
+) -> Result<bool> {
     use rusqlite::OptionalExtension;
-    let created = db.with_immediate_transaction(|tx| {
-        let held = tx
-            .query_row(
-                "SELECT 1 FROM process_bindings WHERE process_id = ?",
-                rusqlite::params![process_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if held {
-            return Ok(false);
-        }
-        db.set_process_binding(process_id, session_id, target_name)?;
-        Ok(true)
-    });
-    match created {
-        Ok(true) => {}
-        Ok(false) => return None,
-        Err(e) => {
-            eprintln!("[hcom] warn: set_process_binding failed for {target_name}: {e}");
-            return None;
-        }
+    let held = db
+        .conn()
+        .query_row(
+            "SELECT 1 FROM process_bindings WHERE process_id = ?",
+            rusqlite::params![process_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if held {
+        return Ok(false);
     }
+    db.set_process_binding(process_id, session_id, target_name)?;
+    Ok(true)
+}
+
+/// Evaluate trust again for the refused id this reclaim bound behind the
+/// restored anchor pid: the verified anchor is the proof. Returns the id when
+/// trusted; otherwise removes only that binding.
+fn trust_restored_binding(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    process_id: &str,
+    target_name: &str,
+) -> Option<String> {
     let mut probe = ctx.clone();
     probe.process_id = Some(process_id.to_string());
     probe.trust_process_id(db);
@@ -2343,6 +2374,50 @@ mod tests {
         assert!(!crate::proctruth::trusted_process_id_for_omp(
             &db, SEAT_UUID
         ));
+    }
+
+    /// Two reclaims of one name race: A recreates the row after B cleared
+    /// it, before B recreates it. B must neither write its anchor onto A's
+    /// row nor bind onto it; it refuses, and A's own restore still lands.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_refuses_row_a_concurrent_reclaim_created() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_race_{}", std::process::id());
+        let anchor = parent_pid();
+        let (start_time, boot_id) = crate::sys::process::procfs_start_identity(anchor).unwrap();
+        /// Reclaim A's row: committed, its own anchor pid not yet written.
+        fn concurrent_reclaim_creates_row(db: &HcomDb, name: &str) {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances
+                     (name, tool, directory, last_event_id, status, status_time,
+                      last_seen, created_at)
+                     VALUES (?1, 'omp', '/tmp/project', 0, 'active', 0, 0, 2)",
+                    params![name],
+                )
+                .unwrap();
+        }
+        REBIND_CREATE_GAP_HOOK.with(|hook| hook.set(Some(concurrent_reclaim_creates_row)));
+
+        let (code, _) = lost_seat_reclaim(
+            &db,
+            &target,
+            stop_snapshot_for(anchor, start_time, &boot_id),
+        );
+        REBIND_CREATE_GAP_HOOK.with(|hook| hook.set(None));
+
+        let row = db.get_instance_full(&target).unwrap().expect("A's row");
+        assert_eq!(row.pid, None, "B wrote its anchor onto A's row");
+        assert_eq!(code, 1, "the reclaim that lost the race refuses");
+        assert_eq!(db.get_process_binding(SEAT_UUID).unwrap(), None);
+        // A's own restore still finds the row pid-less and lands its pid.
+        let a_pid = std::process::id();
+        assert!(db.set_instance_pid_if_unset(&target, a_pid).unwrap());
+        let row = db.get_instance_full(&target).unwrap().expect("A's row");
+        assert_eq!(row.pid, Some(i64::from(a_pid)));
     }
 
     /// Same pid, another incarnation: a reused pid must not become the anchor.
