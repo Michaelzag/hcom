@@ -201,6 +201,8 @@ pub struct LaunchParams {
     pub skip_validation: bool,
     pub terminal: Option<String>,
     pub append_reply_handoff: bool,
+    /// Omp recorded session cwd was missing; answer its re-root prompt once.
+    pub answer_omp_reroot_prompt: bool,
 }
 
 impl Default for LaunchParams {
@@ -226,6 +228,7 @@ impl Default for LaunchParams {
             skip_validation: false,
             terminal: None,
             append_reply_handoff: true,
+            answer_omp_reroot_prompt: false,
         }
     }
 }
@@ -1918,6 +1921,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
     for _ in 0..params.count {
         let mut instance_env = base_env.clone();
+        if params.answer_omp_reroot_prompt {
+            instance_env.insert("HCOM_ANSWER_OMP_REROOT_PROMPT".to_string(), "1".to_string());
+        }
         instance_env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
         instance_env.insert(
             "HCOM_LAUNCH_EVENT_ID".to_string(),

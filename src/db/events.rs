@@ -211,7 +211,7 @@ impl HcomDb {
     /// (`{action, by, status, context, [reason], [detail], [batch_id]}`) and
     /// write it to the events table. Returns `(launcher, batch_id)` so the
     /// caller can decide whether to push a follow-up notification.
-    fn emit_launch_lifecycle_event(
+    pub(crate) fn emit_launch_lifecycle_event(
         &self,
         name: &str,
         action: &str,

@@ -625,6 +625,15 @@ impl ScreenTracker {
         screen.rows(0, cols).collect()
     }
 
+    /// Return whether omp's exact re-root prompt is visible.
+    pub fn is_omp_reroot_prompt_visible(&self) -> bool {
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+        screen
+            .rows(0, cols)
+            .any(|line| line.contains("Session's directory no longer exists ("))
+    }
+
     /// Return a compact tail of visible screen content for launch-blocked diagnostics.
     pub fn visible_tail(&self, max_lines: usize, max_chars: usize) -> Option<String> {
         let mut lines: Vec<String> = self
@@ -1179,6 +1188,16 @@ mod tests {
             debug_flag_path: std::path::PathBuf::new(),
             instance_name: None,
         }
+    }
+    #[test]
+    fn omp_reroot_prompt_requires_exact_prefix() {
+        let mut tracker = make_tracker(8, 120, "");
+        tracker.process(b"Session's directory no longer exists (/gone/dir). Move (re-root) it into the current directory? [Y/n] ");
+        assert!(tracker.is_omp_reroot_prompt_visible());
+        tracker.process(b"\r\x1b[2J\rdirectory no longer exists");
+        assert!(!tracker.is_omp_reroot_prompt_visible());
+        tracker.process(b"\r\x1b[2J\rSession directory no longer exists (");
+        assert!(!tracker.is_omp_reroot_prompt_visible());
     }
 
     #[test]

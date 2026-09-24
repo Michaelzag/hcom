@@ -57,6 +57,8 @@ use screen::ScreenTracker;
 use terminal::TerminalGuard;
 
 #[cfg(unix)]
+use crate::db::HcomDb;
+#[cfg(unix)]
 use crate::delivery::ScreenState;
 use crate::tool::Tool;
 
@@ -190,6 +192,16 @@ fn strip_focus_events(buf: &[u8]) -> Option<Vec<u8>> {
         i += 1;
     }
     found.then_some(out)
+}
+/// Window in which a newly resumed omp may ask to re-root its missing cwd.
+pub const OMP_REROOT_PROMPT_WINDOW: Duration = Duration::from_secs(30);
+pub fn omp_reroot_should_answer(
+    enabled: bool,
+    screen_visible: bool,
+    elapsed: Duration,
+    already_answered: bool,
+) -> bool {
+    enabled && screen_visible && !already_answered && elapsed <= OMP_REROOT_PROMPT_WINDOW
 }
 
 /// Check if data ends inside an incomplete escape sequence.
@@ -585,8 +597,8 @@ pub struct ProxyConfig {
     pub instance_name: Option<String>,
     /// Known integration or explicit ad-hoc command.
     pub target: PtyTarget,
-    /// Extra environment variables to set in the child process
     pub env_vars: Vec<(String, String)>,
+    pub answer_omp_reroot_prompt: bool,
 }
 
 impl Default for ProxyConfig {
@@ -596,6 +608,7 @@ impl Default for ProxyConfig {
             instance_name: None,
             target: PtyTarget::Known(Tool::Claude),
             env_vars: vec![],
+            answer_omp_reroot_prompt: false,
         }
     }
 }
@@ -813,6 +826,7 @@ impl Proxy {
         let mut ready_signaled = false;
         let mut delivery_started = false;
         let startup_time = Instant::now();
+        let mut omp_reroot_answered = false;
 
         // Track last written title to detect changes (delivery thread updates Arcs)
         let mut last_written_name = String::new();
@@ -1105,6 +1119,32 @@ impl Proxy {
                     // Process raw chunks for screen tracking
                     for raw in &raw_chunks {
                         self.screen.process(raw);
+                        if self.config.answer_omp_reroot_prompt
+                            && !omp_reroot_answered
+                            && startup_time.elapsed() <= OMP_REROOT_PROMPT_WINDOW
+                            && self.screen.is_omp_reroot_prompt_visible()
+                            && omp_reroot_should_answer(
+                                true,
+                                true,
+                                startup_time.elapsed(),
+                                omp_reroot_answered,
+                            )
+                        {
+                            write_all(&self.pty_master, b"y\r")?;
+                            omp_reroot_answered = true;
+                            if let Some(name) = &self.config.instance_name {
+                                let _ = HcomDb::open().and_then(|db| {
+                                    db.emit_launch_lifecycle_event(
+                                        name,
+                                        "omp_reroot_prompt_answered",
+                                        "listening",
+                                        "omp reroot prompt",
+                                        None,
+                                        Some("answered re-root prompt"),
+                                    )
+                                });
+                            }
+                        }
                     }
                     if !raw_chunks.is_empty() {
                         shared::update_delivery_state(
@@ -1680,8 +1720,44 @@ where
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        PtyTarget, initialize_delivery_components, prompt_submit_observed, strip_focus_events,
+        OMP_REROOT_PROMPT_WINDOW, PtyTarget, initialize_delivery_components,
+        omp_reroot_should_answer, prompt_submit_observed, strip_focus_events,
     };
+    use std::time::Duration;
+
+    #[test]
+    fn omp_reroot_prompt_decision() {
+        assert!(omp_reroot_should_answer(
+            true,
+            true,
+            Duration::from_secs(1),
+            false
+        ));
+        assert!(!omp_reroot_should_answer(
+            true,
+            true,
+            Duration::from_secs(1),
+            true
+        ));
+        assert!(!omp_reroot_should_answer(
+            false,
+            true,
+            Duration::from_secs(1),
+            false
+        ));
+        assert!(!omp_reroot_should_answer(
+            true,
+            true,
+            OMP_REROOT_PROMPT_WINDOW + Duration::from_secs(1),
+            false
+        ));
+        assert!(!omp_reroot_should_answer(
+            true,
+            false,
+            Duration::from_secs(1),
+            false
+        ));
+    }
     use anyhow::anyhow;
     use rusqlite::Connection;
     use std::path::PathBuf;

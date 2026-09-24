@@ -178,6 +178,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
             instance_name,
             target,
             env_vars: pty_child_env(),
+            answer_omp_reroot_prompt: std::env::var("HCOM_ANSWER_OMP_REROOT_PROMPT").is_ok(),
         },
     ) {
         Ok(proxy) => proxy,

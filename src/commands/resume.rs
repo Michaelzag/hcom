@@ -64,6 +64,9 @@ struct TrackedForkIdentity {
     custom_initial_prompt: Option<String>,
     custom_system_prompt: Option<String>,
 }
+fn omp_reroot_flag(tool: &str, snapshot_dir: &str) -> bool {
+    tool == "omp" && !snapshot_dir.is_empty() && !std::path::Path::new(snapshot_dir).is_dir()
+}
 
 struct ResumePromptInput<'a> {
     tool: &'a str,
@@ -710,8 +713,9 @@ fn prepare_resume_plan_from_source(
             tag: launch_tag,
             system_prompt: effective_system_prompt,
             purpose: effective_purpose,
-            current: effective_current,
+            answer_omp_reroot_prompt: omp_reroot_flag(&tool, &snapshot_dir),
             initial_prompt: fork_initial_prompt,
+            current: effective_current,
             background: is_headless,
             cwd: Some(effective_cwd),
             env: None,
@@ -2532,6 +2536,14 @@ fn build_adopt_plan(
 mod tests {
     use super::*;
     use crate::db::HcomDb;
+    #[test]
+    fn omp_reroot_flag_matches_snapshot_directory_existence() {
+        let existing = tempfile::tempdir().unwrap();
+        let gone = existing.path().join("gone");
+        assert!(omp_reroot_flag("omp", gone.to_str().unwrap()));
+        assert!(!omp_reroot_flag("omp", existing.path().to_str().unwrap()));
+        assert!(!omp_reroot_flag("claude", gone.to_str().unwrap()));
+    }
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|i| i.to_string()).collect()
