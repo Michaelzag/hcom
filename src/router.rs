@@ -8,7 +8,7 @@ use std::process::Command;
 
 use clap::Parser;
 
-use crate::db::DEV_ROOT_KV_KEY;
+use crate::db::{DEV_ROOT_KV_KEY, HcomDb};
 use crate::log::{log_error, log_info, log_warn};
 use crate::shared::{HcomError, dev_root_binary};
 use crate::tool::Tool;
@@ -50,28 +50,36 @@ fn is_launch_tool(name: &str) -> bool {
     matches!(name, "f" | "r") || name.parse::<Tool>().is_ok_and(|tool| tool.spec().released)
 }
 
-fn maybe_external_send_name_hint(
+/// Error text for a failed context build. An external sender outside any AI
+/// tool that used `send --name` for a known (once-registered) name also gets
+/// the `--from` form. A never-seen name gets none here: its not-found error
+/// (`identity::instance_not_found_error_for`) already carries it.
+fn ctx_error_message(
+    db: &HcomDb,
     cmd: &str,
     explicit_name: Option<&str>,
     has_from_flag: bool,
     process_id: Option<&str>,
     is_inside_ai_tool: bool,
     err: &HcomError,
-) -> Option<String> {
-    let name = explicit_name?;
+) -> String {
+    let Some(name) = explicit_name else {
+        return err.to_string();
+    };
     if cmd != "send"
         || has_from_flag
         || process_id.is_some()
         || is_inside_ai_tool
         || !matches!(err, HcomError::NotFound(_))
+        || !crate::identity::has_life_history(db, name)
     {
-        return None;
+        return err.to_string();
     }
 
     let hcom_cmd = crate::runtime_env::build_hcom_command();
-    Some(format!(
+    format!(
         "{err}\nHint: If '{name}' is an external sender (cron/script/manual alert), use:\n  {hcom_cmd} send --from {name} ..."
-    ))
+    )
 }
 
 fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, String) {
@@ -770,15 +778,15 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     ) {
         Ok(ctx) => ctx,
         Err(e) => {
-            let msg = maybe_external_send_name_hint(
+            let msg = ctx_error_message(
+                &db,
                 cmd,
                 flags.name.as_deref(),
                 has_from_flag,
                 process_id.as_deref(),
                 is_inside_ai,
                 &e,
-            )
-            .unwrap_or_else(|| e.to_string());
+            );
             eprintln!("Error: {msg}");
             return 1;
         }
@@ -1353,37 +1361,76 @@ mod tests {
         }
     }
 
+    fn test_db() -> (HcomDb, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (db, dir)
+    }
+
     #[test]
-    fn send_not_found_gets_external_sender_hint_outside_ai() {
-        let err = HcomError::NotFound(
-            "Instance 'healthcheck' not found. Run 'hcom start --as healthcheck' to reclaim your identity.".into(),
-        );
-        let msg =
-            maybe_external_send_name_hint("send", Some("healthcheck"), false, None, false, &err)
-                .expect("expected hint");
+    fn send_not_found_known_name_gets_external_sender_hint_outside_ai() {
+        let (db, _dir) = test_db();
+        db.log_life_event("healthcheck", "stopped", "test", "exit", None, None)
+            .unwrap();
+        let err = HcomError::NotFound(crate::identity::instance_not_found_error_for(
+            &db,
+            "healthcheck",
+        ));
+        let msg = ctx_error_message(&db, "send", Some("healthcheck"), false, None, false, &err);
+        assert!(msg.contains("start --as healthcheck"), "{msg}");
         assert!(msg.contains("Hint: If 'healthcheck' is an external sender"));
-        assert!(msg.contains("send --from healthcheck"));
+        assert_eq!(msg.matches("send --from healthcheck").count(), 1, "{msg}");
+    }
+
+    #[test]
+    fn send_not_found_never_seen_name_suggests_from_exactly_once() {
+        let (db, _dir) = test_db();
+        let err = HcomError::NotFound(crate::identity::instance_not_found_error_for(
+            &db,
+            "fill_alarm",
+        ));
+        for (process_id, inside_ai) in [(None, false), (Some("pid-123"), true)] {
+            let msg = ctx_error_message(
+                &db,
+                "send",
+                Some("fill_alarm"),
+                false,
+                process_id,
+                inside_ai,
+                &err,
+            );
+            assert_eq!(msg.matches("send --from fill_alarm").count(), 1, "{msg}");
+            assert!(!msg.contains("--as"), "{msg}");
+        }
     }
 
     #[test]
     fn send_not_found_keeps_agent_recovery_path_inside_ai() {
-        let err = HcomError::NotFound(
-            "Instance 'luna' not found. Run 'hcom start --as luna' to reclaim your identity."
-                .into(),
+        let (db, _dir) = test_db();
+        db.log_life_event("luna", "stopped", "test", "exit", None, None)
+            .unwrap();
+        let err = HcomError::NotFound(crate::identity::instance_not_found_error_for(&db, "luna"));
+        let msg = ctx_error_message(
+            &db,
+            "send",
+            Some("luna"),
+            false,
+            Some("pid-123"),
+            true,
+            &err,
         );
-        let msg =
-            maybe_external_send_name_hint("send", Some("luna"), false, Some("pid-123"), true, &err);
-        assert!(msg.is_none());
+        assert_eq!(msg, err.to_string());
     }
 
     #[test]
     fn non_not_found_name_errors_do_not_get_external_sender_hint() {
+        let (db, _dir) = test_db();
         let err = HcomError::InvalidInput(
             "Invalid instance name 'Invalid-Name!'. Use base name only (lowercase letters, numbers, underscore).".into(),
         );
-        let msg =
-            maybe_external_send_name_hint("send", Some("Invalid-Name!"), false, None, false, &err);
-        assert!(msg.is_none());
+        let msg = ctx_error_message(&db, "send", Some("Invalid-Name!"), false, None, false, &err);
+        assert_eq!(msg, err.to_string());
     }
 
     // ── is_hook / is_command ────────────────────────────────────────────

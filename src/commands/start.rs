@@ -408,12 +408,39 @@ fn start_rebind(
     };
     let child_links = snapshot_child_links(db, session_id.as_deref())?;
 
+    // The caller's live row, when it holds an identity other than the target:
+    // the row this rebind would rename away.
+    let current_row = if !current_name.is_empty() && current_name != target_name {
+        db.get_instance_full(&current_name)?
+    } else {
+        None
+    };
+
+    // Guard: a name with no row and no life history was never an identity, so
+    // this is not a reclaim. From a process already holding a live identity it
+    // would silently rename that identity away (a subagent following a
+    // not-found hint inherits its parent's process binding).
+    if current_row.is_some()
+        && db.get_instance_full(&target_name)?.is_none()
+        && !identity::has_life_history(db, &target_name)
+    {
+        eprintln!(
+            "Error: '{target_name}' is not an identity this process held; this process is '{current_name}'.\n\
+             If '{target_name}' is an external sender (cron/script/manual alert), use 'hcom send --from {target_name} ...'.\n\
+             To rename '{current_name}' to '{target_name}', run 'hcom start --as {target_name}' from a fresh shell."
+        );
+        return Ok(1);
+    }
+
     let target_meta = load_rebind_target_metadata(db, &target_name).ok();
-    if let Some(ref meta) = target_meta {
+    if let Some(meta) = &target_meta {
         ensure_rebind_compatible(&target_name, meta, ctx)?;
     }
 
-    // Preserve last_event_id from target (cursor preservation)
+    // Preserve the target's own cursor. A caller re-registering the identity
+    // it holds reads it from its live row (never an older snapshot); a caller
+    // reclaiming another name must not inherit the replaced identity's
+    // position, which would skip the target's unread messages.
     let mut last_event_id = target_meta.as_ref().map(|m| m.last_event_id);
     let target_data = db.get_instance_full(&target_name)?;
 
@@ -450,7 +477,22 @@ fn start_rebind(
         eprintln!("[hcom] warn: delete_session_bindings failed for {target_name}: {e}");
     }
 
-    // Delete old identity if different from target
+    // Delete old identity if different from target. A rename is recorded as
+    // the old name's stop, so it never disappears without a life event.
+    if current_row.is_some() {
+        let snapshot = db.get_instance_snapshot(&current_name).ok().flatten();
+        let life = json!({
+            "action": "stopped",
+            "by": current_name,
+            "reason": "renamed",
+            "renamed_to": target_name,
+            "process_id": ctx.process_id,
+            "snapshot": snapshot,
+        });
+        if let Err(e) = db.log_event("life", &current_name, &life) {
+            eprintln!("[hcom] warn: rename life event failed for {current_name}: {e}");
+        }
+    }
     if !current_name.is_empty()
         && current_name != target_name
         && let Err(e) = db.delete_instance(&current_name)
@@ -1174,6 +1216,8 @@ mod tests {
         // The first start draws its name at random and "nova" is one of the
         // likeliest draws; reclaiming the drawn name would rebind to itself.
         let target = if first == "nova" { "luna" } else { "nova" };
+        // Reclaim means the name existed: a never-seen name is refused.
+        log_stopped_snapshot(&db, target, "claude", "/tmp/project", "sess-old", 0);
 
         assert_eq!(start_rebind(&db, target, &ctx, None).unwrap(), 0);
         assert_eq!(
@@ -1711,5 +1755,151 @@ mod tests {
         unsafe {
             libc::kill(orphan as libc::pid_t, libc::SIGKILL);
         }
+    }
+
+    /// A caller bound to a live identity: row with a delivery cursor, plus
+    /// its session and process bindings.
+    fn bind_caller(db: &HcomDb, name: &str, sid: &str, process_id: &str, cursor: i64) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, directory, last_event_id, status, status_time,
+                  last_seen, created_at)
+                 VALUES (?1, ?2, 'claude', '/tmp/project', ?3, 'active', 0, 0, 1)",
+                params![name, sid, cursor],
+            )
+            .unwrap();
+        db.set_session_binding(sid, name).unwrap();
+        db.set_process_binding(process_id, sid, name).unwrap();
+    }
+
+    fn caller_ctx(process_id: &str) -> HcomContext {
+        make_ctx(
+            &[("CLAUDECODE", "1"), ("HCOM_PROCESS_ID", process_id)],
+            "/tmp/project",
+        )
+    }
+
+    /// The valo incident: a process holding identity A runs
+    /// `start --as <never-seen>`. That is not a reclaim, so it must refuse and
+    /// leave A's row and both bindings exactly as they were.
+    #[test]
+    #[serial]
+    fn test_start_rebind_refuses_never_seen_name_from_bound_caller() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let caller = format!("stas_a_{}", std::process::id());
+        let target = format!("stas_never_{}", std::process::id());
+        bind_caller(&db, &caller, "sess-a", "proc-a", 42);
+
+        let code = start_rebind(&db, &target, &caller_ctx("proc-a"), None).unwrap();
+
+        assert_eq!(code, 1, "a never-seen name is not the caller's to reclaim");
+        let row = db
+            .get_instance_full(&caller)
+            .unwrap()
+            .expect("A's row kept");
+        assert_eq!(row.session_id.as_deref(), Some("sess-a"));
+        assert_eq!(row.last_event_id, 42);
+        assert_eq!(
+            db.get_session_binding("sess-a").unwrap().as_deref(),
+            Some(caller.as_str())
+        );
+        assert_eq!(
+            db.get_process_binding_full("proc-a").unwrap(),
+            Some((Some("sess-a".to_string()), caller.clone()))
+        );
+        assert!(db.get_instance_full(&target).unwrap().is_none());
+        assert!(!identity::has_life_history(&db, &target));
+    }
+
+    /// valo reclaiming valo after its row was renamed away: the name has life
+    /// history, so the reclaim proceeds and takes both bindings. The cursor is
+    /// valo's own: the identity it replaces read further, but messages to valo
+    /// past valo's snapshot cursor are still unread.
+    #[test]
+    #[serial]
+    fn test_start_rebind_reclaims_name_with_history_from_bound_caller() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let caller = format!("stas_fill_{}", std::process::id());
+        let target = format!("stas_valo_{}", std::process::id());
+        log_stopped_snapshot(&db, &target, "claude", "/tmp/project", "sess-v", 100);
+        bind_caller(&db, &caller, "sess-v", "proc-v", 900);
+
+        let code = start_rebind(&db, &target, &caller_ctx("proc-v"), None).unwrap();
+
+        assert_eq!(code, 0, "a name with history is reclaimable");
+        let row = db
+            .get_instance_full(&target)
+            .unwrap()
+            .expect("reclaimed row");
+        assert_eq!(
+            row.last_event_id, 100,
+            "the reclaimed name resumes at its own cursor, not the replaced identity's"
+        );
+        assert_eq!(
+            db.get_session_binding("sess-v").unwrap().as_deref(),
+            Some(target.as_str())
+        );
+        assert_eq!(
+            db.get_process_binding_full("proc-v").unwrap(),
+            Some((Some("sess-v".to_string()), target.clone()))
+        );
+        assert!(db.get_instance_full(&caller).unwrap().is_none());
+    }
+
+    /// Re-registering the identity the caller already holds keeps its live
+    /// cursor: an older stopped snapshot of the same name never rewinds it.
+    #[test]
+    #[serial]
+    fn test_start_rebind_same_name_keeps_live_cursor_over_old_snapshot() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let name = format!("stas_self_{}", std::process::id());
+        log_stopped_snapshot(&db, &name, "claude", "/tmp/project", "sess-s", 100);
+        bind_caller(&db, &name, "sess-s", "proc-s", 900);
+
+        assert_eq!(
+            start_rebind(&db, &name, &caller_ctx("proc-s"), None).unwrap(),
+            0
+        );
+
+        let row = db.get_instance_full(&name).unwrap().expect("row kept");
+        assert_eq!(row.last_event_id, 900);
+    }
+
+    /// A real rename writes the old name's stop: never a silent disappearance.
+    #[test]
+    #[serial]
+    fn test_start_rebind_rename_logs_stopped_renamed_for_old_name() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let caller = format!("stas_old_{}", std::process::id());
+        let target = format!("stas_new_{}", std::process::id());
+        log_stopped_snapshot(&db, &target, "claude", "/tmp/project", "sess-r", 7);
+        bind_caller(&db, &caller, "sess-r", "proc-r", 9);
+
+        assert_eq!(
+            start_rebind(&db, &target, &caller_ctx("proc-r"), None).unwrap(),
+            0
+        );
+
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = ?
+                 ORDER BY id DESC LIMIT 1",
+                params![caller],
+                |row| row.get(0),
+            )
+            .expect("the renamed-away name has a life event");
+        let life: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(life["action"], "stopped");
+        assert_eq!(life["reason"], "renamed");
+        assert_eq!(life["by"], caller.as_str());
+        assert_eq!(life["renamed_to"], target.as_str());
+        assert_eq!(life["snapshot"]["session_id"], "sess-r");
+        assert_eq!(life["snapshot"]["last_event_id"], 9);
     }
 }
