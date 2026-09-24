@@ -137,6 +137,7 @@ impl IncarnationToken {
 /// [`classify_lost_teardown`]).
 struct ResolvedIncarnation {
     token: IncarnationToken,
+    #[allow(dead_code)]
     event_watermark: i64,
 }
 
@@ -480,25 +481,26 @@ fn classify_lost_teardown(
                 json_extract(data, '$.snapshot.session_id'), \
                 json_extract(data, '$.snapshot.agent_id'), \
                 json_extract(data, '$.snapshot') FROM events \
-         WHERE type = 'life' AND instance = ?1 AND id >= ?2 \
-           AND json_extract(data, '$.action') = 'stopped'",
+         WHERE type = 'life' AND instance = ?1 \
+           AND json_extract(data, '$.action') = 'stopped' \
+           AND (json_extract(data, '$.by') IN ('session', 'pty') \
+             OR json_extract(data, '$.by') = 'daemon')",
     )?;
-    let mut process_ids =
-        stmt.query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                match r.get_ref(3)? {
-                    rusqlite::types::ValueRef::Null => None,
-                    rusqlite::types::ValueRef::Integer(bits) => Some(bits as u64),
-                    _ => None,
-                },
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-            ))
-        })?;
+    let mut process_ids = stmt.query_map(rusqlite::params![name], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            match r.get_ref(3)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Integer(bits) => Some(bits as u64),
+                _ => None,
+            },
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<String>>(6)?,
+        ))
+    })?;
     let mut self_stop = false;
     for row in &mut process_ids {
         let (
@@ -543,7 +545,11 @@ fn classify_lost_teardown(
         Some(current)
             if current.created_at.to_bits() == token.created_at.to_bits()
                 && current.session_id == token.session_id
-                && current.agent_id == token.agent_id =>
+                && current.agent_id == token.agent_id
+                && current
+                    .binding_ids
+                    .iter()
+                    .all(|id| token.binding_ids.contains(id)) =>
         {
             TeardownOutcome::SessionStoppedKeptRow
         }
