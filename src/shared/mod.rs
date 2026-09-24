@@ -5,6 +5,7 @@ pub mod constants;
 pub mod context;
 pub mod errors;
 pub mod identity;
+pub mod launch_dir;
 pub mod platform;
 pub mod terminal_presets;
 pub mod time;

@@ -464,10 +464,11 @@ fn omp_owner_close_releases_row_and_resume_restores_title() {
     let name = format!("rocclose{}", std::process::id());
     let process_id = format!("pid-roc-close-{}", std::process::id());
     save_test_instance(&db, &name, ST_LISTENING);
+    // Any real dir outside /tmp: omp resume redirects /tmp snapshot dirs.
     db.conn()
         .execute(
-            "UPDATE instances SET session_id = 'sid-roc-close', directory = '/tmp' WHERE name = ?1",
-            rusqlite::params![name],
+            "UPDATE instances SET session_id = 'sid-roc-close', directory = ?2 WHERE name = ?1",
+            rusqlite::params![name, env!("CARGO_MANIFEST_DIR")],
         )
         .unwrap();
     db.set_process_binding(&process_id, "sid-roc-close", &name)
@@ -509,6 +510,43 @@ fn omp_owner_close_releases_row_and_resume_restores_title() {
     .unwrap();
     assert_eq!(plan.launch.purpose.as_deref(), Some("zagdb: rc.48 roll"));
     assert_eq!(plan.launch.current.as_deref(), Some("probing WAL"));
+
+    cleanup(path);
+}
+
+/// omp refuses to start with cwd under /tmp, so an explicit `--dir /tmp` on
+/// an omp resume is refused before any launch, naming the guard.
+#[cfg(target_os = "linux")]
+#[test]
+fn omp_resume_refuses_explicit_tmp_dir() {
+    crate::config::Config::init();
+    let (db, path) = setup_test_db();
+    let name = format!("rocdir{}", std::process::id());
+    save_test_instance(&db, &name, ST_LISTENING);
+    db.conn()
+        .execute(
+            "UPDATE instances SET session_id = 'sid-roc-dir', directory = ?2 WHERE name = ?1",
+            rusqlite::params![name, env!("CARGO_MANIFEST_DIR")],
+        )
+        .unwrap();
+    let argv = [
+        "--name".to_string(),
+        name.clone(),
+        "--reason".to_string(),
+        "shutdown".to_string(),
+    ];
+    assert_eq!(handle_stop(&db, &argv).0, 0);
+
+    let err = crate::commands::resume::prepare_resume_plan(
+        &db,
+        &name,
+        false,
+        &["--dir".to_string(), "/tmp".to_string()],
+        &crate::router::GlobalFlags::default(),
+    )
+    .err()
+    .expect("explicit --dir /tmp must be refused for omp");
+    assert!(err.to_string().contains("omp /tmp start guard"), "{err}");
 
     cleanup(path);
 }

@@ -185,6 +185,11 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
                 if !path.is_dir() {
                     bail!("--dir path does not exist or is not a directory: {}", dir);
                 }
+                // New instance names are not assigned yet, so no seat here.
+                if matches!(launch_tool, LaunchTool::Omp) {
+                    crate::shared::launch_dir::guard_launch_dir(dir, None, true)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
                 path.canonicalize()
                     .map(|p| crate::shared::platform::child_process_path(&p))
                     .map(|p| p.to_string_lossy().to_string())
