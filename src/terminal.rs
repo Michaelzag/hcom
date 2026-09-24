@@ -1292,6 +1292,12 @@ where
         strip.insert(v);
     }
     strip.insert("HCOM_LAUNCHED_PRESET");
+    // The caller's name must not reach the launch shell's initial environ;
+    // the script's own export is the only source of the seat's name. Kept
+    // out of HCOM_IDENTITY_VARS, which also drives the run-here strip set
+    // and the runner scripts' unset lines.
+    strip.insert("HCOM_INSTANCE_NAME");
+    strip.insert("HCOM_NAME");
 
     vars.into_iter()
         .filter(|(k, _)| !strip.contains(k.as_str()))
@@ -2867,6 +2873,18 @@ mod tests {
         assert_eq!(info.pane_id, "pane-1");
         assert_eq!(info.process_id, "proc-1");
         assert_eq!(info.terminal_id, "term-1");
+    }
+
+    #[test]
+    fn test_launcher_env_strips_caller_instance_name() {
+        let env = get_launcher_env_from(vec![
+            ("HCOM_INSTANCE_NAME".into(), "tuba".into()),
+            ("HCOM_NAME".into(), "tuba".into()),
+            ("PATH".into(), "/bin".into()),
+        ]);
+        assert!(!env.contains_key("HCOM_INSTANCE_NAME"));
+        assert!(!env.contains_key("HCOM_NAME"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
     }
 
     #[test]
