@@ -2082,6 +2082,25 @@ mod tests {
         assert!(!is_falsy("on"));
     }
 
+    /// The omp plugin pre-gates plain sessions on the same raw value the Rust
+    /// gate parses; both sides check this table (plugin side:
+    /// `src/omp_plugin/plain_sessions.test.ts`).
+    #[test]
+    fn plain_sessions_cases_match_rust_parser() {
+        let cases: Vec<(String, bool)> =
+            serde_json::from_str(include_str!("omp_plugin/plain_sessions_cases.json")).unwrap();
+        let disagreements: Vec<String> = cases
+            .iter()
+            .filter(|(value, enabled)| {
+                let mut config = HcomConfig::default();
+                config.set_field("plain_sessions", value).unwrap();
+                config.plain_sessions != *enabled
+            })
+            .map(|(value, enabled)| format!("{value:?}: table={enabled}"))
+            .collect();
+        assert!(disagreements.is_empty(), "{disagreements:?}");
+    }
+
     #[test]
     fn test_to_env_dict_roundtrip() {
         let config = HcomConfig::default();

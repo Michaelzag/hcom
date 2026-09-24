@@ -1,0 +1,22 @@
+[
+	["0", false],
+	["false", false],
+	["False", false],
+	["no", false],
+	["off", false],
+	["", false],
+	["1", true],
+	["true", true],
+	["True", true],
+	["TRUE", true],
+	["yes", true],
+	["YES", true],
+	["on", true],
+	["ON", true],
+	["2", true],
+	["FALSE", true],
+	["No", true],
+	[" true ", true],
+	["false ", true],
+	["0x1", true]
+]

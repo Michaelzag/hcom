@@ -7,7 +7,8 @@
   },
   "packageManager": "npm@10.9.8",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test src/*_plugin/*.test.ts"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.81.1",

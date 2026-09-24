@@ -113,12 +113,22 @@ log("INFO", "identity_resolved", null, {
 	reason: resolvedIdentity.reason,
 });
 
+// The Rust gate reads `plain_sessions` as `!is_falsy(value)` (src/config.rs
+// `is_falsy`, applied by `HcomConfig::set_field`): exactly these six values
+// are false, case-sensitive and untrimmed; everything else is true.
+const RUST_FALSY_VALUES: Record<string, true> = { "0": true, false: true, False: true, no: true, off: true, "": true };
+export function plainSessionsValueEnabled(value: string): boolean {
+	return !Object.hasOwn(RUST_FALSY_VALUES, value);
+}
+
 let plainSessionsPromise: Promise<boolean> | null = null;
 function plainSessionsEnabled(): Promise<boolean> {
-	plainSessionsPromise ??= hcom(["config", "plain_sessions"]).then((result) => {
+	// `--json` carries the raw value; the plain form prints "(not set)" for an
+	// empty one instead of the value itself.
+	plainSessionsPromise ??= hcom(["config", "--json", "plain_sessions"]).then((result) => {
 		if (result.code !== 0) return false;
-		const value = result.stdout.trim();
-		return value === "true" || value === "1";
+		const value = JSON.parse(result.stdout).HCOM_PLAIN_SESSIONS;
+		return typeof value === "string" && plainSessionsValueEnabled(value);
 	}).catch(() => false);
 	return plainSessionsPromise;
 }

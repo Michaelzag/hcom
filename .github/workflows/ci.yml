@@ -79,6 +79,7 @@ jobs:
           node-version: 22.23.1
           cache: npm
       - run: bash ./scripts/typecheck.sh
+      - run: npm test
 
   # Fails if the checked-in release.yml has drifted from what the pinned
   # cargo-dist would generate. Version must match cargo-dist-version in
