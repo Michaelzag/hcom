@@ -1505,6 +1505,47 @@ mod tests {
     }
 
     #[test]
+    fn test_collision_subscription_alerts_on_shared_paths_not_uris() {
+        use std::collections::HashMap;
+
+        let (db, db_path) = setup_full_test_db();
+        for name in ["one", "two"] {
+            db.conn
+                .execute(
+                    "INSERT INTO instances (name, created_at) VALUES (?1, 1000.0)",
+                    params![name],
+                )
+                .unwrap();
+        }
+        let filters = HashMap::from([("collision".to_string(), vec!["true".to_string()])]);
+        create_filter_subscription(&db, &filters, &[], "two", false, None).unwrap();
+
+        // Both seats write `detail`; count the collision alerts naming it.
+        let collision_alerts = |detail: &str| -> i64 {
+            for instance in ["one", "two"] {
+                let data = serde_json::json!({"status": "active", "context": "tool:write", "detail": detail});
+                db.log_event("status", instance, &data).unwrap();
+            }
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE type = 'message'
+                     AND json_extract(data, '$.text') LIKE '%COLLISION%'
+                     AND json_extract(data, '$.text') LIKE ?1",
+                    params![format!("%{detail}")],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        for uri in ["xd://retain", "agent://x", "proc://x/kill"] {
+            assert_eq!(collision_alerts(uri), 0, "{uri}");
+        }
+        assert_eq!(collision_alerts("/home/u/proj/src/main.rs"), 1);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
     fn test_subscription_recursion_guard_sys_prefix() {
         let (db, db_path) = setup_full_test_db();
 
