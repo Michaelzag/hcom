@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::db::HcomDb;
-use crate::hooks::common::{StopOutcome, stop_instance, stop_instance_without_reap};
+use crate::hooks::common::{StopOutcome, stop_instance_without_reap};
 use crate::identity;
 use crate::log::log_info;
 use crate::paths;
@@ -252,9 +252,9 @@ pub fn kill_tracked_instance(
 
 /// [`kill_tracked_instance`] with an injectable self set and reap:
 /// production passes [`crate::proctruth::caller_ancestor_pids`] and the real
-/// [`crate::proctruth::reap_instance_tree_for_excluding`]; tests pass a fake
-/// set holding a sleeper pid plus the real caller pid, and a reap that can
-/// mutate the row mid-kill (the teardown CAS seam).
+/// [`crate::proctruth::reap_instance_tree_for_excluding_captured`]; tests
+/// pass a fake set holding a sleeper pid plus the real caller pid, and a reap
+/// that can mutate the row mid-kill (the teardown CAS seam).
 #[allow(clippy::too_many_arguments)]
 fn kill_tracked_instance_with_self_pids(
     db: &HcomDb,
@@ -268,14 +268,16 @@ fn kill_tracked_instance_with_self_pids(
         crate::proctruth::ReapCapture,
     ) -> Result<(), crate::proctruth::ReapError>,
 ) -> Result<KillTrackedResult, String> {
-    let inst = db
-        .get_instance_full(name)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Agent '{}' not found", name))?;
+    // The row and its binding epoch come from ONE snapshot: separate reads
+    // can straddle a `start --as` and pair one incarnation's row with
+    // another's bindings.
+    let (inst, binding_ids) = db
+        .get_instance_with_bindings(name)
+        .map_err(|e| e.to_string())?;
+    let inst = inst.ok_or_else(|| format!("Agent '{}' not found", name))?;
     let pid = inst
         .pid
         .ok_or_else(|| format!("No tracked PID for '{}'", name))? as u32;
-    let binding_ids = db.process_binding_ids(name).map_err(|e| e.to_string())?;
 
     // The incarnation this kill resolves against: the row as read plus its
     // binding epoch, and the events watermark read with it. Captured BEFORE
@@ -304,8 +306,10 @@ fn kill_tracked_instance_with_self_pids(
         .collect();
     // Capture identity, owner ancestry, and the first carrier set before
     // kill_instance signals the recorded process group. Its root may die and
-    // reparent eligible descendants before reap begins.
-    let capture = crate::proctruth::capture_reap_carriers(db, name, &binding_ids, &excluded);
+    // reparent eligible descendants before reap begins. Built from the same
+    // snapshot as the incarnation above.
+    let capture =
+        crate::proctruth::capture_reap_carriers(name, Some(&inst), &binding_ids, &excluded);
     if !excluded.is_empty() {
         return kill_self_tracked_instance(
             db,
@@ -436,7 +440,10 @@ fn teardown_if_incarnation_unchanged(
 /// touch a rebound row). Then a gone row was released by the session, and a
 /// row with the same `created_at` + `session_id` whose bindings only shrank
 /// was kept by it. Anything else — no such event, a new identity, or any
-/// binding the kill never resolved — is a genuine re-registration.
+/// binding the kill never resolved — is a genuine re-registration. An event
+/// with neither bits nor a readable legacy `created_at` (no snapshot, or a
+/// `created_at` that is absent, null, non-numeric, or not a scalar) names
+/// no incarnation: it is logged and never taken for the resolved one.
 /// `current` is the incarnation the CAS just read in this transaction.
 fn classify_lost_teardown(
     tx: &rusqlite::Transaction<'_>,
@@ -446,7 +453,7 @@ fn classify_lost_teardown(
 ) -> Result<TeardownOutcome> {
     let token = &incarnation.token;
     let mut stmt = tx.prepare(
-        "SELECT json_extract(data, '$.process_id'), \
+        "SELECT id, json_extract(data, '$.process_id'), \
                 json_extract(data, '$.snapshot.created_at_bits'), \
                 json_extract(data, '$.snapshot') FROM events \
          WHERE type = 'life' AND instance = ?1 AND id > ?2 \
@@ -457,14 +464,15 @@ fn classify_lost_teardown(
     let mut process_ids =
         stmt.query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
             Ok((
-                r.get::<_, Option<String>>(0)?,
-                r.get::<_, Option<i64>>(1)?.map(|bits| bits as u64),
-                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<i64>>(2)?.map(|bits| bits as u64),
+                r.get::<_, Option<String>>(3)?,
             ))
         })?;
     let mut self_stop = false;
     for row in &mut process_ids {
-        let (process_id, snapshot_created_at_bits, snapshot) = row?;
+        let (event_id, process_id, snapshot_created_at_bits, snapshot) = row?;
         let matches = match process_id {
             Some(id) => token.binding_ids.contains(&id),
             None => match snapshot_created_at_bits {
@@ -477,10 +485,26 @@ fn classify_lost_teardown(
                 // the exact bit pattern of its raw JSON token — the correctly
                 // rounded decode the backfill uses — so a missing bits field
                 // is never treated as a mismatch.
-                None => {
-                    snapshot.as_deref().and_then(crate::db::raw_created_at_bits)
-                        == Some(token.created_at.to_bits())
-                }
+                None => match snapshot.as_deref().and_then(crate::db::raw_created_at_bits) {
+                    Some(bits) => bits == token.created_at.to_bits(),
+                    // No incarnation to read: never guessed to be this one.
+                    // Logged, so the conservative report is explained.
+                    None => {
+                        crate::log::log_warn(
+                            "kill",
+                            "teardown.stop_event_unreadable",
+                            &format!(
+                                "instance={name} event={event_id} reason={}",
+                                if snapshot.is_some() {
+                                    "unreadable-created_at"
+                                } else {
+                                    "no-snapshot"
+                                }
+                            ),
+                        );
+                        false
+                    }
+                },
             },
         };
         if matches {
@@ -824,10 +848,10 @@ fn capture_orphan_carriers(
         .names
         .iter()
         .map(|name| {
-            let binding_ids = db.process_binding_ids(name).unwrap_or_default();
+            let (row, binding_ids) = db.get_instance_with_bindings(name).unwrap_or_default();
             (
                 name.clone(),
-                crate::proctruth::capture_reap_carriers(db, name, &binding_ids, &[]),
+                crate::proctruth::capture_reap_carriers(name, row.as_ref(), &binding_ids, &[]),
             )
         })
         .collect()
@@ -849,8 +873,14 @@ fn report_release_failure(name: &str, outcome: &StopOutcome) -> bool {
 }
 
 /// Kill all instances.
+///
+/// The enumeration is the snapshot: every row and its process bindings are
+/// read in one read transaction, and each row's signal, pre-signal capture,
+/// and release all derive from that one pair. A `start --as` landing after
+/// the snapshot meets the release's incarnation guard; nothing re-reads the
+/// row to resolve it.
 fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<i32> {
-    let instances = db.iter_instances_full()?;
+    let instances = db.iter_instances_with_bindings()?;
     let mut killed = 0;
     let mut failed = 0;
     let mut incomplete = 0;
@@ -858,18 +888,19 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
     // Collect active PIDs for orphan filtering
     let mut active_pids = HashSet::new();
 
-    for inst in &instances {
+    for (inst, binding_ids) in &instances {
         // Skip remote instances
         if inst.origin_device_id.is_some() {
             continue;
         }
 
+        // Before any signal, from the snapshot: binds the release below to
+        // this incarnation, pid-less rows included.
+        let pre_capture =
+            crate::proctruth::capture_reap_carriers(&inst.name, Some(inst), binding_ids, &[]);
         if let Some(pid) = inst.pid {
             active_pids.insert(pid as u32);
             let is_headless = inst.background != 0;
-            let binding_ids = db.process_binding_ids(&inst.name).unwrap_or_default();
-            let pre_capture =
-                crate::proctruth::capture_reap_carriers(db, &inst.name, &binding_ids, &[]);
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
                 kill_instance(db, &inst.name, pid as u32, inst, is_headless);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
@@ -911,7 +942,13 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
             println!("  To resume: hcom r {}", inst.name);
         } else {
             // No PID tracked — just clean up
-            let outcome = stop_instance(db, &inst.name, initiator, "killed");
+            let outcome = crate::hooks::common::stop_instance_with_capture(
+                db,
+                &inst.name,
+                initiator,
+                "killed",
+                pre_capture,
+            );
             failed += report_release_failure(&inst.name, &outcome) as i32;
         }
     }
@@ -982,12 +1019,13 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
     Ok(if failed > 0 || incomplete > 0 { 1 } else { 0 })
 }
 
-/// Kill instances by tag.
+/// Kill instances by tag. Resolved like [`kill_all`]: one snapshot of rows
+/// and bindings feeds each row's signal, capture, and release.
 fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &str) -> Result<i32> {
-    let instances = db.iter_instances_full()?;
+    let instances = db.iter_instances_with_bindings()?;
     let tagged: Vec<_> = instances
         .iter()
-        .filter(|inst| inst.tag.as_deref() == Some(tag) && inst.origin_device_id.is_none())
+        .filter(|(inst, _)| inst.tag.as_deref() == Some(tag) && inst.origin_device_id.is_none())
         .collect();
 
     let mut killed = 0;
@@ -995,12 +1033,12 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     let mut incomplete = 0;
 
     // Kill active instances with this tag
-    for inst in &tagged {
+    for (inst, binding_ids) in &tagged {
+        // Before any signal, from the snapshot (see `kill_all`).
+        let pre_capture =
+            crate::proctruth::capture_reap_carriers(&inst.name, Some(inst), binding_ids, &[]);
         if let Some(pid) = inst.pid {
             let is_headless = inst.background != 0;
-            let binding_ids = db.process_binding_ids(&inst.name).unwrap_or_default();
-            let pre_capture =
-                crate::proctruth::capture_reap_carriers(db, &inst.name, &binding_ids, &[]);
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
                 kill_instance(db, &inst.name, pid as u32, inst, is_headless);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
@@ -1040,7 +1078,13 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         } else {
             // No PID tracked — clean up DB entry
             println!("No tracked process for '{}', stopping instance.", inst.name);
-            let outcome = stop_instance(db, &inst.name, initiator, "killed");
+            let outcome = crate::hooks::common::stop_instance_with_capture(
+                db,
+                &inst.name,
+                initiator,
+                "killed",
+                pre_capture,
+            );
             failed += report_release_failure(&inst.name, &outcome) as i32;
         }
     }
@@ -1048,7 +1092,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     // Also kill orphan processes with this tag (stopped but still running)
     let active_pids: HashSet<u32> = tagged
         .iter()
-        .filter_map(|i| i.pid.map(|p| p as u32))
+        .filter_map(|(inst, _)| inst.pid.map(|p| p as u32))
         .collect();
     let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
     let tagged_orphans: Vec<_> = orphans.iter().filter(|o| o.tag == tag).collect();
@@ -1691,8 +1735,8 @@ mod tests {
     /// and events watermark), captured the way production does.
     #[cfg(unix)]
     fn capture_incarnation(db: &crate::db::HcomDb, name: &str) -> ResolvedIncarnation {
-        let row = db.get_instance_full(name).unwrap().expect("row");
-        ResolvedIncarnation::capture(db, &row, &db.process_binding_ids(name).unwrap()).unwrap()
+        let (row, binding_ids) = db.get_instance_with_bindings(name).unwrap();
+        ResolvedIncarnation::capture(db, &row.expect("row"), &binding_ids).unwrap()
     }
 
     /// A: kill reaps the whole name tree — even processes outside the
@@ -1933,7 +1977,7 @@ mod tests {
             .unwrap();
         db.set_process_binding("proc-kill-fc", "sess-kill-fc", &name)
             .unwrap();
-        let binding_ids = db.process_binding_ids(&name).unwrap();
+        let (row, binding_ids) = db.get_instance_with_bindings(&name).unwrap();
         let incarnation = capture_incarnation(&db, &name);
 
         // A name-only carrier that outlives the signal budget — reported as
@@ -1951,7 +1995,7 @@ mod tests {
             &binding_ids,
             &excluded,
             &incarnation,
-            crate::proctruth::capture_reap_carriers(&db, &name, &binding_ids, &excluded),
+            crate::proctruth::capture_reap_carriers(&name, row.as_ref(), &binding_ids, &excluded),
             |_, _, _, _capture| Err(crate::proctruth::ReapError::Survivors(vec![survivor_pid])),
         )
         .err()
@@ -2073,7 +2117,7 @@ mod tests {
             .unwrap();
         db.set_process_binding("proc-kill-rb-old", "sess-kill-rb", &name)
             .unwrap();
-        let binding_ids = db.process_binding_ids(&name).unwrap();
+        let (row, binding_ids) = db.get_instance_with_bindings(&name).unwrap();
 
         // The old incarnation's live tree; the real reap below must take it
         // even though the row is rebound before the teardown.
@@ -2091,7 +2135,7 @@ mod tests {
             &binding_ids,
             &excluded,
             &incarnation,
-            crate::proctruth::capture_reap_carriers(&db, &name, &binding_ids, &excluded),
+            crate::proctruth::capture_reap_carriers(&name, row.as_ref(), &binding_ids, &excluded),
             |n, b, e, capture| {
                 // The real reap, then the mid-kill rebind: same name, new
                 // binding epoch (the `start --as` shape).
@@ -3103,6 +3147,230 @@ mod tests {
             TeardownOutcome::RowReRegistered
         );
         let _ = _guard;
+    }
+
+    // The legacy `created_at` fallback serves two sites: the kill's
+    // lost-teardown classification (a `stopped` snapshot as SQLite renders
+    // it) and the session finalizers' claim check (the raw kv claim). A token
+    // neither can read names no incarnation and is never taken for one: the
+    // classification logs it and keeps the conservative report, and a live
+    // kill's claim holds the row untouched.
+    #[cfg(unix)]
+    const LEGACY_CREATED_AT: f64 = 1_790_000_000.000_002_1;
+
+    #[cfg(unix)]
+    fn legacy_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    #[cfg(unix)]
+    fn logged(event: &str, needle: &str) -> bool {
+        std::fs::read_to_string(crate::paths::log_path())
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.contains(event) && line.contains(needle))
+    }
+
+    /// Classify a lost teardown (row gone) against one bindingless `stopped`
+    /// event with raw `data`; returns the outcome and the event id.
+    #[cfg(unix)]
+    fn classify_legacy_stop_event(db: &HcomDb, name: &str, data: &str) -> (TeardownOutcome, i64) {
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) \
+                 VALUES ('2026-09-24T00:00:00Z', 'life', ?1, ?2)",
+                rusqlite::params![name, data],
+            )
+            .unwrap();
+        let event_id = db.conn().last_insert_rowid();
+        let incarnation = ResolvedIncarnation {
+            token: IncarnationToken::new(LEGACY_CREATED_AT, None, vec![]),
+            event_watermark: 0,
+        };
+        let outcome = db
+            .with_immediate_transaction(|tx| classify_lost_teardown(tx, name, &incarnation, None))
+            .unwrap();
+        (outcome, event_id)
+    }
+
+    #[cfg(unix)]
+    fn assert_stop_event_not_matched(db: &HcomDb, name: &str, data: &str, reason: &str) {
+        let (outcome, event_id) = classify_legacy_stop_event(db, name, data);
+        assert_eq!(outcome, TeardownOutcome::RowReRegistered, "{data}");
+        assert!(
+            logged(
+                "teardown.stop_event_unreadable",
+                &format!("instance={name} event={event_id} reason={reason}")
+            ),
+            "the unreadable event is logged: {data}"
+        );
+    }
+
+    /// A live kill's claim on `name` (session `sess-legacy`) with no bits
+    /// and `created_at_member` spliced in raw. Both session finalizers must
+    /// hold the row for the kill: no exit writes, no binding release, no
+    /// stopped event, and the hold logged.
+    #[cfg(unix)]
+    fn assert_live_claim_holds_the_row(db: &HcomDb, name: &str, created_at_member: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id) \
+                 VALUES (?1, 'active', ?2, 'codex', 'sess-legacy')",
+                rusqlite::params![name, LEGACY_CREATED_AT],
+            )
+            .unwrap();
+        db.set_process_binding("proc-legacy", "sess-legacy", name)
+            .unwrap();
+        let pid = std::process::id();
+        let start = crate::sys::process::identity(pid).expect("own process identity");
+        let claim = format!(
+            r#"{{"pid":{pid},"process_start":{},"session_id":"sess-legacy"{created_at_member}}}"#,
+            serde_json::Value::String(start)
+        );
+        db.kv_set(&format!("teardown_claim:{name}"), Some(&claim))
+            .unwrap();
+
+        crate::hooks::common::soft_finalize_session(db, name, "shutdown", None, false);
+        assert_eq!(
+            crate::hooks::common::finalize_session(db, name, "shutdown", None),
+            StopOutcome::AlreadyStopped,
+            "{claim}"
+        );
+        let row = db
+            .get_instance_full(name)
+            .unwrap()
+            .expect("row held for the live kill");
+        assert_eq!(row.status, "active", "no exit writes: {claim}");
+        assert_eq!(
+            db.process_binding_ids(name).unwrap(),
+            vec!["proc-legacy".to_string()],
+            "bindings left to the kill: {claim}"
+        );
+        assert_eq!(
+            stopped_events(db, name),
+            0,
+            "the stopped event is the kill's"
+        );
+        assert!(
+            logged(
+                "sessionend.teardown_claim_held",
+                &format!("instance={name} reason=unreadable-created_at")
+            ),
+            "the hold is logged: {claim}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn legacy_created_at_absent_is_never_matched_and_holds_the_row() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-absent", std::process::id());
+        assert_stop_event_not_matched(
+            &db,
+            &format!("{name}-event"),
+            r#"{"action":"stopped","by":"session","reason":"exit:normal","process_id":null,"snapshot":{"name":"x"}}"#,
+            "unreadable-created_at",
+        );
+        assert_live_claim_holds_the_row(&db, &format!("{name}-claim"), "");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn legacy_created_at_null_is_never_matched_and_holds_the_row() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-null", std::process::id());
+        assert_stop_event_not_matched(
+            &db,
+            &format!("{name}-event"),
+            r#"{"action":"stopped","by":"session","reason":"exit:normal","process_id":null,"snapshot":{"created_at":null}}"#,
+            "unreadable-created_at",
+        );
+        assert_live_claim_holds_the_row(&db, &format!("{name}-claim"), r#","created_at":null"#);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn legacy_created_at_non_numeric_string_is_never_matched_and_holds_the_row() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-iso", std::process::id());
+        assert_stop_event_not_matched(
+            &db,
+            &format!("{name}-event"),
+            r#"{"action":"stopped","by":"session","reason":"exit:normal","process_id":null,"snapshot":{"created_at":"2026-09-24T10:00:00Z"}}"#,
+            "unreadable-created_at",
+        );
+        assert_live_claim_holds_the_row(
+            &db,
+            &format!("{name}-claim"),
+            r#","created_at":"2026-09-24T10:00:00Z""#,
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn legacy_created_at_non_scalar_is_never_matched_and_holds_the_row() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-bool", std::process::id());
+        assert_stop_event_not_matched(
+            &db,
+            &format!("{name}-event"),
+            r#"{"action":"stopped","by":"session","reason":"exit:normal","process_id":null,"snapshot":{"created_at":true}}"#,
+            "unreadable-created_at",
+        );
+        assert_live_claim_holds_the_row(&db, &format!("{name}-claim"), r#","created_at":true"#);
+    }
+
+    /// No snapshot at all: what a 0.7.29 PTY exit writes when its snapshot
+    /// read fails (and it deletes the row anyway). Classification only; a
+    /// claim has no snapshot to lose.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn stop_event_without_a_snapshot_is_never_matched() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-nosnap", std::process::id());
+        assert_stop_event_not_matched(
+            &db,
+            &name,
+            r#"{"action":"stopped","by":"pty","reason":"closed","process_id":null}"#,
+            "no-snapshot",
+        );
+    }
+
+    /// A quoted number padded before its delimiter: only a raw claim can
+    /// carry it, and the raw scan cannot read it, so the claim holds the
+    /// row. SQLite renders the same snapshot token compactly, so the
+    /// classification reads it exactly and matches the session's stop.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn padded_legacy_claim_created_at_holds_the_row() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-padded", std::process::id());
+        assert_live_claim_holds_the_row(
+            &db,
+            &format!("{name}-claim"),
+            r#","created_at": "1790000000.0000021" "#,
+        );
+        let (outcome, _) = classify_legacy_stop_event(
+            &db,
+            &format!("{name}-event"),
+            r#"{"action":"stopped","by":"session","reason":"exit:normal","process_id":null,"snapshot":{"created_at": "1790000000.0000021" }}"#,
+        );
+        assert_eq!(outcome, TeardownOutcome::SessionStoppedReleasedRow);
     }
 
     /// CAS (iv), the atomicity fix: the incarnation comparison and the

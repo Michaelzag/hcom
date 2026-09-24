@@ -168,6 +168,22 @@ impl HcomDb {
         Ok(result)
     }
 
+    /// Run `f` inside one `BEGIN DEFERRED` read transaction and commit.
+    ///
+    /// Every read inside `f` sees the same database snapshot, so reads that
+    /// must agree (a row and its process bindings) cannot straddle another
+    /// connection's commit between them. A deferred transaction takes no
+    /// write lock. Queries inside `f` must use the provided transaction.
+    pub fn with_read_snapshot<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let txn = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let result = f(&txn)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
     /// One-shot v20 backfill: give every `stopped` snapshot that carries
     /// `created_at` the exact f64 bit pattern beside it.
     ///

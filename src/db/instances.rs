@@ -839,6 +839,65 @@ impl HcomDb {
         Ok(rows)
     }
 
+    /// `name`'s row and its process binding ids (newest first), read in ONE
+    /// snapshot ([`HcomDb::with_read_snapshot`]). `start --as` deletes and
+    /// recreates a row and its bindings in separate commits, so two
+    /// independent reads can pair one incarnation's row with another's
+    /// binding epoch. The ids come back even when no row exists.
+    pub fn get_instance_with_bindings(
+        &self,
+        name: &str,
+    ) -> Result<(Option<InstanceRow>, Vec<String>)> {
+        self.with_read_snapshot(|tx| {
+            let row = tx
+                .prepare_cached("SELECT * FROM instances WHERE name = ?")?
+                .query_row(params![name], InstanceRow::from_row)
+                .optional()?;
+            let ids = tx
+                .prepare_cached(
+                    "SELECT process_id FROM process_bindings \
+                     WHERE instance_name = ? ORDER BY updated_at DESC",
+                )?
+                .query_map(params![name], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((row, ids))
+        })
+    }
+
+    /// Every row (newest first) paired with its process binding ids (newest
+    /// first), all read in ONE snapshot (see
+    /// [`Self::get_instance_with_bindings`]): a bulk operation resolves each
+    /// row against this read instead of re-reading it per name.
+    pub fn iter_instances_with_bindings(&self) -> Result<Vec<(InstanceRow, Vec<String>)>> {
+        self.with_read_snapshot(|tx| {
+            let rows: Vec<InstanceRow> = tx
+                .prepare_cached("SELECT * FROM instances ORDER BY created_at DESC")?
+                .query_map([], InstanceRow::from_row)?
+                .filter_map(|r| r.ok())
+                .collect();
+            let mut bindings: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut stmt = tx.prepare_cached(
+                "SELECT instance_name, process_id FROM process_bindings \
+                 WHERE instance_name IS NOT NULL ORDER BY updated_at DESC",
+            )?;
+            let pairs = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for pair in pairs {
+                let (name, id) = pair?;
+                bindings.entry(name).or_default().push(id);
+            }
+            Ok(rows
+                .into_iter()
+                .map(|row| {
+                    let ids = bindings.remove(&row.name).unwrap_or_default();
+                    (row, ids)
+                })
+                .collect())
+        })
+    }
+
     /// Save (INSERT OR REPLACE) an instance row.
     /// Uses a JSON Value map for flexible field specification.
     pub fn save_instance_named(

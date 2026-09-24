@@ -1500,11 +1500,16 @@ enum BoundIncarnation {
 }
 
 /// Whether `name`'s row is now another incarnation than the bound one. An
-/// absent row is not: the release CAS reports it as already stopped. A
-/// captured incarnation also loses to any binding the capture never saw (a
-/// newer epoch); bindings its own session released since do not count.
-/// Read through `conn`, so inside the finalize transaction it decides with
-/// the writes.
+/// absent row is not: the release CAS reports it as already stopped. The
+/// row identity (`created_at` bits, `session_id`, `agent_id`) decides; a
+/// captured binding epoch only ever adds a refusal. It loses to any binding
+/// the capture never saw (a newer epoch), and a non-empty capture loses to
+/// an empty current set: that set is indistinguishable from a replacement
+/// row that has not bound yet — `soft_finalize_session` with
+/// `keep_process_binding: false` empties the same row's process bindings —
+/// and both refuse. Bindings its own session released since, leaving a
+/// non-empty subset, do not count. Read through `conn`, so inside the
+/// finalize transaction it decides with the writes.
 fn row_re_registered(
     conn: &rusqlite::Connection,
     name: &str,
@@ -1557,7 +1562,8 @@ fn row_re_registered(
     let current = stmt
         .query_map(params![name], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(current.iter().any(|id| !bound_bindings.contains(id)))
+    Ok((current.is_empty() && !bound_bindings.is_empty())
+        || current.iter().any(|id| !bound_bindings.contains(id)))
 }
 
 /// The guard's refusal: nothing was signalled or written for the new row.
@@ -1670,13 +1676,33 @@ fn stop_instance_inner_scoped(
 
     // The headless group step may kill the recorded root before the reap
     // snapshots its descendants. Capture proven carrier identities first so
-    // reparenting cannot erase that ownership evidence.
-    let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
-    let capture = pre_capture.or_else(|| {
-        reap_gate.then(|| {
-            crate::proctruth::capture_reap_carriers(db, instance_name, &binding_ids, exclude)
-        })
-    });
+    // reparenting cannot erase that ownership evidence. The capture and the
+    // reap's call-start epoch come from one snapshot: a threaded capture
+    // brings the epoch it was taken with, and this stop's own capture reads
+    // the row and its bindings together.
+    let (capture, binding_ids) = match pre_capture {
+        Some(capture) => {
+            let ids = capture
+                .incarnation()
+                .map(|captured| captured.binding_ids.clone())
+                .unwrap_or_default();
+            (Some(capture), ids)
+        }
+        None if reap_gate => {
+            let (row, ids) = match db.get_instance_with_bindings(instance_name) {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    return StopOutcome::RetryableError(
+                        format!("could not read instance {instance_name}: {e}").into(),
+                    );
+                }
+            };
+            let capture =
+                crate::proctruth::capture_reap_carriers(instance_name, row.as_ref(), &ids, exclude);
+            (Some(capture), ids)
+        }
+        None => (None, Vec::new()),
+    };
 
     // Kill headless processes (background=true)
     // Skipped when the reap gate is off (the kill paths): kill owns the
@@ -2097,8 +2123,9 @@ fn stop_instance_inner_scoped(
 struct TeardownOwner {
     pid: u32,
     process_start: String,
-    // A 0.7.29 killer's claim carries the legacy `created_at` float and no
-    // bits; the comparison falls back to it (see `yield_to_teardown`).
+    // The claim writer before the bits (never in a release) wrote only a
+    // `created_at` float; the comparison falls back to it (see
+    // `yield_to_teardown`).
     created_at_bits: Option<u64>,
     session_id: Option<String>,
 }
@@ -2163,36 +2190,75 @@ impl Drop for TeardownClaim<'_> {
     }
 }
 
-fn yield_to_teardown(db: &HcomDb, instance_name: &str) -> Option<(f64, Option<String>)> {
-    let incarnation = db
+/// What a session finalizer does about an in-flight kill's teardown claim.
+enum TeardownYield {
+    /// No live killer's claim covers this row — including a dead or
+    /// malformed claim, or one naming another session or incarnation. The
+    /// finalizer owns the teardown.
+    NoClaim,
+    /// A live claim names this session but no `created_at` can be read from
+    /// it (absent, null, non-numeric, not a scalar). The row is held for the
+    /// live kill — no teardown, no exit writes, logged — and the incarnation
+    /// is never guessed.
+    Held,
+    /// Yield to the live kill, carrying the incarnation the finalizer's
+    /// exit writes may target.
+    YieldTo(f64, Option<String>),
+}
+
+/// The [`TeardownYield`] for `instance_name`: [`TeardownYield::YieldTo`]
+/// when a live killer's claim covers this row, carrying the incarnation the
+/// finalizer's exit writes may target.
+///
+/// Bits are authoritative. A claim without them is matched on the exact bit
+/// pattern of its raw `created_at` token (a float decode can change a ULP).
+/// When a live claim names this session but no `created_at` can be read
+/// from it (absent, null, non-numeric, not a scalar), the finalizer fails
+/// closed like the daemon sweep: [`TeardownYield::Held`] holds the row for
+/// the live kill, and never guesses the incarnation.
+fn yield_to_teardown(db: &HcomDb, instance_name: &str) -> TeardownYield {
+    let Some(value) = db
         .kv_get(&format!("teardown_claim:{instance_name}"))
         .ok()
         .flatten()
-        .and_then(|value| {
-            let owner: TeardownOwner = serde_json::from_str(&value).ok()?;
-            if !crate::sys::process::has_identity(owner.pid, &owner.process_start) {
-                return None;
-            }
-            let row = db.get_instance_full(instance_name).ok().flatten()?;
-            // Bits are authoritative. A 0.7.29 killer claims with the legacy
-            // `created_at` float and no bits — matched on its exact bit
-            // pattern via the raw-token decode (a float decode can change a
-            // ULP), so a missing bits field is never treated as a mismatch.
-            let created_at_matches = match owner.created_at_bits {
-                Some(bits) => row.created_at.to_bits() == bits,
-                None => crate::db::raw_created_at_bits(&value) == Some(row.created_at.to_bits()),
-            };
-            (created_at_matches && row.session_id == owner.session_id)
-                .then_some((row.created_at, row.session_id))
-        });
-    if incarnation.is_some() {
-        log::log_info(
-            "hooks",
-            "sessionend.yielded_to_teardown",
-            &format!("instance={instance_name}"),
-        );
+    else {
+        return TeardownYield::NoClaim;
+    };
+    let Some(owner) = serde_json::from_str::<TeardownOwner>(&value).ok() else {
+        return TeardownYield::NoClaim;
+    };
+    if !crate::sys::process::has_identity(owner.pid, &owner.process_start) {
+        return TeardownYield::NoClaim;
     }
-    incarnation
+    let Some(row) = db.get_instance_full(instance_name).ok().flatten() else {
+        return TeardownYield::NoClaim;
+    };
+    // Another session is another incarnation, whatever the timestamp says.
+    if row.session_id != owner.session_id {
+        return TeardownYield::NoClaim;
+    }
+    let Some(bits) = owner
+        .created_at_bits
+        .or_else(|| crate::db::raw_created_at_bits(&value))
+    else {
+        log::log_warn(
+            "hooks",
+            "sessionend.teardown_claim_held",
+            &format!(
+                "instance={instance_name} reason=unreadable-created_at; row left to the live kill, no exit writes"
+            ),
+        );
+        return TeardownYield::Held;
+    };
+    if row.created_at.to_bits() != bits {
+        return TeardownYield::NoClaim;
+    }
+    log::log_info(
+        "hooks",
+        "sessionend.yielded_to_teardown",
+        &format!("instance={instance_name}"),
+    );
+    TeardownYield::YieldTo(row.created_at, row.session_id)
 }
 
 /// Keep the one-shot hook's exit state if the kill fails, but never apply
@@ -2265,7 +2331,8 @@ fn persist_yielded_session_exit(
 /// OMP soft-stop passes `keep_process_binding: true` so the live process can rebind
 /// via `bind_session_to_process` on the next turn. Antigravity passes `false`.
 /// A live kill claim keeps the early exit status and metadata writes, but
-/// leaves the stopped event, bindings, and row release to the kill.
+/// leaves the stopped event, bindings, and row release to the kill. A live
+/// claim whose incarnation cannot be read holds the row without those writes.
 pub fn soft_finalize_session(
     db: &HcomDb,
     instance_name: &str,
@@ -2273,9 +2340,19 @@ pub fn soft_finalize_session(
     updates: Option<&serde_json::Map<String, Value>>,
     keep_process_binding: bool,
 ) {
-    if let Some(incarnation) = yield_to_teardown(db, instance_name) {
-        persist_yielded_session_exit(db, instance_name, incarnation, reason, updates);
-        return;
+    match yield_to_teardown(db, instance_name) {
+        TeardownYield::NoClaim => {}
+        TeardownYield::Held => return,
+        TeardownYield::YieldTo(created_at, session_id) => {
+            persist_yielded_session_exit(
+                db,
+                instance_name,
+                (created_at, session_id),
+                reason,
+                updates,
+            );
+            return;
+        }
     }
     log::log_info(
         "hooks",
@@ -2401,6 +2478,8 @@ pub fn finalize_session(
 /// a release would report success blind (see `keep_own_row_off_linux`).
 /// A live kill claim preserves the early exit status and metadata writes
 /// and returns `AlreadyStopped`; the kill owns the stopped event and release.
+/// A live claim whose incarnation cannot be read holds the row the same way,
+/// without the exit writes.
 pub fn finalize_session_excluding(
     db: &HcomDb,
     instance_name: &str,
@@ -2408,9 +2487,19 @@ pub fn finalize_session_excluding(
     updates: Option<&serde_json::Map<String, Value>>,
     exclude: &[u32],
 ) -> StopOutcome {
-    if let Some(incarnation) = yield_to_teardown(db, instance_name) {
-        persist_yielded_session_exit(db, instance_name, incarnation, reason, updates);
-        return StopOutcome::AlreadyStopped;
+    match yield_to_teardown(db, instance_name) {
+        TeardownYield::NoClaim => {}
+        TeardownYield::Held => return StopOutcome::AlreadyStopped,
+        TeardownYield::YieldTo(created_at, session_id) => {
+            persist_yielded_session_exit(
+                db,
+                instance_name,
+                (created_at, session_id),
+                reason,
+                updates,
+            );
+            return StopOutcome::AlreadyStopped;
+        }
     }
     #[cfg(not(target_os = "linux"))]
     if !exclude.is_empty() {
@@ -3653,7 +3742,10 @@ mod tests {
             let (_dir, db) = make_test_db();
             insert_test_instance(&db, "reused");
             let _claim = TeardownClaim::register(&db, "reused", 0.0, None).unwrap();
-            let incarnation = yield_to_teardown(&db, "reused").expect("live claim matches");
+            let incarnation = match yield_to_teardown(&db, "reused") {
+                TeardownYield::YieldTo(created_at, session_id) => (created_at, session_id),
+                _ => panic!("live claim matches"),
+            };
             db.delete_instance("reused").unwrap();
             insert_test_instance(&db, "reused");
             db.conn().execute(
@@ -3767,7 +3859,10 @@ mod tests {
         insert_test_instance(&db, "claim-owner");
         let claim = TeardownClaim::register(&db, "claim-owner", 0.0, None).unwrap();
         assert!(
-            yield_to_teardown(&db, "claim-owner").is_some(),
+            !matches!(
+                yield_to_teardown(&db, "claim-owner"),
+                TeardownYield::NoClaim
+            ),
             "stale owner replaced"
         );
         drop(claim);

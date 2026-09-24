@@ -307,7 +307,8 @@ pub(crate) struct ReapCapture {
     scope: CarrierTreeScope,
     #[cfg(unix)]
     carriers: Vec<ProcMatch>,
-    /// `None` when no row existed at capture time.
+    /// `None` when no row existed at capture time, or when the capture is
+    /// reap-only and deliberately binds no incarnation.
     incarnation: Option<CapturedIncarnation>,
 }
 
@@ -355,38 +356,56 @@ fn carrier_tree_scope(row_pid: Option<i64>, binding_ids: &[String]) -> CarrierTr
     }
 }
 
-/// `binding_ids` must be the row's bindings as read with it: they become the
-/// captured incarnation's binding epoch.
-pub(crate) fn capture_reap_carriers(
-    db: &HcomDb,
+/// A capture with NO bound incarnation: the row contributes only its
+/// recorded-pid root. The reap conveniences pair that fresh row read with
+/// the caller's call-start binding ids — two reads, never one snapshot — so
+/// their capture must not carry a [`CapturedIncarnation`] a stop could
+/// release against. The reap consumes only scope and carriers.
+fn capture_reap_carriers_unbound(
     name: &str,
+    row_pid: Option<i64>,
     binding_ids: &[String],
     exclude: &[u32],
 ) -> ReapCapture {
-    // One row read feeds both the owner roots and the bound incarnation.
-    let row = db.get_instance_full(name).ok().flatten();
-    let incarnation = row.as_ref().map(|row| CapturedIncarnation {
+    #[cfg(unix)]
+    {
+        let mut scope = carrier_tree_scope(row_pid, binding_ids);
+        let carriers = snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
+        ReapCapture {
+            scope,
+            carriers,
+            incarnation: None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (name, row_pid, binding_ids, exclude);
+        ReapCapture { incarnation: None }
+    }
+}
+
+/// `row` and `binding_ids` must be ONE snapshot of the instance
+/// ([`HcomDb::get_instance_with_bindings`] or
+/// [`HcomDb::iter_instances_with_bindings`]): they become the captured
+/// incarnation. A row paired with another incarnation's binding epoch lets
+/// a stop bound to it release a row nobody resolved.
+pub(crate) fn capture_reap_carriers(
+    name: &str,
+    row: Option<&crate::db::InstanceRow>,
+    binding_ids: &[String],
+    exclude: &[u32],
+) -> ReapCapture {
+    let mut capture =
+        capture_reap_carriers_unbound(name, row.and_then(|row| row.pid), binding_ids, exclude);
+    // The snapshot's row feeds the bound incarnation as well as the roots.
+    capture.incarnation = row.map(|row| CapturedIncarnation {
         created_at: row.created_at,
         pid: row.pid,
         session_id: row.session_id.clone(),
         agent_id: row.agent_id.clone(),
         binding_ids: binding_ids.to_vec(),
     });
-    #[cfg(unix)]
-    {
-        let mut scope = carrier_tree_scope(row.and_then(|row| row.pid), binding_ids);
-        let carriers = snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
-        ReapCapture {
-            scope,
-            carriers,
-            incarnation,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = exclude;
-        ReapCapture { incarnation }
-    }
+    capture
 }
 
 #[cfg(unix)]
@@ -893,7 +912,13 @@ pub fn reap_instance_tree_for_excluding(
     binding_ids: &[String],
     exclude: &[u32],
 ) -> Result<(), ReapError> {
-    let capture = capture_reap_carriers(db, name, binding_ids, exclude);
+    // The caller's ids are the call-start epoch this convenience reaps; the
+    // row only supplies the recorded-pid root. The two are not one snapshot,
+    // so the capture binds NO incarnation: the reap consumes only scope and
+    // carriers, and nothing releases against it.
+    let row = db.get_instance_full(name).ok().flatten();
+    let capture =
+        capture_reap_carriers_unbound(name, row.and_then(|row| row.pid), binding_ids, exclude);
     reap_instance_tree_for_excluding_captured(db, name, binding_ids, exclude, capture)
 }
 
@@ -1789,8 +1814,8 @@ mod tests {
         insert_null_pid_row(&db, &name, &process_id);
         let carrier = spawn_detached_named_sleeper(&name, &process_id);
         wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
-        let bindings = db.process_binding_ids(&name).unwrap();
-        let capture = capture_reap_carriers(&db, &name, &bindings, &[]);
+        let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
+        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[]);
         let result = reap_instance_tree_for_excluding_captured(&db, &name, &bindings, &[], capture);
         assert!(result.is_err());
         assert!(!process_gone(carrier));
@@ -1840,9 +1865,9 @@ mod tests {
         insert_null_pid_row(&db, &name, &token_a);
         // A's own carrier sits in the test's tree, so the capture admits it.
         let mut carrier_a = spawn_named_sleeper(&name, &token_a);
-        let bindings_a = db.process_binding_ids(&name).unwrap();
+        let (row_a, bindings_a) = db.get_instance_with_bindings(&name).unwrap();
         wait_for_enumerated(&name, &bindings_a, carrier_a.id());
-        let capture = capture_reap_carriers(&db, &name, &bindings_a, &[]);
+        let capture = capture_reap_carriers(&name, row_a.as_ref(), &bindings_a, &[]);
         // The kill's group signal takes A down.
         carrier_a.kill().ok();
         carrier_a.wait().ok();
@@ -1895,6 +1920,119 @@ mod tests {
         assert!(!line.contains("Stopped"), "{line}");
     }
 
+    /// A `start --as` rebind landing after a bulk kill read the name. The
+    /// kill resolved A, row and bindings in one snapshot; the replacement B
+    /// was just created, so it has no bindings yet and no carrier of its
+    /// own. Nothing but the incarnation guard stands between the stop and
+    /// B's live row: B must survive, reported skipped.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bulk_stop_does_not_release_a_replacement_row_with_no_bindings() {
+        let db = test_db();
+        let name = unique_name("rebind-unbound");
+        let token_a = format!("proc-{}", rand_suffix());
+        insert_null_pid_row(&db, &name, &token_a);
+
+        // The bulk kill's one snapshot: A's row with A's binding epoch.
+        let (row_a, bindings_a) = db
+            .iter_instances_with_bindings()
+            .unwrap()
+            .into_iter()
+            .find(|(row, _)| row.name == name)
+            .expect("A in the snapshot");
+
+        // `start --as` by A's own session: row and bindings are deleted and
+        // the row recreated in separate commits, same session, no bindings.
+        db.conn()
+            .execute(
+                "DELETE FROM instances WHERE name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        let created_b = crate::shared::time::now_epoch_f64() + 1.0;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id) \
+                 VALUES (?1, 'active', ?2, 'codex', 'sess-carrier')",
+                rusqlite::params![name, created_b],
+            )
+            .unwrap();
+
+        // The pre-signal capture, built from that snapshot alone.
+        let capture = capture_reap_carriers(&name, Some(&row_a), &bindings_a, &[]);
+        let outcome =
+            crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
+
+        let row = db.get_instance_full(&name).unwrap();
+        assert!(
+            row.is_some_and(|row| row.created_at.to_bits() == created_b.to_bits()),
+            "the live replacement row must survive the stop: {outcome:?}"
+        );
+        assert!(outcome.is_re_registered(), "{outcome:?}");
+    }
+
+    /// The binding epoch only ever adds refusals to the row identity. A
+    /// captured epoch emptied under the same row identity refuses the
+    /// release: an unbound replacement looks exactly like that, so an empty
+    /// set never passes for a non-empty capture.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bulk_stop_refuses_a_captured_epoch_emptied_under_the_same_row() {
+        let db = test_db();
+        let name = unique_name("epoch-emptied");
+        insert_null_pid_row(&db, &name, &format!("proc-{}", rand_suffix()));
+        let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
+        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[]);
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+
+        let outcome =
+            crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
+        assert!(outcome.is_re_registered(), "{outcome:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_some(), "row kept");
+    }
+
+    /// The other side of that rule: a session that shrank its own epoch to a
+    /// non-empty subset is still the captured incarnation, and releases.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bulk_stop_releases_a_captured_epoch_its_session_shrank() {
+        let db = test_db();
+        let name = unique_name("epoch-shrunk");
+        let kept = format!("proc-{}-kept", rand_suffix());
+        let released = format!("proc-{}-released", rand_suffix());
+        insert_null_pid_row(&db, &name, &kept);
+        db.set_process_binding(&released, "sess-carrier", &name)
+            .unwrap();
+        let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
+        assert_eq!(bindings.len(), 2);
+        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[]);
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE process_id = ?1",
+                rusqlite::params![released],
+            )
+            .unwrap();
+
+        let outcome =
+            crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
+        assert_eq!(outcome, crate::hooks::common::StopOutcome::Stopped);
+        assert!(
+            db.get_instance_full(&name).unwrap().is_none(),
+            "row released"
+        );
+    }
+
     /// A name-carrying sleeper that leads its own session and process group,
     /// outside the test's tree (the `sh` parent exits). Returns its pid, which
     /// is also its group id.
@@ -1927,7 +2065,7 @@ mod tests {
         let name = unique_name("orphan-group");
         let leader = spawn_detached_group_leader(&name);
         wait_for_enumerated(&name, &[], leader);
-        let capture = capture_reap_carriers(&db, &name, &[], &[]);
+        let capture = capture_reap_carriers(&name, None, &[], &[]);
         // The orphan arm's group signal.
         unsafe { libc::kill(-(leader as libc::pid_t), libc::SIGKILL) };
         for _ in 0..100 {
@@ -2126,7 +2264,7 @@ mod tests {
             if !previously_identified {
                 MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
             }
-            let capture = capture_reap_carriers(&db, &name, &[], &[]);
+            let capture = capture_reap_carriers(&name, None, &[], &[]);
             MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
             let result = reap_instance_tree_for_excluding_captured(&db, &name, &[], &[], capture);
             MISSING_CARRIER_IDENTITY.with(|missing| missing.set(None));
