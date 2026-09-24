@@ -2571,7 +2571,8 @@ mod tests {
         let db = test_db();
         let name = unique_name("rebind");
         insert_row(&db, &name, "active", Some(dead_pid()));
-        db.set_process_binding("proc-old", "sess-old", &name).unwrap();
+        db.set_process_binding("proc-old", "sess-old", &name)
+            .unwrap();
 
         // The sweep's single captured read.
         let (row, binding_ids) = db
@@ -2583,7 +2584,8 @@ mod tests {
         assert_eq!(binding_ids, vec!["proc-old".to_string()]);
 
         // The replacement lands in that window.
-        db.set_process_binding("proc-new", "sess-new", &name).unwrap();
+        db.set_process_binding("proc-new", "sess-new", &name)
+            .unwrap();
 
         let process_id = binding_ids.first().map(String::as_str);
         let data = serde_json::json!({

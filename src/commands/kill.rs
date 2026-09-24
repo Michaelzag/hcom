@@ -103,14 +103,29 @@ struct IncarnationToken {
 
 impl IncarnationToken {
     fn capture(row: &crate::db::InstanceRow, binding_ids: &[String]) -> Self {
-        Self::new(row.created_at, row.session_id.clone(), row.agent_id.clone(), binding_ids.to_vec())
+        Self::new(
+            row.created_at,
+            row.session_id.clone(),
+            row.agent_id.clone(),
+            binding_ids.to_vec(),
+        )
     }
 
-    fn new(created_at: f64, session_id: Option<String>, agent_id: Option<String>, binding_ids: Vec<String>) -> Self {
+    fn new(
+        created_at: f64,
+        session_id: Option<String>,
+        agent_id: Option<String>,
+        binding_ids: Vec<String>,
+    ) -> Self {
         let mut ids = binding_ids;
         ids.sort();
         ids.dedup();
-        Self { created_at, session_id, agent_id, binding_ids: ids }
+        Self {
+            created_at,
+            session_id,
+            agent_id,
+            binding_ids: ids,
+        }
     }
 }
 
@@ -140,8 +155,7 @@ impl ResolvedIncarnation {
 const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[cfg(test)]
-static CAPTURE_GAP_HOOK: std::sync::Mutex<Option<fn(&HcomDb, &str)>> =
-    std::sync::Mutex::new(None);
+static CAPTURE_GAP_HOOK: std::sync::Mutex<Option<fn(&HcomDb, &str)>> = std::sync::Mutex::new(None);
 
 #[derive(Clone, Copy)]
 enum PaneCleanupProcessState {
@@ -474,7 +488,11 @@ fn classify_lost_teardown(
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
-                match r.get_ref(3)? { rusqlite::types::ValueRef::Null => None, rusqlite::types::ValueRef::Integer(bits) => Some(bits as u64), _ => None },
+                match r.get_ref(3)? {
+                    rusqlite::types::ValueRef::Null => None,
+                    rusqlite::types::ValueRef::Integer(bits) => Some(bits as u64),
+                    _ => None,
+                },
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, Option<String>>(6)?,
@@ -482,16 +500,34 @@ fn classify_lost_teardown(
         })?;
     let mut self_stop = false;
     for row in &mut process_ids {
-
-        let (event_id, _by, process_id, snapshot_created_at_bits, snapshot_session_id, snapshot_agent_id, snapshot) = row?;
-        let bits = snapshot_created_at_bits.or_else(|| snapshot.as_deref().and_then(crate::db::raw_created_at_bits));
+        let (
+            event_id,
+            _by,
+            process_id,
+            snapshot_created_at_bits,
+            snapshot_session_id,
+            snapshot_agent_id,
+            snapshot,
+        ) = row?;
+        let bits = snapshot_created_at_bits
+            .or_else(|| snapshot.as_deref().and_then(crate::db::raw_created_at_bits));
         let identity_match = bits == Some(token.created_at.to_bits())
-            && snapshot_session_id.as_ref().is_none_or(|id| Some(id.as_str()) == token.session_id.as_deref())
-            && snapshot_agent_id.as_ref().is_none_or(|id| Some(id.as_str()) == token.agent_id.as_deref());
-        let binding_match = process_id.as_ref().is_some_and(|id| token.binding_ids.contains(id));
+            && snapshot_session_id
+                .as_ref()
+                .is_none_or(|id| Some(id.as_str()) == token.session_id.as_deref())
+            && snapshot_agent_id
+                .as_ref()
+                .is_none_or(|id| Some(id.as_str()) == token.agent_id.as_deref());
+        let binding_match = process_id
+            .as_ref()
+            .is_some_and(|id| token.binding_ids.contains(id));
         let matches = identity_match || binding_match;
         if !matches {
-            crate::log::log_warn("kill", "teardown.stop_event_unreadable", &format!("instance={name} event={event_id}"));
+            crate::log::log_warn(
+                "kill",
+                "teardown.stop_event_unreadable",
+                &format!("instance={name} event={event_id}"),
+            );
         }
         if matches {
             self_stop = true;
@@ -2656,9 +2692,8 @@ mod tests {
     ) -> TeardownOutcome {
         let db = crate::db::HcomDb::open_raw(db_path).unwrap();
         db.init_db().unwrap();
-        let mut sleeper = seed_bound_row_with_sleeper(
-            &db, name, "proc-kill-vanished", "sess-kill-vanished",
-        );
+        let mut sleeper =
+            seed_bound_row_with_sleeper(&db, name, "proc-kill-vanished", "sess-kill-vanished");
         db.conn()
             .execute(
                 "UPDATE instances SET created_at = 42 WHERE name = ?",
@@ -2717,7 +2752,10 @@ mod tests {
         );
         assert_eq!(outcome, TeardownOutcome::RowReRegistered);
         let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
-        assert!(db.get_instance_full(&name).unwrap().is_some(), "replacement row survives");
+        assert!(
+            db.get_instance_full(&name).unwrap().is_some(),
+            "replacement row survives"
+        );
     }
 
     #[test]
@@ -2733,15 +2771,34 @@ mod tests {
         let mut sleeper = seed_bound_row_with_sleeper(&db, &name, "proc-gap", "sess-gap");
         *CAPTURE_GAP_HOOK.lock().unwrap() = Some(capture_gap_finalize);
         fn capture_gap_finalize(db: &HcomDb, name: &str) {
-            let bits = db.get_instance_full(name).unwrap().unwrap().created_at.to_bits();
+            let bits = db
+                .get_instance_full(name)
+                .unwrap()
+                .unwrap()
+                .created_at
+                .to_bits();
             let snapshot = serde_json::json!({ "created_at_bits": bits as i64 });
-            db.log_life_event(name, "stopped", "pty", "killed", Some(snapshot), Some("proc-gap")).unwrap();
+            db.log_life_event(
+                name,
+                "stopped",
+                "pty",
+                "killed",
+                Some(snapshot),
+                Some("proc-gap"),
+            )
+            .unwrap();
             db.delete_instance(name).unwrap();
         }
         let result = kill_tracked_instance_with_self_pids(
-            &db, &name, "test", &[std::process::id()],
-            |n, b, e, capture| crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture),
-        ).unwrap();
+            &db,
+            &name,
+            "test",
+            &[std::process::id()],
+            |n, b, e, capture| {
+                crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture)
+            },
+        )
+        .unwrap();
         sleeper.wait().ok();
         assert_eq!(result.teardown, TeardownOutcome::SessionStoppedReleasedRow);
     }
@@ -2751,11 +2808,21 @@ mod tests {
     #[serial]
     fn kill_reports_re_registration_for_unreadable_vanished_sweep() {
         let _guard = crate::hooks::test_helpers::isolated_test_env();
-        for (index, value) in [None, Some(serde_json::Value::Null), Some(serde_json::json!("bad"))].into_iter().enumerate() {
+        for (index, value) in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("bad")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let dir = tempfile::tempdir().unwrap();
             let outcome = kill_mid_daemon_sweep(
                 &dir.path().join("test.db"),
-                &format!("hcom-kill-{}-vanished-unreadable-{index}", std::process::id()),
+                &format!(
+                    "hcom-kill-{}-vanished-unreadable-{index}",
+                    std::process::id()
+                ),
                 value,
                 false,
             );

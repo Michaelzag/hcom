@@ -1340,7 +1340,10 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         data.insert("name".into(), serde_json::json!(name));
         data.insert("status".into(), serde_json::json!("pending"));
         data.insert("status_context".into(), serde_json::json!("new"));
-        data.insert("created_at".into(), serde_json::json!(now_epoch_f64() - 200.0));
+        data.insert(
+            "created_at".into(),
+            serde_json::json!(now_epoch_f64() - 200.0),
+        );
         db.save_instance_named(&name, &data).unwrap();
 
         // `start --as` shape: the row is deleted and recreated with a fresh

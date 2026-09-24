@@ -2800,8 +2800,12 @@ fn exit_incarnation_holds(
         .prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?1")?
         .query_map(rusqlite::params![name], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(!(bindings.is_empty() && !incarnation.binding_ids.is_empty())
-        && bindings.iter().all(|id| incarnation.binding_ids.contains(id)))
+    Ok(
+        !(bindings.is_empty() && !incarnation.binding_ids.is_empty())
+            && bindings
+                .iter()
+                .all(|id| incarnation.binding_ids.contains(id)),
+    )
 }
 
 /// Log why PTY exit cleanup was skipped when this thread no longer owns the instance.
