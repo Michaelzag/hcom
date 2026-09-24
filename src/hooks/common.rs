@@ -1902,31 +1902,82 @@ impl Drop for TeardownClaim<'_> {
     }
 }
 
-fn yield_to_teardown(db: &HcomDb, instance_name: &str) -> bool {
-    let live = db
+fn yield_to_teardown(db: &HcomDb, instance_name: &str) -> Option<(f64, Option<String>)> {
+    let incarnation = db
         .kv_get(&format!("teardown_claim:{instance_name}"))
         .ok()
         .flatten()
         .and_then(|value| serde_json::from_str::<TeardownOwner>(&value).ok())
-        .is_some_and(|owner| {
-            crate::sys::process::has_identity(owner.pid, &owner.process_start)
-                && db
-                    .get_instance_full(instance_name)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|row| {
-                        row.created_at.to_bits() == owner.created_at_bits
-                            && row.session_id == owner.session_id
-                    })
+        .and_then(|owner| {
+            if !crate::sys::process::has_identity(owner.pid, &owner.process_start) {
+                return None;
+            }
+            let row = db.get_instance_full(instance_name).ok().flatten()?;
+            (row.created_at.to_bits() == owner.created_at_bits
+                && row.session_id == owner.session_id)
+                .then_some((row.created_at, row.session_id))
         });
-    if live {
+    if incarnation.is_some() {
         log::log_info(
             "hooks",
             "sessionend.yielded_to_teardown",
             &format!("instance={instance_name}"),
         );
     }
-    live
+    incarnation
+}
+
+/// Keep the one-shot hook's exit state if the kill fails, but never apply
+/// that state to a name reused after the claim check. The immediate write
+/// lock covers the incarnation re-read and both existing same-connection
+/// writers, so a concurrent replacement cannot land between those writes.
+fn persist_yielded_session_exit(
+    db: &HcomDb,
+    instance_name: &str,
+    incarnation: (f64, Option<String>),
+    reason: &str,
+    updates: Option<&serde_json::Map<String, Value>>,
+) {
+    use rusqlite::OptionalExtension;
+
+    let updated = db.with_immediate_transaction(|tx| {
+        let current: Option<(f64, Option<String>)> = tx
+            .query_row(
+                "SELECT created_at, session_id FROM instances WHERE name = ?",
+                params![instance_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if !current.is_some_and(|(created_at, session_id)| {
+            created_at.to_bits() == incarnation.0.to_bits() && session_id == incarnation.1
+        }) {
+            return Ok(false);
+        }
+        lifecycle::set_status(
+            db,
+            instance_name,
+            ST_INACTIVE,
+            &format!("exit:{}", reason),
+            Default::default(),
+        );
+        if let Some(updates) = updates {
+            instances::update_instance_position(db, instance_name, updates);
+        }
+        Ok(true)
+    });
+    match updated {
+        Ok(true) => {}
+        Ok(false) => log::log_info(
+            "hooks",
+            "sessionend.yield_incarnation_changed",
+            &format!("instance={instance_name}; exit writes skipped"),
+        ),
+        Err(error) => log::log_warn(
+            "hooks",
+            "sessionend.yield_write_failed",
+            &format!("instance={instance_name} err={error}"),
+        ),
+    }
 }
 
 /// Soft session end for Antigravity: mark inactive without deleting the `instances` row.
@@ -1954,19 +2005,8 @@ pub fn soft_finalize_session(
     updates: Option<&serde_json::Map<String, Value>>,
     keep_process_binding: bool,
 ) {
-    if yield_to_teardown(db, instance_name) {
-        // The one-shot hook will not replay if the kill later fails. Keep
-        // the same inactive exit state as a normal finalize whose reap fails.
-        lifecycle::set_status(
-            db,
-            instance_name,
-            ST_INACTIVE,
-            &format!("exit:{}", reason),
-            Default::default(),
-        );
-        if let Some(updates) = updates {
-            instances::update_instance_position(db, instance_name, updates);
-        }
+    if let Some(incarnation) = yield_to_teardown(db, instance_name) {
+        persist_yielded_session_exit(db, instance_name, incarnation, reason, updates);
         return;
     }
     log::log_info(
@@ -2099,19 +2139,8 @@ pub fn finalize_session_excluding(
     updates: Option<&serde_json::Map<String, Value>>,
     exclude: &[u32],
 ) -> StopOutcome {
-    if yield_to_teardown(db, instance_name) {
-        // A failed kill must leave the session inactive with its exit
-        // metadata, not falsely listening after this one-shot hook yields.
-        lifecycle::set_status(
-            db,
-            instance_name,
-            ST_INACTIVE,
-            &format!("exit:{}", reason),
-            Default::default(),
-        );
-        if let Some(updates) = updates {
-            instances::update_instance_position(db, instance_name, updates);
-        }
+    if let Some(incarnation) = yield_to_teardown(db, instance_name) {
+        persist_yielded_session_exit(db, instance_name, incarnation, reason, updates);
         return StopOutcome::AlreadyStopped;
     }
     #[cfg(not(target_os = "linux"))]
@@ -3344,6 +3373,49 @@ mod tests {
 
     #[test]
     #[serial]
+    fn yielded_exit_does_not_update_re_registered_name() {
+        let _env = isolated_test_env();
+        for (created_at, session_id) in [(1.0, None), (0.0, Some("replacement-session"))] {
+            let (_dir, db) = make_test_db();
+            insert_test_instance(&db, "reused");
+            let _claim = TeardownClaim::register(&db, "reused", 0.0, None).unwrap();
+            let incarnation = yield_to_teardown(&db, "reused").expect("live claim matches");
+            db.delete_instance("reused").unwrap();
+            insert_test_instance(&db, "reused");
+            db.conn().execute(
+                "UPDATE instances SET created_at = ?, session_id = ?, transcript_path = '/new/session' WHERE name = 'reused'",
+                params![created_at, session_id],
+            ).unwrap();
+
+            let updates = serde_json::json!({"transcript_path": "/old/session"});
+            persist_yielded_session_exit(
+                &db,
+                "reused",
+                incarnation,
+                "shutdown",
+                updates.as_object(),
+            );
+
+            let row = db.get_instance_full("reused").unwrap().unwrap();
+            assert_eq!(row.status, ST_LISTENING);
+            assert_eq!(row.status_context, "start");
+            assert_eq!(row.transcript_path, "/new/session");
+            assert_eq!(row.created_at, created_at);
+            assert_eq!(row.session_id.as_deref(), session_id);
+            let events: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE instance = 'reused'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(events, 0, "a superseded yield writes no event");
+        }
+    }
+
+    #[test]
+    #[serial]
     fn session_finalize_ignores_claim_for_another_incarnation() {
         let _env = isolated_test_env();
         for (created_at, session_id) in [(1.0, None), (0.0, Some("new-session"))] {
@@ -3421,7 +3493,7 @@ mod tests {
         insert_test_instance(&db, "claim-owner");
         let claim = TeardownClaim::register(&db, "claim-owner", 0.0, None).unwrap();
         assert!(
-            yield_to_teardown(&db, "claim-owner"),
+            yield_to_teardown(&db, "claim-owner").is_some(),
             "stale owner replaced"
         );
         drop(claim);
