@@ -1563,7 +1563,7 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         // count: a SIGKILLed carrier keeps its environ until its parent
         // reaps it, but it is gone for lifecycle purposes — same rule as
         // reap verification (live_carriers_for).
-        if processes_for_instance(&inst.name, &binding_ids)
+        if processes_for_instance(&inst.name, binding_ids)
             .into_iter()
             .any(|m| !is_zombie(m.pid))
         {
@@ -1611,7 +1611,7 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             inst.agent_id.as_deref(),
             &data,
             process_id,
-            &binding_ids,
+            binding_ids,
         ) {
             Ok(true) => {
                 crate::log::log_info(

@@ -155,6 +155,7 @@ impl ResolvedIncarnation {
 const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 static CAPTURE_GAP_HOOK: std::sync::Mutex<Option<fn(&HcomDb, &str)>> = std::sync::Mutex::new(None);
 
 #[derive(Clone, Copy)]

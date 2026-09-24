@@ -626,6 +626,7 @@ pub fn set_status(
 // authorizes, so a test can land a replacement incarnation in that gap.
 #[cfg(test)]
 thread_local! {
+    #[allow(clippy::type_complexity)]
     static PLACEHOLDER_STOP_GAP_HOOK: std::cell::Cell<Option<fn(&HcomDb, &str)>> =
         const { std::cell::Cell::new(None) };
 }
