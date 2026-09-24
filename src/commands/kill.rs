@@ -454,7 +454,10 @@ fn classify_lost_teardown(
     )?;
     let mut process_ids = stmt
         .query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
-            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?.map(|bits| bits as u64)))
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<i64>>(1)?.map(|bits| bits as u64),
+            ))
         })?;
     let mut self_stop = false;
     for row in &mut process_ids {
@@ -2660,8 +2663,10 @@ mod tests {
             "proc-bindingless-stop",
             "sess-bindingless-stop",
         );
-        // An exact timestamp isolates the bindingless ownership branch from
-        // the separately tracked snapshot JSON float-precision issue.
+        // The bindingless branch is keyed to the exact `created_at` bit
+        // pattern, so the fixture's stopped snapshot carries it the way the
+        // PTY wrapper's exit cleanup writes it (see
+        // `delivery::cleanup_deleted_instance`).
         db.conn()
             .execute(
                 "UPDATE instances SET created_at = 42 WHERE name = ?",
@@ -2683,7 +2688,18 @@ mod tests {
                 crate::proctruth::reap_instance_tree_for_excluding_captured(
                     &db, n, bindings, excluded, capture,
                 )?;
-                let snapshot = db.get_instance_snapshot(n).unwrap();
+                let snapshot = db.get_instance_snapshot(n).unwrap().map(|mut snapshot| {
+                    if let Some(created_at) =
+                        snapshot.get("created_at").and_then(serde_json::Value::as_f64)
+                        && let Some(object) = snapshot.as_object_mut()
+                    {
+                        object.insert(
+                            "created_at_bits".to_string(),
+                            serde_json::json!(created_at.to_bits()),
+                        );
+                    }
+                    snapshot
+                });
                 db.log_life_event(n, "stopped", "pty", "killed", snapshot, None)
                     .unwrap();
                 db.delete_instance(n).unwrap();
@@ -2746,6 +2762,201 @@ mod tests {
             1,
             "only the fresh incarnation's stopped event; the kill wrote none"
         );
+        let _ = _guard;
+    }
+
+    /// The pre-#21 writer's rows still release. 0.7.29 wrote
+    /// `instances.created_at` as a fractional f64 through exactly the writer
+    /// below; every release path binds the value re-read from that same row
+    /// in the same transaction as the delete. One row per release path, each
+    /// asserted GONE afterwards — the ghost-row failure is any path that
+    /// leaves the row behind.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn rows_written_by_the_0_7_29_writer_release_through_close_kill_and_sweep() {
+        // ULP-critical: both float decoders in the stack mangle this one, a
+        // correctly rounded parse does not.
+        const FRACTIONAL: f64 = 1_790_000_000.000_002_1;
+        assert_eq!(FRACTIONAL.to_bits(), 4_745_294_612_153_761_801);
+
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+
+        // (i) close — the byte-identical 0.7.29 production writer.
+
+        let close_name = format!("hcom-close-{}-oldwriter", std::process::id());
+        assert!(crate::instance_binding::initialize_instance_in_position_file(
+            &db,
+            &close_name,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let close_row = db
+            .get_instance_full(&close_name)
+            .unwrap()
+            .expect("0.7.29 writer stored the row");
+        assert_ne!(
+            close_row.created_at.fract(),
+            0.0,
+            "0.7.29 wrote a fractional created_at"
+        );
+        let closed = crate::hooks::common::stop_instance(&db, &close_name, "test", "test-close");
+        assert!(
+            db.get_instance_full(&close_name).unwrap().is_none(),
+            "close left a ghost row for {close_name}: {closed:?}"
+        );
+        assert_eq!(closed, crate::hooks::common::StopOutcome::Stopped);
+
+        // (ii) kill — the same writer, pinned to a ULP-critical value.
+        let kill_name = format!("hcom-kill-{}-oldwriter", std::process::id());
+        legacy_row(&db, &kill_name, FRACTIONAL);
+        db.update_instance_pid(&kill_name, dead_pid())
+            .unwrap();
+        db.set_process_binding("proc-oldwriter", &format!("sess-{kill_name}"), &kill_name)
+            .unwrap();
+        let killed = kill_tracked_instance_with_self_pids(
+            &db,
+            &kill_name,
+            "test",
+            &[std::process::id()],
+            |n, bindings, excluded, capture| {
+                crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, bindings, excluded, capture,
+                )
+            },
+        )
+        .unwrap_or_else(|e| panic!("a release through kill is not a kill failure: {e}"));
+        assert_eq!(killed.teardown, TeardownOutcome::Completed);
+        assert!(
+            db.get_instance_full(&kill_name).unwrap().is_none(),
+            "kill left a ghost row for {kill_name}"
+        );
+
+        // (iii) sweep — the same deterministic write, released by the daemon.
+        let sweep_name = format!("hcom-sweep-{}-oldwriter", std::process::id());
+        legacy_row(&db, &sweep_name, FRACTIONAL);
+        // Positive death evidence: the `omp-<pid>` binding the sweep reads
+        // (off Linux it skips inactive rows, hence the active status).
+        let evidence_pid = dead_pid();
+        db.set_process_binding(
+            &format!("omp-{evidence_pid}"),
+            &format!("sess-{sweep_name}"),
+            &sweep_name,
+        )
+        .unwrap();
+        let swept = crate::proctruth::sweep_vanished_instances(&db);
+        assert!(
+            swept.contains(&sweep_name),
+            "sweep held the vanished row: {swept:?}"
+        );
+        assert!(
+            db.get_instance_full(&sweep_name).unwrap().is_none(),
+            "sweep left a ghost row for {sweep_name}"
+        );
+        let _ = _guard;
+    }
+
+    /// The 0.7.29 row writer: the same `serde_json::Map` shape
+    /// `initialize_instance_in_position_file` builds (see the
+    /// `data.insert("created_at", json!(now))` there), with `created_at`
+    /// pinned to `now` so the release CAS runs against a fixed,
+    /// ULP-critical value instead of whatever the clock produced. `pid` and
+    /// the bindings are attached afterwards by the release path's caller —
+    /// 0.7.29's `start` filled those in separately too.
+    #[cfg(unix)]
+    fn legacy_row(db: &HcomDb, name: &str, now: f64) {
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!(name));
+        data.insert("last_event_id".into(), serde_json::json!(0));
+        data.insert("directory".into(), serde_json::json!(""));
+        data.insert("last_stop".into(), serde_json::json!(0));
+        data.insert("created_at".into(), serde_json::json!(now));
+        data.insert(
+            "session_id".into(),
+            serde_json::json!(format!("sess-{name}")),
+        );
+        data.insert("transcript_path".into(), serde_json::json!(""));
+        data.insert("name_announced".into(), serde_json::json!(0));
+        data.insert("tag".into(), serde_json::Value::Null);
+        data.insert("status".into(), serde_json::json!("active"));
+        data.insert(
+            "status_time".into(),
+            serde_json::json!(crate::shared::time::now_epoch_i64()),
+        );
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("tool".into(), serde_json::json!("codex"));
+        data.insert("background".into(), serde_json::json!(0));
+        data.insert("wait_timeout".into(), serde_json::json!(86400));
+        assert!(db.save_instance_named(name, &data).unwrap());
+    }
+
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// A bindingless self-stop is recognized on the EXACT `created_at` bit
+    /// pattern, not on a float round trip. Measured on this build,
+    /// `json_extract` decodes 1762720048.770769 exactly (...223), so the
+    /// f64 compare happens to agree here; serde_json's own f64 parser does
+    /// not (it mangles ~1 value in 8, e.g. 1790000000.0000021 -> ...800).
+    /// The integer bit pattern removes the decoder from the comparison
+    /// entirely, and this pins that contract on the bindingless branch: a
+    /// null-`process_id` stop is a self-stop only on the exact bits.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn classify_lost_teardown_matches_bindingless_stops_on_exact_created_at_bits() {
+        const CREATED_AT: f64 = 1_762_720_048.770_769;
+        assert_eq!(CREATED_AT.to_bits(), 4_745_180_191_745_201_223);
+
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = format!("hcom-kill-{}-bits", std::process::id());
+
+        // The session's own stopped record, written through the production
+        // snapshot shape: the fractional created_at beside its exact bit
+        // pattern, and no process named (bindingless).
+        db.log_life_event(
+            &name,
+            "stopped",
+            "session",
+            "exit:normal",
+            Some(serde_json::json!({
+                "name": name,
+                "created_at": CREATED_AT,
+                "created_at_bits": CREATED_AT.to_bits(),
+            })),
+            None,
+        )
+        .unwrap();
+
+        let incarnation = ResolvedIncarnation {
+            token: IncarnationToken::new(CREATED_AT, None, vec![]),
+            event_watermark: 0,
+        };
+        let outcome = db
+            .with_immediate_transaction(|tx| classify_lost_teardown(tx, &name, &incarnation, None))
+            .unwrap();
+        assert_eq!(outcome, TeardownOutcome::SessionStoppedReleasedRow);
         let _ = _guard;
     }
 
