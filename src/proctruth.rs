@@ -332,7 +332,7 @@ fn carrier_tree_scope(row_pid: Option<i64>, binding_ids: &[String]) -> CarrierTr
         // Only the minted omp-<pid>-... shape identifies an owner. A live
         // process with another comm must not become a root on the strength of
         // a borrowed or stale binding id.
-        if let Some(pid) = omp_minted_pid(id)
+        if let Some(pid) = shell_pid_from_process_id(id)
             && id
                 .strip_prefix("omp-")
                 .is_some_and(|rest| rest.contains('-'))
@@ -800,6 +800,17 @@ fn walk_ancestor_links(
         child_ticks = parent_ticks;
     }
     ancestors
+}
+
+/// Shell pid behind a self-bound process id: `omp-<pid>-…` → `<pid>`.
+/// Unlike [`omp_minted_pid`], this also accepts the legacy bare `omp-<pid>`
+/// shape used as sweep death evidence.
+fn shell_pid_from_process_id(process_id: &str) -> Option<u32> {
+    process_id
+        .strip_prefix("omp-")
+        .and_then(|rest| rest.split('-').next())
+        .filter(|head| !head.is_empty())
+        .and_then(|head| head.parse::<u32>().ok())
 }
 
 /// A reap cannot release ownership while carriers survive or its scope is unproven.
@@ -1959,7 +1970,11 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             .map(|pid| pid as u32)
             .into_iter()
             .collect();
-        evidence_pids.extend(binding_ids.iter().filter_map(|id| omp_minted_pid(id)));
+        evidence_pids.extend(
+            binding_ids
+                .iter()
+                .filter_map(|id| shell_pid_from_process_id(id)),
+        );
         if evidence_pids.is_empty() {
             crate::log::log(
                 "DEBUG",
