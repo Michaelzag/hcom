@@ -1965,9 +1965,7 @@ pub(super) mod tests {
 
         let (mut db, db_path) = setup_full_test_db();
         // Stand the database back at v19 — the shape production opens.
-        db.conn
-            .execute_batch("PRAGMA user_version = 19")
-            .unwrap();
+        db.conn.execute_batch("PRAGMA user_version = 19").unwrap();
         for (name, data) in [
             ("num", &number_row),
             ("str", &string_row),

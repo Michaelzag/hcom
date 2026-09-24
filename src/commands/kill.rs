@@ -452,8 +452,8 @@ fn classify_lost_teardown(
            AND json_extract(data, '$.by') IN ('session', 'pty') \
            AND COALESCE(json_extract(data, '$.reason'), '') != 'stale-harness-exit'",
     )?;
-    let mut process_ids = stmt
-        .query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
+    let mut process_ids =
+        stmt.query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?,
                 r.get::<_, Option<i64>>(1)?.map(|bits| bits as u64),
@@ -2689,8 +2689,9 @@ mod tests {
                     &db, n, bindings, excluded, capture,
                 )?;
                 let snapshot = db.get_instance_snapshot(n).unwrap().map(|mut snapshot| {
-                    if let Some(created_at) =
-                        snapshot.get("created_at").and_then(serde_json::Value::as_f64)
+                    if let Some(created_at) = snapshot
+                        .get("created_at")
+                        .and_then(serde_json::Value::as_f64)
                         && let Some(object) = snapshot.as_object_mut()
                     {
                         object.insert(
@@ -2788,22 +2789,24 @@ mod tests {
         // (i) close — the byte-identical 0.7.29 production writer.
 
         let close_name = format!("hcom-close-{}-oldwriter", std::process::id());
-        assert!(crate::instance_binding::initialize_instance_in_position_file(
-            &db,
-            &close_name,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ));
+        assert!(
+            crate::instance_binding::initialize_instance_in_position_file(
+                &db,
+                &close_name,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        );
         let close_row = db
             .get_instance_full(&close_name)
             .unwrap()
@@ -2823,8 +2826,7 @@ mod tests {
         // (ii) kill — the same writer, pinned to a ULP-critical value.
         let kill_name = format!("hcom-kill-{}-oldwriter", std::process::id());
         legacy_row(&db, &kill_name, FRACTIONAL);
-        db.update_instance_pid(&kill_name, dead_pid())
-            .unwrap();
+        db.update_instance_pid(&kill_name, dead_pid()).unwrap();
         db.set_process_binding("proc-oldwriter", &format!("sess-{kill_name}"), &kill_name)
             .unwrap();
         let killed = kill_tracked_instance_with_self_pids(

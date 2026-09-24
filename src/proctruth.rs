@@ -1462,7 +1462,9 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         // incarnation without a lossy float decode.
         let snapshot = db.get_instance_snapshot(&inst.name).unwrap_or(None);
         let snapshot = snapshot.map(|mut snapshot| {
-            if let Some(created_at) = snapshot.get("created_at").and_then(serde_json::Value::as_f64)
+            if let Some(created_at) = snapshot
+                .get("created_at")
+                .and_then(serde_json::Value::as_f64)
                 && let Some(object) = snapshot.as_object_mut()
             {
                 object.insert(
