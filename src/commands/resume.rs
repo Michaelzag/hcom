@@ -456,7 +456,6 @@ fn prepare_resume_plan_from_source(
     // Extract hcom-level flags from extra args before tool parsing.
     let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
 
-
     // Extract hcom-level flags from extra args before tool parsing.
 
     // The name's delivery cursor must never move backwards on resume. A plan
@@ -4450,12 +4449,7 @@ mod tests {
         // launch env supplied by hcom is the only place the override exists.
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), child_home.to_string_lossy().to_string());
-        ensure_omp_session_file_in_env(
-            OMP_MISSING_SID,
-            "",
-            &env,
-            std::path::Path::new("."),
-        )
-        .unwrap();
+        ensure_omp_session_file_in_env(OMP_MISSING_SID, "", &env, std::path::Path::new("."))
+            .unwrap();
     }
 }

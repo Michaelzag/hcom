@@ -358,7 +358,7 @@ pub(crate) fn claude_projects_dir() -> PathBuf {
 /// `PI_PROFILE` (legacy) is consulted only when `OMP_PROFILE` is entirely unset.
 /// OMP trims the selected value and treats empty/whitespace and the `"default"`
 /// sentinel as the implicit default profile.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn omp_profile_from_env() -> Option<String> {
     let value = match std::env::var("OMP_PROFILE") {
         Ok(value) => Some(value),
@@ -771,7 +771,6 @@ mod tests {
             vec![cwd.path().join("agent").join("sessions")]
         );
     }
-
 
     // Unix-only: PI_CODING_AGENT_DIR is set to a Unix-style absolute path
     // (`/tmp/...`), which on Windows has no drive letter and resolves against
