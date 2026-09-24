@@ -5477,7 +5477,18 @@ mod tests {
     fn test_take_restore_earlier_flag_leaves_option_values() {
         // As the value of a value-taking `hcom r` option, the token is that
         // option's value: the resume keeps it and is no restore.
-        for option in ["--tag", "--hcom-title", "--dir"] {
+        for option in [
+            "--tag",
+            "--terminal",
+            "--device",
+            "--dir",
+            "--hcom-system-prompt",
+            "--system",
+            "--hcom-prompt",
+            "--hcom-title",
+            "--batch-id",
+            "--name",
+        ] {
             let mut args = s(&[option, "--restore-earlier"]);
             assert!(
                 !take_restore_earlier_flag(&mut args),

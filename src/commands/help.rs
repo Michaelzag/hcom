@@ -1035,7 +1035,7 @@ pub fn get_command_help(name: &str) -> String {
              CWD is recovered from the session's transcript/DB.",
             &[(
                 "--restore-earlier",
-                "Resume the seat's earlier session if the newest omp file is gone (name only)",
+                "Resume the seat's earlier session when its newest omp session has no ID or its file is gone (name only)",
             )],
             &see_also,
         );
@@ -1283,6 +1283,13 @@ mod tests {
 
         let resume_help = get_command_help("r");
         assert!(resume_help.contains("Claude/Kimi resume or fork only"));
+    }
+
+    #[test]
+    fn resume_help_explains_unbound_newest_omp_session_restore() {
+        let help = get_command_help("r");
+        assert!(help.contains("--restore-earlier"));
+        assert!(help.contains("newest omp session has no ID or its file is gone"));
     }
 
     #[test]
