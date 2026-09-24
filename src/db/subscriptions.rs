@@ -28,7 +28,7 @@ use rusqlite::params;
 use serde_json::json;
 
 use super::HcomDb;
-use crate::core::filters::{FILE_WRITE_CONTEXTS, build_sql_from_flags};
+use crate::core::filters::{FILE_WRITE_CONTEXTS, build_sql_from_flags, is_uri_status_detail};
 use crate::messages::{InstanceInfo, MessageScope, ScopeResult, compute_scope, resolve_targets};
 use crate::shared::constants::extract_mentions;
 
@@ -603,6 +603,17 @@ pub(crate) fn process_logged_event(
             .get("filters")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
+        // Collision subs stored by an older build carry SQL without the URI
+        // guard; a URI write never collides, whatever the stored SQL says.
+        if sub_filters.get("collision").is_some()
+            && event_type == "status"
+            && data
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .is_some_and(is_uri_status_detail)
+        {
+            continue;
+        }
         if sub_filters.get("request_watch").is_some() {
             let request_id = sub_filters
                 .get("request_id")
@@ -1504,10 +1515,8 @@ mod tests {
         assert!(!sql.contains("< 20"));
     }
 
-    #[test]
-    fn test_collision_subscription_alerts_on_shared_paths_not_uris() {
-        use std::collections::HashMap;
-
+    /// A store with instances `one` and `two`.
+    fn collision_test_db() -> (HcomDb, PathBuf) {
         let (db, db_path) = setup_full_test_db();
         for name in ["one", "two"] {
             db.conn
@@ -1517,30 +1526,66 @@ mod tests {
                 )
                 .unwrap();
         }
+        (db, db_path)
+    }
+
+    /// Both seats write `detail`; returns the collision alerts naming it.
+    fn write_pair_and_count_collision_alerts(db: &HcomDb, detail: &str) -> i64 {
+        for instance in ["one", "two"] {
+            let data =
+                serde_json::json!({"status": "active", "context": "tool:write", "detail": detail});
+            db.log_event("status", instance, &data).unwrap();
+        }
+        db.conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'
+                 AND json_extract(data, '$.text') LIKE '%COLLISION%'
+                 AND json_extract(data, '$.text') LIKE ?1",
+                params![format!("%{detail}")],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_collision_subscription_alerts_on_shared_paths_not_uris() {
+        use std::collections::HashMap;
+
+        let (db, db_path) = collision_test_db();
         let filters = HashMap::from([("collision".to_string(), vec!["true".to_string()])]);
         create_filter_subscription(&db, &filters, &[], "two", false, None).unwrap();
 
-        // Both seats write `detail`; count the collision alerts naming it.
-        let collision_alerts = |detail: &str| -> i64 {
-            for instance in ["one", "two"] {
-                let data = serde_json::json!({"status": "active", "context": "tool:write", "detail": detail});
-                db.log_event("status", instance, &data).unwrap();
-            }
-            db.conn
-                .query_row(
-                    "SELECT COUNT(*) FROM events WHERE type = 'message'
-                     AND json_extract(data, '$.text') LIKE '%COLLISION%'
-                     AND json_extract(data, '$.text') LIKE ?1",
-                    params![format!("%{detail}")],
-                    |row| row.get(0),
-                )
-                .unwrap()
-        };
-
         for uri in ["xd://retain", "agent://x", "proc://x/kill"] {
-            assert_eq!(collision_alerts(uri), 0, "{uri}");
+            assert_eq!(write_pair_and_count_collision_alerts(&db, uri), 0, "{uri}");
         }
-        assert_eq!(collision_alerts("/home/u/proj/src/main.rs"), 1);
+        assert_eq!(
+            write_pair_and_count_collision_alerts(&db, "/home/u/proj/src/main.rs"),
+            1
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_collision_subscription_stored_without_uri_guard_ignores_uris() {
+        // A row written by an older build keeps its SQL in kv. This one matches
+        // every status event, so only the evaluation-time check can stop a URI
+        // alert on a live seat that was subscribed before the upgrade.
+        let (db, db_path) = collision_test_db();
+        let sub = serde_json::json!({
+            "id": "sub-legacy",
+            "caller": "two",
+            "caller_kind": "instance",
+            "filters": {"collision": ["true"]},
+            "sql": "type = 'status'",
+            "last_id": 0,
+            "once": false
+        });
+        db.kv_set("events_sub:sub-legacy", Some(&sub.to_string()))
+            .unwrap();
+
+        assert_eq!(write_pair_and_count_collision_alerts(&db, "xd://retain"), 0);
+        assert!(write_pair_and_count_collision_alerts(&db, "/home/u/proj/src/main.rs") > 0);
 
         cleanup_test_db(db_path);
     }
