@@ -667,6 +667,8 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
 /// A reap cannot release ownership while carriers survive or its scope is unproven.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReapError {
+    // The non-Unix reap is a no-op success and never constructs this variant.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Survivors(Vec<u32>),
     #[cfg(unix)]
     UnprovenOwnership,
