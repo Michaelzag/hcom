@@ -54,6 +54,7 @@ pub mod test_helpers {
         saved_pi_config_dir: Option<String>,
         saved_omp_profile: Option<String>,
         saved_pi_profile: Option<String>,
+        saved_build_root: Option<String>,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
         _lock: MutexGuard<'static, ()>,
@@ -86,6 +87,7 @@ pub mod test_helpers {
                 saved_pi_config_dir: std::env::var("PI_CONFIG_DIR").ok(),
                 saved_omp_profile: std::env::var("OMP_PROFILE").ok(),
                 saved_pi_profile: std::env::var("PI_PROFILE").ok(),
+                saved_build_root: std::env::var("HCOM_BUILD_ROOT").ok(),
                 _lock: lock,
             }
         }
@@ -158,6 +160,10 @@ pub mod test_helpers {
                     Some(v) => std::env::set_var("PI_PROFILE", v),
                     None => std::env::remove_var("PI_PROFILE"),
                 }
+                match &self.saved_build_root {
+                    Some(v) => std::env::set_var("HCOM_BUILD_ROOT", v),
+                    None => std::env::remove_var("HCOM_BUILD_ROOT"),
+                }
             }
             crate::config::Config::reset();
             crate::config::Config::init();
@@ -179,6 +185,8 @@ pub mod test_helpers {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
             std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
+            // Keep the omp /tmp redirect (`<build_root>/<seat>/tmp`) inside the tempdir.
+            std::env::set_var("HCOM_BUILD_ROOT", test_home.join("build"));
         }
         crate::config::Config::reset();
         crate::config::Config::init();
