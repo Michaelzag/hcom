@@ -625,6 +625,35 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
     }
 }
 
+/// A reap cannot release ownership while carriers survive or its scope is unproven.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReapError {
+    Survivors(Vec<u32>),
+    #[cfg(unix)]
+    UnprovenOwnership,
+}
+
+impl std::fmt::Display for ReapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Survivors(pids) => {
+                f.write_str("process(es) still alive after SIGKILL: ")?;
+                for (index, pid) in pids.iter().enumerate() {
+                    if index != 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{pid}")?;
+                }
+                Ok(())
+            }
+            #[cfg(unix)]
+            Self::UnprovenOwnership => {
+                f.write_str("cannot prove process ownership on this host; row left intact")
+            }
+        }
+    }
+}
+
 /// Reap every proven in-scope process holding the instance: descendants of
 /// an owning root carrying `HCOM_INSTANCE_NAME=<name>` or one of its binding
 /// process ids (the self-bound tree never carries the name).
@@ -641,9 +670,9 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
 /// binding epoch (a brand-new registration of a newer epoch) is spared and
 /// never blocks; conversely a snapshot pid recycled by an unrelated process
 /// no longer carries the name and is neither signalled nor counted (an EPERM
-/// on such a pid is not survival). Returns the surviving pids on failure — callers must
-/// not report success or release the row while any survive (fail-closed: the
-/// reap must reach `Ok(())` before any `stopped` write or binding release).
+/// on such a pid is not survival). Returns an error when carriers survive or
+/// the caller's ownership chain cannot be proven: the reap must reach `Ok(())`
+/// before any `stopped` write or binding release.
 ///
 /// The calling process is never signalled (see [`processes_for_instance`]).
 /// Zombies are excluded from verification: a SIGKILLed carrier stays visible
@@ -656,7 +685,7 @@ pub fn reap_instance_tree_for(
     db: &HcomDb,
     name: &str,
     binding_ids: &[String],
-) -> Result<(), Vec<u32>> {
+) -> Result<(), ReapError> {
     reap_instance_tree_for_excluding(db, name, binding_ids, &[])
 }
 
@@ -742,7 +771,7 @@ pub fn reap_instance_tree_for_excluding(
     name: &str,
     binding_ids: &[String],
     exclude: &[u32],
-) -> Result<(), Vec<u32>> {
+) -> Result<(), ReapError> {
     let capture = capture_reap_carriers(db, name, binding_ids, exclude);
     reap_instance_tree_for_excluding_captured(db, name, binding_ids, exclude, capture)
 }
@@ -753,7 +782,7 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
     binding_ids: &[String],
     exclude: &[u32],
     capture: ReapCapture,
-) -> Result<(), Vec<u32>> {
+) -> Result<(), ReapError> {
     #[cfg(not(unix))]
     {
         let _ = (db, name, binding_ids, exclude, capture);
@@ -762,13 +791,17 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
     #[cfg(unix)]
     {
         let mut scope = capture.scope;
+        // A broken view of the caller's ancestry cannot authorize either
+        // signalling or release, even when enumeration found no carriers.
+        if scope.caller_ancestors.last() != Some(&1) {
+            return Err(ReapError::UnprovenOwnership);
+        }
         // The first round uses the pre-signal capture itself. Re-enumerating
         // here would wrongly TERM a carrier that arrived after that capture
-        // (and, on headless paths, after the group signal).
+        // (and, on headless paths, after the group signal). An empty first
+        // capture still runs the KILL capture and epoch classification below:
+        // an excluded owner may have forked a carrier since stop entry.
         let mut matches: Vec<ProcMatch> = scope.known.values().map(|(m, _)| m.clone()).collect();
-        if matches.is_empty() {
-            return Ok(());
-        }
         // Carriers of the first snapshot are this reap's own business and
         // stay in scope at every round; only late-appearing carriers go
         // through the scope rule below. `spared` captures each late
@@ -866,7 +899,11 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
             })
             .map(|m| m.pid)
             .collect();
-        if still.is_empty() { Ok(()) } else { Err(still) }
+        if still.is_empty() {
+            Ok(())
+        } else {
+            Err(ReapError::Survivors(still))
+        }
     }
 }
 
@@ -1651,6 +1688,30 @@ mod tests {
     fn reap_empty_name_is_noop_ok() {
         let db = test_db();
         assert!(reap_instance_tree_for(&db, &unique_name("empty"), &[]).is_ok());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn reap_refuses_unanchored_caller_scope() {
+        let db = test_db();
+        let capture = ReapCapture {
+            scope: CarrierTreeScope {
+                roots: vec![std::process::id()],
+                caller_ancestors: vec![std::process::id()],
+                known: HashMap::new(),
+            },
+        };
+        assert!(
+            reap_instance_tree_for_excluding_captured(
+                &db,
+                &unique_name("unanchored"),
+                &[],
+                &[],
+                capture,
+            )
+            .is_err(),
+            "an unproven owner chain must never authorize release",
+        );
     }
 
     #[test]

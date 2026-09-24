@@ -1732,18 +1732,14 @@ fn stop_instance_inner_scoped(
             capture,
         )
     {
-        let pids = survivors
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let error = survivors.to_string();
         log::log_warn(
             "hooks",
             "stop_instance.reap_incomplete",
-            &format!("instance={instance_name} survivors={pids}"),
+            &format!("instance={instance_name} err={error}"),
         );
         return StopOutcome::RetryableError(format!(
-            "could not stop {instance_name}: process(es) still alive after SIGKILL: {pids} — run hcom kill {instance_name} first"
+            "could not stop {instance_name}: {error} — run hcom kill {instance_name} first"
         ));
     }
 

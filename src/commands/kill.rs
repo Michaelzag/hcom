@@ -261,7 +261,12 @@ fn kill_tracked_instance_with_self_pids(
     name: &str,
     initiator: &str,
     self_pids: &[u32],
-    reap: impl FnOnce(&str, &[String], &[u32], crate::proctruth::ReapCapture) -> Result<(), Vec<u32>>,
+    reap: impl FnOnce(
+        &str,
+        &[String],
+        &[u32],
+        crate::proctruth::ReapCapture,
+    ) -> Result<(), crate::proctruth::ReapError>,
 ) -> Result<KillTrackedResult, String> {
     let inst = db
         .get_instance_full(name)
@@ -336,17 +341,9 @@ fn kill_tracked_instance_with_self_pids(
     })
 }
 
-/// The fail-closed survivor error shared by the self and foreign paths: the
-/// kill reports the survivors and leaves the row and bindings untouched.
-fn survivors_error(name: &str, survivors: &[u32]) -> String {
-    let pids = survivors
-        .iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "could not stop {name}: process(es) still alive after SIGKILL: {pids} — run hcom kill {name} first"
-    )
+/// A refused reap leaves the row and bindings available for a retry.
+fn survivors_error(name: &str, error: &crate::proctruth::ReapError) -> String {
+    format!("could not stop {name}: {error} — run hcom kill {name} first")
 }
 
 /// Re-read the incarnation token of `name` through the teardown transaction;
@@ -514,7 +511,12 @@ fn kill_self_tracked_instance(
     excluded: &[u32],
     incarnation: &ResolvedIncarnation,
     capture: crate::proctruth::ReapCapture,
-    reap: impl FnOnce(&str, &[String], &[u32], crate::proctruth::ReapCapture) -> Result<(), Vec<u32>>,
+    reap: impl FnOnce(
+        &str,
+        &[String],
+        &[u32],
+        crate::proctruth::ReapCapture,
+    ) -> Result<(), crate::proctruth::ReapError>,
 ) -> Result<KillTrackedResult, String> {
     // Signal and verify the non-self carriers FIRST. On survivors: bail
     // exactly like the foreign path, before touching the row or bindings.
@@ -776,16 +778,7 @@ fn reap_orphan_tree(db: &HcomDb, orphan: &crate::pidtrack::OrphanProcess) -> boo
     let mut survived = false;
     for orphan_name in &orphan.names {
         if let Err(survivors) = crate::proctruth::reap_instance_tree_for(db, orphan_name, ids) {
-            eprintln!(
-                "Processes still alive for '{}' after SIGKILL: {} — run hcom kill {} first",
-                orphan_name,
-                survivors
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                orphan_name,
-            );
+            eprintln!("{}", survivors_error(orphan_name, &survivors));
             survived = true;
         }
     }
@@ -1891,7 +1884,7 @@ mod tests {
             &excluded,
             &incarnation,
             crate::proctruth::capture_reap_carriers(&db, &name, &binding_ids, &excluded),
-            |_, _, _, _capture| Err(vec![survivor_pid]),
+            |_, _, _, _capture| Err(crate::proctruth::ReapError::Survivors(vec![survivor_pid])),
         )
         .err()
         .expect("a non-self survivor must fail the kill");
@@ -2300,6 +2293,46 @@ mod tests {
         let _ = _guard;
     }
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[serial]
+    fn kill_reaps_late_child_after_excluded_only_capture() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = format!("hcom-kill-{}-empty-capture", std::process::id());
+        let mut owner =
+            seed_bound_row_with_sleeper(&db, &name, "proc-empty-capture", "sess-empty-capture");
+        let mut late = None;
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            &name,
+            "test",
+            &[std::process::id(), owner.id()],
+            |n, bindings, excluded, capture| {
+                let child = spawn_named_sleeper(n, "");
+                wait_for_enumerated(n, child.id());
+                late = Some(child);
+                crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, bindings, excluded, capture,
+                )
+            },
+        );
+        let mut late = late.expect("reap callback ran");
+        let late_alive = !crate::proctruth::process_gone(late.id());
+        let owner_alive = crate::sys::process::is_alive(owner.id());
+        late.kill().ok();
+        late.wait().ok();
+        owner.kill().ok();
+        owner.wait().ok();
+        assert!(owner_alive, "the excluded owner must not be signalled");
+        assert!(!late_alive, "the late child must be gone before teardown");
+        assert_eq!(result.unwrap().teardown, TeardownOutcome::Completed);
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert_killed_by(&db, &name, "test");
+    }
+
+    #[test]
     #[cfg(unix)]
     #[serial]
     fn kill_failure_after_session_yield_keeps_exit_state_and_bindings() {
@@ -2347,7 +2380,7 @@ mod tests {
                     }
                     // Model an unkillable survivor after its one-shot hook
                     // has yielded. The guard drops without replaying the hook.
-                    Err(vec![pid])
+                    Err(crate::proctruth::ReapError::Survivors(vec![pid]))
                 },
             );
             let alive = crate::sys::process::is_alive(pid);
