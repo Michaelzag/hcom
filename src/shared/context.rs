@@ -132,22 +132,25 @@ impl HcomContext {
         self
     }
 
-    /// Drop a process id whose provenance this process tree cannot prove
-    /// ([`crate::proctruth::trusted_process_id`]), and drop the derived
-    /// `is_launched` claim with it. Idempotent — a cleared id is never
-    /// re-refused.
+    /// Drop a process id this hook cannot prove, together with the derived
+    /// `is_launched` claim. OMP hooks require a proven launcher UUID or an
+    /// OMP-minted ancestor id; other tools retain synthetic-id carriage.
+    /// Idempotent — a cleared id is never re-refused.
     ///
-    /// `is_launched` (§1.1) is derivative: the env claim alone proves
-    /// nothing. It holds only with a present, trusted, launcher-shaped id —
-    /// an `omp-<pid>-…` id can only come from the plugin or a shell hack
-    /// (the launcher mints UUIDs and strips inherited identity vars), so it
-    /// never proves a launch.
+    /// `HCOM_LAUNCHED=1` alone proves nothing. For OMP, only a trusted
+    /// launcher UUID backed by a recorded ancestor pid establishes a launch;
+    /// a proven OMP-minted id belongs to a plain or nested session. Other
+    /// tools keep their existing synthetic-id carriage and launch claims.
     pub fn trust_process_id(&mut self, db: &HcomDb) {
         let Some(id) = self.process_id.clone() else {
             self.is_launched = false;
             return;
         };
-        let trusted = crate::proctruth::trusted_process_id(db, &id);
+        let trusted = if self.tool == Tool::Omp {
+            crate::proctruth::trusted_process_id_for_omp(db, &id)
+        } else {
+            crate::proctruth::trusted_process_id(db, &id)
+        };
         if !trusted {
             self.process_id = None;
             crate::log::log_info(
@@ -156,8 +159,13 @@ impl HcomContext {
                 &format!("tool={} refused process id {id}", self.tool.as_str()),
             );
         }
-        self.is_launched =
-            self.is_launched && trusted && crate::proctruth::omp_minted_pid(&id).is_none();
+        self.is_launched = self.is_launched
+            && trusted
+            && if self.tool == Tool::Omp {
+                crate::proctruth::is_launcher_process_id(&id)
+            } else {
+                crate::proctruth::omp_minted_pid(&id).is_none()
+            };
     }
 
     // === Derived paths ===

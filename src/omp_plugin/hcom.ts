@@ -36,7 +36,8 @@ function log(
 }
 
 const HCOM_TIMEOUT_MS = 1800;
-const OMP_ID_PATTERN = /^omp-(\d+)-/;
+const OMP_ID_PATTERN = /^omp-(\d+)-.+$/;
+const LAUNCHER_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function ompIdPid(id: string): number | null {
 	const match = OMP_ID_PATTERN.exec(id);
@@ -84,7 +85,10 @@ function resolveProcessId(): { id: string; minted: boolean; reason: string } {
 	if (!existing) return { id: mintProcessId(), minted: true, reason: "missing" };
 	const pid = ompIdPid(existing);
 	if (pid === null) {
-		return { id: existing, minted: false, reason: "launcher_shape" };
+		// Only a launcher UUID can retain its inherited identity. The Rust
+		// hook, not this shape check, proves its row and ancestor pid.
+		if (inheritedLauncherCandidate) return { id: existing, minted: false, reason: "launcher_candidate" };
+		return { id: mintProcessId(), minted: true, reason: "inherited_non_launcher" };
 	}
 	if (process.platform !== "linux") {
 		return { id: mintProcessId(), minted: true, reason: "non_linux" };
@@ -98,6 +102,10 @@ function resolveProcessId(): { id: string; minted: boolean; reason: string } {
 	return { id: existing, minted: false, reason: "trusted_omp_ancestor" };
 }
 
+const inheritedLauncherCandidate =
+	process.env.HCOM_LAUNCHED === "1" &&
+	!!process.env.HCOM_PROCESS_ID &&
+	LAUNCHER_ID_PATTERN.test(process.env.HCOM_PROCESS_ID);
 const resolvedIdentity = resolveProcessId();
 process.env.HCOM_PROCESS_ID = resolvedIdentity.id;
 log("INFO", "identity_resolved", null, {
@@ -355,7 +363,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	async function bindIdentity(ctx: ExtensionContext): Promise<void> {
 		currentCtx = ctx;
 		if (instanceName || bindingPromise) return bindingPromise ?? Promise.resolve();
-		if (process.env.HCOM_LAUNCHED !== "1" && !(await plainSessionsEnabled())) return;
+		if (!inheritedLauncherCandidate && !(await plainSessionsEnabled())) return;
 		const skipReason = nestedSkipReason();
 		if (skipReason) {
 			nestedOptOut = true;
@@ -383,16 +391,29 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				const args = ["omp-start", "--session-id", sid, "--cwd", ctx.cwd];
 				if (transcriptPath) args.push("--transcript-path", transcriptPath);
 				if (port) args.push("--notify-port", String(port));
-				const result = await hcom(args);
+				let result = await hcom(args);
 				if (result.code !== 0) {
 					stopNotifyServer();
 					log("WARN", "plugin.bind_failed", null, { exit_code: result.code, stderr: result.stderr.slice(0, 300) });
 					return;
 				}
-				const json = JSON.parse(result.stdout || "{}");
-				if (json.error) {
+				let json = JSON.parse(result.stdout || "{}");
+				if (inheritedLauncherCandidate && json.error === "HCOM_PROCESS_ID not set" && (await plainSessionsEnabled())) {
+					// The hook refused the inherited UUID. With the plain-session
+					// opt-in, give this OMP process its own id and try only once.
+					process.env.HCOM_PROCESS_ID = mintProcessId();
+					log("INFO", "identity_resolved", null, { minted: true, reason: "unproven_launcher" });
+					result = await hcom(args);
+					if (result.code !== 0) {
+						stopNotifyServer();
+						log("WARN", "plugin.bind_failed", null, { exit_code: result.code, stderr: result.stderr.slice(0, 300) });
+						return;
+					}
+					json = JSON.parse(result.stdout || "{}");
+				}
+				if (json.error || !json.name) {
 					stopNotifyServer();
-					log("WARN", "plugin.bind_failed", null, { error: json.error });
+					log("WARN", "plugin.bind_failed", null, { error: json.error || "No instance bound to this process" });
 					return;
 				}
 				instanceName = json.name;

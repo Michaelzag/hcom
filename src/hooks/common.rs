@@ -80,8 +80,8 @@ pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
 ///
 /// This prevents outputting hints/errors when hcom is installed but not actively used.
 pub fn hook_gate_check(ctx: &mut HcomContext, db: &HcomDb) -> bool {
-    // A process id this process tree cannot prove is treated as ABSENT for
-    // every tool (design §2.2) — sanitize before the gate reads identity.
+    // Sanitize once before the gate reads identity. The context's presenter
+    // tool selects OMP's strict proof or the other hooks' carriage rule.
     ctx.trust_process_id(db);
     if ctx.process_id.is_some() || ctx.is_launched {
         return true;

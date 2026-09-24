@@ -146,12 +146,10 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
                 // `HCOM_PROCESS_ID`. Mint an identity the same way
                 // Claude/Gemini/Kimi do for orphaned PTY sessions: generate a
                 // name, create the row, and bind session+process to it.
-                //
-                // `ctx.is_launched` is derivative (the env flag AND a process id
-                // this process tree can prove), so a leaked `HCOM_LAUNCHED=1`
-                // does not count. A plain (non-hcom-launched) session joins
-                // only when the operator opted in with
-                // `[launch.omp].plain_sessions`.
+                // `ctx.is_launched` requires a proven launcher UUID whose
+                // recorded pid is an ancestor; inherited HCOM_LAUNCHED=1 or
+                // a provable OMP-minted id does not claim a launch. A plain
+                // session joins only with `[launch.omp].plain_sessions`.
                 let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
                 if ctx.is_launched || hcom_config.plain_sessions {
                     match instance_binding::create_orphaned_pty_identity(
@@ -393,6 +391,9 @@ pub(crate) fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
 pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
     let start = Instant::now();
     let mut ctx = HcomContext::from_os();
+    // This dispatcher is authoritative about its presenter even when an
+    // inherited HCOM_TOOL points at a different tool.
+    ctx.tool = crate::tool::Tool::Omp;
     crate::paths::ensure_hcom_directories_at(&ctx.hcom_dir);
     let db = match HcomDb::open() {
         Ok(db) => db,
@@ -408,7 +409,7 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
             );
         }
     };
-    if !common::hook_gate_check(&mut ctx, &db) {
+    if !common::hook_gate_check(&mut ctx, &db) && hook_name != "omp-start" {
         return (0, String::new());
     }
     let handler_argv: Vec<String> = if !argv.is_empty() && argv[0] == hook_name {

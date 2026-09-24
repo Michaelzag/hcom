@@ -1,17 +1,16 @@
 //! Identity minting and inherited-id trust, end to end against the real
 //! binary (design `omp-identity` §1–§4).
 //!
-//! The rule under test: an inherited `HCOM_PROCESS_ID` may bind, claim, or
-//! create a row ONLY when its provenance is proven by process ancestry —
-//! `omp-<pid>-...` requires `<pid>` to be a live ancestor whose
-//! `/proc/<pid>/comm` is exactly `omp`; `HCOM_LAUNCHED=1` proves nothing by
-//! itself, and an omp-shaped id can never prove a launch (launcher ids are
-//! UUIDs). A foreign id is sanitized to ABSENT for every tool, so leaked
-//! desktop env binds nothing. Plain (non-launched) omp sessions join only
-//! through the `[launch.omp] plain_sessions` opt-in.
+//! The rule under test: an inherited `HCOM_PROCESS_ID` binds only when its
+//! provenance is proven. Launcher UUIDs require a recorded ancestor pid;
+//! `omp-<pid>-...` requires a live OMP ancestor. An unanchored launcher row
+//! and inherited synthetic id are never OMP identities. `HCOM_LAUNCHED=1`
+//! alone proves nothing. Plain OMP sessions join only through the
+//! `[launch.omp] plain_sessions` opt-in.
 //!
-//! Linux only: the trust proof walks `/proc`, and off Linux every inherited
-//! id is unprovable by design, so there is nothing to pin here.
+//! Linux only: these integration tests exercise `/proc` ancestry. Windows
+//! ToolHelp ancestry is covered by pure walker tests and windows-build CI;
+//! macOS currently retains the explicit pre-0.7.30 passthrough.
 //!
 //! Carrier note: tests/ crates cannot link hcom internals (bin-only crate),
 //! so carrier enumeration is observed the way `tests/omp_stop_release.rs`
@@ -169,7 +168,7 @@ fn assert_no_bind_and_owner_intact(
 }
 
 /// Pipe a JSON payload to a JSON-stdin hook while the environment carries the
-/// leaked identity (the lotso `.zshenv` shape: foreign omp-shaped id PLUS
+/// leaked identity (the lotso `.zshenv` shape: a foreign id plus
 /// `HCOM_LAUNCHED=1`).
 fn run_leaked_hook(h: &Hcom, hook: &str, leaked_id: &str, payload: &Value) {
     let mut cmd = h.cmd();
@@ -280,6 +279,9 @@ fn spawn_provable_omp_session(h: &Hcom, tag: &str, session_id: &str) -> FakeOmpS
         .env("TEST_BIN", env!("CARGO_BIN_EXE_hcom"))
         .env("TEST_SID", session_id)
         .env("TEST_CWD", &h.workspace)
+        // Simulate plugin load inheriting a synthetic id before it replaces
+        // that id with this OMP process's own minted identity at exec.
+        .env("HCOM_PROCESS_ID", "pid-agy-123")
         .process_group(0);
     let child = command
         .spawn()
@@ -397,6 +399,161 @@ fn leaked_omp_id_binds_nothing_through_claude_and_codex_hooks() {
         }),
     );
     assert_no_bind_and_owner_intact(&h, &codex_sid, &seeded_name, &seeded_sid, &leaked);
+}
+
+#[test]
+fn launcher_uuid_null_pid_row_refuses_leaked_claude_hook() {
+    // The pre-spawn launcher row exists, but its pid is still NULL. The
+    // presenting hook carries the UUID itself; carriage cannot replace the
+    // missing ancestry anchor or attach to the owner's row.
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "status failed: {stderr}");
+    let suffix = unique_suffix();
+    let owner_name = format!("preanchor{suffix}");
+    let owner_sid = format!("sid-preanchor-{suffix}");
+    let launcher_id = "550e8400-e29b-41d4-a716-446655440000";
+    seed_identity(&h, &owner_name, &owner_sid, launcher_id);
+    let sid = format!("sid-leaked-preanchor-{suffix}");
+    run_leaked_hook(
+        &h,
+        "sessionstart",
+        launcher_id,
+        &json!({
+            "session_id": sid,
+            "cwd": h.workspace,
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+        }),
+    );
+    assert_no_bind_and_owner_intact(&h, &sid, &owner_name, &owner_sid, launcher_id);
+}
+
+#[test]
+fn inherited_synthetic_omp_id_does_not_join_without_plain_sessions() {
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "status failed: {stderr}");
+    let sid = format!("sid-inherited-{}", unique_suffix());
+    let inherited_id = "pid-agy-123";
+    let mut cmd = h.cmd();
+    cmd.args(["omp-start", "--session-id", &sid]);
+    cmd.arg("--cwd").arg(&h.workspace);
+    cmd.env("HCOM_PROCESS_ID", inherited_id);
+    cmd.env("HCOM_LAUNCHED", "1");
+    let out = cmd
+        .output()
+        .expect("run omp-start with inherited synthetic id");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let response: Value =
+        serde_json::from_slice(&out.stdout).expect("refused omp-start emits JSON response");
+    assert!(
+        response.get("error").is_some() && response.get("name").is_none(),
+        "inherited synthetic id joined without opt-in: {response}"
+    );
+    let db = open_db(&h);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM instances", &[]), 0);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM session_bindings WHERE session_id = ?1",
+            &[sid.as_str()]
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM process_bindings WHERE process_id = ?1",
+            &[inherited_id]
+        ),
+        0
+    );
+}
+
+#[test]
+fn unproven_launcher_uuid_retries_as_plain_with_opt_in() {
+    // Model the plugin's one retry: first present an inherited launcher UUID
+    // without a row, then replace it with this OMP process's minted id.
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "status failed: {stderr}");
+    enable_plain_sessions(&h);
+    let inherited_id = "550e8400-e29b-41d4-a716-446655440000";
+    let sid = format!("sid-retry-{}", unique_suffix());
+    let fakebin = h.root_path().join("fakebin");
+    fs::create_dir_all(&fakebin).expect("create fakebin dir");
+    let omp = fakebin.join("omp");
+    unix_fs::symlink("/bin/bash", &omp).expect("symlink omp -> /bin/bash");
+    let out_dir = h.root_path().join("retry-session");
+    fs::create_dir_all(&out_dir).expect("create retry output dir");
+    let script = out_dir.join("session.sh");
+    fs::write(
+        &script,
+        r#"
+HCOM_LAUNCHED=1 HCOM_TOOL=omp "$TEST_BIN" omp-start --session-id "$TEST_SID" --cwd "$TEST_CWD" \
+    > "$TEST_OUT_DIR/first.json" 2> "$TEST_OUT_DIR/first.stderr"
+export HCOM_PROCESS_ID=omp-$$-1-1
+printf "%s" "$HCOM_PROCESS_ID" > "$TEST_OUT_DIR/id.txt"
+HCOM_LAUNCHED=1 HCOM_TOOL=omp "$TEST_BIN" omp-start --session-id "$TEST_SID" --cwd "$TEST_CWD" \
+    > "$TEST_OUT_DIR/start.json" 2> "$TEST_OUT_DIR/start.stderr"
+printf "%s" "$?" > "$TEST_OUT_DIR/start.code"
+while :; do sleep 1; done
+"#,
+    )
+    .expect("write retry script");
+    let mut cmd = h.external_cmd(&omp);
+    cmd.arg("-c")
+        .arg(format!(
+            "exec env HCOM_PROCESS_ID={} {} {}",
+            inherited_id,
+            shell_quote(&omp),
+            shell_quote(&script)
+        ))
+        .env("TEST_OUT_DIR", &out_dir)
+        .env("TEST_BIN", env!("CARGO_BIN_EXE_hcom"))
+        .env("TEST_SID", &sid)
+        .env("TEST_CWD", &h.workspace)
+        .process_group(0);
+    let child = cmd.spawn().expect("spawn fake omp retry session");
+    h.track_cleanup_pid(child.id() as i64);
+    let mut session = FakeOmpSession { child, out_dir };
+    let (start_code, start) = wait_for_start(&h, &session);
+    assert_eq!(start_code, "0", "retry exit {}", session.detail(&start));
+    let first: Value =
+        serde_json::from_str(&session.read("first.json")).expect("initial hook refusal JSON");
+    assert_eq!(first["error"], "HCOM_PROCESS_ID not set", "{first}");
+    assert!(
+        first.get("name").is_none(),
+        "unproven UUID bound on first attempt: {first}"
+    );
+    let name = start["name"].as_str().expect("plain retry bound own id");
+    assert_eq!(session.read("id.txt"), session.minted_id());
+    let db = open_db(&h);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM instances", &[]), 1);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM process_bindings WHERE process_id = ?1",
+            &[inherited_id]
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM process_bindings WHERE process_id = ?1 AND instance_name = ?2",
+            &[session.minted_id().as_str(), name],
+        ),
+        1
+    );
+    drop(db);
+    kill_group(&mut session.child);
 }
 
 #[test]
@@ -534,8 +691,32 @@ fn plain_sessions_gate_controls_provable_chain_minting() {
     drop(db);
     kill_group(&mut session_a.child);
 
-    // Phase B — operator opts in: two plain sessions, two distinct identities.
+    // Phase B — with the opt-in, plugin load replaces the inherited
+    // pid-agy-123 id with each OMP process's own minted id.
     enable_plain_sessions(&h);
+    // A raw inherited synthetic id is not itself admitted even with the
+    // opt-in: the plugin must replace it with this process's own OMP id.
+    let raw_sid = format!("sid-raw-{suffix}");
+    let mut raw_hook = h.cmd();
+    raw_hook.args(["omp-start", "--session-id", &raw_sid]);
+    raw_hook.arg("--cwd").arg(&h.workspace);
+    raw_hook.env("HCOM_PROCESS_ID", "pid-agy-123");
+    raw_hook.env("HCOM_LAUNCHED", "1");
+    let raw = raw_hook.output().expect("run raw synthetic omp-start");
+    assert_eq!(
+        raw.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    let refused: Value = serde_json::from_slice(&raw.stdout).expect("raw hook refusal JSON");
+    assert!(
+        refused.get("error").is_some() && refused.get("name").is_none(),
+        "raw inherited synthetic id bound despite the opt-in: {refused}"
+    );
+    let db = open_db(&h);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM instances", &[]), 0);
+    drop(db);
     let sid_b = format!("sid-gate-b-{suffix}");
     let sid_c = format!("sid-gate-c-{suffix}");
     let mut session_b = spawn_provable_omp_session(&h, &format!("gate-b-{suffix}"), &sid_b);
@@ -591,6 +772,15 @@ fn plain_sessions_gate_controls_provable_chain_minting() {
             "no process binding for {name}'s trusted id"
         );
     }
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM process_bindings WHERE process_id = ?1",
+            &["pid-agy-123"],
+        ),
+        0,
+        "the inherited synthetic id must not be bound"
+    );
     drop(db);
 
     kill_group(&mut session_b.child);
