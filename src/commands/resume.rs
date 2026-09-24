@@ -936,17 +936,21 @@ fn resolve_restore_earlier_plan(
 
 /// Append the `--restore-earlier` corrective `life.stopped` event — a copy of
 /// the restored snapshot, so the seat's newest snapshot names a live session
-/// again — and return the line reporting it. `None`, with no write, for every
-/// other plan.
+/// again — reserve the seat for the launch, and return the line reporting it.
+/// `None`, with no write, for every other plan.
 ///
-/// The newest-snapshot and holder re-checks and the append share ONE
-/// `BEGIN IMMEDIATE` transaction: a stopped snapshot appended for the seat or
-/// an instance that claimed the session after planning either commits first,
-/// so a re-check sees it and nothing is written, or lands after the
-/// corrective event. The copy's cursor is clamped to the name's
-/// newest ([`name_newest_cursor`]): a launch that fails after this append
-/// leaves the copy as the seat's newest snapshot, and a retry must not resume
-/// from the older snapshot's cursor and redeliver consumed messages.
+/// The newest-snapshot, seat and holder re-checks, the append and the
+/// reservation share ONE `BEGIN IMMEDIATE` transaction. A stopped snapshot
+/// appended for the seat, or an instance that claimed the seat or the
+/// session after planning, either commits first, so a re-check sees it and
+/// nothing is written or launched, or commits after the reservation and finds
+/// the session held ([`live_session_holder`]). The reservation is the row the
+/// launcher pre-registers for a resume: inactive and carrying the session,
+/// which the launch consumes and recreates in place. The copy's cursor is
+/// clamped to the name's newest ([`name_newest_cursor`]): a launch that fails
+/// after this append leaves the copy as the seat's newest snapshot, and a
+/// retry must not resume from the older snapshot's cursor and redeliver
+/// consumed messages.
 fn append_restored_snapshot(
     db: &HcomDb,
     name: &str,
@@ -963,19 +967,25 @@ fn append_restored_snapshot(
                  planning; nothing restored"
             );
         }
+        if let Some(inst) = db.get_instance_full(name)?
+            && inst.status != ST_INACTIVE
+        {
+            bail!("'{name}' is still active — run hcom kill {name} first");
+        }
         if let Some(holder) = live_session_holder(db, session_id)? {
             bail!(
                 "{RESTORE_EARLIER_FLAG}: earlier session {session_id} of '{name}' is live as \
                  '{holder}'; nothing restored"
             );
         }
+        let cursor = restored
+            .snapshot
+            .get("last_event_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+            .max(name_newest_cursor(db, name));
         let mut snapshot = restored.snapshot.clone();
         if let Some(fields) = snapshot.as_object_mut() {
-            let cursor = fields
-                .get("last_event_id")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0)
-                .max(name_newest_cursor(db, name));
             fields.insert("last_event_id".to_string(), json!(cursor));
         }
         db.log_life_event(
@@ -985,7 +995,23 @@ fn append_restored_snapshot(
             RESTORE_EARLIER_REASON,
             Some(snapshot),
             None,
-        )
+        )?;
+        let mut row = serde_json::Map::new();
+        row.insert("session_id".into(), json!(session_id));
+        row.insert("tool".into(), json!(plan.output.tool));
+        row.insert("status".into(), json!(ST_INACTIVE));
+        row.insert("status_context".into(), json!("new"));
+        row.insert(
+            "directory".into(),
+            json!(plan.launch.cwd.as_deref().unwrap_or_default()),
+        );
+        row.insert("last_event_id".into(), json!(cursor));
+        row.insert(
+            "created_at".into(),
+            json!(crate::shared::time::now_epoch_f64()),
+        );
+        db.save_instance_named(name, &row)?;
+        Ok(())
     })?;
     Ok(Some(format!(
         "restored earlier session {session_id} of '{name}' (from event #{})",
@@ -4825,7 +4851,7 @@ mod tests {
                 "tag": "",
                 "background": 0,
                 "last_event_id": 0,
-                "directory": "/tmp",
+                "directory": env!("CARGO_MANIFEST_DIR"),
                 "purpose": "",
                 "current": "",
                 "transcript_path": transcript_path,
@@ -5143,37 +5169,52 @@ mod tests {
             .collect()
     }
 
+    /// A seat directory outside `/tmp`, beside the test binary, removed on
+    /// drop. omp refuses a cwd under `/tmp`, so resume redirects a snapshot
+    /// directory there to `/build/<seat>/tmp` — creating it, which a CI runner
+    /// can't — before the session-file check these tests pin.
+    #[cfg(unix)]
+    fn seat_dir() -> tempfile::TempDir {
+        let exe = std::env::current_exe().unwrap();
+        tempfile::Builder::new()
+            .prefix("hcom-seat-")
+            .tempdir_in(exe.parent().unwrap())
+            .unwrap()
+    }
+
     /// Seat `lave`: an older snapshot of session A (file exists when
     /// `earlier_has_file`, directory `a_dir`) followed by two poisoned
     /// snapshots of `dead_sid` — a session with no file, or no session at
     /// all when empty (a launch that never bound). Returns the db, A's
-    /// directory, and the id of A's `life.stopped` event.
+    /// directory, the id of A's `life.stopped` event, and the guard owning
+    /// the seat directories.
     #[cfg(unix)]
     fn poisoned_seat_db(
-        home: &std::path::Path,
         earlier_has_file: bool,
         dead_sid: &str,
-    ) -> (HcomDb, String, i64) {
+    ) -> (HcomDb, String, i64, tempfile::TempDir) {
         if earlier_has_file {
             write_omp_session_file(&format!("2026-01-01T00-00-00Z_{OMP_EARLIER_SID}.jsonl"));
         }
-        let a_dir = home.join("seat-dir");
+        let seats = seat_dir();
+        let a_dir = seats.path().join("seat-dir");
         std::fs::create_dir_all(&a_dir).unwrap();
         let a_dir = a_dir.to_string_lossy().to_string();
+        let dead_dir = seats.path().to_string_lossy().to_string();
         let db = test_db();
         let a_event =
             insert_omp_stopped_event(&db, "lave", OMP_EARLIER_SID, &a_dir, OMP_EARLIER_CURSOR);
-        insert_omp_stopped_event(&db, "lave", dead_sid, "/tmp", OMP_DEAD_CURSOR);
-        insert_omp_stopped_event(&db, "lave", dead_sid, "/tmp", OMP_DEAD_CURSOR);
-        (db, a_dir, a_event)
+        insert_omp_stopped_event(&db, "lave", dead_sid, &dead_dir, OMP_DEAD_CURSOR);
+        insert_omp_stopped_event(&db, "lave", dead_sid, &dead_dir, OMP_DEAD_CURSOR);
+        (db, a_dir, a_event, seats)
     }
 
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn test_omp_resume_dead_newest_names_earlier_session() {
-        with_omp_home(|home| {
-            let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
+        with_omp_home(|_| {
+            let (db, _, _, _seats) = poisoned_seat_db(true, OMP_MISSING_SID);
             let err = prepare_resume_plan(&db, "lave", false, &[], &GlobalFlags::default())
                 .err()
                 .expect("resume of a dead newest snapshot must fail")
@@ -5192,8 +5233,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_restore_earlier_appends_one_snapshot_and_resumes_it() {
-        with_omp_home(|home| {
-            let (db, a_dir, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
+        with_omp_home(|_| {
+            let (db, a_dir, _, _seats) = poisoned_seat_db(true, OMP_MISSING_SID);
             let before = stopped_events(&db, "lave").len();
 
             let (resolved, plan) =
@@ -5235,8 +5276,8 @@ mod tests {
         // Held via an instance row carrying the session, then via a
         // session binding whose instance is live.
         for via_binding in [false, true] {
-            with_omp_home(|home| {
-                let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
+            with_omp_home(|_| {
+                let (db, _, _, _seats) = poisoned_seat_db(true, OMP_MISSING_SID);
                 let mut data = serde_json::Map::new();
                 if !via_binding {
                     data.insert("session_id".into(), json!(OMP_EARLIER_SID));
@@ -5273,8 +5314,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_restore_earlier_without_earlier_file_writes_nothing() {
-        with_omp_home(|home| {
-            let (db, _, _) = poisoned_seat_db(home, false, OMP_MISSING_SID);
+        with_omp_home(|_| {
+            let (db, _, _, _seats) = poisoned_seat_db(false, OMP_MISSING_SID);
             let err = prepare_resume_plan(&db, "lave", false, &[], &GlobalFlags::default())
                 .err()
                 .unwrap()
@@ -5299,8 +5340,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_restore_earlier_rejects_session_id() {
-        with_omp_home(|home| {
-            let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
+        with_omp_home(|_| {
+            let (db, _, _, _seats) = poisoned_seat_db(true, OMP_MISSING_SID);
             let before = stopped_events(&db, "lave").len();
             let err =
                 resolve_restore_earlier_plan(&db, OMP_EARLIER_SID, &[], &GlobalFlags::default())
@@ -5323,8 +5364,8 @@ mod tests {
         // launch fails after the corrective append, that copy is the seat's
         // newest snapshot, and the retry must not resume from A's 100 and
         // redeliver the messages up to 500 the seat already consumed.
-        with_omp_home(|home| {
-            let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
+        with_omp_home(|_| {
+            let (db, _, _, _seats) = poisoned_seat_db(true, OMP_MISSING_SID);
             let (_, plan) =
                 resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
             append_restored_snapshot(&db, "lave", &plan).unwrap();
@@ -5346,8 +5387,8 @@ mod tests {
     fn test_restore_earlier_refuses_a_holder_that_appears_after_planning() {
         // Planning found A free; an instance then claims A before the
         // corrective write, which must refuse and write nothing.
-        with_omp_home(|home| {
-            let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
+        with_omp_home(|_| {
+            let (db, _, _, _seats) = poisoned_seat_db(true, OMP_MISSING_SID);
             let (_, plan) =
                 resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
             let mut data = serde_json::Map::new();
@@ -5357,7 +5398,9 @@ mod tests {
             db.save_instance_named("rune", &data).unwrap();
             let before = stopped_events(&db, "lave").len();
 
-            let err = append_restored_snapshot(&db, "lave", &plan)
+            // The launch path: the refusal lands before anything is reserved
+            // or spawned.
+            let err = execute_prepared_resume_result(&db, "lave", false, &plan)
                 .expect_err("a session claimed after planning must not be restored")
                 .to_string();
             assert_eq!(
@@ -5368,6 +5411,74 @@ mod tests {
                 )
             );
             assert_eq!(stopped_events(&db, "lave").len(), before);
+            assert!(db.get_instance_full("lave").unwrap().is_none());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_reserves_the_session_with_the_corrective_event() {
+        // Seats lave and kiwi both plan to restore A while it is free. lave
+        // commits first: its corrective event and its launch reservation of
+        // A land in one commit, so kiwi, committing after, finds A held and
+        // restores nothing — no event, no row, nothing to launch.
+        with_omp_home(|_| {
+            let (db, a_dir, _, seats) = poisoned_seat_db(true, OMP_MISSING_SID);
+            let dead_dir = seats.path().to_string_lossy().to_string();
+            insert_omp_stopped_event(&db, "kiwi", OMP_EARLIER_SID, &a_dir, OMP_EARLIER_CURSOR);
+            insert_omp_stopped_event(&db, "kiwi", OMP_MISSING_SID, &dead_dir, OMP_DEAD_CURSOR);
+            let (_, kiwi_plan) =
+                resolve_restore_earlier_plan(&db, "kiwi", &[], &GlobalFlags::default()).unwrap();
+            let (_, lave_plan) =
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+
+            append_restored_snapshot(&db, "lave", &lave_plan).unwrap();
+            let row = db.get_instance_full("lave").unwrap().unwrap();
+            assert_eq!(row.session_id.as_deref(), Some(OMP_EARLIER_SID));
+            assert_eq!(row.status, ST_INACTIVE);
+
+            let before = stopped_events(&db, "kiwi").len();
+            let err = append_restored_snapshot(&db, "kiwi", &kiwi_plan)
+                .expect_err("a session reserved by another seat must not be restored")
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "--restore-earlier: earlier session {OMP_EARLIER_SID} of 'kiwi' is live as \
+                     'lave'; nothing restored"
+                )
+            );
+            assert_eq!(stopped_events(&db, "kiwi").len(), before);
+            assert!(db.get_instance_full("kiwi").unwrap().is_none());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_refuses_a_seat_that_went_live_after_planning() {
+        // The reservation replaces the seat's row: one that turned live
+        // after planning must refuse the restore, never be overwritten.
+        with_omp_home(|_| {
+            let (db, _, _, _seats) = poisoned_seat_db(true, OMP_MISSING_SID);
+            let (_, plan) =
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+            let mut data = serde_json::Map::new();
+            data.insert("session_id".into(), json!(OMP_OTHER_SID));
+            data.insert("tool".into(), json!("omp"));
+            data.insert("status".into(), json!("listening"));
+            data.insert("created_at".into(), json!(1.0));
+            db.save_instance_named("lave", &data).unwrap();
+            let before = stopped_events(&db, "lave").len();
+
+            let err = append_restored_snapshot(&db, "lave", &plan)
+                .expect_err("a seat live since planning must not be restored")
+                .to_string();
+            assert_eq!(err, "'lave' is still active — run hcom kill lave first");
+            assert_eq!(stopped_events(&db, "lave").len(), before);
+            let row = db.get_instance_full("lave").unwrap().unwrap();
+            assert_eq!(row.session_id.as_deref(), Some(OMP_OTHER_SID));
         });
     }
 
@@ -5379,12 +5490,18 @@ mod tests {
         // into a live session and stopped again before the corrective write.
         // Restoring A now would bury that newer session, so the append must
         // refuse and write nothing.
-        with_omp_home(|home| {
-            let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
+        with_omp_home(|_| {
+            let (db, _, _, _seats) = poisoned_seat_db(true, OMP_MISSING_SID);
             let (_, plan) =
                 resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
             write_omp_session_file(&format!("2026-01-02T00-00-00Z_{OMP_OTHER_SID}.jsonl"));
-            insert_omp_stopped_event(&db, "lave", OMP_OTHER_SID, "/tmp", OMP_DEAD_CURSOR + 1);
+            insert_omp_stopped_event(
+                &db,
+                "lave",
+                OMP_OTHER_SID,
+                env!("CARGO_MANIFEST_DIR"),
+                OMP_DEAD_CURSOR + 1,
+            );
             let before = stopped_events(&db, "lave").len();
 
             let err = append_restored_snapshot(&db, "lave", &plan)
@@ -5410,8 +5527,8 @@ mod tests {
     fn test_restore_earlier_recovers_a_seat_whose_newest_launch_never_bound() {
         // The common poisoned seat: its newest snapshot names no session at
         // all, which is as dead as a session whose file is gone.
-        with_omp_home(|home| {
-            let (db, _, a_event) = poisoned_seat_db(home, true, "");
+        with_omp_home(|_| {
+            let (db, _, a_event, _seats) = poisoned_seat_db(true, "");
             let err = prepare_resume_plan(&db, "lave", false, &[], &GlobalFlags::default())
                 .err()
                 .expect("resume of a never-bound newest snapshot must fail")
@@ -5456,7 +5573,7 @@ mod tests {
         // lives only under the child's root, where the resume guard looks, so
         // the earlier-session check must look there too.
         with_omp_home(|home| {
-            let (db, _, _) = poisoned_seat_db(home, false, OMP_MISSING_SID);
+            let (db, _, _, _seats) = poisoned_seat_db(false, OMP_MISSING_SID);
             // config.toml first: a config load with none rewrites the env file.
             crate::config::write_default_config().unwrap();
             crate::config::save_env_file(&std::collections::HashMap::from([(
@@ -5504,8 +5621,8 @@ mod tests {
         // resumed omp runs in: for A, its snapshot's directory. A's file lives
         // only under `<A's directory>/agent`, so the earlier-session check
         // must resolve the root there, as the resume of A will.
-        with_omp_home(|home| {
-            let (db, a_dir, _) = poisoned_seat_db(home, false, OMP_MISSING_SID);
+        with_omp_home(|_| {
+            let (db, a_dir, _, _seats) = poisoned_seat_db(false, OMP_MISSING_SID);
             // config.toml first: a config load with none rewrites the env file.
             crate::config::write_default_config().unwrap();
             crate::config::save_env_file(&std::collections::HashMap::from([(
