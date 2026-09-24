@@ -269,9 +269,21 @@ struct CarrierTreeScope {
     roots: Vec<u32>,
     caller_ancestors: Vec<u32>,
     known: HashMap<u32, (ProcMatch, String)>,
-    dropped_live: std::cell::Cell<usize>,
+    /// Identity carriers seen live outside the proven scope. Only the ones
+    /// still alive at the release decision can block it.
+    dropped_live: std::cell::RefCell<Vec<u32>>,
     admitted: std::cell::Cell<usize>,
     excluded: Vec<u32>,
+}
+
+#[cfg(unix)]
+impl CarrierTreeScope {
+    fn drop_unproven(&self, pid: u32) {
+        let mut dropped = self.dropped_live.borrow_mut();
+        if !dropped.contains(&pid) {
+            dropped.push(pid);
+        }
+    }
 }
 
 /// The row a capture was taken against. A stop that threads the capture may
@@ -338,7 +350,7 @@ fn carrier_tree_scope(row_pid: Option<i64>, binding_ids: &[String]) -> CarrierTr
         caller_ancestors: caller_ancestor_pids(),
         known: HashMap::new(),
         excluded: Vec::new(),
-        dropped_live: std::cell::Cell::new(0),
+        dropped_live: std::cell::RefCell::new(Vec::new()),
         admitted: std::cell::Cell::new(0),
     }
 }
@@ -568,7 +580,7 @@ fn enumerate_unix(
                 if scope.excluded.contains(&pid) {
                     scope.admitted.set(scope.admitted.get() + 1);
                 } else {
-                    scope.dropped_live.set(scope.dropped_live.get() + 1);
+                    scope.drop_unproven(pid);
                 }
                 log_carrier_out_of_scope(pid, name, scope);
             }
@@ -579,7 +591,7 @@ fn enumerate_unix(
                 if scope.excluded.contains(&pid) {
                     scope.admitted.set(scope.admitted.get() + 1);
                 } else {
-                    scope.dropped_live.set(scope.dropped_live.get() + 1);
+                    scope.drop_unproven(pid);
                 }
                 true
             } else {
@@ -961,7 +973,15 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
             })
             .collect();
         if current.is_empty() {
-            if scope.dropped_live.get() > 0 && scope.admitted.get() == 0 {
+            // Ownership is unproven only while a dropped carrier still lives:
+            // one seen only before the signal, and dead since, owns nothing.
+            if scope.admitted.get() == 0
+                && scope
+                    .dropped_live
+                    .borrow()
+                    .iter()
+                    .any(|&pid| !process_gone(pid))
+            {
                 return Err(ReapError::UnprovenOwnership);
             }
             return Ok(());
@@ -1671,7 +1691,7 @@ mod tests {
             caller_ancestors: vec![10, 2, 1],
             known: HashMap::new(),
             excluded: Vec::new(),
-            dropped_live: std::cell::Cell::new(0),
+            dropped_live: std::cell::RefCell::new(Vec::new()),
             admitted: std::cell::Cell::new(0),
         };
         let parents = [
@@ -1875,6 +1895,52 @@ mod tests {
         assert!(!line.contains("Stopped"), "{line}");
     }
 
+    /// A name-carrying sleeper that leads its own session and process group,
+    /// outside the test's tree (the `sh` parent exits). Returns its pid, which
+    /// is also its group id.
+    #[cfg(target_os = "linux")]
+    fn spawn_detached_group_leader(name: &str) -> u32 {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("setsid sleep 300 >/dev/null 2>&1 & echo $!")
+            .env("HCOM_INSTANCE_NAME", name)
+            .env_remove("HCOM_PROCESS_ID")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("spawn group leader");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("group leader pid")
+    }
+
+    /// The orphan arm captures before its group signal. A row-less orphan
+    /// has no row root, so its live group is dropped unproven; once the
+    /// signal kills it nothing lives, and the reap must not refuse on a
+    /// carrier that existed only in the pre-signal snapshot.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unproven_refusal_requires_a_live_carrier_at_decision() {
+        let db = test_db();
+        let name = unique_name("orphan-group");
+        let leader = spawn_detached_group_leader(&name);
+        wait_for_enumerated(&name, &[], leader);
+        let capture = capture_reap_carriers(&db, &name, &[], &[]);
+        // The orphan arm's group signal.
+        unsafe { libc::kill(-(leader as libc::pid_t), libc::SIGKILL) };
+        for _ in 0..100 {
+            if process_gone(leader) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(process_gone(leader), "group signal must kill the leader");
+        let result = reap_instance_tree_for_excluding_captured(&db, &name, &[], &[], capture);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
     /// The round seam as a rendezvous: the reaper blocks at `point` until
     /// the returned sender is fired, and the returned receiver yields when
     /// the boundary is reached — so the test's registration/spawn lands at
@@ -1978,7 +2044,7 @@ mod tests {
                 caller_ancestors: vec![std::process::id()],
                 known: HashMap::new(),
                 excluded: Vec::new(),
-                dropped_live: std::cell::Cell::new(0),
+                dropped_live: std::cell::RefCell::new(Vec::new()),
                 admitted: std::cell::Cell::new(0),
             },
             carriers: Vec::new(),
