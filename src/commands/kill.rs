@@ -283,7 +283,12 @@ fn kill_tracked_instance_with_self_pids(
     // is still the row's.
     let incarnation =
         ResolvedIncarnation::capture(db, &inst, &binding_ids).map_err(|e| e.to_string())?;
-    let _teardown_claim = crate::hooks::common::TeardownClaim::register(db, name);
+    let _teardown_claim = crate::hooks::common::TeardownClaim::register(
+        db,
+        name,
+        incarnation.token.created_at,
+        incarnation.token.session_id.as_deref(),
+    );
 
     // Self-kill check BEFORE any signal: when the caller runs inside the
     // instance it is killing, the carrier set holds the caller's own session

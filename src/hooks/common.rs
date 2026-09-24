@@ -1838,11 +1838,13 @@ fn stop_instance_inner_scoped(
 struct TeardownOwner {
     pid: u32,
     process_start: String,
+    created_at: f64,
+    session_id: Option<String>,
 }
 
 /// An in-flight kill owns the stopped record before it sends any signal.
-/// Session hooks yield to its live OS identity; a crashed killer's claim
-/// cannot block the next session end or kill.
+/// Session hooks yield only for the claimed incarnation and live OS identity;
+/// a crashed killer or a re-registered name cannot block the next session end.
 pub(crate) struct TeardownClaim<'a> {
     db: &'a HcomDb,
     key: String,
@@ -1850,7 +1852,12 @@ pub(crate) struct TeardownClaim<'a> {
 }
 
 impl<'a> TeardownClaim<'a> {
-    pub(crate) fn register(db: &'a HcomDb, instance_name: &str) -> Option<Self> {
+    pub(crate) fn register(
+        db: &'a HcomDb,
+        instance_name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+    ) -> Option<Self> {
         let pid = std::process::id();
         let Some(process_start) = crate::sys::process::identity(pid) else {
             log::log_warn(
@@ -1861,7 +1868,13 @@ impl<'a> TeardownClaim<'a> {
             return None;
         };
         let key = format!("teardown_claim:{instance_name}");
-        let value = serde_json::json!({"pid": pid, "process_start": process_start}).to_string();
+        let value = serde_json::json!({
+            "pid": pid,
+            "process_start": process_start,
+            "created_at": created_at,
+            "session_id": session_id,
+        })
+        .to_string();
         // The latest killer owns the claim, including when replacing a dead
         // owner. Earlier guards cannot clear another process's ownership.
         if let Err(e) = db.kv_set(&key, Some(&value)) {
@@ -1893,7 +1906,16 @@ fn yield_to_teardown(db: &HcomDb, instance_name: &str) -> bool {
         .ok()
         .flatten()
         .and_then(|value| serde_json::from_str::<TeardownOwner>(&value).ok())
-        .is_some_and(|owner| crate::sys::process::has_identity(owner.pid, &owner.process_start));
+        .is_some_and(|owner| {
+            crate::sys::process::has_identity(owner.pid, &owner.process_start)
+                && db
+                    .get_instance_full(instance_name)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| {
+                        row.created_at == owner.created_at && row.session_id == owner.session_id
+                    })
+        });
     if live {
         log::log_info(
             "hooks",
@@ -3281,6 +3303,8 @@ mod tests {
             let value = serde_json::json!({
                 "pid": std::process::id(),
                 "process_start": crate::sys::process::identity(std::process::id()).unwrap(),
+                "created_at": 0.0,
+                "session_id": null,
             })
             .to_string();
             db.kv_set(&format!("teardown_claim:{name}"), Some(&value))
@@ -3316,14 +3340,40 @@ mod tests {
 
     #[test]
     #[serial]
+    fn session_finalize_ignores_claim_for_another_incarnation() {
+        let _env = isolated_test_env();
+        for (created_at, session_id) in [(1.0, None), (0.0, Some("new-session"))] {
+            let (_dir, db) = make_test_db();
+            insert_test_instance(&db, "reclaimed");
+            let _claim = TeardownClaim::register(&db, "reclaimed", 0.0, None).unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE instances SET created_at = ?, session_id = ? WHERE name = 'reclaimed'",
+                    params![created_at, session_id],
+                )
+                .unwrap();
+
+            assert_eq!(
+                finalize_session(&db, "reclaimed", "shutdown", None),
+                StopOutcome::Stopped,
+            );
+            assert!(db.get_instance_full("reclaimed").unwrap().is_none());
+            let snapshot = newest_stopped_snapshot(&db, "reclaimed");
+            assert_eq!(snapshot["created_at"], serde_json::json!(created_at));
+            assert_eq!(snapshot["session_id"], serde_json::json!(session_id));
+        }
+    }
+
+    #[test]
+    #[serial]
     fn session_finalizers_ignore_stale_and_malformed_teardown_claims() {
         let _env = isolated_test_env();
         let (_dir, db) = make_test_db();
         for value in [
             "not-json".to_string(),
-            serde_json::json!({"pid": std::process::id(), "process_start": "wrong-start"})
+            serde_json::json!({"pid": std::process::id(), "process_start": "wrong-start", "created_at": 0.0, "session_id": null})
                 .to_string(),
-            serde_json::json!({"pid": u32::MAX, "process_start": "dead"}).to_string(),
+            serde_json::json!({"pid": u32::MAX, "process_start": "dead", "created_at": 0.0, "session_id": null}).to_string(),
         ] {
             for soft in [false, true] {
                 let name = "stale-claim";
@@ -3364,7 +3414,8 @@ mod tests {
         let key = "teardown_claim:claim-owner";
         db.kv_set(key, Some(r#"{"pid":1,"process_start":"stale"}"#))
             .unwrap();
-        let claim = TeardownClaim::register(&db, "claim-owner").unwrap();
+        insert_test_instance(&db, "claim-owner");
+        let claim = TeardownClaim::register(&db, "claim-owner", 0.0, None).unwrap();
         assert!(
             yield_to_teardown(&db, "claim-owner"),
             "stale owner replaced"
@@ -3372,10 +3423,12 @@ mod tests {
         drop(claim);
         assert!(db.kv_get(key).unwrap().is_none());
 
-        let claim = TeardownClaim::register(&db, "claim-owner").unwrap();
+        let claim = TeardownClaim::register(&db, "claim-owner", 0.0, None).unwrap();
         let foreign = serde_json::json!({
             "pid": std::process::id().wrapping_add(1),
             "process_start": "another-killer",
+            "created_at": 0.0,
+            "session_id": null,
         })
         .to_string();
         db.kv_set(key, Some(&foreign)).unwrap();
