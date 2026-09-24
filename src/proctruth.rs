@@ -947,6 +947,9 @@ pub fn trusted_process_id(db: &HcomDb, id: &str) -> bool {
     if id.is_empty() {
         return false;
     }
+    // `mut` is only used by the off-Linux arm below, where the row-recorded
+    // launcher pid joins the (self-only) ancestor list.
+    #[cfg_attr(target_os = "linux", allow(unused_mut))]
     let mut ancestors = caller_ancestor_pids();
     let binding_row_pid = match db.get_process_binding(id) {
         Ok(Some(instance_name)) => match db.get_instance_full(&instance_name) {
