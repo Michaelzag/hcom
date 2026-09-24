@@ -4443,8 +4443,11 @@ mod tests {
             std::fs::write(project.join(format!("{OMP_MISSING_SID}.jsonl")), "{}").unwrap();
             let db = test_db();
             seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, "");
-            let plan =
-                prepare_resume_plan(&db, "mira", false, &[], &GlobalFlags::default()).unwrap();
+            // --run-here keeps the launch env on this process's env; under
+            // CI the default regime reads the login shell's env instead.
+            let run_here = ["--run-here".to_string()];
+            let plan = prepare_resume_plan(&db, "mira", false, &run_here, &GlobalFlags::default())
+                .unwrap();
             assert_eq!(
                 plan.launch.cwd.as_deref(),
                 Some(redirect.to_string_lossy().as_ref())
