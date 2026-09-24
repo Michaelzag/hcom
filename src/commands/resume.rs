@@ -32,6 +32,13 @@ enum ResumeSource<'a> {
     /// carrying `session_id` — never the name's newest snapshot, which may
     /// belong to a later session that reused the name.
     StoppedSession { name: &'a str, session_id: &'a str },
+    /// `hcom r <name> --restore-earlier`: resume `name` from one of its own
+    /// earlier stopped snapshots (already loaded; see
+    /// [`resolve_restore_earlier_plan`]).
+    EarlierSnapshot {
+        name: &'a str,
+        loaded: LoadedInstanceData,
+    },
     /// Adopt a session from its on-disk transcript (first-time bring-in under hcom).
     Disk {
         session_id: String,
@@ -46,6 +53,9 @@ pub(crate) struct PreparedResume {
     last_event_id: i64,
     session_id: String,
     tracked_fork_identity: Option<TrackedForkIdentity>,
+    /// `--restore-earlier`: the earlier snapshot to append as a corrective
+    /// `life.stopped` event for the seat right before launch.
+    restored_snapshot: Option<serde_json::Value>,
 }
 
 struct ResumeOutputContext {
@@ -82,11 +92,32 @@ struct ResumePromptInput<'a> {
     custom_initial_prompt: Option<&'a str>,
 }
 
+/// `hcom r` flag: restore the seat's earlier session when its newest
+/// snapshot names an omp session whose file is gone.
+const RESTORE_EARLIER_FLAG: &str = "--restore-earlier";
+/// `by`/`reason` of the corrective `life.stopped` event `--restore-earlier`
+/// appends.
+const RESTORE_EARLIER_BY: &str = "cli";
+const RESTORE_EARLIER_REASON: &str = "restored by hcom r --restore-earlier";
+
 /// Run the resume command. `argv` is the full argv[1..].
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
-    let (name, extra_args) = parse_resume_argv(argv, "r")?;
+    let (name, mut extra_args) = parse_resume_argv(argv, "r")?;
+    let restore_earlier = take_restore_earlier_flag(&mut extra_args);
 
-    do_resume(&name, false, &extra_args, flags)
+    run_resume(&name, false, restore_earlier, &extra_args, flags)
+}
+
+/// Strip `--restore-earlier` from `hcom r`'s extra args (only before `--`,
+/// which ends hcom flag parsing). Returns whether it was present.
+fn take_restore_earlier_flag(args: &mut Vec<String>) -> bool {
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let tail = args.split_off(end);
+    let before = args.len();
+    args.retain(|a| a != RESTORE_EARLIER_FLAG);
+    let found = args.len() != before;
+    args.extend(tail);
+    found
 }
 
 /// Parse resume/fork argv: `r|f <name> [extra-args...]`
@@ -126,6 +157,16 @@ pub fn do_resume(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<i32> {
+    run_resume(name, fork, false, extra_args, flags)
+}
+
+fn run_resume(
+    name: &str,
+    fork: bool,
+    restore_earlier: bool,
+    extra_args: &[String],
+    flags: &GlobalFlags,
+) -> Result<i32> {
     let db = HcomDb::open()?;
     let name = crate::identity::resolve_display_name_or_stopped(&db, name)
         .unwrap_or_else(|| name.to_string());
@@ -133,6 +174,9 @@ pub fn do_resume(
     let ctx = crate::shared::HcomContext::from_os();
 
     if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
+        if restore_earlier {
+            bail!("{RESTORE_EARLIER_FLAG} is not supported for remote instances");
+        }
         if fork {
             let has_dir = extra_args
                 .iter()
@@ -188,7 +232,11 @@ pub fn do_resume(
         return Ok(0);
     }
 
-    let (resolved, plan) = resolve_name_to_plan(&db, &name, fork, extra_args, flags)?;
+    let (resolved, plan) = if restore_earlier {
+        resolve_restore_earlier_plan(&db, &name, extra_args, flags)?
+    } else {
+        resolve_name_to_plan(&db, &name, fork, extra_args, flags)?
+    };
     let is_adoption = plan.launch.name.is_none();
     if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
         print_resume_preview(&plan, &hcom_config, &resolved, fork);
@@ -376,6 +424,11 @@ fn prepare_resume_plan_from_source(
     flags: &GlobalFlags,
 ) -> Result<PreparedResume> {
     let is_adoption = matches!(source, ResumeSource::Disk { .. });
+    // Only a plain name resume can suggest `--restore-earlier`.
+    let restore_hint_name = match &source {
+        ResumeSource::Instance { name } if !fork => Some(*name),
+        _ => None,
+    };
 
     // Load the (tool, session_id, prior-launch-args, tag, background, last_event_id, cwd_hint, purpose, current, transcript_path, display_name)
     // from the DB (instance newest or exact session), or the on-disk transcript (adoption).
@@ -417,6 +470,23 @@ fn prepare_resume_plan_from_source(
             ensure_resumable(db, name, fork)?;
             let (tool, sid, largs, tag, bg, leid, snap, purpose, current, tpath) =
                 load_stopped_snapshot_by_session_id(db, session_id)?;
+            (
+                tool,
+                sid,
+                largs,
+                tag,
+                bg,
+                leid,
+                snap,
+                purpose,
+                current,
+                tpath,
+                name.to_string(),
+            )
+        }
+        ResumeSource::EarlierSnapshot { name, loaded } => {
+            ensure_resumable(db, name, fork)?;
+            let (tool, sid, largs, tag, bg, leid, snap, purpose, current, tpath) = loaded;
             (
                 tool,
                 sid,
@@ -484,9 +554,6 @@ fn prepare_resume_plan_from_source(
         Some(tag.clone())
     };
 
-    // - Explicit --dir flag wins (validated and canonicalized)
-    // - For fork (tracked instance): use current directory (start fresh in new context)
-    // - Otherwise: use snapshot/transcript directory, falling back to current
     // omp refuses a cwd under /tmp: explicit --dir there is refused up front
     // (it's the user's own input); a snapshot dir there is redirected to
     // /build/<seat>/tmp, created only after the session file check passes.
@@ -495,78 +562,58 @@ fn prepare_resume_plan_from_source(
         Ok(crate::launcher::LaunchTool::Omp)
     );
     let seat = (!is_adoption).then_some(display_name.as_str());
-    let mut redirected_from: Option<&str> = None;
-    let effective_cwd = if let Some(ref dir) = dir_override {
-        let path = std::path::Path::new(dir);
-        if !path.is_dir() {
-            bail!("--dir path does not exist or is not a directory: {}", dir);
-        }
-        if omp_guard {
-            crate::shared::launch_dir::guard_launch_dir(dir, seat, true)
-                .map_err(|e| anyhow::anyhow!(e))?;
-        }
-        path.canonicalize()
-            .map(|p| crate::shared::platform::child_process_path(&p))
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| dir.clone())
-    } else if fork && !is_adoption {
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string())
-    } else if !snapshot_dir.is_empty() && std::path::Path::new(&snapshot_dir).is_dir() {
-        if omp_guard {
-            match crate::shared::launch_dir::plan_launch_dir(&snapshot_dir, seat, false)
-                .map_err(|e| anyhow::anyhow!(e))?
-            {
-                Some(target) => {
-                    redirected_from = Some(snapshot_dir.as_str());
-                    target.to_string_lossy().into_owned()
-                }
-                None => snapshot_dir.clone(),
-            }
-        } else {
-            snapshot_dir.clone()
-        }
-    } else {
-        if !snapshot_dir.is_empty() {
+    let (effective_cwd, dir_fallback) = resume_working_dir(
+        dir_override.as_deref(),
+        fork && !is_adoption,
+        &snapshot_dir,
+        omp_guard,
+        seat,
+    )?;
+    let redirected_from = match dir_fallback {
+        DirFallback::None => None,
+        DirFallback::SnapshotGone => {
             eprintln!(
                 "Warning: original directory '{}' no longer exists, using current directory",
                 snapshot_dir
             );
+            None
         }
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string())
+        DirFallback::TmpRedirect => Some(snapshot_dir.as_str()),
     };
 
     // Omp resolves relative PI_CODING_AGENT_DIR against the child process's
     // effective working directory (omp packages/utils/src/dirs.ts:328-335).
-    // Check the resulting root only after that working directory is finalized.
-    if tool == "omp" && !is_adoption {
-        let hcom_config = load_hcom_config();
-        let inside_ai_tool = crate::shared::HcomContext::from_os().is_inside_ai_tool();
-        let terminal_mode = launch_flags
-            .terminal
-            .as_deref()
-            .or(Some(hcom_config.terminal.as_str()).filter(|t| !t.is_empty()));
-        let run_here = crate::launcher::will_run_in_current_terminal(
-            1,
-            background,
-            launch_flags.run_here,
-            terminal_mode,
-            inside_ai_tool,
-        );
-        let mut env = crate::launcher::build_launch_env(
-            &hcom_config,
-            crate::launcher::launch_env_regime(run_here, inside_ai_tool),
-        );
-        crate::launcher::apply_tool_config_dir_to_env(&crate::launcher::LaunchTool::Omp, &mut env);
-        ensure_omp_session_file_in_env(
+    // Check the resulting root only after that working directory is finalized,
+    // in the environment assembled for the child ([`resume_child_env`]). A
+    // snapshot pointing at a deleted session would only burn a harness and
+    // poison the trail with another dead snapshot: refuse before spawning
+    // anything, with no life event.
+    if tool == "omp"
+        && !is_adoption
+        && let Err(err) = ensure_omp_session_file_in_env(
             &session_id,
             &snapshot_transcript_path,
-            &env,
+            &resume_child_env(&launch_flags, background),
             std::path::Path::new(&effective_cwd),
-        )?;
+        )
+    {
+        // A seat whose newest snapshot is dead may still own an earlier
+        // session with a file: name it, never resume it implicitly.
+        if let Some(name) = restore_hint_name
+            && let EarlierSession::Resumable { loaded, .. } = find_earlier_session(
+                db,
+                name,
+                &session_id,
+                dir_override.as_deref(),
+                &launch_flags,
+            )?
+        {
+            bail!(
+                "{err}; earlier session {} is resumable: hcom r {name} {RESTORE_EARLIER_FLAG}",
+                loaded.1
+            );
+        }
+        return Err(err);
     }
 
     if let Some(original) = redirected_from {
@@ -736,7 +783,200 @@ fn prepare_resume_plan_from_source(
         last_event_id,
         session_id,
         tracked_fork_identity,
+        restored_snapshot: None,
     })
+}
+
+/// `hcom r <name> --restore-earlier`: when the seat's newest stopped snapshot
+/// names an omp session whose file is gone, plan a resume of the seat's
+/// newest earlier session found by [`find_earlier_session`]. The plan
+/// carries a copy of that snapshot, which [`append_restored_snapshot`] writes
+/// as a corrective `life.stopped` event right before launch — so every
+/// refusal here (and a preview) writes nothing.
+fn resolve_restore_earlier_plan(
+    db: &HcomDb,
+    name: &str,
+    extra_args: &[String],
+    flags: &GlobalFlags,
+) -> Result<(String, PreparedResume)> {
+    if is_session_id(name) {
+        bail!(
+            "{RESTORE_EARLIER_FLAG} takes a seat name, not a session id: \
+             hcom r {name} already resumes that exact session"
+        );
+    }
+    let (tool, newest_session_id, _, _, newest_background, _, newest_dir, ..) =
+        load_stopped_snapshot(db, name)?;
+    // Dead exactly when the guard a plain `hcom r <name>` runs would refuse:
+    // same child env, same working directory.
+    let (dir_override, launch_flags, _) = extract_resume_flags(extra_args);
+    let (newest_cwd, _) = resume_working_dir(
+        dir_override.as_deref(),
+        false,
+        &newest_dir,
+        tool == "omp",
+        Some(name),
+    )?;
+    if tool != "omp"
+        || newest_session_id.is_empty()
+        || omp_session_file_in_env(
+            &newest_session_id,
+            &resume_child_env(&launch_flags, newest_background),
+            std::path::Path::new(&newest_cwd),
+        )
+    {
+        bail!(
+            "{RESTORE_EARLIER_FLAG}: the newest session of '{name}' ({newest_session_id}) \
+             is not an omp session with a missing file; resume it with hcom r {name}"
+        );
+    }
+    match find_earlier_session(
+        db,
+        name,
+        &newest_session_id,
+        dir_override.as_deref(),
+        &launch_flags,
+    )? {
+        EarlierSession::Resumable { snapshot, loaded } => {
+            let mut plan = prepare_resume_plan_from_source(
+                db,
+                ResumeSource::EarlierSnapshot { name, loaded },
+                false,
+                extra_args,
+                flags,
+            )?;
+            plan.restored_snapshot = Some(snapshot);
+            Ok((name.to_string(), plan))
+        }
+        EarlierSession::Held { session_id, holder } => bail!(
+            "{RESTORE_EARLIER_FLAG}: earlier session {session_id} of '{name}' is live as \
+             '{holder}'; nothing restored"
+        ),
+        EarlierSession::None => bail!(
+            "{RESTORE_EARLIER_FLAG}: no earlier session of '{name}' has a session file; \
+             nothing restored"
+        ),
+    }
+}
+
+/// Append the `--restore-earlier` corrective `life.stopped` event: a copy of
+/// the restored snapshot, so the seat's newest snapshot names a live session
+/// again. No-op for every other plan.
+fn append_restored_snapshot(db: &HcomDb, name: &str, plan: &PreparedResume) -> Result<()> {
+    if let Some(snapshot) = &plan.restored_snapshot {
+        db.log_life_event(
+            name,
+            "stopped",
+            RESTORE_EARLIER_BY,
+            RESTORE_EARLIER_REASON,
+            Some(snapshot.clone()),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// Outcome of [`find_earlier_session`].
+enum EarlierSession {
+    /// The newest earlier snapshot whose session file exists and that no live
+    /// instance holds: its raw `snapshot` object and parsed data.
+    Resumable {
+        snapshot: serde_json::Value,
+        loaded: LoadedInstanceData,
+    },
+    /// No free candidate; the newest earlier session with a file is held.
+    Held {
+        session_id: String,
+        holder: String,
+    },
+    None,
+}
+
+/// Walk `name`'s OWN stopped snapshots newest first for the newest one whose
+/// session differs from `dead_session_id`, whose omp session file exists
+/// under the root the resume guard will check when that snapshot is resumed
+/// ([`resume_child_env`] with `launch_flags` and the snapshot's background
+/// flag, run in [`resume_working_dir`] of `dir_override` and the snapshot's
+/// directory), and that no live instance holds ([`live_session_holder`]).
+fn find_earlier_session(
+    db: &HcomDb,
+    name: &str,
+    dead_session_id: &str,
+    dir_override: Option<&str>,
+    launch_flags: &crate::commands::launch::HcomLaunchFlags,
+) -> Result<EarlierSession> {
+    let mut stmt = db.conn().prepare(
+        "SELECT data FROM events
+         WHERE type='life'
+           AND instance=?
+           AND json_extract(data, '$.action') = 'stopped'
+         ORDER BY id DESC",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map(rusqlite::params![name], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // A poisoned trail repeats the same sessions; probe each one once.
+    let mut seen = std::collections::HashSet::new();
+    // The child env varies only with the background flag: build each once.
+    let mut child_envs: [Option<std::collections::HashMap<String, String>>; 2] = [None, None];
+    let mut held = None;
+    for data_str in &rows {
+        let Some(loaded) = parse_stopped_snapshot(data_str) else {
+            continue;
+        };
+        let session_id = &loaded.1;
+        // An empty id would match any session file name.
+        if session_id.is_empty()
+            || session_id.eq_ignore_ascii_case(dead_session_id)
+            || !seen.insert(session_id.clone())
+        {
+            continue;
+        }
+        let background = loaded.4;
+        let env = child_envs[usize::from(background)]
+            .get_or_insert_with(|| resume_child_env(launch_flags, background));
+        let (cwd, _) =
+            resume_working_dir(dir_override, false, &loaded.6, loaded.0 == "omp", Some(name))?;
+        if !omp_session_file_in_env(session_id, env, std::path::Path::new(&cwd)) {
+            continue;
+        }
+        if let Some(holder) = live_session_holder(db, session_id)? {
+            held.get_or_insert(EarlierSession::Held {
+                session_id: session_id.clone(),
+                holder,
+            });
+            continue;
+        }
+        let Some(snapshot) = serde_json::from_str::<serde_json::Value>(data_str)
+            .ok()
+            .and_then(|mut data| data.get_mut("snapshot").map(serde_json::Value::take))
+        else {
+            continue;
+        };
+        return Ok(EarlierSession::Resumable { snapshot, loaded });
+    }
+    Ok(held.unwrap_or(EarlierSession::None))
+}
+
+/// The live instance holding `session_id`: the `session_bindings` owner when
+/// that instance still has a row, else any instance row carrying the session.
+fn live_session_holder(db: &HcomDb, session_id: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    if let Some(bound) = db.get_session_binding(session_id)?
+        && db.get_instance_full(&bound)?.is_some()
+    {
+        return Ok(Some(bound));
+    }
+    Ok(db
+        .conn()
+        .query_row(
+            "SELECT name FROM instances WHERE session_id = ? LIMIT 1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
 }
 
 fn execute_prepared_resume(
@@ -793,6 +1033,7 @@ fn execute_prepared_resume_result(
     fork: bool,
     plan: &PreparedResume,
 ) -> Result<LaunchResult> {
+    append_restored_snapshot(db, name, plan)?;
     let launch = prepare_launch_for_execution(db, plan)?;
     let result = launcher::launch(db, launch.clone())?;
 
@@ -2168,27 +2409,134 @@ fn derive_omp_transcript_path(session_id: &str) -> Option<String> {
     None
 }
 
+/// Why [`resume_working_dir`] did not run in the requested directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirFallback {
+    None,
+    /// The snapshot directory no longer exists; the current directory is used.
+    SnapshotGone,
+    /// The snapshot directory is under /tmp and omp is guarded: redirected to
+    /// `/build/<seat>/tmp`, which the caller creates
+    /// ([`crate::shared::launch_dir::create_redirect_dir`]) only once it
+    /// commits to launching.
+    TmpRedirect,
+}
+
+/// The working directory a resume or fork runs in, as the plan decides it:
+/// an explicit `--dir` wins (validated and canonicalized); a tracked-instance
+/// fork (`fresh_start`) starts in the current directory; anything else goes
+/// back to `snapshot_dir` while it exists, else the current directory. With
+/// `omp_guard`, an explicit `--dir` under /tmp is refused and a snapshot dir
+/// under /tmp is redirected to `/build/<seat>/tmp`
+/// ([`crate::shared::launch_dir::plan_launch_dir`]); nothing is created, so
+/// probing candidates has no side effects. The [`DirFallback`] reports a
+/// departure from the snapshot directory (the plan warns).
+fn resume_working_dir(
+    dir_override: Option<&str>,
+    fresh_start: bool,
+    snapshot_dir: &str,
+    omp_guard: bool,
+    seat: Option<&str>,
+) -> Result<(String, DirFallback)> {
+    if let Some(dir) = dir_override {
+        let path = std::path::Path::new(dir);
+        if !path.is_dir() {
+            bail!("--dir path does not exist or is not a directory: {}", dir);
+        }
+        if omp_guard {
+            crate::shared::launch_dir::guard_launch_dir(dir, seat, true)
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+        let canonical = path
+            .canonicalize()
+            .map(|p| crate::shared::platform::child_process_path(&p))
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| dir.to_string());
+        return Ok((canonical, DirFallback::None));
+    }
+    if !fresh_start && !snapshot_dir.is_empty() && std::path::Path::new(snapshot_dir).is_dir() {
+        if omp_guard
+            && let Some(target) =
+                crate::shared::launch_dir::plan_launch_dir(snapshot_dir, seat, false)
+                    .map_err(|e| anyhow::anyhow!(e))?
+        {
+            return Ok((
+                target.to_string_lossy().into_owned(),
+                DirFallback::TmpRedirect,
+            ));
+        }
+        return Ok((snapshot_dir.to_string(), DirFallback::None));
+    }
+    let current = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let fallback = if !fresh_start && !snapshot_dir.is_empty() {
+        DirFallback::SnapshotGone
+    } else {
+        DirFallback::None
+    };
+    Ok((current, fallback))
+}
+
+/// The environment the resumed child will launch with: launch config and env
+/// overlaid on the base of the launch regime `launch_flags` and the
+/// snapshot's `background` flag select, plus the omp config-dir root the
+/// launcher injects ([`crate::launcher::apply_tool_config_dir_to_env`]). Omp
+/// resolves its session root from this, which may differ from hcom's own
+/// process environment, so every omp session-file check for a resume goes
+/// through it.
+fn resume_child_env(
+    launch_flags: &crate::commands::launch::HcomLaunchFlags,
+    background: bool,
+) -> std::collections::HashMap<String, String> {
+    let hcom_config = load_hcom_config();
+    let inside_ai_tool = crate::shared::HcomContext::from_os().is_inside_ai_tool();
+    let terminal_mode = launch_flags
+        .terminal
+        .as_deref()
+        .or(Some(hcom_config.terminal.as_str()).filter(|t| !t.is_empty()));
+    let run_here = crate::launcher::will_run_in_current_terminal(
+        1,
+        background,
+        launch_flags.run_here,
+        terminal_mode,
+        inside_ai_tool,
+    );
+    let mut env = crate::launcher::build_launch_env(
+        &hcom_config,
+        crate::launcher::launch_env_regime(run_here, inside_ai_tool),
+    );
+    crate::launcher::apply_tool_config_dir_to_env(&crate::launcher::LaunchTool::Omp, &mut env);
+    env
+}
+
+/// Whether the omp session root `env` resolves, for a child running in
+/// `effective_cwd` (omp resolves a relative `PI_CODING_AGENT_DIR` against
+/// it), holds `session_id`'s file.
+fn omp_session_file_in_env(
+    session_id: &str,
+    env: &std::collections::HashMap<String, String>,
+    effective_cwd: &std::path::Path,
+) -> bool {
+    crate::transcript::omp_session_roots_for_env(env, effective_cwd)
+        .iter()
+        .any(|root| root.exists() && find_pi_transcript_in_root(root, session_id).is_some())
+}
+
 /// Refuse an omp snapshot resume when omp's own session root no longer holds
 /// the session file. omp exits at once for a missing `--resume` id (the
 /// plugin never binds), so launching would only burn a harness and poison the
 /// trail with another snapshot pointing at the dead session. Existence uses
-/// [`derive_omp_transcript_path`] — the same root omp resume reads — and the
-/// hint (when the snapshot's transcript names another live session) never
-/// resumes it automatically.
+/// [`omp_session_file_in_env`] on the child's `env` and working directory —
+/// the root omp resume reads — and the hint (when the snapshot's transcript
+/// names another live session) never resumes it automatically.
 fn ensure_omp_session_file_in_env(
     session_id: &str,
     transcript_path: &str,
     env: &std::collections::HashMap<String, String>,
     effective_cwd: &std::path::Path,
 ) -> Result<()> {
-    let mut found = false;
-    for root in crate::transcript::omp_session_roots_for_env(env, effective_cwd) {
-        if root.exists() && find_pi_transcript_in_root(&root, session_id).is_some() {
-            found = true;
-            break;
-        }
-    }
-    if found {
+    if omp_session_file_in_env(session_id, env, effective_cwd) {
         return Ok(());
     }
     let mut err = format!("session file not found: {session_id}");
@@ -4580,5 +4928,236 @@ mod tests {
         env.insert("HOME".to_string(), child_home.to_string_lossy().to_string());
         ensure_omp_session_file_in_env(OMP_MISSING_SID, "", &env, std::path::Path::new("."))
             .unwrap();
+    }
+
+    // ── `hcom r <name> --restore-earlier` ───────────────────────────
+
+    #[cfg(unix)]
+    const OMP_EARLIER_SID: &str = "66666666-6666-6666-6666-666666666666";
+
+    /// Append one omp `life.stopped` event for `instance` (no instance row:
+    /// the stopped seat's row is gone, as on the live store).
+    #[cfg(unix)]
+    fn insert_omp_stopped_event(db: &HcomDb, instance: &str, session_id: &str, directory: &str) {
+        let data = json!({
+            "action": "stopped",
+            "by": "session",
+            "reason": "exit:normal",
+            "process_id": null,
+            "snapshot": {
+                "tool": "omp",
+                "session_id": session_id,
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": 0,
+                "directory": directory,
+                "purpose": "",
+                "current": "",
+                "transcript_path": "",
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', ?, ?)",
+                rusqlite::params!["2026-01-01T00:00:00Z", instance, data.to_string()],
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn stopped_events(db: &HcomDb, instance: &str) -> Vec<serde_json::Value> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT data FROM events WHERE type='life' AND instance=?
+                   AND json_extract(data, '$.action') = 'stopped' ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params![instance], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+            .collect()
+    }
+
+    /// Seat `lave`: an older snapshot of session A (file exists, directory
+    /// `a_dir`) followed by two poisoned snapshots of a probe session with no
+    /// file. Returns the db and A's directory.
+    #[cfg(unix)]
+    fn poisoned_seat_db(home: &std::path::Path, earlier_has_file: bool) -> (HcomDb, String) {
+        if earlier_has_file {
+            write_omp_session_file(&format!("2026-01-01T00-00-00Z_{OMP_EARLIER_SID}.jsonl"));
+        }
+        let a_dir = home.join("seat-dir");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        let a_dir = a_dir.to_string_lossy().to_string();
+        let db = test_db();
+        insert_omp_stopped_event(&db, "lave", OMP_EARLIER_SID, &a_dir);
+        insert_omp_stopped_event(&db, "lave", OMP_MISSING_SID, "/tmp");
+        insert_omp_stopped_event(&db, "lave", OMP_MISSING_SID, "/tmp");
+        (db, a_dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_resume_dead_newest_names_earlier_session() {
+        with_omp_home(|home| {
+            let (db, _) = poisoned_seat_db(home, true);
+            let err = prepare_resume_plan(&db, "lave", false, &[], &GlobalFlags::default())
+                .err()
+                .expect("resume of a dead newest snapshot must fail")
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "session file not found: {OMP_MISSING_SID}; earlier session \
+                     {OMP_EARLIER_SID} is resumable: hcom r lave --restore-earlier"
+                )
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_appends_one_snapshot_and_resumes_it() {
+        with_omp_home(|home| {
+            let (db, a_dir) = poisoned_seat_db(home, true);
+            let before = stopped_events(&db, "lave").len();
+
+            let (resolved, plan) =
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+            assert_eq!(resolved, "lave");
+            assert_eq!(plan.launch.name.as_deref(), Some("lave"));
+            assert!(
+                plan.launch
+                    .args
+                    .windows(2)
+                    .any(|w| w[0] == "--resume" && w[1] == OMP_EARLIER_SID),
+                "plan must resume the earlier session: {:?}",
+                plan.launch.args
+            );
+            assert_eq!(plan.launch.cwd.as_deref(), Some(a_dir.as_str()));
+            // Planning alone (a preview) writes nothing.
+            assert_eq!(stopped_events(&db, "lave").len(), before);
+
+            append_restored_snapshot(&db, "lave", &plan).unwrap();
+            let events = stopped_events(&db, "lave");
+            assert_eq!(events.len(), before + 1, "exactly one corrective event");
+            let newest = events.last().unwrap();
+            assert_eq!(newest["snapshot"]["session_id"], OMP_EARLIER_SID);
+            assert_eq!(newest["snapshot"]["directory"], a_dir.as_str());
+            assert_eq!(newest["by"], "cli");
+            assert_eq!(newest["reason"], "restored by hcom r --restore-earlier");
+
+            // The trail is repaired: a plain `hcom r lave` now resumes A.
+            let plan =
+                prepare_resume_plan(&db, "lave", false, &[], &GlobalFlags::default()).unwrap();
+            assert_eq!(plan.session_id, OMP_EARLIER_SID);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_refuses_session_held_by_live_instance() {
+        // Held via an instance row carrying the session, then via a
+        // session binding whose instance is live.
+        for via_binding in [false, true] {
+            with_omp_home(|home| {
+                let (db, _) = poisoned_seat_db(home, true);
+                let mut data = serde_json::Map::new();
+                if !via_binding {
+                    data.insert("session_id".into(), json!(OMP_EARLIER_SID));
+                }
+                data.insert("tool".into(), json!("omp"));
+                data.insert("created_at".into(), json!(1.0));
+                db.save_instance_named("rune", &data).unwrap();
+                if via_binding {
+                    db.set_session_binding(OMP_EARLIER_SID, "rune").unwrap();
+                }
+                let before = stopped_events(&db, "lave").len();
+
+                let err = resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default())
+                    .err()
+                    .expect("restoring a held session must fail")
+                    .to_string();
+                assert!(
+                    err.contains(&format!("earlier session {OMP_EARLIER_SID} of 'lave'"))
+                        && err.contains("is live as 'rune'; nothing restored"),
+                    "unexpected error: {err}"
+                );
+                assert_eq!(stopped_events(&db, "lave").len(), before);
+                // Nor does the plain resume advertise it.
+                let err = prepare_resume_plan(&db, "lave", false, &[], &GlobalFlags::default())
+                    .err()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(err, format!("session file not found: {OMP_MISSING_SID}"));
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_without_earlier_file_writes_nothing() {
+        with_omp_home(|home| {
+            let (db, _) = poisoned_seat_db(home, false);
+            let err = prepare_resume_plan(&db, "lave", false, &[], &GlobalFlags::default())
+                .err()
+                .unwrap()
+                .to_string();
+            assert_eq!(err, format!("session file not found: {OMP_MISSING_SID}"));
+
+            let before = stopped_events(&db, "lave").len();
+            let err = resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default())
+                .err()
+                .expect("no earlier session with a file must fail")
+                .to_string();
+            assert_eq!(
+                err,
+                "--restore-earlier: no earlier session of 'lave' has a session file; \
+                 nothing restored"
+            );
+            assert_eq!(stopped_events(&db, "lave").len(), before);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_rejects_session_id() {
+        with_omp_home(|home| {
+            let (db, _) = poisoned_seat_db(home, true);
+            let before = stopped_events(&db, "lave").len();
+            let err =
+                resolve_restore_earlier_plan(&db, OMP_EARLIER_SID, &[], &GlobalFlags::default())
+                    .err()
+                    .expect("a session id is already exact")
+                    .to_string();
+            assert!(
+                err.starts_with("--restore-earlier takes a seat name, not a session id"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(stopped_events(&db, "lave").len(), before);
+        });
+    }
+
+    #[test]
+    fn test_take_restore_earlier_flag_stops_at_double_dash() {
+        let mut args = s(&[
+            "--restore-earlier",
+            "--model",
+            "x",
+            "--",
+            "--restore-earlier",
+        ]);
+        assert!(take_restore_earlier_flag(&mut args));
+        assert_eq!(args, s(&["--model", "x", "--", "--restore-earlier"]));
+        let mut args = s(&["--", "--restore-earlier"]);
+        assert!(!take_restore_earlier_flag(&mut args));
+        assert_eq!(args, s(&["--", "--restore-earlier"]));
     }
 }
