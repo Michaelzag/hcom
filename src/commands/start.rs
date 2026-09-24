@@ -437,14 +437,11 @@ fn start_rebind(
         ensure_rebind_compatible(&target_name, meta, ctx)?;
     }
 
-    // Preserve last_event_id from target (cursor preservation), never below
-    // the caller's current delivery position: an older snapshot cursor would
-    // re-deliver messages the caller already consumed.
-    let mut last_event_id = target_meta.as_ref().map(|m| {
-        current_row.as_ref().map_or(m.last_event_id, |row| {
-            m.last_event_id.max(row.last_event_id)
-        })
-    });
+    // Preserve the target's own cursor. A caller re-registering the identity
+    // it holds reads it from its live row (never an older snapshot); a caller
+    // reclaiming another name must not inherit the replaced identity's
+    // position, which would skip the target's unread messages.
+    let mut last_event_id = target_meta.as_ref().map(|m| m.last_event_id);
     let target_data = db.get_instance_full(&target_name)?;
 
     // Final fallback: use current max to avoid re-delivering old messages
@@ -1817,8 +1814,9 @@ mod tests {
     }
 
     /// valo reclaiming valo after its row was renamed away: the name has life
-    /// history, so the reclaim proceeds, takes both bindings, records the
-    /// rename of the name it replaces, and keeps the caller's newer cursor.
+    /// history, so the reclaim proceeds and takes both bindings. The cursor is
+    /// valo's own: the identity it replaces read further, but messages to valo
+    /// past valo's snapshot cursor are still unread.
     #[test]
     #[serial]
     fn test_start_rebind_reclaims_name_with_history_from_bound_caller() {
@@ -1827,7 +1825,7 @@ mod tests {
         let caller = format!("stas_fill_{}", std::process::id());
         let target = format!("stas_valo_{}", std::process::id());
         log_stopped_snapshot(&db, &target, "claude", "/tmp/project", "sess-v", 100);
-        bind_caller(&db, &caller, "sess-v", "proc-v", 500);
+        bind_caller(&db, &caller, "sess-v", "proc-v", 900);
 
         let code = start_rebind(&db, &target, &caller_ctx("proc-v"), None).unwrap();
 
@@ -1837,8 +1835,8 @@ mod tests {
             .unwrap()
             .expect("reclaimed row");
         assert_eq!(
-            row.last_event_id, 500,
-            "the snapshot's older cursor must not rewind the caller's delivery position"
+            row.last_event_id, 100,
+            "the reclaimed name resumes at its own cursor, not the replaced identity's"
         );
         assert_eq!(
             db.get_session_binding("sess-v").unwrap().as_deref(),
@@ -1849,6 +1847,26 @@ mod tests {
             Some((Some("sess-v".to_string()), target.clone()))
         );
         assert!(db.get_instance_full(&caller).unwrap().is_none());
+    }
+
+    /// Re-registering the identity the caller already holds keeps its live
+    /// cursor: an older stopped snapshot of the same name never rewinds it.
+    #[test]
+    #[serial]
+    fn test_start_rebind_same_name_keeps_live_cursor_over_old_snapshot() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let name = format!("stas_self_{}", std::process::id());
+        log_stopped_snapshot(&db, &name, "claude", "/tmp/project", "sess-s", 100);
+        bind_caller(&db, &name, "sess-s", "proc-s", 900);
+
+        assert_eq!(
+            start_rebind(&db, &name, &caller_ctx("proc-s"), None).unwrap(),
+            0
+        );
+
+        let row = db.get_instance_full(&name).unwrap().expect("row kept");
+        assert_eq!(row.last_event_id, 900);
     }
 
     /// A real rename writes the old name's stop: never a silent disappearance.
