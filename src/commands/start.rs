@@ -481,19 +481,20 @@ fn start_rebind(
     // history, verified against the live process table. Both reads happen
     // before the deletions below rewrite the rows and bindings they consult.
     let anchor = match_reclaim_anchor(db, &target_name);
-    // A refused id may be bound here only when no row with a recorded pid
-    // holds it: such an id belongs to that pid's tree, and taking it would
-    // be the hijack the trust gate exists to stop.
-    let claimable_refused_id = refused_process_id.filter(|id| match db.get_process_binding(id) {
-        Ok(None) => true,
-        Ok(Some(owner)) => {
-            owner == target_name
-                || db
-                    .get_instance_full(&owner)
-                    .is_ok_and(|row| row.is_none_or(|row| row.pid.is_none()))
-        }
-        Err(_) => false,
-    });
+    // The refused id may ride on the restored anchor only when it is tied to
+    // the same history: it must be the process id recorded on the very stop
+    // event the anchor was verified from, and no binding may hold it for
+    // any instance but the target. Anything else belongs to another seat.
+    let claimable_refused_id = match &anchor {
+        Ok(matched) => refused_process_id.filter(|id| {
+            matched.process_id.as_deref() == Some(*id)
+                && match db.get_process_binding(id) {
+                    Ok(owner) => owner.is_none_or(|owner| owner == target_name),
+                    Err(_) => false,
+                }
+        }),
+        Err(_) => None,
+    };
 
     // Skip delete for remote instances (origin_device_id)
     if let Some(ref td) = target_data
@@ -721,11 +722,12 @@ fn start_rebind(
 }
 
 /// The anchor pid a reclaim may restore, and the `life.stopped` event it
-/// came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// came from, with the process id that event recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ReclaimAnchor {
     event_id: i64,
     pid: u32,
+    process_id: Option<String>,
 }
 
 /// Why a reclaim restores no anchor pid; `event_id` is the snapshot
@@ -769,16 +771,22 @@ fn match_reclaim_anchor(db: &HcomDb, name: &str) -> Result<ReclaimAnchor, Anchor
             });
         }
     };
-    let snapshot = serde_json::from_str::<serde_json::Value>(&data)
-        .ok()
-        .and_then(|mut data| data.get_mut("snapshot").map(serde_json::Value::take))
-        .unwrap_or_default();
+    let data = serde_json::from_str::<serde_json::Value>(&data).unwrap_or_default();
+    let process_id = data
+        .get("process_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let snapshot = data.get("snapshot").cloned().unwrap_or_default();
     crate::proctruth::verify_reclaim_anchor(
         &snapshot,
         &crate::proctruth::caller_ancestor_pids(),
         &crate::sys::process::procfs_start_identity,
     )
-    .map(|pid| ReclaimAnchor { event_id, pid })
+    .map(|pid| ReclaimAnchor {
+        event_id,
+        pid,
+        process_id,
+    })
     .map_err(|reason| AnchorMiss {
         event_id: Some(event_id),
         reason,
@@ -787,7 +795,8 @@ fn match_reclaim_anchor(db: &HcomDb, name: &str) -> Result<ReclaimAnchor, Anchor
 
 /// Bind a refused `process_id` to `target_name`, whose row now carries the
 /// restored anchor pid, then evaluate trust again: the verified anchor is the
-/// proof. Returns the id when trusted; otherwise the binding is removed.
+/// proof. The binding is created only while no binding holds the id, and a
+/// failed recheck removes only that binding. Returns the id when trusted.
 fn bind_behind_restored_anchor(
     db: &HcomDb,
     ctx: &HcomContext,
@@ -795,15 +804,38 @@ fn bind_behind_restored_anchor(
     session_id: &str,
     target_name: &str,
 ) -> Option<String> {
-    if let Err(e) = db.set_process_binding(process_id, session_id, target_name) {
-        eprintln!("[hcom] warn: set_process_binding failed for {target_name}: {e}");
-        return None;
+    use rusqlite::OptionalExtension;
+    let created = db.with_immediate_transaction(|tx| {
+        let held = tx
+            .query_row(
+                "SELECT 1 FROM process_bindings WHERE process_id = ?",
+                rusqlite::params![process_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if held {
+            return Ok(false);
+        }
+        db.set_process_binding(process_id, session_id, target_name)?;
+        Ok(true)
+    });
+    match created {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => {
+            eprintln!("[hcom] warn: set_process_binding failed for {target_name}: {e}");
+            return None;
+        }
     }
     let mut probe = ctx.clone();
     probe.process_id = Some(process_id.to_string());
     probe.trust_process_id(db);
     if probe.process_id.is_none()
-        && let Err(e) = db.delete_process_binding(process_id)
+        && let Err(e) = db.conn().execute(
+            "DELETE FROM process_bindings WHERE process_id = ? AND instance_name = ?",
+            rusqlite::params![process_id, target_name],
+        )
     {
         eprintln!("[hcom] warn: delete_process_binding failed for {target_name}: {e}");
     }
@@ -2108,8 +2140,10 @@ mod tests {
 
     /// A launcher id shape (8-4-4-4-12 lowercase hex): trusted only through a
     /// recorded ancestor pid.
+    #[cfg(target_os = "linux")]
     const SEAT_UUID: &str = "5a1e0c3d-7b2f-4e8a-9c1d-0f2e3a4b5c6d";
 
+    #[cfg(target_os = "linux")]
     fn stop_snapshot_for(pid: u32, start_time: u64, boot_id: &str) -> serde_json::Value {
         json!({
             "tool": "omp",
@@ -2124,7 +2158,20 @@ mod tests {
     /// A launcher seat whose row was lost reclaims its own name from inside
     /// itself: the trust gate refuses its launcher id first, exactly as in
     /// `run`. Returns the exit code and the stop snapshot's event id.
+    #[cfg(target_os = "linux")]
     fn lost_seat_reclaim(db: &HcomDb, target: &str, snapshot: serde_json::Value) -> (i32, i64) {
+        lost_seat_reclaim_recorded(db, target, snapshot, SEAT_UUID)
+    }
+
+    /// [`lost_seat_reclaim`] with the stop event recording `recorded_id` as
+    /// the process id it released.
+    #[cfg(target_os = "linux")]
+    fn lost_seat_reclaim_recorded(
+        db: &HcomDb,
+        target: &str,
+        snapshot: serde_json::Value,
+        recorded_id: &str,
+    ) -> (i32, i64) {
         let event_id = db
             .log_event(
                 "life",
@@ -2133,7 +2180,7 @@ mod tests {
                     "action": "stopped",
                     "by": "daemon",
                     "reason": "vanished",
-                    "process_id": SEAT_UUID,
+                    "process_id": recorded_id,
                     "snapshot": snapshot,
                 }),
             )
@@ -2153,6 +2200,7 @@ mod tests {
     }
 
     /// The `anchor` record of the reclaim's life event for `target`.
+    #[cfg(target_os = "linux")]
     fn reclaim_anchor_record(db: &HcomDb, target: &str) -> serde_json::Value {
         let data: String = db
             .conn()
@@ -2231,6 +2279,70 @@ mod tests {
         assert_eq!(record["restored"], true);
         assert_eq!(record["snapshot_event_id"], event_id);
         assert_eq!(record["pid"], anchor);
+    }
+
+    /// The refused id is another pid-less seat's binding: the anchor still
+    /// restores for the target, but that seat keeps its binding and row.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_leaves_refused_id_bound_to_another_seat() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_claim_{}", std::process::id());
+        let other = format!("anchor_holder_{}", std::process::id());
+        bind_caller(&db, &other, "sess-holder", SEAT_UUID, 3);
+        let anchor = parent_pid();
+        let (start_time, boot_id) = crate::sys::process::procfs_start_identity(anchor).unwrap();
+
+        let (code, _) = lost_seat_reclaim(
+            &db,
+            &target,
+            stop_snapshot_for(anchor, start_time, &boot_id),
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            db.get_process_binding(SEAT_UUID).unwrap().as_deref(),
+            Some(other.as_str()),
+            "another seat's binding is never taken"
+        );
+        assert!(db.get_instance_full(&other).unwrap().is_some());
+        let row = db
+            .get_instance_full(&target)
+            .unwrap()
+            .expect("reclaimed row");
+        assert_eq!(
+            row.pid,
+            Some(i64::from(anchor)),
+            "the anchor itself still restores"
+        );
+    }
+
+    /// The refused id is not the one the anchor's stop event released, so it
+    /// has no history with that anchor and is not bound.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_refuses_id_other_than_snapshot_process_id() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_other_id_{}", std::process::id());
+        let anchor = parent_pid();
+        let (start_time, boot_id) = crate::sys::process::procfs_start_identity(anchor).unwrap();
+
+        let (code, _) = lost_seat_reclaim_recorded(
+            &db,
+            &target,
+            stop_snapshot_for(anchor, start_time, &boot_id),
+            "0badc0de-0000-4000-8000-000000000000",
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(db.get_process_binding(SEAT_UUID).unwrap(), None);
+        assert!(!crate::proctruth::trusted_process_id_for_omp(
+            &db, SEAT_UUID
+        ));
     }
 
     /// Same pid, another incarnation: a reused pid must not become the anchor.
