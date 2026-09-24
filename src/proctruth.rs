@@ -274,6 +274,18 @@ struct CarrierTreeScope {
     excluded: Vec<u32>,
 }
 
+/// The row a capture was taken against. A stop that threads the capture may
+/// release this incarnation and no other: a `start --as` rebind between the
+/// capture and the release is a different row, whatever its name.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CapturedIncarnation {
+    pub(crate) created_at: f64,
+    pub(crate) pid: Option<i64>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) binding_ids: Vec<String>,
+}
+
 /// The owning roots and carrier set from before the operation's first signal.
 /// Live carriers whose identity is unreadable stay in the set but cannot be
 /// signalled. Callers with a headless group signal capture before that step;
@@ -283,13 +295,20 @@ pub(crate) struct ReapCapture {
     scope: CarrierTreeScope,
     #[cfg(unix)]
     carriers: Vec<ProcMatch>,
+    /// `None` when no row existed at capture time.
+    incarnation: Option<CapturedIncarnation>,
+}
+
+impl ReapCapture {
+    pub(crate) fn incarnation(&self) -> Option<&CapturedIncarnation> {
+        self.incarnation.as_ref()
+    }
 }
 
 #[cfg(unix)]
-fn carrier_tree_scope(db: &HcomDb, name: &str, binding_ids: &[String]) -> CarrierTreeScope {
+fn carrier_tree_scope(row_pid: Option<i64>, binding_ids: &[String]) -> CarrierTreeScope {
     let mut roots = vec![std::process::id()];
-    if let Ok(Some(row)) = db.get_instance_full(name)
-        && let Some(pid) = row.pid.and_then(|pid| u32::try_from(pid).ok())
+    if let Some(pid) = row_pid.and_then(|pid| u32::try_from(pid).ok())
         && pid != 0
         && !roots.contains(&pid)
     {
@@ -324,22 +343,37 @@ fn carrier_tree_scope(db: &HcomDb, name: &str, binding_ids: &[String]) -> Carrie
     }
 }
 
+/// `binding_ids` must be the row's bindings as read with it: they become the
+/// captured incarnation's binding epoch.
 pub(crate) fn capture_reap_carriers(
     db: &HcomDb,
     name: &str,
     binding_ids: &[String],
     exclude: &[u32],
 ) -> ReapCapture {
+    // One row read feeds both the owner roots and the bound incarnation.
+    let row = db.get_instance_full(name).ok().flatten();
+    let incarnation = row.as_ref().map(|row| CapturedIncarnation {
+        created_at: row.created_at,
+        pid: row.pid,
+        session_id: row.session_id.clone(),
+        agent_id: row.agent_id.clone(),
+        binding_ids: binding_ids.to_vec(),
+    });
     #[cfg(unix)]
     {
-        let mut scope = carrier_tree_scope(db, name, binding_ids);
+        let mut scope = carrier_tree_scope(row.and_then(|row| row.pid), binding_ids);
         let carriers = snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
-        ReapCapture { scope, carriers }
+        ReapCapture {
+            scope,
+            carriers,
+            incarnation,
+        }
     }
     #[cfg(not(unix))]
     {
-        let _ = (db, name, binding_ids, exclude);
-        ReapCapture {}
+        let _ = exclude;
+        ReapCapture { incarnation }
     }
 }
 
@@ -1772,6 +1806,75 @@ mod tests {
         unsafe { libc::kill(detached as libc::pid_t, libc::SIGKILL) };
     }
 
+    /// Bulk kill against a `start --as` rebind landing between the pre-signal
+    /// capture and the release: the capture binds incarnation A, so B's row,
+    /// bindings, and live process are not its to touch, and the site reports
+    /// the name skipped rather than stopped.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stop_with_capture_refuses_release_when_the_incarnation_rebound() {
+        let db = test_db();
+        let name = unique_name("rebound");
+        let token_a = format!("proc-{}", rand_suffix());
+        insert_null_pid_row(&db, &name, &token_a);
+        // A's own carrier sits in the test's tree, so the capture admits it.
+        let mut carrier_a = spawn_named_sleeper(&name, &token_a);
+        let bindings_a = db.process_binding_ids(&name).unwrap();
+        wait_for_enumerated(&name, &bindings_a, carrier_a.id());
+        let capture = capture_reap_carriers(&db, &name, &bindings_a, &[]);
+        // The kill's group signal takes A down.
+        carrier_a.kill().ok();
+        carrier_a.wait().ok();
+
+        // `start --as` replaces the row and its bindings with incarnation B.
+        let token_b = format!("proc-{}", rand_suffix());
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM instances WHERE name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        let created_b = crate::shared::time::now_epoch_f64() + 1.0;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id) \
+                 VALUES (?1, 'active', ?2, 'codex', 'sess-rebound')",
+                rusqlite::params![name, created_b],
+            )
+            .unwrap();
+        db.set_process_binding(&token_b, "sess-rebound", &name)
+            .unwrap();
+        let carrier_b = spawn_detached_named_sleeper(&name, &token_b);
+        wait_for_enumerated(&name, std::slice::from_ref(&token_b), carrier_b);
+
+        let outcome = crate::hooks::common::stop_instance_with_capture(
+            &db, &name, "test", "killed", capture,
+        );
+        let row = db.get_instance_full(&name).unwrap();
+        let b_alive = !process_gone(carrier_b);
+        unsafe { libc::kill(carrier_b as libc::pid_t, libc::SIGKILL) };
+
+        assert!(
+            row.is_some_and(|row| row.created_at.to_bits() == created_b.to_bits()),
+            "B's row must survive a release bound to A's capture"
+        );
+        assert_eq!(db.process_binding_ids(&name).unwrap(), vec![token_b]);
+        assert!(b_alive, "B's process must be unharmed");
+        assert!(outcome.is_re_registered(), "{outcome:?}");
+        let line = crate::hooks::common::skipped_stop_line(&name);
+        assert_eq!(
+            line,
+            format!("{name} skipped: row re-registered during stop")
+        );
+        assert!(!line.contains("Stopped"), "{line}");
+    }
+
     /// The round seam as a rendezvous: the reaper blocks at `point` until
     /// the returned sender is fired, and the returned receiver yields when
     /// the boundary is reached — so the test's registration/spawn lands at
@@ -1879,6 +1982,7 @@ mod tests {
                 admitted: std::cell::Cell::new(0),
             },
             carriers: Vec::new(),
+            incarnation: None,
         };
         assert!(
             reap_instance_tree_for_excluding_captured(

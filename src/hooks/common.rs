@@ -1370,7 +1370,56 @@ pub fn stop_instance_without_reap(
 pub enum StopOutcome {
     Stopped,
     AlreadyStopped,
-    RetryableError(String),
+    RetryableError(StopError),
+}
+
+impl StopOutcome {
+    /// The stop left the row alone because it is another incarnation now: a
+    /// session re-registered the name mid-stop. Not stopped, and not a
+    /// failure to retry against the new row.
+    pub fn is_re_registered(&self) -> bool {
+        matches!(self, Self::RetryableError(error) if error.re_registered)
+    }
+}
+
+/// Why a stop left the row in place. Displays as its message. Only the
+/// incarnation guard constructs the re-registration case, through
+/// [`StopError::re_registered`]; everything else converts from a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopError {
+    message: String,
+    re_registered: bool,
+}
+
+impl StopError {
+    fn re_registered() -> Self {
+        Self {
+            message: "row re-registered during stop".to_string(),
+            re_registered: true,
+        }
+    }
+}
+
+impl From<String> for StopError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            re_registered: false,
+        }
+    }
+}
+
+impl std::fmt::Display for StopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// What a stop or kill site prints for a name whose release it skipped
+/// because the row was re-registered mid-stop (see
+/// [`StopOutcome::is_re_registered`]). Never "Stopped": the new row is live.
+pub(crate) fn skipped_stop_line(display: &str) -> String {
+    format!("{display} skipped: {}", StopError::re_registered())
 }
 
 pub(crate) fn stop_placeholder_instance(
@@ -1439,6 +1488,87 @@ fn caller_tree_outside_group(_pid: u32, _exclude: &[u32]) -> bool {
     false
 }
 
+/// The incarnation a stop may release (see [`row_re_registered`]).
+enum BoundIncarnation {
+    /// The row the stop read at entry. Its release CAS compares
+    /// `created_at`, `session_id`, and `agent_id`; bindings keep the
+    /// `expected_process_id` gate.
+    Entry,
+    /// The row a pre-signal capture was taken against, binding epoch
+    /// included; `None` when no row existed at capture time.
+    Captured(Option<crate::proctruth::CapturedIncarnation>),
+}
+
+/// Whether `name`'s row is now another incarnation than the bound one. An
+/// absent row is not: the release CAS reports it as already stopped. A
+/// captured incarnation also loses to any binding the capture never saw (a
+/// newer epoch); bindings its own session released since do not count.
+/// Read through `conn`, so inside the finalize transaction it decides with
+/// the writes.
+fn row_re_registered(
+    conn: &rusqlite::Connection,
+    name: &str,
+    entry: &InstanceRow,
+    bound: &BoundIncarnation,
+) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let Some((created_at, session_id, agent_id)) = conn
+        .query_row(
+            "SELECT created_at, session_id, agent_id FROM instances WHERE name = ?",
+            params![name],
+            |row| {
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let (bound_created_at, bound_session_id, bound_agent_id, bound_bindings) = match bound {
+        BoundIncarnation::Entry => (
+            entry.created_at,
+            entry.session_id.as_deref(),
+            entry.agent_id.as_deref(),
+            None,
+        ),
+        BoundIncarnation::Captured(None) => return Ok(true),
+        BoundIncarnation::Captured(Some(captured)) => (
+            captured.created_at,
+            captured.session_id.as_deref(),
+            captured.agent_id.as_deref(),
+            Some(&captured.binding_ids),
+        ),
+    };
+    if created_at.to_bits() != bound_created_at.to_bits()
+        || session_id.as_deref() != bound_session_id
+        || agent_id.as_deref() != bound_agent_id
+    {
+        return Ok(true);
+    }
+    let Some(bound_bindings) = bound_bindings else {
+        return Ok(false);
+    };
+    let mut stmt = conn.prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?")?;
+    let current = stmt
+        .query_map(params![name], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(current.iter().any(|id| !bound_bindings.contains(id)))
+}
+
+/// The guard's refusal: nothing was signalled or written for the new row.
+fn re_registered_outcome(instance_name: &str) -> StopOutcome {
+    log::log_info(
+        "hooks",
+        "stop_instance.re_registered",
+        &format!("instance={instance_name}; release skipped, row left to its new incarnation"),
+    );
+    StopOutcome::RetryableError(StopError::re_registered())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stop_instance_inner(
     db: &HcomDb,
@@ -1501,20 +1631,41 @@ fn stop_instance_inner_scoped(
                 MAX_STOP_DEPTH, instance_name
             ),
         );
-        return StopOutcome::RetryableError(format!(
-            "recursion limit reached while stopping {instance_name}"
-        ));
+        return StopOutcome::RetryableError(
+            format!("recursion limit reached while stopping {instance_name}").into(),
+        );
     }
 
     let instance_data = match db.get_instance_full(instance_name) {
         Ok(Some(data)) => data,
         Ok(None) => return StopOutcome::AlreadyStopped,
         Err(e) => {
-            return StopOutcome::RetryableError(format!(
-                "could not read instance {instance_name}: {e}"
-            ));
+            return StopOutcome::RetryableError(
+                format!("could not read instance {instance_name}: {e}").into(),
+            );
         }
     };
+
+    // The one incarnation this stop may release: a threaded pre-signal
+    // capture binds the row it was taken against (bulk kill), every other
+    // stop binds its entry read. A capture taken for another incarnation
+    // authorizes nothing against this row: no signal, no child stop, no
+    // reap, no release. The finalize transaction re-checks it.
+    let bound = match &pre_capture {
+        Some(capture) => BoundIncarnation::Captured(capture.incarnation().cloned()),
+        None => BoundIncarnation::Entry,
+    };
+    if matches!(bound, BoundIncarnation::Captured(_)) {
+        match row_re_registered(db.conn(), instance_name, &instance_data, &bound) {
+            Ok(false) => {}
+            Ok(true) => return re_registered_outcome(instance_name),
+            Err(e) => {
+                return StopOutcome::RetryableError(
+                    format!("could not read instance {instance_name}: {e}").into(),
+                );
+            }
+        }
+    }
 
     // The headless group step may kill the recorded root before the reap
     // snapshots its descendants. Capture proven carrier identities first so
@@ -1695,9 +1846,10 @@ fn stop_instance_inner_scoped(
         Some(session_id) => match child_instance_names(db, "parent_session_id", session_id) {
             Ok(children) => children,
             Err(e) => {
-                return StopOutcome::RetryableError(format!(
-                    "could not enumerate session children of {instance_name}: {e}"
-                ));
+                return StopOutcome::RetryableError(
+                    format!("could not enumerate session children of {instance_name}: {e}")
+                        .into(),
+                );
             }
         },
         None => Vec::new(),
@@ -1705,17 +1857,19 @@ fn stop_instance_inner_scoped(
     let native_children = match child_instance_names(db, "parent_name", instance_name) {
         Ok(children) => children,
         Err(e) => {
-            return StopOutcome::RetryableError(format!(
-                "could not enumerate native children of {instance_name}: {e}"
-            ));
+            return StopOutcome::RetryableError(
+                format!("could not enumerate native children of {instance_name}: {e}").into(),
+            );
         }
     };
 
     // Finish children first while the parent row keeps the teardown retryable.
     // Concurrent callers may repeat this work; every child has its own atomic
     // event/delete gate.
+    // A child re-registered mid-stop is another session's row now, left to
+    // it exactly as a lost release CAS always was; it does not fail the parent.
     for sub_name in session_subagents {
-        if let StopOutcome::RetryableError(error) = stop_instance_inner_scoped(
+        let outcome = stop_instance_inner_scoped(
             db,
             &sub_name,
             initiated_by,
@@ -1727,15 +1881,18 @@ fn stop_instance_inner_scoped(
             post,
             exclude,
             None,
-        ) {
+        );
+        if !outcome.is_re_registered()
+            && let StopOutcome::RetryableError(error) = outcome
+        {
             log::log_warn(
                 "hooks",
                 "finalize.child_stop_incomplete",
                 &format!("parent={instance_name} child={sub_name} err={error}"),
             );
-            return StopOutcome::RetryableError(format!(
-                "could not stop child {sub_name}: {error}"
-            ));
+            return StopOutcome::RetryableError(
+                format!("could not stop child {sub_name}: {error}").into(),
+            );
         }
     }
 
@@ -1743,7 +1900,7 @@ fn stop_instance_inner_scoped(
     // as parent_session_id, so only parent_name links nested children. A row
     // already stopped via the session set is a no-op here.
     for child in native_children {
-        if let StopOutcome::RetryableError(error) = stop_instance_inner_scoped(
+        let outcome = stop_instance_inner_scoped(
             db,
             &child,
             initiated_by,
@@ -1755,13 +1912,18 @@ fn stop_instance_inner_scoped(
             post,
             exclude,
             None,
-        ) {
+        );
+        if !outcome.is_re_registered()
+            && let StopOutcome::RetryableError(error) = outcome
+        {
             log::log_warn(
                 "hooks",
                 "finalize.child_stop_incomplete",
                 &format!("parent={instance_name} child={child} err={error}"),
             );
-            return StopOutcome::RetryableError(format!("could not stop child {child}: {error}"));
+            return StopOutcome::RetryableError(
+                format!("could not stop child {child}: {error}").into(),
+            );
         }
     }
     // Reap the proven in-scope tree for this name before releasing the row.
@@ -1787,9 +1949,12 @@ fn stop_instance_inner_scoped(
             "stop_instance.reap_incomplete",
             &format!("instance={instance_name} err={error}"),
         );
-        return StopOutcome::RetryableError(format!(
-            "could not stop {instance_name}: {error} — run hcom kill {instance_name} first"
-        ));
+        return StopOutcome::RetryableError(
+            format!(
+                "could not stop {instance_name}: {error} — run hcom kill {instance_name} first"
+            )
+            .into(),
+        );
     }
 
     // Key the release to the current process incarnation: the stopped event
@@ -1815,48 +1980,93 @@ fn stop_instance_inner_scoped(
     if placeholder {
         event_data["placeholder"] = serde_json::json!(true);
     }
-    let finalized = match tx {
-        Some(tx) => db
-            .finalize_instance_stop_in_txn(
-                tx,
-                instance_name,
-                instance_data.created_at,
-                instance_data.pid,
-                instance_data.session_id.as_deref(),
-                instance_data.agent_id.as_deref(),
-                &event_data,
-                expected_process_id.as_deref(),
-            )
-            .map(|(won, event_id)| {
-                if let Some(event_id) = event_id {
-                    // Deferred: the shared transaction is not committed yet.
-                    post.events
-                        .push((event_id, instance_name.to_string(), event_data.clone()));
-                }
-                won
-            }),
-        None => db.finalize_instance_stop(
-            instance_name,
+    // The release CAS runs under the bound incarnation's identity: a captured
+    // row (bulk kill) or the entry read.
+    let (created_at, pid, session_id, agent_id) = match &bound {
+        BoundIncarnation::Captured(Some(captured)) => (
+            captured.created_at,
+            captured.pid,
+            captured.session_id.as_deref(),
+            captured.agent_id.as_deref(),
+        ),
+        _ => (
             instance_data.created_at,
             instance_data.pid,
             instance_data.session_id.as_deref(),
             instance_data.agent_id.as_deref(),
-            &event_data,
-            expected_process_id.as_deref(),
         ),
     };
+    // `None`: the row is another incarnation now, so nothing was written.
+    let finalized: Result<Option<bool>> = match tx {
+        Some(tx) => match row_re_registered(tx, instance_name, &instance_data, &bound) {
+            Ok(true) => Ok(None),
+            Ok(false) => db
+                .finalize_instance_stop_in_txn(
+                    tx,
+                    instance_name,
+                    created_at,
+                    pid,
+                    session_id,
+                    agent_id,
+                    &event_data,
+                    expected_process_id.as_deref(),
+                )
+                .map(|(won, event_id)| {
+                    if let Some(event_id) = event_id {
+                        // Deferred: the shared transaction is not committed yet.
+                        post.events
+                            .push((event_id, instance_name.to_string(), event_data.clone()));
+                    }
+                    Some(won)
+                }),
+            Err(e) => Err(e),
+        },
+        None => db
+            .with_immediate_transaction(|tx| {
+                if row_re_registered(tx, instance_name, &instance_data, &bound)? {
+                    return Ok(None);
+                }
+                db.finalize_instance_stop_in_txn(
+                    tx,
+                    instance_name,
+                    created_at,
+                    pid,
+                    session_id,
+                    agent_id,
+                    &event_data,
+                    expected_process_id.as_deref(),
+                )
+                .map(Some)
+            })
+            .map(|finalized| {
+                finalized.map(|(won, event_id)| {
+                    // Best-effort external effect, only once the event is durable.
+                    if let Some(event_id) = event_id {
+                        crate::db::subscriptions::process_logged_event(
+                            db,
+                            event_id,
+                            "life",
+                            instance_name,
+                            &event_data,
+                        );
+                    }
+                    won
+                })
+            }),
+    };
     match finalized {
-        Ok(true) => {}
-        Ok(false) => return StopOutcome::AlreadyStopped,
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return StopOutcome::AlreadyStopped,
+        Ok(None) => return re_registered_outcome(instance_name),
         Err(e) => {
             log::log_warn(
                 "hooks",
                 "finalize.transaction_failed",
                 &format!("instance={instance_name} err={e}"),
             );
-            return StopOutcome::RetryableError(format!(
-                "could not finalize stop for {instance_name}: {e}"
-            ));
+            return StopOutcome::RetryableError(
+                format!("could not finalize stop for {instance_name}: {e}").into(),
+            );
         }
     }
 
@@ -2230,7 +2440,11 @@ pub fn finalize_session_excluding(
         exclude,
         None,
     );
-    if let StopOutcome::RetryableError(e) = &outcome {
+    // A re-registered name belongs to another session now; the guard logged
+    // the skip, and this session's own end is not a refused stop.
+    if !outcome.is_re_registered()
+        && let StopOutcome::RetryableError(e) = &outcome
+    {
         log::log_warn(
             "hooks",
             "sessionend.stop_refused",
@@ -2258,9 +2472,9 @@ fn keep_own_row_off_linux(
         Ok(Some(row)) => row.status,
         Ok(None) => return StopOutcome::AlreadyStopped,
         Err(e) => {
-            return StopOutcome::RetryableError(format!(
-                "could not read instance {instance_name}: {e}"
-            ));
+            return StopOutcome::RetryableError(
+                format!("could not read instance {instance_name}: {e}").into(),
+            );
         }
     };
     log::log_info(
@@ -3194,7 +3408,7 @@ mod tests {
         // Clear the thread-local hook before any assertion can unwind.
         arm_round_seam(|_| {});
         assert!(
-            matches!(&outcome, StopOutcome::RetryableError(e) if e.contains("persisted its pid")),
+            matches!(&outcome, StopOutcome::RetryableError(e) if e.to_string().contains("persisted its pid")),
             "{outcome:?}"
         );
         let pid = launched.borrow().as_ref().expect("seam fired").0.id();

@@ -818,6 +818,21 @@ fn capture_orphan_carriers(
         .collect()
 }
 
+/// Report a bulk kill's release of `name`; true when it counts against the
+/// kill. A release skipped because the row was re-registered mid-kill is
+/// not a stop either: the new row is live.
+fn report_release_failure(name: &str, outcome: &StopOutcome) -> bool {
+    if outcome.is_re_registered() {
+        eprintln!("{}", crate::hooks::common::skipped_stop_line(name));
+        return true;
+    }
+    if let StopOutcome::RetryableError(e) = outcome {
+        eprintln!("Error releasing '{name}': {e}");
+        return true;
+    }
+    false
+}
+
 /// Kill all instances.
 fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<i32> {
     let instances = db.iter_instances_full()?;
@@ -870,25 +885,19 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
             // The release reaps the whole tree; a failure means live
             // processes remain, so it counts against the kill.
-            if let StopOutcome::RetryableError(e) = crate::hooks::common::stop_instance_with_capture(
+            let outcome = crate::hooks::common::stop_instance_with_capture(
                 db,
                 &inst.name,
                 initiator,
                 "killed",
                 pre_capture,
-            ) {
-                eprintln!("Error releasing '{}': {e}", inst.name);
-                failed += 1;
-            }
+            );
+            failed += report_release_failure(&inst.name, &outcome) as i32;
             println!("  To resume: hcom r {}", inst.name);
         } else {
             // No PID tracked — just clean up
-            if let StopOutcome::RetryableError(e) =
-                stop_instance(db, &inst.name, initiator, "killed")
-            {
-                eprintln!("Error releasing '{}': {e}", inst.name);
-                failed += 1;
-            }
+            let outcome = stop_instance(db, &inst.name, initiator, "killed");
+            failed += report_release_failure(&inst.name, &outcome) as i32;
         }
     }
 
@@ -1005,25 +1014,19 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
             }
             incomplete +=
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-            if let StopOutcome::RetryableError(e) = crate::hooks::common::stop_instance_with_capture(
+            let outcome = crate::hooks::common::stop_instance_with_capture(
                 db,
                 &inst.name,
                 initiator,
                 "killed",
                 pre_capture,
-            ) {
-                eprintln!("Error releasing '{}': {e}", inst.name);
-                failed += 1;
-            }
+            );
+            failed += report_release_failure(&inst.name, &outcome) as i32;
         } else {
             // No PID tracked — clean up DB entry
             println!("No tracked process for '{}', stopping instance.", inst.name);
-            if let StopOutcome::RetryableError(e) =
-                stop_instance(db, &inst.name, initiator, "killed")
-            {
-                eprintln!("Error releasing '{}': {e}", inst.name);
-                failed += 1;
-            }
+            let outcome = stop_instance(db, &inst.name, initiator, "killed");
+            failed += report_release_failure(&inst.name, &outcome) as i32;
         }
     }
 

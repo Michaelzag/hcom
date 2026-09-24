@@ -88,6 +88,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
         let mut stopped_names = Vec::new();
         let mut failed_names = Vec::new();
+        let mut skipped_names = Vec::new();
         let mut bg_logs = Vec::new();
 
         for inst in &instances {
@@ -95,6 +96,10 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             // The release reaps the whole tree first; a failure means live
             // processes remain, so the name must not be reported as stopped.
             match stop_instance(db, &inst.name, &launcher, "stop_all") {
+                outcome if outcome.is_re_registered() => {
+                    eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
+                    skipped_names.push(display.clone());
+                }
                 crate::hooks::common::StopOutcome::Stopped
                 | crate::hooks::common::StopOutcome::AlreadyStopped => {
                     stopped_names.push(display.clone());
@@ -110,7 +115,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             }
         }
 
-        if stopped_names.is_empty() && failed_names.is_empty() {
+        if stopped_names.is_empty() && failed_names.is_empty() && skipped_names.is_empty() {
             println!("Nothing to stop");
         } else {
             if !stopped_names.is_empty() {
@@ -126,7 +131,11 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 }
             }
         }
-        return if failed_names.is_empty() { 0 } else { 1 };
+        return if failed_names.is_empty() && skipped_names.is_empty() {
+            0
+        } else {
+            1
+        };
     }
 
     // Handle tag:name syntax
@@ -181,11 +190,16 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         );
         let mut stopped_names = Vec::new();
         let mut failed_names = Vec::new();
+        let mut skipped_names = Vec::new();
         let mut bg_logs = Vec::new();
 
         for inst in &tag_matches {
             let display = get_full_name(inst);
             match stop_instance(db, &inst.name, &launcher, "tag_stop") {
+                outcome if outcome.is_re_registered() => {
+                    eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
+                    skipped_names.push(display.clone());
+                }
                 crate::hooks::common::StopOutcome::Stopped
                 | crate::hooks::common::StopOutcome::AlreadyStopped => {
                     stopped_names.push(display.clone());
@@ -212,7 +226,11 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 println!("  {name}: {log_file}");
             }
         }
-        return if failed_names.is_empty() { 0 } else { 1 };
+        return if failed_names.is_empty() && skipped_names.is_empty() {
+            0
+        } else {
+            1
+        };
     }
 
     // Handle multiple explicit targets
@@ -250,6 +268,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         let launcher = resolve_initiator(db, ctx, explicit_name);
         let mut stopped_names = Vec::new();
         let mut failed_names = Vec::new();
+        let mut skipped_names = Vec::new();
         let mut bg_logs = Vec::new();
 
         for inst in &instances_to_stop {
@@ -259,6 +278,10 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             }
             let display = get_full_name(inst);
             match stop_instance(db, &inst.name, &launcher, "multi_stop") {
+                outcome if outcome.is_re_registered() => {
+                    eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
+                    skipped_names.push(display.clone());
+                }
                 crate::hooks::common::StopOutcome::Stopped
                 | crate::hooks::common::StopOutcome::AlreadyStopped => {
                     stopped_names.push(display.clone());
@@ -285,7 +308,11 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 println!("  {name}: {log_file}");
             }
         }
-        return if failed_names.is_empty() { 0 } else { 1 };
+        return if failed_names.is_empty() && skipped_names.is_empty() {
+            0
+        } else {
+            1
+        };
     }
 
     // Single target or self-stop
@@ -355,6 +382,10 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
     // The release reaps the whole tree first; on failure the name stays
     // live and must not be reported as stopped.
     match stop_instance(db, &instance_name, &launcher, reason) {
+        outcome if outcome.is_re_registered() => {
+            eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
+            return 1;
+        }
         crate::hooks::common::StopOutcome::Stopped
         | crate::hooks::common::StopOutcome::AlreadyStopped => {}
         crate::hooks::common::StopOutcome::RetryableError(e) => {

@@ -2543,6 +2543,8 @@ fn subagent_stop(
             Default::default(),
         );
         match common::stop_instance(db, &subagent_name, "subagent", "idle") {
+            // Another session owns the name now; nothing of this subagent's is left.
+            outcome if outcome.is_re_registered() => {}
             common::StopOutcome::RetryableError(error) => return block_subagent_stop(error),
             common::StopOutcome::Stopped | common::StopOutcome::AlreadyStopped => {}
         }
@@ -2629,6 +2631,8 @@ fn subagent_stop(
             Default::default(),
         );
         match common::stop_instance(db, &subagent_name, "subagent", reason) {
+            // Another session owns the name now; nothing of this subagent's is left.
+            outcome if outcome.is_re_registered() => {}
             common::StopOutcome::RetryableError(error) => return block_subagent_stop(error),
             common::StopOutcome::Stopped | common::StopOutcome::AlreadyStopped => {}
         }
