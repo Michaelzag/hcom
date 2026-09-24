@@ -40,6 +40,27 @@ const LIFE_FLAGS: &[&str] = &["action"];
 /// File-write tool contexts for SQL filters.
 pub const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:NotebookEdit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit', 'tool:write_to_file', 'tool:replace_file_content', 'tool:multi_replace_file_content', 'tool:StrReplace', 'tool:create')";
 
+/// True when a status detail names a URI (`xd://retain`, `agent://<id>`,
+/// `proc://<id>/kill`) rather than a filesystem path. omp's write tool takes
+/// both, but only paths can collide. A URI is an RFC 3986 scheme
+/// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`) followed by `://`.
+pub fn is_uri_status_detail(detail: &str) -> bool {
+    detail.split_once("://").is_some_and(|(scheme, _)| {
+        let mut bytes = scheme.bytes();
+        bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+            && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    })
+}
+
+/// SQL form of [`is_uri_status_detail`] over `column`. False for NULL.
+pub fn uri_status_detail_sql(column: &str) -> String {
+    format!(
+        "(instr(coalesce({column}, ''), '://') > 1 \
+         AND substr({column}, 1, 1) GLOB '[A-Za-z]' \
+         AND substr({column}, 1, instr({column}, '://') - 1) NOT GLOB '*[^A-Za-z0-9+.-]*')"
+    )
+}
+
 /// All file operation contexts.
 pub const FILE_OP_CONTEXTS: &[&str] = &[
     "tool:Write",
@@ -411,6 +432,7 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
             "(type = 'status' AND status_context IN {ctx}\n\
              AND events_v.status_detail IS NOT NULL\n\
              AND events_v.status_detail != ''\n\
+             AND NOT {uri}\n\
              AND EXISTS (\n\
              \x20   SELECT 1 FROM events_v e\n\
              \x20   WHERE e.type = 'status' AND e.status_context IN {ctx}\n\
@@ -419,7 +441,8 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
              \x20   AND e.instance != events_v.instance\n\
              \x20   AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 30\n\
              ))",
-            ctx = FILE_WRITE_CONTEXTS
+            ctx = FILE_WRITE_CONTEXTS,
+            uri = uri_status_detail_sql("events_v.status_detail")
         );
         clauses.push(collision_sql);
     }
@@ -768,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collision_filter_matches_real_writes_and_rejects_empty_details() {
+    fn test_collision_filter_matches_real_writes_and_rejects_empty_and_uri_details() {
         let db = crate::db::HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
         db.init_db().unwrap();
 
@@ -808,6 +831,57 @@ mod tests {
         insert("empty-b", "2026-06-07T12:00:21Z", "tool:Edit", Some(""));
         insert("null-a", "2026-06-07T12:00:22Z", "tool:Write", None);
         insert("null-b", "2026-06-07T12:00:23Z", "tool:Edit", None);
+        // omp's write tool also takes URIs; two seats saving memory are not
+        // editing the same file.
+        insert(
+            "xd-a",
+            "2026-06-07T12:00:30Z",
+            "tool:write",
+            Some("xd://retain"),
+        );
+        insert(
+            "xd-b",
+            "2026-06-07T12:00:31Z",
+            "tool:write",
+            Some("xd://retain"),
+        );
+        insert(
+            "agent-a",
+            "2026-06-07T12:00:32Z",
+            "tool:write",
+            Some("agent://x"),
+        );
+        insert(
+            "agent-b",
+            "2026-06-07T12:00:33Z",
+            "tool:write",
+            Some("agent://x"),
+        );
+        insert(
+            "proc-a",
+            "2026-06-07T12:00:34Z",
+            "tool:write",
+            Some("proc://x/kill"),
+        );
+        insert(
+            "proc-b",
+            "2026-06-07T12:00:35Z",
+            "tool:write",
+            Some("proc://x/kill"),
+        );
+        // A relative path that merely contains `://` is still a path.
+        insert(
+            "rel-a",
+            "2026-06-07T12:00:36Z",
+            "tool:write",
+            Some("docs/a://b.md"),
+        );
+        insert(
+            "rel-b",
+            "2026-06-07T12:00:37Z",
+            "tool:write",
+            Some("docs/a://b.md"),
+        );
 
         let mut filters = FilterMap::new();
         filters.insert("collision".into(), vec!["true".into()]);
@@ -820,7 +894,35 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
 
-        assert_eq!(matches, vec!["luna".to_string(), "nova".to_string()]);
+        assert_eq!(matches, ["luna", "nova", "rel-a", "rel-b"]);
+    }
+
+    #[test]
+    fn test_uri_status_detail_rust_and_sql_agree() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = format!("SELECT {}", uri_status_detail_sql("?1"));
+        for (detail, is_uri) in [
+            ("xd://retain", true),
+            ("agent://x", true),
+            ("proc://x/kill", true),
+            ("x://", true),
+            ("svn+ssh://host/repo", true),
+            ("/home/u/proj/src/main.rs", false),
+            ("relative/path.rs", false),
+            (r"C:\Users\u\main.rs", false),
+            ("docs/a://b.md", false),
+            ("://missing-scheme", false),
+            ("1abc://x", false),
+            ("", false),
+        ] {
+            assert_eq!(is_uri_status_detail(detail), is_uri, "rust: {detail}");
+            let sql_is_uri: bool = conn.query_row(&sql, [detail], |row| row.get(0)).unwrap();
+            assert_eq!(sql_is_uri, is_uri, "sql: {detail}");
+        }
+        let null_is_uri: bool = conn
+            .query_row(&sql, [Option::<&str>::None], |row| row.get(0))
+            .unwrap();
+        assert!(!null_is_uri);
     }
 
     #[test]
