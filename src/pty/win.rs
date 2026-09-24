@@ -693,6 +693,9 @@ impl Proxy {
                             let _ = w.write_all(b"y\r");
                             let _ = w.flush();
                             omp_reroot_answered = true;
+                            // Release the ConPTY writer before touching the DB so
+                            // stdin/injection threads are never blocked on it.
+                            drop(w);
                             if let Some(name) = &instance {
                                 let _ = HcomDb::open().and_then(|db| {
                                     db.emit_launch_lifecycle_event(
