@@ -210,10 +210,11 @@ fn is_bound_process_id(process_id: &str, binding_ids: &[String]) -> bool {
 
 /// Broker-owned daemons inherit the first session's identity but do not belong
 /// to it. Only a nested `omp` below the nearest broker starts a new carrier
-/// subtree. Off Linux there is no `/proc/<pid>/comm` to distinguish them, so
-/// keep the existing identity-only rule.
+/// subtree. Off Linux and Android there is no `/proc/<pid>/comm` to distinguish
+/// them, so keep the existing identity-only rule.
+#[cfg(unix)]
 pub(crate) fn carrier_eligible(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         carrier_eligible_with(
             pid,
@@ -221,14 +222,14 @@ pub(crate) fn carrier_eligible(pid: u32) -> bool {
             parent_pid,
         )
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = pid;
         true
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn carrier_eligible_with(
     pid: u32,
     comm_of: impl Fn(u32) -> Option<String>,
@@ -288,7 +289,7 @@ fn carrier_tree_scope(db: &HcomDb, name: &str, binding_ids: &[String]) -> Carrie
     {
         roots.push(pid);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     for id in binding_ids {
         // Only the minted omp-<pid>-... shape identifies an owner. A live
         // process with another comm must not become a root on the strength of
@@ -305,7 +306,7 @@ fn carrier_tree_scope(db: &HcomDb, name: &str, binding_ids: &[String]) -> Carrie
             roots.push(pid);
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let _ = binding_ids;
     CarrierTreeScope {
         roots,
@@ -369,7 +370,7 @@ fn snapshot_reap_carriers(
 /// An identity holder is signalable only when its parent chain reaches one
 /// of the captured roots. An unreadable or changing chain never proves
 /// ownership. A root itself counts, except if it is a caller ancestor.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn carrier_in_owner_tree_with(
     pid: u32,
     scope: &CarrierTreeScope,
@@ -415,7 +416,7 @@ fn carrier_in_signal_scope(pid: u32, name: &str, scope: &CarrierTreeScope) -> bo
     {
         return true;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     if carrier_in_owner_tree_with(pid, scope, parent_pid) {
         return true;
     }
@@ -472,7 +473,7 @@ fn enumerate_unix(
         // earlier signal. Keep its broker decision, but never signal a pid
         // that has itself become the shared broker.
         if frozen.is_some() {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             if std::fs::read_to_string(format!("/proc/{pid}/comm")).map_or(true, |comm| {
                 comm.trim_end_matches('\n') == "omp daemon brok"
             }) {
@@ -1034,7 +1035,7 @@ fn pid_carries_instance(
             log_carrier_out_of_scope(pid, name, scope);
             return false;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if std::fs::read_to_string(format!("/proc/{pid}/comm")).map_or(true, |comm| {
             comm.trim_end_matches('\n') == "omp daemon brok"
         }) {
