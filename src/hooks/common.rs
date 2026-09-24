@@ -1924,7 +1924,8 @@ fn yield_to_teardown(db: &HcomDb, instance_name: &str) -> bool {
 ///
 /// OMP soft-stop passes `keep_process_binding: true` so the live process can rebind
 /// via `bind_session_to_process` on the next turn. Antigravity passes `false`.
-/// A live kill claim leaves status, metadata, bindings, and events untouched.
+/// A live kill claim keeps the early exit status and metadata writes, but
+/// leaves the stopped event, bindings, and row release to the kill.
 pub fn soft_finalize_session(
     db: &HcomDb,
     instance_name: &str,
@@ -1933,6 +1934,18 @@ pub fn soft_finalize_session(
     keep_process_binding: bool,
 ) {
     if yield_to_teardown(db, instance_name) {
+        // The one-shot hook will not replay if the kill later fails. Keep
+        // the same inactive exit state as a normal finalize whose reap fails.
+        lifecycle::set_status(
+            db,
+            instance_name,
+            ST_INACTIVE,
+            &format!("exit:{}", reason),
+            Default::default(),
+        );
+        if let Some(updates) = updates {
+            instances::update_instance_position(db, instance_name, updates);
+        }
         return;
     }
     log::log_info(
@@ -2056,8 +2069,8 @@ pub fn finalize_session(
 /// Off Linux a non-empty `exclude` never deletes the row: without /proc the
 /// reap and the headless check see none of the session's other carriers, so
 /// a release would report success blind (see `keep_own_row_off_linux`).
-/// A live kill claim yields without writes and returns `AlreadyStopped`;
-/// the kill owns the pending stop and hook callers need no further action.
+/// A live kill claim preserves the early exit status and metadata writes
+/// and returns `AlreadyStopped`; the kill owns the stopped event and release.
 pub fn finalize_session_excluding(
     db: &HcomDb,
     instance_name: &str,
@@ -2066,6 +2079,18 @@ pub fn finalize_session_excluding(
     exclude: &[u32],
 ) -> StopOutcome {
     if yield_to_teardown(db, instance_name) {
+        // A failed kill must leave the session inactive with its exit
+        // metadata, not falsely listening after this one-shot hook yields.
+        lifecycle::set_status(
+            db,
+            instance_name,
+            ST_INACTIVE,
+            &format!("exit:{}", reason),
+            Default::default(),
+        );
+        if let Some(updates) = updates {
+            instances::update_instance_position(db, instance_name, updates);
+        }
         return StopOutcome::AlreadyStopped;
     }
     #[cfg(not(target_os = "linux"))]
@@ -3264,7 +3289,7 @@ mod tests {
             .to_string();
             db.kv_set(&format!("teardown_claim:{name}"), Some(&value))
                 .unwrap();
-            let updates = serde_json::json!({"transcript_path": "/should-not-write"});
+            let updates = serde_json::json!({"transcript_path": "/ended/transcript"});
             if soft {
                 soft_finalize_session(&db, name, "shutdown", updates.as_object(), false);
             } else {
@@ -3277,19 +3302,19 @@ mod tests {
                 .get_instance_full(name)
                 .unwrap()
                 .expect("claimed row retained");
-            assert_eq!(row.status, ST_LISTENING);
-            assert_eq!(row.status_context, "start");
-            assert_ne!(row.transcript_path, "/should-not-write");
+            assert_eq!(row.status, ST_INACTIVE);
+            assert_eq!(row.status_context, "exit:shutdown");
+            assert_eq!(row.transcript_path, "/ended/transcript");
             assert_eq!(db.process_binding_ids(name).unwrap(), vec!["claim-process"]);
             let events: i64 = db
                 .conn()
                 .query_row(
-                    "SELECT COUNT(*) FROM events WHERE instance = ?",
+                    "SELECT COUNT(*) FROM events WHERE instance = ? AND type = 'life' AND json_extract(data, '$.action') = 'stopped'",
                     [name],
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(events, 0, "yield writes no status or life event");
+            assert_eq!(events, 0, "yield leaves the stopped event to the kill");
         }
     }
 

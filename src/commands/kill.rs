@@ -2299,6 +2299,77 @@ mod tests {
         assert_killed_by(&db, &name, "test");
         let _ = _guard;
     }
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_failure_after_session_yield_keeps_exit_state_and_bindings() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        for soft in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+            db.init_db().unwrap();
+            let name = format!("hcom-kill-{}-yield-failure-{soft}", std::process::id());
+            let mut survivor =
+                seed_bound_row_with_sleeper(&db, &name, "proc-yield-failure", "sess-yield-failure");
+            let pid = survivor.id();
+            db.conn()
+                .execute(
+                    "UPDATE instances SET status = 'listening' WHERE name = ?",
+                    rusqlite::params![name],
+                )
+                .unwrap();
+            let bindings = db.process_binding_ids(&name).unwrap();
+            let result = kill_tracked_instance_with_self_pids(
+                &db,
+                &name,
+                "test",
+                &[std::process::id()],
+                |n, _, _, _| {
+                    let updates = serde_json::json!({"transcript_path": "/ended/transcript"});
+                    if soft {
+                        crate::hooks::common::soft_finalize_session(
+                            &db,
+                            n,
+                            "shutdown",
+                            updates.as_object(),
+                            false,
+                        );
+                    } else {
+                        assert_eq!(
+                            crate::hooks::common::finalize_session(
+                                &db,
+                                n,
+                                "shutdown",
+                                updates.as_object()
+                            ),
+                            StopOutcome::AlreadyStopped,
+                        );
+                    }
+                    // Model an unkillable survivor after its one-shot hook
+                    // has yielded. The guard drops without replaying the hook.
+                    Err(vec![pid])
+                },
+            );
+            let alive = crate::sys::process::is_alive(pid);
+            survivor.kill().ok();
+            survivor.wait().ok();
+
+            let error = result.err().expect("survivors fail the kill");
+            assert!(error.contains(&pid.to_string()), "{error}");
+            assert!(alive, "the injected reap leaves its survivor alone");
+            let row = db.get_instance_full(&name).unwrap().expect("row retained");
+            assert_eq!(row.status, crate::shared::ST_INACTIVE);
+            assert_eq!(row.status_context, "exit:shutdown");
+            assert_eq!(row.transcript_path, "/ended/transcript");
+            assert_eq!(db.process_binding_ids(&name).unwrap(), bindings);
+            assert_eq!(stopped_events(&db, &name), 0);
+            assert!(
+                db.kv_get(&format!("teardown_claim:{name}"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
 
     /// Precedence: a PTY stop lands mid-kill, then a fresh process binds to
     /// the kept row. The new binding is still a genuine re-registration.
