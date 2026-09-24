@@ -457,6 +457,27 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
     Some(root.join(dirname))
 }
 
+/// Apply the same tool-config root injection to the environment the launcher
+/// will execute with. Prelaunch validation also depends on this final value.
+pub(crate) fn apply_tool_config_dir_to_env(
+    tool: &LaunchTool,
+    env: &mut HashMap<String, String>,
+) {
+    if let Some(env_var) = tool.spec().launch.config_dir_env
+        && !env.contains_key(env_var)
+        && std::env::var(env_var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_none()
+        && let Some(config_dir) = isolated_tool_config_dir(tool)
+    {
+        env.insert(
+            env_var.to_string(),
+            config_dir.to_string_lossy().to_string(),
+        );
+    }
+}
+
 /// Get system prompt file path for Gemini/Codex.
 fn get_system_prompt_path(tool: &str) -> std::path::PathBuf {
     let prompts_dir = paths::hcom_path(&["system-prompts"]);
@@ -1761,19 +1782,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         base_env.extend(caller_env.clone());
     }
     base_env.remove("HCOM_TERMINAL");
-    if let Some(env_var) = normalized.spec().launch.config_dir_env
-        && !base_env.contains_key(env_var)
-        && std::env::var(env_var)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_none()
-        && let Some(config_dir) = isolated_tool_config_dir(&normalized)
-    {
-        base_env.insert(
-            env_var.to_string(),
-            config_dir.to_string_lossy().to_string(),
-        );
-    }
+    apply_tool_config_dir_to_env(&normalized, &mut base_env);
 
     // Tag resolution
     let effective_tag = if let Some(ref tag) = params.tag {

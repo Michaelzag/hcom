@@ -526,9 +526,13 @@ fn prepare_resume_plan_from_source(
             terminal_mode,
             inside_ai_tool,
         );
-        let env = crate::launcher::build_launch_env(
+        let mut env = crate::launcher::build_launch_env(
             &hcom_config,
             crate::launcher::launch_env_regime(run_here, inside_ai_tool),
+        );
+        crate::launcher::apply_tool_config_dir_to_env(
+            &crate::launcher::LaunchTool::Omp,
+            &mut env,
         );
         ensure_omp_session_file_in_env(
             &session_id,
@@ -4380,6 +4384,42 @@ mod tests {
                 plan.launch.args
             );
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_resume_finds_managed_session_when_hcom_dir_outside_home() {
+        let (_home_dir, _hcom_dir, home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env();
+        let external = tempfile::tempdir().unwrap();
+        let hcom_dir = external.path().join("state");
+        std::fs::create_dir_all(&hcom_dir).unwrap();
+        crate::paths::test_roots::register(external.path());
+        assert_ne!(hcom_dir.parent(), Some(home.as_path()));
+
+        unsafe {
+            std::env::set_var("HCOM_DIR", &hcom_dir);
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("PI_CONFIG_DIR");
+        }
+        crate::config::Config::reset();
+        let root = external.path().join(".omp").join("sessions");
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::write(
+            root.join("project")
+                .join(format!("{OMP_MISSING_SID}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+
+        let db = test_db();
+        seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, "");
+        prepare_resume_plan(&db, "mira", false, &[], &GlobalFlags::default()).unwrap();
     }
 
     #[cfg(unix)]
