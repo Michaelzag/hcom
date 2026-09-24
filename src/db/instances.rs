@@ -364,7 +364,9 @@ impl HcomDb {
         }
     }
 
-    /// Get instance snapshot for life event logging before deletion
+    /// Get instance snapshot for life event logging before deletion. A
+    /// recorded pid carries its incarnation (`pid_start_time`, `boot_id`;
+    /// see [`crate::proctruth::record_anchor_identity`]).
     ///
     /// Returns:
     /// - Ok(Some(snapshot)) if instance exists
@@ -402,7 +404,10 @@ impl HcomDb {
                 "current": row.get::<_, String>(18).unwrap_or_default(),
             }))
         }) {
-            Ok(snapshot) => Ok(Some(snapshot)),
+            Ok(mut snapshot) => {
+                crate::proctruth::record_anchor_identity(&mut snapshot);
+                Ok(Some(snapshot))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }

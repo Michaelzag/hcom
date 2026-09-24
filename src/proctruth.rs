@@ -1119,6 +1119,73 @@ pub(crate) fn is_launcher_process_id(id: &str) -> bool {
     groups == sizes.len() && sizes == [8, 4, 4, 4, 12]
 }
 
+/// Stamp a `life.stopped` snapshot with the incarnation of its anchor `pid`:
+/// `pid_start_time` (boot-relative clock ticks) and `boot_id`. A later
+/// reclaim ([`verify_reclaim_anchor`]) uses them to prove a live ancestor is
+/// that same process, not a reused pid. Nothing is added when the snapshot
+/// records no pid or the pid's procfs identity is unreadable (gone, or a
+/// target without procfs).
+pub(crate) fn record_anchor_identity(snapshot: &mut serde_json::Value) {
+    let Some(pid) = snapshot
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        return;
+    };
+    let Some((start_time, boot_id)) = crate::sys::process::procfs_start_identity(pid) else {
+        return;
+    };
+    if let Some(fields) = snapshot.as_object_mut() {
+        fields.insert("pid_start_time".into(), serde_json::json!(start_time));
+        fields.insert("boot_id".into(), serde_json::json!(boot_id));
+    }
+}
+
+/// Decide whether a reclaim may restore the anchor pid recorded in the
+/// target's own newest `life.stopped` snapshot. Returns the pid, or why not.
+///
+/// All three must hold: the snapshot carries `pid` + `pid_start_time` +
+/// `boot_id`; that pid is in `ancestors` (self-inclusive, as the trust gate
+/// reads it); and `live_identity(pid)` reports the same start time on the
+/// same boot. History plus ancestry plus process identity, never env
+/// carriage: a reused pid on the caller's chain differs in start time, and a
+/// reboot differs in boot id.
+pub(crate) fn verify_reclaim_anchor(
+    snapshot: &serde_json::Value,
+    ancestors: &[u32],
+    live_identity: &dyn Fn(u32) -> Option<(u64, String)>,
+) -> Result<u32, &'static str> {
+    let Some(pid) = snapshot
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        return Err("snapshot records no anchor pid");
+    };
+    let (Some(start_time), Some(boot_id)) = (
+        snapshot
+            .get("pid_start_time")
+            .and_then(serde_json::Value::as_u64),
+        snapshot.get("boot_id").and_then(serde_json::Value::as_str),
+    ) else {
+        return Err("snapshot predates anchor start time and boot id");
+    };
+    if !ancestors.contains(&pid) {
+        return Err("anchor pid is not a live ancestor of this process");
+    }
+    let Some((live_start_time, live_boot_id)) = live_identity(pid) else {
+        return Err("anchor pid identity unreadable");
+    };
+    if live_boot_id != boot_id {
+        return Err("boot id differs from the snapshot");
+    }
+    if live_start_time != start_time {
+        return Err("anchor pid start time differs from the snapshot");
+    }
+    Ok(pid)
+}
+
 /// Pure decision core for process-identity trust — NO io. `ancestors` is
 /// self-inclusive ([`caller_ancestor_pids`]); `binding_row_pid` is `None`
 /// for no binding row and `Some(None)` for a row whose bound instance
