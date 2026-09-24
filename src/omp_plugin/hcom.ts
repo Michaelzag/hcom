@@ -370,8 +370,35 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		return null;
 	}
 
+	// Probe gate: a throwaway omp process that inherited a bound seat's env
+	// (`omp -p` print probes, `--no-session` runs, subagent probes) must stay
+	// completely inert — no omp-start bind, no config read, no status, no
+	// omp-stop/release, no notify server, no delivery. handle_start recovers
+	// the seat's binding by HCOM_INSTANCE_NAME / process binding and overwrites
+	// the seat's session with the probe's (lave / demo incidents). Probe when
+	// (a) there is no UI: print/RPC/json runs — hcom never launches those modes
+	// (launch_arg_validation.rs rejects -p/--print/--mode) — or (b) the session
+	// is not persisted: the ephemeral session manager keeps no session file,
+	// while a persistent one has its path allocated before the first write.
+	// Computed once per process: mode and persistence do not change across
+	// session switches.
+	let probeReason: string | null | undefined;
+
+	function probeSkipReason(ctx: ExtensionContext): string | null {
+		if (probeReason === undefined) {
+			probeReason = !ctx.hasUI
+				? "no_ui"
+				: !ctx.sessionManager.getSessionFile()
+					? "no_session_file"
+					: null;
+			log("INFO", probeReason ? "plugin.probe_inert" : "plugin.probe_checked", null, { reason: probeReason });
+		}
+		return probeReason;
+	}
+
 	async function bindIdentity(ctx: ExtensionContext): Promise<void> {
 		currentCtx = ctx;
+		if (probeSkipReason(ctx)) return;
 		if (instanceName || bindingPromise) return bindingPromise ?? Promise.resolve();
 		if (!inheritedLauncherCandidate && !(await plainSessionsEnabled())) return;
 		const skipReason = nestedSkipReason();
@@ -452,6 +479,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	async function fetchPending(): Promise<{ messages: any[]; maxId: number } | null> {
+		if (probeReason) return null;
 		if (!instanceName) return null;
 		const result = await hcom(["omp-read", "--name", instanceName]);
 		if (result.code !== 0) {
@@ -473,6 +501,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	async function deliverPending(ctx: ExtensionContext): Promise<boolean> {
 		currentCtx = ctx;
+		if (probeSkipReason(ctx)) return false;
 		await bindIdentity(ctx);
 		if (!instanceName || !sessionId) return false;
 		if (!isBoundSession(ctx.sessionManager.getSessionId())) return false;
@@ -555,6 +584,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	async function ackPending(source: string): Promise<boolean> {
+		if (probeReason) return false;
 		if (ackInFlight) return ackInFlight;
 		if (!instanceName || pendingAckId === null) return false;
 		const ackInstance = instanceName;
@@ -589,6 +619,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	async function reportStatus(ctx: ExtensionContext, status: "active" | "listening", context = "", detail = ""): Promise<void> {
+		if (probeSkipReason(ctx)) return;
 		await bindIdentity(ctx);
 		if (!instanceName) return;
 		const args = ["omp-status", "--name", instanceName, "--status", status];
@@ -682,6 +713,11 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	// Stop only when THIS extension instance owns the identity (nested task
 	// instances never bind, so they never stop the parent).
 	pi.on("session_shutdown", async () => {
+		if (probeReason) {
+			log("INFO", "plugin.session_shutdown_skipped", null, { reason: "probe", probe_reason: probeReason });
+			resetBinding();
+			return;
+		}
 		let keepOwner = false;
 		if (instanceName && ownsIdentity) {
 			const reg = getIdentityRegistry();
@@ -818,6 +854,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event, ctx) => {
 		currentCtx = ctx;
+		if (probeSkipReason(ctx)) return undefined;
 		await bindIdentity(ctx);
 		if (!instanceName) return undefined;
 		await reportStatus(ctx, "active", `tool:${event.toolName}`, String((event.input as any)?.path ?? (event.input as any)?.command ?? ""));
