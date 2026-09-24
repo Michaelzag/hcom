@@ -53,10 +53,21 @@ pub(crate) struct PreparedResume {
     last_event_id: i64,
     session_id: String,
     tracked_fork_identity: Option<TrackedForkIdentity>,
-    /// `--restore-earlier`: the id of the earlier `life.stopped` event and
-    /// its snapshot, appended as a corrective `life.stopped` event for the
-    /// seat right before launch.
-    restored_snapshot: Option<(i64, serde_json::Value)>,
+    /// `--restore-earlier`: the earlier snapshot appended as a corrective
+    /// `life.stopped` event for the seat right before launch.
+    restored_snapshot: Option<RestoredSnapshot>,
+}
+
+/// The `--restore-earlier` part of a plan: what [`append_restored_snapshot`]
+/// writes, and the seat state it was planned against.
+struct RestoredSnapshot {
+    /// Id of the earlier `life.stopped` event being restored.
+    source_event_id: i64,
+    /// That event's raw `snapshot` object.
+    snapshot: serde_json::Value,
+    /// Id of the seat's newest `life.stopped` event when planning judged it
+    /// dead ([`newest_stopped_event_id`]); the append refuses if it moved.
+    planned_newest_id: Option<i64>,
 }
 
 struct ResumeOutputContext {
@@ -856,6 +867,10 @@ fn resolve_restore_earlier_plan(
              hcom r {name} already resumes that exact session"
         );
     }
+    // Captured before the newest snapshot is read and judged dead: the append
+    // re-reads it under its write lock and refuses if any stopped snapshot
+    // landed in between, so it never buries a newer, live session.
+    let planned_newest_id = newest_stopped_event_id(db.conn(), name)?;
     let (tool, newest_session_id, _, _, newest_background, _, newest_dir, ..) =
         load_stopped_snapshot(db, name)?;
     // Dead exactly when the guard a plain `hcom r <name>` runs would refuse:
@@ -901,7 +916,11 @@ fn resolve_restore_earlier_plan(
                 extra_args,
                 flags,
             )?;
-            plan.restored_snapshot = Some((event_id, snapshot));
+            plan.restored_snapshot = Some(RestoredSnapshot {
+                source_event_id: event_id,
+                snapshot,
+                planned_newest_id,
+            });
             Ok((name.to_string(), plan))
         }
         EarlierSession::Held { session_id, holder } => bail!(
@@ -920,10 +939,11 @@ fn resolve_restore_earlier_plan(
 /// again — and return the line reporting it. `None`, with no write, for every
 /// other plan.
 ///
-/// The holder re-check and the append share ONE `BEGIN IMMEDIATE`
-/// transaction: an instance that claimed the session after planning either
-/// commits first, so the re-check sees it and nothing is written, or lands
-/// after the corrective event. The copy's cursor is clamped to the name's
+/// The newest-snapshot and holder re-checks and the append share ONE
+/// `BEGIN IMMEDIATE` transaction: a stopped snapshot appended for the seat or
+/// an instance that claimed the session after planning either commits first,
+/// so a re-check sees it and nothing is written, or lands after the
+/// corrective event. The copy's cursor is clamped to the name's
 /// newest ([`name_newest_cursor`]): a launch that fails after this append
 /// leaves the copy as the seat's newest snapshot, and a retry must not resume
 /// from the older snapshot's cursor and redeliver consumed messages.
@@ -932,18 +952,24 @@ fn append_restored_snapshot(
     name: &str,
     plan: &PreparedResume,
 ) -> Result<Option<String>> {
-    let Some((source_event_id, snapshot)) = &plan.restored_snapshot else {
+    let Some(restored) = &plan.restored_snapshot else {
         return Ok(None);
     };
     let session_id = &plan.session_id;
-    db.with_immediate_transaction(|_| {
+    db.with_immediate_transaction(|tx| {
+        if newest_stopped_event_id(tx, name)? != restored.planned_newest_id {
+            bail!(
+                "{RESTORE_EARLIER_FLAG}: the newest session of '{name}' changed since \
+                 planning; nothing restored"
+            );
+        }
         if let Some(holder) = live_session_holder(db, session_id)? {
             bail!(
                 "{RESTORE_EARLIER_FLAG}: earlier session {session_id} of '{name}' is live as \
                  '{holder}'; nothing restored"
             );
         }
-        let mut snapshot = snapshot.clone();
+        let mut snapshot = restored.snapshot.clone();
         if let Some(fields) = snapshot.as_object_mut() {
             let cursor = fields
                 .get("last_event_id")
@@ -962,8 +988,25 @@ fn append_restored_snapshot(
         )
     })?;
     Ok(Some(format!(
-        "restored earlier session {session_id} of '{name}' (from event #{source_event_id})"
+        "restored earlier session {session_id} of '{name}' (from event #{})",
+        restored.source_event_id
     )))
+}
+
+/// Id of `name`'s newest `life.stopped` event, if any.
+fn newest_stopped_event_id(conn: &rusqlite::Connection, name: &str) -> Result<Option<i64>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT id FROM events
+             WHERE type='life'
+               AND instance=?
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// Outcome of [`find_earlier_session`].
@@ -5320,6 +5363,39 @@ mod tests {
                 )
             );
             assert_eq!(stopped_events(&db, "lave").len(), before);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_refuses_a_newer_snapshot_that_appears_after_planning() {
+        // Planning judged the newest snapshot dead; the seat then relaunched
+        // into a live session and stopped again before the corrective write.
+        // Restoring A now would bury that newer session, so the append must
+        // refuse and write nothing.
+        with_omp_home(|home| {
+            let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
+            let (_, plan) =
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+            write_omp_session_file(&format!("2026-01-02T00-00-00Z_{OMP_OTHER_SID}.jsonl"));
+            insert_omp_stopped_event(&db, "lave", OMP_OTHER_SID, "/tmp", OMP_DEAD_CURSOR + 1);
+            let before = stopped_events(&db, "lave").len();
+
+            let err = append_restored_snapshot(&db, "lave", &plan)
+                .expect_err("a snapshot stopped after planning must not be buried")
+                .to_string();
+            assert_eq!(
+                err,
+                "--restore-earlier: the newest session of 'lave' changed since planning; \
+                 nothing restored"
+            );
+            let events = stopped_events(&db, "lave");
+            assert_eq!(events.len(), before);
+            assert_eq!(
+                events.last().unwrap()["snapshot"]["session_id"],
+                OMP_OTHER_SID
+            );
         });
     }
 
