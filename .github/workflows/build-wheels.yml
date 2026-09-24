@@ -6,6 +6,19 @@ on:
       plan:
         required: true
         type: string
+  # HAND-MAINTAINED: dispatch lets a branch get a pre-merge compile check of
+  # every wheel target (notably darwin + android, which no PR job builds):
+  #   gh workflow run build-wheels.yml --ref <branch>
+  # Dispatch only uploads artifacts; it never publishes (PyPI publish is a
+  # separate workflow_call inside the Release chain). The `plan` input is
+  # vestigial here — no job in this file reads it.
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: "unused by dispatch; workflow_call plumbing only"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   build-wheels:
