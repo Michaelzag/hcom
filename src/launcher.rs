@@ -201,6 +201,8 @@ pub struct LaunchParams {
     pub skip_validation: bool,
     pub terminal: Option<String>,
     pub append_reply_handoff: bool,
+    /// Omp recorded session cwd was missing; answer its re-root prompt once.
+    pub answer_omp_reroot_prompt: bool,
 }
 
 impl Default for LaunchParams {
@@ -226,6 +228,7 @@ impl Default for LaunchParams {
             skip_validation: false,
             terminal: None,
             append_reply_handoff: true,
+            answer_omp_reroot_prompt: false,
         }
     }
 }
@@ -877,6 +880,7 @@ fn create_runner_script_windows(
     env: &HashMap<String, String>,
     tool_args: &[String],
     run_here: bool,
+    answer_omp_reroot_prompt: bool,
 ) -> Result<String> {
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
     let instance_state_env: &[&str] = tool_spec.map(|s| s.instance_state_env).unwrap_or(&[]);
@@ -898,6 +902,7 @@ fn create_runner_script_windows(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     hcom_env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+    hcom_env.remove("HCOM_ANSWER_OMP_REROOT_PROMPT");
     let env_block = terminal::build_env_string(&hcom_env, "powershell");
 
     // Non-HCOM ambient env (may carry secrets) goes through a private sidecar
@@ -1014,9 +1019,18 @@ fn create_runner_script_windows(
     let hcom_bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "hcom".to_string());
-    let run_line = if tool_args.is_empty() {
-        format!("& {} pty {}", terminal::ps_quote(&hcom_bin), tool)
-    } else {
+    // `hcom pty` takes the tool first, then its proxy-only options, then the
+    // args sidecar; emit each as its own token so none can fuse or reorder.
+    let mut run_tokens = vec![
+        "&".to_string(),
+        terminal::ps_quote(&hcom_bin),
+        "pty".to_string(),
+        tool.to_string(),
+    ];
+    if answer_omp_reroot_prompt {
+        run_tokens.push(crate::pty::ANSWER_OMP_REROOT_PROMPT_OPTION.to_string());
+    }
+    if !tool_args.is_empty() {
         let args_file = launch_dir.join(format!(
             "{}_{}_{}_{}.args.json",
             tool,
@@ -1026,13 +1040,10 @@ fn create_runner_script_windows(
         ));
         let mut file = crate::sys::fs::create_private_new(&args_file)?;
         file.write_all(serde_json::to_string(tool_args)?.as_bytes())?;
-        format!(
-            "& {} pty {} --hcom-args-file {}",
-            terminal::ps_quote(&hcom_bin),
-            tool,
-            terminal::ps_quote(&args_file.to_string_lossy())
-        )
-    };
+        run_tokens.push("--hcom-args-file".to_string());
+        run_tokens.push(terminal::ps_quote(&args_file.to_string_lossy()));
+    }
+    let run_line = run_tokens.join(" ");
     // `powershell -File` returns 0 unless the script exits with an explicit
     // code, so surface the wrapper's real exit status (agent failures, PTY
     // crashes, kill signals) instead of always reporting success.
@@ -1089,9 +1100,18 @@ pub fn create_runner_script(
     env: &HashMap<String, String>,
     tool_args: &[String],
     run_here: bool,
+    answer_omp_reroot_prompt: bool,
 ) -> Result<String> {
     if cfg!(windows) {
-        return create_runner_script_windows(tool, cwd, instance_name, env, tool_args, run_here);
+        return create_runner_script_windows(
+            tool,
+            cwd,
+            instance_name,
+            env,
+            tool_args,
+            run_here,
+            answer_omp_reroot_prompt,
+        );
     }
     // Resolve the tool's IntegrationSpec for instance-state env stripping
     let tool_spec = tool.parse::<crate::tool::Tool>().map(|t| t.spec()).ok();
@@ -1114,11 +1134,12 @@ pub fn create_runner_script(
     // The visible .sh only exports HCOM_* vars + PATH + cwd (minimal).
     // This avoids the sensitivity-classification heuristic entirely — no
     // secret ever lands in the 0755 world-readable script.
-    let hcom_env: HashMap<String, String> = env
+    let mut hcom_env: HashMap<String, String> = env
         .iter()
         .filter(|(k, _)| k.starts_with("HCOM_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    hcom_env.remove("HCOM_ANSWER_OMP_REROOT_PROMPT");
     let pane_identity_vars = if run_here {
         std::collections::HashSet::new()
     } else {
@@ -1155,9 +1176,14 @@ pub fn create_runner_script(
         let quoted = crate::tools::args_common::shell_quote(&env_file.to_string_lossy());
         format!("if [ -f {quoted} ]; then\n  . {quoted}\n  rm -f {quoted}\nfi")
     };
-    let tool_args_str: String = tool_args
-        .iter()
-        .map(|a| crate::tools::args_common::shell_quote(a))
+    // `hcom pty` takes the tool first, then its proxy-only options, then the
+    // tool's own args; quote each token separately so none can fuse.
+    let reroot_option =
+        answer_omp_reroot_prompt.then_some(crate::pty::ANSWER_OMP_REROOT_PROMPT_OPTION);
+    let pty_args_str: String = std::iter::once(tool)
+        .chain(reroot_option)
+        .chain(tool_args.iter().map(String::as_str))
+        .map(crate::tools::args_common::shell_quote)
         .collect::<Vec<_>>()
         .join(" ");
 
@@ -1208,7 +1234,7 @@ pub fn create_runner_script(
          {}\n\
          {}\n\
          \n\
-         {}{} pty {} {}\n",
+         {}{} pty {}\n",
         tool.chars()
             .next()
             .unwrap_or('?')
@@ -1226,8 +1252,7 @@ pub fn create_runner_script(
         path_export,
         use_exec,
         crate::tools::args_common::shell_quote(&native_bin_str),
-        tool,
-        tool_args_str,
+        pty_args_str,
     );
 
     fs::write(&script_file, &content)?;
@@ -1276,6 +1301,7 @@ pub fn launch_pty(
     run_here: bool,
     terminal: Option<&str>,
     inside_ai_tool: bool,
+    answer_omp_reroot_prompt: bool,
 ) -> Result<bool> {
     if env.get("HCOM_PROCESS_ID").is_none_or(|v| v.is_empty()) {
         crate::log::log_error(
@@ -1293,8 +1319,15 @@ pub fn launch_pty(
         .or_insert_with(|| tool.to_string());
     runner_env.extend(tool_extra_env(tool));
 
-    let script_file =
-        create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, run_here)?;
+    let script_file = create_runner_script(
+        tool,
+        cwd,
+        instance_name,
+        &runner_env,
+        tool_args,
+        run_here,
+        answer_omp_reroot_prompt,
+    )?;
 
     let command = runner_invocation_command(&script_file);
     let terminal_env: HashMap<String, String> = runner_env
@@ -1403,6 +1436,7 @@ fn finalize_background_launch(
     }));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_background_runner(
     tool: &str,
     cwd: &str,
@@ -1411,6 +1445,7 @@ fn launch_background_runner(
     tool_args: &[String],
     terminal_mode: Option<&str>,
     inside_ai_tool: bool,
+    answer_omp_reroot_prompt: bool,
 ) -> Result<(String, u32, String)> {
     let log_filename = format!(
         "background_{}_{}.log",
@@ -1422,8 +1457,15 @@ fn launch_background_runner(
     );
     let mut runner_env = background_runner_env(tool, instance_env, instance_name);
     runner_env.insert("HCOM_BACKGROUND".to_string(), log_filename);
-    let script_file =
-        create_runner_script(tool, cwd, instance_name, &runner_env, tool_args, false)?;
+    let script_file = create_runner_script(
+        tool,
+        cwd,
+        instance_name,
+        &runner_env,
+        tool_args,
+        false,
+        answer_omp_reroot_prompt,
+    )?;
     let command = runner_invocation_command(&script_file);
     let terminal_env: HashMap<String, String> = runner_env
         .iter()
@@ -1466,6 +1508,7 @@ fn launch_pty_or_background(
             tool_args,
             ctx.terminal_mode,
             inside_ai_tool,
+            params.answer_omp_reroot_prompt,
         )?;
         finalize_background_launch(ctx, log_file, pid, effective_preset);
         Ok(true)
@@ -1486,6 +1529,7 @@ fn launch_pty_or_background(
             effective_run_here,
             ctx.terminal_mode,
             inside_ai_tool,
+            params.answer_omp_reroot_prompt,
         )?;
         if ok {
             ctx.handles
@@ -3381,7 +3425,8 @@ mod tests {
             ("RORI_MY_VAR".to_string(), "myval".to_string()),
         ]);
 
-        let script = create_runner_script("gemini", "/tmp", "test", &env, &[], false).unwrap();
+        let script =
+            create_runner_script("gemini", "/tmp", "test", &env, &[], false, false).unwrap();
 
         let content = std::fs::read_to_string(&script).unwrap();
         // Instance-state stripped from unset block
@@ -3419,7 +3464,8 @@ mod tests {
             ("RORI_MY_VAR".to_string(), "myval".to_string()),
         ]);
 
-        let script = create_runner_script("gemini", "/tmp", "test", &env, &[], true).unwrap();
+        let script =
+            create_runner_script("gemini", "/tmp", "test", &env, &[], true, false).unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
         let env_file = content
             .lines()
@@ -3447,7 +3493,8 @@ mod tests {
         ]);
 
         let script =
-            create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[], false).unwrap();
+            create_runner_script_windows("gemini", "/tmp", "test-win", &env, &[], false, false)
+                .unwrap();
 
         let bytes = std::fs::read(&script).unwrap();
         assert_eq!(
@@ -3500,7 +3547,8 @@ mod tests {
         ];
 
         let script =
-            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args, false).unwrap();
+            create_runner_script_windows("codex", "/tmp", "test-args", &env, &args, false, false)
+                .unwrap();
         let content = std::fs::read_to_string(&script).unwrap();
 
         let run_line = content
@@ -3527,19 +3575,86 @@ mod tests {
         std::fs::remove_file(args_file).ok();
     }
 
-    #[test]
-    fn test_runner_script_windows_no_args_skips_sidecar_file() {
-        let env = HashMap::new();
-        let script =
-            create_runner_script_windows("gemini", "/tmp", "test-noargs", &env, &[], false)
-                .unwrap();
-        let content = std::fs::read_to_string(&script).unwrap();
-        let run_line = content
+    /// Split a runner's `hcom pty ...` line the way its shell would and feed
+    /// everything after `pty` to the parser `hcom pty` itself uses.
+    fn parse_runner_pty_line(content: &str, is_windows: bool) -> (String, bool, Vec<String>) {
+        let line = content
             .lines()
-            .find(|l| l.contains(" pty gemini"))
+            .find(|l| l.contains(" pty "))
             .expect("runner must invoke hcom pty");
-        assert!(!run_line.contains("--hcom-args-file"));
-        std::fs::remove_file(&script).ok();
+        let argv = crate::tools::args_common::shell_split(line, is_windows).unwrap();
+        let pty = argv
+            .iter()
+            .position(|a| a == "pty")
+            .expect("run line should contain the pty subcommand");
+        let pty_args = argv[pty + 1..].to_vec();
+        let (answer, tool_args) = crate::consume_pty_tool_args(&pty_args).unwrap();
+        (
+            pty_args[0].clone(),
+            answer,
+            tool_args.into_iter().map(|a| a.into_owned()).collect(),
+        )
+    }
+
+    fn reroot_tool_args() -> Vec<String> {
+        vec![
+            "--resume".to_string(),
+            "session id with spaces".to_string(),
+            "it's quoted".to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_runner_script_unix_reroot_opt_in_parses_as_proxy_option() {
+        for answer in [true, false] {
+            let args = reroot_tool_args();
+            let script = create_runner_script(
+                "omp",
+                "/tmp",
+                "test-reroot",
+                &HashMap::new(),
+                &args,
+                false,
+                answer,
+            )
+            .unwrap();
+            let content = std::fs::read_to_string(&script).unwrap();
+            std::fs::remove_file(&script).ok();
+
+            let (tool, parsed_answer, tool_args) = parse_runner_pty_line(&content, false);
+            assert_eq!(tool, "omp");
+            assert_eq!(parsed_answer, answer);
+            assert_eq!(tool_args, args);
+        }
+    }
+
+    #[test]
+    fn test_runner_script_windows_reroot_opt_in_parses_as_proxy_option() {
+        for answer in [true, false] {
+            let args = reroot_tool_args();
+            let env =
+                HashMap::from([("HCOM_ANSWER_OMP_REROOT_PROMPT".to_string(), "1".to_string())]);
+            let script = create_runner_script_windows(
+                "omp",
+                "/tmp",
+                "test-reroot",
+                &env,
+                &args,
+                false,
+                answer,
+            )
+            .unwrap();
+            let content = std::fs::read_to_string(&script).unwrap();
+            std::fs::remove_file(&script).ok();
+            assert!(!content.contains("HCOM_ANSWER_OMP_REROOT_PROMPT="));
+
+            // Parsing reads and deletes the args sidecar.
+            let (tool, parsed_answer, tool_args) = parse_runner_pty_line(&content, true);
+            assert_eq!(tool, "omp");
+            assert_eq!(parsed_answer, answer);
+            assert_eq!(tool_args, args);
+        }
     }
 
     #[test]

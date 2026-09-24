@@ -206,6 +206,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             name: None, // --name is caller identity, not instance name
             skip_validation: false,
             terminal,
+            answer_omp_reroot_prompt: false,
             append_reply_handoff: true,
         },
     )?;

@@ -798,6 +798,7 @@ fn handle_remote_launch(
             skip_validation: false,
             terminal: request.terminal,
             append_reply_handoff: false,
+            answer_omp_reroot_prompt: false,
         },
     )
     .map_err(|e| e.to_string())?;
