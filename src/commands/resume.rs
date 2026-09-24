@@ -455,14 +455,32 @@ fn prepare_resume_plan_from_source(
     }
 
     // Omp exits at once when `--resume` names a session with no file, so a
-    // snapshot pointing at a deleted session would only burn a harness and
-    // poison the trail with another dead snapshot. Refuse before building or
-    // spawning anything, with no life event. Adoption already proved the file
-    // on disk, and every other tool keeps its old path: the only branch is
-    // on tool.
+    // snapshot pointing at a deleted session would only burn a harness.
+    // Resolve roots from the environment assembled for the child, rather than
+    // hcom's process environment (which may differ via launch config/env).
+    let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
     if tool == "omp" && !is_adoption {
-        ensure_omp_session_file(&session_id, &snapshot_transcript_path)?;
+        let hcom_config = load_hcom_config();
+        let inside_ai_tool = crate::shared::HcomContext::from_os().is_inside_ai_tool();
+        let terminal_mode = launch_flags
+            .terminal
+            .as_deref()
+            .or(Some(hcom_config.terminal.as_str()).filter(|t| !t.is_empty()));
+        let run_here = crate::launcher::will_run_in_current_terminal(
+            1,
+            background,
+            launch_flags.run_here,
+            terminal_mode,
+            inside_ai_tool,
+        );
+        let env = crate::launcher::build_launch_env(
+            &hcom_config,
+            crate::launcher::launch_env_regime(run_here, inside_ai_tool),
+        );
+        ensure_omp_session_file_in_env(&session_id, &snapshot_transcript_path, &env)?;
     }
+
+    // Extract hcom-level flags from extra args before tool parsing.
 
     // The name's delivery cursor must never move backwards on resume. A plan
     // loaded from an older stopped snapshot (StoppedSession) carries that
@@ -484,8 +502,6 @@ fn prepare_resume_plan_from_source(
         Some(tag.clone())
     };
 
-    // Extract hcom-level flags from extra args before tool parsing.
-    let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
 
     // Determine effective working directory:
     // - Explicit --dir flag wins (validated and canonicalized)
@@ -2090,20 +2106,11 @@ fn merge_omp_args(original: &[String], resume: &[String]) -> Vec<String> {
     final_args
 }
 
-/// Locate an OMP transcript by session id under OMP's currently active session
-/// root. Notably does **not** search `PI_CODING_AGENT_SESSION_DIR` — OMP never
-/// reads it, so it stays Pi-exclusive. Shared with the snapshot-resume
-/// missing-file guard, so resume and adoption can never drift to a second
-/// lookup: production attribution still goes through
-/// [`resolve_pi_omp_on_disk`], which keeps exclusive/shared provenance.
+#[cfg(test)]
 fn derive_omp_transcript_path(session_id: &str) -> Option<String> {
     for root in crate::transcript::omp_session_roots() {
-        if !root.exists() {
-            continue;
-        }
-        if let Some(path) = find_pi_transcript_in_root(&root, session_id) {
-            return Some(path);
-        }
+        if !root.exists() { continue; }
+        if let Some(path) = find_pi_transcript_in_root(&root, session_id) { return Some(path); }
     }
     None
 }
@@ -2115,18 +2122,23 @@ fn derive_omp_transcript_path(session_id: &str) -> Option<String> {
 /// [`derive_omp_transcript_path`] — the same root omp resume reads — and the
 /// hint (when the snapshot's transcript names another live session) never
 /// resumes it automatically.
-fn ensure_omp_session_file(session_id: &str, transcript_path: &str) -> Result<()> {
-    if derive_omp_transcript_path(session_id).is_some() {
-        return Ok(());
+fn ensure_omp_session_file_in_env(
+    session_id: &str,
+    transcript_path: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let mut found = false;
+    for root in crate::transcript::omp_session_roots_for_env(env) {
+        if root.exists() && find_pi_transcript_in_root(&root, session_id).is_some() {
+            found = true;
+            break;
+        }
     }
+    if found { return Ok(()); }
     let mut err = format!("session file not found: {session_id}");
     if let Some(other) = transcript_session_id(transcript_path)
         && !other.eq_ignore_ascii_case(session_id)
-    {
-        err.push_str(&format!(
-            "; the snapshot's transcript is session {other}: run hcom r {other}"
-        ));
-    }
+    { err.push_str(&format!("; the snapshot's transcript is session {other}: run hcom r {other}")); }
     bail!("{err}")
 }
 
@@ -4396,10 +4408,31 @@ mod tests {
                 .expect("resume with no session file must fail")
                 .to_string();
             assert_eq!(err, format!("session file not found: {OMP_MISSING_SID}"));
+
             assert!(
                 !err.contains("hcom r"),
                 "plain error must carry no hint: {err}"
             );
         });
+    }
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_resume_finds_file_under_child_env_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_home = dir.path().join("child-home");
+        let root = child_home.join(".omp").join("agent").join("sessions");
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::write(
+            root.join("project").join(format!("{OMP_MISSING_SID}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+
+        // The process HOME intentionally does not point at child_home; the
+        // launch env supplied by hcom is the only place the override exists.
+        let mut env = std::collections::HashMap::new();
+        env.insert("HOME".to_string(), child_home.to_string_lossy().to_string());
+        ensure_omp_session_file_in_env(OMP_MISSING_SID, "", &env).unwrap();
     }
 }

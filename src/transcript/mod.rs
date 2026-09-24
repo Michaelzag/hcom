@@ -358,6 +358,7 @@ pub(crate) fn claude_projects_dir() -> PathBuf {
 /// `PI_PROFILE` (legacy) is consulted only when `OMP_PROFILE` is entirely unset.
 /// OMP trims the selected value and treats empty/whitespace and the `"default"`
 /// sentinel as the implicit default profile.
+#[cfg(test)]
 pub(crate) fn omp_profile_from_env() -> Option<String> {
     let value = match std::env::var("OMP_PROFILE") {
         Ok(value) => Some(value),
@@ -375,57 +376,28 @@ pub(crate) fn omp_profile_from_env() -> Option<String> {
 /// - XDG is selected only on supported platforms and only after the applicable
 ///   app/profile directory exists;
 /// - otherwise sessions remain under the config root.
-fn omp_active_session_root() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
-    let config_name = std::env::var("PI_CONFIG_DIR")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| ".omp".to_string());
-    let profile = omp_profile_from_env();
-    let config_root = match &profile {
-        Some(name) => home.join(&config_name).join("profiles").join(name),
-        None => home.join(&config_name),
-    };
+fn omp_active_session_root_with_env(env: &std::collections::HashMap<String, String>) -> PathBuf {
+    let home = env.get("HOME").map(PathBuf::from).or_else(dirs::home_dir).unwrap_or_default();
+    let config_name = env.get("PI_CONFIG_DIR").map(String::as_str).filter(|v| !v.is_empty()).unwrap_or(".omp");
+    let profile = env.get("OMP_PROFILE").or_else(|| env.get("PI_PROFILE")).map(String::as_str).map(str::trim).filter(|v| !v.is_empty() && *v != "default");
+    let config_root = profile.map(|name| home.join(config_name).join("profiles").join(name)).unwrap_or_else(|| home.join(config_name));
     let default_agent = config_root.join("agent");
-    let agent_override = if profile.is_none() {
-        std::env::var("PI_CODING_AGENT_DIR")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                let path = PathBuf::from(value);
-                if path.is_absolute() {
-                    path
-                } else {
-                    std::env::current_dir().unwrap_or_default().join(path)
-                }
-            })
-    } else {
-        None
-    };
-    let agent_dir = agent_override.unwrap_or_else(|| default_agent.clone());
-    let is_default_agent = agent_dir == default_agent;
-
-    // Bun reports `process.platform === "linux"` on Android/Termux, so OMP
-    // enables its XDG layout there even though Rust's target_os is `android`.
-    if cfg!(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "android"
-    )) && is_default_agent
-        && let Ok(xdg) = std::env::var("XDG_DATA_HOME")
-        && !xdg.is_empty()
-    {
-        let app_root = PathBuf::from(xdg).join("omp");
-        let candidate = match &profile {
-            Some(name) => app_root.join("profiles").join(name),
-            None => app_root,
-        };
-        if candidate.exists() {
-            return candidate.join("sessions");
-        }
+    let agent_override = profile.is_none().then(|| env.get("PI_CODING_AGENT_DIR").map(String::as_str).filter(|v| !v.is_empty()).map(PathBuf::from)).flatten();
+    let agent_dir = agent_override.map(|p| if p.is_absolute() { p } else { env.get("PWD").map(PathBuf::from).unwrap_or_default().join(p) }).unwrap_or(default_agent.clone());
+    if cfg!(any(target_os = "linux", target_os = "macos", target_os = "android")) && agent_dir == default_agent && env.get("XDG_DATA_HOME").is_some_and(|v| !v.is_empty()) {
+        let xdg = PathBuf::from(env.get("XDG_DATA_HOME").unwrap()).join("omp");
+        let candidate = profile.map(|p| xdg.join("profiles").join(p)).unwrap_or(xdg);
+        if candidate.exists() { return candidate.join("sessions"); }
     }
-
     agent_dir.join("sessions")
+}
+
+fn omp_active_session_root() -> PathBuf {
+    omp_active_session_root_with_env(&std::env::vars().collect())
+}
+
+pub(crate) fn omp_session_roots_for_env(env: &std::collections::HashMap<String, String>) -> Vec<PathBuf> {
+    vec![omp_active_session_root_with_env(env)]
 }
 
 /// Disk root that holds OMP session files. Single source of truth shared by
