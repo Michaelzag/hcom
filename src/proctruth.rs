@@ -1620,6 +1620,8 @@ mod tests {
             roots: vec![10, 20, 30],
             caller_ancestors: vec![10, 2, 1],
             known: HashMap::new(),
+            dropped_live: std::cell::Cell::new(0),
+            admitted: std::cell::Cell::new(0),
         };
         let parents = [
             (10, 2),
@@ -1670,6 +1672,87 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn sleep")
+    }
+
+
+    #[cfg(target_os = "linux")]
+    fn insert_null_pid_row(db: &HcomDb, name: &str, process_id: &str) {
+        let now = crate::shared::time::now_epoch_f64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id) \
+                 VALUES (?1, 'active', ?2, 'codex', 'sess-carrier')",
+                rusqlite::params![name, now],
+            )
+            .unwrap();
+        db.set_process_binding(process_id, "sess-carrier", name)
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn kill_releases_never_succeed_while_an_unsignalled_identity_carrier_lives() {
+        let db = test_db();
+        let name = unique_name("unproven-release");
+        let process_id = format!("proc-{}", rand_suffix());
+        insert_null_pid_row(&db, &name, &process_id);
+        let carrier = spawn_detached_named_sleeper(&name, &process_id);
+        wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
+        let outcome = crate::hooks::common::stop_instance(&db, &name, "test", "stopped");
+        assert!(matches!(outcome, crate::hooks::common::StopOutcome::RetryableError(_)));
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_eq!(db.process_binding_ids(&name).unwrap(), vec![process_id]);
+        assert!(!process_gone(carrier));
+        unsafe { libc::kill(carrier as libc::pid_t, libc::SIGKILL) };
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bulk_kill_scope_is_captured_before_the_first_signal() {
+        let db = test_db();
+        let name = unique_name("bulk-pre-signal");
+        let process_id = format!("proc-{}", rand_suffix());
+        insert_null_pid_row(&db, &name, &process_id);
+        let carrier = spawn_detached_named_sleeper(&name, &process_id);
+        wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
+        let bindings = db.process_binding_ids(&name).unwrap();
+        let capture = capture_reap_carriers(&db, &name, &bindings, &[]);
+        let result = reap_instance_tree_for_excluding_captured(
+            &db, &name, &bindings, &[], capture,
+        );
+        assert!(result.is_err());
+        assert!(!process_gone(carrier));
+        unsafe { libc::kill(carrier as libc::pid_t, libc::SIGKILL) };
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn empty_reap_still_releases_a_vanished_instance() {
+        let db = test_db();
+        let name = unique_name("empty-release");
+        insert_null_pid_row(&db, &name, &format!("proc-{}", rand_suffix()));
+        let outcome = crate::hooks::common::stop_instance(&db, &name, "test", "stopped");
+        assert_eq!(outcome, crate::hooks::common::StopOutcome::Stopped);
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rooted_tree_release_skips_unrootable_identity_carriers() {
+        let db = test_db();
+        let name = unique_name("rooted-release");
+        let token = format!("proc-{}", rand_suffix());
+        insert_null_pid_row(&db, &name, &token);
+        let mut rooted = spawn_named_sleeper(&name, &token);
+        let detached = spawn_detached_named_sleeper(&name, &token);
+        let bindings = db.process_binding_ids(&name).unwrap();
+        wait_for_enumerated(&name, &bindings, rooted.id());
+        wait_for_enumerated(&name, &bindings, detached);
+        let result = reap_instance_tree_for_excluding(&db, &name, &bindings, &[]);
+        assert!(result.is_ok());
+        rooted.wait().ok();
+        assert!(!process_gone(detached));
+        unsafe { libc::kill(detached as libc::pid_t, libc::SIGKILL) };
     }
 
     /// The round seam as a rendezvous: the reaper blocks at `point` until
@@ -1774,6 +1857,8 @@ mod tests {
                 roots: vec![std::process::id()],
                 caller_ancestors: vec![std::process::id()],
                 known: HashMap::new(),
+                dropped_live: std::cell::Cell::new(0),
+                admitted: std::cell::Cell::new(0),
             },
             carriers: Vec::new(),
         };
