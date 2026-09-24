@@ -750,6 +750,9 @@ impl std::fmt::Display for ReapError {
 /// would wedge every stop behind an unreaped child.
 ///
 /// Unix only; elsewhere this is a no-op success.
+// Test-facing conveniences over the captured reap; production threads its own
+// pre-signal capture into `reap_instance_tree_for_excluding_captured`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn reap_instance_tree_for(
     db: &HcomDb,
     name: &str,
@@ -836,6 +839,9 @@ pub fn reap_instance_tree_for(
 ///
 /// `db` supplies the per-round binding registry read behind the epoch rule.
 /// Unix only; elsewhere this is a no-op success.
+// Test-facing conveniences over the captured reap; production threads its own
+// pre-signal capture into `reap_instance_tree_for_excluding_captured`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn reap_instance_tree_for_excluding(
     db: &HcomDb,
     name: &str,
