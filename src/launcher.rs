@@ -1324,9 +1324,9 @@ struct BackgroundLaunchCtx<'a> {
     handles: &'a mut Vec<serde_json::Value>,
 }
 
-/// Shared bookkeeping after a successful background launch for gemini/codex/opencode.
-/// Persists the launch context, updates position, records the PID, and appends
-/// log_file / handle entries. Per-tool differences (args, prompt) stay in the caller.
+/// Shared bookkeeping after a successful background launch.
+/// Persists context and log metadata; fills a NULL pid with the runner's pid,
+/// but never overwrites the PTY wrapper's newer self/tool ancestry anchor.
 fn finalize_background_launch(
     ctx: &mut BackgroundLaunchCtx<'_>,
     log_file: String,
@@ -1340,21 +1340,40 @@ fn finalize_background_launch(
         &effective_preset,
         Some(ctx.process_id),
     );
+    // terminal::launch_terminal waits briefly after spawning the runner.
+    // The wrapper can record its own pid and then its tool's pid during that
+    // wait; an unconditional launcher write here would replace the proof.
+    // Non-PTY backgrounds have no wrapper writer, so they keep this pid.
+    if let Err(e) = ctx.db.conn().execute(
+        "UPDATE instances SET pid = ?1 WHERE name = ?2 AND pid IS NULL",
+        rusqlite::params![pid as i64, ctx.instance_name],
+    ) {
+        crate::log::log_error("launcher", "background.pid", &format!("{e}"));
+    }
     instances::update_instance_position(
         ctx.db,
         ctx.instance_name,
-        &serde_json::Map::from_iter([
-            ("pid".to_string(), json!(pid)),
-            ("background_log_file".to_string(), json!(&log_file)),
-        ]),
+        &serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]),
     );
+    // Orphan filtering compares pidtrack entries with instances.pid. Record
+    // the effective row pid: a PTY wrapper/tool may have won, or the NULL-only
+    // launcher fill supplied the runner. A tool-pid write between this read
+    // and record_pid can briefly differ; both pids remain in the same tree.
+    let tracked_pid = ctx
+        .db
+        .get_instance_full(ctx.instance_name)
+        .ok()
+        .flatten()
+        .and_then(|row| row.pid)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .unwrap_or(pid);
     crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
         process_id: ctx.process_id,
         terminal_preset: &effective_preset,
         tag: ctx.tag,
         ..crate::pidtrack::PidRecord::new(
             &crate::paths::hcom_dir(),
-            pid,
+            tracked_pid,
             ctx.tool,
             ctx.instance_name,
             ctx.working_dir,
@@ -1980,7 +1999,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             ),
         );
 
-        // Pre-register instance
+        // Pre-register the binding with a NULL pid. The PTY wrapper records
+        // its own pid on entry, before it spawns the tool, then overwrites
+        // the anchor with the tool pid. A leaked UUID cannot trust this row
+        // until an ancestor pid has been recorded.
         if let Err(e) = (|| -> Result<()> {
             instance_binding::initialize_instance_in_position_file(
                 db,

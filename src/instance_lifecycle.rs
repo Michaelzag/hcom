@@ -326,12 +326,10 @@ pub(crate) fn finalize_launch_failure_detail(
     } else {
         0
     };
-    // Name what the pid actually is. For a background launch this is the
-    // wrapper shell hcom spawned, not the tool: the tool is its grandchild, and
-    // a wrapper that is alive says nothing about whether the tool ever started.
-    // The old wording ("process alive Ns, never bound") read as "the tool is
-    // running but won't bind" and sent a Windows launch-chain stall investigation
-    // after the tool instead of the chain.
+    // The launcher records a background runner pid only while the row's pid
+    // is NULL; a PTY wrapper can record itself or its child first and wins.
+    // This diagnostic checks liveness, not which process in that ancestry
+    // is named; an alive runner or wrapper does not prove tool startup.
     let process_state = data.pid.and_then(|pid| {
         let alive = crate::sys::process::is_alive(pid as u32);
         let what = if data.background != 0 {

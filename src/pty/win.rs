@@ -93,6 +93,14 @@ pub struct Proxy {
 impl Proxy {
     /// Spawn `command` under a ConPTY and prepare the proxy.
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
+        // Anchor the launcher UUID before its tool exists. The launcher
+        // cannot see this wrapper's pid in a foreground terminal, so record
+        // it here and replace it with the ConPTY child pid below.
+        if let Some(instance_name) = &config.instance_name
+            && let Ok(db) = HcomDb::open()
+        {
+            let _ = db.update_instance_pid(instance_name, std::process::id());
+        }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
         let pty_system = native_pty_system();
