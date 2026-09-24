@@ -670,7 +670,7 @@ pub enum ReapError {
     // The non-Unix reap is a no-op success and never constructs this variant.
     #[cfg_attr(not(unix), allow(dead_code))]
     Survivors(Vec<u32>),
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     UnprovenOwnership,
 }
 
@@ -687,7 +687,7 @@ impl std::fmt::Display for ReapError {
                 }
                 Ok(())
             }
-            #[cfg(unix)]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             Self::UnprovenOwnership => {
                 f.write_str("cannot prove process ownership on this host; row left intact")
             }
@@ -832,8 +832,9 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
     #[cfg(unix)]
     {
         let mut scope = capture.scope;
-        // A broken view of the caller's ancestry cannot authorize either
-        // signalling or release, even when enumeration found no carriers.
+        // On /proc platforms, an unanchored caller cannot authorize release.
+        // Other Unix hosts retain the baseline empty-reap success.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if scope.caller_ancestors.last() != Some(&1) {
             return Err(ReapError::UnprovenOwnership);
         }
