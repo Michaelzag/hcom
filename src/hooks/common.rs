@@ -1470,7 +1470,8 @@ fn child_instance_names(db: &HcomDb, column: &str, value: &str) -> Result<Vec<St
 #[cfg(target_os = "linux")]
 fn headless_group_holds_carrier(db: &HcomDb, instance_name: &str, pid: u32) -> bool {
     let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
-    crate::proctruth::group_holds_instance_carrier(pid, instance_name, &binding_ids)
+    let owners = crate::proctruth::omp_owner_bindings(db, instance_name);
+    crate::proctruth::group_holds_instance_carrier(pid, instance_name, &binding_ids, &owners)
 }
 
 /// No /proc outside Linux: the recorded group is signalled as before.
@@ -1677,8 +1678,15 @@ fn stop_instance_inner_scoped(
     let (row, pre_capture) = match pre_capture {
         None if reap_gate => match db.get_instance_with_bindings(instance_name) {
             Ok((row, ids)) => {
+                let owners = crate::proctruth::omp_owner_bindings(db, instance_name);
                 let capture = row.as_ref().map(|row| {
-                    crate::proctruth::capture_reap_carriers(instance_name, Some(row), &ids, exclude)
+                    crate::proctruth::capture_reap_carriers(
+                        instance_name,
+                        Some(row),
+                        &ids,
+                        &owners,
+                        exclude,
+                    )
                 });
                 (row, capture)
             }
@@ -1724,6 +1732,7 @@ fn stop_instance_inner_scoped(
                 .unwrap_or_default();
             (Some(capture), ids)
         }
+
         None => (None, Vec::new()),
     };
 
@@ -4319,7 +4328,7 @@ mod tests {
         // `$!` is echoed while the job may still be `env`, before it execs
         // `sleep` with the name; stopping earlier would find no carrier.
         let enumerated = (0..50).any(|_| {
-            let found = crate::proctruth::processes_for_instance(name, &[])
+            let found = crate::proctruth::processes_for_instance(name, &[], &[])
                 .iter()
                 .any(|m| m.pid == carrier);
             if !found {

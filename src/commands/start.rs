@@ -1476,7 +1476,7 @@ mod tests {
     #[cfg(unix)]
     fn wait_for_carrier(name: &str, pid: u32) {
         for _ in 0..50 {
-            if crate::proctruth::processes_for_instance(name, &[])
+            if crate::proctruth::processes_for_instance(name, &[], &[])
                 .iter()
                 .any(|m| m.pid == pid)
             {
@@ -1674,7 +1674,7 @@ mod tests {
             .to_string();
         let orphan = spawn_detached_named_sleeper(&target, &format!("proc-old-{}", rand_suffix()));
         wait_for_carrier(&target, orphan);
-        let start = crate::proctruth::processes_for_instance(&target, &[])
+        let start = crate::proctruth::processes_for_instance(&target, &[], &[])
             .into_iter()
             .find(|m| m.pid == orphan)
             .expect("detached orphan enumerated")

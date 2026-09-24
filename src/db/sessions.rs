@@ -688,6 +688,21 @@ impl HcomDb {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(ids)
     }
+
+    /// Every process binding of an instance with its `updated_at`
+    /// (registration time), newest first.
+    pub fn process_bindings_registered(&self, instance_name: &str) -> Result<Vec<(String, f64)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT process_id, updated_at FROM process_bindings \
+             WHERE instance_name = ? ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![instance_name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]

@@ -647,7 +647,8 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
             }
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
-                if crate::proctruth::has_live_carriers(&data.name, binding_ids) {
+                let owners = crate::proctruth::omp_owner_bindings(db, &data.name);
+                if crate::proctruth::has_live_carriers(&data.name, binding_ids, &owners) {
                     crate::log::log_debug(
                         "cleanup",
                         "placeholder_held_live_launch",
@@ -663,6 +664,7 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
                     &data.name,
                     Some(data),
                     binding_ids,
+                    &owners,
                     &[],
                 );
                 match crate::hooks::common::stop_placeholder_instance(

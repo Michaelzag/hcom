@@ -124,19 +124,27 @@ const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// a carrier. Its descendants need a nested `omp` between them and their
 /// nearest broker, including the candidate itself.
 ///
+/// A third arm covers the owner of a minted `omp-<pid>-...` binding: the omp
+/// plugin sets that id in omp's runtime env, which /proc environ (exec-time
+/// only) never shows, so the owner is proven from the binding instead — see
+/// [`OmpOwnerBinding`].
+///
 /// Only the `HCOM_INSTANCE_NAME` and `HCOM_PROCESS_ID` entries are ever
 /// inspected; no other environ values are read or reported. The calling
 /// process itself is always excluded (a CLI running inside the session
 /// inherits the name but never owns it).
-pub fn processes_for_instance(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
+pub fn processes_for_instance(
+    name: &str,
+    binding_ids: &[String],
+    owners: &[OmpOwnerBinding],
+) -> Vec<ProcMatch> {
     #[cfg(unix)]
     {
-        enumerate_unix(name, binding_ids, None)
+        enumerate_unix(name, binding_ids, owners, None)
     }
     #[cfg(not(unix))]
     {
-        let _ = name;
-        let _ = binding_ids;
+        let _ = (name, binding_ids, owners);
         Vec::new()
     }
 }
@@ -145,10 +153,56 @@ pub fn processes_for_instance(name: &str, binding_ids: &[String]) -> Vec<ProcMat
 /// one of its binding ids. The placeholder janitor's hold rule: a stale
 /// placeholder whose launch is still running is held, never released or
 /// signalled.
-pub(crate) fn has_live_carriers(name: &str, binding_ids: &[String]) -> bool {
-    processes_for_instance(name, binding_ids)
+pub(crate) fn has_live_carriers(
+    name: &str,
+    binding_ids: &[String],
+    owners: &[OmpOwnerBinding],
+) -> bool {
+    processes_for_instance(name, binding_ids, owners)
         .iter()
         .any(|m| !process_gone(m.pid))
+}
+
+/// A minted `omp-<pid>-...` binding and when it was registered. `<pid>` holds
+/// the instance while it is alive, its `/proc/<pid>/comm` is exactly `omp`
+/// (the reap-root proof), and it started no later than the registration —
+/// a process that started after the binding existed reused the pid.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields are read only by the Linux/Android owner proof
+pub struct OmpOwnerBinding {
+    pid: u32,
+    process_id: String,
+    registered_at: f64,
+}
+
+/// The instance's minted omp bindings with their registration times. A DB
+/// error reads as none: the owner arm only ever adds carriers.
+pub fn omp_owner_bindings(db: &HcomDb, name: &str) -> Vec<OmpOwnerBinding> {
+    db.process_bindings_registered(name)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(process_id, registered_at)| {
+            Some(OmpOwnerBinding {
+                pid: omp_minted_pid(&process_id)?,
+                process_id,
+                registered_at,
+            })
+        })
+        .collect()
+}
+
+/// /proc start times derive from whole-second `btime`, so a start epoch can
+/// read up to a second late against a DB timestamp.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const START_EPOCH_SLACK_SECS: f64 = 1.0;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proven_omp_owner(owner: &OmpOwnerBinding, btime: f64) -> bool {
+    !process_gone(owner.pid)
+        && std::fs::read_to_string(format!("/proc/{}/comm", owner.pid))
+            .is_ok_and(|comm| comm.trim_end_matches('\n') == "omp")
+        && process_start_epoch(owner.pid, btime)
+            .is_some_and(|start| start <= owner.registered_at + START_EPOCH_SLACK_SECS)
 }
 
 /// Decode the two identity facts from a raw /proc environ block: whether it
@@ -274,6 +328,9 @@ struct CarrierTreeScope {
     dropped_live: std::cell::RefCell<Vec<u32>>,
     admitted: std::cell::Cell<usize>,
     excluded: Vec<u32>,
+    /// Captured with the roots: every round of this teardown proves binding
+    /// owners against the same registrations.
+    owners: Vec<OmpOwnerBinding>,
 }
 
 #[cfg(unix)]
@@ -319,7 +376,11 @@ impl ReapCapture {
 }
 
 #[cfg(unix)]
-fn carrier_tree_scope(row_pid: Option<i64>, binding_ids: &[String]) -> CarrierTreeScope {
+fn carrier_tree_scope(
+    row_pid: Option<i64>,
+    binding_ids: &[String],
+    owners: &[OmpOwnerBinding],
+) -> CarrierTreeScope {
     let mut roots = vec![std::process::id()];
     if let Some(pid) = row_pid.and_then(|pid| u32::try_from(pid).ok())
         && pid != 0
@@ -353,6 +414,7 @@ fn carrier_tree_scope(row_pid: Option<i64>, binding_ids: &[String]) -> CarrierTr
         excluded: Vec::new(),
         dropped_live: std::cell::RefCell::new(Vec::new()),
         admitted: std::cell::Cell::new(0),
+        owners: owners.to_vec(),
     }
 }
 
@@ -365,11 +427,12 @@ fn capture_reap_carriers_unbound(
     name: &str,
     row_pid: Option<i64>,
     binding_ids: &[String],
+    owners: &[OmpOwnerBinding],
     exclude: &[u32],
 ) -> ReapCapture {
     #[cfg(unix)]
     {
-        let mut scope = carrier_tree_scope(row_pid, binding_ids);
+        let mut scope = carrier_tree_scope(row_pid, binding_ids, owners);
         let carriers = snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
         ReapCapture {
             scope,
@@ -379,7 +442,7 @@ fn capture_reap_carriers_unbound(
     }
     #[cfg(not(unix))]
     {
-        let _ = (name, row_pid, binding_ids, exclude);
+        let _ = (name, row_pid, binding_ids, owners, exclude);
         ReapCapture { incarnation: None }
     }
 }
@@ -393,10 +456,16 @@ pub(crate) fn capture_reap_carriers(
     name: &str,
     row: Option<&crate::db::InstanceRow>,
     binding_ids: &[String],
+    owners: &[OmpOwnerBinding],
     exclude: &[u32],
 ) -> ReapCapture {
-    let mut capture =
-        capture_reap_carriers_unbound(name, row.and_then(|row| row.pid), binding_ids, exclude);
+    let mut capture = capture_reap_carriers_unbound(
+        name,
+        row.and_then(|row| row.pid),
+        binding_ids,
+        owners,
+        exclude,
+    );
     // The snapshot's row feeds the bound incarnation as well as the roots.
     capture.incarnation = row.map(|row| CapturedIncarnation {
         created_at: row.created_at,
@@ -431,7 +500,8 @@ fn snapshot_reap_carriers(
 ) -> Vec<ProcMatch> {
     scope.excluded.clear();
     scope.excluded.extend_from_slice(exclude);
-    let mut matches = live_carriers_for(name, binding_ids, exclude, Some(scope));
+    let owners = scope.owners.clone();
+    let mut matches = live_carriers_for(name, binding_ids, &owners, exclude, Some(scope));
     matches.retain(|m| {
         let Some(identity) = carrier_identity(m.pid) else {
             let alive = crate::sys::process::is_alive(m.pid);
@@ -522,6 +592,7 @@ fn carrier_in_signal_scope(pid: u32, name: &str, scope: &CarrierTreeScope) -> bo
 fn enumerate_unix(
     name: &str,
     binding_ids: &[String],
+    owners: &[OmpOwnerBinding],
     scope: Option<&CarrierTreeScope>,
 ) -> Vec<ProcMatch> {
     let want = format!("HCOM_INSTANCE_NAME={name}");
@@ -549,12 +620,27 @@ fn enumerate_unix(
         let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else {
             continue;
         };
-        let (carries_name, process_id) = identity_facts(&env, want.as_bytes());
+        let (carries_name, mut process_id) = identity_facts(&env, want.as_bytes());
         // Self-bound arm: the process carries one of the instance's binding
         // ids even though it never carried the name. Empty binding ids never
         // match (an absent HCOM_PROCESS_ID reads as empty).
         if !carries_name && !is_bound_process_id(&process_id, binding_ids) {
-            continue;
+            // Binding-owner arm: the process minted the binding in its
+            // runtime env, which its environ never shows.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let owned = owners
+                .iter()
+                .find(|owner| owner.pid == pid && proven_omp_owner(owner, btime));
+            // No comm/start-time proof off Linux: the arm never admits there.
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let owned: Option<&OmpOwnerBinding> = {
+                let _ = owners;
+                None
+            };
+            let Some(owner) = owned else {
+                continue;
+            };
+            process_id = owner.process_id.clone();
         }
         let frozen = scope.and_then(|scope| scope.known.get(&pid));
         if let Some((original, identity)) = frozen {
@@ -1352,8 +1438,14 @@ pub fn reap_instance_tree_for_excluding(
     // so the capture binds NO incarnation: the reap consumes only scope and
     // carriers, and nothing releases against it.
     let row = db.get_instance_full(name).ok().flatten();
-    let capture =
-        capture_reap_carriers_unbound(name, row.and_then(|row| row.pid), binding_ids, exclude);
+    let owners = omp_owner_bindings(db, name);
+    let capture = capture_reap_carriers_unbound(
+        name,
+        row.and_then(|row| row.pid),
+        binding_ids,
+        &owners,
+        exclude,
+    );
     reap_instance_tree_for_excluding_captured(db, name, binding_ids, exclude, capture)
 }
 
@@ -1601,10 +1693,11 @@ pub(crate) fn arm_round_seam(hook: impl FnMut(RoundPoint) + 'static) {
 fn live_carriers_for(
     name: &str,
     binding_ids: &[String],
+    owners: &[OmpOwnerBinding],
     exclude: &[u32],
     scope: Option<&CarrierTreeScope>,
 ) -> Vec<ProcMatch> {
-    enumerate_unix(name, binding_ids, scope)
+    enumerate_unix(name, binding_ids, owners, scope)
         .into_iter()
         .filter(|m| !is_zombie(m.pid) && !exclude.contains(&m.pid))
         .collect()
@@ -1617,8 +1710,13 @@ fn live_carriers_for(
 /// below it does. An unrelated process that reused the pid has none of the
 /// instance's carriers in its group.
 #[cfg(target_os = "linux")]
-pub(crate) fn group_holds_instance_carrier(pgid: u32, name: &str, binding_ids: &[String]) -> bool {
-    live_carriers_for(name, binding_ids, &[], None)
+pub(crate) fn group_holds_instance_carrier(
+    pgid: u32,
+    name: &str,
+    binding_ids: &[String],
+    owners: &[OmpOwnerBinding],
+) -> bool {
+    live_carriers_for(name, binding_ids, owners, &[], None)
         .iter()
         .any(|m| process_group_id(m.pid) == Some(pgid))
 }
@@ -1653,6 +1751,14 @@ fn pid_carries_instance(
         let (carries_name, process_id) = identity_facts(&env, want.as_bytes());
         carries_name || is_bound_process_id(&process_id, binding_ids)
     });
+    // A binding owner never shows its id in environ; the same proof that
+    // admitted it (see `enumerate_unix`) still has to hold now.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let carries = carries
+        || scope
+            .owners
+            .iter()
+            .any(|owner| owner.pid == pid && proven_omp_owner(owner, system_btime()));
     if !carries {
         return false;
     }
@@ -1789,7 +1895,11 @@ fn caller_identity_tree(
 /// already in this base).
 pub fn check_spawn_allowed(db: &HcomDb, name: &str) -> Result<(), SpawnRefusal> {
     let binding_ids = db.process_binding_ids(name).unwrap_or_default();
-    let holders = processes_for_instance(name, &binding_ids);
+    // No binding-owner arm here: the self-tree exclusion below finds the
+    // caller's session root by environ identity, which a binding owner never
+    // shows, so admitting owners would refuse a session re-registering its
+    // own name.
+    let holders = processes_for_instance(name, &binding_ids, &[]);
     if holders.is_empty() {
         return Ok(());
     }
@@ -1998,7 +2108,9 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         // count: a SIGKILLed carrier keeps its environ until its parent
         // reaps it, but it is gone for lifecycle purposes — same rule as
         // reap verification (live_carriers_for).
-        if processes_for_instance(&inst.name, binding_ids)
+        // No binding owners: every minted owner pid is in `evidence_pids`,
+        // all of which are gone by here.
+        if processes_for_instance(&inst.name, binding_ids, &[])
             .into_iter()
             .any(|m| !is_zombie(m.pid))
         {
@@ -2164,6 +2276,7 @@ mod tests {
             excluded: Vec::new(),
             dropped_live: std::cell::RefCell::new(Vec::new()),
             admitted: std::cell::Cell::new(0),
+            owners: Vec::new(),
         };
         let parents = [
             (10, 2),
@@ -2250,6 +2363,100 @@ mod tests {
         unsafe { libc::kill(carrier as libc::pid_t, libc::SIGKILL) };
     }
 
+    /// A live process exec'd through a symlink named `comm` (so
+    /// /proc/<pid>/comm reads `comm`) with no hcom identity in its environ:
+    /// an omp whose plugin minted its id into the runtime env only. The loop
+    /// keeps any orphaned `sleep` to at most a second once it dies.
+    #[cfg(target_os = "linux")]
+    fn spawn_comm_process(dir: &std::path::Path, comm: &str) -> std::process::Child {
+        let link = dir.join(comm);
+        std::os::unix::fs::symlink("/bin/sh", &link).unwrap();
+        std::process::Command::new(&link)
+            .args(["-c", "while :; do sleep 1; done"])
+            .env_remove("HCOM_INSTANCE_NAME")
+            .env_remove("HCOM_PROCESS_ID")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn comm process")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owner_binding(pid: u32, registered_at: f64) -> OmpOwnerBinding {
+        OmpOwnerBinding {
+            pid,
+            process_id: format!("omp-{pid}-{}-1", rand_suffix()),
+            registered_at,
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn binding_owner_without_the_id_in_its_environ_is_a_carrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = spawn_comm_process(dir.path(), "omp");
+        let binding = owner_binding(owner.id(), crate::shared::time::now_epoch_f64());
+        let found = processes_for_instance(
+            &unique_name("binding-owner"),
+            std::slice::from_ref(&binding.process_id),
+            std::slice::from_ref(&binding),
+        );
+        owner.kill().ok();
+        owner.wait().ok();
+        let owned = found.iter().find(|m| m.pid == binding.pid);
+        assert!(owned.is_some(), "binding owner not enumerated: {found:?}");
+        assert_eq!(owned.unwrap().process_id, binding.process_id);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn binding_owner_needs_omp_comm_and_a_start_before_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = spawn_comm_process(dir.path(), "notomp");
+        let mut late = spawn_comm_process(dir.path(), "omp");
+        let now = crate::shared::time::now_epoch_f64();
+        // Named by a binding but not an omp process.
+        let not_omp = owner_binding(other.id(), now);
+        // An omp that started after the binding was registered: pid reuse.
+        let reused = owner_binding(late.id(), now - 60.0);
+        let found = processes_for_instance(
+            &unique_name("binding-owner-refused"),
+            &[not_omp.process_id.clone(), reused.process_id.clone()],
+            &[not_omp, reused],
+        );
+        for child in [&mut other, &mut late] {
+            child.kill().ok();
+            child.wait().ok();
+        }
+        assert!(found.is_empty(), "unproven owners enumerated: {found:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stop_never_releases_while_its_binding_owner_runs() {
+        // The plain-omp shape: row pid NULL, one minted binding, and the only
+        // live evidence is the omp that minted it, whose environ lacks the id.
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let mut owner = spawn_comm_process(dir.path(), "omp");
+        let name = unique_name("binding-owner-stop");
+        let process_id = format!("omp-{}-{}-1", owner.id(), rand_suffix());
+        insert_null_pid_row(&db, &name, &process_id);
+        let outcome = crate::hooks::common::stop_instance(&db, &name, "test", "stopped");
+        let released = db.get_instance_full(&name).unwrap().is_none();
+        let owner_alive = owner.try_wait().unwrap().is_none();
+        owner.kill().ok();
+        owner.wait().ok();
+        assert!(
+            !(released && owner_alive),
+            "row released while its binding owner ran: {outcome:?}"
+        );
+        // The owner is a proven root and carrier, so the existing rules reap
+        // it before the release.
+        assert_eq!(outcome, crate::hooks::common::StopOutcome::Stopped);
+        assert!(released && !owner_alive);
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn bulk_kill_scope_is_captured_before_the_first_signal() {
@@ -2260,7 +2467,7 @@ mod tests {
         let carrier = spawn_detached_named_sleeper(&name, &process_id);
         wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
         let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
-        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[]);
+        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[], &[]);
         let result = reap_instance_tree_for_excluding_captured(&db, &name, &bindings, &[], capture);
         assert!(result.is_err());
         assert!(!process_gone(carrier));
@@ -2312,7 +2519,7 @@ mod tests {
         let mut carrier_a = spawn_named_sleeper(&name, &token_a);
         let (row_a, bindings_a) = db.get_instance_with_bindings(&name).unwrap();
         wait_for_enumerated(&name, &bindings_a, carrier_a.id());
-        let capture = capture_reap_carriers(&name, row_a.as_ref(), &bindings_a, &[]);
+        let capture = capture_reap_carriers(&name, row_a.as_ref(), &bindings_a, &[], &[]);
         // The kill's group signal takes A down.
         carrier_a.kill().ok();
         carrier_a.wait().ok();
@@ -2410,7 +2617,7 @@ mod tests {
             .unwrap();
 
         // The pre-signal capture, built from that snapshot alone.
-        let capture = capture_reap_carriers(&name, Some(&row_a), &bindings_a, &[]);
+        let capture = capture_reap_carriers(&name, Some(&row_a), &bindings_a, &[], &[]);
         let outcome =
             crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
 
@@ -2436,7 +2643,7 @@ mod tests {
         let name = unique_name("epoch-emptied");
         insert_null_pid_row(&db, &name, &format!("proc-{}", rand_suffix()));
         let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
-        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[]);
+        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[], &[]);
         db.conn()
             .execute(
                 "DELETE FROM process_bindings WHERE instance_name = ?1",
@@ -2467,7 +2674,7 @@ mod tests {
             .unwrap();
         let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
         assert_eq!(bindings.len(), 2);
-        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[]);
+        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[], &[]);
         db.conn()
             .execute(
                 "DELETE FROM process_bindings WHERE process_id = ?1",
@@ -2516,7 +2723,7 @@ mod tests {
         let name = unique_name("orphan-group");
         let leader = spawn_detached_group_leader(&name);
         wait_for_enumerated(&name, &[], leader);
-        let capture = capture_reap_carriers(&name, None, &[], &[]);
+        let capture = capture_reap_carriers(&name, None, &[], &[], &[]);
         // The orphan arm's group signal.
         unsafe { libc::kill(-(leader as libc::pid_t), libc::SIGKILL) };
         for _ in 0..100 {
@@ -2607,13 +2814,13 @@ mod tests {
     #[cfg(unix)]
     fn wait_for_enumerated(name: &str, binding_ids: &[String], pid: u32) -> Vec<ProcMatch> {
         for _ in 0..50 {
-            let found = processes_for_instance(name, binding_ids);
+            let found = processes_for_instance(name, binding_ids, &[]);
             if found.iter().any(|m| m.pid == pid) {
                 return found;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        processes_for_instance(name, binding_ids)
+        processes_for_instance(name, binding_ids, &[])
     }
 
     #[test]
@@ -2643,7 +2850,7 @@ mod tests {
         let name = unique_name("other");
         let mut child = spawn_named_sleeper("hcom-proctruth-unrelated", "proc-x");
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let found = processes_for_instance(&name, &[]);
+        let found = processes_for_instance(&name, &[], &[]);
         assert!(found.is_empty(), "unexpected matches: {found:?}");
         child.kill().ok();
         child.wait().ok();
@@ -2686,6 +2893,7 @@ mod tests {
                 excluded: Vec::new(),
                 dropped_live: std::cell::RefCell::new(Vec::new()),
                 admitted: std::cell::Cell::new(0),
+                owners: Vec::new(),
             },
             carriers: Vec::new(),
             incarnation: None,
@@ -2715,7 +2923,7 @@ mod tests {
             if !previously_identified {
                 MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
             }
-            let capture = capture_reap_carriers(&name, None, &[], &[]);
+            let capture = capture_reap_carriers(&name, None, &[], &[], &[]);
             MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
             let result = reap_instance_tree_for_excluding_captured(&db, &name, &[], &[], capture);
             MISSING_CARRIER_IDENTITY.with(|missing| missing.set(None));
@@ -2935,7 +3143,7 @@ mod tests {
         let mut sleeper = spawn_named_sleeper(&name, "proc-old");
         let pid = sleeper.id();
         wait_for_enumerated(&name, &[], pid);
-        let start = processes_for_instance(&name, &[])
+        let start = processes_for_instance(&name, &[], &[])
             .into_iter()
             .find(|m| m.pid == pid)
             .expect("sleeper enumerated")
@@ -4433,7 +4641,7 @@ mod tests {
         let name = unique_name("orphanout");
         let orphan = spawn_detached_named_sleeper(&name, &format!("proc-old-{}", rand_suffix()));
         wait_for_enumerated(&name, &[], orphan);
-        let start = processes_for_instance(&name, &[])
+        let start = processes_for_instance(&name, &[], &[])
             .into_iter()
             .find(|m| m.pid == orphan)
             .expect("detached sleeper enumerated")
@@ -4503,7 +4711,7 @@ mod tests {
         let mut stripped = spawn_stripped_sleeper();
         let stripped_pid = stripped.id();
         wait_for_enumerated(&name, &[], sharing_pid);
-        let holders = processes_for_instance(&name, &[]);
+        let holders = processes_for_instance(&name, &[], &[]);
         let _identity = CallerIdentityEnv::pose(Some(&name), None);
 
         let tree = caller_identity_tree(&name, &[], &holders, sharing_pid);

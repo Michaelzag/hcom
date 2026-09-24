@@ -3662,7 +3662,7 @@ mod tests {
             .expect("spawn sleep");
         let spid = sleeper.id();
         for _ in 0..50 {
-            if crate::proctruth::processes_for_instance(&name, &[])
+            if crate::proctruth::processes_for_instance(&name, &[], &[])
                 .iter()
                 .any(|m| m.pid == spid)
             {
