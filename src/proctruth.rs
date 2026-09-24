@@ -740,8 +740,8 @@ fn ancestor_or_self_pids(pid: u32) -> Vec<u32> {
 }
 
 /// The calling process's pid plus its ancestor chain. Linux/Android use
-/// `/proc/<pid>/stat`; Windows uses one ToolHelp snapshot and rejects stale
-/// parent links by creation time. Other platforms have only the caller pid.
+/// `/proc/<pid>/stat`; Windows uses ToolHelp and macOS uses proc_pidinfo.
+/// Both reject stale parent links by process creation time.
 pub fn caller_ancestor_pids() -> Vec<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -751,23 +751,32 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
     {
         let self_pid = std::process::id();
         let snapshot = crate::sys::process::snapshot_parents(false);
-        walk_windows_ancestors(
+        walk_ancestor_links(
             self_pid,
             |pid| snapshot.as_ref()?.get(&pid).map(|entry| entry.parent_pid),
             crate::sys::process::creation_ticks_win,
         )
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        mac_ancestor_pids(&MacProcessLookup::default())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        windows,
+        target_os = "macos"
+    )))]
     {
         vec![std::process::id()]
     }
 }
 
-/// Self-inclusive ancestry from one Windows snapshot. The creation-time
-/// comparison discards a link to a PID reused by a younger process; cycles
-/// and a bounded walk cannot promote arbitrary processes into the chain.
-#[cfg(any(windows, test))]
-fn walk_windows_ancestors(
+/// Self-inclusive ancestry from injected parent and creation-time lookups.
+/// An older child cannot belong to a younger, PID-reused parent. Cycles and
+/// a bounded walk cannot promote arbitrary processes into the chain.
+#[cfg(any(windows, target_os = "macos", test))]
+fn walk_ancestor_links(
     self_pid: u32,
     parent_of: impl Fn(u32) -> Option<u32>,
     ticks_of: impl Fn(u32) -> Option<u64>,
@@ -824,15 +833,80 @@ impl std::fmt::Display for ReapError {
     }
 }
 
+/// The Apple process facts needed for both ancestry and OMP executable proof.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct MacProcessFacts {
+    parent_pid: u32,
+    start_micros: u64,
+    comm: [u8; libc::MAXCOMLEN],
+}
+
+/// Reuse the Apple proc_pidinfo reader used by stable process identity.
+#[cfg(target_os = "macos")]
+fn mac_process_facts(pid: u32) -> Option<MacProcessFacts> {
+    let _ = libc::c_int::try_from(pid).ok()?;
+    let info = crate::sys::process::process_info_apple(pid)?;
+    if info.pbi_pid != pid {
+        return None;
+    }
+    Some(MacProcessFacts {
+        parent_pid: info.pbi_ppid,
+        start_micros: mac_start_micros(info.pbi_start_tvsec, info.pbi_start_tvusec)?,
+        comm: std::array::from_fn(|i| info.pbi_comm[i] as u8),
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mac_start_micros(seconds: u64, micros: u64) -> Option<u64> {
+    if micros >= 1_000_000 {
+        return None;
+    }
+    seconds.checked_mul(1_000_000)?.checked_add(micros)
+}
+
+/// Each ancestor's parent, start time, and comm come from one per-pid
+/// proc_pidinfo call; both walker lookups and the kind check share its result.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct MacProcessLookup(
+    std::cell::RefCell<std::collections::HashMap<u32, Option<MacProcessFacts>>>,
+);
+
+#[cfg(target_os = "macos")]
+impl MacProcessLookup {
+    fn get(&self, pid: u32) -> Option<MacProcessFacts> {
+        if let Some(cached) = self.0.borrow().get(&pid).copied() {
+            return cached;
+        }
+        let facts = mac_process_facts(pid);
+        self.0.borrow_mut().insert(pid, facts);
+        facts
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_ancestor_pids(lookup: &MacProcessLookup) -> Vec<u32> {
+    walk_ancestor_links(
+        std::process::id(),
+        |pid| lookup.get(pid).map(|facts| facts.parent_pid),
+        |pid| lookup.get(pid).map(|facts| facts.start_micros),
+    )
+}
 /// Which program an ancestor pid is running, as far as the platform will say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AncestorProcess {
-    /// Linux/Android `/proc/<pid>/comm` is `omp`, or Windows ToolHelp
-    /// `szExeFile` is `omp.exe` (case-insensitive).
+    /// Linux/Android `/proc/<pid>/comm` is `omp`, macOS `pbi_comm` is
+    /// `omp`, or Windows ToolHelp `szExeFile` is `omp.exe`.
     Omp,
     /// A readable process name that does not name OMP.
     #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android", windows)),
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            windows
+        )),
         allow(dead_code)
     )]
     Other,
@@ -893,6 +967,23 @@ fn ancestor_process_kind(
             .get(&pid)
             .and_then(|entry| entry.exe_name.as_deref()),
     )
+}
+
+/// The macOS BSD comm is MAXCOMLEN bytes including its NUL terminator.
+#[cfg(any(target_os = "macos", test))]
+fn ancestor_process_kind_from_comm(comm: Option<&[u8]>) -> AncestorProcess {
+    let Some(comm) = comm else {
+        return AncestorProcess::Unknown;
+    };
+    let end = comm
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(comm.len());
+    if comm[..end].trim_ascii() == b"omp" {
+        AncestorProcess::Omp
+    } else {
+        AncestorProcess::Other
+    }
 }
 
 /// True when `pid` carries exactly `HCOM_PROCESS_ID=<id>` in its environ —
@@ -956,8 +1047,8 @@ pub(crate) fn is_launcher_process_id(id: &str) -> bool {
 /// OMP only trusts proven launcher UUIDs or proven OMP-minted ids.
 ///
 /// Linux/Android prove `/proc` ancestry, Windows uses ToolHelp plus creation
-/// ticks, and macOS/other platforms explicitly pass ids through unchanged
-/// until verified sysctl ancestry ships (ffc-pzvep).
+/// ticks, and macOS uses proc_pidinfo BSD parent/start/comm facts. Other
+/// unshipped targets fail closed until they have an ancestry mechanism.
 /// [`AncestorProcess::Unknown`] never satisfies the OMP clause.
 pub(crate) fn process_id_trusted(
     id: &str,
@@ -1032,15 +1123,24 @@ pub(crate) fn trusted_process_id_for_omp(db: &HcomDb, id: &str) -> bool {
 }
 
 fn trusted_process_id_for_presenter(db: &HcomDb, id: &str, presenter_is_omp: bool) -> bool {
-    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
     {
-        // macOS has no shipped build or CI that verifies ancestry. Restore
-        // pre-0.7.30 passthrough until sysctl KERN_PROC proof ships (ffc-pzvep).
-        let _ = (db, presenter_is_omp);
-        return !id.is_empty();
+        // Unshipped targets get no inherited-id trust without ancestry proof.
+        let _ = (db, id, presenter_is_omp);
+        return false;
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    ))]
     {
         if id.is_empty() {
             return false;
@@ -1072,7 +1172,7 @@ fn trusted_process_id_for_presenter(db: &HcomDb, id: &str, presenter_is_omp: boo
         {
             // One ToolHelp snapshot supplies both parent links and exe names.
             let snapshot = crate::sys::process::snapshot_parents(true);
-            let ancestors = walk_windows_ancestors(
+            let ancestors = walk_ancestor_links(
                 std::process::id(),
                 |pid| snapshot.as_ref()?.get(&pid).map(|entry| entry.parent_pid),
                 crate::sys::process::creation_ticks_win,
@@ -1088,6 +1188,25 @@ fn trusted_process_id_for_presenter(db: &HcomDb, id: &str, presenter_is_omp: boo
                         })
                 },
                 binding_row_pid,
+                &|want| ancestors.iter().any(|&pid| carries_process_id(pid, want)),
+            )
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let lookup = MacProcessLookup::default();
+            let ancestors = mac_ancestor_pids(&lookup);
+            decide(
+                id,
+                &ancestors,
+                &|pid| {
+                    let facts = lookup.get(pid);
+                    ancestor_process_kind_from_comm(
+                        facts.as_ref().map(|facts| facts.comm.as_slice()),
+                    )
+                },
+                binding_row_pid,
+                // Self-carriage retains the non-OMP synthetic-id basis;
+                // Darwin has no shipped reader for other pids' environ.
                 &|want| ancestors.iter().any(|&pid| carries_process_id(pid, want)),
             )
         }
@@ -2613,7 +2732,7 @@ mod tests {
     #[test]
     fn windows_ancestor_walk_follows_valid_chain() {
         let parents = [(40, 30), (30, 20), (20, 10), (10, 4)];
-        let chain = walk_windows_ancestors(
+        let chain = walk_ancestor_links(
             40,
             |pid| parents.iter().find(|(child, _)| *child == pid).map(|p| p.1),
             |pid| Some(pid as u64),
@@ -2623,7 +2742,7 @@ mod tests {
 
     #[test]
     fn windows_ancestor_walk_truncates_stale_pid_reuse_link() {
-        let chain = walk_windows_ancestors(
+        let chain = walk_ancestor_links(
             40,
             |pid| match pid {
                 40 => Some(30),
@@ -2638,7 +2757,7 @@ mod tests {
     #[test]
     fn windows_ancestor_walk_truncates_missing_parent() {
         assert_eq!(
-            walk_windows_ancestors(40, |pid| (pid == 40).then_some(30), |_| Some(10),),
+            walk_ancestor_links(40, |pid| (pid == 40).then_some(30), |_| Some(10),),
             vec![40, 30]
         );
     }
@@ -2646,14 +2765,14 @@ mod tests {
     #[test]
     fn windows_ancestor_walk_bounds_cycles_and_hops() {
         assert_eq!(
-            walk_windows_ancestors(
+            walk_ancestor_links(
                 10,
                 |pid| Some(if pid == 10 { 11 } else { 10 }),
                 |_| Some(10),
             ),
             vec![10, 11]
         );
-        let chain = walk_windows_ancestors(10, |pid| Some(pid + 1), |_| Some(10));
+        let chain = walk_ancestor_links(10, |pid| Some(pid + 1), |_| Some(10));
         assert_eq!(chain.len(), 1024);
         assert_eq!(chain[0], 10);
         assert_eq!(chain[1023], 1033);
@@ -2675,6 +2794,53 @@ mod tests {
         );
         assert_eq!(
             ancestor_process_kind_from_name(None),
+            AncestorProcess::Unknown
+        );
+    }
+
+    #[test]
+    fn mac_ancestor_walk_rejects_reused_parent_by_microsecond_starttime() {
+        let chain = walk_ancestor_links(
+            40,
+            |pid| match pid {
+                40 => Some(30),
+                30 => Some(20),
+                _ => None,
+            },
+            |pid| match pid {
+                40 => mac_start_micros(100, 200),
+                30 => mac_start_micros(100, 100),
+                20 => mac_start_micros(101, 0),
+                _ => None,
+            },
+        );
+        assert_eq!(chain, vec![40, 30]);
+    }
+
+    #[test]
+    fn mac_start_micros_rejects_invalid_or_overflowed_timeval() {
+        assert_eq!(mac_start_micros(1, 999_999), Some(1_999_999));
+        assert_eq!(mac_start_micros(2, 0), Some(2_000_000));
+        assert_eq!(mac_start_micros(1, 1_000_000), None);
+        assert_eq!(mac_start_micros(u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn mac_ancestor_kind_requires_exact_trimmed_comm() {
+        assert_eq!(
+            ancestor_process_kind_from_comm(Some(b" omp \0ignored")),
+            AncestorProcess::Omp
+        );
+        assert_eq!(
+            ancestor_process_kind_from_comm(Some(b"OMP\0")),
+            AncestorProcess::Other
+        );
+        assert_eq!(
+            ancestor_process_kind_from_comm(Some(b"bash\0")),
+            AncestorProcess::Other
+        );
+        assert_eq!(
+            ancestor_process_kind_from_comm(None),
             AncestorProcess::Unknown
         );
     }

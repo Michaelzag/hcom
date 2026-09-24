@@ -101,7 +101,7 @@ fn process_identity_platform(pid: u32) -> Option<String> {
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
-fn process_info_apple(pid: u32) -> Option<libc::proc_bsdinfo> {
+pub(crate) fn process_info_apple(pid: u32) -> Option<libc::proc_bsdinfo> {
     // SAFETY: `info` is a correctly sized writable proc_bsdinfo buffer and
     // proc_pidinfo only fills it for the queried PID.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -596,7 +596,7 @@ pub fn spawn_detached(command: &mut Command) -> std::io::Result<std::process::Ch
 /// leaves the pre-existing behaviour untouched wherever this check has nothing
 /// to say. A process we cannot query is one we generally cannot terminate
 /// either.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn child_link_is_plausible(parent_ticks: Option<u64>, child_ticks: Option<u64>) -> bool {
     match (parent_ticks, child_ticks) {
         (Some(parent), Some(child)) => child >= parent,
