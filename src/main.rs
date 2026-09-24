@@ -3,6 +3,7 @@
 //! Humans usually launch agents with `hcom <tool>` and talk to them through
 //! each tool's own UI. Agents use `hcom` CLI commands (learnt through bootstrap.rs)
 //! as a side-channel for messaging and coordination with other agents.
+use std::borrow::Cow;
 
 mod bootstrap;
 mod claude_actor;
@@ -109,26 +110,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     }
 
     let tool_str = &args[0];
-    let (answer_omp_reroot_prompt, tool_arg_start) = consume_reroot_option(&args[1..]);
-
-    // Windows runner scripts pass tool args via a JSON sidecar file instead of
-    // inline argv (see create_runner_script_windows): the PowerShell →
-    // native-exe boundary corrupts arguments with embedded double quotes.
-    let sidecar_args: Vec<String>;
-    let tool_args: Vec<&str> =
-        if args.get(tool_arg_start).map(String::as_str) == Some("--hcom-args-file") {
-            let Some(path) = args.get(tool_arg_start + 1) else {
-                bail!("--hcom-args-file requires a path");
-            };
-            let content = std::fs::read_to_string(path)
-                .with_context(|| format!("Failed to read args file {path}"))?;
-            let _ = std::fs::remove_file(path);
-            sidecar_args = serde_json::from_str(&content)
-                .with_context(|| format!("Invalid JSON in args file {path}"))?;
-            sidecar_args.iter().map(|s| s.as_str()).collect()
-        } else {
-            args[tool_arg_start..].iter().map(|s| s.as_str()).collect()
-        };
+    let (answer_omp_reroot_prompt, tool_args) = consume_pty_tool_args(args)?;
 
     // Keep arbitrary commands explicit so they cannot inherit a known tool's
     // delivery behavior merely because parsing failed.
@@ -167,7 +149,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
     let full_args: Vec<&str> = extra_args
         .iter()
         .map(|s| s.as_str())
-        .chain(tool_args.iter().copied())
+        .chain(tool_args.iter().map(|arg| arg.as_ref()))
         .collect();
 
     // Create and run PTY
@@ -237,6 +219,35 @@ fn consume_reroot_option(args: &[String]) -> (bool, usize) {
     (enabled, usize::from(enabled))
 }
 
+fn consume_pty_tool_args(args: &[String]) -> Result<(bool, Vec<Cow<'_, str>>)> {
+    let (answer_omp_reroot_prompt, consumed) = consume_reroot_option(&args[1..]);
+    // `consume_reroot_option` receives the post-tool slice, so translate its
+    // relative count back to an index in the full PTY argument vector.
+    let tool_arg_start = 1 + consumed;
+    if args.get(tool_arg_start).map(String::as_str) != Some("--hcom-args-file") {
+        return Ok((
+            answer_omp_reroot_prompt,
+            args[tool_arg_start..]
+                .iter()
+                .map(|arg| Cow::Borrowed(arg.as_str()))
+                .collect(),
+        ));
+    }
+
+    let Some(path) = args.get(tool_arg_start + 1) else {
+        bail!("--hcom-args-file requires a path");
+    };
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read args file {path}"))?;
+    let _ = std::fs::remove_file(path);
+    let sidecar_args: Vec<String> = serde_json::from_str(&content)
+        .with_context(|| format!("Invalid JSON in args file {path}"))?;
+    Ok((
+        answer_omp_reroot_prompt,
+        sidecar_args.into_iter().map(Cow::Owned).collect(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::router::{self, Action};
@@ -288,15 +299,42 @@ mod tests {
 
     #[test]
     fn test_reroot_option_is_proxy_only() {
-        let tool_args = args(&[
+        let pty_args = args(&[
+            "omp",
+            crate::pty::ANSWER_OMP_REROOT_PROMPT_OPTION,
+            "--model",
+            "test-model",
+        ]);
+        let (enabled, tool_args) = super::consume_pty_tool_args(&pty_args).unwrap();
+        assert!(enabled);
+        assert_eq!(tool_args, ["--model", "test-model"]);
+    }
+
+    #[test]
+    fn test_tool_name_is_not_forwarded() {
+        let pty_args = args(&["omp", "--continue"]);
+        let (enabled, tool_args) = super::consume_pty_tool_args(&pty_args).unwrap();
+        assert!(!enabled);
+        assert_eq!(tool_args, ["--continue"]);
+    }
+
+    #[test]
+    fn test_windows_args_file_is_consumed_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("omp.args.json");
+        std::fs::write(&path, r#"["exec","resume","id","a b"]"#).unwrap();
+        let pty_args = args(&[
+            "omp",
             crate::pty::ANSWER_OMP_REROOT_PROMPT_OPTION,
             "--hcom-args-file",
-            "args.json",
+            path.to_str().unwrap(),
         ]);
-        let (enabled, consumed) = super::consume_reroot_option(&tool_args);
+
+        let (enabled, tool_args) = super::consume_pty_tool_args(&pty_args).unwrap();
+
         assert!(enabled);
-        assert_eq!(consumed, 1);
-        assert_eq!(&tool_args[consumed..], &["--hcom-args-file", "args.json"]);
+        assert_eq!(tool_args, ["exec", "resume", "id", "a b"]);
+        assert!(!path.exists());
     }
 
     #[test]

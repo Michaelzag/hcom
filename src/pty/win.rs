@@ -693,6 +693,18 @@ impl Proxy {
                             let _ = w.write_all(b"y\r");
                             let _ = w.flush();
                             omp_reroot_answered = true;
+                            if let Some(name) = &instance {
+                                let _ = HcomDb::open().and_then(|db| {
+                                    db.emit_launch_lifecycle_event(
+                                        name,
+                                        "omp_reroot_prompt_answered",
+                                        "listening",
+                                        "omp reroot prompt",
+                                        None,
+                                        Some("answered re-root prompt"),
+                                    )
+                                });
+                            }
                         }
 
                         // Refresh the `hcom term` snapshot, throttled to ≤10Hz so
