@@ -5366,6 +5366,55 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_finds_the_earlier_file_under_the_child_root() {
+        // The launch env file moves the child's omp config root to
+        // `.child-omp`; hcom's own environment still names `.omp`. A's file
+        // lives only under the child's root, where the resume guard looks, so
+        // the earlier-session check must look there too.
+        with_omp_home(|home| {
+            let (db, _, _) = poisoned_seat_db(home, false, OMP_MISSING_SID);
+            // config.toml first: a config load with none rewrites the env file.
+            crate::config::write_default_config().unwrap();
+            crate::config::save_env_file(&std::collections::HashMap::from([(
+                "PI_CONFIG_DIR".to_string(),
+                ".child-omp".to_string(),
+            )]))
+            .unwrap();
+            let root = home.join(".child-omp/agent/sessions/project");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join(format!("2026-01-01T00-00-00Z_{OMP_EARLIER_SID}.jsonl")),
+                "{}",
+            )
+            .unwrap();
+
+            let err = prepare_resume_plan(&db, "lave", false, &[], &GlobalFlags::default())
+                .err()
+                .expect("resume of a dead newest snapshot must fail")
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "session file not found: {OMP_MISSING_SID}; earlier session \
+                     {OMP_EARLIER_SID} is resumable: hcom r lave --restore-earlier"
+                )
+            );
+            let (_, plan) =
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+            assert!(
+                plan.launch
+                    .args
+                    .windows(2)
+                    .any(|w| w[0] == "--resume" && w[1] == OMP_EARLIER_SID),
+                "plan must resume the earlier session: {:?}",
+                plan.launch.args
+            );
+        });
+    }
+
     #[test]
     fn test_take_restore_earlier_flag_stops_at_double_dash() {
         let mut args = s(&[
