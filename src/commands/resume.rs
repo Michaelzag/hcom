@@ -478,10 +478,21 @@ fn prepare_resume_plan_from_source(
     // - Explicit --dir flag wins (validated and canonicalized)
     // - For fork (tracked instance): use current directory (start fresh in new context)
     // - Otherwise: use snapshot/transcript directory, falling back to current
+    // omp refuses a cwd under /tmp: explicit --dir there is refused, a
+    // snapshot dir there is redirected to /build/<seat>/tmp.
+    let omp_guard = matches!(
+        crate::launcher::LaunchTool::from_str(&tool),
+        Ok(crate::launcher::LaunchTool::Omp)
+    );
+    let seat = (!is_adoption).then_some(display_name.as_str());
     let effective_cwd = if let Some(ref dir) = dir_override {
         let path = std::path::Path::new(dir);
         if !path.is_dir() {
             bail!("--dir path does not exist or is not a directory: {}", dir);
+        }
+        if omp_guard {
+            crate::shared::launch_dir::guard_launch_dir(dir, seat, true)
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
         path.canonicalize()
             .map(|p| crate::shared::platform::child_process_path(&p))
@@ -492,7 +503,20 @@ fn prepare_resume_plan_from_source(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string())
     } else if !snapshot_dir.is_empty() && std::path::Path::new(&snapshot_dir).is_dir() {
-        snapshot_dir.clone()
+        if omp_guard {
+            let guarded = crate::shared::launch_dir::guard_launch_dir(&snapshot_dir, seat, false)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if guarded != snapshot_dir {
+                eprintln!(
+                    "Warning: original directory '{}' is under /tmp, where omp refuses to start; \
+                     resuming in '{}' instead",
+                    snapshot_dir, guarded
+                );
+            }
+            guarded
+        } else {
+            snapshot_dir.clone()
+        }
     } else {
         if !snapshot_dir.is_empty() {
             eprintln!(
