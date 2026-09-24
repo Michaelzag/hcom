@@ -459,10 +459,7 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
 
 /// Apply the same tool-config root injection to the environment the launcher
 /// will execute with. Prelaunch validation also depends on this final value.
-pub(crate) fn apply_tool_config_dir_to_env(
-    tool: &LaunchTool,
-    env: &mut HashMap<String, String>,
-) {
+pub(crate) fn apply_tool_config_dir_to_env(tool: &LaunchTool, env: &mut HashMap<String, String>) {
     if let Some(env_var) = tool.spec().launch.config_dir_env
         && !env.contains_key(env_var)
         && std::env::var(env_var)

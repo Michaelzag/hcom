@@ -530,10 +530,7 @@ fn prepare_resume_plan_from_source(
             &hcom_config,
             crate::launcher::launch_env_regime(run_here, inside_ai_tool),
         );
-        crate::launcher::apply_tool_config_dir_to_env(
-            &crate::launcher::LaunchTool::Omp,
-            &mut env,
-        );
+        crate::launcher::apply_tool_config_dir_to_env(&crate::launcher::LaunchTool::Omp, &mut env);
         ensure_omp_session_file_in_env(
             &session_id,
             &snapshot_transcript_path,
@@ -4390,8 +4387,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_omp_resume_finds_managed_session_when_hcom_dir_outside_home() {
-        let (_home_dir, _hcom_dir, home, _guard) =
-            crate::hooks::test_helpers::isolated_test_env();
+        let (_home_dir, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let external = tempfile::tempdir().unwrap();
         let hcom_dir = external.path().join("state");
         std::fs::create_dir_all(&hcom_dir).unwrap();
