@@ -1556,7 +1556,11 @@ fn launch_pty_or_background(
 ///   (`initialize_instance_in_position_file`) promotes the placeholder in
 ///   place, so it must survive — bailing here broke every tracked `hcom f`.
 /// - Name held by anything else (listening/active/blocked) → Err.
-fn resolve_explicit_name_conflict(db: &HcomDb, name: &str, session_id: Option<&str>) -> Result<()> {
+pub(crate) fn resolve_explicit_name_conflict(
+    db: &HcomDb,
+    name: &str,
+    session_id: Option<&str>,
+) -> Result<()> {
     // Process truth first: never spawn under a name whose prior subtree is
     // still alive (orphan) or whose newest binding is live-held — not even
     // over a free or inactive row. A reservation placeholder carries no
@@ -1611,7 +1615,7 @@ fn resolve_explicit_name_conflict(db: &HcomDb, name: &str, session_id: Option<&s
 /// the placeholder window (a concurrent resume in its pre-spawn gap; once it
 /// spawns, process truth in [`resolve_explicit_name_conflict`] takes over).
 #[allow(clippy::too_many_arguments)]
-fn register_launch_instance(
+pub(crate) fn register_launch_instance(
     db: &HcomDb,
     instance_name: &str,
     session_id: Option<&str>,

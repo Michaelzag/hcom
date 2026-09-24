@@ -966,8 +966,14 @@ const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--hcom-title <text>", "Session purpose (window title)"),
 ];
 /// Shared help body for `hcom r` / `hcom f` (both accept the same target
-/// forms and launch flags; only the header, blurb, and see-also differ).
-fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> String {
+/// forms and launch flags; only the header, blurb, own flags, and see-also
+/// differ).
+fn resume_fork_help(
+    usage_line: &str,
+    blurb: &str,
+    own_flags: &[(&str, &str)],
+    see_also_line: &str,
+) -> String {
     let mut flags = String::new();
     for (flag, desc) in SHARED_LAUNCH_FLAGS {
         let desc = if *flag == "--headless" {
@@ -975,6 +981,9 @@ fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> Strin
         } else {
             *desc
         };
+        flags.push_str(&format!("  {:<34}{}\n", flag, desc));
+    }
+    for (flag, desc) in own_flags {
         flags.push_str(&format!("  {:<34}{}\n", flag, desc));
     }
     flags.push_str(&format!(
@@ -1024,6 +1033,10 @@ pub fn get_command_help(name: &str) -> String {
             "Adopting by UUID or thread-name reclaims the original hcom\n\
              identity if one existed; otherwise a new identity is assigned.\n\
              CWD is recovered from the session's transcript/DB.",
+            &[(
+                "--restore-earlier",
+                "Resume the seat's earlier session when its newest omp session has no ID or its file is gone (name only)",
+            )],
             &see_also,
         );
     }
@@ -1041,6 +1054,7 @@ pub fn get_command_help(name: &str) -> String {
         return resume_fork_help(
             "hcom f <target> [tool-args...]    Fork an agent session (active or stopped)",
             &blurb,
+            &[],
             &see_also,
         );
     }
@@ -1269,6 +1283,13 @@ mod tests {
 
         let resume_help = get_command_help("r");
         assert!(resume_help.contains("Claude/Kimi resume or fork only"));
+    }
+
+    #[test]
+    fn resume_help_explains_unbound_newest_omp_session_restore() {
+        let help = get_command_help("r");
+        assert!(help.contains("--restore-earlier"));
+        assert!(help.contains("newest omp session has no ID or its file is gone"));
     }
 
     #[test]
