@@ -453,32 +453,9 @@ fn prepare_resume_plan_from_source(
             if fork { "fork" } else { "resume" }
         );
     }
-
-    // Omp exits at once when `--resume` names a session with no file, so a
-    // snapshot pointing at a deleted session would only burn a harness.
-    // Resolve roots from the environment assembled for the child, rather than
-    // hcom's process environment (which may differ via launch config/env).
+    // Extract hcom-level flags from extra args before tool parsing.
     let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
-    if tool == "omp" && !is_adoption {
-        let hcom_config = load_hcom_config();
-        let inside_ai_tool = crate::shared::HcomContext::from_os().is_inside_ai_tool();
-        let terminal_mode = launch_flags
-            .terminal
-            .as_deref()
-            .or(Some(hcom_config.terminal.as_str()).filter(|t| !t.is_empty()));
-        let run_here = crate::launcher::will_run_in_current_terminal(
-            1,
-            background,
-            launch_flags.run_here,
-            terminal_mode,
-            inside_ai_tool,
-        );
-        let env = crate::launcher::build_launch_env(
-            &hcom_config,
-            crate::launcher::launch_env_regime(run_here, inside_ai_tool),
-        );
-        ensure_omp_session_file_in_env(&session_id, &snapshot_transcript_path, &env)?;
-    }
+
 
     // Extract hcom-level flags from extra args before tool parsing.
 
@@ -532,6 +509,35 @@ fn prepare_resume_plan_from_source(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string())
     };
+
+    // Omp resolves relative PI_CODING_AGENT_DIR against the child process's
+    // effective working directory (omp packages/utils/src/dirs.ts:328-335).
+    // Check the resulting root only after that working directory is finalized.
+    if tool == "omp" && !is_adoption {
+        let hcom_config = load_hcom_config();
+        let inside_ai_tool = crate::shared::HcomContext::from_os().is_inside_ai_tool();
+        let terminal_mode = launch_flags
+            .terminal
+            .as_deref()
+            .or(Some(hcom_config.terminal.as_str()).filter(|t| !t.is_empty()));
+        let run_here = crate::launcher::will_run_in_current_terminal(
+            1,
+            background,
+            launch_flags.run_here,
+            terminal_mode,
+            inside_ai_tool,
+        );
+        let env = crate::launcher::build_launch_env(
+            &hcom_config,
+            crate::launcher::launch_env_regime(run_here, inside_ai_tool),
+        );
+        ensure_omp_session_file_in_env(
+            &session_id,
+            &snapshot_transcript_path,
+            &env,
+            std::path::Path::new(&effective_cwd),
+        )?;
+    }
 
     // Merge with original launch args (only applicable for tracked instances).
     let original_args: Vec<String> = if !launch_args_str.is_empty() {
@@ -2129,9 +2135,10 @@ fn ensure_omp_session_file_in_env(
     session_id: &str,
     transcript_path: &str,
     env: &std::collections::HashMap<String, String>,
+    effective_cwd: &std::path::Path,
 ) -> Result<()> {
     let mut found = false;
-    for root in crate::transcript::omp_session_roots_for_env(env) {
+    for root in crate::transcript::omp_session_roots_for_env(env, effective_cwd) {
         if root.exists() && find_pi_transcript_in_root(&root, session_id).is_some() {
             found = true;
             break;
@@ -4443,6 +4450,12 @@ mod tests {
         // launch env supplied by hcom is the only place the override exists.
         let mut env = std::collections::HashMap::new();
         env.insert("HOME".to_string(), child_home.to_string_lossy().to_string());
-        ensure_omp_session_file_in_env(OMP_MISSING_SID, "", &env).unwrap();
+        ensure_omp_session_file_in_env(
+            OMP_MISSING_SID,
+            "",
+            &env,
+            std::path::Path::new("."),
+        )
+        .unwrap();
     }
 }

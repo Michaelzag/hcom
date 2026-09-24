@@ -376,7 +376,10 @@ pub(crate) fn omp_profile_from_env() -> Option<String> {
 /// - XDG is selected only on supported platforms and only after the applicable
 ///   app/profile directory exists;
 /// - otherwise sessions remain under the config root.
-fn omp_active_session_root_with_env(env: &std::collections::HashMap<String, String>) -> PathBuf {
+fn omp_active_session_root_with_env(
+    env: &std::collections::HashMap<String, String>,
+    effective_cwd: &std::path::Path,
+) -> PathBuf {
     let home = env
         .get("HOME")
         .map(PathBuf::from)
@@ -411,10 +414,7 @@ fn omp_active_session_root_with_env(env: &std::collections::HashMap<String, Stri
             if p.is_absolute() {
                 p
             } else {
-                env.get("PWD")
-                    .map(PathBuf::from)
-                    .unwrap_or_default()
-                    .join(p)
+                effective_cwd.join(p)
             }
         })
         .unwrap_or(default_agent.clone());
@@ -435,13 +435,17 @@ fn omp_active_session_root_with_env(env: &std::collections::HashMap<String, Stri
 }
 
 fn omp_active_session_root() -> PathBuf {
-    omp_active_session_root_with_env(&std::env::vars().collect())
+    omp_active_session_root_with_env(
+        &std::env::vars().collect(),
+        &std::env::current_dir().unwrap_or_default(),
+    )
 }
 
 pub(crate) fn omp_session_roots_for_env(
     env: &std::collections::HashMap<String, String>,
+    effective_cwd: &std::path::Path,
 ) -> Vec<PathBuf> {
-    vec![omp_active_session_root_with_env(env)]
+    vec![omp_active_session_root_with_env(env, effective_cwd)]
 }
 
 /// Disk root that holds OMP session files. Single source of truth shared by
@@ -748,6 +752,26 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn omp_relative_agent_root_uses_resumed_cwd_not_launch_pwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        let pwd = tempfile::tempdir().unwrap();
+        let env = std::collections::HashMap::from([
+            ("HOME".to_string(), pwd.path().display().to_string()),
+            ("PWD".to_string(), pwd.path().display().to_string()),
+            ("PI_CODING_AGENT_DIR".to_string(), "agent".to_string()),
+        ]);
+
+        assert_eq!(
+            omp_session_roots_for_env(&env, cwd.path()),
+            vec![cwd.path().join("agent").join("sessions")]
+        );
+        assert_ne!(
+            omp_session_roots_for_env(&env, pwd.path()),
+            vec![cwd.path().join("agent").join("sessions")]
+        );
+    }
+
 
     // Unix-only: PI_CODING_AGENT_DIR is set to a Unix-style absolute path
     // (`/tmp/...`), which on Windows has no drive letter and resolves against
