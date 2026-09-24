@@ -24,8 +24,14 @@ use crate::transcript::claude_projects_dir;
 
 /// Where to load the resume/fork plan from.
 enum ResumeSource<'a> {
-    /// Resume an hcom-tracked instance by name (active or stopped).
+    /// Resume an hcom-tracked instance by name (active or stopped). Loads
+    /// the newest stopped snapshot for the name.
     Instance { name: &'a str },
+    /// Resume the exact stopped session `session_id`, reclaiming the hcom
+    /// identity `name` it stopped under. Loads the newest stopped snapshot
+    /// carrying `session_id` — never the name's newest snapshot, which may
+    /// belong to a later session that reused the name.
+    StoppedSession { name: &'a str, session_id: &'a str },
     /// Adopt a session from its on-disk transcript (first-time bring-in under hcom).
     Disk {
         session_id: String,
@@ -238,8 +244,12 @@ pub fn run_local_resume_result(
 ///    binding → events → adoption chain on the resolved session ID.
 /// 4. Otherwise, prepare a plan for an existing hcom instance.
 ///
-/// Returns `(resolved_name_for_display, prepared_plan)`. The loop form
-/// avoids re-opening the DB that the old recursive `do_resume` calls did.
+/// A session ID that hits the events lookup resumes its OWN stopped
+/// snapshot (the newest `life.stopped` event carrying that session ID),
+/// even when the hcom name has since been reused by a newer session. A
+/// bare name still resumes the name's newest snapshot.
+///
+/// Returns `(resolved_name_for_display, prepared_plan)`.
 fn resolve_name_to_plan(
     db: &HcomDb,
     name: &str,
@@ -247,64 +257,77 @@ fn resolve_name_to_plan(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<(String, PreparedResume)> {
-    let mut current = crate::identity::resolve_display_name_or_stopped(db, name)
+    let current = crate::identity::resolve_display_name_or_stopped(db, name)
         .unwrap_or_else(|| name.to_string());
 
-    // A loop over reclaim hops (binding → events → redirect to instance name).
-    // Bounded by MAX_HOPS in case of pathological DB state.
-    for _ in 0..8 {
-        if is_session_id(&current) {
-            if let Ok(Some(bound)) = db.get_session_binding(&current)
-                && matches!(db.get_instance_full(&bound), Ok(Some(_)))
-            {
-                bail!(
-                    "Session {} is currently active as '{}' — run hcom kill {} first",
-                    current,
-                    bound,
-                    bound
-                );
-            }
-            // Stale binding: events are authoritative. Fall through.
-            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&current) {
-                current = instance_name;
-                continue;
-            }
-            let plan = build_adopt_plan(db, &current, fork, extra_args, flags)?;
-            return Ok((current, plan));
-        }
-
-        if matches!(db.get_instance_full(&current), Ok(None) | Err(_))
-            && crate::relay::control::split_device_suffix(&current).is_none()
-            && let Some(session_id) = resolve_thread_name(&current)?
+    if is_session_id(&current) {
+        if let Ok(Some(bound)) = db.get_session_binding(&current)
+            && matches!(db.get_instance_full(&bound), Ok(Some(_)))
         {
-            if let Ok(Some(bound)) = db.get_session_binding(&session_id)
-                && matches!(db.get_instance_full(&bound), Ok(Some(_)))
-            {
-                bail!(
-                    "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
-                    session_id,
-                    current,
-                    bound,
-                    bound
-                );
-            }
-            // Stale binding: fall through to events.
-            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id) {
-                current = instance_name;
-                continue;
-            }
-            let plan = build_adopt_plan(db, &session_id, fork, extra_args, flags)?;
-            return Ok((session_id, plan));
+            bail!(
+                "Session {} is currently active as '{}' — run hcom kill {} first",
+                current,
+                bound,
+                bound
+            );
         }
-
-        let plan = prepare_resume_plan(db, &current, fork, extra_args, flags)?;
+        // Stale binding: events are authoritative. Resume the exact stopped
+        // snapshot for this session ID (see StoppedSession); never redirect
+        // to the name and reload its newest snapshot, which may belong to a
+        // later session that reused the name.
+        if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&current) {
+            let plan = prepare_resume_plan_from_source(
+                db,
+                ResumeSource::StoppedSession {
+                    name: &instance_name,
+                    session_id: &current,
+                },
+                fork,
+                extra_args,
+                flags,
+            )?;
+            return Ok((instance_name, plan));
+        }
+        let plan = build_adopt_plan(db, &current, fork, extra_args, flags)?;
         return Ok((current, plan));
     }
 
-    bail!(
-        "Name resolution for '{}' did not converge (possible circular binding)",
-        name
-    );
+    if matches!(db.get_instance_full(&current), Ok(None) | Err(_))
+        && crate::relay::control::split_device_suffix(&current).is_none()
+        && let Some(session_id) = resolve_thread_name(&current)?
+    {
+        if let Ok(Some(bound)) = db.get_session_binding(&session_id)
+            && matches!(db.get_instance_full(&bound), Ok(Some(_)))
+        {
+            bail!(
+                "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
+                session_id,
+                current,
+                bound,
+                bound
+            );
+        }
+        // Same exact-session rule as the UUID path above: the thread name
+        // resolves to a session ID, so resume that session's own snapshot.
+        if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id) {
+            let plan = prepare_resume_plan_from_source(
+                db,
+                ResumeSource::StoppedSession {
+                    name: &instance_name,
+                    session_id: &session_id,
+                },
+                fork,
+                extra_args,
+                flags,
+            )?;
+            return Ok((instance_name, plan));
+        }
+        let plan = build_adopt_plan(db, &session_id, fork, extra_args, flags)?;
+        return Ok((session_id, plan));
+    }
+
+    let plan = prepare_resume_plan(db, &current, fork, extra_args, flags)?;
+    Ok((current, plan))
 }
 
 pub(crate) fn prepare_resume_plan(
@@ -317,6 +340,28 @@ pub(crate) fn prepare_resume_plan(
     prepare_resume_plan_from_source(db, ResumeSource::Instance { name }, fork, extra_args, flags)
 }
 
+/// Spawn gates shared by name resume and exact-session resume: refuse when
+/// the hcom name is still live (or held), unless forking under a fresh name.
+/// Both paths gate on the same name so a UUID resume never slips past the
+/// live check that a name resume would hit.
+fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
+    if !fork
+        && let Ok(Some(inst)) = db.get_instance_full(name)
+        && inst.status != ST_INACTIVE
+    {
+        bail!("'{}' is still active — run hcom kill {} first", name, name);
+    }
+    // Process truth gates the spawn: even with the row stopped, a
+    // still-running prior subtree (orphan) or a live holder of the
+    // newest binding must block the new harness. Forks spawn under
+    // a fresh name, so they are exempt here; the launcher's
+    // explicit-name check covers their reservation.
+    if !fork && let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name) {
+        bail!("{refusal}");
+    }
+    Ok(())
+}
+
 fn prepare_resume_plan_from_source(
     db: &HcomDb,
     source: ResumeSource<'_>,
@@ -327,7 +372,7 @@ fn prepare_resume_plan_from_source(
     let is_adoption = matches!(source, ResumeSource::Disk { .. });
 
     // Load the (tool, session_id, prior-launch-args, tag, background, last_event_id, cwd_hint, purpose, current, display_name)
-    // from either the DB (instance) or the on-disk transcript (adoption).
+    // from the DB (instance newest or exact session), or the on-disk transcript (adoption).
     let (
         tool,
         session_id,
@@ -341,25 +386,29 @@ fn prepare_resume_plan_from_source(
         display_name,
     ) = match source {
         ResumeSource::Instance { name } => {
-            if !fork
-                && let Ok(Some(inst)) = db.get_instance_full(name)
-                && inst.status != ST_INACTIVE
-            {
-                bail!("'{}' is still active — run hcom kill {} first", name, name);
-            }
-            // Process truth gates the spawn: even with the row stopped, a
-            // still-running prior subtree (orphan) or a live holder of the
-            // newest binding must block the new harness. Forks spawn under
-            // a fresh name, so they are exempt here; the launcher's
-            // explicit-name check covers their reservation.
-            if !fork && let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name) {
-                bail!("{refusal}");
-            }
+            ensure_resumable(db, name, fork)?;
             let (tool, sid, largs, tag, bg, leid, snap, purpose, current) = if fork {
                 load_instance_data(db, name)?
             } else {
                 load_stopped_snapshot(db, name)?
             };
+            (
+                tool,
+                sid,
+                largs,
+                tag,
+                bg,
+                leid,
+                snap,
+                purpose,
+                current,
+                name.to_string(),
+            )
+        }
+        ResumeSource::StoppedSession { name, session_id } => {
+            ensure_resumable(db, name, fork)?;
+            let (tool, sid, largs, tag, bg, leid, snap, purpose, current) =
+                load_stopped_snapshot_by_session_id(db, session_id)?;
             (
                 tool,
                 sid,
@@ -401,6 +450,19 @@ fn prepare_resume_plan_from_source(
             if fork { "fork" } else { "resume" }
         );
     }
+
+    // The name's delivery cursor must never move backwards on resume. A plan
+    // loaded from an older stopped snapshot (StoppedSession) carries that
+    // session's stale last_event_id while the name may have been reused since;
+    // restoring it verbatim would rewind the cursor and redeliver messages a
+    // later session already consumed. Restore max(snapshot cursor, name's
+    // newest cursor). For the Instance arm the snapshot already IS the name's
+    // newest, so the max is a no-op there; adoption has no name cursor.
+    let last_event_id = if is_adoption {
+        last_event_id
+    } else {
+        last_event_id.max(name_newest_cursor(db, &display_name))
+    };
 
     validate_resume_operation(&tool, fork)?;
     let inherited_tag = if tag.is_empty() {
@@ -971,66 +1033,8 @@ pub(crate) fn load_stopped_snapshot(db: &HcomDb, name: &str) -> Result<LoadedIns
         .collect();
 
     for data_str in &rows {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
-            && data.get("action").and_then(|v| v.as_str()) == Some("stopped")
-            && let Some(snapshot) = data.get("snapshot")
-        {
-            let tool = snapshot
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let session_id = snapshot
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let launch_args = snapshot
-                .get("launch_args")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let tag = snapshot
-                .get("tag")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let background = snapshot
-                .get("background")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                != 0;
-            let last_event_id = snapshot
-                .get("last_event_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let directory = snapshot
-                .get("directory")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let purpose = snapshot
-                .get("purpose")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let current = snapshot
-                .get("current")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            return Ok((
-                tool,
-                session_id,
-                launch_args,
-                tag,
-                background,
-                last_event_id,
-                directory,
-                purpose,
-                current,
-            ));
+        if let Some(loaded) = parse_stopped_snapshot(data_str) {
+            return Ok(loaded);
         }
     }
 
@@ -1038,6 +1042,118 @@ pub(crate) fn load_stopped_snapshot(db: &HcomDb, name: &str) -> Result<LoadedIns
         "No stopped snapshot found for '{name}'. Not a known hcom instance, \
          session UUID, or recognized thread name."
     )
+}
+
+/// Load the newest stopped snapshot carrying `session_id`, regardless of
+/// which hcom name stopped it. Used by exact-session resume so a UUID
+/// resolves to its own snapshot even after the name was reused.
+fn load_stopped_snapshot_by_session_id(
+    db: &HcomDb,
+    session_id: &str,
+) -> Result<LoadedInstanceData> {
+    let mut stmt = db.conn().prepare(
+        "SELECT data FROM events
+         WHERE type='life'
+           AND json_extract(data, '$.action') = 'stopped'
+           AND json_extract(data, '$.snapshot.session_id') = ?
+         ORDER BY id DESC LIMIT 1",
+    )?;
+
+    let rows: Vec<String> = stmt
+        .query_map(rusqlite::params![session_id], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for data_str in &rows {
+        if let Some(loaded) = parse_stopped_snapshot(data_str) {
+            return Ok(loaded);
+        }
+    }
+
+    bail!("No stopped snapshot found for session '{session_id}'.")
+}
+
+/// The name's newest delivery cursor: its newest `life.stopped` snapshot's
+/// `last_event_id`, then the instance row's current cursor when a row exists.
+/// Resume must never restore a cursor below this — a plan loaded from an
+/// older stopped snapshot (exact-session resume) would otherwise rewind the
+/// name's message cursor and redeliver what a later session already consumed.
+fn name_newest_cursor(db: &HcomDb, name: &str) -> i64 {
+    let snapshot_cursor = load_stopped_snapshot(db, name)
+        .map(|(_, _, _, _, _, last_event_id, _, _, _)| last_event_id)
+        .unwrap_or(0);
+    let row_cursor = db
+        .get_instance_full(name)
+        .ok()
+        .flatten()
+        .map(|inst| inst.last_event_id)
+        .unwrap_or(0);
+    snapshot_cursor.max(row_cursor)
+}
+
+/// Parse one `life.stopped` event body into loaded instance data.
+fn parse_stopped_snapshot(data_str: &str) -> Option<LoadedInstanceData> {
+    let data = serde_json::from_str::<serde_json::Value>(data_str).ok()?;
+    if data.get("action").and_then(|v| v.as_str()) != Some("stopped") {
+        return None;
+    }
+    let snapshot = data.get("snapshot")?;
+    let tool = snapshot
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let session_id = snapshot
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let launch_args = snapshot
+        .get("launch_args")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tag = snapshot
+        .get("tag")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let background = snapshot
+        .get("background")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        != 0;
+    let last_event_id = snapshot
+        .get("last_event_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let directory = snapshot
+        .get("directory")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let purpose = snapshot
+        .get("purpose")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let current = snapshot
+        .get("current")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some((
+        tool,
+        session_id,
+        launch_args,
+        tag,
+        background,
+        last_event_id,
+        directory,
+        purpose,
+        current,
+    ))
 }
 
 /// Build tool-specific resume/fork args from the integration spec.
@@ -3527,6 +3643,166 @@ mod tests {
         assert!(
             err.contains("Opencode"),
             "error should mention opencode: {err}"
+        );
+    }
+
+    const EXACT_SESSION_A: &str = "11111111-1111-1111-1111-111111111111";
+    const EXACT_SESSION_B: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn insert_stopped_snapshot(db: &HcomDb, instance: &str, session_id: &str, cursor: i64) {
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "claude",
+                "session_id": session_id,
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": cursor,
+                "directory": "/tmp",
+                "purpose": "",
+                "current": "",
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', ?, ?)",
+                rusqlite::params!["2026-01-01T00:00:00Z", instance, snapshot.to_string()],
+            )
+            .unwrap();
+    }
+
+    /// One name, two stopped sessions: A stopped first, then the name was
+    /// reused and B stopped later. The name's newest snapshot is B's.
+    fn reused_name_db_with_cursors(a_cursor: i64, b_cursor: i64) -> HcomDb {
+        let db = test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!(EXACT_SESSION_B));
+        data.insert("tool".into(), json!("claude"));
+        data.insert("status".into(), json!(ST_INACTIVE));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named("luna", &data).unwrap();
+        insert_stopped_snapshot(&db, "luna", EXACT_SESSION_A, a_cursor);
+        insert_stopped_snapshot(&db, "luna", EXACT_SESSION_B, b_cursor);
+        db
+    }
+
+    fn reused_name_db() -> HcomDb {
+        reused_name_db_with_cursors(0, 0)
+    }
+
+    #[test]
+    fn test_resolve_uuid_resumes_exact_session_not_newest() {
+        // `hcom r <A>` must carry `--resume A` even though the name's newest
+        // stopped snapshot belongs to the later session B.
+        let db = reused_name_db();
+        let (resolved, plan) =
+            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
+                .unwrap();
+        assert_eq!(resolved, "luna");
+        assert_eq!(plan.session_id, EXACT_SESSION_A);
+        assert!(
+            plan.launch.args.contains(&"--resume".to_string())
+                && plan.launch.args.contains(&EXACT_SESSION_A.to_string()),
+            "plan must carry --resume A, got: {:?}",
+            plan.launch.args
+        );
+        assert!(
+            !plan.launch.args.contains(&EXACT_SESSION_B.to_string()),
+            "plan must not leak the newer session, got: {:?}",
+            plan.launch.args
+        );
+    }
+
+    #[test]
+    fn test_resolve_name_still_resumes_newest_snapshot() {
+        // Control: `hcom r <name>` keeps meaning the name's newest snapshot.
+        let db = reused_name_db();
+        let (resolved, plan) =
+            resolve_name_to_plan(&db, "luna", false, &[], &GlobalFlags::default()).unwrap();
+        assert_eq!(resolved, "luna");
+        assert_eq!(plan.session_id, EXACT_SESSION_B);
+        assert!(
+            plan.launch.args.contains(&EXACT_SESSION_B.to_string()),
+            "plan must carry --resume B, got: {:?}",
+            plan.launch.args
+        );
+    }
+
+    #[test]
+    fn test_resolve_uuid_restores_the_name_newest_cursor() {
+        // Name reuse: A stopped at cursor 100, then `luna` was reused and B
+        // stopped at 500. Resuming A must restore the NAME's newest cursor
+        // (500), not A's stale 100 — restoring 100 would rewind the name's
+        // delivery cursor and redeliver messages B already consumed.
+        let db = reused_name_db_with_cursors(100, 500);
+        let (resolved, plan) =
+            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
+                .unwrap();
+        assert_eq!(resolved, "luna");
+        assert_eq!(plan.session_id, EXACT_SESSION_A);
+        assert_eq!(
+            plan.last_event_id, 500,
+            "restored cursor must be the name's newest, not A's stale snapshot cursor"
+        );
+        assert!(
+            plan.launch.args.contains(&"--resume".to_string())
+                && plan.launch.args.contains(&EXACT_SESSION_A.to_string()),
+            "plan must still carry --resume A, got: {:?}",
+            plan.launch.args
+        );
+    }
+
+    #[test]
+    fn test_resolve_uuid_keeps_a_higher_snapshot_cursor() {
+        // Grey zone: A's cursor is higher than the name's newest (the newer
+        // snapshot predates the cursor field, say). The max keeps A's cursor.
+        let db = reused_name_db_with_cursors(700, 500);
+        let (_resolved, plan) =
+            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
+                .unwrap();
+        assert_eq!(
+            plan.last_event_id, 700,
+            "a cursor above the name's newest must be kept"
+        );
+    }
+
+    #[test]
+    fn test_resolve_uuid_counts_the_instance_row_cursor() {
+        // The name's newest cursor also lives on the instance row when one
+        // exists: a row advanced past every snapshot must not be rewound.
+        let db = reused_name_db_with_cursors(100, 400);
+        let mut data = serde_json::Map::new();
+        data.insert("last_event_id".into(), json!(500));
+        crate::instances::update_instance_position(&db, "luna", &data);
+        let (_resolved, plan) =
+            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
+                .unwrap();
+        assert_eq!(
+            plan.last_event_id, 500,
+            "the instance row's cursor counts toward the name's newest"
+        );
+    }
+
+    #[test]
+    fn test_resolve_unknown_uuid_still_takes_adopt_path() {
+        // Grey zone: a UUID with no stopped snapshot falls through to
+        // on-disk adoption, as before — the adoption "not found" error (not
+        // the name-based "No stopped snapshot" error) proves the routing.
+        let db = reused_name_db();
+        let err = resolve_name_to_plan(
+            &db,
+            "12345678-1234-5678-1234-567812345678",
+            false,
+            &[],
+            &GlobalFlags::default(),
+        )
+        .err()
+        .expect("expected adoption lookup to fail for unknown UUID")
+        .to_string();
+        assert!(
+            err.contains("Session 12345678-1234-5678-1234-567812345678 not found"),
+            "expected adoption error, got: {err}"
         );
     }
 
