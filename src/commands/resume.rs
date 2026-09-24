@@ -1075,8 +1075,13 @@ fn find_earlier_session(
         let background = loaded.4;
         let env = child_envs[usize::from(background)]
             .get_or_insert_with(|| resume_child_env(launch_flags, background));
-        let (cwd, _) =
-            resume_working_dir(dir_override, false, &loaded.6, loaded.0 == "omp", Some(name))?;
+        let (cwd, _) = resume_working_dir(
+            dir_override,
+            false,
+            &loaded.6,
+            loaded.0 == "omp",
+            Some(name),
+        )?;
         if !omp_session_file_in_env(session_id, env, std::path::Path::new(&cwd)) {
             continue;
         }
