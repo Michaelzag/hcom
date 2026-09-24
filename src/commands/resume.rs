@@ -451,6 +451,19 @@ fn prepare_resume_plan_from_source(
         );
     }
 
+    // The name's delivery cursor must never move backwards on resume. A plan
+    // loaded from an older stopped snapshot (StoppedSession) carries that
+    // session's stale last_event_id while the name may have been reused since;
+    // restoring it verbatim would rewind the cursor and redeliver messages a
+    // later session already consumed. Restore max(snapshot cursor, name's
+    // newest cursor). For the Instance arm the snapshot already IS the name's
+    // newest, so the max is a no-op there; adoption has no name cursor.
+    let last_event_id = if is_adoption {
+        last_event_id
+    } else {
+        last_event_id.max(name_newest_cursor(db, &display_name))
+    };
+
     validate_resume_operation(&tool, fork)?;
     let inherited_tag = if tag.is_empty() {
         None
@@ -1058,6 +1071,24 @@ fn load_stopped_snapshot_by_session_id(
     }
 
     bail!("No stopped snapshot found for session '{session_id}'.")
+}
+
+/// The name's newest delivery cursor: its newest `life.stopped` snapshot's
+/// `last_event_id`, then the instance row's current cursor when a row exists.
+/// Resume must never restore a cursor below this — a plan loaded from an
+/// older stopped snapshot (exact-session resume) would otherwise rewind the
+/// name's message cursor and redeliver what a later session already consumed.
+fn name_newest_cursor(db: &HcomDb, name: &str) -> i64 {
+    let snapshot_cursor = load_stopped_snapshot(db, name)
+        .map(|(_, _, _, _, _, last_event_id, _, _, _)| last_event_id)
+        .unwrap_or(0);
+    let row_cursor = db
+        .get_instance_full(name)
+        .ok()
+        .flatten()
+        .map(|inst| inst.last_event_id)
+        .unwrap_or(0);
+    snapshot_cursor.max(row_cursor)
 }
 
 /// Parse one `life.stopped` event body into loaded instance data.
@@ -3618,7 +3649,7 @@ mod tests {
     const EXACT_SESSION_A: &str = "11111111-1111-1111-1111-111111111111";
     const EXACT_SESSION_B: &str = "22222222-2222-2222-2222-222222222222";
 
-    fn insert_stopped_snapshot(db: &HcomDb, instance: &str, session_id: &str) {
+    fn insert_stopped_snapshot(db: &HcomDb, instance: &str, session_id: &str, cursor: i64) {
         let snapshot = serde_json::json!({
             "action": "stopped",
             "snapshot": {
@@ -3627,7 +3658,7 @@ mod tests {
                 "launch_args": "[]",
                 "tag": "",
                 "background": 0,
-                "last_event_id": 0,
+                "last_event_id": cursor,
                 "directory": "/tmp",
                 "purpose": "",
                 "current": "",
@@ -3643,7 +3674,7 @@ mod tests {
 
     /// One name, two stopped sessions: A stopped first, then the name was
     /// reused and B stopped later. The name's newest snapshot is B's.
-    fn reused_name_db() -> HcomDb {
+    fn reused_name_db_with_cursors(a_cursor: i64, b_cursor: i64) -> HcomDb {
         let db = test_db();
         let mut data = serde_json::Map::new();
         data.insert("session_id".into(), json!(EXACT_SESSION_B));
@@ -3651,9 +3682,13 @@ mod tests {
         data.insert("status".into(), json!(ST_INACTIVE));
         data.insert("created_at".into(), json!(1.0));
         db.save_instance_named("luna", &data).unwrap();
-        insert_stopped_snapshot(&db, "luna", EXACT_SESSION_A);
-        insert_stopped_snapshot(&db, "luna", EXACT_SESSION_B);
+        insert_stopped_snapshot(&db, "luna", EXACT_SESSION_A, a_cursor);
+        insert_stopped_snapshot(&db, "luna", EXACT_SESSION_B, b_cursor);
         db
+    }
+
+    fn reused_name_db() -> HcomDb {
+        reused_name_db_with_cursors(0, 0)
     }
 
     #[test]
@@ -3691,6 +3726,61 @@ mod tests {
             plan.launch.args.contains(&EXACT_SESSION_B.to_string()),
             "plan must carry --resume B, got: {:?}",
             plan.launch.args
+        );
+    }
+
+    #[test]
+    fn test_resolve_uuid_restores_the_name_newest_cursor() {
+        // Name reuse: A stopped at cursor 100, then `luna` was reused and B
+        // stopped at 500. Resuming A must restore the NAME's newest cursor
+        // (500), not A's stale 100 — restoring 100 would rewind the name's
+        // delivery cursor and redeliver messages B already consumed.
+        let db = reused_name_db_with_cursors(100, 500);
+        let (resolved, plan) =
+            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
+                .unwrap();
+        assert_eq!(resolved, "luna");
+        assert_eq!(plan.session_id, EXACT_SESSION_A);
+        assert_eq!(
+            plan.last_event_id, 500,
+            "restored cursor must be the name's newest, not A's stale snapshot cursor"
+        );
+        assert!(
+            plan.launch.args.contains(&"--resume".to_string())
+                && plan.launch.args.contains(&EXACT_SESSION_A.to_string()),
+            "plan must still carry --resume A, got: {:?}",
+            plan.launch.args
+        );
+    }
+
+    #[test]
+    fn test_resolve_uuid_keeps_a_higher_snapshot_cursor() {
+        // Grey zone: A's cursor is higher than the name's newest (the newer
+        // snapshot predates the cursor field, say). The max keeps A's cursor.
+        let db = reused_name_db_with_cursors(700, 500);
+        let (_resolved, plan) =
+            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
+                .unwrap();
+        assert_eq!(
+            plan.last_event_id, 700,
+            "a cursor above the name's newest must be kept"
+        );
+    }
+
+    #[test]
+    fn test_resolve_uuid_counts_the_instance_row_cursor() {
+        // The name's newest cursor also lives on the instance row when one
+        // exists: a row advanced past every snapshot must not be rewound.
+        let db = reused_name_db_with_cursors(100, 400);
+        let mut data = serde_json::Map::new();
+        data.insert("last_event_id".into(), json!(500));
+        crate::instances::update_instance_position(&db, "luna", &data);
+        let (_resolved, plan) =
+            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
+                .unwrap();
+        assert_eq!(
+            plan.last_event_id, 500,
+            "the instance row's cursor counts toward the name's newest"
         );
     }
 
