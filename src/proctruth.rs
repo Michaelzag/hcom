@@ -271,12 +271,15 @@ struct CarrierTreeScope {
     known: HashMap<u32, (ProcMatch, String)>,
 }
 
-/// The owning roots and proven carriers from before the operation's first
-/// signal. Callers with a headless group signal capture this before that
-/// signal; callers with no pre-step capture at reap entry.
+/// The owning roots and carrier set from before the operation's first signal.
+/// Live carriers whose identity is unreadable stay in the set but cannot be
+/// signalled. Callers with a headless group signal capture before that step;
+/// callers with no pre-step capture at reap entry.
 pub(crate) struct ReapCapture {
     #[cfg(unix)]
     scope: CarrierTreeScope,
+    #[cfg(unix)]
+    carriers: Vec<ProcMatch>,
 }
 
 #[cfg(unix)]
@@ -324,8 +327,8 @@ pub(crate) fn capture_reap_carriers(
     #[cfg(unix)]
     {
         let mut scope = carrier_tree_scope(db, name, binding_ids);
-        snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
-        ReapCapture { scope }
+        let carriers = snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
+        ReapCapture { scope, carriers }
     }
     #[cfg(not(unix))]
     {
@@ -334,9 +337,20 @@ pub(crate) fn capture_reap_carriers(
     }
 }
 
+#[cfg(unix)]
+fn carrier_identity(pid: u32) -> Option<String> {
+    #[cfg(test)]
+    if MISSING_CARRIER_IDENTITY.with(|missing| missing.get() == Some(pid)) {
+        return None;
+    }
+    crate::sys::process::identity(pid)
+}
+
 /// Build a round's live carrier set. Proven members from an earlier snapshot
 /// survive reparenting only with the same OS process identity; new carriers
 /// must pass ancestry and the broker rule at their first snapshot.
+/// An unreadable identity is not death: keep a live carrier in the round
+/// without granting it a signalable identity in `scope.known`.
 #[cfg(unix)]
 fn snapshot_reap_carriers(
     name: &str,
@@ -346,9 +360,16 @@ fn snapshot_reap_carriers(
 ) -> Vec<ProcMatch> {
     let mut matches = live_carriers_for(name, binding_ids, exclude, Some(scope));
     matches.retain(|m| {
-        let Some(identity) = crate::sys::process::identity(m.pid) else {
-            log_carrier_out_of_scope(m.pid, name, scope);
-            return false;
+        let Some(identity) = carrier_identity(m.pid) else {
+            let alive = crate::sys::process::is_alive(m.pid);
+            if alive {
+                crate::log::log_info(
+                    "proctruth",
+                    "carrier_identity_unavailable",
+                    &format!("pid={} instance={name}", m.pid),
+                );
+            }
+            return alive;
         };
         match scope.known.get(&m.pid) {
             Some((_, original)) => {
@@ -412,7 +433,7 @@ fn carrier_in_signal_scope(pid: u32, name: &str, scope: &CarrierTreeScope) -> bo
     if scope
         .known
         .get(&pid)
-        .is_some_and(|(_, identity)| crate::sys::process::has_identity(pid, identity))
+        .is_some_and(|(_, identity)| carrier_identity(pid).as_ref() == Some(identity))
     {
         return true;
     }
@@ -463,11 +484,29 @@ fn enumerate_unix(
             continue;
         }
         let frozen = scope.and_then(|scope| scope.known.get(&pid));
-        if frozen.is_some_and(|(_, identity)| !crate::sys::process::has_identity(pid, identity)) {
-            if let Some(scope) = scope {
-                log_carrier_out_of_scope(pid, name, scope);
+        if let Some((original, identity)) = frozen {
+            match carrier_identity(pid) {
+                Some(current) if current != *identity => {
+                    if let Some(scope) = scope {
+                        log_carrier_out_of_scope(pid, name, scope);
+                    }
+                    continue;
+                }
+                None => {
+                    // A proven carrier may have lost its parent already.
+                    // Missing identity cannot authorize a signal, but a live
+                    // pid still blocks release even without an ancestry path.
+                    if crate::sys::process::is_alive(pid) {
+                        out.push(ProcMatch {
+                            pid,
+                            process_id,
+                            start_epoch: original.start_epoch,
+                        });
+                    }
+                    continue;
+                }
+                Some(_) => {}
             }
-            continue;
         }
         // A previously scoped descendant may have been reparented by an
         // earlier signal. Keep its broker decision, but never signal a pid
@@ -801,12 +840,11 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
         // (and, on headless paths, after the group signal). An empty first
         // capture still runs the KILL capture and epoch classification below:
         // an excluded owner may have forked a carrier since stop entry.
-        let mut matches: Vec<ProcMatch> = scope.known.values().map(|(m, _)| m.clone()).collect();
-        // Carriers of the first snapshot are this reap's own business and
-        // stay in scope at every round; only late-appearing carriers go
-        // through the scope rule below. `spared` captures each late
-        // carrier's spare decision once it is observed.
-        let started: Vec<u32> = matches.iter().map(|m| m.pid).collect();
+        let mut matches = capture.carriers;
+        // Only identified first-snapshot carriers belong to this epoch by
+        // fiat. Unidentified carriers still need the fresh-epoch check if
+        // their identity becomes readable in a later round.
+        let started: Vec<u32> = scope.known.keys().copied().collect();
         let mut spared: HashSet<u32> = HashSet::new();
         // Oldest first: pty wrapper before children.
         matches.sort_by(|a, b| {
@@ -984,6 +1022,7 @@ type RoundSeamSlot = std::cell::RefCell<Option<Box<dyn FnMut(RoundPoint)>>>;
 #[cfg(all(test, unix))]
 thread_local! {
     static ROUND_SEAM: RoundSeamSlot = std::cell::RefCell::new(None);
+    static MISSING_CARRIER_IDENTITY: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(all(test, unix))]
@@ -1056,8 +1095,8 @@ pub(crate) fn pids_outside_group(pgid: u32, pids: &[u32]) -> bool {
 }
 
 /// Recheck identity and the captured process incarnation before signalling.
-/// Captured carriers keep their scope after their parents die; a pid not yet
-/// captured must still satisfy broker ownership and current root ancestry.
+/// Captured carriers keep their scope after their parents die. A live carrier
+/// without a captured OS identity blocks release but is never signalled.
 #[cfg(unix)]
 fn pid_carries_instance(
     pid: u32,
@@ -1073,19 +1112,17 @@ fn pid_carries_instance(
     if !carries {
         return false;
     }
-    if let Some((_, identity)) = scope.known.get(&pid) {
-        if !crate::sys::process::has_identity(pid, identity) {
-            log_carrier_out_of_scope(pid, name, scope);
-            return false;
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        if std::fs::read_to_string(format!("/proc/{pid}/comm")).map_or(true, |comm| {
-            comm.trim_end_matches('\n') == "omp daemon brok"
-        }) {
-            log_carrier_out_of_scope(pid, name, scope);
-            return false;
-        }
-    } else if !carrier_eligible(pid) {
+    let Some((_, identity)) = scope.known.get(&pid) else {
+        return false;
+    };
+    if carrier_identity(pid).as_ref() != Some(identity) {
+        log_carrier_out_of_scope(pid, name, scope);
+        return false;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if std::fs::read_to_string(format!("/proc/{pid}/comm")).map_or(true, |comm| {
+        comm.trim_end_matches('\n') == "omp daemon brok"
+    }) {
         log_carrier_out_of_scope(pid, name, scope);
         return false;
     }
@@ -1700,6 +1737,7 @@ mod tests {
                 caller_ancestors: vec![std::process::id()],
                 known: HashMap::new(),
             },
+            carriers: Vec::new(),
         };
         assert!(
             reap_instance_tree_for_excluding_captured(
@@ -1712,6 +1750,30 @@ mod tests {
             .is_err(),
             "an unproven owner chain must never authorize release",
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn reap_keeps_live_unidentified_carriers_as_unsignalable_survivors() {
+        for previously_identified in [false, true] {
+            let db = test_db();
+            let name = unique_name("missing-identity");
+            let mut child = spawn_named_sleeper(&name, "");
+            let pid = child.id();
+            wait_for_enumerated(&name, &[], pid);
+            if !previously_identified {
+                MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
+            }
+            let capture = capture_reap_carriers(&db, &name, &[], &[]);
+            MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
+            let result = reap_instance_tree_for_excluding_captured(&db, &name, &[], &[], capture);
+            MISSING_CARRIER_IDENTITY.with(|missing| missing.set(None));
+            let alive = !process_gone(pid);
+            child.kill().ok();
+            child.wait().ok();
+            assert!(alive, "an unidentified carrier must not be signalled");
+            assert_eq!(result, Err(ReapError::Survivors(vec![pid])));
+        }
     }
 
     #[test]
