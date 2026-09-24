@@ -171,52 +171,57 @@ impl HcomDb {
         let tx = self.conn.unchecked_transaction()?;
         let rows = {
             let mut stmt = tx.prepare(
-                "SELECT id, data FROM events WHERE json_extract(data, '$.snapshot.created_at') IS NOT NULL
+                "SELECT id, json_extract(data, '$.snapshot') FROM events WHERE json_extract(data, '$.snapshot.created_at') IS NOT NULL
                  AND json_extract(data, '$.snapshot.created_at_bits') IS NULL",
             )?;
             stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.collect::<Result<Vec<_>>>()?
         };
-        for (id, data) in rows {
-            let Some(bits) = raw_created_at_bits(&data) else { continue };
-            let Some(snapshot_start) = data.find("\"snapshot\"") else { continue };
-            let Some(open) = data[snapshot_start..].find('{').map(|i| snapshot_start + i) else { continue };
-            let mut depth = 0usize;
-            let mut end = None;
-            for (i, ch) in data[open..].char_indices() {
-                match ch { '{' => depth += 1, '}' => { depth -= 1; if depth == 0 { end = Some(open + i); break } }, _ => {} }
-            }
-            let Some(end) = end else { continue };
-            let mut updated = String::with_capacity(data.len() + 32);
-            updated.push_str(&data[..end]);
-            updated.push_str(&format!(",\"created_at_bits\":{bits}"));
-            updated.push_str(&data[end..]);
-            tx.execute("UPDATE events SET data = ?1 WHERE id = ?2", rusqlite::params![updated, id])?;
+        for (id, snapshot) in rows {
+            let Some(bits) = raw_created_at_bits(&snapshot) else { continue };
+            tx.execute(
+                "UPDATE events SET data = json_set(data, '$.snapshot.created_at_bits', ?1) WHERE id = ?2",
+                rusqlite::params![bits as i64, id],
+            )?;
         }
         tx.commit()?;
         Ok(())
     }
 
 fn raw_created_at_bits(data: &str) -> Option<u64> {
-    let key = "\"created_at\"";
-    let start = data.find(key)? + key.len();
-    let rest = data[start..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let (token, _) = if let Some(quoted) = rest.strip_prefix('"') {
-        (quoted.split_once('"')?.0, true)
-    } else {
-        (rest.split(|c: char| c == ',' || c == '}' || c.is_whitespace()).next()?, false)
-    };
-    let _ = rest;
-    token.parse::<f64>().ok().map(f64::to_bits)
-}
-
-    /// Access the filesystem path backing this DB handle.
-    pub fn path(&self) -> &std::path::Path {
-        &self.db_path
+    let bytes = data.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if in_string {
+            if escaped { escaped = false; }
+            else if ch == '\\' { escaped = true; }
+            else if ch == '"' { in_string = false; }
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            if data[i..].starts_with("\"created_at\"") {
+                let mut j = i + 12;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+                if bytes.get(j) != Some(&b':') { i += 1; continue; }
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
+                let start = j;
+                if bytes.get(j) == Some(&b'"') {
+                    j += 1;
+                    while j < bytes.len() && bytes[j] != b'"' { j += 1; }
+                    while j < bytes.len() && !matches!(bytes[j], b',' | b'}') { j += 1; }
+                }
+                return data[start..j].trim_matches('"').parse::<f64>().ok().map(f64::to_bits);
+            }
+            in_string = true;
+        }
+        i += 1;
     }
-
-    /// Open the hcom database at ~/.hcom/hcom.db with schema migration/compat.
-    pub fn open() -> Result<Self> {
+    None
+}
         let hcom_dir = crate::paths::hcom_dir();
         crate::paths::ensure_private_directory(&hcom_dir)
             .with_context(|| format!("Failed to secure hcom directory: {}", hcom_dir.display()))?;
@@ -494,8 +499,11 @@ fn raw_created_at_bits(data: &str) -> Option<u64> {
     pub fn ensure_schema(&mut self) -> Result<()> {
         match self.check_schema_compat()? {
             SchemaCompat::Ok => {
+                let old_version: i32 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                 self.init_db()?;
-                self.migrate_created_at_bits()?;
+                if old_version < 20 {
+                    self.migrate_created_at_bits()?;
+                }
                 Ok(())
             }
             SchemaCompat::NeedsArchive(reason, old_version) => {
