@@ -1838,7 +1838,7 @@ fn stop_instance_inner_scoped(
 struct TeardownOwner {
     pid: u32,
     process_start: String,
-    created_at: f64,
+    created_at_bits: u64,
     session_id: Option<String>,
 }
 
@@ -1871,7 +1871,9 @@ impl<'a> TeardownClaim<'a> {
         let value = serde_json::json!({
             "pid": pid,
             "process_start": process_start,
-            "created_at": created_at,
+            // Preserve the exact SQLite f64; JSON's default float parser can
+            // round a fractional timestamp to a neighboring representable value.
+            "created_at_bits": created_at.to_bits(),
             "session_id": session_id,
         })
         .to_string();
@@ -1913,7 +1915,8 @@ fn yield_to_teardown(db: &HcomDb, instance_name: &str) -> bool {
                     .ok()
                     .flatten()
                     .is_some_and(|row| {
-                        row.created_at == owner.created_at && row.session_id == owner.session_id
+                        row.created_at.to_bits() == owner.created_at_bits
+                            && row.session_id == owner.session_id
                     })
         });
     if live {
@@ -3300,15 +3303,16 @@ mod tests {
             insert_test_instance(&db, name);
             db.set_process_binding("claim-process", "claim-session", name)
                 .unwrap();
-            let value = serde_json::json!({
-                "pid": std::process::id(),
-                "process_start": crate::sys::process::identity(std::process::id()).unwrap(),
-                "created_at": 0.0,
-                "session_id": null,
-            })
-            .to_string();
-            db.kv_set(&format!("teardown_claim:{name}"), Some(&value))
+            // Integer timestamps hid the lossy JSON float parser. This
+            // fractional created_at must keep the live claim's identity.
+            let created_at = f64::from_bits(4745294612153761801);
+            db.conn()
+                .execute(
+                    "UPDATE instances SET created_at = ? WHERE name = ?",
+                    params![created_at, name],
+                )
                 .unwrap();
+            let _claim = TeardownClaim::register(&db, name, created_at, None).unwrap();
             let updates = serde_json::json!({"transcript_path": "/ended/transcript"});
             if soft {
                 soft_finalize_session(&db, name, "shutdown", updates.as_object(), false);
@@ -3371,9 +3375,9 @@ mod tests {
         let (_dir, db) = make_test_db();
         for value in [
             "not-json".to_string(),
-            serde_json::json!({"pid": std::process::id(), "process_start": "wrong-start", "created_at": 0.0, "session_id": null})
+            serde_json::json!({"pid": std::process::id(), "process_start": "wrong-start", "created_at_bits": 0_u64, "session_id": null})
                 .to_string(),
-            serde_json::json!({"pid": u32::MAX, "process_start": "dead", "created_at": 0.0, "session_id": null}).to_string(),
+            serde_json::json!({"pid": u32::MAX, "process_start": "dead", "created_at_bits": 0_u64, "session_id": null}).to_string(),
         ] {
             for soft in [false, true] {
                 let name = "stale-claim";
@@ -3427,7 +3431,7 @@ mod tests {
         let foreign = serde_json::json!({
             "pid": std::process::id().wrapping_add(1),
             "process_start": "another-killer",
-            "created_at": 0.0,
+            "created_at_bits": 0_u64,
             "session_id": null,
         })
         .to_string();
