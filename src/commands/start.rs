@@ -360,8 +360,8 @@ fn restore_child_links_after_root_rebind(
     })
 }
 
-// Test seam: runs between a rebind clearing its target and recreating the
-// row, so a test can land a concurrent reclaim of the same name in that gap.
+// Test seam: runs between a rebind's planning reads and its one write
+// transaction, so a test can commit a competing reclaim of the name there.
 #[cfg(test)]
 thread_local! {
     static REBIND_CREATE_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
@@ -503,69 +503,65 @@ fn start_rebind(
         Err(_) => None,
     };
 
-    // Skip delete for remote instances (origin_device_id)
-    if let Some(ref td) = target_data
-        && (td.origin_device_id.is_none() || td.origin_device_id.as_deref() == Some(""))
-        && let Err(e) = db.delete_instance(&target_name)
-    {
-        eprintln!("[hcom] warn: delete_instance failed for {target_name}: {e}");
-    }
+    // A kept remote row is updated in place and never takes a local anchor;
+    // a local target row is replaced. `planned_target` is the local row this
+    // rebind planned to replace, by its creation-time bits.
+    let kept_remote_row = target_data
+        .as_ref()
+        .and_then(|td| td.origin_device_id.as_deref())
+        .is_some_and(|device| !device.is_empty());
+    let planned_target = target_data.as_ref().map(|row| row.created_at.to_bits());
+    let tool = ctx.tool.as_str();
+    let cwd_override = ctx.cwd.to_string_lossy().to_string();
+    let binding_sid = session_id.as_deref().unwrap_or("");
 
-    // Clean up target's bindings
-    if let Err(e) = db.delete_process_bindings_for_instance(&target_name) {
-        eprintln!("[hcom] warn: delete_process_bindings failed for {target_name}: {e}");
-    }
-    if let Err(e) = db.delete_session_bindings_for_instance(&target_name) {
-        eprintln!("[hcom] warn: delete_session_bindings failed for {target_name}: {e}");
-    }
-
-    // Delete old identity if different from target. A rename is recorded as
-    // the old name's stop, so it never disappears without a life event.
-    if current_row.is_some() {
-        let snapshot = db.get_instance_snapshot(&current_name).ok().flatten();
-        let life = json!({
-            "action": "stopped",
-            "by": current_name,
-            "reason": "renamed",
-            "renamed_to": target_name,
-            "process_id": ctx.process_id,
-            "snapshot": snapshot,
-        });
-        if let Err(e) = db.log_event("life", &current_name, &life) {
-            eprintln!("[hcom] warn: rename life event failed for {current_name}: {e}");
-        }
-    }
-    if !current_name.is_empty()
-        && current_name != target_name
-        && let Err(e) = db.delete_instance(&current_name)
-    {
-        eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
-    }
-
-    // Test seam: a concurrent reclaim of the same name lands here, after this
-    // one cleared the target and before it recreates the row.
+    // Test seam: a competing reclaim of the same name commits here, after
+    // this rebind planned and before it writes.
     #[cfg(test)]
     if let Some(hook) = REBIND_CREATE_GAP_HOOK.with(std::cell::Cell::take) {
         hook(db, &target_name);
     }
 
-    // Create the row, restore its anchor pid and bind the process id in ONE
-    // write transaction. A row found here that this rebind did not keep is a
-    // concurrent reclaim's (it recreated the name after this one cleared
-    // it): refuse and write nothing, so neither this anchor pid nor this
-    // binding lands on a row this call did not create. A kept remote row is
-    // updated in place as before and never takes a local anchor.
-    let kept_remote_row = target_data
-        .as_ref()
-        .and_then(|td| td.origin_device_id.as_deref())
-        .is_some_and(|device| !device.is_empty());
-    let tool = ctx.tool.as_str();
-    let cwd_override = ctx.cwd.to_string_lossy().to_string();
-    let binding_sid = session_id.as_deref().unwrap_or("");
-    let created = db.with_immediate_transaction(|_tx| {
-        if !kept_remote_row && db.get_instance_full(&target_name)?.is_some() {
+    // Every write of the rebind happens in ONE write transaction: replacing
+    // the target row and its bindings, recording and removing the renamed-
+    // away identity, creating the target row with its verified anchor pid
+    // and cursor, and the bindings. Either all of it commits or none of it
+    // does. The target is re-read first: a local row other than the planned
+    // one was committed by a competing reclaim, so this rebind refuses with
+    // nothing written — the caller keeps its row, cursor and bindings, and
+    // no anchor pid or binding lands on a row this call did not create.
+    let committed = db.with_immediate_transaction(|_tx| {
+        let occupant = db.get_instance_full(&target_name)?;
+        if !kept_remote_row
+            && let Some(occupant) = occupant
+            && Some(occupant.created_at.to_bits()) != planned_target
+        {
             return Ok(None);
         }
+        if !kept_remote_row {
+            db.delete_instance(&target_name)?;
+        }
+        db.delete_process_bindings_for_instance(&target_name)?;
+        db.delete_session_bindings_for_instance(&target_name)?;
+
+        // A rename is recorded as the old name's stop, so it never
+        // disappears without a life event.
+        if current_row.is_some() {
+            let snapshot = db.get_instance_snapshot(&current_name)?;
+            let life = json!({
+                "action": "stopped",
+                "by": current_name,
+                "reason": "renamed",
+                "renamed_to": target_name,
+                "process_id": ctx.process_id,
+                "snapshot": snapshot,
+            });
+            db.log_event("life", &current_name, &life)?;
+        }
+        if !current_name.is_empty() && current_name != target_name {
+            db.delete_instance(&current_name)?;
+        }
+
         if !instance_binding::initialize_instance_in_position_file(
             db,
             &target_name,
@@ -584,12 +580,40 @@ fn start_rebind(
         ) {
             bail!("could not create the instance row for '{target_name}'");
         }
+        // Restore cursor position + mark as announced
+        let mut updates = serde_json::Map::new();
+        if let Some(eid) = last_event_id {
+            updates.insert("last_event_id".into(), serde_json::json!(eid));
+        }
+        updates.insert("name_announced".into(), serde_json::json!(1));
+        db.update_instance_fields(&target_name, &updates)?;
         let restored_pid = match &anchor {
             Ok(matched) if !kept_remote_row => db
                 .set_instance_pid_if_unset(&target_name, matched.pid)?
                 .then_some(matched.pid),
             _ => None,
         };
+
+        if let Some(sid) = &session_id {
+            if let Err(e) = db.set_session_binding(sid, &target_name) {
+                eprintln!("[hcom] warn: set_session_binding failed for {target_name}: {e}");
+            } else if ctx.tool == crate::tool::Tool::Claude
+                && let Err(e) = db.mark_claude_session_validated(sid, &target_name)
+            {
+                // The cache still names the identity being replaced, and it is
+                // keyed by session generation, so it does not expire on its
+                // own. Left stale, every hook for this session resolves to
+                // no_instance: no status, no delivery, and the reclaimed row is
+                // flagged launch_failed ~30s later while the session is alive
+                // and bound.
+                eprintln!(
+                    "[hcom] warn: mark_claude_session_validated failed for {target_name}: {e}"
+                );
+            }
+            if !current_name.is_empty() && current_name != target_name {
+                db.rebind_claude_root_actor_state(sid, &current_name, &target_name)?;
+            }
+        }
         let created_refused_binding = if let Some(process_id) = &ctx.process_id {
             db.set_process_binding(process_id, binding_sid, &target_name)?;
             false
@@ -602,54 +626,25 @@ fn start_rebind(
         };
         Ok(Some((restored_pid, created_refused_binding)))
     })?;
-    let Some((restored_pid, created_refused_binding)) = created else {
+    let Some((restored_pid, created_refused_binding)) = committed else {
         eprintln!(
-            "Error: '{target_name}' was recreated by a concurrent reclaim while this one ran; \
-             nothing was written to it.\n\
+            "Error: '{target_name}' was reclaimed by another session while this one ran; \
+             nothing was changed.\n\
              If this session should hold '{target_name}', run 'hcom start --as {target_name}' again."
         );
         return Ok(1);
     };
 
-    if let Some(ref sid) = session_id {
+    // The child links keep their own write transaction.
+    if let Some(sid) = &session_id {
         let old_root = if current_name.is_empty() {
             target_name.as_str()
         } else {
             current_name.as_str()
         };
         restore_child_links_after_root_rebind(db, &child_links, sid, old_root, &target_name)?;
-        if old_root != target_name {
-            db.rebind_claude_root_actor_state(sid, old_root, &target_name)?;
-        }
     }
 
-    // Restore cursor position + mark as announced
-    {
-        let mut updates = serde_json::Map::new();
-        if let Some(eid) = last_event_id {
-            updates.insert("last_event_id".into(), serde_json::json!(eid));
-        }
-        updates.insert("name_announced".into(), serde_json::json!(1));
-        if let Err(e) = db.update_instance_fields(&target_name, &updates) {
-            eprintln!("[hcom] warn: update_instance_fields failed for {target_name}: {e}");
-        }
-    }
-
-    // Create bindings
-    if let Some(ref sid) = session_id {
-        if let Err(e) = db.set_session_binding(sid, &target_name) {
-            eprintln!("[hcom] warn: set_session_binding failed for {target_name}: {e}");
-        } else if ctx.tool == crate::tool::Tool::Claude
-            && let Err(e) = db.mark_claude_session_validated(sid, &target_name)
-        {
-            // The cache still names the identity being replaced, and it is keyed
-            // by session generation, so it does not expire on its own. Left
-            // stale, every hook for this session resolves to no_instance: no
-            // status, no delivery, and the reclaimed row is flagged
-            // launch_failed ~30s later while the session is alive and bound.
-            eprintln!("[hcom] warn: mark_claude_session_validated failed for {target_name}: {e}");
-        }
-    }
     let mut bound_process_id = ctx.process_id.clone();
     if created_refused_binding && let Some(process_id) = claimable_refused_id {
         bound_process_id = trust_restored_binding(db, ctx, process_id, &target_name);
@@ -2167,6 +2162,62 @@ mod tests {
         assert_eq!(life["renamed_to"], target.as_str());
         assert_eq!(life["snapshot"]["session_id"], "sess-r");
         assert_eq!(life["snapshot"]["last_event_id"], 9);
+    }
+
+    /// A competing reclaim commits the target row after this rebind planned
+    /// and before it writes. The rebind must refuse with nothing written:
+    /// the caller keeps its row, cursor, bindings and life history, and the
+    /// competitor's row is untouched.
+    #[test]
+    #[serial]
+    fn test_rebind_losing_race_leaves_caller_unchanged() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let caller = format!("race_caller_{}", std::process::id());
+        let target = format!("race_target_{}", std::process::id());
+        log_stopped_snapshot(&db, &target, "claude", "/tmp/project", "sess-t", 100);
+        bind_caller(&db, &caller, "sess-c", "proc-c", 500);
+        fn competitor_commits_target(db: &HcomDb, name: &str) {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances
+                     (name, session_id, tool, directory, last_event_id, status,
+                      status_time, last_seen, created_at)
+                     VALUES (?1, 'sess-other', 'claude', '/tmp/project', 7, 'active', 0, 0, 3)",
+                    params![name],
+                )
+                .unwrap();
+        }
+        REBIND_CREATE_GAP_HOOK.with(|hook| hook.set(Some(competitor_commits_target)));
+
+        let code = start_rebind(&db, &target, &caller_ctx("proc-c"), None, None).unwrap();
+        REBIND_CREATE_GAP_HOOK.with(|hook| hook.set(None));
+
+        let row = db
+            .get_instance_full(&caller)
+            .unwrap()
+            .expect("the caller keeps its row");
+        assert_eq!(code, 1, "the rebind that lost the race refuses");
+        assert_eq!(row.session_id.as_deref(), Some("sess-c"));
+        assert_eq!(row.last_event_id, 500);
+        assert_eq!(
+            db.get_session_binding("sess-c").unwrap().as_deref(),
+            Some(caller.as_str())
+        );
+        assert_eq!(
+            db.get_process_binding_full("proc-c").unwrap(),
+            Some((Some("sess-c".to_string()), caller.clone()))
+        );
+        assert!(
+            !identity::has_life_history(&db, &caller),
+            "no rename was recorded"
+        );
+        let competitor = db
+            .get_instance_full(&target)
+            .unwrap()
+            .expect("competitor's row");
+        assert_eq!(competitor.session_id.as_deref(), Some("sess-other"));
+        assert_eq!(competitor.last_event_id, 7);
     }
 
     /// A launcher id shape (8-4-4-4-12 lowercase hex): trusted only through a
