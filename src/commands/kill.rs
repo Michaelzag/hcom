@@ -482,7 +482,7 @@ fn classify_lost_teardown(
                 json_extract(data, '$.snapshot.agent_id'), \
                 json_extract(data, '$.snapshot') FROM events \
          WHERE type = 'life' AND instance = ?1 \
-           AND json_extract(data, '$.action') = 'stopped' \
+           AND COALESCE(json_extract(data, '$.reason'), '') != 'stale-harness-exit' \
            AND (json_extract(data, '$.by') IN ('session', 'pty') \
              OR json_extract(data, '$.by') = 'daemon')",
     )?;
