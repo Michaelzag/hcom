@@ -107,6 +107,14 @@ pub(crate) const OMP_REJECTED_ARGS: &[RejectedArg] = &[
         kind: RejectedArgKind::Flag,
     },
     RejectedArg {
+        // The omp plugin treats a session with no session file as a throwaway
+        // probe and stays inert (no bind, no delivery), so an hcom-launched
+        // `--no-session` seat would lose binding for its whole life.
+        token: "--no-session",
+        reason: "runs without a session file, so hcom cannot bind, deliver to, or resume it",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
         // `omp acp` forces mode=acp and starts an ACP stdio server with no TUI
         // readiness marker — same class as OpenCode/Kilo `acp`. The `--mode`
         // flag rejection above does not cover it because `acp` is a root
@@ -254,16 +262,26 @@ mod tests {
             vec!["--mode".to_string(), "json".to_string()],
             vec!["--mode=rpc".to_string()],
             vec!["--no-extensions".to_string()],
+            // A no-session seat keeps no session file, so the omp plugin's
+            // probe gate would classify it as a probe and leave it unbound and
+            // undeliverable for its whole life. Reject it at launch instead.
+            vec!["--no-session".to_string()],
         ] {
             let errors = validate_rejected_args("Oh My Pi", "hcom omp", &args, OMP_REJECTED_ARGS);
             assert_eq!(errors.len(), 1, "expected rejection for {args:?}");
         }
 
+        // Normal session-related args keep working.
         assert!(
             validate_rejected_args(
                 "Oh My Pi",
                 "hcom omp",
-                &["--model".to_string(), "opus".to_string()],
+                &[
+                    "--session-dir".to_string(),
+                    "/sessions".to_string(),
+                    "--model".to_string(),
+                    "opus".to_string(),
+                ],
                 OMP_REJECTED_ARGS,
             )
             .is_empty()
