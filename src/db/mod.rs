@@ -167,17 +167,30 @@ impl HcomDb {
         txn.commit()?;
         Ok(result)
     }
+
+    /// One-shot v20 backfill: give every `stopped` snapshot that carries
+    /// `created_at` the exact f64 bit pattern beside it.
+    ///
+    /// The rows are selected through `json_extract(data, '$.snapshot')` so
+    /// the scan sees the snapshot object alone, and the numeric token is
+    /// parsed with `str::parse::<f64>` (correctly rounded) — both SQLite's
+    /// scalar decode and a serde round trip lose ULPs. The rewrite is a
+    /// `json_set`, so every other field of the row, adversarial braces and
+    /// quote bait included, is preserved byte for byte.
     fn migrate_created_at_bits(&self) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        let rows = {
+        let rows: Vec<(i64, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, json_extract(data, '$.snapshot') FROM events WHERE json_extract(data, '$.snapshot.created_at') IS NOT NULL
                  AND json_extract(data, '$.snapshot.created_at_bits') IS NULL",
             )?;
-            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.collect::<Result<Vec<_>>>()?
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for (id, snapshot) in rows {
-            let Some(bits) = raw_created_at_bits(&snapshot) else { continue };
+            let Some(bits) = raw_created_at_bits(&snapshot) else {
+                continue;
+            };
             tx.execute(
                 "UPDATE events SET data = json_set(data, '$.snapshot.created_at_bits', ?1) WHERE id = ?2",
                 rusqlite::params![bits as i64, id],
@@ -187,41 +200,13 @@ impl HcomDb {
         Ok(())
     }
 
-fn raw_created_at_bits(data: &str) -> Option<u64> {
-    let bytes = data.as_bytes();
-    let mut i = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        if in_string {
-            if escaped { escaped = false; }
-            else if ch == '\\' { escaped = true; }
-            else if ch == '"' { in_string = false; }
-            i += 1;
-            continue;
-        }
-        if ch == '"' {
-            if data[i..].starts_with("\"created_at\"") {
-                let mut j = i + 12;
-                while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
-                if bytes.get(j) != Some(&b':') { i += 1; continue; }
-                j += 1;
-                while j < bytes.len() && bytes[j].is_ascii_whitespace() { j += 1; }
-                let start = j;
-                if bytes.get(j) == Some(&b'"') {
-                    j += 1;
-                    while j < bytes.len() && bytes[j] != b'"' { j += 1; }
-                    while j < bytes.len() && !matches!(bytes[j], b',' | b'}') { j += 1; }
-                }
-                return data[start..j].trim_matches('"').parse::<f64>().ok().map(f64::to_bits);
-            }
-            in_string = true;
-        }
-        i += 1;
+    /// Access the filesystem path backing this DB handle.
+    pub fn path(&self) -> &std::path::Path {
+        &self.db_path
     }
-    None
-}
+
+    /// Open the hcom database at ~/.hcom/hcom.db with schema migration/compat.
+    pub fn open() -> Result<Self> {
         let hcom_dir = crate::paths::hcom_dir();
         crate::paths::ensure_private_directory(&hcom_dir)
             .with_context(|| format!("Failed to secure hcom directory: {}", hcom_dir.display()))?;
@@ -497,11 +482,17 @@ fn raw_created_at_bits(data: &str) -> Option<u64> {
     /// Checks schema version, archives DB if mismatched, reconnects, and reinitializes.
     /// Call after open() for production use.
     pub fn ensure_schema(&mut self) -> Result<()> {
+        // Read the version this handle opened ONCE: the v20 created_at-bits
+        // backfill is run-once, gated on the version found at open, not on
+        // whatever `init_db`/`try_apply_migrations` stamp afterwards.
+        let opened_version: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
         match self.check_schema_compat()? {
             SchemaCompat::Ok => {
-                let old_version: i32 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                 self.init_db()?;
-                if old_version < 20 {
+                if opened_version < 20 {
                     self.migrate_created_at_bits()?;
                 }
                 Ok(())
@@ -514,7 +505,12 @@ fn raw_created_at_bits(data: &str) -> Option<u64> {
                     // start, so key off the columns actually present.
                     let migrate_from = self.repair_migrate_from(version);
                     match self.try_apply_migrations(migrate_from) {
-                        Ok(true) => return Ok(()),
+                        Ok(true) => {
+                            if migrate_from < 20 {
+                                self.migrate_created_at_bits()?;
+                            }
+                            return Ok(());
+                        }
                         Ok(false) => {}
                         Err(e) => {
                             crate::log::log_warn(
@@ -1052,6 +1048,80 @@ fn raw_created_at_bits(data: &str) -> Option<u64> {
         // Delegates to db::subscriptions; events_sub: kv ownership lives there.
         subscriptions::send_message_as(self, sender_name, sender_kind, message)
     }
+}
+
+/// Extract the exact `f64` bit pattern of the first `"created_at"` key in a
+/// raw JSON document. Scans the raw bytes, skipping over JSON string
+/// contents so a `"created_at"` decoy inside a string is never mistaken for
+/// the key, and hands the token itself to `str::parse::<f64>` — correctly
+/// rounded, where serde_json's own f64 parser drops the last ULP on roughly
+/// one epoch value in eight.
+///
+/// Both token shapes are accepted: a bare number (`"created_at":1.5`) and a
+/// quoted one (`"created_at":"1.5"`), which the scan takes to the closing
+/// quote and the surrounding delimiter.
+fn raw_created_at_bits(data: &str) -> Option<u64> {
+    let bytes = data.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            if data[i..].starts_with("\"created_at\"") {
+                let mut j = i + 12;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if bytes.get(j) != Some(&b':') {
+                    i += 1;
+                    continue;
+                }
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let start = j;
+                if bytes.get(j) == Some(&b'"') {
+                    // Quoted token: take the string, then run past its
+                    // closing quote to the delimiter that ends the value.
+                    j += 1;
+                    while j < bytes.len() && bytes[j] != b'"' {
+                        j += 1;
+                    }
+                    while j < bytes.len() && !matches!(bytes[j], b',' | b'}') {
+                        j += 1;
+                    }
+                } else {
+                    // Bare number: take the JSON number token itself.
+                    while j < bytes.len()
+                        && matches!(bytes[j], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                    {
+                        j += 1;
+                    }
+                }
+                return data[start..j]
+                    .trim_matches('"')
+                    .parse::<f64>()
+                    .ok()
+                    .map(f64::to_bits);
+            }
+            in_string = true;
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Generate ISO timestamp for current time.
@@ -1859,5 +1929,129 @@ pub(super) mod tests {
         );
         cleanup_test_db(db_path);
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// The v20 backfill derives `snapshot.created_at_bits` from the raw JSON
+    /// token: `json_extract`'s scalar decode and a serde f64 round trip both
+    /// lose ULPs, `str::parse::<f64>` does not. The row is rewritten with
+    /// `json_set`, so every other field — adversarial braces and a literal
+    /// `"created_at"` inside string bait included — survives untouched.
+    ///
+    /// The backfill is RUN-ONCE: it fires on the first open that upgrades a
+    /// database from below v20, and a database already stamped v20 is never
+    /// rescanned (pinned here by the second event).
+    #[test]
+    fn events_migration_derives_created_at_bits_without_float_loss() {
+        const NUMBER_TOKEN: &str = "1790000000.0000021";
+        const NUMBER_BITS: u64 = 4_745_294_612_153_761_801;
+        const STRING_TOKEN: &str = "1762720048.770769";
+        const STRING_BITS: u64 = 4_745_180_191_745_201_223;
+        // Guard the fixtures themselves: std parse is the exact decoder.
+        assert_eq!(NUMBER_TOKEN.parse::<f64>().unwrap().to_bits(), NUMBER_BITS);
+        assert_eq!(STRING_TOKEN.parse::<f64>().unwrap().to_bits(), STRING_BITS);
+
+        let number_row = format!(
+            r#"{{"action":"stopped","by":"session","reason":"exit","process_id":null,"snapshot":{{"name":"num","created_at":{NUMBER_TOKEN},"tool":"codex"}}}}"#
+        );
+        let string_row = format!(
+            r#"{{"action":"stopped","by":"session","reason":"exit","process_id":null,"snapshot":{{"name":"str","created_at":"{STRING_TOKEN}"}}}}"#
+        );
+        let adversarial_row = format!(
+            r#"{{"action":"stopped","by":"session","reason":"exit","process_id":null,"hints":"use {{}} and \"created_at\": 999.5","text":"{{\"created_at\": 42}}","snapshot":{{"name":"adv","hints":"literal \"created_at\": 1.5 inside a string","created_at":{STRING_TOKEN}}}}}"#
+        );
+        let post_v20_row = format!(
+            r#"{{"action":"stopped","by":"session","reason":"exit","process_id":null,"snapshot":{{"name":"late","created_at":{NUMBER_TOKEN}}}}}"#
+        );
+
+        let (mut db, db_path) = setup_full_test_db();
+        // Stand the database back at v19 — the shape production opens.
+        db.conn
+            .execute_batch("PRAGMA user_version = 19")
+            .unwrap();
+        for (name, data) in [
+            ("num", &number_row),
+            ("str", &string_row),
+            ("adv", &adversarial_row),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', ?, ?)",
+                    params!["2026-01-01T00:00:00Z", name, data],
+                )
+                .unwrap();
+        }
+
+        // Production entry: open() -> ensure_schema().
+        db.ensure_schema().unwrap();
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            20
+        );
+
+        for (name, original, expected_bits) in [
+            ("num", &number_row, NUMBER_BITS),
+            ("str", &string_row, STRING_BITS),
+            ("adv", &adversarial_row, STRING_BITS),
+        ] {
+            let raw: String = db
+                .conn
+                .query_row(
+                    "SELECT data FROM events WHERE type='life' AND instance=?1",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let bits = migrated["snapshot"]
+                .as_object_mut()
+                .unwrap()
+                .remove("created_at_bits")
+                .expect("created_at_bits added");
+            assert_eq!(
+                bits.as_u64(),
+                Some(expected_bits),
+                "{name}: bits derived from the real snapshot.created_at"
+            );
+            let original: serde_json::Value = serde_json::from_str(original).unwrap();
+            assert_eq!(&migrated, &original, "{name}: only the key was added");
+        }
+        // The fractional token itself was not reformatted by the rewrite.
+        let num_raw: String = db
+            .conn
+            .query_row(
+                "SELECT data FROM events WHERE type='life' AND instance='num'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            num_raw.contains(&format!(r#""created_at":{NUMBER_TOKEN}"#)),
+            "raw token preserved: {num_raw}"
+        );
+
+        // Run-once gating: a DB already at v20 is NOT backfilled on re-open.
+        db.conn
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', 'late', ?)",
+                params!["2026-01-01T00:00:00Z", &post_v20_row],
+            )
+            .unwrap();
+        db.ensure_schema().unwrap();
+        let late: String = db
+            .conn
+            .query_row(
+                "SELECT data FROM events WHERE type='life' AND instance='late'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            late, post_v20_row,
+            "a v20 database is never rescanned by the backfill"
+        );
+
+        cleanup_test_db(db_path);
     }
 }

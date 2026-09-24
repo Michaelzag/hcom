@@ -1457,8 +1457,21 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             );
             continue;
         }
-        // Vanished: snapshot, stopped by=daemon, release.
+        // Vanished: snapshot, stopped by=daemon, release. The exact bit
+        // pattern rides beside created_at so a later reader can match the
+        // incarnation without a lossy float decode.
         let snapshot = db.get_instance_snapshot(&inst.name).unwrap_or(None);
+        let snapshot = snapshot.map(|mut snapshot| {
+            if let Some(created_at) = snapshot.get("created_at").and_then(serde_json::Value::as_f64)
+                && let Some(object) = snapshot.as_object_mut()
+            {
+                object.insert(
+                    "created_at_bits".to_string(),
+                    serde_json::json!(created_at.to_bits()),
+                );
+            }
+            snapshot
+        });
         let process_id = newest.as_ref().map(|(p, _)| p.as_str());
         let data = serde_json::json!({
             "action": "stopped",
