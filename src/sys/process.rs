@@ -79,14 +79,30 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
         .ok()
 }
 
+/// One incarnation of `pid` on this host: its boot-relative start time in
+/// clock ticks (`/proc/<pid>/stat` field 22) and the host boot id
+/// (`/proc/sys/kernel/random/boot_id`). A reused pid differs in the start
+/// time; a reboot differs in the boot id. None when the process is gone or
+/// procfs is unreadable, and on targets without procfs.
 #[cfg(any(target_os = "android", target_os = "linux"))]
-fn process_identity_platform(pid: u32) -> Option<String> {
+pub fn procfs_start_identity(pid: u32) -> Option<(u64, String)> {
     let start_ticks = process_start_ticks(pid)?;
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     let boot_id = boot_id.trim();
     if boot_id.is_empty() {
         return None;
     }
+    Some((start_ticks, boot_id.to_string()))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+pub fn procfs_start_identity(_pid: u32) -> Option<(u64, String)> {
+    None
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn process_identity_platform(pid: u32) -> Option<String> {
+    let (start_ticks, boot_id) = procfs_start_identity(pid)?;
     // Boot ID keeps the boot-relative tick count unique across restarts.
     Some(format!("linux:{boot_id}:{start_ticks}"))
 }

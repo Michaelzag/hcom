@@ -1871,7 +1871,7 @@ fn stop_instance_inner_scoped(
 
     // Prepare snapshot before delete (preserves data for transcript access)
     // Use Option values directly so None serializes as JSON null
-    let snapshot = serde_json::json!({
+    let mut snapshot = serde_json::json!({
         "name": instance_name,
         "transcript_path": instance_data.transcript_path,
         "session_id": instance_data.session_id,
@@ -1897,6 +1897,7 @@ fn stop_instance_inner_scoped(
         "purpose": instance_data.purpose.as_deref().unwrap_or_default(),
         "current": instance_data.current.as_deref().unwrap_or_default(),
     });
+    crate::proctruth::record_anchor_identity(&mut snapshot);
 
     // Snapshot both child sets before deleting the parent. Only the teardown
     // winner processes them, but it still needs relationships that may be
@@ -2464,7 +2465,7 @@ pub fn soft_finalize_session(
             return Ok(false);
         };
 
-        let snapshot = serde_json::json!({
+        let mut snapshot = serde_json::json!({
             "name": instance_name,
             "transcript_path": instance_data.transcript_path,
             "session_id": instance_data.session_id,
@@ -2490,6 +2491,7 @@ pub fn soft_finalize_session(
             "purpose": instance_data.purpose.as_deref().unwrap_or_default(),
             "current": instance_data.current.as_deref().unwrap_or_default(),
         });
+        crate::proctruth::record_anchor_identity(&mut snapshot);
 
         if let Some(session_id) = &instance_data.session_id {
             let _ = tx.execute(
@@ -4252,6 +4254,41 @@ mod tests {
         let snapshot = newest_stopped_snapshot(&db, "tala");
         assert_eq!(snapshot["purpose"], "zagdb: rc.48 roll");
         assert_eq!(snapshot["current"], "probing WAL");
+    }
+
+    /// A stop snapshot names the anchor's incarnation, not just its pid, so a
+    /// later reclaim can tell the recorded process from a reused pid.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stop_snapshot_records_anchor_start_time_and_boot_id() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "tala");
+        // The test's own pid: live, and never signalled by a soft stop.
+        let pid = std::process::id();
+        db.update_instance_pid("tala", pid).unwrap();
+        let (start_time, boot_id) = crate::sys::process::procfs_start_identity(pid).unwrap();
+
+        soft_finalize_session(&db, "tala", "shutdown", None, true);
+
+        let snapshot = newest_stopped_snapshot(&db, "tala");
+        assert_eq!(snapshot["pid"], pid);
+        assert_eq!(snapshot["pid_start_time"], start_time);
+        assert_eq!(snapshot["boot_id"], boot_id.as_str());
+    }
+
+    #[test]
+    fn stop_snapshot_without_pid_records_no_anchor_identity() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "tala");
+
+        soft_finalize_session(&db, "tala", "shutdown", None, true);
+
+        let snapshot = newest_stopped_snapshot(&db, "tala");
+        assert!(snapshot["pid"].is_null());
+        assert!(snapshot.get("pid_start_time").is_none());
+        assert!(snapshot.get("boot_id").is_none());
     }
 
     fn insert_headless_instance(db: &crate::db::HcomDb, name: &str, pid: u32) {

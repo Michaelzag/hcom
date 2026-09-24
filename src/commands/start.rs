@@ -78,7 +78,12 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let hcom_dir = paths::hcom_dir();
 
     let mut ctx = HcomContext::from_os();
+    let presented_process_id = ctx.process_id.clone();
     ctx.trust_process_id(&db);
+    // The id the trust gate just refused. Only a reclaim that restores the
+    // target's verified anchor pid may bind it, re-checking trust after the
+    // restore (see start_rebind); nothing else ever sees it.
+    let refused_process_id = presented_process_id.filter(|_| ctx.process_id.is_none());
     let verified_actor = claude_actor::resolve_env_actor(&db).map_err(anyhow::Error::new)?;
     if let (Some(actor), Some(name)) = (verified_actor.as_ref(), flags.name.as_deref()) {
         claude_actor::ensure_explicit_matches(&db, actor, name).map_err(anyhow::Error::new)?;
@@ -138,7 +143,13 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             .as_ref()
             .map(|actor| actor.name.as_str())
             .or(requested_name.as_deref());
-        return start_rebind(&db, &rebind, &ctx, current_name);
+        return start_rebind(
+            &db,
+            &rebind,
+            &ctx,
+            current_name,
+            refused_process_id.as_deref(),
+        );
     }
 
     if let Some(subagent) = subagent_via_name {
@@ -351,11 +362,16 @@ fn restore_child_links_after_root_rebind(
 
 /// Rebind session identity (`--as <name>`), preserving last_event_id and any
 /// live Claude child hierarchy owned by the current root actor.
+///
+/// `refused_process_id` is the `HCOM_PROCESS_ID` the trust gate refused in
+/// [`run`]. It is bound only behind a restored anchor pid (see
+/// [`match_reclaim_anchor`]), and trust is evaluated again after the restore.
 fn start_rebind(
     db: &HcomDb,
     rebind_target: &str,
     ctx: &HcomContext,
     explicit_name: Option<&str>,
+    refused_process_id: Option<&str>,
 ) -> Result<i32> {
     let hcom_dir = paths::hcom_dir();
 
@@ -461,6 +477,24 @@ fn start_rebind(
         anyhow::bail!("{refusal}");
     }
 
+    // The recreated row gets an anchor pid only from the target's own
+    // history, verified against the live process table. Both reads happen
+    // before the deletions below rewrite the rows and bindings they consult.
+    let anchor = match_reclaim_anchor(db, &target_name);
+    // A refused id may be bound here only when no row with a recorded pid
+    // holds it: such an id belongs to that pid's tree, and taking it would
+    // be the hijack the trust gate exists to stop.
+    let claimable_refused_id = refused_process_id.filter(|id| match db.get_process_binding(id) {
+        Ok(None) => true,
+        Ok(Some(owner)) => {
+            owner == target_name
+                || db
+                    .get_instance_full(&owner)
+                    .is_ok_and(|row| row.is_none_or(|row| row.pid.is_none()))
+        }
+        Err(_) => false,
+    });
+
     // Skip delete for remote instances (origin_device_id)
     if let Some(ref td) = target_data
         && (td.origin_device_id.is_none() || td.origin_device_id.as_deref() == Some(""))
@@ -544,6 +578,18 @@ fn start_rebind(
         }
     }
 
+    let restored_pid = match &anchor {
+        Ok(matched) => match db.set_instance_pid_if_unset(&target_name, matched.pid) {
+            Ok(true) => Some(matched.pid),
+            Ok(false) => None,
+            Err(e) => {
+                eprintln!("[hcom] warn: anchor pid restore failed for {target_name}: {e}");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+
     // Create bindings
     if let Some(ref sid) = session_id {
         if let Err(e) = db.set_session_binding(sid, &target_name) {
@@ -559,12 +605,24 @@ fn start_rebind(
             eprintln!("[hcom] warn: mark_claude_session_validated failed for {target_name}: {e}");
         }
     }
-    if let Some(ref process_id) = ctx.process_id {
+    let mut bound_process_id = ctx.process_id.clone();
+    if let Some(process_id) = &ctx.process_id {
         let sid = session_id.as_deref().unwrap_or("");
         if let Err(e) = db.set_process_binding(process_id, sid, &target_name) {
             eprintln!("[hcom] warn: set_process_binding failed for {target_name}: {e}");
         }
-
+    } else if restored_pid.is_some()
+        && let Some(process_id) = claimable_refused_id
+    {
+        bound_process_id = bind_behind_restored_anchor(
+            db,
+            ctx,
+            process_id,
+            session_id.as_deref().unwrap_or(""),
+            &target_name,
+        );
+    }
+    if bound_process_id.is_some() {
         // Migrate notify endpoints before notify so wake reaches correct port
         if !current_name.is_empty()
             && current_name != target_name
@@ -574,6 +632,58 @@ fn start_rebind(
         }
 
         crate::notify::wake(db, &target_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+    }
+
+    // Record which snapshot and pid the reclaim matched, or why it did not.
+    let anchor_record = match (&anchor, restored_pid) {
+        (Ok(matched), Some(pid)) => json!({
+            "restored": true,
+            "snapshot_event_id": matched.event_id,
+            "pid": pid,
+        }),
+        (Ok(matched), None) => json!({
+            "restored": false,
+            "snapshot_event_id": matched.event_id,
+            "pid": matched.pid,
+            "reason": "anchor pid write failed",
+        }),
+        (Err(miss), _) => json!({
+            "restored": false,
+            "snapshot_event_id": miss.event_id,
+            "reason": miss.reason,
+        }),
+    };
+    let reclaim = json!({
+        "action": "started",
+        "by": "cli",
+        "reason": "reclaim",
+        "process_id": bound_process_id,
+        "anchor": anchor_record,
+    });
+    if let Err(e) = db.log_event("life", &target_name, &reclaim) {
+        eprintln!("[hcom] warn: reclaim life event failed for {target_name}: {e}");
+    }
+
+    // Only a launcher UUID needs the anchor: its trust is a recorded ancestor
+    // pid (proctruth::process_id_trusted). OMP-minted and synthetic ids never
+    // read it, so plain seats stay pid-less without a warning.
+    let anchor_needed = ctx
+        .process_id
+        .as_deref()
+        .or(refused_process_id)
+        .is_some_and(crate::proctruth::is_launcher_process_id);
+    let trusted_after = restored_pid.is_some() && bound_process_id.is_some();
+    if anchor_needed && !trusted_after {
+        let why = match &anchor {
+            Err(miss) => miss.reason,
+            Ok(_) if restored_pid.is_none() => "anchor pid write failed",
+            Ok(_) => "its launcher id could not be bound to the restored anchor",
+        };
+        println!(
+            "[HCOM] '{target_name}' was reclaimed without anchor-based trust ({why}). \
+             Its launcher id stays refused until the seat is relaunched: \
+             'hcom stop {target_name}', then 'hcom r {target_name}'."
+        );
     }
 
     // Print bootstrap
@@ -608,6 +718,96 @@ fn start_rebind(
     );
 
     Ok(0)
+}
+
+/// The anchor pid a reclaim may restore, and the `life.stopped` event it
+/// came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReclaimAnchor {
+    event_id: i64,
+    pid: u32,
+}
+
+/// Why a reclaim restores no anchor pid; `event_id` is the snapshot
+/// consulted, if there was one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnchorMiss {
+    event_id: Option<i64>,
+    reason: &'static str,
+}
+
+/// Match `name`'s own newest `life.stopped` snapshot against the live
+/// process table ([`crate::proctruth::verify_reclaim_anchor`]): its recorded
+/// pid must be a live ancestor of this process, still the incarnation the
+/// snapshot recorded (start time, boot id).
+fn match_reclaim_anchor(db: &HcomDb, name: &str) -> Result<ReclaimAnchor, AnchorMiss> {
+    use rusqlite::OptionalExtension;
+    let newest = db
+        .conn()
+        .query_row(
+            "SELECT id, data FROM events
+             WHERE type='life'
+               AND instance=?
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![name],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional();
+    let (event_id, data) = match newest {
+        Ok(Some(newest)) => newest,
+        Ok(None) => {
+            return Err(AnchorMiss {
+                event_id: None,
+                reason: "no stop snapshot for this name",
+            });
+        }
+        Err(_) => {
+            return Err(AnchorMiss {
+                event_id: None,
+                reason: "stop snapshot unreadable",
+            });
+        }
+    };
+    let snapshot = serde_json::from_str::<serde_json::Value>(&data)
+        .ok()
+        .and_then(|mut data| data.get_mut("snapshot").map(serde_json::Value::take))
+        .unwrap_or_default();
+    crate::proctruth::verify_reclaim_anchor(
+        &snapshot,
+        &crate::proctruth::caller_ancestor_pids(),
+        &crate::sys::process::procfs_start_identity,
+    )
+    .map(|pid| ReclaimAnchor { event_id, pid })
+    .map_err(|reason| AnchorMiss {
+        event_id: Some(event_id),
+        reason,
+    })
+}
+
+/// Bind a refused `process_id` to `target_name`, whose row now carries the
+/// restored anchor pid, then evaluate trust again: the verified anchor is the
+/// proof. Returns the id when trusted; otherwise the binding is removed.
+fn bind_behind_restored_anchor(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    process_id: &str,
+    session_id: &str,
+    target_name: &str,
+) -> Option<String> {
+    if let Err(e) = db.set_process_binding(process_id, session_id, target_name) {
+        eprintln!("[hcom] warn: set_process_binding failed for {target_name}: {e}");
+        return None;
+    }
+    let mut probe = ctx.clone();
+    probe.process_id = Some(process_id.to_string());
+    probe.trust_process_id(db);
+    if probe.process_id.is_none()
+        && let Err(e) = db.delete_process_binding(process_id)
+    {
+        eprintln!("[hcom] warn: delete_process_binding failed for {target_name}: {e}");
+    }
+    probe.process_id
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1219,7 +1419,7 @@ mod tests {
         // Reclaim means the name existed: a never-seen name is refused.
         log_stopped_snapshot(&db, target, "claude", "/tmp/project", "sess-old", 0);
 
-        assert_eq!(start_rebind(&db, target, &ctx, None).unwrap(), 0);
+        assert_eq!(start_rebind(&db, target, &ctx, None, None).unwrap(), 0);
         assert_eq!(
             db.get_session_binding("sess-rebind").unwrap().as_deref(),
             Some(target),
@@ -1386,7 +1586,10 @@ mod tests {
             .unwrap();
 
         let ctx = make_ctx(&[("CLAUDECODE", "1")], "/tmp/project");
-        assert_eq!(start_rebind(&db, "nova", &ctx, Some("nova")).unwrap(), 0);
+        assert_eq!(
+            start_rebind(&db, "nova", &ctx, Some("nova"), None).unwrap(),
+            0
+        );
 
         let child = db.get_instance_full("nova_task_1").unwrap().unwrap();
         assert_eq!(child.parent_session_id.as_deref(), Some("sess-1"));
@@ -1418,7 +1621,7 @@ mod tests {
             "/tmp/hcom-gan-harness/.worktrees/bench-infra",
         );
 
-        let err = start_rebind(&db, "fama", &ctx, None).unwrap_err();
+        let err = start_rebind(&db, "fama", &ctx, None, None).unwrap_err();
         assert!(
             err.to_string().contains("Refusing to reclaim 'fama'"),
             "unexpected error: {err}"
@@ -1448,7 +1651,7 @@ mod tests {
             "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes",
         );
 
-        let exit_code = start_rebind(&db, "nova", &ctx, None).unwrap();
+        let exit_code = start_rebind(&db, "nova", &ctx, None, None).unwrap();
         assert_eq!(exit_code, 0);
 
         let inst = db.get_instance_full("nova").unwrap().unwrap();
@@ -1480,7 +1683,7 @@ mod tests {
             "/tmp/hcom-gan-harness/.worktrees/bench-infra",
         );
 
-        let err = start_rebind(&db, "mira", &ctx, None).unwrap_err();
+        let err = start_rebind(&db, "mira", &ctx, None, None).unwrap_err();
         assert!(
             err.to_string().contains("Refusing to reclaim 'mira'"),
             "unexpected error: {err}"
@@ -1566,7 +1769,7 @@ mod tests {
         let spid = sleeper.id();
         wait_for_carrier(&target, spid);
 
-        assert_eq!(start_rebind(&db, &target, &ctx, None).unwrap(), 0);
+        assert_eq!(start_rebind(&db, &target, &ctx, None, None).unwrap(), 0);
         assert!(
             db.get_instance_full(&target).unwrap().is_some(),
             "self-claim re-creates the target row"
@@ -1597,7 +1800,7 @@ mod tests {
         let spid = sleeper.id();
         wait_for_carrier(&target, spid);
 
-        let err = start_rebind(&db, &target, &ctx, None).unwrap_err();
+        let err = start_rebind(&db, &target, &ctx, None, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains(&format!("refusing to spawn under '{target}'")),
@@ -1733,7 +1936,7 @@ mod tests {
         let ctx = make_ctx(&[("CLAUDECODE", "1")], &cwd);
         insert_live_row(&db, &target, ctx.tool.as_str(), &cwd);
 
-        let err = start_rebind(&db, &target, &ctx, None).unwrap_err();
+        let err = start_rebind(&db, &target, &ctx, None, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains(&format!("refusing to spawn under '{target}'")),
@@ -1792,7 +1995,7 @@ mod tests {
         let target = format!("stas_never_{}", std::process::id());
         bind_caller(&db, &caller, "sess-a", "proc-a", 42);
 
-        let code = start_rebind(&db, &target, &caller_ctx("proc-a"), None).unwrap();
+        let code = start_rebind(&db, &target, &caller_ctx("proc-a"), None, None).unwrap();
 
         assert_eq!(code, 1, "a never-seen name is not the caller's to reclaim");
         let row = db
@@ -1827,7 +2030,7 @@ mod tests {
         log_stopped_snapshot(&db, &target, "claude", "/tmp/project", "sess-v", 100);
         bind_caller(&db, &caller, "sess-v", "proc-v", 900);
 
-        let code = start_rebind(&db, &target, &caller_ctx("proc-v"), None).unwrap();
+        let code = start_rebind(&db, &target, &caller_ctx("proc-v"), None, None).unwrap();
 
         assert_eq!(code, 0, "a name with history is reclaimable");
         let row = db
@@ -1861,7 +2064,7 @@ mod tests {
         bind_caller(&db, &name, "sess-s", "proc-s", 900);
 
         assert_eq!(
-            start_rebind(&db, &name, &caller_ctx("proc-s"), None).unwrap(),
+            start_rebind(&db, &name, &caller_ctx("proc-s"), None, None).unwrap(),
             0
         );
 
@@ -1881,7 +2084,7 @@ mod tests {
         bind_caller(&db, &caller, "sess-r", "proc-r", 9);
 
         assert_eq!(
-            start_rebind(&db, &target, &caller_ctx("proc-r"), None).unwrap(),
+            start_rebind(&db, &target, &caller_ctx("proc-r"), None, None).unwrap(),
             0
         );
 
@@ -1901,5 +2104,263 @@ mod tests {
         assert_eq!(life["renamed_to"], target.as_str());
         assert_eq!(life["snapshot"]["session_id"], "sess-r");
         assert_eq!(life["snapshot"]["last_event_id"], 9);
+    }
+
+    /// A launcher id shape (8-4-4-4-12 lowercase hex): trusted only through a
+    /// recorded ancestor pid.
+    const SEAT_UUID: &str = "5a1e0c3d-7b2f-4e8a-9c1d-0f2e3a4b5c6d";
+
+    fn stop_snapshot_for(pid: u32, start_time: u64, boot_id: &str) -> serde_json::Value {
+        json!({
+            "tool": "omp",
+            "directory": "/tmp/project",
+            "last_event_id": 0,
+            "pid": pid,
+            "pid_start_time": start_time,
+            "boot_id": boot_id,
+        })
+    }
+
+    /// A launcher seat whose row was lost reclaims its own name from inside
+    /// itself: the trust gate refuses its launcher id first, exactly as in
+    /// `run`. Returns the exit code and the stop snapshot's event id.
+    fn lost_seat_reclaim(db: &HcomDb, target: &str, snapshot: serde_json::Value) -> (i32, i64) {
+        let event_id = db
+            .log_event(
+                "life",
+                target,
+                &json!({
+                    "action": "stopped",
+                    "by": "daemon",
+                    "reason": "vanished",
+                    "process_id": SEAT_UUID,
+                    "snapshot": snapshot,
+                }),
+            )
+            .unwrap();
+        let mut ctx = make_ctx(
+            &[("OMPCODE", "1"), ("HCOM_PROCESS_ID", SEAT_UUID)],
+            "/tmp/project",
+        );
+        let presented = ctx.process_id.clone();
+        ctx.trust_process_id(db);
+        assert!(
+            ctx.process_id.is_none(),
+            "the lost seat's id starts refused"
+        );
+        let code = start_rebind(db, target, &ctx, None, presented.as_deref()).unwrap();
+        (code, event_id)
+    }
+
+    /// The `anchor` record of the reclaim's life event for `target`.
+    fn reclaim_anchor_record(db: &HcomDb, target: &str) -> serde_json::Value {
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = ?
+                   AND json_extract(data, '$.reason') = 'reclaim'
+                 ORDER BY id DESC LIMIT 1",
+                params![target],
+                |row| row.get(0),
+            )
+            .expect("the reclaim writes a life event");
+        let life: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(life["action"], "started");
+        life["anchor"].clone()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parent_pid() -> u32 {
+        // SAFETY: getppid has no preconditions and cannot fail.
+        unsafe { libc::getppid() as u32 }
+    }
+
+    /// No anchor restored: the row stays pid-less, the refused id stays
+    /// unbound and untrusted, and the life event says why.
+    #[cfg(target_os = "linux")]
+    fn assert_reclaimed_without_anchor(db: &HcomDb, target: &str, event_id: i64, why: &str) {
+        let row = db
+            .get_instance_full(target)
+            .unwrap()
+            .expect("reclaimed row");
+        assert_eq!(row.pid, None, "no verified anchor, no pid");
+        assert_eq!(db.get_process_binding(SEAT_UUID).unwrap(), None);
+        assert!(!crate::proctruth::trusted_process_id_for_omp(db, SEAT_UUID));
+        let record = reclaim_anchor_record(db, target);
+        assert_eq!(record["restored"], false);
+        assert_eq!(record["snapshot_event_id"], event_id);
+        let reason = record["reason"].as_str().unwrap();
+        assert!(reason.contains(why), "reason {reason:?} lacks {why:?}");
+    }
+
+    /// valo's case: the snapshot's pid is a live ancestor, still the recorded
+    /// incarnation, so the reclaim restores it, binds the refused launcher
+    /// id behind it, and the trust gate then accepts that id.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_restores_verified_anchor_pid() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_ok_{}", std::process::id());
+        let anchor = parent_pid();
+        let (start_time, boot_id) = crate::sys::process::procfs_start_identity(anchor).unwrap();
+
+        let (code, event_id) = lost_seat_reclaim(
+            &db,
+            &target,
+            stop_snapshot_for(anchor, start_time, &boot_id),
+        );
+
+        assert_eq!(code, 0);
+        let row = db
+            .get_instance_full(&target)
+            .unwrap()
+            .expect("reclaimed row");
+        // `hcom kill` targets through this pid (kill.rs bails without it).
+        assert_eq!(row.pid, Some(i64::from(anchor)));
+        assert_eq!(
+            db.get_process_binding(SEAT_UUID).unwrap().as_deref(),
+            Some(target.as_str())
+        );
+        assert!(
+            crate::proctruth::trusted_process_id_for_omp(&db, SEAT_UUID),
+            "the restored anchor proves the launcher id"
+        );
+        let record = reclaim_anchor_record(&db, &target);
+        assert_eq!(record["restored"], true);
+        assert_eq!(record["snapshot_event_id"], event_id);
+        assert_eq!(record["pid"], anchor);
+    }
+
+    /// Same pid, another incarnation: a reused pid must not become the anchor.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_refuses_anchor_with_other_start_time() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_start_{}", std::process::id());
+        let anchor = parent_pid();
+        let (start_time, boot_id) = crate::sys::process::procfs_start_identity(anchor).unwrap();
+
+        let (code, event_id) = lost_seat_reclaim(
+            &db,
+            &target,
+            stop_snapshot_for(anchor, start_time + 1, &boot_id),
+        );
+
+        assert_eq!(code, 0, "the reclaim still binds, without a pid");
+        assert_reclaimed_without_anchor(&db, &target, event_id, "start time");
+    }
+
+    /// A start time recorded on another boot says nothing about this one.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_refuses_anchor_from_other_boot() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_boot_{}", std::process::id());
+        let anchor = parent_pid();
+        let (start_time, _) = crate::sys::process::procfs_start_identity(anchor).unwrap();
+
+        let (code, event_id) = lost_seat_reclaim(
+            &db,
+            &target,
+            stop_snapshot_for(anchor, start_time, "00000000-0000-0000-0000-000000000000"),
+        );
+
+        assert_eq!(code, 0);
+        assert_reclaimed_without_anchor(&db, &target, event_id, "boot id");
+    }
+
+    /// A live process with the exact recorded identity that is not above the
+    /// caller is somebody else's anchor.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_refuses_anchor_outside_caller_ancestry() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_foreign_{}", std::process::id());
+        let mut sibling = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (start_time, boot_id) =
+            crate::sys::process::procfs_start_identity(sibling.id()).unwrap();
+
+        let (code, event_id) = lost_seat_reclaim(
+            &db,
+            &target,
+            stop_snapshot_for(sibling.id(), start_time, &boot_id),
+        );
+        sibling.kill().ok();
+        sibling.wait().ok();
+
+        assert_eq!(code, 0);
+        assert_reclaimed_without_anchor(&db, &target, event_id, "not a live ancestor");
+    }
+
+    /// A snapshot written before stops recorded the anchor's incarnation
+    /// carries a bare pid, which can never prove it.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_refuses_bare_pid_from_older_snapshot() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_old_{}", std::process::id());
+
+        let (code, event_id) = lost_seat_reclaim(
+            &db,
+            &target,
+            json!({
+                "tool": "omp",
+                "directory": "/tmp/project",
+                "last_event_id": 0,
+                "pid": parent_pid(),
+            }),
+        );
+
+        assert_eq!(code, 0);
+        assert_reclaimed_without_anchor(&db, &target, event_id, "predates");
+    }
+
+    /// The rename stop records the renamed-away row's anchor incarnation.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_start_rebind_rename_snapshot_records_anchor_identity() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let caller = format!("anchor_old_name_{}", std::process::id());
+        let target = format!("anchor_new_name_{}", std::process::id());
+        log_stopped_snapshot(&db, &target, "claude", "/tmp/project", "sess-an", 7);
+        bind_caller(&db, &caller, "sess-an", "proc-an", 9);
+        let pid = std::process::id();
+        db.update_instance_pid(&caller, pid).unwrap();
+        let (start_time, boot_id) = crate::sys::process::procfs_start_identity(pid).unwrap();
+
+        assert_eq!(
+            start_rebind(&db, &target, &caller_ctx("proc-an"), None, None).unwrap(),
+            0
+        );
+
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = ?
+                   AND json_extract(data, '$.reason') = 'renamed'",
+                params![caller],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let snapshot =
+            serde_json::from_str::<serde_json::Value>(&data).unwrap()["snapshot"].clone();
+        assert_eq!(snapshot["pid"], pid);
+        assert_eq!(snapshot["pid_start_time"], start_time);
+        assert_eq!(snapshot["boot_id"], boot_id.as_str());
     }
 }
