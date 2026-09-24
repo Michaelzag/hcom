@@ -1552,7 +1552,8 @@ fn row_re_registered(
     let Some(bound_bindings) = bound_bindings else {
         return Ok(false);
     };
-    let mut stmt = conn.prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?")?;
+    let mut stmt =
+        conn.prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?")?;
     let current = stmt
         .query_map(params![name], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1847,8 +1848,7 @@ fn stop_instance_inner_scoped(
             Ok(children) => children,
             Err(e) => {
                 return StopOutcome::RetryableError(
-                    format!("could not enumerate session children of {instance_name}: {e}")
-                        .into(),
+                    format!("could not enumerate session children of {instance_name}: {e}").into(),
                 );
             }
         },

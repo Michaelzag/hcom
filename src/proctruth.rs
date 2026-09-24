@@ -1874,9 +1874,8 @@ mod tests {
         let carrier_b = spawn_detached_named_sleeper(&name, &token_b);
         wait_for_enumerated(&name, std::slice::from_ref(&token_b), carrier_b);
 
-        let outcome = crate::hooks::common::stop_instance_with_capture(
-            &db, &name, "test", "killed", capture,
-        );
+        let outcome =
+            crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
         let row = db.get_instance_full(&name).unwrap();
         let b_alive = !process_gone(carrier_b);
         unsafe { libc::kill(carrier_b as libc::pid_t, libc::SIGKILL) };
