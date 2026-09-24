@@ -4285,12 +4285,34 @@ mod tests {
     /// Seed an inactive omp row plus its stopped snapshot carrying
     /// `transcript_path`, mirroring the real `life.stopped` body (which
     /// carries the row's transcript path via `get_instance_snapshot`).
+    ///
+    /// The snapshot directory is the crate root, never under `/tmp`, so the
+    /// omp `/tmp` start guard stays out of these fixtures; the redirect test
+    /// that needs a `/tmp` snapshot uses [`seed_omp_stopped_snapshot_in`].
     #[cfg(unix)]
     fn seed_omp_stopped_snapshot(
         db: &HcomDb,
         instance: &str,
         session_id: &str,
         transcript_path: &str,
+    ) {
+        seed_omp_stopped_snapshot_in(
+            db,
+            instance,
+            session_id,
+            transcript_path,
+            env!("CARGO_MANIFEST_DIR"),
+        );
+    }
+
+    /// [`seed_omp_stopped_snapshot`] with an explicit snapshot directory.
+    #[cfg(unix)]
+    fn seed_omp_stopped_snapshot_in(
+        db: &HcomDb,
+        instance: &str,
+        session_id: &str,
+        transcript_path: &str,
+        directory: &str,
     ) {
         let mut data = serde_json::Map::new();
         data.insert("session_id".into(), json!(session_id));
@@ -4307,7 +4329,7 @@ mod tests {
                 "tag": "",
                 "background": 0,
                 "last_event_id": 0,
-                "directory": "/tmp",
+                "directory": directory,
                 "purpose": "",
                 "current": "",
                 "transcript_path": transcript_path,
@@ -4362,7 +4384,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_omp_resume_missing_session_file_refuses() {
-        with_omp_home(|home| {
+        with_omp_home(|_| {
             let db = test_db();
             seed_omp_stopped_snapshot(
                 &db,
@@ -4397,8 +4419,6 @@ mod tests {
                 err.starts_with(&format!("session file not found: {OMP_MISSING_SID}")),
                 "unexpected error: {err}"
             );
-            // The session check runs before the /tmp redirect is created.
-            assert!(!home.join("build").join("mira").exists());
         });
     }
 
@@ -4406,7 +4426,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_omp_resume_session_file_present_succeeds() {
-        with_omp_home(|home| {
+        with_omp_home(|_| {
             write_omp_session_file(&format!("{OMP_MISSING_SID}.jsonl"));
             let db = test_db();
             seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, "");
@@ -4419,13 +4439,8 @@ mod tests {
                 "plan must carry --resume <sid>, got: {:?}",
                 plan.launch.args
             );
-            // Snapshot dir is /tmp: the plan redirects to <build_root>/<seat>/tmp.
-            let redirect = home.join("build").join("mira").join("tmp");
-            assert_eq!(
-                plan.launch.cwd.as_deref(),
-                Some(redirect.to_string_lossy().as_ref())
-            );
-            assert!(redirect.is_dir());
+            // The snapshot dir is the crate root, outside /tmp: no redirect.
+            assert_eq!(plan.launch.cwd.as_deref(), Some(env!("CARGO_MANIFEST_DIR")));
         });
     }
 
@@ -4442,7 +4457,8 @@ mod tests {
             std::fs::create_dir_all(&project).unwrap();
             std::fs::write(project.join(format!("{OMP_MISSING_SID}.jsonl")), "{}").unwrap();
             let db = test_db();
-            seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, "");
+            // The redirect test: it needs a /tmp snapshot dir.
+            seed_omp_stopped_snapshot_in(&db, "mira", OMP_MISSING_SID, "", "/tmp");
             // --run-here keeps the launch env on this process's env; under
             // CI the default regime reads the login shell's env instead.
             let run_here = ["--run-here".to_string()];
