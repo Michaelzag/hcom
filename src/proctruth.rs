@@ -1455,6 +1455,13 @@ fn is_orphan_carrier(start_epoch: f64, binding_updated_at: f64) -> bool {
 /// but a sweep tick landing mid-exit must not write `vanished` first.
 const SWEEP_FRESH_GRACE_SECS: i64 = 60;
 
+// Test seam: runs between the sweep's snapshot read and the release it
+// authorizes, so a test can land a rebind or replacement in that gap.
+#[cfg(test)]
+thread_local! {
+    static SWEEP_RELEASE_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
+}
+
 /// Daemon-side periodic check (runs on the relay worker's watchdog tick, so
 /// in a different process — and typically a different cgroup — from any
 /// session): for every local instance, test whether its harness is gone.
@@ -1476,7 +1483,10 @@ const SWEEP_FRESH_GRACE_SECS: i64 = 60;
 ///
 /// A vanished row gets `stopped by=daemon reason=vanished` with the instance
 /// snapshot, then the row is released — the notice systemd-oomd kills
-/// currently never produce.
+/// currently never produce. The release is bound to the incarnation the
+/// sweep read (row identity plus binding epoch, one snapshot): a rebind or
+/// `start --as` replacement landing after that read keeps its row and
+/// bindings.
 ///
 /// Skips rows already released (they are simply not returned by the live
 /// query, so a normal exit's wrapper-written `stopped` never double-fires),
@@ -1575,6 +1585,10 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             );
             continue;
         }
+        #[cfg(test)]
+        if let Some(hook) = SWEEP_RELEASE_GAP_HOOK.with(std::cell::Cell::take) {
+            hook(db, &inst.name);
+        }
         // Vanished: snapshot, stopped by=daemon, release. The exact bit
         // pattern rides beside created_at so a later reader can match the
         // incarnation without a lossy float decode.
@@ -1611,7 +1625,7 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             inst.agent_id.as_deref(),
             &data,
             process_id,
-            binding_ids,
+            Some(binding_ids.as_slice()),
         ) {
             Ok(true) => {
                 crate::log::log_info(
@@ -1983,13 +1997,16 @@ mod tests {
         assert!(outcome.is_re_registered(), "{outcome:?}");
     }
 
-    /// The binding epoch only ever adds refusals to the row identity. A
-    /// captured epoch emptied under the same row identity refuses the
-    /// release: an unbound replacement looks exactly like that, so an empty
-    /// set never passes for a non-empty capture.
+    /// The binding epoch only ever adds refusals to the row identity, and an
+    /// emptied set adds none: the same row (created_at bits, session_id,
+    /// agent_id) whose every captured binding its own session released — an
+    /// Antigravity soft stop does exactly that and keeps the row — is still
+    /// the captured incarnation, and the bulk stop releases it. An unbound
+    /// replacement is another created_at and is still refused
+    /// (`bulk_stop_does_not_release_a_replacement_row_with_no_bindings`).
     #[test]
     #[cfg(target_os = "linux")]
-    fn bulk_stop_refuses_a_captured_epoch_emptied_under_the_same_row() {
+    fn bulk_stop_releases_a_captured_epoch_emptied_under_the_same_row() {
         let db = test_db();
         let name = unique_name("epoch-emptied");
         insert_null_pid_row(&db, &name, &format!("proc-{}", rand_suffix()));
@@ -2004,12 +2021,15 @@ mod tests {
 
         let outcome =
             crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
-        assert!(outcome.is_re_registered(), "{outcome:?}");
-        assert!(db.get_instance_full(&name).unwrap().is_some(), "row kept");
+        assert_eq!(outcome, crate::hooks::common::StopOutcome::Stopped);
+        assert!(
+            db.get_instance_full(&name).unwrap().is_none(),
+            "row released"
+        );
     }
 
-    /// The other side of that rule: a session that shrank its own epoch to a
-    /// non-empty subset is still the captured incarnation, and releases.
+    /// A session that shrank its own epoch to a non-empty subset is still the
+    /// captured incarnation too, and releases.
     #[test]
     #[cfg(target_os = "linux")]
     fn bulk_stop_releases_a_captured_epoch_its_session_shrank() {
@@ -2462,7 +2482,7 @@ mod tests {
                 None,
                 &data,
                 Some("proc-old"),
-                &["proc-current".to_string()],
+                None,
             )
             .unwrap();
         assert!(!won, "stale process_id must not win the release");
@@ -2513,7 +2533,7 @@ mod tests {
                 None,
                 &data,
                 Some("proc-current"),
-                &["proc-current".to_string()],
+                None,
             )
             .unwrap();
         assert!(won, "current process_id releases the row");
@@ -2560,62 +2580,47 @@ mod tests {
         );
     }
 
+    /// A rebind landing between the sweep's one-snapshot read and its
+    /// release: a new process binds under the same row, whose identity
+    /// (created_at, session, agent) is unchanged, so only the captured
+    /// binding epoch shows the newer registration. The row and every
+    /// binding survive, and the sweep writes no stopped record.
     #[test]
     #[cfg(unix)]
-    fn sweep_release_refuses_when_a_new_binding_lands_after_the_read() {
-        // The window the one-snapshot route closes: the sweep captures the
-        // row and its binding epoch in one read, then a replacement process
-        // registers a new binding under the same name before the write.
-        // The row's own identity (created_at/session/agent) is unchanged, so
-        // the delete CAS cannot see the swap — only the binding set can.
+    fn sweep_spares_a_rebind_landing_after_its_read() {
         let db = test_db();
         let name = unique_name("rebind");
         insert_row(&db, &name, "active", Some(dead_pid()));
         db.set_process_binding("proc-old", "sess-old", &name)
             .unwrap();
+        fn rebind(db: &HcomDb, name: &str) {
+            db.set_process_binding("proc-new", "sess-new", name)
+                .unwrap();
+        }
+        SWEEP_RELEASE_GAP_HOOK.with(|hook| hook.set(Some(rebind)));
+        let swept = sweep_vanished_instances(&db);
+        SWEEP_RELEASE_GAP_HOOK.with(|hook| hook.set(None));
 
-        // The sweep's single captured read.
-        let (row, binding_ids) = db
-            .iter_instances_with_bindings()
-            .unwrap()
-            .into_iter()
-            .find(|(row, _)| row.name == name)
-            .expect("captured row + bindings");
-        assert_eq!(binding_ids, vec!["proc-old".to_string()]);
-
-        // The replacement lands in that window.
-        db.set_process_binding("proc-new", "sess-new", &name)
-            .unwrap();
-
-        let process_id = binding_ids.first().map(String::as_str);
-        let data = serde_json::json!({
-            "action": "stopped", "by": "daemon", "reason": "vanished",
-            "process_id": process_id, "snapshot": null,
-        });
-        let won = db
-            .finalize_instance_stop(
-                &name,
-                row.created_at,
-                row.pid,
-                row.session_id.as_deref(),
-                row.agent_id.as_deref(),
-                &data,
-                process_id,
-                &binding_ids,
-            )
-            .unwrap();
-
-        assert!(!won, "a re-bound incarnation must not be released");
+        assert!(!swept.contains(&name), "{swept:?}");
         assert!(
             db.get_instance_full(&name).unwrap().is_some(),
-            "replacement row was deleted by the stale read"
+            "the rebound row survives"
         );
-        let current = db.process_binding_ids(&name).unwrap();
+        let mut bindings = db.process_binding_ids(&name).unwrap();
+        bindings.sort();
         assert_eq!(
-            current,
-            vec!["proc-new".to_string(), "proc-old".to_string()],
-            "process bindings were deleted by the stale read"
+            bindings,
+            vec!["proc-new".to_string(), "proc-old".to_string()]
         );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "no stopped record for the rebound row");
     }
 
     #[test]

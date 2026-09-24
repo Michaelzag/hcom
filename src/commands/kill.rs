@@ -131,33 +131,45 @@ impl IncarnationToken {
 
 /// What a kill resolved against, captured together before any signal: the
 /// [`IncarnationToken`] the teardown CAS compares, plus the events
-/// watermark (`MAX(events.id)` at capture time). The watermark is never part
-/// of the CAS; it only scopes the lost-CAS classification to `stopped`
-/// events written after the kill resolved its target (see
-/// [`classify_lost_teardown`]).
+/// watermark (`MAX(events.id)`). The row, its binding epoch, and the
+/// watermark come from ONE snapshot ([`Self::read`]), so a `stopped` event
+/// committed right after the kill read the row is above the watermark. The
+/// watermark is never part of the CAS; it only scopes the lost-CAS
+/// classification to `stopped` events written after the kill resolved its
+/// target (see [`classify_lost_teardown`]).
 struct ResolvedIncarnation {
     token: IncarnationToken,
-    #[allow(dead_code)]
     event_watermark: i64,
 }
 
 impl ResolvedIncarnation {
-    fn capture(db: &HcomDb, row: &crate::db::InstanceRow, binding_ids: &[String]) -> Result<Self> {
-        let event_watermark =
-            db.conn()
-                .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?;
-        Ok(Self {
+    /// `name`'s row, its binding ids (newest first), and the events
+    /// watermark, read in ONE snapshot.
+    fn read(db: &HcomDb, name: &str) -> Result<(Option<crate::db::InstanceRow>, Vec<String>, i64)> {
+        db.with_read_snapshot(|tx| {
+            let (row, binding_ids) = HcomDb::instance_with_bindings_in(tx, name)?;
+            let event_watermark =
+                tx.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?;
+            Ok((row, binding_ids, event_watermark))
+        })
+    }
+
+    fn new(row: &crate::db::InstanceRow, binding_ids: &[String], event_watermark: i64) -> Self {
+        Self {
             token: IncarnationToken::capture(row, binding_ids),
             event_watermark,
-        })
+        }
     }
 }
 
 const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
+// Test seam: runs right after the kill's one-snapshot read, so a test can
+// commit a stop in the gap before any signal.
 #[cfg(test)]
-#[allow(clippy::type_complexity)]
-static CAPTURE_GAP_HOOK: std::sync::Mutex<Option<fn(&HcomDb, &str)>> = std::sync::Mutex::new(None);
+thread_local! {
+    static CAPTURE_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
+}
 
 #[derive(Clone, Copy)]
 enum PaneCleanupProcessState {
@@ -285,15 +297,15 @@ fn kill_tracked_instance_with_self_pids(
         crate::proctruth::ReapCapture,
     ) -> Result<(), crate::proctruth::ReapError>,
 ) -> Result<KillTrackedResult, String> {
-    // The row and its binding epoch come from ONE snapshot: separate reads
-    // can straddle a `start --as` and pair one incarnation's row with
-    // another's bindings.
-    let (inst, binding_ids) = db
-        .get_instance_with_bindings(name)
-        .map_err(|e| e.to_string())?;
+    // The row, its binding epoch, and the events watermark come from ONE
+    // snapshot: separate reads can straddle a `start --as` and pair one
+    // incarnation's row with another's bindings, and a watermark read after
+    // the row can hide a stop that committed in between.
+    let (inst, binding_ids, event_watermark) =
+        ResolvedIncarnation::read(db, name).map_err(|e| e.to_string())?;
     let inst = inst.ok_or_else(|| format!("Agent '{}' not found", name))?;
     #[cfg(test)]
-    if let Some(hook) = CAPTURE_GAP_HOOK.lock().unwrap().take() {
+    if let Some(hook) = CAPTURE_GAP_HOOK.with(std::cell::Cell::take) {
         hook(db, name);
     }
     let pid = inst
@@ -301,11 +313,10 @@ fn kill_tracked_instance_with_self_pids(
         .ok_or_else(|| format!("No tracked PID for '{}'", name))? as u32;
 
     // The incarnation this kill resolves against: the row as read plus its
-    // binding epoch, and the events watermark read with it. Captured BEFORE
-    // any signal; the teardown below runs only while this exact incarnation
-    // is still the row's.
-    let incarnation =
-        ResolvedIncarnation::capture(db, &inst, &binding_ids).map_err(|e| e.to_string())?;
+    // binding epoch, and the events watermark read with them. Captured
+    // BEFORE any signal; the teardown below runs only while this exact
+    // incarnation is still the row's.
+    let incarnation = ResolvedIncarnation::new(&inst, &binding_ids, event_watermark);
     let _teardown_claim = crate::hooks::common::TeardownClaim::register(
         db,
         name,
@@ -447,23 +458,24 @@ fn teardown_if_incarnation_unchanged(
 }
 
 /// Why the teardown CAS lost, read-only inside the same teardown
-/// transaction. A session hook already running before the claim, or the
-/// PTY wrapper's exit cleanup (`by = pty`, see
-/// `delivery::cleanup_deleted_instance`), may finalize the row while the
-/// kill runs. That is a self-stop, not a re-registration: a `life`/`stopped`
-/// event by one of those for
-/// this instance written after the kill resolved its target (id above the
-/// watermark), keyed to one of the resolved bindings — or, when no process
-/// is named, carrying the resolved incarnation's `created_at` in its
-/// snapshot (as its exact `created_at_bits` when present, else the legacy
-/// `created_at` itself — the same identity the CAS compares, so a
-/// re-registered bindingless incarnation finalizing mid-kill is not
-/// mistaken for the session) — and not a `stale-harness-exit` (a stale
-/// touch a rebound row). Then a gone row was released by the session, and a
-/// row with the same `created_at` + `session_id` whose bindings only shrank
-/// was kept by it. Anything else — no such event, a new identity, or any
-/// binding the kill never resolved — is a genuine re-registration. An event
-/// with neither bits nor a readable legacy `created_at` (no snapshot, or a
+/// transaction. The row can be stopped while the kill runs: by the
+/// session's own exit hook (one already past the claim check, or one with
+/// no claim to yield to — a 0.7.29 relay worker kills remotely and writes
+/// none), the PTY wrapper's exit cleanup, the daemon's vanished sweep, a
+/// stop command, or another kill. Which writer did is irrelevant; the
+/// incarnation decides. A `stopped` event for this instance written after
+/// the kill resolved its target (id above the watermark) — other than a
+/// `stale-harness-exit`, a stale harness declining to touch a rebound row —
+/// names the incarnation it stopped by its snapshot: `created_at` (the
+/// exact `created_at_bits` whenever present, else the bit pattern of the
+/// legacy raw `created_at` token) plus `session_id`. Only when the snapshot
+/// has no readable `created_at` does the event's `process_id` stand in, as
+/// one of the resolved bindings. An event naming the resolved incarnation
+/// is a self-stop: a gone row was released, and a row with the same
+/// identity whose bindings only shrank (down to none) was kept. Anything
+/// else — no such event, another incarnation's stop, or a current row the
+/// kill never resolved — is a genuine re-registration. An event with no
+/// readable `created_at` and no `process_id` (no snapshot, or a
 /// `created_at` that is absent, null, non-numeric, or not a scalar) names
 /// no incarnation: it is logged and never taken for the resolved one.
 /// `current` is the incarnation the CAS just read in this transaction.
@@ -473,66 +485,67 @@ fn classify_lost_teardown(
     incarnation: &ResolvedIncarnation,
     current: Option<IncarnationToken>,
 ) -> Result<TeardownOutcome> {
+    use rusqlite::types::ValueRef;
     let token = &incarnation.token;
+    // A snapshot renders a NULL session as "" (`get_instance_snapshot`) or
+    // as null: both mean no session, on either side of the comparison.
+    fn session(id: Option<&str>) -> Option<&str> {
+        id.filter(|id| !id.is_empty())
+    }
     let mut stmt = tx.prepare(
-        "SELECT id, json_extract(data, '$.by'), \
-                json_extract(data, '$.process_id'), \
+        "SELECT id, json_extract(data, '$.process_id'), \
                 json_extract(data, '$.snapshot.created_at_bits'), \
                 json_extract(data, '$.snapshot.session_id'), \
-                json_extract(data, '$.snapshot.agent_id'), \
                 json_extract(data, '$.snapshot') FROM events \
-         WHERE type = 'life' AND instance = ?1 \
-           AND COALESCE(json_extract(data, '$.reason'), '') != 'stale-harness-exit' \
-           AND (json_extract(data, '$.by') IN ('session', 'pty') \
-             OR json_extract(data, '$.by') = 'daemon')",
+         WHERE type = 'life' AND instance = ?1 AND id > ?2 \
+           AND json_extract(data, '$.action') = 'stopped' \
+           AND COALESCE(json_extract(data, '$.reason'), '') != 'stale-harness-exit'",
     )?;
-    let mut process_ids = stmt.query_map(rusqlite::params![name], |r| {
+    let mut events = stmt.query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
         Ok((
             r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(1)?,
+            match r.get_ref(2)? {
+                ValueRef::Integer(bits) => Some(bits as u64),
+                _ => None,
+            },
             match r.get_ref(3)? {
-                rusqlite::types::ValueRef::Null => None,
-                rusqlite::types::ValueRef::Integer(bits) => Some(bits as u64),
+                ValueRef::Text(id) => Some(String::from_utf8_lossy(id).into_owned()),
                 _ => None,
             },
             r.get::<_, Option<String>>(4)?,
-            r.get::<_, Option<String>>(5)?,
-            r.get::<_, Option<String>>(6)?,
         ))
     })?;
     let mut self_stop = false;
-    for row in &mut process_ids {
-        let (
-            event_id,
-            _by,
-            process_id,
-            snapshot_created_at_bits,
-            snapshot_session_id,
-            snapshot_agent_id,
-            snapshot,
-        ) = row?;
-        let bits = snapshot_created_at_bits
+    for event in &mut events {
+        let (event_id, process_id, created_at_bits, session_id, snapshot) = event?;
+        let bits = created_at_bits
             .or_else(|| snapshot.as_deref().and_then(crate::db::raw_created_at_bits));
-        let identity_match = bits == Some(token.created_at.to_bits())
-            && snapshot_session_id
-                .as_ref()
-                .is_none_or(|id| Some(id.as_str()) == token.session_id.as_deref())
-            && snapshot_agent_id
-                .as_ref()
-                .is_none_or(|id| Some(id.as_str()) == token.agent_id.as_deref());
-        let binding_match = process_id
-            .as_ref()
-            .is_some_and(|id| token.binding_ids.contains(id));
-        let matches = identity_match || binding_match;
-        if !matches {
-            crate::log::log_warn(
-                "kill",
-                "teardown.stop_event_unreadable",
-                &format!("instance={name} event={event_id}"),
-            );
-        }
-        if matches {
+        let names_resolved = match (bits, process_id) {
+            (Some(bits), _) => {
+                bits == token.created_at.to_bits()
+                    && session(session_id.as_deref()) == session(token.session_id.as_deref())
+            }
+            (None, Some(process_id)) => token.binding_ids.contains(&process_id),
+            // No incarnation to read: never guessed to be this one. Logged,
+            // so the conservative report is explained.
+            (None, None) => {
+                crate::log::log_warn(
+                    "kill",
+                    "teardown.stop_event_unreadable",
+                    &format!(
+                        "instance={name} event={event_id} reason={}",
+                        if snapshot.is_some() {
+                            "unreadable-created_at"
+                        } else {
+                            "no-snapshot"
+                        }
+                    ),
+                );
+                false
+            }
+        };
+        if names_resolved {
             self_stop = true;
             break;
         }
@@ -1761,8 +1774,8 @@ mod tests {
     /// and events watermark), captured the way production does.
     #[cfg(unix)]
     fn capture_incarnation(db: &crate::db::HcomDb, name: &str) -> ResolvedIncarnation {
-        let (row, binding_ids) = db.get_instance_with_bindings(name).unwrap();
-        ResolvedIncarnation::capture(db, &row.expect("row"), &binding_ids).unwrap()
+        let (row, binding_ids, event_watermark) = ResolvedIncarnation::read(db, name).unwrap();
+        ResolvedIncarnation::new(&row.expect("row"), &binding_ids, event_watermark)
     }
 
     /// A: kill reaps the whole name tree — even processes outside the
@@ -2430,6 +2443,87 @@ mod tests {
         assert_killed_by(&db, &name, "test");
         let _ = _guard;
     }
+
+    /// No claim at all is live mixed-version code, not a dead branch: a
+    /// 0.7.29 relay worker kills remotely and writes none, and a claim that
+    /// fails to register leaves the same state. With no claim to yield to,
+    /// the session's own exit hook ends the session as a natural exit — its
+    /// reason, its initiator — and the kill's lost teardown reports that as
+    /// the session's self-stop, never a re-registration: released by the
+    /// hard SessionEnd, kept by the soft stop.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_without_a_claim_reports_the_session_exit_hook_as_self_stop() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        for soft in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+            db.init_db().unwrap();
+            let name = format!("hcom-kill-{}-no-claim-{soft}", std::process::id());
+            let mut sleeper =
+                seed_bound_row_with_sleeper(&db, &name, "proc-no-claim", "sess-no-claim");
+            let result = kill_tracked_instance_with_self_pids(
+                &db,
+                &name,
+                "test",
+                &[std::process::id()],
+                |n, b, e, capture| {
+                    let out = crate::proctruth::reap_instance_tree_for_excluding_captured(
+                        &db, n, b, e, capture,
+                    );
+                    // The kill holds no claim, the state a 0.7.29 relay
+                    // worker's kill leaves.
+                    db.kv_set(&format!("teardown_claim:{n}"), None).unwrap();
+                    if soft {
+                        crate::hooks::common::soft_finalize_session(
+                            &db, n, "shutdown", None, false,
+                        );
+                    } else {
+                        assert_eq!(
+                            crate::hooks::common::finalize_session(&db, n, "shutdown", None),
+                            StopOutcome::Stopped
+                        );
+                    }
+                    out
+                },
+            )
+            .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
+            sleeper.wait().ok();
+
+            let (expected, row_kept) = if soft {
+                (TeardownOutcome::SessionStoppedKeptRow, true)
+            } else {
+                (TeardownOutcome::SessionStoppedReleasedRow, false)
+            };
+            assert_eq!(result.teardown, expected, "soft={soft}");
+            assert_eq!(
+                db.get_instance_full(&name).unwrap().is_some(),
+                row_kept,
+                "soft={soft}"
+            );
+            let records: Vec<(String, String)> = db
+                .conn()
+                .prepare(
+                    "SELECT json_extract(data, '$.reason'), json_extract(data, '$.by') \
+                     FROM events WHERE type = 'life' AND instance = ?1 \
+                     AND json_extract(data, '$.action') = 'stopped'",
+                )
+                .unwrap()
+                .query_map(rusqlite::params![name], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                records,
+                vec![("exit:shutdown".to_string(), "session".to_string())],
+                "soft={soft}: the session's own record, the kill wrote none"
+            );
+        }
+    }
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[serial]
@@ -2691,6 +2785,13 @@ mod tests {
         let _ = _guard;
     }
 
+    /// Kill a bound row (`created_at = 42`) whose vanished sweep releases it
+    /// mid-kill: the real reap, then a `stopped by=daemon` event whose
+    /// snapshot carries `event_bits` as its `created_at_bits` beside the
+    /// row's own session (`None`: no snapshot at all), and the row deleted —
+    /// optionally replaced by another incarnation. Returns the kill's
+    /// teardown outcome.
+    #[cfg(unix)]
     fn kill_mid_daemon_sweep(
         db_path: &std::path::Path,
         name: &str,
@@ -2712,7 +2813,9 @@ mod tests {
             &db, name, "test", &[std::process::id()],
             |n, b, e, capture| {
                 let out = crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture);
-                let snapshot = event_bits.map(|bits| serde_json::json!({ "created_at_bits": bits }));
+                let snapshot = event_bits.map(|bits| {
+                    serde_json::json!({ "created_at_bits": bits, "session_id": "sess-kill-vanished" })
+                });
                 db.log_life_event(n, "stopped", "daemon", "vanished", snapshot, Some("newest-binding")).unwrap();
                 db.delete_instance(n).unwrap();
                 if replace {
@@ -2765,10 +2868,14 @@ mod tests {
         );
     }
 
+    /// A PTY exit that commits its stop right after the kill read the row is
+    /// above the kill's watermark, because the watermark comes from the same
+    /// snapshot as the row and its bindings: a self-stop, not a
+    /// re-registration. A watermark read after the row would hide it.
     #[test]
     #[cfg(unix)]
     #[serial]
-    fn kill_reports_pty_self_stop_between_snapshot_and_watermark() {
+    fn kill_reports_pty_self_stop_committed_right_after_its_read() {
         let _guard = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
@@ -2776,15 +2883,12 @@ mod tests {
         db.init_db().unwrap();
         let name = format!("hcom-kill-{}-capture-gap", std::process::id());
         let mut sleeper = seed_bound_row_with_sleeper(&db, &name, "proc-gap", "sess-gap");
-        *CAPTURE_GAP_HOOK.lock().unwrap() = Some(capture_gap_finalize);
+        CAPTURE_GAP_HOOK.with(|hook| hook.set(Some(capture_gap_finalize)));
+        /// The PTY wrapper's exit release, in its production snapshot shape.
         fn capture_gap_finalize(db: &HcomDb, name: &str) {
-            let bits = db
-                .get_instance_full(name)
-                .unwrap()
-                .unwrap()
-                .created_at
-                .to_bits();
-            let snapshot = serde_json::json!({ "created_at_bits": bits as i64 });
+            let mut snapshot = db.get_instance_snapshot(name).unwrap().unwrap();
+            let bits = snapshot["created_at"].as_f64().unwrap().to_bits();
+            snapshot["created_at_bits"] = serde_json::json!(bits);
             db.log_life_event(
                 name,
                 "stopped",
@@ -2890,12 +2994,15 @@ mod tests {
         let _ = _guard;
     }
 
-    /// A PTY stopped event keyed to a process the kill never resolved is
-    /// another incarnation's exit, not this session's self-stop.
+    /// The incarnation decides, not the writer: a PTY wrapper whose process
+    /// the kill never resolved releases the row the kill resolved, and its
+    /// stopped snapshot names that very incarnation. The resolved row was
+    /// stopped and nothing re-registered, so the lost teardown is the
+    /// session's self-stop.
     #[test]
     #[cfg(unix)]
     #[serial]
-    fn kill_reports_re_registration_when_pty_exit_names_foreign_process() {
+    fn kill_reports_self_stop_when_a_foreign_wrapper_releases_the_resolved_incarnation() {
         let _guard = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
@@ -2922,7 +3029,7 @@ mod tests {
             "the foreign wrapper's stopped event landed"
         );
         assert!(db.get_instance_full(&name).unwrap().is_none(), "row gone");
-        assert_eq!(outcome, TeardownOutcome::RowReRegistered);
+        assert_eq!(outcome, TeardownOutcome::SessionStoppedReleasedRow);
         let _ = _guard;
     }
 

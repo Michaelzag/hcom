@@ -626,9 +626,7 @@ pub fn set_status(
 // authorizes, so a test can land a replacement incarnation in that gap.
 #[cfg(test)]
 thread_local! {
-    #[allow(clippy::type_complexity)]
-    static PLACEHOLDER_STOP_GAP_HOOK: std::cell::Cell<Option<fn(&HcomDb, &str)>> =
-        const { std::cell::Cell::new(None) };
+    static PLACEHOLDER_STOP_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
 }
 
 /// Hold a stale placeholder with a live identity carrier (for example, Claude
@@ -660,7 +658,7 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
                     continue;
                 }
                 #[cfg(test)]
-                if let Some(hook) = PLACEHOLDER_STOP_GAP_HOOK.with(std::cell::Cell::get) {
+                if let Some(hook) = PLACEHOLDER_STOP_GAP_HOOK.with(std::cell::Cell::take) {
                     hook(db, &data.name);
                 }
                 let capture = crate::proctruth::capture_reap_carriers(

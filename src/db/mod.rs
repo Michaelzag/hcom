@@ -127,6 +127,12 @@ fn assert_isolated_db_path(db_path: &std::path::Path) {
     );
 }
 
+/// A test seam on a release path: a test sets it to run once (`Cell::take`)
+/// between the path's one-snapshot read and its gated writes, landing a
+/// rebind or replacement in exactly that gap.
+#[cfg(test)]
+pub(crate) type GapHook = std::cell::Cell<Option<fn(&HcomDb, &str)>>;
+
 impl HcomDb {
     /// Open a hardened connection: secure the directory and database files to
     /// owner-only modes (see `paths::ensure_private_db`), then open with the

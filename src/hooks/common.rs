@@ -1507,13 +1507,12 @@ enum BoundIncarnation {
 /// absent row is not: the release CAS reports it as already stopped. The
 /// row identity (`created_at` bits, `session_id`, `agent_id`) decides; a
 /// captured binding epoch only ever adds a refusal. It loses to any binding
-/// the capture never saw (a newer epoch), and a non-empty capture loses to
-/// an empty current set: that set is indistinguishable from a replacement
-/// row that has not bound yet — `soft_finalize_session` with
-/// `keep_process_binding: false` empties the same row's process bindings —
-/// and both refuse. Bindings its own session released since, leaving a
-/// non-empty subset, do not count. Read through `conn`, so inside the
-/// finalize transaction it decides with the writes.
+/// the capture never saw (a newer epoch). Bindings the row's own session
+/// released since do not count, down to none at all: `soft_finalize_session`
+/// with `keep_process_binding: false` empties the same row's bindings and
+/// keeps the row, and an unbound replacement is caught by its new
+/// `created_at`. Read through `conn`, so inside the finalize transaction it
+/// decides with the writes (the finalize CAS applies the same epoch rule).
 fn row_re_registered(
     conn: &rusqlite::Connection,
     name: &str,
@@ -1606,6 +1605,15 @@ fn stop_instance_inner(
     )
 }
 
+// Test seam: runs as a stop starts, after its caller's read (a stop or kill
+// command's enumeration) and before any read of its own, so a test can land
+// a rebind or replacement in that gap.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STOP_ENTRY_GAP_HOOK: crate::db::GapHook =
+        const { std::cell::Cell::new(None) };
+}
+
 /// [`stop_instance_inner`] with the write scope spelled out. `tx: None` is
 /// the standalone path: every node finalizes in its own transaction and
 /// fires its external side effects inline — unchanged historical behavior.
@@ -1646,21 +1654,45 @@ fn stop_instance_inner_scoped(
         );
     }
 
-    let instance_data = match db.get_instance_full(instance_name) {
-        Ok(Some(data)) => data,
-        Ok(None) => return StopOutcome::AlreadyStopped,
-        Err(e) => {
-            return StopOutcome::RetryableError(
-                format!("could not read instance {instance_name}: {e}").into(),
-            );
-        }
+    #[cfg(test)]
+    if let Some(hook) = STOP_ENTRY_GAP_HOOK.with(std::cell::Cell::take) {
+        hook(db, instance_name);
+    }
+
+    // The row this stop works from and the one incarnation it may release
+    // come from ONE snapshot. A threaded pre-signal capture binds the row
+    // its caller read together with the bindings (bulk kill and stop, stale
+    // placeholder cleanup). A reap-gated stop without one reads the row and
+    // its binding epoch together here and binds that: an entry read alone
+    // never sees a binding a rebind adds, and a second read for the reap
+    // could pair this row with another incarnation's bindings. Only the
+    // kill's teardown (reap gate off, inside the kill's own CAS
+    // transaction) binds its entry read.
+    let read_error = |e: &dyn std::fmt::Display| {
+        StopOutcome::RetryableError(format!("could not read instance {instance_name}: {e}").into())
+    };
+    let (row, pre_capture) = match pre_capture {
+        None if reap_gate => match db.get_instance_with_bindings(instance_name) {
+            Ok((row, ids)) => {
+                let capture = row.as_ref().map(|row| {
+                    crate::proctruth::capture_reap_carriers(instance_name, Some(row), &ids, exclude)
+                });
+                (row, capture)
+            }
+            Err(e) => return read_error(&e),
+        },
+        pre_capture => match db.get_instance_full(instance_name) {
+            Ok(row) => (row, pre_capture),
+            Err(e) => return read_error(&e),
+        },
+    };
+    let Some(instance_data) = row else {
+        return StopOutcome::AlreadyStopped;
     };
 
-    // The one incarnation this stop may release: a threaded pre-signal
-    // capture binds the row it was taken against (bulk kill), every other
-    // stop binds its entry read. A capture taken for another incarnation
-    // authorizes nothing against this row: no signal, no child stop, no
-    // reap, no release. The finalize transaction re-checks it.
+    // A capture taken for another incarnation authorizes nothing against
+    // this row: no signal, no child stop, no reap, no release. The finalize
+    // transaction re-checks it.
     let bound = match &pre_capture {
         Some(capture) => BoundIncarnation::Captured(capture.incarnation().cloned()),
         None => BoundIncarnation::Entry,
@@ -1678,30 +1710,15 @@ fn stop_instance_inner_scoped(
     }
 
     // The headless group step may kill the recorded root before the reap
-    // snapshots its descendants. Capture proven carrier identities first so
-    // reparenting cannot erase that ownership evidence. The capture and the
-    // reap's call-start epoch come from one snapshot: a threaded capture
-    // brings the epoch it was taken with, and this stop's own capture reads
-    // the row and its bindings together.
+    // snapshots its descendants, so the capture above holds the proven
+    // carrier identities first: reparenting cannot erase that ownership
+    // evidence. The reap's call-start epoch is the captured one.
     let (capture, binding_ids) = match pre_capture {
         Some(capture) => {
             let ids = capture
                 .incarnation()
                 .map(|captured| captured.binding_ids.clone())
                 .unwrap_or_default();
-            (Some(capture), ids)
-        }
-        None if reap_gate => {
-            let (row, ids) = match db.get_instance_with_bindings(instance_name) {
-                Ok(snapshot) => snapshot,
-                Err(e) => {
-                    return StopOutcome::RetryableError(
-                        format!("could not read instance {instance_name}: {e}").into(),
-                    );
-                }
-            };
-            let capture =
-                crate::proctruth::capture_reap_carriers(instance_name, row.as_ref(), &ids, exclude);
             (Some(capture), ids)
         }
         None => (None, Vec::new()),
@@ -2025,9 +2042,9 @@ fn stop_instance_inner_scoped(
             instance_data.agent_id.as_deref(),
         ),
     };
-    let expected_binding_ids: &[String] = match &bound {
-        BoundIncarnation::Captured(Some(captured)) => &captured.binding_ids,
-        _ => &[],
+    let captured_bindings: Option<&[String]> = match &bound {
+        BoundIncarnation::Captured(Some(captured)) => Some(captured.binding_ids.as_slice()),
+        _ => None,
     };
     // `None`: the row is another incarnation now, so nothing was written.
     let finalized: Result<Option<bool>> = match tx {
@@ -2043,7 +2060,7 @@ fn stop_instance_inner_scoped(
                     agent_id,
                     &event_data,
                     expected_process_id.as_deref(),
-                    expected_binding_ids,
+                    captured_bindings,
                 )
                 .map(|(won, event_id)| {
                     if let Some(event_id) = event_id {
@@ -2069,7 +2086,7 @@ fn stop_instance_inner_scoped(
                     agent_id,
                     &event_data,
                     expected_process_id.as_deref(),
-                    expected_binding_ids,
+                    captured_bindings,
                 )
                 .map(Some)
             })
@@ -2323,6 +2340,13 @@ fn persist_yielded_session_exit(
     }
 }
 
+// Test seam: runs between the soft stop's snapshot read and its writes, so
+// a test can land a rebind or replacement in that gap.
+#[cfg(test)]
+thread_local! {
+    static SOFT_STOP_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
+}
+
 /// Soft session end for Antigravity: mark inactive without deleting the `instances` row.
 ///
 /// agy has no process-death hook — its hook set is only PreToolUse/PostToolUse/
@@ -2336,6 +2360,10 @@ fn persist_yielded_session_exit(
 ///
 /// Clears session bindings (and process bindings unless `keep_process_binding`),
 /// and logs a stopped life event with snapshot, but does not delete the instance row.
+/// The row and its binding epoch are read in ONE snapshot and every write runs
+/// in one transaction gated on that incarnation: a `start --as` replacement or
+/// a rebind landing after the read keeps its status, bindings, and
+/// subscriptions, and gets no stopped record from this session.
 ///
 /// OMP soft-stop passes `keep_process_binding: true` so the live process can rebind
 /// via `bind_session_to_process` on the next turn. Antigravity passes `false`.
@@ -2363,93 +2391,148 @@ pub fn soft_finalize_session(
             return;
         }
     }
+    let (row, binding_ids) = match db.get_instance_with_bindings(instance_name) {
+        Ok((Some(row), ids)) => (row, ids),
+        Ok((None, _)) => return,
+        Err(e) => {
+            log::log_warn(
+                "hooks",
+                "sessionend.soft.read_failed",
+                &format!("instance={instance_name} err={e}"),
+            );
+            return;
+        }
+    };
+    #[cfg(test)]
+    if let Some(hook) = SOFT_STOP_GAP_HOOK.with(std::cell::Cell::take) {
+        hook(db, instance_name);
+    }
+    let bound = BoundIncarnation::Captured(Some(crate::proctruth::CapturedIncarnation {
+        created_at: row.created_at,
+        pid: row.pid,
+        session_id: row.session_id.clone(),
+        agent_id: row.agent_id.clone(),
+        binding_ids,
+    }));
     log::log_info(
         "hooks",
         "sessionend.soft",
         &format!("instance={} reason={}", instance_name, reason),
     );
 
-    lifecycle::set_status(
-        db,
-        instance_name,
-        ST_INACTIVE,
-        &format!("exit:{}", reason),
-        Default::default(),
-    );
+    let written = db.with_immediate_transaction(|tx| {
+        use rusqlite::OptionalExtension;
+        let present = tx
+            .query_row(
+                "SELECT 1 FROM instances WHERE name = ?",
+                params![instance_name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !present || row_re_registered(tx, instance_name, &row, &bound)? {
+            return Ok(false);
+        }
 
-    if let Some(updates) = updates {
-        instances::update_instance_position(db, instance_name, updates);
-    }
-
-    let instance_data = match db.get_instance_full(instance_name) {
-        Ok(Some(data)) => data,
-        _ => return,
-    };
-
-    let snapshot = serde_json::json!({
-        "name": instance_name,
-        "transcript_path": instance_data.transcript_path,
-        "session_id": instance_data.session_id,
-        "tool": instance_data.tool,
-        "directory": instance_data.directory,
-        "parent_name": instance_data.parent_name,
-        "parent_session_id": instance_data.parent_session_id,
-        "tag": instance_data.tag,
-        "wait_timeout": instance_data.wait_timeout,
-        "subagent_timeout": instance_data.subagent_timeout,
-        "hints": instance_data.hints,
-        "pid": instance_data.pid,
-        "created_at": instance_data.created_at,
-        "created_at_bits": instance_data.created_at.to_bits(),
-        "last_seen": instance_data.last_seen,
-        "background": instance_data.background,
-        "agent_id": instance_data.agent_id,
-        "name_announced": instance_data.name_announced,
-        "launch_args": instance_data.launch_args,
-        "origin_device_id": instance_data.origin_device_id,
-        "background_log_file": instance_data.background_log_file,
-        "last_event_id": instance_data.last_event_id,
-        "purpose": instance_data.purpose.as_deref().unwrap_or_default(),
-        "current": instance_data.current.as_deref().unwrap_or_default(),
-    });
-
-    if let Some(ref session_id) = instance_data.session_id {
-        let _ = db.conn().execute(
-            "DELETE FROM session_bindings WHERE session_id = ?",
-            params![session_id],
+        lifecycle::set_status(
+            db,
+            instance_name,
+            ST_INACTIVE,
+            &format!("exit:{}", reason),
+            Default::default(),
         );
-        if !keep_process_binding {
-            let _ = db.conn().execute(
-                "DELETE FROM process_bindings WHERE session_id = ?",
+
+        if let Some(updates) = updates {
+            instances::update_instance_position(db, instance_name, updates);
+        }
+
+        // Re-read inside the gated transaction: the snapshot carries the
+        // exit writes above, and it is still the incarnation just checked.
+        let Some(instance_data) = db.get_instance_full(instance_name)? else {
+            return Ok(false);
+        };
+
+        let snapshot = serde_json::json!({
+            "name": instance_name,
+            "transcript_path": instance_data.transcript_path,
+            "session_id": instance_data.session_id,
+            "tool": instance_data.tool,
+            "directory": instance_data.directory,
+            "parent_name": instance_data.parent_name,
+            "parent_session_id": instance_data.parent_session_id,
+            "tag": instance_data.tag,
+            "wait_timeout": instance_data.wait_timeout,
+            "subagent_timeout": instance_data.subagent_timeout,
+            "hints": instance_data.hints,
+            "pid": instance_data.pid,
+            "created_at": instance_data.created_at,
+            "created_at_bits": instance_data.created_at.to_bits(),
+            "last_seen": instance_data.last_seen,
+            "background": instance_data.background,
+            "agent_id": instance_data.agent_id,
+            "name_announced": instance_data.name_announced,
+            "launch_args": instance_data.launch_args,
+            "origin_device_id": instance_data.origin_device_id,
+            "background_log_file": instance_data.background_log_file,
+            "last_event_id": instance_data.last_event_id,
+            "purpose": instance_data.purpose.as_deref().unwrap_or_default(),
+            "current": instance_data.current.as_deref().unwrap_or_default(),
+        });
+
+        if let Some(session_id) = &instance_data.session_id {
+            let _ = tx.execute(
+                "DELETE FROM session_bindings WHERE session_id = ?",
                 params![session_id],
             );
+            if !keep_process_binding {
+                let _ = tx.execute(
+                    "DELETE FROM process_bindings WHERE session_id = ?",
+                    params![session_id],
+                );
+            }
         }
-    }
 
-    let _ = db.delete_notify_endpoints(instance_name);
-    if !keep_process_binding {
-        let _ = db.conn().execute(
-            "DELETE FROM process_bindings WHERE instance_name = ?",
-            params![instance_name],
-        );
-    }
-    let _ = db.cleanup_subscriptions(instance_name);
+        let _ = db.delete_notify_endpoints(instance_name);
+        if !keep_process_binding {
+            let _ = tx.execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?",
+                params![instance_name],
+            );
+        }
+        let _ = db.cleanup_subscriptions(instance_name);
 
-    if let Err(e) = db.log_life_event(
-        instance_name,
-        "stopped",
-        "session",
-        &format!("exit:{}", reason),
-        Some(snapshot),
-        // Soft stops preserve the row for resume; no incarnation is
-        // released, so no process_id is claimed.
-        None,
-    ) {
-        log::log_warn(
+        if let Err(e) = db.log_life_event(
+            instance_name,
+            "stopped",
+            "session",
+            &format!("exit:{}", reason),
+            Some(snapshot),
+            // Soft stops preserve the row for resume; no incarnation is
+            // released, so no process_id is claimed.
+            None,
+        ) {
+            log::log_warn(
+                "hooks",
+                "sessionend.soft.life_event_failed",
+                &format!("log_life_event failed for {instance_name}: {e}"),
+            );
+        }
+        Ok(true)
+    });
+    match written {
+        Ok(true) => {}
+        Ok(false) => log::log_info(
             "hooks",
-            "sessionend.soft.life_event_failed",
-            &format!("log_life_event failed for {instance_name}: {e}"),
-        );
+            "sessionend.soft.re_registered",
+            &format!(
+                "instance={instance_name}; another incarnation holds the name, soft stop skipped"
+            ),
+        ),
+        Err(e) => log::log_warn(
+            "hooks",
+            "sessionend.soft.write_failed",
+            &format!("instance={instance_name} err={e}"),
+        ),
     }
 }
 
@@ -2763,6 +2846,62 @@ mod tests {
                 [name],
             )
             .unwrap();
+    }
+
+    /// `start --as` lands between the soft stop's read and its writes: the
+    /// row is recreated as another incarnation bound to its own process.
+    /// The old session's soft stop touches none of it — no exit status, no
+    /// binding released, no stopped record.
+    #[test]
+    #[serial]
+    fn soft_stop_spares_a_replacement_landing_after_its_read() {
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        fn seed(db: &HcomDb, name: &str, created_at: f64, session: &str, process: &str) {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, tool, status, status_context, status_time, \
+                     created_at, last_event_id, session_id) \
+                     VALUES (?1, 'antigravity', 'listening', 'start', 0, ?2, 0, ?3)",
+                    params![name, created_at, session],
+                )
+                .unwrap();
+            db.set_process_binding(process, session, name).unwrap();
+        }
+        fn replace(db: &HcomDb, name: &str) {
+            db.conn()
+                .execute(
+                    "DELETE FROM process_bindings WHERE instance_name = ?1",
+                    params![name],
+                )
+                .unwrap();
+            db.conn()
+                .execute("DELETE FROM instances WHERE name = ?1", params![name])
+                .unwrap();
+            seed(db, name, 2.0, "sess-new", "proc-new");
+        }
+        seed(&db, "agy", 1.0, "sess-old", "proc-old");
+        SOFT_STOP_GAP_HOOK.with(|hook| hook.set(Some(replace)));
+        soft_finalize_session(&db, "agy", "shutdown", None, false);
+        SOFT_STOP_GAP_HOOK.with(|hook| hook.set(None));
+
+        let row = db
+            .get_instance_full("agy")
+            .unwrap()
+            .expect("replacement row retained");
+        assert_eq!(row.created_at, 2.0);
+        assert_eq!(row.status, "listening", "no exit status on the replacement");
+        assert_eq!(db.process_binding_ids("agy").unwrap(), vec!["proc-new"]);
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'agy' \
+                 AND json_extract(data, '$.action') = 'stopped'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "no stopped record for the replacement");
     }
 
     #[test]
@@ -3568,7 +3707,7 @@ mod tests {
                 old.agent_id.as_deref(),
                 &event,
                 None,
-                &[],
+                None,
             )
             .unwrap();
         assert!(!won, "the stale row incarnation must lose its delete CAS");

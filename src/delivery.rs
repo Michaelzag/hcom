@@ -2587,33 +2587,57 @@ pub fn run_delivery_loop(
 /// [`cleanup_deleted_instance`].
 pub(crate) enum ExitBinding {
     /// Nothing more: released with the row in the release transaction, or
-    /// left alone because the row is another incarnation now (or the read
+    /// released only while it was still the exact binding row this exit
+    /// read — never one a replacement re-registered since (or the read
     /// failed and authorizes nothing).
     Settled,
     /// A stale harness under a rebound name: its own binding is not the
     /// live one and goes, as it always has.
     Stale,
-    /// The row was already gone at the read: the binding goes only while
-    /// no row holds the name.
-    RowGone,
+}
+
+// Test seam: runs between the PTY exit's snapshot read and its release
+// transaction, so a test can land a rebind or replacement in that gap.
+#[cfg(test)]
+thread_local! {
+    static PTY_EXIT_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
 }
 
 /// Hard PTY exit cleanup: inactive status, life event, delete instance row.
 ///
-/// The row and its process bindings are read in ONE snapshot. A stale
-/// harness exiting under a resumed (rebound) name — the newest binding no
-/// longer names `process_id` — leaves the row untouched and logs a
-/// `stale-harness-exit` instead. Otherwise every write (status, endpoints,
-/// subscriptions, the `stopped` event, the row delete, and the release of
-/// this process's binding) runs in one `BEGIN IMMEDIATE` transaction gated
-/// on the incarnation that snapshot read ([`exit_incarnation_holds`]): a
-/// replacement that lands after the read is never written to or deleted.
+/// The row, its process bindings, and this process's own binding row are
+/// read in ONE snapshot. A stale harness exiting under a resumed (rebound)
+/// name — the newest binding no longer names `process_id` — leaves the row
+/// untouched and logs a `stale-harness-exit` instead. Otherwise every write
+/// (status, endpoints, subscriptions, the `stopped` event, the row delete,
+/// and the release of this process's binding) runs in one `BEGIN IMMEDIATE`
+/// transaction gated on the incarnation that snapshot read
+/// ([`exit_incarnation_holds`]): a replacement or rebind that lands after
+/// the read is never written to or deleted. When the gate refuses, or the
+/// row was already gone, the exiting process's own binding still goes — but
+/// only while it is the exact binding row this exit read.
 pub(crate) fn cleanup_deleted_instance(
     db: &mut HcomDb,
     current_name: &str,
     process_id: &str,
 ) -> ExitBinding {
-    let (row, binding_ids) = match db.get_instance_with_bindings(current_name) {
+    let read = db.with_read_snapshot(|tx| {
+        use rusqlite::OptionalExtension;
+        let (row, binding_ids) = HcomDb::instance_with_bindings_in(tx, current_name)?;
+        let own_binding: Option<OwnBinding> = if process_id.is_empty() {
+            None
+        } else {
+            tx.query_row(
+                "SELECT session_id, updated_at FROM process_bindings \
+                 WHERE process_id = ?1 AND instance_name = ?2",
+                rusqlite::params![process_id, current_name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        };
+        Ok((row, binding_ids, own_binding))
+    });
+    let (row, binding_ids, own_binding) = match read {
         Ok(snapshot) => snapshot,
         Err(e) => {
             log_error(
@@ -2662,7 +2686,10 @@ pub(crate) fn cleanup_deleted_instance(
                 current_name
             ),
         );
-        return ExitBinding::RowGone;
+        if let Err(e) = release_own_binding(db.conn(), current_name, process_id, &own_binding) {
+            log_warn("native", "delivery.cleanup_binding_fail", &format!("{}", e));
+        }
+        return ExitBinding::Settled;
     };
     let incarnation = crate::proctruth::CapturedIncarnation {
         created_at: row.created_at,
@@ -2671,6 +2698,10 @@ pub(crate) fn cleanup_deleted_instance(
         agent_id: row.agent_id,
         binding_ids,
     };
+    #[cfg(test)]
+    if let Some(hook) = PTY_EXIT_GAP_HOOK.with(std::cell::Cell::take) {
+        hook(db, current_name);
+    }
 
     let was_killed = EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
     let (exit_context, exit_reason) = if was_killed {
@@ -2685,6 +2716,7 @@ pub(crate) fn cleanup_deleted_instance(
     };
     let released = db.with_immediate_transaction(|tx| {
         if !exit_incarnation_holds(tx, current_name, &incarnation)? {
+            release_own_binding(tx, current_name, process_id, &own_binding)?;
             return Ok(false);
         }
         let snapshot = db.get_instance_snapshot(current_name)?.map(|mut snapshot| {
@@ -2730,6 +2762,7 @@ pub(crate) fn cleanup_deleted_instance(
         // Re-checked after the writes above: anything they set off (a launch
         // publishing its pid, a replacement row or rebind) keeps the row.
         if !exit_incarnation_holds(tx, current_name, &incarnation)? {
+            release_own_binding(tx, current_name, process_id, &own_binding)?;
             return Ok(false);
         }
         let deleted = tx.execute(
@@ -2757,7 +2790,7 @@ pub(crate) fn cleanup_deleted_instance(
             "native",
             "delivery.cleanup_re_registered",
             &format!(
-                "{current_name} is another incarnation than this exit read; row and bindings untouched"
+                "{current_name} is another incarnation than this exit read; its row and bindings untouched"
             ),
         ),
         Err(e) => eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}"),
@@ -2765,13 +2798,36 @@ pub(crate) fn cleanup_deleted_instance(
     ExitBinding::Settled
 }
 
+/// This exiting process's binding row as its exit read it: `session_id`
+/// and `updated_at`. A re-registration of the process id replaces the row
+/// and changes both.
+type OwnBinding = (Option<String>, Option<f64>);
+
+/// Release the exiting process's own binding only while it is still the
+/// exact binding row the exit read: a replacement that re-registered the
+/// process id since keeps it.
+fn release_own_binding(
+    conn: &rusqlite::Connection,
+    name: &str,
+    process_id: &str,
+    own_binding: &Option<OwnBinding>,
+) -> rusqlite::Result<usize> {
+    let Some((session_id, updated_at)) = own_binding else {
+        return Ok(0);
+    };
+    conn.execute(
+        "DELETE FROM process_bindings WHERE process_id = ?1 AND instance_name = ?2 \
+         AND session_id IS ?3 AND updated_at IS ?4",
+        rusqlite::params![process_id, name, session_id, updated_at],
+    )
+}
+
 /// Whether `name`'s row is still exactly the incarnation this exit read:
 /// the same `created_at` bits, `pid`, `session_id`, and `agent_id`, and a
-/// binding epoch that only shrank. Any binding the read never saw, or an
-/// emptied set where the read saw bindings, is a rebind (the same binding
-/// rule as the stop path's captured-incarnation guard). An absent row is
-/// not this incarnation either. Read through `tx` so it decides with the
-/// writes it gates.
+/// binding epoch that only shrank, down to none (the stop path's
+/// captured-epoch rule). Any binding the read never saw is a rebind. An
+/// absent row is not this incarnation either. Read through `tx` so it
+/// decides with the writes it gates.
 fn exit_incarnation_holds(
     tx: &rusqlite::Transaction<'_>,
     name: &str,
@@ -2800,12 +2856,9 @@ fn exit_incarnation_holds(
         .prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?1")?
         .query_map(rusqlite::params![name], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(
-        !(bindings.is_empty() && !incarnation.binding_ids.is_empty())
-            && bindings
-                .iter()
-                .all(|id| incarnation.binding_ids.contains(id)),
-    )
+    Ok(bindings
+        .iter()
+        .all(|id| incarnation.binding_ids.contains(id)))
 }
 
 /// Log why PTY exit cleanup was skipped when this thread no longer owns the instance.
@@ -2842,24 +2895,10 @@ fn cleanup_pty_exit_default(
         log_pty_cleanup_skipped(db, current_name);
         ExitBinding::Stale
     };
-    if process_id.is_empty() {
+    if process_id.is_empty() || matches!(binding, ExitBinding::Settled) {
         return;
     }
-    let released = match binding {
-        ExitBinding::Settled => return,
-        ExitBinding::Stale => db.delete_process_binding(process_id),
-        // The row this exit read was absent: release the binding only while
-        // it still is, never under a replacement row of the same name.
-        ExitBinding::RowGone => db
-            .conn()
-            .execute(
-                "DELETE FROM process_bindings WHERE process_id = ?1 \
-                 AND NOT EXISTS (SELECT 1 FROM instances WHERE name = ?2)",
-                rusqlite::params![process_id, current_name],
-            )
-            .map(|_| ())
-            .map_err(Into::into),
-    };
+    let released = db.delete_process_binding(process_id);
     if let Err(e) = released {
         log_warn("native", "delivery.cleanup_binding_fail", &format!("{}", e));
     }
@@ -3077,6 +3116,103 @@ mod tests {
         assert_eq!(row.created_at, 2.0);
         assert_eq!(row.session_id.as_deref(), Some("sess-new"));
         assert_eq!(db.process_binding_ids("buli").unwrap(), vec!["proc-exit"]);
+    }
+
+    /// A PTY exit's row, `buli` at `created_at` 1, bound to `proc-exit`.
+    fn exiting_row() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at, session_id)
+                 VALUES ('buli', 'pi', 'active', 1, 'sess-old')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("proc-exit", "sess-old", "buli")
+            .unwrap();
+        (dir, db)
+    }
+
+    fn stopped_records(db: &HcomDb) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = 'buli' \
+                 AND json_extract(data, '$.action') = 'stopped'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// `start --as` lands between the PTY exit's read and its release: the
+    /// row is recreated as another incarnation bound to its own process.
+    /// That incarnation keeps its row, its status, and its binding, and gets
+    /// no stopped record from this exit.
+    #[test]
+    fn pty_exit_spares_a_replacement_landing_after_its_read() {
+        let (_dir, mut db) = exiting_row();
+        fn replace(db: &HcomDb, name: &str) {
+            db.conn()
+                .execute(
+                    "DELETE FROM process_bindings WHERE instance_name = ?1",
+                    rusqlite::params![name],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "DELETE FROM instances WHERE name = ?1",
+                    rusqlite::params![name],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, tool, status, created_at, session_id)
+                     VALUES (?1, 'pi', 'active', 2, 'sess-new')",
+                    rusqlite::params![name],
+                )
+                .unwrap();
+            db.set_process_binding("proc-new", "sess-new", name)
+                .unwrap();
+        }
+        PTY_EXIT_GAP_HOOK.with(|hook| hook.set(Some(replace)));
+        cleanup_pty_exit_default(&mut db, "buli", "proc-exit", true);
+        PTY_EXIT_GAP_HOOK.with(|hook| hook.set(None));
+
+        let row = db
+            .get_instance_full("buli")
+            .unwrap()
+            .expect("replacement row retained");
+        assert_eq!(row.created_at, 2.0);
+        assert_eq!(row.status, "active");
+        assert_eq!(db.process_binding_ids("buli").unwrap(), vec!["proc-new"]);
+        assert_eq!(stopped_records(&db), 0);
+    }
+
+    /// A rebind lands between the PTY exit's read and its release: another
+    /// process binds under the same row. The release is refused (the row
+    /// now carries a registration this exit never read), and the exiting
+    /// process's own binding — still exactly the one it read — goes anyway:
+    /// a dead process must not stay bound to a live row.
+    #[test]
+    fn pty_exit_releases_only_its_own_binding_when_a_rebind_lands_after_its_read() {
+        let (_dir, mut db) = exiting_row();
+        fn rebind(db: &HcomDb, name: &str) {
+            db.set_process_binding("proc-new", "sess-new", name)
+                .unwrap();
+        }
+        PTY_EXIT_GAP_HOOK.with(|hook| hook.set(Some(rebind)));
+        cleanup_pty_exit_default(&mut db, "buli", "proc-exit", true);
+        PTY_EXIT_GAP_HOOK.with(|hook| hook.set(None));
+
+        let row = db
+            .get_instance_full("buli")
+            .unwrap()
+            .expect("the rebound row is not this exit's to release");
+        assert_eq!(row.status, "active");
+        assert_eq!(db.process_binding_ids("buli").unwrap(), vec!["proc-new"]);
+        assert_eq!(stopped_records(&db), 0);
     }
 
     #[test]
