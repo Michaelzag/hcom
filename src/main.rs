@@ -219,7 +219,7 @@ fn consume_reroot_option(args: &[String]) -> (bool, usize) {
     (enabled, usize::from(enabled))
 }
 
-fn consume_pty_tool_args(args: &[String]) -> Result<(bool, Vec<Cow<'_, str>>)> {
+pub(crate) fn consume_pty_tool_args(args: &[String]) -> Result<(bool, Vec<Cow<'_, str>>)> {
     let (answer_omp_reroot_prompt, consumed) = consume_reroot_option(&args[1..]);
     // `consume_reroot_option` receives the post-tool slice, so translate its
     // relative count back to an index in the full PTY argument vector.
