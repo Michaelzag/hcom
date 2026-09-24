@@ -7,7 +7,15 @@
 
 use std::path::{Component, Path, PathBuf};
 
-const BUILD_ROOT: &str = "/build";
+const DEFAULT_BUILD_ROOT: &str = "/build";
+
+fn build_root() -> std::borrow::Cow<'static, str> {
+    std::env::var("HCOM_BUILD_ROOT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(std::borrow::Cow::Owned)
+        .unwrap_or(std::borrow::Cow::Borrowed(DEFAULT_BUILD_ROOT))
+}
 
 /// Check `dir` against the omp `/tmp` start guard.
 ///
@@ -15,7 +23,8 @@ const BUILD_ROOT: &str = "/build";
 /// (user-supplied `--dir`) is refused with a message naming the guard;
 /// otherwise `/build/<seat>/tmp` is created and returned instead.
 pub fn guard_launch_dir(dir: &str, seat: Option<&str>, explicit: bool) -> Result<String, String> {
-    guard_launch_dir_in(dir, seat, explicit, Path::new(BUILD_ROOT))
+    let build_root = build_root();
+    guard_launch_dir_in(dir, seat, explicit, Path::new(build_root.as_ref()))
 }
 
 fn guard_launch_dir_in(

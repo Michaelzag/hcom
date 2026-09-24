@@ -478,7 +478,33 @@ fn prepare_resume_plan_from_source(
         Some(tag.clone())
     };
 
-    // Determine effective working directory:
+    if tool == "omp" && !is_adoption {
+        let hcom_config = load_hcom_config();
+        let inside_ai_tool = crate::shared::HcomContext::from_os().is_inside_ai_tool();
+        let terminal_mode = launch_flags
+            .terminal
+            .as_deref()
+            .or(Some(hcom_config.terminal.as_str()).filter(|t| !t.is_empty()));
+        let run_here = crate::launcher::will_run_in_current_terminal(
+            1,
+            background,
+            launch_flags.run_here,
+            terminal_mode,
+            inside_ai_tool,
+        );
+        let mut env = crate::launcher::build_launch_env(
+            &hcom_config,
+            crate::launcher::launch_env_regime(run_here, inside_ai_tool),
+        );
+        crate::launcher::apply_tool_config_dir_to_env(&crate::launcher::LaunchTool::Omp, &mut env);
+        ensure_omp_session_file_in_env(
+            &session_id,
+            &snapshot_transcript_path,
+            &env,
+            std::path::Path::new(&snapshot_dir),
+        )?;
+    }
+
     // - Explicit --dir flag wins (validated and canonicalized)
     // - For fork (tracked instance): use current directory (start fresh in new context)
     // - Otherwise: use snapshot/transcript directory, falling back to current
