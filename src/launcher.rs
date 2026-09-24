@@ -1544,7 +1544,11 @@ fn launch_pty_or_background(
 /// - Name is free → Ok(()).
 /// - Name held by an inactive row → consume the row (delete) and return Ok(()).
 ///   An inactive row is a resume handle from agy soft-finalize; launch will
-///   re-create a fresh row with the same name.
+///   re-create a fresh row with the same name. Except this launch's own
+///   reservation: an inactive `new` row carrying the session being resumed
+///   (a resume plan's reservation, or the row a concurrent resume of the same
+///   session registered) is kept. Deleting it would reopen the session to a
+///   second seat; [`register_launch_instance`] decides whether to use it.
 /// - Name held by a `pending` placeholder reservation → Ok(()) without
 ///   deleting. This is *our own* reservation: the fork/resume path calls
 ///   `reserve_generated_name` (under flock, against an unused name) before the
@@ -1552,7 +1556,7 @@ fn launch_pty_or_background(
 ///   (`initialize_instance_in_position_file`) promotes the placeholder in
 ///   place, so it must survive — bailing here broke every tracked `hcom f`.
 /// - Name held by anything else (listening/active/blocked) → Err.
-fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
+fn resolve_explicit_name_conflict(db: &HcomDb, name: &str, session_id: Option<&str>) -> Result<()> {
     // Process truth first: never spawn under a name whose prior subtree is
     // still alive (orphan) or whose newest binding is live-held — not even
     // over a free or inactive row. A reservation placeholder carries no
@@ -1564,23 +1568,24 @@ fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
         return Ok(());
     };
     let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("");
-    if status == "inactive" {
-        db.delete_instance(name).map_err(|e| {
-            anyhow::anyhow!("Failed to clear inactive resume row '{}': {}", name, e)
-        })?;
-        return Ok(());
-    }
-    // A pending placeholder with no session yet is a reservation, not a live
-    // agent — leave it for the launcher's pre-register promotion.
     let status_context = row
         .get("status_context")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let session_empty = row
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.is_empty())
-        .unwrap_or(true);
+    let row_session = row.get("session_id").and_then(|v| v.as_str());
+    if status == crate::shared::ST_INACTIVE {
+        let own_reservation = status_context == "new"
+            && session_id.is_some_and(|sid| !sid.is_empty() && row_session == Some(sid));
+        if !own_reservation {
+            db.delete_instance(name).map_err(|e| {
+                anyhow::anyhow!("Failed to clear inactive resume row '{}': {}", name, e)
+            })?;
+        }
+        return Ok(());
+    }
+    // A pending placeholder with no session yet is a reservation, not a live
+    // agent — leave it for the launcher's pre-register promotion.
+    let session_empty = row_session.map(|s| s.is_empty()).unwrap_or(true);
     if status == instance_names::PLACEHOLDER_STATUS
         && status_context == instance_names::PLACEHOLDER_CONTEXT
         && session_empty
@@ -1591,6 +1596,90 @@ fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
         "Instance '{}' already exists (stop it first or use a different name)",
         name
     );
+}
+
+/// Pre-register this launch's row and its process binding (NULL pid), or
+/// refuse — before anything is spawned — when another seat already holds
+/// the session being resumed.
+///
+/// The holder checks, the row write and the binding share ONE `BEGIN
+/// IMMEDIATE` transaction, so two resumes of one session serialize here: the
+/// second one sees the first's committed row and binding and fails naming
+/// it. Holders of `session_id`: another row carrying it (live or pending),
+/// its `session_bindings` owner, or — under this launch's own name — a row
+/// whose newest process binding was registered for this incarnation within
+/// the placeholder window (a concurrent resume in its pre-spawn gap; once it
+/// spawns, process truth in [`resolve_explicit_name_conflict`] takes over).
+#[allow(clippy::too_many_arguments)]
+fn register_launch_instance(
+    db: &HcomDb,
+    instance_name: &str,
+    session_id: Option<&str>,
+    process_id: &str,
+    tool: &str,
+    background: bool,
+    tag: Option<&str>,
+    working_dir: &str,
+) -> Result<()> {
+    db.with_immediate_transaction(|_tx| {
+        if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            refuse_held_session(db, instance_name, sid)?;
+        }
+        if !instance_binding::initialize_instance_in_position_file(
+            db,
+            instance_name,
+            session_id,
+            None,       // parent_session_id
+            None,       // parent_name
+            None,       // agent_id
+            None,       // transcript_path
+            Some(tool), // tool
+            background,
+            tag,
+            None,              // wait_timeout
+            None,              // subagent_timeout
+            None,              // hints
+            Some(working_dir), // cwd_override: use launch params cwd, not current_dir()
+        ) {
+            bail!("Failed to register instance '{instance_name}'");
+        }
+        db.set_process_binding(process_id, "", instance_name)?;
+        Ok(())
+    })
+}
+
+/// Err naming the holder when anything but `name`'s own unclaimed row holds
+/// `session_id`; see [`register_launch_instance`].
+fn refuse_held_session(db: &HcomDb, name: &str, session_id: &str) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    let holder = match db.get_session_binding(session_id)? {
+        Some(bound) if bound != name => Some(bound),
+        _ => db
+            .conn()
+            .query_row(
+                "SELECT name FROM instances WHERE session_id = ? AND name <> ? LIMIT 1",
+                rusqlite::params![session_id, name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?,
+    };
+    if let Some(holder) = holder {
+        bail!("session {session_id} is already held by '{holder}'; not launching '{name}'");
+    }
+    let Some(row) = db.get_instance_full(name)? else {
+        return Ok(());
+    };
+    if let Some((claimer, bound_at)) = db.newest_process_binding(name)?
+        && bound_at >= row.created_at
+        && crate::shared::time::now_epoch_f64() - bound_at
+            < crate::instance_lifecycle::CLEANUP_PLACEHOLDER_THRESHOLD as f64
+    {
+        bail!(
+            "'{name}' is already being launched for session {session_id} \
+             (process {claimer}); not launching it twice"
+        );
+    }
+    Ok(())
 }
 
 /// Inject ephemeral workspace trust flags into args for gemini and codex.
@@ -1847,7 +1936,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 params.count
             );
         }
-        resolve_explicit_name_conflict(db, name)?;
+        resolve_explicit_name_conflict(db, name, params.prior_session_id.as_deref())?;
     }
 
     // System prompt file for Gemini/Codex
@@ -2050,30 +2139,16 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         // its own pid on entry, before it spawns the tool, then overwrites
         // the anchor with the tool pid. A leaked UUID cannot trust this row
         // until an ancestor pid has been recorded.
-        if let Err(e) = (|| -> Result<()> {
-            instance_binding::initialize_instance_in_position_file(
-                db,
-                &instance_name,
-                params.prior_session_id.as_deref(),
-                None,            // parent_session_id
-                None,            // parent_name
-                None,            // agent_id
-                None,            // transcript_path
-                Some(tool_type), // tool
-                params.background,
-                if effective_tag.is_empty() {
-                    None
-                } else {
-                    Some(effective_tag.as_str())
-                },
-                None,              // wait_timeout
-                None,              // subagent_timeout
-                None,              // hints
-                Some(working_dir), // cwd_override: use launch params cwd, not current_dir()
-            );
-            db.set_process_binding(&process_id, "", &instance_name)?;
-            Ok(())
-        })() {
+        if let Err(e) = register_launch_instance(
+            db,
+            &instance_name,
+            params.prior_session_id.as_deref(),
+            &process_id,
+            tool_type,
+            params.background,
+            (!effective_tag.is_empty()).then_some(effective_tag.as_str()),
+            working_dir,
+        ) {
             errors.push(json!({"tool": base_tool, "error": e.to_string()}));
             continue;
         }
@@ -3717,14 +3792,14 @@ mod tests {
     #[test]
     fn resolve_explicit_name_conflict_allows_free_name() {
         let db = launcher_test_db();
-        assert!(resolve_explicit_name_conflict(&db, "luna").is_ok());
+        assert!(resolve_explicit_name_conflict(&db, "luna", None).is_ok());
     }
 
     #[test]
     fn resolve_explicit_name_conflict_consumes_inactive_resume_row() {
         let db = launcher_test_db();
         insert_test_instance(&db, "zeno", "inactive");
-        assert!(resolve_explicit_name_conflict(&db, "zeno").is_ok());
+        assert!(resolve_explicit_name_conflict(&db, "zeno", None).is_ok());
         // Row must be gone so the launcher can create a fresh row with the same name.
         assert!(db.get_instance("zeno").unwrap().is_none());
     }
@@ -3748,7 +3823,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert!(resolve_explicit_name_conflict(&db, "milo").is_ok());
+        assert!(resolve_explicit_name_conflict(&db, "milo", None).is_ok());
         // Row must survive — the launcher promotes it in place.
         assert!(db.get_instance("milo").unwrap().is_some());
     }
@@ -3757,7 +3832,7 @@ mod tests {
     fn resolve_explicit_name_conflict_rejects_active_row() {
         let db = launcher_test_db();
         insert_test_instance(&db, "rune", "listening");
-        let err = resolve_explicit_name_conflict(&db, "rune")
+        let err = resolve_explicit_name_conflict(&db, "rune", None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("already exists"), "unexpected: {err}");
@@ -3791,13 +3866,157 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let err = resolve_explicit_name_conflict(&db, &name)
+        let err = resolve_explicit_name_conflict(&db, &name, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains(&spid.to_string()), "unexpected: {err}");
         assert!(err.contains("hcom kill"), "unexpected: {err}");
         sleeper.kill().ok();
         sleeper.wait().ok();
+    }
+
+    const RACE_SESSION: &str = "omp-session-a";
+
+    /// One resume's pre-spawn steps up to its launch registration: the
+    /// explicit-name check, then the registration. `Ok` is the go-ahead to
+    /// spawn; the launcher spawns nothing for an `Err`.
+    fn resume_registration(
+        db: &HcomDb,
+        name: &str,
+        process_id: &str,
+        between: impl FnOnce(&HcomDb),
+    ) -> Result<()> {
+        resolve_explicit_name_conflict(db, name, Some(RACE_SESSION))?;
+        between(db);
+        register_launch_instance(
+            db,
+            name,
+            Some(RACE_SESSION),
+            process_id,
+            "omp",
+            false,
+            None,
+            "/work",
+        )
+    }
+
+    fn bound_instance(db: &HcomDb, process_id: &str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        db.conn()
+            .query_row(
+                "SELECT instance_name FROM process_bindings WHERE process_id = ?",
+                rusqlite::params![process_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resume_registration_refuses_a_session_another_seat_took_after_the_check() {
+        // Seat rune registers session A between luna's name check and its
+        // registration: luna's launch must fail naming rune, spawn nothing,
+        // and leave rune's row alone.
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        let err = resume_registration(&db, "luna", "proc-luna", |db| {
+            let mut row = serde_json::Map::new();
+            row.insert("session_id".into(), json!(RACE_SESSION));
+            row.insert("tool".into(), json!("omp"));
+            row.insert("status".into(), json!("listening"));
+            row.insert("created_at".into(), json!(1.0));
+            db.save_instance_named("rune", &row).unwrap();
+        })
+        .expect_err("a session another seat holds must not be launched")
+        .to_string();
+        assert_eq!(
+            err,
+            format!("session {RACE_SESSION} is already held by 'rune'; not launching 'luna'")
+        );
+        let rune = db.get_instance_full("rune").unwrap().expect("rune kept");
+        assert_eq!(rune.session_id.as_deref(), Some(RACE_SESSION));
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+        assert_eq!(bound_instance(&db, "proc-luna"), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn second_resume_of_one_session_under_one_name_is_refused() {
+        // Two `hcom r luna` of session A: the first registers and may spawn;
+        // the second must not drop the first's row and must fail before
+        // spawning, naming the seat that won.
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        resume_registration(&db, "luna", "proc-first", |_| {}).unwrap();
+        let first = db.get_instance_full("luna").unwrap().expect("first row");
+
+        let err = resume_registration(&db, "luna", "proc-second", |_| {})
+            .expect_err("the second resume must not spawn")
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "'luna' is already being launched for session {RACE_SESSION} \
+                 (process proc-first); not launching it twice"
+            )
+        );
+        let row = db
+            .get_instance_full("luna")
+            .unwrap()
+            .expect("first row kept");
+        assert_eq!(row.created_at, first.created_at);
+        assert_eq!(row.session_id.as_deref(), Some(RACE_SESSION));
+        assert_eq!(bound_instance(&db, "proc-first").as_deref(), Some("luna"));
+        assert_eq!(bound_instance(&db, "proc-second"), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resume_registration_keeps_its_own_reservation() {
+        // A resume plan's reservation (inactive, 'new', carrying A) is this
+        // launch's own: the name check keeps it, and registration proceeds
+        // on that row.
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        let mut row = serde_json::Map::new();
+        row.insert("session_id".into(), json!(RACE_SESSION));
+        row.insert("tool".into(), json!("omp"));
+        row.insert("status".into(), json!(crate::shared::ST_INACTIVE));
+        row.insert("status_context".into(), json!("new"));
+        row.insert("created_at".into(), json!(7.0));
+        db.save_instance_named("luna", &row).unwrap();
+
+        resume_registration(&db, "luna", "proc-luna", |db| {
+            assert_eq!(
+                db.get_instance_full("luna").unwrap().map(|r| r.created_at),
+                Some(7.0),
+                "the name check must keep the reservation"
+            );
+        })
+        .unwrap();
+        let row = db.get_instance_full("luna").unwrap().expect("registered");
+        assert_eq!(row.created_at, 7.0);
+        assert_eq!(row.session_id.as_deref(), Some(RACE_SESSION));
+        assert_eq!(bound_instance(&db, "proc-luna").as_deref(), Some("luna"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resume_registration_re_registers_its_own_row_after_a_clean_stop() {
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = launcher_test_db();
+        resume_registration(&db, "luna", "proc-first", |_| {}).unwrap();
+        crate::hooks::common::finalize_session(&db, "luna", "shutdown", None);
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+
+        resume_registration(&db, "luna", "proc-again", |_| {}).unwrap();
+        let row = db
+            .get_instance_full("luna")
+            .unwrap()
+            .expect("re-registered");
+        assert_eq!(row.session_id.as_deref(), Some(RACE_SESSION));
+        assert_eq!(bound_instance(&db, "proc-again").as_deref(), Some("luna"));
     }
 
     #[test]
