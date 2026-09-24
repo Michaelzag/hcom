@@ -63,15 +63,14 @@ fn redirect_target(build_root: &Path, seat: Option<&str>) -> PathBuf {
 
 /// Whether `dir` resolves to `/tmp` or something beneath it. Compared
 /// component-wise, so `/tmpfoo` does not match; `/tmp` itself is also
-/// resolved so a symlinked `/tmp` (macOS `/private/tmp`) is caught.
+/// resolved so a symlinked `/tmp` (macOS `/private/tmp`) is caught. A path
+/// that can't be resolved (doesn't exist) is judged as written.
 #[cfg(unix)]
 fn is_under_tmp(dir: &Path) -> bool {
     let tmp = Path::new("/tmp");
     let resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let tmp_resolved = tmp.canonicalize().unwrap_or_else(|_| tmp.to_path_buf());
-    [dir, resolved.as_path()]
-        .iter()
-        .any(|p| p.starts_with(tmp) || p.starts_with(&tmp_resolved))
+    resolved.starts_with(tmp) || resolved.starts_with(&tmp_resolved)
 }
 
 #[cfg(not(unix))]
@@ -124,7 +123,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = env!("CARGO_MANIFEST_DIR");
         let with_slash = format!("{dir}/");
-        for d in [dir.to_string(), with_slash, "/tmpfoo".into()] {
+        // `/tmp/..` resolves to `/`, which is not under /tmp.
+        for d in [
+            dir.to_string(),
+            with_slash,
+            "/tmpfoo".into(),
+            "/tmp/..".into(),
+        ] {
             assert_eq!(
                 guard_launch_dir_in(&d, Some("nuzi"), true, root.path()).unwrap(),
                 d
