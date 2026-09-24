@@ -271,6 +271,7 @@ struct CarrierTreeScope {
     known: HashMap<u32, (ProcMatch, String)>,
     dropped_live: std::cell::Cell<usize>,
     admitted: std::cell::Cell<usize>,
+    excluded: Vec<u32>,
 }
 
 /// The owning roots and carrier set from before the operation's first signal.
@@ -317,6 +318,7 @@ fn carrier_tree_scope(db: &HcomDb, name: &str, binding_ids: &[String]) -> Carrie
         roots,
         caller_ancestors: caller_ancestor_pids(),
         known: HashMap::new(),
+        excluded: Vec::new(),
         dropped_live: std::cell::Cell::new(0),
         admitted: std::cell::Cell::new(0),
     }
@@ -362,6 +364,8 @@ fn snapshot_reap_carriers(
     exclude: &[u32],
     scope: &mut CarrierTreeScope,
 ) -> Vec<ProcMatch> {
+    scope.excluded.clear();
+    scope.excluded.extend_from_slice(exclude);
     let mut matches = live_carriers_for(name, binding_ids, exclude, Some(scope));
     matches.retain(|m| {
         let Some(identity) = carrier_identity(m.pid) else {
@@ -527,14 +531,22 @@ fn enumerate_unix(
             }
         } else if !carrier_eligible(pid) {
             if let Some(scope) = scope {
-                scope.dropped_live.set(scope.dropped_live.get() + 1);
+                if scope.excluded.contains(&pid) {
+                    scope.admitted.set(scope.admitted.get() + 1);
+                } else {
+                    scope.dropped_live.set(scope.dropped_live.get() + 1);
+                }
                 log_carrier_out_of_scope(pid, name, scope);
             }
             continue;
         }
         if scope.is_some_and(|scope| {
             if !carrier_in_signal_scope(pid, name, scope) {
-                scope.dropped_live.set(scope.dropped_live.get() + 1);
+                if scope.excluded.contains(&pid) {
+                    scope.admitted.set(scope.admitted.get() + 1);
+                } else {
+                    scope.dropped_live.set(scope.dropped_live.get() + 1);
+                }
                 true
             } else {
                 scope.admitted.set(scope.admitted.get() + 1);
@@ -1620,6 +1632,7 @@ mod tests {
             roots: vec![10, 20, 30],
             caller_ancestors: vec![10, 2, 1],
             known: HashMap::new(),
+            excluded: Vec::new(),
             dropped_live: std::cell::Cell::new(0),
             admitted: std::cell::Cell::new(0),
         };
@@ -1857,6 +1870,7 @@ mod tests {
                 roots: vec![std::process::id()],
                 caller_ancestors: vec![std::process::id()],
                 known: HashMap::new(),
+                excluded: Vec::new(),
                 dropped_live: std::cell::Cell::new(0),
                 admitted: std::cell::Cell::new(0),
             },
