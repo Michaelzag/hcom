@@ -1687,7 +1687,6 @@ mod tests {
             .expect("spawn sleep")
     }
 
-
     #[cfg(target_os = "linux")]
     fn insert_null_pid_row(db: &HcomDb, name: &str, process_id: &str) {
         let now = crate::shared::time::now_epoch_f64();
@@ -1712,7 +1711,10 @@ mod tests {
         let carrier = spawn_detached_named_sleeper(&name, &process_id);
         wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
         let outcome = crate::hooks::common::stop_instance(&db, &name, "test", "stopped");
-        assert!(matches!(outcome, crate::hooks::common::StopOutcome::RetryableError(_)));
+        assert!(matches!(
+            outcome,
+            crate::hooks::common::StopOutcome::RetryableError(_)
+        ));
         assert!(db.get_instance_full(&name).unwrap().is_some());
         assert_eq!(db.process_binding_ids(&name).unwrap(), vec![process_id]);
         assert!(!process_gone(carrier));
@@ -1730,9 +1732,7 @@ mod tests {
         wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
         let bindings = db.process_binding_ids(&name).unwrap();
         let capture = capture_reap_carriers(&db, &name, &bindings, &[]);
-        let result = reap_instance_tree_for_excluding_captured(
-            &db, &name, &bindings, &[], capture,
-        );
+        let result = reap_instance_tree_for_excluding_captured(&db, &name, &bindings, &[], capture);
         assert!(result.is_err());
         assert!(!process_gone(carrier));
         unsafe { libc::kill(carrier as libc::pid_t, libc::SIGKILL) };

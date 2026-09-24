@@ -1241,7 +1241,17 @@ pub fn stop_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, true, &[], None)
+    stop_instance_inner(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        false,
+        0,
+        true,
+        &[],
+        None,
+    )
 }
 pub(crate) fn stop_instance_with_capture(
     db: &HcomDb,
@@ -1250,7 +1260,17 @@ pub(crate) fn stop_instance_with_capture(
     reason: &str,
     capture: crate::proctruth::ReapCapture,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, true, &[], Some(capture))
+    stop_instance_inner(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        false,
+        0,
+        true,
+        &[],
+        Some(capture),
+    )
 }
 
 /// External side effects of a stop: subscription notifications, listener
@@ -1359,7 +1379,17 @@ pub(crate) fn stop_placeholder_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, true, &[], None)
+    stop_instance_inner(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        true,
+        0,
+        true,
+        &[],
+        None,
+    )
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1409,15 +1439,31 @@ fn caller_tree_outside_group(_pid: u32, _exclude: &[u32]) -> bool {
     false
 }
 
-
 #[allow(clippy::too_many_arguments)]
 fn stop_instance_inner(
-    db: &HcomDb, instance_name: &str, initiated_by: &str, reason: &str,
-    placeholder: bool, depth: u32, reap_gate: bool, exclude: &[u32],
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+    placeholder: bool,
+    depth: u32,
+    reap_gate: bool,
+    exclude: &[u32],
     pre_capture: Option<crate::proctruth::ReapCapture>,
 ) -> StopOutcome {
-    stop_instance_inner_scoped(db, instance_name, initiated_by, reason, placeholder, depth,
-        reap_gate, None, &mut PostCommit::default(), exclude, pre_capture)
+    stop_instance_inner_scoped(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        placeholder,
+        depth,
+        reap_gate,
+        None,
+        &mut PostCommit::default(),
+        exclude,
+        pre_capture,
+    )
 }
 
 /// [`stop_instance_inner`] with the write scope spelled out. `tx: None` is
@@ -1474,9 +1520,11 @@ fn stop_instance_inner_scoped(
     // snapshots its descendants. Capture proven carrier identities first so
     // reparenting cannot erase that ownership evidence.
     let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
-    let capture = pre_capture.or_else(|| reap_gate.then(|| {
-        crate::proctruth::capture_reap_carriers(db, instance_name, &binding_ids, exclude)
-    }));
+    let capture = pre_capture.or_else(|| {
+        reap_gate.then(|| {
+            crate::proctruth::capture_reap_carriers(db, instance_name, &binding_ids, exclude)
+        })
+    });
 
     // Kill headless processes (background=true)
     // Skipped when the reap gate is off (the kill paths): kill owns the
