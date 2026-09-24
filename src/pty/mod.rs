@@ -679,57 +679,59 @@ impl Proxy {
         let slave_fd = pty.slave.as_raw_fd();
         let master_fd = pty.master.as_raw_fd();
 
+        let mut cmd = Command::new(command);
+        cmd.args(args)
+            .envs(
+                config
+                    .env_vars
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
+            )
+            .env_remove("HCOM_ANSWER_OMP_REROOT_PROMPT");
         // SAFETY: pre_exec closure runs in the child process after fork() but before exec().
         // All operations are async-signal-safe (setsid, ioctl, dup2, close).
         // slave_fd and master_fd are i32 (Copy), captured by value before the OwnedFds are moved.
-        let child = unsafe {
-            Command::new(command)
-                .args(args)
-                .envs(
-                    config
-                        .env_vars
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str())),
-                )
-                .env_remove("HCOM_ANSWER_OMP_REROOT_PROMPT")
-                .pre_exec(move || {
-                    // Create new session
-                    if libc::setsid() == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // Set controlling terminal
-                    #[cfg(target_os = "linux")]
-                    let tiocsctty = libc::TIOCSCTTY;
-                    #[cfg(target_os = "android")]
-                    let tiocsctty = libc::TIOCSCTTY as libc::c_int;
-                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                    let tiocsctty = libc::TIOCSCTTY as libc::c_ulong;
-                    if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // Redirect stdio to slave
-                    if libc::dup2(slave_fd, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::dup2(slave_fd, 1) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::dup2(slave_fd, 2) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    // Close slave fd if it's not stdio
-                    if slave_fd > 2 {
-                        libc::close(slave_fd);
-                    }
-                    // Close master fd — child should only have the slave side.
-                    // Without this, the child holds a ref to the PTY master,
-                    // preventing proper SIGHUP delivery on PTY teardown.
-                    libc::close(master_fd);
-                    Ok(())
-                })
-                .spawn()
-                .context("spawn failed")?
-        };
+        unsafe {
+            cmd.pre_exec(move || {
+                // Create new session
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                // Set controlling terminal
+                #[cfg(target_os = "linux")]
+                let tiocsctty = libc::TIOCSCTTY;
+                #[cfg(target_os = "android")]
+                let tiocsctty = libc::TIOCSCTTY as libc::c_int;
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let tiocsctty = libc::TIOCSCTTY as libc::c_ulong;
+                if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                // Redirect stdio to slave
+                if libc::dup2(slave_fd, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::dup2(slave_fd, 1) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::dup2(slave_fd, 2) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                // Close slave fd if it's not stdio
+                if slave_fd > 2 {
+                    libc::close(slave_fd);
+                }
+                // Close master fd — child should only have the slave side.
+                // Without this, the child holds a ref to the PTY master,
+                // preventing proper SIGHUP delivery on PTY teardown.
+                libc::close(master_fd);
+                Ok(())
+            });
+        }
+        // The tool gets only the PTY slave on 0/1/2; nothing else hcom or its
+        // caller holds open crosses into it.
+        crate::sys::process::close_inherited_fds(&mut cmd);
+        let child = cmd.spawn().context("spawn failed")?;
 
         // Write PID and launch context to database for hcom kill
         if let Some(ref instance_name) = config.instance_name

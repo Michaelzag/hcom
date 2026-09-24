@@ -413,6 +413,83 @@ pub fn detach_session(command: &mut Command) {
     }
 }
 
+/// Keep the caller's open descriptors out of a launched seat.
+///
+/// hcom is usually run from inside another agent's shell tool, and that agent
+/// may hold files open without `O_CLOEXEC` (omp/bun keeps its transcript open
+/// for append). Without this, every descriptor >= 3 crosses the exec into the
+/// runner, the PTY wrapper and the new seat's whole process tree. hcom passes
+/// no descriptor above stderr to a seat, so everything >= 3 is dropped.
+///
+/// The descriptors are marked close-on-exec rather than closed: `Command`
+/// reports an exec failure to the parent through a CLOEXEC pipe that must stay
+/// open until the exec itself, and for [`exec_replace`] a failed exec leaves
+/// hcom running with its own descriptors intact.
+///
+/// Unix: a `pre_exec` hook calling `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`
+/// on Linux/Android, falling back to `fcntl(FD_CLOEXEC)` over every possible
+/// descriptor where that syscall is unavailable. Windows: no-op; std creates
+/// children with handle inheritance on, but only handles explicitly marked
+/// inheritable cross, and [`spawn_detached`] already strips the std handles.
+pub fn close_inherited_fds(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Resolved in the parent: the hook itself must not allocate or take
+        // locks, and sysconf is not async-signal-safe. Clamped so a huge
+        // RLIMIT_NOFILE cannot turn the fallback loop into a stall.
+        // SAFETY: sysconf only reads a limit.
+        let open_max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        let max_fd = if open_max <= 0 {
+            1024
+        } else {
+            open_max.min(1 << 20) as libc::c_int
+        };
+        // SAFETY: the hook only issues close_range/fcntl syscalls, both
+        // async-signal-safe, and touches no Rust-managed state.
+        unsafe {
+            command.pre_exec(move || {
+                mark_cloexec_from(3, max_fd);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    let _ = command;
+}
+
+/// Set `FD_CLOEXEC` on every descriptor `>= first`. Async-signal-safe.
+#[cfg(unix)]
+fn mark_cloexec_from(first: libc::c_int, max_fd: libc::c_int) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // SAFETY: raw close_range syscall with scalar arguments; on kernels
+        // older than 5.11 it fails with ENOSYS/EINVAL and we fall through.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                first as libc::c_uint,
+                libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if ret == 0 {
+            return;
+        }
+    }
+    for fd in first..max_fd {
+        // SAFETY: fcntl on an arbitrary descriptor number; EBADF for closed
+        // slots is expected and ignored.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
 /// Best-effort graceful shutdown request on Windows, the analogue of Unix
 /// `SIGTERM`: it asks the target to exit but does not force it.
 ///
@@ -852,6 +929,87 @@ mod tests {
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
         let identity = identity(std::process::id()).unwrap();
         assert!(identity.contains(boot_id.trim()));
+    }
+
+    /// Open `/dev/null` the way omp/bun opens its transcript: without
+    /// `O_CLOEXEC`, so a plain fork+exec hands it to the child.
+    #[cfg(unix)]
+    fn open_inheritable_fd() -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        // SAFETY: open with a NUL-terminated literal path; result checked.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_APPEND) };
+        assert!(fd > 2, "open(/dev/null) failed or returned stdio: {fd}");
+        // SAFETY: fd is a fresh descriptor this test owns.
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// Which of `fds` are open in a `sh` spawned from `command`, as seen by
+    /// the shell itself (`/dev/fd` resolves to the process running `test`).
+    #[cfg(unix)]
+    fn fds_open_in_child(mut command: Command, fds: &[i32]) -> Vec<(i32, bool)> {
+        let list = fds
+            .iter()
+            .map(|fd| fd.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let output = command
+            .arg("-c")
+            .arg(format!(
+                "for fd in {list}; do if [ -e /dev/fd/$fd ]; then echo $fd open; else echo $fd closed; fi; done"
+            ))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn sh");
+        assert!(output.status.success(), "sh failed: {output:?}");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (fd, state) = line.split_once(' ').unwrap();
+                (fd.parse().unwrap(), state == "open")
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_inherited_fds_keeps_caller_descriptors_out_of_the_child() {
+        use std::os::fd::AsRawFd;
+        let leaked = open_inheritable_fd();
+        let fd = leaked.as_raw_fd();
+
+        // Control: without the helper the descriptor does cross the exec, so
+        // the assertion below is not vacuous.
+        let plain = fds_open_in_child(Command::new("sh"), &[fd]);
+        assert_eq!(plain, vec![(fd, true)], "test fd must be inheritable");
+
+        let mut command = Command::new("sh");
+        close_inherited_fds(&mut command);
+        let seen = fds_open_in_child(command, &[0, 1, 2, fd]);
+        assert_eq!(
+            seen,
+            vec![(0, true), (1, true), (2, true), (fd, false)],
+            "launched child must keep stdio and drop the caller's fd {fd}"
+        );
+        // The helper acts in the child only; the caller keeps its descriptor.
+        // SAFETY: F_GETFD on a descriptor this test owns.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_inherited_fds_still_reports_exec_failure() {
+        // Command reports a failed exec through a CLOEXEC pipe >= 3; closing
+        // it in pre_exec would turn a missing binary into a spawned child.
+        let mut command = Command::new("/nonexistent/hcom-close-inherited-fds");
+        close_inherited_fds(&mut command);
+        let err = command
+            .spawn()
+            .expect_err("exec of a missing binary must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     // Reproduces the bug fixed above: the process object stays valid (and

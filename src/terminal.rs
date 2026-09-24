@@ -1811,21 +1811,22 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
         let launch_dir = paths::hcom_path(&[paths::LAUNCH_DIR]);
         fs::create_dir_all(&launch_dir).ok();
 
-        let child = Command::new(&argv[0])
+        let mut command = Command::new(&argv[0]);
+        command
             .args(&argv[1..])
             .env_clear()
             .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                anyhow!(maybe_append_ai_tool_launch_hint(
-                    format!("Failed to spawn terminal process: {err}"),
-                    argv,
-                    inside_ai_tool,
-                ))
-            })?;
+            .stderr(std::process::Stdio::piped());
+        crate::sys::process::close_inherited_fds(&mut command);
+        let child = command.spawn().map_err(|err| {
+            anyhow!(maybe_append_ai_tool_launch_hint(
+                format!("Failed to spawn terminal process: {err}"),
+                argv,
+                inside_ai_tool,
+            ))
+        })?;
 
         let output = child
             .wait_with_output()
@@ -1842,10 +1843,13 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
         Ok((true, captured))
     } else {
         // Normal case: wait for terminal launcher to complete
-        let output = Command::new(&argv[0])
+        let mut command = Command::new(&argv[0]);
+        command
             .args(&argv[1..])
             .env_clear()
-            .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        crate::sys::process::close_inherited_fds(&mut command);
+        let output = command
             .output()
             .context("Failed to run terminal launcher")?;
 
@@ -2116,6 +2120,7 @@ pub fn launch_terminal(
             .stdin(std::process::Stdio::null())
             .stdout(log_handle.try_clone()?)
             .stderr(log_handle);
+        crate::sys::process::close_inherited_fds(&mut cmd);
 
         // Detach child into its own session so it survives parent exit (no
         // SIGHUP), without leaking a captured caller's stdout/stderr handles
@@ -2158,6 +2163,7 @@ pub fn launch_terminal(
             Command::new(resolve_bash_command())
         };
         cmd.arg(script_file).env_clear().envs(&full_env);
+        crate::sys::process::close_inherited_fds(&mut cmd);
         let err = crate::sys::process::exec_replace(cmd);
         bail!("exec failed: {}", err);
     }
