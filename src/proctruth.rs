@@ -269,6 +269,8 @@ struct CarrierTreeScope {
     roots: Vec<u32>,
     caller_ancestors: Vec<u32>,
     known: HashMap<u32, (ProcMatch, String)>,
+    dropped_live: std::cell::Cell<usize>,
+    admitted: std::cell::Cell<usize>,
 }
 
 /// The owning roots and carrier set from before the operation's first signal.
@@ -315,6 +317,8 @@ fn carrier_tree_scope(db: &HcomDb, name: &str, binding_ids: &[String]) -> Carrie
         roots,
         caller_ancestors: caller_ancestor_pids(),
         known: HashMap::new(),
+        dropped_live: std::cell::Cell::new(0),
+        admitted: std::cell::Cell::new(0),
     }
 }
 
@@ -523,12 +527,24 @@ fn enumerate_unix(
             }
         } else if !carrier_eligible(pid) {
             if let Some(scope) = scope {
+                scope.dropped_live.set(scope.dropped_live.get() + 1);
                 log_carrier_out_of_scope(pid, name, scope);
             }
             continue;
         }
-        if scope.is_some_and(|scope| !carrier_in_signal_scope(pid, name, scope)) {
+        if scope.is_some_and(|scope| {
+            if !carrier_in_signal_scope(pid, name, scope) {
+                scope.dropped_live.set(scope.dropped_live.get() + 1);
+                true
+            } else {
+                scope.admitted.set(scope.admitted.get() + 1);
+                false
+            }
+        }) {
             continue;
+        }
+        if let Some(scope) = scope {
+            scope.admitted.set(scope.admitted.get() + 1);
         }
         // A second pass is unnecessary: process_id defaults to empty when
         // the entry is absent, which simply never matches a binding.
@@ -670,7 +686,7 @@ pub enum ReapError {
     // The non-Unix reap is a no-op success and never constructs this variant.
     #[cfg_attr(not(unix), allow(dead_code))]
     Survivors(Vec<u32>),
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(unix)]
     UnprovenOwnership,
 }
 
@@ -687,7 +703,7 @@ impl std::fmt::Display for ReapError {
                 }
                 Ok(())
             }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(unix)]
             Self::UnprovenOwnership => {
                 f.write_str("cannot prove process ownership on this host; row left intact")
             }
@@ -804,6 +820,7 @@ pub fn reap_instance_tree_for(
 /// while alive, a survivor (fail-closed).
 /// The row itself is torn down only while the incarnation the kill resolved
 /// against is still the row's (the kill command's teardown CAS).
+/// If every live identity carrier seen is outside the proven scope and no carrier was admitted, release fails closed with the row intact.
 ///
 /// `db` supplies the per-round binding registry read behind the epoch rule.
 /// Unix only; elsewhere this is a no-op success.
@@ -894,6 +911,9 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
             })
             .collect();
         if current.is_empty() {
+            if scope.dropped_live.get() > 0 && scope.admitted.get() == 0 {
+                return Err(ReapError::UnprovenOwnership);
+            }
             return Ok(());
         }
         current.sort_by(|a, b| {

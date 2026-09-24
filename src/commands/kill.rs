@@ -810,6 +810,8 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         if let Some(pid) = inst.pid {
             active_pids.insert(pid as u32);
             let is_headless = inst.background != 0;
+            let binding_ids = db.process_binding_ids(&inst.name).unwrap_or_default();
+            let pre_capture = crate::proctruth::capture_reap_carriers(db, &inst.name, &binding_ids, &[]);
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
                 kill_instance(db, &inst.name, pid as u32, inst, is_headless);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
@@ -840,8 +842,8 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
             // The release reaps the whole tree; a failure means live
             // processes remain, so it counts against the kill.
-            if let StopOutcome::RetryableError(e) =
-                stop_instance(db, &inst.name, initiator, "killed")
+            if let StopOutcome::RetryableError(e) = crate::hooks::common::stop_instance_with_capture(
+                db, &inst.name, initiator, "killed", pre_capture)
             {
                 eprintln!("Error releasing '{}': {e}", inst.name);
                 failed += 1;
@@ -939,6 +941,8 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     for inst in &tagged {
         if let Some(pid) = inst.pid {
             let is_headless = inst.background != 0;
+            let binding_ids = db.process_binding_ids(&inst.name).unwrap_or_default();
+            let pre_capture = crate::proctruth::capture_reap_carriers(db, &inst.name, &binding_ids, &[]);
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
                 kill_instance(db, &inst.name, pid as u32, inst, is_headless);
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
@@ -967,8 +971,8 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
             }
             incomplete +=
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-            if let StopOutcome::RetryableError(e) =
-                stop_instance(db, &inst.name, initiator, "killed")
+            if let StopOutcome::RetryableError(e) = crate::hooks::common::stop_instance_with_capture(
+                db, &inst.name, initiator, "killed", pre_capture)
             {
                 eprintln!("Error releasing '{}': {e}", inst.name);
                 failed += 1;
