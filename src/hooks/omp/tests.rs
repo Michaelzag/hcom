@@ -458,7 +458,24 @@ fn soft_stop_keeps_instance_row_and_process_binding() {
 /// and a resume from the newest stopped snapshot restores the title.
 #[cfg(target_os = "linux")]
 #[test]
+#[serial_test::serial]
 fn omp_owner_close_releases_row_and_resume_restores_title() {
+    // The resume guard requires the omp session file on disk: point the omp
+    // root at a fake HOME and seed sid-roc-close there (never real ~/.omp).
+    let (_dir, home, _guard) = isolated_omp_env();
+    unsafe {
+        std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+        std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("OMP_PROFILE");
+        std::env::remove_var("PI_PROFILE");
+    }
+    let root = home
+        .join(".omp")
+        .join("agent")
+        .join("sessions")
+        .join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("sid-roc-close.jsonl"), "{}").unwrap();
     crate::config::Config::init();
     let (db, path) = setup_test_db();
     let name = format!("rocclose{}", std::process::id());
