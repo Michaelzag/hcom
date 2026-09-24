@@ -5415,6 +5415,48 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_resolves_a_relative_root_in_the_seat_directory() {
+        // A relative `PI_CODING_AGENT_DIR` resolves against the directory the
+        // resumed omp runs in: for A, its snapshot's directory. A's file lives
+        // only under `<A's directory>/agent`, so the earlier-session check
+        // must resolve the root there, as the resume of A will.
+        with_omp_home(|home| {
+            let (db, a_dir, _) = poisoned_seat_db(home, false, OMP_MISSING_SID);
+            // config.toml first: a config load with none rewrites the env file.
+            crate::config::write_default_config().unwrap();
+            crate::config::save_env_file(&std::collections::HashMap::from([(
+                "PI_CODING_AGENT_DIR".to_string(),
+                "agent".to_string(),
+            )]))
+            .unwrap();
+            let root = std::path::Path::new(&a_dir).join("agent/sessions/project");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join(format!("2026-01-01T00-00-00Z_{OMP_EARLIER_SID}.jsonl")),
+                "{}",
+            )
+            .unwrap();
+
+            let err = prepare_resume_plan(&db, "lave", false, &[], &GlobalFlags::default())
+                .err()
+                .expect("resume of a dead newest snapshot must fail")
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "session file not found: {OMP_MISSING_SID}; earlier session \
+                     {OMP_EARLIER_SID} is resumable: hcom r lave --restore-earlier"
+                )
+            );
+            let (_, plan) =
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+            assert_eq!(plan.launch.cwd.as_deref(), Some(a_dir.as_str()));
+        });
+    }
+
     #[test]
     fn test_take_restore_earlier_flag_stops_at_double_dash() {
         let mut args = s(&[
