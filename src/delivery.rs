@@ -2645,13 +2645,12 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str, proc
         if let Some(created_at) = snapshot
             .get("created_at")
             .and_then(serde_json::Value::as_f64)
+            && let Some(object) = snapshot.as_object_mut()
         {
-            if let Some(object) = snapshot.as_object_mut() {
-                object.insert(
-                    "created_at_bits".to_string(),
-                    serde_json::json!(created_at.to_bits()),
-                );
-            }
+            object.insert(
+                "created_at_bits".to_string(),
+                serde_json::json!(created_at.to_bits()),
+            );
         }
         snapshot
     });
