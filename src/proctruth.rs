@@ -576,11 +576,12 @@ fn enumerate_unix(
                 continue;
             }
         } else if !carrier_eligible(pid) {
+            // The broker rule's rejects are not carriers (ffc-vpjpg): shared
+            // daemons inheriting the identity are residue, never unproven
+            // ownership. An excluded one still counts as admitted (b58539b).
             if let Some(scope) = scope {
                 if scope.excluded.contains(&pid) {
                     scope.admitted.set(scope.admitted.get() + 1);
-                } else {
-                    scope.drop_unproven(pid);
                 }
                 log_carrier_out_of_scope(pid, name, scope);
             }
@@ -1939,6 +1940,57 @@ mod tests {
         assert!(process_gone(leader), "group signal must kill the leader");
         let result = reap_instance_tree_for_excluding_captured(&db, &name, &[], &[], capture);
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// A stale row whose owners are gone while the shared broker still
+    /// carries the identity it inherited from the first session. Broker
+    /// residue is not a carrier (ffc-vpjpg), so it cannot hold the release.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stale_row_releases_when_only_broker_identity_residue_remains() {
+        let db = test_db();
+        let name = unique_name("broker-residue");
+        insert_null_pid_row(&db, &name, &format!("proc-{}", rand_suffix()));
+        // The kernel names a process after the file it was exec'd through.
+        // bash, unlike multicall coreutils, runs under any name; its builtin
+        // `read` blocks on the held pipe without forking.
+        let dir = tempfile::tempdir().unwrap();
+        let broker_exe = dir.path().join("omp daemon brok");
+        let bash = ["/usr/bin/bash", "/bin/bash"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .expect("bash binary");
+        std::os::unix::fs::symlink(bash, &broker_exe).unwrap();
+        let mut broker = std::process::Command::new(&broker_exe)
+            .args(["-c", "read -r -t 300 _"])
+            .env("HCOM_INSTANCE_NAME", &name)
+            .env_remove("HCOM_PROCESS_ID")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn broker stand-in");
+        // The broker rule hides it from `processes_for_instance`, so wait for
+        // the exec itself: comm and environ switch together.
+        let comm_path = format!("/proc/{}/comm", broker.id());
+        let mut comm = String::new();
+        for _ in 0..100 {
+            comm = std::fs::read_to_string(&comm_path).unwrap_or_default();
+            if comm.trim_end() == "omp daemon brok" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let outcome = crate::hooks::common::stop_instance(&db, &name, "test", "stopped");
+        let broker_alive = !process_gone(broker.id());
+        broker.kill().ok();
+        broker.wait().ok();
+
+        assert_eq!(comm.trim_end(), "omp daemon brok");
+        assert_eq!(outcome, crate::hooks::common::StopOutcome::Stopped);
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert!(broker_alive, "the broker is never signalled");
     }
 
     /// The round seam as a rendezvous: the reaper blocks at `point` until
