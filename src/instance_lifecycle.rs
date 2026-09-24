@@ -622,23 +622,34 @@ pub fn set_status(
     let _ = db.log_event("status", instance_name, &data);
 }
 
+// Test seam: runs between the cleanup's snapshot read and the stop it
+// authorizes, so a test can land a replacement incarnation in that gap.
+#[cfg(test)]
+thread_local! {
+    static PLACEHOLDER_STOP_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
+}
+
 /// Hold a stale placeholder with a live identity carrier (for example, Claude
 /// waiting on a trust prompt) without signalling its launch. Every other stale
 /// placeholder keeps the reap-verified teardown: release only once no process
 /// holds the instance.
+///
+/// Each row and its binding epoch come from ONE snapshot, and the stop is
+/// bound to exactly that incarnation: a rebind or `start --as` replacement
+/// landing after this read is another incarnation, and the release CAS
+/// leaves its row and bindings intact.
 pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
     let mut deleted = 0;
     let now = now_epoch_f64();
 
-    if let Ok(instances) = db.iter_instances_full() {
-        for data in &instances {
+    if let Ok(instances) = db.iter_instances_with_bindings() {
+        for (data, binding_ids) in &instances {
             if !crate::instances::is_launching_placeholder(data) {
                 continue;
             }
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
-                let binding_ids = db.process_binding_ids(&data.name).unwrap_or_default();
-                if crate::proctruth::has_live_carriers(&data.name, &binding_ids) {
+                if crate::proctruth::has_live_carriers(&data.name, binding_ids) {
                     crate::log::log_debug(
                         "cleanup",
                         "placeholder_held_live_launch",
@@ -646,11 +657,22 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
                     );
                     continue;
                 }
+                #[cfg(test)]
+                if let Some(hook) = PLACEHOLDER_STOP_GAP_HOOK.with(std::cell::Cell::take) {
+                    hook(db, &data.name);
+                }
+                let capture = crate::proctruth::capture_reap_carriers(
+                    &data.name,
+                    Some(data),
+                    binding_ids,
+                    &[],
+                );
                 match crate::hooks::common::stop_placeholder_instance(
                     db,
                     &data.name,
                     "system",
                     "stale_cleanup",
+                    capture,
                 ) {
                     outcome if outcome.is_re_registered() => {
                         crate::log::log_info(
@@ -1302,5 +1324,54 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         );
         assert_eq!(deleted, 0);
         assert!(kept);
+    }
+
+    /// A replacement incarnation landing between the cleanup's snapshot read
+    /// and the stop it authorizes is not the stale placeholder: its row and
+    /// its process bindings survive, and the cleanup counts no release.
+    #[test]
+    fn test_cleanup_stale_placeholders_spares_rebind_after_read() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let name = format!("placeholder-rebind-{}", std::process::id());
+
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!(name));
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert(
+            "created_at".into(),
+            serde_json::json!(now_epoch_f64() - 200.0),
+        );
+        db.save_instance_named(&name, &data).unwrap();
+
+        // `start --as` shape: the row is deleted and recreated with a fresh
+        // identity, then bound, after the cleanup already read the old one.
+        fn replace(db: &HcomDb, name: &str) {
+            db.delete_instance(name).unwrap();
+            let mut data = serde_json::Map::new();
+            data.insert("status".into(), serde_json::json!("pending"));
+            data.insert("status_context".into(), serde_json::json!("new"));
+            data.insert("created_at".into(), serde_json::json!(now_epoch_f64()));
+            data.insert("session_id".into(), serde_json::json!("sess-replacement"));
+            db.save_instance_named(name, &data).unwrap();
+            db.set_process_binding("proc-replacement", "sess-replacement", name)
+                .unwrap();
+        }
+        PLACEHOLDER_STOP_GAP_HOOK.with(|hook| hook.set(Some(replace)));
+        let deleted = cleanup_stale_placeholders(&db);
+        PLACEHOLDER_STOP_GAP_HOOK.with(|hook| hook.set(None));
+
+        let row = db.get_instance_full(&name).unwrap();
+        let bindings = db.process_binding_ids(&name).unwrap();
+        cleanup(path);
+
+        assert_eq!(deleted, 0);
+        assert_eq!(
+            row.and_then(|row| row.session_id).as_deref(),
+            Some("sess-replacement"),
+            "the replacement row survives"
+        );
+        assert_eq!(bindings, vec!["proc-replacement".to_string()]);
     }
 }

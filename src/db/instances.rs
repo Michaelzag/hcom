@@ -423,6 +423,13 @@ impl HcomDb {
     /// `expected_pid` is the caller's entry-read pid. A concurrent launch
     /// persisting a different pid refuses the release before any event write.
     ///
+    /// `captured_bindings` is the binding epoch the caller read together
+    /// with the row, in one snapshot. Any binding outside it is a newer
+    /// registration under the name: the release is refused and nothing is
+    /// written. A binding set that only shrank — some or all of it released
+    /// by the row's own session — is still that incarnation and releases.
+    /// `None` (no captured epoch) skips the check.
+    ///
     /// The instance delete is the ownership CAS. Cleanup and event insertion
     /// share its transaction, so an error restores the row for a later retry.
     #[allow(clippy::too_many_arguments)]
@@ -435,6 +442,7 @@ impl HcomDb {
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
         expected_process_id: Option<&str>,
+        captured_bindings: Option<&[String]>,
     ) -> Result<bool> {
         let (won, event_id) = self.with_immediate_transaction(|tx| {
             self.finalize_instance_stop_in_txn(
@@ -446,6 +454,7 @@ impl HcomDb {
                 agent_id,
                 event_data,
                 expected_process_id,
+                captured_bindings,
             )
         })?;
 
@@ -459,8 +468,9 @@ impl HcomDb {
 
     /// [`Self::finalize_instance_stop`]'s transactional body under a
     /// caller-provided transaction (the kill path's atomic CAS+teardown):
-    /// the `expected_process_id` release gate, the ownership CAS delete, the
-    /// control-plane cleanup, and the `stopped` event insert all run as one
+    /// the `expected_process_id` release gate, the captured binding-epoch
+    /// gate, the ownership CAS delete, the control-plane cleanup, and the
+    /// `stopped` event insert all run as one
     /// unit in `tx`. Returns `(won, event_id)`; the caller owns the commit
     /// and must fire the subscription notification for `event_id` only after
     /// it lands.
@@ -475,6 +485,7 @@ impl HcomDb {
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
         expected_process_id: Option<&str>,
+        captured_bindings: Option<&[String]>,
     ) -> Result<(bool, Option<i64>)> {
         // The same write transaction guards both this read and the delete:
         // a pre-registered launch must not lose its row after spawning.
@@ -530,6 +541,20 @@ impl HcomDb {
                     event_id = Some(tx.last_insert_rowid());
                     return Ok((false, event_id));
                 }
+            }
+        }
+
+        // The captured epoch only ever adds a refusal: a binding the caller
+        // never read belongs to a newer registration under this name, so
+        // nothing of that registration is deleted and no event is written.
+        if let Some(captured) = captured_bindings {
+            let mut stmt =
+                tx.prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?")?;
+            let current = stmt
+                .query_map(params![name], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if current.iter().any(|id| !captured.contains(id)) {
+                return Ok((false, event_id));
             }
         }
         let deleted = tx.execute(
@@ -848,20 +873,29 @@ impl HcomDb {
         &self,
         name: &str,
     ) -> Result<(Option<InstanceRow>, Vec<String>)> {
-        self.with_read_snapshot(|tx| {
-            let row = tx
-                .prepare_cached("SELECT * FROM instances WHERE name = ?")?
-                .query_row(params![name], InstanceRow::from_row)
-                .optional()?;
-            let ids = tx
-                .prepare_cached(
-                    "SELECT process_id FROM process_bindings \
-                     WHERE instance_name = ? ORDER BY updated_at DESC",
-                )?
-                .query_map(params![name], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((row, ids))
-        })
+        self.with_read_snapshot(|tx| Self::instance_with_bindings_in(tx, name))
+    }
+
+    /// [`Self::get_instance_with_bindings`]'s reads inside the caller's own
+    /// snapshot transaction, for a caller that must read more state from
+    /// that same snapshot (a kill's event watermark, a PTY exit's own
+    /// binding row).
+    pub(crate) fn instance_with_bindings_in(
+        tx: &rusqlite::Transaction<'_>,
+        name: &str,
+    ) -> Result<(Option<InstanceRow>, Vec<String>)> {
+        let row = tx
+            .prepare_cached("SELECT * FROM instances WHERE name = ?")?
+            .query_row(params![name], InstanceRow::from_row)
+            .optional()?;
+        let ids = tx
+            .prepare_cached(
+                "SELECT process_id FROM process_bindings \
+                 WHERE instance_name = ? ORDER BY updated_at DESC",
+            )?
+            .query_map(params![name], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((row, ids))
     }
 
     /// Every row (newest first) paired with its process binding ids (newest
@@ -1308,6 +1342,103 @@ mod tests {
         assert_eq!(inst["tag"], "api");
 
         cleanup_test_db(db_path);
+    }
+
+    /// A row bound to `ids`, finalized against `captured`. Returns whether
+    /// the release won, whether the row is left, the bindings left (sorted),
+    /// and how many events were written.
+    fn finalize_against_epoch(
+        name: &str,
+        ids: &[&str],
+        captured: Option<&[&str]>,
+    ) -> (bool, bool, Vec<String>, i64) {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES (?1, 'test', 1.0)",
+                params![name],
+            )
+            .unwrap();
+        for (at, id) in ids.iter().enumerate() {
+            db.conn()
+                .execute(
+                    "INSERT INTO process_bindings (process_id, instance_name, updated_at) \
+                     VALUES (?1, ?2, ?3)",
+                    params![id, name, at as f64],
+                )
+                .unwrap();
+        }
+        let data = serde_json::json!({"action": "stopped", "by": "test", "reason": "closed"});
+        let captured: Option<Vec<String>> =
+            captured.map(|ids| ids.iter().map(|id| id.to_string()).collect());
+        let won = db
+            .finalize_instance_stop(
+                name,
+                1.0,
+                None,
+                None,
+                None,
+                &data,
+                None,
+                captured.as_deref(),
+            )
+            .unwrap();
+        let row_left = db.get_instance_full(name).unwrap().is_some();
+        let mut bindings = db.process_binding_ids(name).unwrap();
+        bindings.sort();
+        let events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        cleanup_test_db(db_path);
+        (won, row_left, bindings, events)
+    }
+
+    /// A binding the caller never read is a newer registration: the release
+    /// is refused and writes nothing — including when the caller read no
+    /// bindings at all.
+    #[test]
+    fn finalize_refuses_a_binding_outside_the_captured_epoch() {
+        assert_eq!(
+            finalize_against_epoch("epoch-grew", &["b1", "b2"], Some(&["b1"])),
+            (false, true, vec!["b1".to_string(), "b2".to_string()], 0)
+        );
+        assert_eq!(
+            finalize_against_epoch("epoch-was-empty", &["b1"], Some(&[])),
+            (false, true, vec!["b1".to_string()], 0)
+        );
+    }
+
+    /// The captured epoch itself, or any part of it the row's own session
+    /// released since, is still that incarnation: the release proceeds. An
+    /// emptied set is the same row too (an Antigravity soft stop clears its
+    /// bindings and keeps the row).
+    #[test]
+    fn finalize_releases_a_captured_epoch_that_only_shrank() {
+        for (name, ids) in [
+            ("epoch-same", &["b1", "b2"][..]),
+            ("epoch-shrunk", &["b1"][..]),
+            ("epoch-emptied", &[][..]),
+        ] {
+            assert_eq!(
+                finalize_against_epoch(name, ids, Some(&["b1", "b2"])),
+                (true, false, vec![], 1),
+                "{name}"
+            );
+        }
+    }
+
+    /// No captured epoch: the binding gate is skipped, as it always was.
+    #[test]
+    fn finalize_without_a_captured_epoch_skips_the_binding_gate() {
+        assert_eq!(
+            finalize_against_epoch("epoch-none", &["b1", "b2"], None),
+            (true, false, vec![], 1)
+        );
     }
 
     #[test]

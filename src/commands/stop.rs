@@ -5,7 +5,6 @@
 //! Inside AI tools, destructive ops require `--go` flag.
 
 use crate::db::HcomDb;
-use crate::hooks::common::stop_instance;
 use crate::identity;
 use crate::identity::{get_full_name, resolve_display_name};
 use crate::instances::{is_remote_instance, is_subagent_instance};
@@ -56,11 +55,13 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
 
-        // Only stop local instances
-        let instances = match db.iter_instances_full() {
+        // Only stop local instances. Every row comes with its binding epoch
+        // from ONE snapshot, and each release is bound to that incarnation
+        // (see `stop_read_instance`).
+        let instances = match db.iter_instances_with_bindings() {
             Ok(rows) => rows
                 .into_iter()
-                .filter(|i| !is_remote_instance(i))
+                .filter(|(i, _)| !is_remote_instance(i))
                 .collect::<Vec<_>>(),
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -91,11 +92,11 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         let mut skipped_names = Vec::new();
         let mut bg_logs = Vec::new();
 
-        for inst in &instances {
+        for (inst, binding_ids) in &instances {
             let display = get_full_name(inst);
             // The release reaps the whole tree first; a failure means live
             // processes remain, so the name must not be reported as stopped.
-            match stop_instance(db, &inst.name, &launcher, "stop_all") {
+            match stop_read_instance(db, inst, binding_ids, &launcher, "stop_all") {
                 outcome if outcome.is_re_registered() => {
                     eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
                     skipped_names.push(display.clone());
@@ -141,10 +142,10 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
     // Handle tag:name syntax
     if targets.len() == 1 && targets[0].starts_with("tag:") {
         let tag = &targets[0][4..];
-        let tag_matches = match db.iter_instances_full() {
+        let tag_matches = match db.iter_instances_with_bindings() {
             Ok(rows) => rows
                 .into_iter()
-                .filter(|i| i.tag.as_deref() == Some(tag) && !is_remote_instance(i))
+                .filter(|(i, _)| i.tag.as_deref() == Some(tag) && !is_remote_instance(i))
                 .collect::<Vec<_>>(),
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -193,9 +194,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         let mut skipped_names = Vec::new();
         let mut bg_logs = Vec::new();
 
-        for inst in &tag_matches {
+        for (inst, binding_ids) in &tag_matches {
             let display = get_full_name(inst);
-            match stop_instance(db, &inst.name, &launcher, "tag_stop") {
+            match stop_read_instance(db, inst, binding_ids, &launcher, "tag_stop") {
                 outcome if outcome.is_re_registered() => {
                     eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
                     skipped_names.push(display.clone());
@@ -245,8 +246,8 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             }
             let resolved = resolve_display_name(db, t);
             let name = resolved.as_deref().unwrap_or(t);
-            match db.get_instance_full(name) {
-                Ok(Some(data)) => instances_to_stop.push(data),
+            match db.get_instance_with_bindings(name) {
+                Ok((Some(data), binding_ids)) => instances_to_stop.push((data, binding_ids)),
                 _ => {
                     not_found.push(t.to_string());
                 }
@@ -271,13 +272,13 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         let mut skipped_names = Vec::new();
         let mut bg_logs = Vec::new();
 
-        for inst in &instances_to_stop {
+        for (inst, binding_ids) in &instances_to_stop {
             if is_remote_instance(inst) {
                 println!("Skipping remote instance: {}", get_full_name(inst));
                 continue;
             }
             let display = get_full_name(inst);
-            match stop_instance(db, &inst.name, &launcher, "multi_stop") {
+            match stop_read_instance(db, inst, binding_ids, &launcher, "multi_stop") {
                 outcome if outcome.is_re_registered() => {
                     eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
                     skipped_names.push(display.clone());
@@ -350,9 +351,10 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         return 1;
     }
 
-    // Lookup instance
-    let position = match db.get_instance_full(&instance_name) {
-        Ok(Some(data)) => data,
+    // Lookup instance: the row and its binding epoch in one snapshot, the
+    // incarnation the release below is bound to.
+    let (position, binding_ids) = match db.get_instance_with_bindings(&instance_name) {
+        Ok((Some(data), binding_ids)) => (data, binding_ids),
         _ => {
             eprintln!("Error: '{instance_name}' not found");
             return 1;
@@ -381,7 +383,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
     // The release reaps the whole tree first; on failure the name stays
     // live and must not be reported as stopped.
-    match stop_instance(db, &instance_name, &launcher, reason) {
+    match stop_read_instance(db, &position, &binding_ids, &launcher, reason) {
         outcome if outcome.is_re_registered() => {
             eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
             return 1;
@@ -407,11 +409,30 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
     0
 }
 
+/// Stop `inst`, bound to the incarnation this command read: `inst` and
+/// `binding_ids` are one snapshot, and the release refuses anything that
+/// registered under the name since (a `start --as` replacement or a rebind),
+/// which is reported skipped and never stopped.
+fn stop_read_instance(
+    db: &HcomDb,
+    inst: &crate::db::InstanceRow,
+    binding_ids: &[String],
+    initiator: &str,
+    reason: &str,
+) -> crate::hooks::common::StopOutcome {
+    let capture = crate::proctruth::capture_reap_carriers(&inst.name, Some(inst), binding_ids, &[]);
+    crate::hooks::common::stop_instance_with_capture(db, &inst.name, initiator, reason, capture)
+}
+
 /// Print a stop preview for any scope (all, tag, or named targets).
-fn print_stop_preview(scope: &str, cmd_suffix: &str, instances: &[crate::db::InstanceRow]) {
+fn print_stop_preview(
+    scope: &str,
+    cmd_suffix: &str,
+    instances: &[(crate::db::InstanceRow, Vec<String>)],
+) {
     let count = instances.len();
-    let names: Vec<String> = instances.iter().map(get_full_name).collect();
-    let headless = instances.iter().filter(|i| i.background != 0).count();
+    let names: Vec<String> = instances.iter().map(|(i, _)| get_full_name(i)).collect();
+    let headless = instances.iter().filter(|(i, _)| i.background != 0).count();
     let interactive = count - headless;
     let instance_list = if count <= 8 {
         names.join(", ")
@@ -435,4 +456,106 @@ fn print_stop_preview(scope: &str, cmd_suffix: &str, instances: &[crate::db::Ins
     println!("Instance data preserved in events table (life.stopped with snapshot).\n");
     println!("Add --go flag and run again to proceed:");
     println!("  hcom --go stop {cmd_suffix}\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks::common::STOP_ENTRY_GAP_HOOK;
+    use serial_test::serial;
+
+    /// A launched session's row, tagged `grp`, bound to its own process.
+    fn seed(db: &HcomDb, name: &str, created_at: f64, session: &str, process: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id, tag) \
+                 VALUES (?1, 'active', ?2, 'codex', ?3, 'grp')",
+                rusqlite::params![name, created_at, session],
+            )
+            .unwrap();
+        db.set_process_binding(process, session, name).unwrap();
+    }
+
+    /// `start --as` between the command's read and its release: the row is
+    /// recreated as another incarnation, same tag, bound to its own process.
+    fn replace(db: &HcomDb, name: &str) {
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM instances WHERE name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        seed(db, name, 2.0, "sess-new", "proc-new");
+    }
+
+    /// Run `hcom --go stop <targets>` against a row a replacement takes over
+    /// right after the command read it. The replacement keeps its row and
+    /// binding and gets no stopped record, and the command reports the
+    /// name skipped, not stopped (exit 1).
+    fn assert_stop_spares_a_replacement(targets: &[&str]) {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = "stop-target";
+        seed(&db, name, 1.0, "sess-old", "proc-old");
+
+        STOP_ENTRY_GAP_HOOK.with(|hook| hook.set(Some(replace)));
+        let args = StopArgs {
+            targets: targets.iter().map(|t| t.to_string()).collect(),
+        };
+        let go = CommandContext {
+            explicit_name: None,
+            identity: None,
+            go: true,
+        };
+        let code = cmd_stop(&db, &args, Some(&go));
+        STOP_ENTRY_GAP_HOOK.with(|hook| hook.set(None));
+
+        let row = db
+            .get_instance_full(name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{targets:?} released the replacement row"));
+        assert_eq!(row.created_at, 2.0, "{targets:?}");
+        assert_eq!(
+            db.process_binding_ids(name).unwrap(),
+            vec!["proc-new"],
+            "{targets:?}"
+        );
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1 \
+                 AND json_extract(data, '$.action') = 'stopped'",
+                rusqlite::params![name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "{targets:?}");
+        assert_eq!(code, 1, "a skipped name is not stopped: {targets:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn stop_all_spares_a_replacement_landing_after_its_read() {
+        assert_stop_spares_a_replacement(&["all"]);
+    }
+
+    #[test]
+    #[serial]
+    fn stop_by_tag_spares_a_replacement_landing_after_its_read() {
+        assert_stop_spares_a_replacement(&["tag:grp"]);
+    }
+
+    #[test]
+    #[serial]
+    fn single_stop_spares_a_replacement_landing_after_its_read() {
+        assert_stop_spares_a_replacement(&["stop-target"]);
+    }
 }
