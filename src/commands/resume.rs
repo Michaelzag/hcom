@@ -64,8 +64,11 @@ struct TrackedForkIdentity {
     custom_initial_prompt: Option<String>,
     custom_system_prompt: Option<String>,
 }
-fn omp_reroot_flag(tool: &str, snapshot_dir: &str) -> bool {
-    tool == "omp" && !snapshot_dir.is_empty() && !std::path::Path::new(snapshot_dir).is_dir()
+fn omp_reroot_flag(tool: &str, snapshot_dir: &str, fork: bool) -> bool {
+    !fork
+        && tool == "omp"
+        && !snapshot_dir.is_empty()
+        && !std::path::Path::new(snapshot_dir).is_dir()
 }
 
 struct ResumePromptInput<'a> {
@@ -710,10 +713,10 @@ fn prepare_resume_plan_from_source(
             // Forks start a new session on first turn; only plain resume
             // inherits the prior id so kill-before-bind stays resumable.
             prior_session_id: (!fork).then(|| session_id.clone()),
-            tag: launch_tag,
+            answer_omp_reroot_prompt: omp_reroot_flag(&tool, &snapshot_dir, fork),
             system_prompt: effective_system_prompt,
+            tag: launch_tag,
             purpose: effective_purpose,
-            answer_omp_reroot_prompt: omp_reroot_flag(&tool, &snapshot_dir),
             initial_prompt: fork_initial_prompt,
             current: effective_current,
             background: is_headless,
@@ -2536,13 +2539,14 @@ fn build_adopt_plan(
 mod tests {
     use super::*;
     use crate::db::HcomDb;
-    #[test]
-    fn omp_reroot_flag_matches_snapshot_directory_existence() {
+    fn omp_reroot_flag_only_arms_for_resume() {
         let existing = tempfile::tempdir().unwrap();
         let gone = existing.path().join("gone");
-        assert!(omp_reroot_flag("omp", gone.to_str().unwrap()));
-        assert!(!omp_reroot_flag("omp", existing.path().to_str().unwrap()));
-        assert!(!omp_reroot_flag("claude", gone.to_str().unwrap()));
+        let gone = gone.to_str().unwrap();
+        assert!(omp_reroot_flag("omp", gone, false));
+        assert!(!omp_reroot_flag("omp", gone, true));
+        assert!(!omp_reroot_flag("omp", existing.path().to_str().unwrap(), false));
+        assert!(!omp_reroot_flag("claude", gone, false));
     }
 
     fn s(items: &[&str]) -> Vec<String> {
