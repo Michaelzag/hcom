@@ -37,7 +37,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 19;
+const SCHEMA_VERSION: i32 = 20;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -71,6 +71,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
         19,
         "ALTER TABLE instances ADD COLUMN purpose TEXT DEFAULT '';
          ALTER TABLE instances ADD COLUMN current TEXT DEFAULT '';",
+    ),
+    (
+        20,
+        "SELECT 1;",
     ),
 ];
 
@@ -163,6 +167,48 @@ impl HcomDb {
         txn.commit()?;
         Ok(result)
     }
+    fn migrate_created_at_bits(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let rows = {
+            let mut stmt = tx.prepare(
+                "SELECT id, data FROM events WHERE json_extract(data, '$.snapshot.created_at') IS NOT NULL
+                 AND json_extract(data, '$.snapshot.created_at_bits') IS NULL",
+            )?;
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.collect::<Result<Vec<_>>>()?
+        };
+        for (id, data) in rows {
+            let Some(bits) = raw_created_at_bits(&data) else { continue };
+            let Some(snapshot_start) = data.find("\"snapshot\"") else { continue };
+            let Some(open) = data[snapshot_start..].find('{').map(|i| snapshot_start + i) else { continue };
+            let mut depth = 0usize;
+            let mut end = None;
+            for (i, ch) in data[open..].char_indices() {
+                match ch { '{' => depth += 1, '}' => { depth -= 1; if depth == 0 { end = Some(open + i); break } }, _ => {} }
+            }
+            let Some(end) = end else { continue };
+            let mut updated = String::with_capacity(data.len() + 32);
+            updated.push_str(&data[..end]);
+            updated.push_str(&format!(",\"created_at_bits\":{bits}"));
+            updated.push_str(&data[end..]);
+            tx.execute("UPDATE events SET data = ?1 WHERE id = ?2", rusqlite::params![updated, id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+fn raw_created_at_bits(data: &str) -> Option<u64> {
+    let key = "\"created_at\"";
+    let start = data.find(key)? + key.len();
+    let rest = data[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let (token, _) = if let Some(quoted) = rest.strip_prefix('"') {
+        (quoted.split_once('"')?.0, true)
+    } else {
+        (rest.split(|c: char| c == ',' || c == '}' || c.is_whitespace()).next()?, false)
+    };
+    let _ = rest;
+    token.parse::<f64>().ok().map(f64::to_bits)
+}
 
     /// Access the filesystem path backing this DB handle.
     pub fn path(&self) -> &std::path::Path {
@@ -449,6 +495,7 @@ impl HcomDb {
         match self.check_schema_compat()? {
             SchemaCompat::Ok => {
                 self.init_db()?;
+                self.migrate_created_at_bits()?;
                 Ok(())
             }
             SchemaCompat::NeedsArchive(reason, old_version) => {

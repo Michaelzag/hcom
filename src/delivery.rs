@@ -2641,6 +2641,17 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str, proc
             None
         }
     };
+    let snapshot = snapshot.map(|mut snapshot| {
+        if let Some(created_at) = snapshot.get("created_at").and_then(serde_json::Value::as_f64) {
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert(
+                    "created_at_bits".to_string(),
+                    serde_json::json!(created_at.to_bits()),
+                );
+            }
+        }
+        snapshot
+    });
     // A launch can publish its pid or replace this row after the snapshot.
     // Key the final delete to the observed incarnation, including a NULL pid;
     // a failed snapshot read cannot authorize deletion.

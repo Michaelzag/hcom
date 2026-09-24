@@ -446,7 +446,7 @@ fn classify_lost_teardown(
     let token = &incarnation.token;
     let mut stmt = tx.prepare(
         "SELECT json_extract(data, '$.process_id'), \
-                json_extract(data, '$.snapshot.created_at') FROM events \
+                json_extract(data, '$.snapshot.created_at_bits') FROM events \
          WHERE type = 'life' AND instance = ?1 AND id > ?2 \
            AND json_extract(data, '$.action') = 'stopped' \
            AND json_extract(data, '$.by') IN ('session', 'pty') \
@@ -454,18 +454,16 @@ fn classify_lost_teardown(
     )?;
     let mut process_ids = stmt
         .query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
-            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<f64>>(1)?))
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?.map(|bits| bits as u64)))
         })?;
     let mut self_stop = false;
     for row in &mut process_ids {
-        let (process_id, snapshot_created_at) = row?;
+        let (process_id, snapshot_created_at_bits) = row?;
         let matches = match process_id {
             Some(id) => token.binding_ids.contains(&id),
-            // A null process_id is not proof on its own: the event must
-            // carry the RESOLVED incarnation's created_at. A re-registered
-            // bindingless incarnation snapshots its OWN created_at, so its
-            // exit is a re-registration, not a self-stop.
-            None => snapshot_created_at == Some(token.created_at),
+            // Snapshot bits are an exact JSON integer representation of the
+            // f64 identity; decoding the fractional number can change its ULP.
+            None => snapshot_created_at_bits == Some(token.created_at.to_bits()),
         };
         if matches {
             self_stop = true;
