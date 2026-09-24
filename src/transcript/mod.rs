@@ -377,17 +377,59 @@ pub(crate) fn omp_profile_from_env() -> Option<String> {
 ///   app/profile directory exists;
 /// - otherwise sessions remain under the config root.
 fn omp_active_session_root_with_env(env: &std::collections::HashMap<String, String>) -> PathBuf {
-    let home = env.get("HOME").map(PathBuf::from).or_else(dirs::home_dir).unwrap_or_default();
-    let config_name = env.get("PI_CONFIG_DIR").map(String::as_str).filter(|v| !v.is_empty()).unwrap_or(".omp");
-    let profile = env.get("OMP_PROFILE").or_else(|| env.get("PI_PROFILE")).map(String::as_str).map(str::trim).filter(|v| !v.is_empty() && *v != "default");
-    let config_root = profile.map(|name| home.join(config_name).join("profiles").join(name)).unwrap_or_else(|| home.join(config_name));
+    let home = env
+        .get("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_default();
+    let config_name = env
+        .get("PI_CONFIG_DIR")
+        .map(String::as_str)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(".omp");
+    let profile = env
+        .get("OMP_PROFILE")
+        .or_else(|| env.get("PI_PROFILE"))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && *v != "default");
+    let config_root = profile
+        .map(|name| home.join(config_name).join("profiles").join(name))
+        .unwrap_or_else(|| home.join(config_name));
     let default_agent = config_root.join("agent");
-    let agent_override = profile.is_none().then(|| env.get("PI_CODING_AGENT_DIR").map(String::as_str).filter(|v| !v.is_empty()).map(PathBuf::from)).flatten();
-    let agent_dir = agent_override.map(|p| if p.is_absolute() { p } else { env.get("PWD").map(PathBuf::from).unwrap_or_default().join(p) }).unwrap_or(default_agent.clone());
-    if cfg!(any(target_os = "linux", target_os = "macos", target_os = "android")) && agent_dir == default_agent && env.get("XDG_DATA_HOME").is_some_and(|v| !v.is_empty()) {
+    let agent_override = profile
+        .is_none()
+        .then(|| {
+            env.get("PI_CODING_AGENT_DIR")
+                .map(String::as_str)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        })
+        .flatten();
+    let agent_dir = agent_override
+        .map(|p| {
+            if p.is_absolute() {
+                p
+            } else {
+                env.get("PWD")
+                    .map(PathBuf::from)
+                    .unwrap_or_default()
+                    .join(p)
+            }
+        })
+        .unwrap_or(default_agent.clone());
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    )) && agent_dir == default_agent
+        && env.get("XDG_DATA_HOME").is_some_and(|v| !v.is_empty())
+    {
         let xdg = PathBuf::from(env.get("XDG_DATA_HOME").unwrap()).join("omp");
         let candidate = profile.map(|p| xdg.join("profiles").join(p)).unwrap_or(xdg);
-        if candidate.exists() { return candidate.join("sessions"); }
+        if candidate.exists() {
+            return candidate.join("sessions");
+        }
     }
     agent_dir.join("sessions")
 }
@@ -396,7 +438,9 @@ fn omp_active_session_root() -> PathBuf {
     omp_active_session_root_with_env(&std::env::vars().collect())
 }
 
-pub(crate) fn omp_session_roots_for_env(env: &std::collections::HashMap<String, String>) -> Vec<PathBuf> {
+pub(crate) fn omp_session_roots_for_env(
+    env: &std::collections::HashMap<String, String>,
+) -> Vec<PathBuf> {
     vec![omp_active_session_root_with_env(env)]
 }
 

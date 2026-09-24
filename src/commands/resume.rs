@@ -502,7 +502,6 @@ fn prepare_resume_plan_from_source(
         Some(tag.clone())
     };
 
-
     // Determine effective working directory:
     // - Explicit --dir flag wins (validated and canonicalized)
     // - For fork (tracked instance): use current directory (start fresh in new context)
@@ -2109,8 +2108,12 @@ fn merge_omp_args(original: &[String], resume: &[String]) -> Vec<String> {
 #[cfg(test)]
 fn derive_omp_transcript_path(session_id: &str) -> Option<String> {
     for root in crate::transcript::omp_session_roots() {
-        if !root.exists() { continue; }
-        if let Some(path) = find_pi_transcript_in_root(&root, session_id) { return Some(path); }
+        if !root.exists() {
+            continue;
+        }
+        if let Some(path) = find_pi_transcript_in_root(&root, session_id) {
+            return Some(path);
+        }
     }
     None
 }
@@ -2134,11 +2137,17 @@ fn ensure_omp_session_file_in_env(
             break;
         }
     }
-    if found { return Ok(()); }
+    if found {
+        return Ok(());
+    }
     let mut err = format!("session file not found: {session_id}");
     if let Some(other) = transcript_session_id(transcript_path)
         && !other.eq_ignore_ascii_case(session_id)
-    { err.push_str(&format!("; the snapshot's transcript is session {other}: run hcom r {other}")); }
+    {
+        err.push_str(&format!(
+            "; the snapshot's transcript is session {other}: run hcom r {other}"
+        ));
+    }
     bail!("{err}")
 }
 
@@ -4424,7 +4433,8 @@ mod tests {
         let root = child_home.join(".omp").join("agent").join("sessions");
         std::fs::create_dir_all(root.join("project")).unwrap();
         std::fs::write(
-            root.join("project").join(format!("{OMP_MISSING_SID}.jsonl")),
+            root.join("project")
+                .join(format!("{OMP_MISSING_SID}.jsonl")),
             "{}",
         )
         .unwrap();
