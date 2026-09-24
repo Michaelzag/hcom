@@ -1344,10 +1344,7 @@ fn finalize_background_launch(
     // The wrapper can record its own pid and then its tool's pid during that
     // wait; an unconditional launcher write here would replace the proof.
     // Non-PTY backgrounds have no wrapper writer, so they keep this pid.
-    if let Err(e) = ctx.db.conn().execute(
-        "UPDATE instances SET pid = ?1 WHERE name = ?2 AND pid IS NULL",
-        rusqlite::params![pid as i64, ctx.instance_name],
-    ) {
+    if let Err(e) = ctx.db.set_instance_pid_if_unset(ctx.instance_name, pid) {
         crate::log::log_error("launcher", "background.pid", &format!("{e}"));
     }
     instances::update_instance_position(
@@ -2111,6 +2108,15 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             terminal_mode,
                             inside_ai_tool,
                         );
+                        // Run-here replaces this process with the tool (exec on
+                        // Unix; on Windows it waits as the tool's parent), so this
+                        // pid is ancestor-or-self of every hook the tool fires.
+                        // Record it before handing over: launch_terminal never
+                        // returns on that path, and the trust gate refuses a
+                        // launcher id whose row has no recorded pid.
+                        if effective_run_here && terminal_mode != Some("print") {
+                            db.update_instance_pid(&instance_name, std::process::id())?;
+                        }
                         let (launch_result, effective_preset) = terminal::launch_terminal(
                             &claude_cmd,
                             &instance_env,

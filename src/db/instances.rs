@@ -223,6 +223,16 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Record `pid` only while the row has none. Returns whether this call set
+    /// it; an existing anchor (a PTY wrapper's, a launcher's) is never replaced.
+    pub fn set_instance_pid_if_unset(&self, name: &str, pid: u32) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE instances SET pid = ?1 WHERE name = ?2 AND pid IS NULL",
+            params![pid as i64, name],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Store launch_context JSON (terminal preset, pane_id, env snapshot).
     /// Merges incoming keys into existing JSON, only filling fields that are
     /// currently missing or empty so late-bound PTY metadata can be persisted

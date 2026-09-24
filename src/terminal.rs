@@ -963,6 +963,17 @@ fn leftover_shell_vars() -> Vec<&'static str> {
     vars
 }
 
+/// The hcom binary a launch script runs `launch-anchor` with, when the script
+/// env carries a launcher process id (the only id that command records for).
+/// The running binary, not whatever `hcom` is first on PATH.
+fn launch_anchor_command(env: &HashMap<String, String>) -> Option<String> {
+    env.get("HCOM_PROCESS_ID")
+        .filter(|id| crate::proctruth::is_launcher_process_id(id))?;
+    std::env::current_exe()
+        .ok()
+        .map(|exe| exe.to_string_lossy().into_owned())
+}
+
 /// Create a bash script for terminal launch.
 ///
 /// Scripts provide uniform execution across all platforms/terminals.
@@ -1052,6 +1063,18 @@ pub fn create_bash_script(
         }
     }
 
+    // Record this script as the row's anchor before the tool can fire a hook:
+    // the trust gate refuses a launcher id whose row has no ancestor pid. The
+    // script stays the tool's parent (no `exec`: the lines after the tool
+    // report its status, clean up, or reopen the shell), so it remains an
+    // ancestor. A refused anchor (already set, e.g. run-here) is a no-op.
+    if let Some(anchor) = launch_anchor_command(env) {
+        writeln!(
+            f,
+            "{} launch-anchor >/dev/null 2>&1 || true",
+            shell_quote(&anchor)
+        )?;
+    }
     writeln!(f, "{}", final_command)?;
 
     if opens_new_window {
@@ -1210,6 +1233,10 @@ pub fn create_powershell_script(
         };
     }
 
+    // Same anchor as the bash script (see `create_bash_script`).
+    if let Some(anchor) = launch_anchor_command(env) {
+        writeln!(f, "& {} launch-anchor *> $null", ps_quote(&anchor))?;
+    }
     writeln!(f, "{final_command}")?;
     if opens_new_window {
         // Clear hcom state from the interactive shell left open after the tool
