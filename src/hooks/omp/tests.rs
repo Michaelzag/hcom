@@ -461,18 +461,20 @@ fn soft_stop_keeps_instance_row_and_process_binding() {
 #[serial_test::serial]
 fn omp_owner_close_releases_row_and_resume_restores_title() {
     // The resume guard requires the omp session file on disk: point the omp
-    // root at a fake HOME and seed sid-roc-close there (never real ~/.omp).
-    let (_dir, home, _guard) = isolated_omp_env();
+    // root at a fake HOME and seed sid-roc-close under the same root the
+    // production lookup searches (never real ~/.omp, never hardcoded).
+    let (_dir, _home, _guard) = isolated_omp_env();
     unsafe {
         std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
         std::env::remove_var("XDG_DATA_HOME");
         std::env::remove_var("OMP_PROFILE");
         std::env::remove_var("PI_PROFILE");
+        std::env::remove_var("PI_CONFIG_DIR");
     }
-    let root = home
-        .join(".omp")
-        .join("agent")
-        .join("sessions")
+    let root = crate::transcript::omp_session_roots()
+        .into_iter()
+        .next()
+        .expect("omp always has exactly one active session root")
         .join("project");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("sid-roc-close.jsonl"), "{}").unwrap();

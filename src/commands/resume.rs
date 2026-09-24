@@ -2661,6 +2661,7 @@ mod tests {
             std::env::remove_var("XDG_DATA_HOME");
             std::env::remove_var("OMP_PROFILE");
             std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("PI_CONFIG_DIR");
         }
         let root = home
             .join(".omp")
@@ -2780,6 +2781,7 @@ mod tests {
             std::env::remove_var("PI_CODING_AGENT_DIR");
             std::env::remove_var("XDG_DATA_HOME");
             std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("PI_CONFIG_DIR");
             std::env::set_var("OMP_PROFILE", "work");
         }
         let root = home
@@ -4256,7 +4258,9 @@ mod tests {
 
     /// Isolated HOME with the omp roots pointed at it (mirrors the
     /// `find_session_on_disk` tests: `$HOME` redirect only works on unix,
-    /// hence the callers' `#[cfg(unix)]`). Runs `f` with the fake home.
+    /// hence the callers' `#[cfg(unix)]`). `PI_CONFIG_DIR` is cleared so the
+    /// active omp root is deterministic under the fake HOME. Runs `f` with
+    /// the fake home.
     #[cfg(unix)]
     fn with_omp_home(f: impl FnOnce(&std::path::Path)) {
         let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
@@ -4266,18 +4270,22 @@ mod tests {
             std::env::remove_var("XDG_DATA_HOME");
             std::env::remove_var("OMP_PROFILE");
             std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("PI_CONFIG_DIR");
         }
         f(&home);
     }
 
-    /// Write `{home}/.omp/agent/sessions/project/{file_name}` (the active omp
-    /// root) and return its path.
+    /// Write `{file_name}` under the active omp session root — derived from
+    /// the same [`crate::transcript::omp_session_roots`] production lookup
+    /// [`derive_omp_transcript_path`] searches, never hardcoded, so the
+    /// fixture tracks `PI_CONFIG_DIR` overrides instead of fighting them —
+    /// and return its path.
     #[cfg(unix)]
-    fn write_omp_session_file(home: &std::path::Path, file_name: &str) -> String {
-        let root = home
-            .join(".omp")
-            .join("agent")
-            .join("sessions")
+    fn write_omp_session_file(file_name: &str) -> String {
+        let root = crate::transcript::omp_session_roots()
+            .into_iter()
+            .next()
+            .expect("omp always has exactly one active session root")
             .join("project");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join(file_name);
@@ -4331,8 +4339,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_omp_resume_session_file_present_succeeds() {
-        with_omp_home(|home| {
-            write_omp_session_file(home, &format!("{OMP_MISSING_SID}.jsonl"));
+        with_omp_home(|_| {
+            write_omp_session_file(&format!("{OMP_MISSING_SID}.jsonl"));
             let db = test_db();
             seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, "");
             let plan =
@@ -4351,12 +4359,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_omp_resume_missing_file_with_other_transcript_hints() {
-        with_omp_home(|home| {
+        with_omp_home(|_| {
             // The snapshot's transcript still exists but belongs to another session.
-            let other = write_omp_session_file(
-                home,
-                &format!("2026-09-24T10-00-00Z_{OMP_OTHER_SID}.jsonl"),
-            );
+            let other =
+                write_omp_session_file(&format!("2026-09-24T10-00-00Z_{OMP_OTHER_SID}.jsonl"));
             let db = test_db();
             seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, &other);
             let err = prepare_resume_plan(&db, "mira", false, &[], &GlobalFlags::default())
