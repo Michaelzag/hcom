@@ -171,9 +171,10 @@ impl HcomDb {
     /// One-shot v20 backfill: give every `stopped` snapshot that carries
     /// `created_at` the exact f64 bit pattern beside it.
     ///
-    /// This is the whole v20 migration — it also commits `user_version = 20` in
-    /// the same transaction as the rewrites, so an interrupted run rolls back
-    /// completely (stays at v19) and the next open re-migrates.
+    /// This is the whole v20 migration. It runs in the caller's migration
+    /// transaction and stamps `user_version = 20` there after its rewrites,
+    /// so an interrupted run rolls back completely — stamp included — and the
+    /// next open re-migrates.
     ///
     /// The rows are selected through `json_extract(data, '$.snapshot')` so
     /// the scan sees the snapshot object alone, and the numeric token is
@@ -181,8 +182,7 @@ impl HcomDb {
     /// scalar decode and a serde round trip lose ULPs. The rewrite is a
     /// `json_set`, so every other field of the row, adversarial braces and
     /// quote bait included, is preserved byte for byte.
-    fn migrate_created_at_bits(&self) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+    fn migrate_created_at_bits(&self, tx: &Transaction<'_>) -> Result<()> {
         let rows: Vec<(i64, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, json_extract(data, '$.snapshot') FROM events WHERE json_extract(data, '$.snapshot.created_at') IS NOT NULL
@@ -200,13 +200,12 @@ impl HcomDb {
                 rusqlite::params![bits as i64, id],
             )?;
         }
-        // Stamp v20 in this same transaction as the rewrites above. Committing
-        // the stamp here — not in a separate try_apply_migrations transaction —
-        // is what makes the backfill interruption-safe: if it dies partway, the
-        // rollback takes the stamp with it and leaves user_version at 19, so the
-        // next open re-migrates instead of trusting a half-backfilled database.
+        // Stamp v20 in the same transaction as the rewrites above, after
+        // them: that is what makes the backfill interruption-safe. If it dies
+        // partway, the rollback takes the stamp with it and leaves
+        // user_version below 20, so the next open re-migrates instead of
+        // trusting a half-backfilled database.
         tx.execute_batch("PRAGMA user_version = 20")?;
-        tx.commit()?;
         Ok(())
     }
 
@@ -491,20 +490,48 @@ impl HcomDb {
     ///
     /// Checks schema version, archives DB if mismatched, reconnects, and reinitializes.
     /// Call after open() for production use.
+    ///
+    /// A store already at `SCHEMA_VERSION` opens without the write lock. An
+    /// open with anything to do takes one `BEGIN IMMEDIATE` first and runs the
+    /// version check and every migration step under it, committed once, so
+    /// concurrent first openers (hooks, a relay sweep) queue on
+    /// `busy_timeout` and each loser finds the winner's stamp.
     pub fn ensure_schema(&mut self) -> Result<()> {
-        // Read the version this handle opened ONCE: the v20 created_at-bits
-        // backfill is run-once, gated on the version found at open, not on
-        // whatever `init_db`/`try_apply_migrations` stamp afterwards.
-        let opened_version: i32 = self
+        // Steady state takes no lock, exactly as before: every hook opens the
+        // DB, and a lock here would queue those opens behind any writer.
+        let is_current = self
             .conn
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+            .unwrap_or(0)
+            == SCHEMA_VERSION;
+        match self.check_schema_compat()? {
+            SchemaCompat::Ok if is_current => return Ok(()),
+            // DB is newer than our code — work with it, don't archive
+            SchemaCompat::StaleProcess => return Ok(()),
+            SchemaCompat::Ok | SchemaCompat::NeedsArchive(..) => {}
+        }
+
+        // Take the write lock BEFORE re-reading the version. A DEFERRED
+        // transaction reads first and then fails its read->write upgrade with
+        // SQLITE_BUSY, which busy_timeout never retries; IMMEDIATE makes a
+        // concurrent opener wait here instead, then see the winner's stamp.
+        // Held by hand, not via `with_immediate_transaction`, because the
+        // archive fallback must roll a partial migration back, not commit it.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // Read the version this open migrates from ONCE, under the lock: the
+        // v20 created_at-bits backfill is run-once, gated on the version found
+        // here, not on whatever `init_db`/`try_apply_migrations` stamp
+        // afterwards.
+        let opened_version: i32 = tx
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
         match self.check_schema_compat()? {
             SchemaCompat::Ok => {
                 self.init_db()?;
                 if opened_version < 20 {
-                    self.migrate_created_at_bits()?;
+                    self.migrate_created_at_bits(&tx)?;
                 }
+                tx.commit()?;
                 Ok(())
             }
             SchemaCompat::NeedsArchive(reason, old_version) => {
@@ -514,13 +541,32 @@ impl HcomDb {
                     // migration"). The stamp alone can't tell us how far back to
                     // start, so key off the columns actually present.
                     let migrate_from = self.repair_migrate_from(version);
-                    match self.try_apply_migrations(migrate_from) {
-                        Ok(true) => {
-                            if migrate_from < 20 {
-                                self.migrate_created_at_bits()?;
+                    match self.try_apply_migrations(&tx, migrate_from) {
+                        Ok(true) => match self.missing_required_instance_column() {
+                            None => {
+                                if migrate_from < 20 {
+                                    self.migrate_created_at_bits(&tx)?;
+                                }
+                                tx.commit()?;
+                                return Ok(());
                             }
-                            return Ok(());
-                        }
+                            // Repair must not report success it cannot
+                            // deliver: a store missing a required column no
+                            // migration adds (`tool` predates MIGRATIONS
+                            // 17-19) would commit "repaired", stay broken,
+                            // and re-migrate on every open. Re-run the column
+                            // guard and take the archive path below instead.
+                            Some(col) => {
+                                crate::log::log_warn(
+                                    "db",
+                                    "schema.repair_incomplete",
+                                    &format!(
+                                        "v{} -> v{} repair left instances.{} missing",
+                                        migrate_from, SCHEMA_VERSION, col
+                                    ),
+                                );
+                            }
+                        },
                         Ok(false) => {}
                         Err(e) => {
                             crate::log::log_warn(
@@ -528,9 +574,32 @@ impl HcomDb {
                                 "schema.migration_failed",
                                 &format!("v{} -> v{} failed: {}", migrate_from, SCHEMA_VERSION, e),
                             );
+                            // A lock error is contention, not corruption:
+                            // SQLITE_BUSY/SQLITE_LOCKED from ordinary hook
+                            // contention must roll the partial migration
+                            // back, release the write lock, and hand the
+                            // healthy store to the next open — archiving here
+                            // would delete it. Archive stays reserved for a
+                            // migration that cannot run (Ok(false)) or that
+                            // failed non-transiently.
+                            if matches!(
+                                e.downcast_ref::<rusqlite::Error>(),
+                                Some(rusqlite::Error::SqliteFailure(err, _))
+                                    if matches!(
+                                        err.code,
+                                        rusqlite::ErrorCode::DatabaseBusy
+                                            | rusqlite::ErrorCode::DatabaseLocked
+                                    )
+                            ) {
+                                drop(tx);
+                                return Err(e);
+                            }
                         }
                     }
                 }
+                // Roll back any partial migration and release the write lock
+                // before the archive replaces this connection and its file.
+                drop(tx);
                 eprintln!("hcom: {}, archiving...", reason);
 
                 // Snapshot running instances to pidtrack before archive so orphan
@@ -575,10 +644,38 @@ impl HcomDb {
                 Ok(())
             }
             SchemaCompat::StaleProcess => {
-                // DB is newer than our code — work with it, don't archive
+                // A newer binary migrated past us after the unlocked check:
+                // work with it, don't archive
+                tx.commit()?;
                 Ok(())
             }
         }
+    }
+
+    /// The column guard: the first required `instances` column that is
+    /// absent. Catches a store stamped without its migration — including
+    /// columns like `tool` that predate `MIGRATIONS` and that no step in
+    /// there can restore.
+    fn missing_required_instance_column(&self) -> Option<String> {
+        self.conn
+            .prepare("PRAGMA table_info(instances)")
+            .and_then(|mut s| {
+                let cols: Vec<String> = s
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                let required = [
+                    "tool",
+                    "terminal_preset_requested",
+                    "terminal_preset_effective",
+                    "last_seen",
+                ];
+                Ok(required
+                    .iter()
+                    .find(|c| !cols.contains(&c.to_string()))
+                    .map(|s| s.to_string()))
+            })
+            .unwrap_or(None)
     }
 
     /// Internal: check schema compatibility without taking action.
@@ -699,27 +796,7 @@ impl HcomDb {
 
         // Column guard: verify all expected columns exist (catches partial schema from
         // version bump before migration was written)
-        let missing_col: Option<String> = self
-            .conn
-            .prepare("PRAGMA table_info(instances)")
-            .and_then(|mut s| {
-                let cols: Vec<String> = s
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                let required = [
-                    "tool",
-                    "terminal_preset_requested",
-                    "terminal_preset_effective",
-                    "last_seen",
-                ];
-                Ok(required
-                    .iter()
-                    .find(|c| !cols.contains(&c.to_string()))
-                    .map(|s| s.to_string()))
-            })
-            .unwrap_or(None);
-        if let Some(col) = missing_col {
+        if let Some(col) = self.missing_required_instance_column() {
             return Ok(SchemaCompat::NeedsArchive(
                 format!("DB schema missing instances.{}", col),
                 Some(version),
@@ -770,13 +847,13 @@ impl HcomDb {
 
     /// Try in-place migration for consecutive schema versions.
     ///
-    /// Returns `Ok(false)` if any step is missing from `MIGRATIONS`,
-    /// causing `ensure_schema()` to fall back to archive+recreate.
-    fn try_apply_migrations(&self, old_version: i32) -> Result<bool> {
+    /// Every step runs in the caller's transaction, which owns the commit.
+    /// Returns `Ok(false)` if any step is missing from `MIGRATIONS`, causing
+    /// `ensure_schema()` to roll back and fall back to archive+recreate.
+    fn try_apply_migrations(&self, tx: &Transaction<'_>, old_version: i32) -> Result<bool> {
         if old_version <= 0 || old_version >= SCHEMA_VERSION {
             return Ok(false);
         }
-        let tx = self.conn.unchecked_transaction()?;
         for next_version in (old_version + 1)..=SCHEMA_VERSION {
             if next_version == 17 {
                 let has_launch_context = tx
@@ -797,6 +874,7 @@ impl HcomDb {
                     .query_map([], |row| row.get::<_, String>(1))?
                     .filter_map(|r| r.ok())
                     .collect();
+                let mut columns_added = false;
                 for column in ["purpose", "current"] {
                     if !columns.contains(column) {
                         tx.execute(
@@ -806,9 +884,15 @@ impl HcomDb {
                             ),
                             [],
                         )?;
+                        columns_added = true;
                     }
                 }
-                tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
+                // Stamp 19 only when the step actually ran. A re-run against
+                // already-migrated columns is a no-op success — stamping
+                // there would silently downgrade a v20 store's stamp.
+                if columns_added {
+                    tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
+                }
                 continue;
             }
             let Some((_, sql)) = MIGRATIONS.iter().find(|(v, _)| *v == next_version) else {
@@ -832,16 +916,14 @@ impl HcomDb {
                 )?;
             }
             // v20's stamp is deliberately not set here. It belongs to the
-            // created_at_bits backfill and commits atomically with it inside
-            // migrate_created_at_bits; stamping v20 in this separate transaction
-            // would publish it before the backfill runs, so an interrupted
-            // backfill would leave the DB at v20 with no bits and never re-run.
+            // created_at_bits backfill, which stamps it after its rewrites in
+            // this same transaction (migrate_created_at_bits); a stamp here
+            // would mark the DB v20 whether or not the backfill ever ran.
             // Every earlier version stamps as it lands.
             if next_version != 20 {
                 tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
             }
         }
-        tx.commit()?;
         Ok(true)
     }
 
@@ -1078,7 +1160,7 @@ impl HcomDb {
 /// Both token shapes are accepted: a bare number (`"created_at":1.5`) and a
 /// quoted one (`"created_at":"1.5"`), which the scan takes to the closing
 /// quote and the surrounding delimiter.
-fn raw_created_at_bits(data: &str) -> Option<u64> {
+pub(crate) fn raw_created_at_bits(data: &str) -> Option<u64> {
     let bytes = data.as_bytes();
     let mut i = 0;
     let mut in_string = false;
@@ -1731,7 +1813,8 @@ pub(super) mod tests {
             _ => panic!("Expected NeedsArchive for missing tool column"),
         }
 
-        // ensure_schema should fix it
+        // No migration adds `tool`, so ensure_schema cannot repair this
+        // store: it must take the archive path and leave a current schema.
         db.ensure_schema().unwrap();
 
         let version: i32 = db
@@ -1928,8 +2011,21 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
 
-        // Second runner re-applying migration 19 must also succeed.
-        assert!(db.try_apply_migrations(18).unwrap());
+        // Second runner re-applying migration 19 must also succeed — and must
+        // not downgrade the stamp it found: the store opened at v20 and the
+        // re-run is a no-op against already-migrated columns.
+        assert!(
+            db.with_immediate_transaction(|tx| db.try_apply_migrations(tx, 18))
+                .unwrap()
+        );
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "migration 19 re-run must leave the v20 stamp alone"
+        );
 
         // Data survived: no archive fallback ran.
         let purpose: String = db
@@ -2205,10 +2301,7 @@ pub(super) mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert!(
-                raw.contains(token),
-                "{name}: raw token preserved: {raw}"
-            );
+            assert!(raw.contains(token), "{name}: raw token preserved: {raw}");
             let mut migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
             let bits = migrated["snapshot"]
                 .as_object_mut()
@@ -2222,6 +2315,305 @@ pub(super) mod tests {
             );
             let original: serde_json::Value = serde_json::from_str(original).unwrap();
             assert_eq!(&migrated, &original, "{name}: only the key was added");
+        }
+
+        cleanup_test_db(db_path);
+    }
+
+    /// The v20 backfill under concurrent opens: the first run after install
+    /// has hooks and a relay sweep opening the same store at the same time,
+    /// so two independent openers race on one old store, released together
+    /// by a barrier. The race runs from v16 — the oldest version migrated in
+    /// place, so every migration step contends — and from v19, where only
+    /// the backfill does. Both openers must return Ok — SQLITE_BUSY must not
+    /// surface to the caller; the busy_timeout retry in `open_connection` is
+    /// part of the behavior under test — and the store must converge on
+    /// exactly the single-run end state: user_version 20, exact bits beside
+    /// every eligible `created_at`, nothing else in any snapshot touched, raw
+    /// numeric tokens unreformatted, and the backfill applied exactly once
+    /// (post-run rows byte-identical to a control store built the same way
+    /// and migrated by a single opener). Every opener's handle and a fresh
+    /// open of the path are checked, so a loser that archived and recreated
+    /// the live store cannot pass on the winner's handle.
+    #[test]
+    fn events_migration_concurrent_opens_backfill_exactly_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(5000);
+
+        const NUMBER_TOKEN: &str = "1790000000.0000021";
+        const NUMBER_BITS: u64 = 4_745_294_612_153_761_801;
+        const STRING_TOKEN: &str = "1762720048.770769";
+        const STRING_BITS: u64 = 4_745_180_191_745_201_223;
+        // Guard the fixtures themselves: std parse is the exact decoder.
+        assert_eq!(NUMBER_TOKEN.parse::<f64>().unwrap().to_bits(), NUMBER_BITS);
+        assert_eq!(STRING_TOKEN.parse::<f64>().unwrap().to_bits(), STRING_BITS);
+
+        let number_row = format!(
+            r#"{{"action":"stopped","by":"session","reason":"exit","process_id":null,"snapshot":{{"name":"num","created_at":{NUMBER_TOKEN},"tool":"codex"}}}}"#
+        );
+        let string_row = format!(
+            r#"{{"action":"stopped","by":"session","reason":"exit","process_id":null,"snapshot":{{"name":"str","created_at":"{STRING_TOKEN}"}}}}"#
+        );
+        let adversarial_row = format!(
+            r#"{{"action":"stopped","by":"session","reason":"exit","process_id":null,"hints":"use {{}} and \"created_at\": 999.5","text":"{{\"created_at\": 42}}","snapshot":{{"name":"adv","hints":"literal \"created_at\": 1.5 inside a string","created_at":{STRING_TOKEN}}}}}"#
+        );
+        let rows: [(&str, &str); 3] = [
+            ("num", &number_row),
+            ("str", &string_row),
+            ("adv", &adversarial_row),
+        ];
+        let insert_rows = |conn: &Connection| {
+            for (name, data) in rows {
+                conn.execute(
+                    "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', ?, ?)",
+                    params!["2026-01-01T00:00:00Z", name, data],
+                )
+                .unwrap();
+            }
+        };
+
+        // Stand a store back at its starting version with the fixture rows —
+        // the shape production sees before its first v20 open. v19 is the
+        // current schema restamped; v16 predates every MIGRATIONS step.
+        let build_v19_store = || -> PathBuf {
+            let (db, db_path) = setup_full_test_db();
+            db.conn.execute_batch("PRAGMA user_version = 19").unwrap();
+            insert_rows(&db.conn);
+            db_path
+        };
+        let build_v16_store = || -> PathBuf {
+            let db_path = std::env::temp_dir().join(format!(
+                "test_hcom_race_v16_{}_{}.db",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let conn = Connection::open(&db_path).unwrap();
+            // WAL like every store hcom has opened: `open_connection` sets it
+            // and the mode persists in the file header.
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (
+                     name TEXT PRIMARY KEY,
+                     tool TEXT DEFAULT 'claude',
+                     created_at REAL NOT NULL,
+                     launch_context TEXT DEFAULT ''
+                 );
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 PRAGMA user_version = 16;",
+            )
+            .unwrap();
+            insert_rows(&conn);
+            db_path
+        };
+        let dump = |db: &HcomDb| -> Vec<(String, String)> {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT instance, data FROM events WHERE type='life' ORDER BY instance")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+
+        // The race is timing, not determinism: one barrier release per
+        // version can serialize lucky and leave the torn interleaving
+        // unexercised. Loop it, rebuilding fresh stores per iteration.
+        const RACE_ITERATIONS: u32 = 12;
+        for (version, iteration) in (0..RACE_ITERATIONS).flat_map(|i| [(16, i), (19, i)]) {
+            let (control_path, raced_path) = match version {
+                16 => (build_v16_store(), build_v16_store()),
+                _ => (build_v19_store(), build_v19_store()),
+            };
+            // Single-run control: one opener migrates its own store.
+            let control = HcomDb::open_at(&control_path).unwrap();
+
+            // The race: two independent openers released together against
+            // the one store file, contending on the same migration.
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let openers: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = raced_path.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        HcomDb::open_at(&path)
+                    })
+                })
+                .collect();
+            let dbs: Vec<HcomDb> = openers
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .enumerate()
+                .map(|(i, result)| match result {
+                    Ok(db) => db,
+                    Err(e) => panic!("v{version} iter {iteration}: opener {i} failed under concurrent open: {e:#}"),
+                })
+                .collect();
+            // What the next open of the path sees.
+            let reopened = HcomDb::open_at(&raced_path).unwrap();
+
+            for raced in dbs.iter().chain([&reopened]) {
+                assert_eq!(
+                    raced
+                        .conn
+                        .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                        .unwrap(),
+                    20,
+                    "v{version} iter {iteration}"
+                );
+
+                // Backfill landed exactly once: exact bits beside every
+                // eligible created_at, nothing else in the snapshot touched,
+                // raw token kept.
+                for (name, original, expected_bits, token) in [
+                    ("num", &number_row, NUMBER_BITS, NUMBER_TOKEN),
+                    ("str", &string_row, STRING_BITS, STRING_TOKEN),
+                    ("adv", &adversarial_row, STRING_BITS, STRING_TOKEN),
+                ] {
+                    let raw: String = raced
+                        .conn
+                        .query_row(
+                            "SELECT data FROM events WHERE type='life' AND instance=?1",
+                            params![name],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or_else(|e| {
+                            panic!("v{version} iter {iteration} {name}: row survived the race: {e}")
+                        });
+                    assert!(
+                        raw.contains(token),
+                        "v{version} iter {iteration} {name}: raw token preserved: {raw}"
+                    );
+                    let mut migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    let bits = migrated["snapshot"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("created_at_bits")
+                        .unwrap_or_else(|| {
+                            panic!("v{version} iter {iteration} {name}: concurrent open backfilled created_at_bits")
+                        });
+                    assert_eq!(
+                        bits.as_u64(),
+                        Some(expected_bits),
+                        "v{version} iter {iteration} {name}: bits bit-identical to the single-run expectation"
+                    );
+                    let original: serde_json::Value = serde_json::from_str(original).unwrap();
+                    assert_eq!(
+                        &migrated, &original,
+                        "v{version} iter {iteration} {name}: only the key was added"
+                    );
+                }
+
+                // Post-run contents match the single-run control byte for
+                // byte — no double-apply, no archive-and-recreate, no lost rows.
+                assert_eq!(
+                    dump(raced),
+                    dump(&control),
+                    "v{version} iter {iteration}: raced store matches the single-run control"
+                );
+            }
+
+            cleanup_test_db(raced_path);
+            cleanup_test_db(control_path);
+        }
+    }
+
+    /// The steady-state open takes no write lock: every hook opens the store,
+    /// so a current store must open while another connection holds a write
+    /// transaction, instead of queueing on busy_timeout and failing with
+    /// SQLITE_BUSY. Only an open with migration work takes the lock.
+    #[test]
+    fn test_ensure_schema_current_store_opens_while_writer_holds_lock() {
+        let (db, db_path) = setup_full_test_db();
+        db.with_immediate_transaction(|_tx| HcomDb::open_at(&db_path).map(drop))
+            .expect("a current store opens without the write lock");
+        cleanup_test_db(db_path);
+    }
+
+    /// The already-WAL store under a concurrent-open storm: the rollout hosts
+    /// run stores that were converted to WAL long ago, so the fresh-file race
+    /// in `open_connection` (converting to WAL upgrades a read transaction to
+    /// a write; the loser gets SQLITE_BUSY with no busy-handler retry) must
+    /// not exist for them. `OPENERS` openers per entry point are released
+    /// together by a barrier against one already-WAL store, covering both
+    /// paths that reach `open_connection`: `open_raw` (bare connection layer)
+    /// and `open_at` (production open with the schema check). Zero
+    /// "database is locked" failures is the pass condition; exact
+    /// success/failure counts are reported either way.
+    #[test]
+    fn already_wal_store_survives_concurrent_opens() {
+        use std::sync::Arc;
+
+        let (db, db_path) = setup_full_test_db();
+        // Precondition, not enforcement: the store must already be WAL before
+        // the race. If it is not, fail with that fact — forcing the mode here
+        // would probe a different race than the rollout's.
+        let journal_mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            journal_mode,
+            "wal",
+            "store at {} is not already in WAL mode (journal_mode={journal_mode})",
+            db_path.display()
+        );
+
+        const OPENERS: usize = 200;
+        for (name, open) in [
+            (
+                "open_raw",
+                HcomDb::open_raw as fn(&std::path::Path) -> Result<HcomDb>,
+            ),
+            (
+                "open_at",
+                HcomDb::open_at as fn(&std::path::Path) -> Result<HcomDb>,
+            ),
+        ] {
+            let barrier = Arc::new(std::sync::Barrier::new(OPENERS));
+            let handles: Vec<_> = (0..OPENERS)
+                .map(|_| {
+                    let path = db_path.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        open(&path).map(drop)
+                    })
+                })
+                .collect();
+            let mut ok = 0usize;
+            let mut failures: Vec<String> = Vec::new();
+            for handle in handles {
+                match handle.join().unwrap() {
+                    Ok(()) => ok += 1,
+                    Err(e) => failures.push(format!("{e:#}")),
+                }
+            }
+            let locked = failures
+                .iter()
+                .filter(|f| f.contains("database is locked"))
+                .count();
+            eprintln!(
+                "{name}: {ok}/{OPENERS} opens ok, {} failed, {locked} 'database is locked'",
+                failures.len()
+            );
+            assert_eq!(
+                locked,
+                0,
+                "{name}: SQLITE_BUSY surfaced on an already-WAL store: \
+                 {locked} of {} failures were 'database is locked': {failures:#?}",
+                failures.len()
+            );
+            assert!(
+                failures.is_empty(),
+                "{name}: {ok}/{OPENERS} opens ok, {} failed for other reasons: {failures:#?}",
+                failures.len()
+            );
         }
 
         cleanup_test_db(db_path);

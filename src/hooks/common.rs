@@ -2097,7 +2097,9 @@ fn stop_instance_inner_scoped(
 struct TeardownOwner {
     pid: u32,
     process_start: String,
-    created_at_bits: u64,
+    // A 0.7.29 killer's claim carries the legacy `created_at` float and no
+    // bits; the comparison falls back to it (see `yield_to_teardown`).
+    created_at_bits: Option<u64>,
     session_id: Option<String>,
 }
 
@@ -2166,14 +2168,21 @@ fn yield_to_teardown(db: &HcomDb, instance_name: &str) -> Option<(f64, Option<St
         .kv_get(&format!("teardown_claim:{instance_name}"))
         .ok()
         .flatten()
-        .and_then(|value| serde_json::from_str::<TeardownOwner>(&value).ok())
-        .and_then(|owner| {
+        .and_then(|value| {
+            let owner: TeardownOwner = serde_json::from_str(&value).ok()?;
             if !crate::sys::process::has_identity(owner.pid, &owner.process_start) {
                 return None;
             }
             let row = db.get_instance_full(instance_name).ok().flatten()?;
-            (row.created_at.to_bits() == owner.created_at_bits
-                && row.session_id == owner.session_id)
+            // Bits are authoritative. A 0.7.29 killer claims with the legacy
+            // `created_at` float and no bits — matched on its exact bit
+            // pattern via the raw-token decode (a float decode can change a
+            // ULP), so a missing bits field is never treated as a mismatch.
+            let created_at_matches = match owner.created_at_bits {
+                Some(bits) => row.created_at.to_bits() == bits,
+                None => crate::db::raw_created_at_bits(&value) == Some(row.created_at.to_bits()),
+            };
+            (created_at_matches && row.session_id == owner.session_id)
                 .then_some((row.created_at, row.session_id))
         });
     if incarnation.is_some() {

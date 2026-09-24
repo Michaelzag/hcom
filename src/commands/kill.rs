@@ -429,9 +429,10 @@ fn teardown_if_incarnation_unchanged(
 /// this instance written after the kill resolved its target (id above the
 /// watermark), keyed to one of the resolved bindings — or, when no process
 /// is named, carrying the resolved incarnation's `created_at` in its
-/// snapshot (the same identity the CAS compares, so a re-registered
-/// bindingless incarnation finalizing mid-kill is not mistaken for the
-/// session) — and not a `stale-harness-exit` (a stale harness declining to
+/// snapshot (as its exact `created_at_bits` when present, else the legacy
+/// `created_at` itself — the same identity the CAS compares, so a
+/// re-registered bindingless incarnation finalizing mid-kill is not
+/// mistaken for the session) — and not a `stale-harness-exit` (a stale
 /// touch a rebound row). Then a gone row was released by the session, and a
 /// row with the same `created_at` + `session_id` whose bindings only shrank
 /// was kept by it. Anything else — no such event, a new identity, or any
@@ -446,7 +447,8 @@ fn classify_lost_teardown(
     let token = &incarnation.token;
     let mut stmt = tx.prepare(
         "SELECT json_extract(data, '$.process_id'), \
-                json_extract(data, '$.snapshot.created_at_bits') FROM events \
+                json_extract(data, '$.snapshot.created_at_bits'), \
+                json_extract(data, '$.snapshot') FROM events \
          WHERE type = 'life' AND instance = ?1 AND id > ?2 \
            AND json_extract(data, '$.action') = 'stopped' \
            AND json_extract(data, '$.by') IN ('session', 'pty') \
@@ -457,16 +459,29 @@ fn classify_lost_teardown(
             Ok((
                 r.get::<_, Option<String>>(0)?,
                 r.get::<_, Option<i64>>(1)?.map(|bits| bits as u64),
+                r.get::<_, Option<String>>(2)?,
             ))
         })?;
     let mut self_stop = false;
     for row in &mut process_ids {
-        let (process_id, snapshot_created_at_bits) = row?;
+        let (process_id, snapshot_created_at_bits, snapshot) = row?;
         let matches = match process_id {
             Some(id) => token.binding_ids.contains(&id),
-            // Snapshot bits are an exact JSON integer representation of the
-            // f64 identity; decoding the fractional number can change its ULP.
-            None => snapshot_created_at_bits == Some(token.created_at.to_bits()),
+            None => match snapshot_created_at_bits {
+                // Snapshot bits are an exact JSON integer representation of
+                // the f64 identity; decoding the fractional number can change
+                // its ULP. Bits are authoritative whenever present.
+                Some(bits) => bits == token.created_at.to_bits(),
+                // Mixed-version window: a stopped event written by a pre-v20
+                // binary carries only the legacy `created_at`. Match it on
+                // the exact bit pattern of its raw JSON token — the correctly
+                // rounded decode the backfill uses — so a missing bits field
+                // is never treated as a mismatch.
+                None => {
+                    snapshot.as_deref().and_then(crate::db::raw_created_at_bits)
+                        == Some(token.created_at.to_bits())
+                }
+            },
         };
         if matches {
             self_stop = true;
@@ -3006,6 +3021,87 @@ mod tests {
             .with_immediate_transaction(|tx| classify_lost_teardown(tx, &name, &incarnation, None))
             .unwrap();
         assert_eq!(outcome, TeardownOutcome::SessionStoppedReleasedRow);
+        let _ = _guard;
+    }
+
+    /// The mixed-version window: install does not stop a 0.7.29 process — an
+    /// old relay worker or hook — from writing to the upgraded log, so a
+    /// stopped event can carry `created_at` with NO `created_at_bits`. The
+    /// 0.7.30 teardown classification must still match that row as a
+    /// self-stop on the legacy `created_at` identity: a missing bits field is
+    /// never a mismatch. `created_at_bits` stays authoritative whenever it is
+    /// present, so a row whose bits name another incarnation never falls back
+    /// to `created_at`.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn classify_lost_teardown_matches_a_pre_v20_event_without_bits() {
+        // ULP-critical: serde_json's own f64 parser mangles this one
+        // (...801 -> ...800), a correctly rounded parse does not. The 0.7.29
+        // writer serialized the value through serde.
+        const CREATED_AT: f64 = 1_790_000_000.000_002_1;
+        assert_eq!(CREATED_AT.to_bits(), 4_745_294_612_153_761_801);
+
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+
+        // The stopped record exactly as 0.7.29 wrote it: `created_at` in the
+        // snapshot, no `created_at_bits`.
+        let name = format!("hcom-kill-{}-pre-v20", std::process::id());
+        db.log_life_event(
+            &name,
+            "stopped",
+            "session",
+            "exit:normal",
+            Some(serde_json::json!({ "name": name, "created_at": CREATED_AT })),
+            None,
+        )
+        .unwrap();
+
+        let classify = |against: f64, event_name: &str| {
+            let incarnation = ResolvedIncarnation {
+                token: IncarnationToken::new(against, None, vec![]),
+                event_watermark: 0,
+            };
+            db.with_immediate_transaction(|tx| {
+                classify_lost_teardown(tx, event_name, &incarnation, None)
+            })
+            .unwrap()
+        };
+
+        // Positive: the pre-v20 row is a self-stop on created_at alone.
+        assert_eq!(
+            classify(CREATED_AT, &name),
+            TeardownOutcome::SessionStoppedReleasedRow
+        );
+        // Negative: another incarnation's created_at never matches it.
+        assert_eq!(
+            classify(CREATED_AT + 1000.0, &name),
+            TeardownOutcome::RowReRegistered
+        );
+
+        // Grey: bits are authoritative — a row carrying a different
+        // created_at_bits never falls back to created_at.
+        let bits_name = format!("hcom-kill-{}-pre-v20-bits", std::process::id());
+        db.log_life_event(
+            &bits_name,
+            "stopped",
+            "session",
+            "exit:normal",
+            Some(serde_json::json!({
+                "name": bits_name,
+                "created_at": CREATED_AT,
+                "created_at_bits": (CREATED_AT + 1000.0).to_bits(),
+            })),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            classify(CREATED_AT, &bits_name),
+            TeardownOutcome::RowReRegistered
+        );
         let _ = _guard;
     }
 
