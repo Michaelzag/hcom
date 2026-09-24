@@ -371,7 +371,7 @@ fn prepare_resume_plan_from_source(
 ) -> Result<PreparedResume> {
     let is_adoption = matches!(source, ResumeSource::Disk { .. });
 
-    // Load the (tool, session_id, prior-launch-args, tag, background, last_event_id, cwd_hint, purpose, current, display_name)
+    // Load the (tool, session_id, prior-launch-args, tag, background, last_event_id, cwd_hint, purpose, current, transcript_path, display_name)
     // from the DB (instance newest or exact session), or the on-disk transcript (adoption).
     let (
         tool,
@@ -383,11 +383,12 @@ fn prepare_resume_plan_from_source(
         snapshot_dir,
         snapshot_purpose,
         snapshot_current,
+        snapshot_transcript_path,
         display_name,
     ) = match source {
         ResumeSource::Instance { name } => {
             ensure_resumable(db, name, fork)?;
-            let (tool, sid, largs, tag, bg, leid, snap, purpose, current) = if fork {
+            let (tool, sid, largs, tag, bg, leid, snap, purpose, current, tpath) = if fork {
                 load_instance_data(db, name)?
             } else {
                 load_stopped_snapshot(db, name)?
@@ -402,12 +403,13 @@ fn prepare_resume_plan_from_source(
                 snap,
                 purpose,
                 current,
+                tpath,
                 name.to_string(),
             )
         }
         ResumeSource::StoppedSession { name, session_id } => {
             ensure_resumable(db, name, fork)?;
-            let (tool, sid, largs, tag, bg, leid, snap, purpose, current) =
+            let (tool, sid, largs, tag, bg, leid, snap, purpose, current, tpath) =
                 load_stopped_snapshot_by_session_id(db, session_id)?;
             (
                 tool,
@@ -419,6 +421,7 @@ fn prepare_resume_plan_from_source(
                 snap,
                 purpose,
                 current,
+                tpath,
                 name.to_string(),
             )
         }
@@ -438,11 +441,11 @@ fn prepare_resume_plan_from_source(
                 cwd_hint.unwrap_or_default(),
                 String::new(),
                 String::new(),
+                String::new(),
                 display,
             )
         }
     };
-
     if session_id.is_empty() {
         bail!(
             "No session ID found for '{}' — cannot {}",
@@ -450,6 +453,10 @@ fn prepare_resume_plan_from_source(
             if fork { "fork" } else { "resume" }
         );
     }
+    // Extract hcom-level flags from extra args before tool parsing.
+    let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
+
+    // Extract hcom-level flags from extra args before tool parsing.
 
     // The name's delivery cursor must never move backwards on resume. A plan
     // loaded from an older stopped snapshot (StoppedSession) carries that
@@ -470,9 +477,6 @@ fn prepare_resume_plan_from_source(
     } else {
         Some(tag.clone())
     };
-
-    // Extract hcom-level flags from extra args before tool parsing.
-    let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
 
     // Determine effective working directory:
     // - Explicit --dir flag wins (validated and canonicalized)
@@ -528,6 +532,36 @@ fn prepare_resume_plan_from_source(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string())
     };
+
+    // Omp resolves relative PI_CODING_AGENT_DIR against the child process's
+    // effective working directory (omp packages/utils/src/dirs.ts:328-335).
+    // Check the resulting root only after that working directory is finalized.
+    if tool == "omp" && !is_adoption {
+        let hcom_config = load_hcom_config();
+        let inside_ai_tool = crate::shared::HcomContext::from_os().is_inside_ai_tool();
+        let terminal_mode = launch_flags
+            .terminal
+            .as_deref()
+            .or(Some(hcom_config.terminal.as_str()).filter(|t| !t.is_empty()));
+        let run_here = crate::launcher::will_run_in_current_terminal(
+            1,
+            background,
+            launch_flags.run_here,
+            terminal_mode,
+            inside_ai_tool,
+        );
+        let mut env = crate::launcher::build_launch_env(
+            &hcom_config,
+            crate::launcher::launch_env_regime(run_here, inside_ai_tool),
+        );
+        crate::launcher::apply_tool_config_dir_to_env(&crate::launcher::LaunchTool::Omp, &mut env);
+        ensure_omp_session_file_in_env(
+            &session_id,
+            &snapshot_transcript_path,
+            &env,
+            std::path::Path::new(&effective_cwd),
+        )?;
+    }
 
     // Merge with original launch args (only applicable for tracked instances).
     let original_args: Vec<String> = if !launch_args_str.is_empty() {
@@ -1005,7 +1039,7 @@ fn resume_system_prompt(tool: &str, name: &str, fork: bool, child_name: Option<&
     }
 }
 /// Loaded instance row for resume: (tool, session_id, launch_args, tag,
-/// background, last_event_id, directory, purpose, current).
+/// background, last_event_id, directory, purpose, current, transcript_path).
 type LoadedInstanceData = (
     String,
     String,
@@ -1013,6 +1047,7 @@ type LoadedInstanceData = (
     String,
     bool,
     i64,
+    String,
     String,
     String,
     String,
@@ -1032,6 +1067,7 @@ fn load_instance_data(db: &HcomDb, name: &str) -> Result<LoadedInstanceData> {
             inst.directory.clone(),
             inst.purpose.clone().unwrap_or_default(),
             inst.current.clone().unwrap_or_default(),
+            inst.transcript_path.clone(),
         ));
     }
 
@@ -1104,7 +1140,7 @@ fn load_stopped_snapshot_by_session_id(
 /// name's message cursor and redeliver what a later session already consumed.
 fn name_newest_cursor(db: &HcomDb, name: &str) -> i64 {
     let snapshot_cursor = load_stopped_snapshot(db, name)
-        .map(|(_, _, _, _, _, last_event_id, _, _, _)| last_event_id)
+        .map(|(_, _, _, _, _, last_event_id, _, _, _, _)| last_event_id)
         .unwrap_or(0);
     let row_cursor = db
         .get_instance_full(name)
@@ -1166,6 +1202,11 @@ fn parse_stopped_snapshot(data_str: &str) -> Option<LoadedInstanceData> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let transcript_path = snapshot
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     Some((
         tool,
@@ -1177,6 +1218,7 @@ fn parse_stopped_snapshot(data_str: &str) -> Option<LoadedInstanceData> {
         directory,
         purpose,
         current,
+        transcript_path,
     ))
 }
 
@@ -2093,10 +2135,6 @@ fn merge_omp_args(original: &[String], resume: &[String]) -> Vec<String> {
     final_args
 }
 
-/// Locate an OMP transcript by session id under OMP's currently active session
-/// root. Notably does **not** search `PI_CODING_AGENT_SESSION_DIR` — OMP never
-/// reads it, so it stays Pi-exclusive. Test helper: production attribution goes through
-/// [`resolve_pi_omp_on_disk`], which keeps exclusive/shared provenance.
 #[cfg(test)]
 fn derive_omp_transcript_path(session_id: &str) -> Option<String> {
     for root in crate::transcript::omp_session_roots() {
@@ -2108,6 +2146,57 @@ fn derive_omp_transcript_path(session_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Refuse an omp snapshot resume when omp's own session root no longer holds
+/// the session file. omp exits at once for a missing `--resume` id (the
+/// plugin never binds), so launching would only burn a harness and poison the
+/// trail with another snapshot pointing at the dead session. Existence uses
+/// [`derive_omp_transcript_path`] — the same root omp resume reads — and the
+/// hint (when the snapshot's transcript names another live session) never
+/// resumes it automatically.
+fn ensure_omp_session_file_in_env(
+    session_id: &str,
+    transcript_path: &str,
+    env: &std::collections::HashMap<String, String>,
+    effective_cwd: &std::path::Path,
+) -> Result<()> {
+    let mut found = false;
+    for root in crate::transcript::omp_session_roots_for_env(env, effective_cwd) {
+        if root.exists() && find_pi_transcript_in_root(&root, session_id).is_some() {
+            found = true;
+            break;
+        }
+    }
+    if found {
+        return Ok(());
+    }
+    let mut err = format!("session file not found: {session_id}");
+    if let Some(other) = transcript_session_id(transcript_path)
+        && !other.eq_ignore_ascii_case(session_id)
+    {
+        err.push_str(&format!(
+            "; the snapshot's transcript is session {other}: run hcom r {other}"
+        ));
+    }
+    bail!("{err}")
+}
+
+/// UUID embedded in a snapshot `transcript_path`'s file name, when that file
+/// still exists. omp/pi session files end `<timestamp>Z_<uuid>.jsonl`; the
+/// trailing `_`-separated segment that parses as a UUID is the session.
+/// `None` for an empty path, a missing file, or a name with no UUID, so the
+/// caller emits the plain missing-file error with no hint.
+fn transcript_session_id(transcript_path: &str) -> Option<String> {
+    if transcript_path.is_empty() || !std::path::Path::new(transcript_path).is_file() {
+        return None;
+    }
+    let stem = std::path::Path::new(transcript_path)
+        .file_stem()
+        .and_then(|s| s.to_str())?;
+    stem.rsplit('_')
+        .find_map(|seg| uuid::Uuid::parse_str(seg).ok())
+        .map(|id| id.to_string())
 }
 
 fn find_pi_transcript_in_root(root: &std::path::Path, session_id: &str) -> Option<String> {
@@ -2624,6 +2713,7 @@ mod tests {
             std::env::remove_var("XDG_DATA_HOME");
             std::env::remove_var("OMP_PROFILE");
             std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("PI_CONFIG_DIR");
         }
         let root = home
             .join(".omp")
@@ -2743,6 +2833,7 @@ mod tests {
             std::env::remove_var("PI_CODING_AGENT_DIR");
             std::env::remove_var("XDG_DATA_HOME");
             std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("PI_CONFIG_DIR");
             std::env::set_var("OMP_PROFILE", "work");
         }
         let root = home
@@ -4169,5 +4260,256 @@ mod tests {
             prepare_resume_plan(&db, &quiet_name, false, &[], &GlobalFlags::default()).is_ok(),
             "resume proceeds with nothing alive"
         );
+    }
+
+    // ── Omp missing-session-file guard ──────────────────────────────
+
+    #[cfg(unix)]
+    const OMP_MISSING_SID: &str = "33333333-3333-3333-3333-333333333333";
+    #[cfg(unix)]
+    const OMP_OTHER_SID: &str = "44444444-4444-4444-4444-444444444444";
+
+    /// Seed an inactive omp row plus its stopped snapshot carrying
+    /// `transcript_path`, mirroring the real `life.stopped` body (which
+    /// carries the row's transcript path via `get_instance_snapshot`).
+    #[cfg(unix)]
+    fn seed_omp_stopped_snapshot(
+        db: &HcomDb,
+        instance: &str,
+        session_id: &str,
+        transcript_path: &str,
+    ) {
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!(session_id));
+        data.insert("tool".into(), json!("omp"));
+        data.insert("status".into(), json!(ST_INACTIVE));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named(instance, &data).unwrap();
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "omp",
+                "session_id": session_id,
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": 0,
+                "directory": "/tmp",
+                "purpose": "",
+                "current": "",
+                "transcript_path": transcript_path,
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', ?, ?)",
+                rusqlite::params!["2026-01-01T00:00:00Z", instance, snapshot.to_string()],
+            )
+            .unwrap();
+    }
+
+    /// Isolated HOME with the omp roots pointed at it (mirrors the
+    /// `find_session_on_disk` tests: `$HOME` redirect only works on unix,
+    /// hence the callers' `#[cfg(unix)]`). `PI_CONFIG_DIR` is cleared so the
+    /// active omp root is deterministic under the fake HOME. Runs `f` with
+    /// the fake home.
+    #[cfg(unix)]
+    fn with_omp_home(f: impl FnOnce(&std::path::Path)) {
+        let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        unsafe {
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("PI_CONFIG_DIR");
+        }
+        f(&home);
+    }
+
+    /// Write `{file_name}` under the active omp session root — derived from
+    /// the same [`crate::transcript::omp_session_roots`] production lookup
+    /// [`derive_omp_transcript_path`] searches, never hardcoded, so the
+    /// fixture tracks `PI_CONFIG_DIR` overrides instead of fighting them —
+    /// and return its path.
+    #[cfg(unix)]
+    fn write_omp_session_file(file_name: &str) -> String {
+        let root = crate::transcript::omp_session_roots()
+            .into_iter()
+            .next()
+            .expect("omp always has exactly one active session root")
+            .join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(file_name);
+        std::fs::write(&path, "{}").unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_resume_missing_session_file_refuses() {
+        with_omp_home(|_| {
+            let db = test_db();
+            seed_omp_stopped_snapshot(
+                &db,
+                "mira",
+                OMP_MISSING_SID,
+                "/nonexistent/2026-09-24T10-00-00Z_55555555-5555-5555-5555-555555555555.jsonl",
+            );
+            // `hcom r <name>`: newest snapshot for the name.
+            let err = prepare_resume_plan(&db, "mira", false, &[], &GlobalFlags::default())
+                .err()
+                .expect("resume with no session file must fail")
+                .to_string();
+            assert!(
+                err.starts_with(&format!("session file not found: {OMP_MISSING_SID}")),
+                "unexpected error: {err}"
+            );
+            // `hcom r <uuid>`: the exact session's own snapshot.
+            let err = prepare_resume_plan_from_source(
+                &db,
+                ResumeSource::StoppedSession {
+                    name: "mira",
+                    session_id: OMP_MISSING_SID,
+                },
+                false,
+                &[],
+                &GlobalFlags::default(),
+            )
+            .err()
+            .expect("exact-session resume with no session file must fail")
+            .to_string();
+            assert!(
+                err.starts_with(&format!("session file not found: {OMP_MISSING_SID}")),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_resume_session_file_present_succeeds() {
+        with_omp_home(|_| {
+            write_omp_session_file(&format!("{OMP_MISSING_SID}.jsonl"));
+            let db = test_db();
+            seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, "");
+            let plan =
+                prepare_resume_plan(&db, "mira", false, &[], &GlobalFlags::default()).unwrap();
+            assert_eq!(plan.session_id, OMP_MISSING_SID);
+            assert!(plan.launch.args.contains(&"--resume".to_string()));
+            assert!(
+                plan.launch.args.contains(&OMP_MISSING_SID.to_string()),
+                "plan must carry --resume <sid>, got: {:?}",
+                plan.launch.args
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_resume_finds_managed_session_when_hcom_dir_outside_home() {
+        let (_home_dir, _hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let external = tempfile::tempdir().unwrap();
+        let hcom_dir = external.path().join("state");
+        std::fs::create_dir_all(&hcom_dir).unwrap();
+        crate::paths::test_roots::register(external.path());
+        assert_ne!(hcom_dir.parent(), Some(home.as_path()));
+
+        unsafe {
+            std::env::set_var("HCOM_DIR", &hcom_dir);
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OMP_PROFILE");
+            std::env::remove_var("PI_PROFILE");
+            std::env::remove_var("PI_CONFIG_DIR");
+        }
+        crate::config::Config::reset();
+        let root = external.path().join(".omp").join("sessions");
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::write(
+            root.join("project")
+                .join(format!("{OMP_MISSING_SID}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+
+        let db = test_db();
+        seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, "");
+        prepare_resume_plan(&db, "mira", false, &[], &GlobalFlags::default()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_resume_missing_file_with_other_transcript_hints() {
+        with_omp_home(|_| {
+            // The snapshot's transcript still exists but belongs to another session.
+            let other =
+                write_omp_session_file(&format!("2026-09-24T10-00-00Z_{OMP_OTHER_SID}.jsonl"));
+            let db = test_db();
+            seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, &other);
+            let err = prepare_resume_plan(&db, "mira", false, &[], &GlobalFlags::default())
+                .err()
+                .expect("resume with no session file must fail")
+                .to_string();
+            assert!(
+                err.starts_with(&format!("session file not found: {OMP_MISSING_SID}")),
+                "unexpected error: {err}"
+            );
+            assert!(
+                err.contains(OMP_OTHER_SID),
+                "hint must name the transcript's session: {err}"
+            );
+            assert!(
+                err.contains(&format!("hcom r {OMP_OTHER_SID}")),
+                "hint must point at the other resume: {err}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_resume_missing_file_empty_transcript_has_no_hint() {
+        with_omp_home(|_| {
+            let db = test_db();
+            seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, "");
+            let err = prepare_resume_plan(&db, "mira", false, &[], &GlobalFlags::default())
+                .err()
+                .expect("resume with no session file must fail")
+                .to_string();
+            assert_eq!(err, format!("session file not found: {OMP_MISSING_SID}"));
+
+            assert!(
+                !err.contains("hcom r"),
+                "plain error must carry no hint: {err}"
+            );
+        });
+    }
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_resume_finds_file_under_child_env_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_home = dir.path().join("child-home");
+        let root = child_home.join(".omp").join("agent").join("sessions");
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::write(
+            root.join("project")
+                .join(format!("{OMP_MISSING_SID}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+
+        // The process HOME intentionally does not point at child_home; the
+        // launch env supplied by hcom is the only place the override exists.
+        let mut env = std::collections::HashMap::new();
+        env.insert("HOME".to_string(), child_home.to_string_lossy().to_string());
+        ensure_omp_session_file_in_env(OMP_MISSING_SID, "", &env, std::path::Path::new("."))
+            .unwrap();
     }
 }
