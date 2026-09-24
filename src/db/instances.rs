@@ -435,6 +435,7 @@ impl HcomDb {
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
         expected_process_id: Option<&str>,
+        expected_binding_ids: &[String],
     ) -> Result<bool> {
         let (won, event_id) = self.with_immediate_transaction(|tx| {
             self.finalize_instance_stop_in_txn(
@@ -446,6 +447,7 @@ impl HcomDb {
                 agent_id,
                 event_data,
                 expected_process_id,
+                expected_binding_ids,
             )
         })?;
 
@@ -475,6 +477,7 @@ impl HcomDb {
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
         expected_process_id: Option<&str>,
+        expected_binding_ids: &[String],
     ) -> Result<(bool, Option<i64>)> {
         // The same write transaction guards both this read and the delete:
         // a pre-registered launch must not lose its row after spawning.
@@ -530,6 +533,38 @@ impl HcomDb {
                     event_id = Some(tx.last_insert_rowid());
                     return Ok((false, event_id));
                 }
+            }
+        }
+
+        if !expected_binding_ids.is_empty() {
+            let current: Vec<String> = tx
+                .prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?")?
+                .query_map(params![name], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let expected_set: std::collections::HashSet<&str> =
+                expected_binding_ids.iter().map(String::as_str).collect();
+            let current_set: std::collections::HashSet<&str> =
+                current.iter().map(String::as_str).collect();
+            if current_set != expected_set {
+                let mut stale = event_data.clone();
+                if let Some(map) = stale.as_object_mut() {
+                    map.insert(
+                        "reason".to_string(),
+                        serde_json::Value::String("stale-harness-exit".to_string()),
+                    );
+                    map.insert(
+                        "process_id".to_string(),
+                        serde_json::Value::String(expected.to_string()),
+                    );
+                }
+                let stale_str = serde_json::to_string(&stale)?;
+                tx.execute(
+                    "INSERT INTO events (timestamp, type, instance, data) \
+                     VALUES (?, 'life', ?, ?)",
+                    params![timestamp, name, stale_str],
+                )?;
+                event_id = Some(tx.last_insert_rowid());
+                return Ok((false, event_id));
             }
         }
         let deleted = tx.execute(
@@ -1293,6 +1328,7 @@ mod tests {
         db.conn
             .execute(
                 "INSERT INTO instances (name, status, created_at) VALUES ('luna', 'active', 1000.0)",
+
                 [],
             )
             .unwrap();
@@ -1307,6 +1343,51 @@ mod tests {
         assert_eq!(inst["status"], "listening");
         assert_eq!(inst["tag"], "api");
 
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn finalize_rejects_added_binding_when_expected_set_is_stale() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn().execute("INSERT INTO instances (name, tool, created_at) VALUES ('stale-set', 'test', 1.0)", []).unwrap();
+        db.conn().execute("INSERT INTO process_bindings (process_id, instance_name, updated_at) VALUES ('b1', 'stale-set', 1.0)", []).unwrap();
+        db.conn().execute("INSERT INTO process_bindings (process_id, instance_name, updated_at) VALUES ('b2', 'stale-set', 2.0)", []).unwrap();
+        let data = serde_json::json!({"action":"stopped","by":"test","reason":"closed","process_id":"b1"});
+        let expected = vec!["b1".to_string()];
+        let won = db.finalize_instance_stop("stale-set", 1.0, None, None, None, &data, Some("b1"), &expected).unwrap();
+        assert!(!won);
+        assert!(db.get_instance_full("stale-set").unwrap().is_some());
+        let bindings: i64 = db.conn().query_row("SELECT COUNT(*) FROM process_bindings WHERE instance_name='stale-set'", [], |r| r.get(0)).unwrap();
+        assert_eq!(bindings, 2);
+        let events: i64 = db.conn().query_row("SELECT COUNT(*) FROM events WHERE instance='stale-set' AND json_extract(data, '$.reason')='stale-harness-exit'", [], |r| r.get(0)).unwrap();
+        assert_eq!(events, 1);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn finalize_releases_when_expected_binding_set_matches() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn().execute("INSERT INTO instances (name, tool, created_at) VALUES ('exact-set', 'test', 1.0)", []).unwrap();
+        db.conn().execute("INSERT INTO process_bindings (process_id, instance_name, updated_at) VALUES ('b1', 'exact-set', 1.0)", []).unwrap();
+        db.conn().execute("INSERT INTO process_bindings (process_id, instance_name, updated_at) VALUES ('b2', 'exact-set', 2.0)", []).unwrap();
+        let data = serde_json::json!({"action":"stopped","by":"test","reason":"closed","process_id":"b1"});
+        let expected = vec!["b1".to_string(), "b2".to_string()];
+        let won = db.finalize_instance_stop("exact-set", 1.0, None, None, None, &data, Some("b1"), &expected).unwrap();
+        assert!(won);
+        assert!(db.get_instance_full("exact-set").unwrap().is_none());
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn finalize_empty_binding_set_preserves_legacy_release() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn().execute("INSERT INTO instances (name, tool, created_at) VALUES ('legacy-set', 'test', 1.0)", []).unwrap();
+        db.conn().execute("INSERT INTO process_bindings (process_id, instance_name, updated_at) VALUES ('b1', 'legacy-set', 1.0)", []).unwrap();
+        db.conn().execute("INSERT INTO process_bindings (process_id, instance_name, updated_at) VALUES ('b2', 'legacy-set', 2.0)", []).unwrap();
+        let data = serde_json::json!({"action":"stopped","by":"test","reason":"closed","process_id":"b1"});
+        let won = db.finalize_instance_stop("legacy-set", 1.0, None, None, None, &data, Some("b1"), &[]).unwrap();
+        assert!(won);
+        assert!(db.get_instance_full("legacy-set").unwrap().is_none());
         cleanup_test_db(db_path);
     }
 

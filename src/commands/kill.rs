@@ -97,23 +97,20 @@ impl TeardownOutcome {
 struct IncarnationToken {
     created_at: f64,
     session_id: Option<String>,
+    agent_id: Option<String>,
     binding_ids: Vec<String>,
 }
 
 impl IncarnationToken {
     fn capture(row: &crate::db::InstanceRow, binding_ids: &[String]) -> Self {
-        Self::new(row.created_at, row.session_id.clone(), binding_ids.to_vec())
+        Self::new(row.created_at, row.session_id.clone(), row.agent_id.clone(), binding_ids.to_vec())
     }
 
-    fn new(created_at: f64, session_id: Option<String>, binding_ids: Vec<String>) -> Self {
+    fn new(created_at: f64, session_id: Option<String>, agent_id: Option<String>, binding_ids: Vec<String>) -> Self {
         let mut ids = binding_ids;
         ids.sort();
         ids.dedup();
-        Self {
-            created_at,
-            session_id,
-            binding_ids: ids,
-        }
+        Self { created_at, session_id, agent_id, binding_ids: ids }
     }
 }
 
@@ -141,6 +138,10 @@ impl ResolvedIncarnation {
 }
 
 const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[cfg(test)]
+static CAPTURE_GAP_HOOK: std::sync::Mutex<Option<fn(&HcomDb, &str)>> =
+    std::sync::Mutex::new(None);
 
 #[derive(Clone, Copy)]
 enum PaneCleanupProcessState {
@@ -275,6 +276,10 @@ fn kill_tracked_instance_with_self_pids(
         .get_instance_with_bindings(name)
         .map_err(|e| e.to_string())?;
     let inst = inst.ok_or_else(|| format!("Agent '{}' not found", name))?;
+    #[cfg(test)]
+    if let Some(hook) = CAPTURE_GAP_HOOK.lock().unwrap().take() {
+        hook(db, name);
+    }
     let pid = inst
         .pid
         .ok_or_else(|| format!("No tracked PID for '{}'", name))? as u32;
@@ -363,14 +368,14 @@ fn read_incarnation_tx(
     name: &str,
 ) -> Result<Option<IncarnationToken>> {
     use rusqlite::OptionalExtension;
-    let row: Option<(f64, Option<String>)> = tx
+    let row: Option<(f64, Option<String>, Option<String>)> = tx
         .query_row(
-            "SELECT created_at, session_id FROM instances WHERE name = ?1",
+            "SELECT created_at, session_id, agent_id FROM instances WHERE name = ?1",
             rusqlite::params![name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((created_at, session_id)) = row else {
+    let Some((created_at, session_id, agent_id)) = row else {
         return Ok(None);
     };
     let mut stmt =
@@ -381,6 +386,7 @@ fn read_incarnation_tx(
     Ok(Some(IncarnationToken::new(
         created_at,
         session_id,
+        agent_id,
         binding_ids,
     )))
 }
@@ -453,60 +459,40 @@ fn classify_lost_teardown(
 ) -> Result<TeardownOutcome> {
     let token = &incarnation.token;
     let mut stmt = tx.prepare(
-        "SELECT id, json_extract(data, '$.process_id'), \
+        "SELECT id, json_extract(data, '$.by'), \
+                json_extract(data, '$.process_id'), \
                 json_extract(data, '$.snapshot.created_at_bits'), \
+                json_extract(data, '$.snapshot.session_id'), \
+                json_extract(data, '$.snapshot.agent_id'), \
                 json_extract(data, '$.snapshot') FROM events \
-         WHERE type = 'life' AND instance = ?1 AND id > ?2 \
-           AND json_extract(data, '$.action') = 'stopped' \
-           AND json_extract(data, '$.by') IN ('session', 'pty') \
-           AND COALESCE(json_extract(data, '$.reason'), '') != 'stale-harness-exit'",
+         WHERE type = 'life' AND instance = ?1 AND id >= ?2 \
+           AND json_extract(data, '$.action') = 'stopped'",
     )?;
     let mut process_ids =
         stmt.query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<i64>>(2)?.map(|bits| bits as u64),
-                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                match r.get_ref(3)? { rusqlite::types::ValueRef::Null => None, rusqlite::types::ValueRef::Integer(bits) => Some(bits as u64), _ => None },
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?;
     let mut self_stop = false;
     for row in &mut process_ids {
-        let (event_id, process_id, snapshot_created_at_bits, snapshot) = row?;
-        let matches = match process_id {
-            Some(id) => token.binding_ids.contains(&id),
-            None => match snapshot_created_at_bits {
-                // Snapshot bits are an exact JSON integer representation of
-                // the f64 identity; decoding the fractional number can change
-                // its ULP. Bits are authoritative whenever present.
-                Some(bits) => bits == token.created_at.to_bits(),
-                // Mixed-version window: a stopped event written by a pre-v20
-                // binary carries only the legacy `created_at`. Match it on
-                // the exact bit pattern of its raw JSON token — the correctly
-                // rounded decode the backfill uses — so a missing bits field
-                // is never treated as a mismatch.
-                None => match snapshot.as_deref().and_then(crate::db::raw_created_at_bits) {
-                    Some(bits) => bits == token.created_at.to_bits(),
-                    // No incarnation to read: never guessed to be this one.
-                    // Logged, so the conservative report is explained.
-                    None => {
-                        crate::log::log_warn(
-                            "kill",
-                            "teardown.stop_event_unreadable",
-                            &format!(
-                                "instance={name} event={event_id} reason={}",
-                                if snapshot.is_some() {
-                                    "unreadable-created_at"
-                                } else {
-                                    "no-snapshot"
-                                }
-                            ),
-                        );
-                        false
-                    }
-                },
-            },
-        };
+
+        let (event_id, _by, process_id, snapshot_created_at_bits, snapshot_session_id, snapshot_agent_id, snapshot) = row?;
+        let bits = snapshot_created_at_bits.or_else(|| snapshot.as_deref().and_then(crate::db::raw_created_at_bits));
+        let identity_match = bits == Some(token.created_at.to_bits())
+            && snapshot_session_id.as_ref().is_none_or(|id| Some(id.as_str()) == token.session_id.as_deref())
+            && snapshot_agent_id.as_ref().is_none_or(|id| Some(id.as_str()) == token.agent_id.as_deref());
+        let binding_match = process_id.as_ref().is_some_and(|id| token.binding_ids.contains(id));
+        let matches = identity_match || binding_match;
+        if !matches {
+            crate::log::log_warn("kill", "teardown.stop_event_unreadable", &format!("instance={name} event={event_id}"));
+        }
         if matches {
             self_stop = true;
             break;
@@ -518,12 +504,9 @@ fn classify_lost_teardown(
     Ok(match current {
         None => TeardownOutcome::SessionStoppedReleasedRow,
         Some(current)
-            if current.created_at == token.created_at
+            if current.created_at.to_bits() == token.created_at.to_bits()
                 && current.session_id == token.session_id
-                && current
-                    .binding_ids
-                    .iter()
-                    .all(|id| token.binding_ids.contains(id)) =>
+                && current.agent_id == token.agent_id =>
         {
             TeardownOutcome::SessionStoppedKeptRow
         }
@@ -2665,6 +2648,121 @@ mod tests {
         let _ = _guard;
     }
 
+    fn kill_mid_daemon_sweep(
+        db_path: &std::path::Path,
+        name: &str,
+        event_bits: Option<serde_json::Value>,
+        replace: bool,
+    ) -> TeardownOutcome {
+        let db = crate::db::HcomDb::open_raw(db_path).unwrap();
+        db.init_db().unwrap();
+        let mut sleeper = seed_bound_row_with_sleeper(
+            &db, name, "proc-kill-vanished", "sess-kill-vanished",
+        );
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = 42 WHERE name = ?",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        let spid = sleeper.id();
+        let result = kill_tracked_instance_with_self_pids(
+            &db, name, "test", &[std::process::id()],
+            |n, b, e, capture| {
+                let out = crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture);
+                let snapshot = event_bits.map(|bits| serde_json::json!({ "created_at_bits": bits }));
+                db.log_life_event(n, "stopped", "daemon", "vanished", snapshot, Some("newest-binding")).unwrap();
+                db.delete_instance(n).unwrap();
+                if replace {
+                    db.conn().execute(
+                        "INSERT INTO instances (name, status, created_at, session_id) VALUES (?1, 'active', 1, 'replacement')",
+                        rusqlite::params![n],
+                    ).unwrap();
+                }
+                out
+            },
+        ).unwrap();
+        sleeper.wait().ok();
+        assert!(!crate::sys::process::is_alive(spid));
+        result.teardown
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reports_session_self_stop_when_vanished_sweep_deletes_row_mid_kill() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = kill_mid_daemon_sweep(
+            &dir.path().join("test.db"),
+            &format!("hcom-kill-{}-vanished", std::process::id()),
+            Some(serde_json::json!(42f64.to_bits() as i64)),
+            false,
+        );
+        assert_eq!(outcome, TeardownOutcome::SessionStoppedReleasedRow);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reports_re_registration_for_vanished_sweep_from_other_incarnation() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("hcom-kill-{}-vanished-other", std::process::id());
+        let outcome = kill_mid_daemon_sweep(
+            &dir.path().join("test.db"),
+            &name,
+            Some(serde_json::json!(1)),
+            true,
+        );
+        assert_eq!(outcome, TeardownOutcome::RowReRegistered);
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        assert!(db.get_instance_full(&name).unwrap().is_some(), "replacement row survives");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reports_pty_self_stop_between_snapshot_and_watermark() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        let name = format!("hcom-kill-{}-capture-gap", std::process::id());
+        let mut sleeper = seed_bound_row_with_sleeper(&db, &name, "proc-gap", "sess-gap");
+        *CAPTURE_GAP_HOOK.lock().unwrap() = Some(capture_gap_finalize);
+        fn capture_gap_finalize(db: &HcomDb, name: &str) {
+            let bits = db.get_instance_full(name).unwrap().unwrap().created_at.to_bits();
+            let snapshot = serde_json::json!({ "created_at_bits": bits as i64 });
+            db.log_life_event(name, "stopped", "pty", "killed", Some(snapshot), Some("proc-gap")).unwrap();
+            db.delete_instance(name).unwrap();
+        }
+        let result = kill_tracked_instance_with_self_pids(
+            &db, &name, "test", &[std::process::id()],
+            |n, b, e, capture| crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture),
+        ).unwrap();
+        sleeper.wait().ok();
+        assert_eq!(result.teardown, TeardownOutcome::SessionStoppedReleasedRow);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reports_re_registration_for_unreadable_vanished_sweep() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        for (index, value) in [None, Some(serde_json::Value::Null), Some(serde_json::json!("bad"))].into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let outcome = kill_mid_daemon_sweep(
+                &dir.path().join("test.db"),
+                &format!("hcom-kill-{}-vanished-unreadable-{index}", std::process::id()),
+                value,
+                false,
+            );
+            assert_eq!(outcome, TeardownOutcome::RowReRegistered);
+        }
+    }
+
     /// A PTY `stale-harness-exit` is a stale wrapper declining to touch a
     /// rebound row, never a self-stop — even when the row then vanishes and
     /// the event names a binding the kill resolved.
@@ -3058,7 +3156,7 @@ mod tests {
         .unwrap();
 
         let incarnation = ResolvedIncarnation {
-            token: IncarnationToken::new(CREATED_AT, None, vec![]),
+            token: IncarnationToken::new(CREATED_AT, None, None, vec![]),
             event_watermark: 0,
         };
         let outcome = db
@@ -3106,7 +3204,7 @@ mod tests {
 
         let classify = |against: f64, event_name: &str| {
             let incarnation = ResolvedIncarnation {
-                token: IncarnationToken::new(against, None, vec![]),
+                token: IncarnationToken::new(against, None, None, vec![]),
                 event_watermark: 0,
             };
             db.with_immediate_transaction(|tx| {
@@ -3187,7 +3285,7 @@ mod tests {
             .unwrap();
         let event_id = db.conn().last_insert_rowid();
         let incarnation = ResolvedIncarnation {
-            token: IncarnationToken::new(LEGACY_CREATED_AT, None, vec![]),
+            token: IncarnationToken::new(LEGACY_CREATED_AT, None, None, vec![]),
             event_watermark: 0,
         };
         let outcome = db

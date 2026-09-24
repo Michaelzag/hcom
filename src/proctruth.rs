@@ -1484,13 +1484,17 @@ const SWEEP_FRESH_GRACE_SECS: i64 = 60;
 /// rows.
 /// Returns swept names.
 pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
-    let instances = match db.iter_instances_full() {
+    // Row and its whole binding epoch come from ONE read transaction: a
+    // `start --as` replacement deletes and recreates row and bindings in
+    // separate commits, so separate reads can pair one incarnation's row
+    // with another's bindings.
+    let instances = match db.iter_instances_with_bindings() {
         Ok(rows) => rows,
         Err(_) => return Vec::new(),
     };
     let now = crate::shared::time::now_epoch_f64() as i64;
     let mut swept = Vec::new();
-    for inst in &instances {
+    for (inst, binding_ids) in &instances {
         // An empty-string origin is local (same convention as start rebind
         // and stop display): only a non-empty device id marks a remote row.
         if inst
@@ -1521,8 +1525,6 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         if inst.last_seen > 0 && now - inst.last_seen < SWEEP_FRESH_GRACE_SECS {
             continue;
         }
-        let newest = db.newest_process_binding(&inst.name).unwrap_or(None);
-        let binding_ids = db.process_binding_ids(&inst.name).unwrap_or_default();
         // Positive-evidence pids: the recorded snapshot pid plus every shell
         // pid parsed from a shell-shaped binding. Unparseable bindings (UUID
         // harness ids, empty, malformed) contribute nothing — they are not
@@ -1590,7 +1592,10 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             }
             snapshot
         });
-        let process_id = newest.as_ref().map(|(p, _)| p.as_str());
+        // Newest binding from the captured set: it is ordered newest-first
+        // (process_bindings.updated_at DESC), the same ordering the old
+        // `newest_process_binding` query used, so no second read.
+        let process_id = binding_ids.first().map(String::as_str);
         let data = serde_json::json!({
             "action": "stopped",
             "by": "daemon",
@@ -1606,6 +1611,7 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             inst.agent_id.as_deref(),
             &data,
             process_id,
+            &binding_ids,
         ) {
             Ok(true) => {
                 crate::log::log_info(
@@ -2456,6 +2462,7 @@ mod tests {
                 None,
                 &data,
                 Some("proc-old"),
+                &["proc-current".to_string()],
             )
             .unwrap();
         assert!(!won, "stale process_id must not win the release");
@@ -2506,6 +2513,7 @@ mod tests {
                 None,
                 &data,
                 Some("proc-current"),
+                &["proc-current".to_string()],
             )
             .unwrap();
         assert!(won, "current process_id releases the row");
@@ -2549,6 +2557,62 @@ mod tests {
         assert_eq!(
             event.get("reason").and_then(|v| v.as_str()),
             Some("vanished")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_release_refuses_when_a_new_binding_lands_after_the_read() {
+        // The window the one-snapshot route closes: the sweep captures the
+        // row and its binding epoch in one read, then a replacement process
+        // registers a new binding under the same name before the write.
+        // The row's own identity (created_at/session/agent) is unchanged, so
+        // the delete CAS cannot see the swap — only the binding set can.
+        let db = test_db();
+        let name = unique_name("rebind");
+        insert_row(&db, &name, "active", Some(dead_pid()));
+        db.set_process_binding("proc-old", "sess-old", &name).unwrap();
+
+        // The sweep's single captured read.
+        let (row, binding_ids) = db
+            .iter_instances_with_bindings()
+            .unwrap()
+            .into_iter()
+            .find(|(row, _)| row.name == name)
+            .expect("captured row + bindings");
+        assert_eq!(binding_ids, vec!["proc-old".to_string()]);
+
+        // The replacement lands in that window.
+        db.set_process_binding("proc-new", "sess-new", &name).unwrap();
+
+        let process_id = binding_ids.first().map(String::as_str);
+        let data = serde_json::json!({
+            "action": "stopped", "by": "daemon", "reason": "vanished",
+            "process_id": process_id, "snapshot": null,
+        });
+        let won = db
+            .finalize_instance_stop(
+                &name,
+                row.created_at,
+                row.pid,
+                row.session_id.as_deref(),
+                row.agent_id.as_deref(),
+                &data,
+                process_id,
+                &binding_ids,
+            )
+            .unwrap();
+
+        assert!(!won, "a re-bound incarnation must not be released");
+        assert!(
+            db.get_instance_full(&name).unwrap().is_some(),
+            "replacement row was deleted by the stale read"
+        );
+        let current = db.process_binding_ids(&name).unwrap();
+        assert_eq!(
+            current,
+            vec!["proc-new".to_string(), "proc-old".to_string()],
+            "process bindings were deleted by the stale read"
         );
     }
 

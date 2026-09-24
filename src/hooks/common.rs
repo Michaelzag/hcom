@@ -1422,11 +1422,15 @@ pub(crate) fn skipped_stop_line(display: &str) -> String {
     format!("{display} skipped: {}", StopError::re_registered())
 }
 
+/// Stop a stale launch placeholder bound to `capture`: the incarnation the
+/// cleanup read (row plus binding epoch, one snapshot). A rebind after that
+/// read is another incarnation and is left intact.
 pub(crate) fn stop_placeholder_instance(
     db: &HcomDb,
     instance_name: &str,
     initiated_by: &str,
     reason: &str,
+    capture: crate::proctruth::ReapCapture,
 ) -> StopOutcome {
     stop_instance_inner(
         db,
@@ -1437,7 +1441,7 @@ pub(crate) fn stop_placeholder_instance(
         0,
         true,
         &[],
-        None,
+        Some(capture),
     )
 }
 
@@ -1562,8 +1566,7 @@ fn row_re_registered(
     let current = stmt
         .query_map(params![name], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok((current.is_empty() && !bound_bindings.is_empty())
-        || current.iter().any(|id| !bound_bindings.contains(id)))
+    Ok(current.iter().any(|id| !bound_bindings.contains(id)))
 }
 
 /// The guard's refusal: nothing was signalled or written for the new row.
@@ -2022,6 +2025,10 @@ fn stop_instance_inner_scoped(
             instance_data.agent_id.as_deref(),
         ),
     };
+    let expected_binding_ids: &[String] = match &bound {
+        BoundIncarnation::Captured(Some(captured)) => &captured.binding_ids,
+        _ => &[],
+    };
     // `None`: the row is another incarnation now, so nothing was written.
     let finalized: Result<Option<bool>> = match tx {
         Some(tx) => match row_re_registered(tx, instance_name, &instance_data, &bound) {
@@ -2036,6 +2043,7 @@ fn stop_instance_inner_scoped(
                     agent_id,
                     &event_data,
                     expected_process_id.as_deref(),
+                    expected_binding_ids,
                 )
                 .map(|(won, event_id)| {
                     if let Some(event_id) = event_id {
@@ -2061,6 +2069,7 @@ fn stop_instance_inner_scoped(
                     agent_id,
                     &event_data,
                     expected_process_id.as_deref(),
+                    expected_binding_ids,
                 )
                 .map(Some)
             })
@@ -3559,6 +3568,7 @@ mod tests {
                 old.agent_id.as_deref(),
                 &event,
                 None,
+                &[],
             )
             .unwrap();
         assert!(!won, "the stale row incarnation must lose its delete CAS");

@@ -2583,18 +2583,52 @@ pub fn run_delivery_loop(
     }
 }
 
+/// What the exiting process's own binding is owed after
+/// [`cleanup_deleted_instance`].
+pub(crate) enum ExitBinding {
+    /// Nothing more: released with the row in the release transaction, or
+    /// left alone because the row is another incarnation now (or the read
+    /// failed and authorizes nothing).
+    Settled,
+    /// A stale harness under a rebound name: its own binding is not the
+    /// live one and goes, as it always has.
+    Stale,
+    /// The row was already gone at the read: the binding goes only while
+    /// no row holds the name.
+    RowGone,
+}
+
 /// Hard PTY exit cleanup: inactive status, life event, delete instance row.
 ///
-/// The delete is keyed to this exiting process incarnation: when the row's
-/// current binding no longer names `process_id` (the name was resumed and
-/// rebound while this harness was dying), the row is left untouched and a
-/// `stale-harness-exit` is logged instead of deleting the live session.
-pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str, process_id: &str) {
+/// The row and its process bindings are read in ONE snapshot. A stale
+/// harness exiting under a resumed (rebound) name — the newest binding no
+/// longer names `process_id` — leaves the row untouched and logs a
+/// `stale-harness-exit` instead. Otherwise every write (status, endpoints,
+/// subscriptions, the `stopped` event, the row delete, and the release of
+/// this process's binding) runs in one `BEGIN IMMEDIATE` transaction gated
+/// on the incarnation that snapshot read ([`exit_incarnation_holds`]): a
+/// replacement that lands after the read is never written to or deleted.
+pub(crate) fn cleanup_deleted_instance(
+    db: &mut HcomDb,
+    current_name: &str,
+    process_id: &str,
+) -> ExitBinding {
+    let (row, binding_ids) = match db.get_instance_with_bindings(current_name) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            log_error(
+                "native",
+                "delivery.cleanup",
+                &format!("DB error reading instance snapshot: {}", e),
+            );
+            return ExitBinding::Settled;
+        }
+    };
     // Gate on the current binding: a stale harness exiting under a resumed
     // (rebound) name must not delete the live row. No binding row at all
     // means the release path already cleared it — this exit owns the name.
     if !process_id.is_empty()
-        && let Ok(Some((bound, _))) = db.newest_process_binding(current_name)
+        && let Some(bound) = binding_ids.first()
         && bound != process_id
     {
         log_info(
@@ -2617,51 +2651,26 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str, proc
                 &format!("Failed to log life event: {}", e),
             );
         }
-        return;
+        return ExitBinding::Stale;
     }
-    let snapshot = match db.get_instance_snapshot(current_name) {
-        Ok(Some(snap)) => Some(snap),
-        Ok(None) => {
-            log_info(
-                "native",
-                "delivery.cleanup_skipped",
-                &format!(
-                    "Skipping PTY stop event for {} because the instance row is already gone",
-                    current_name
-                ),
-            );
-            return;
-        }
-        Err(e) => {
-            log_error(
-                "native",
-                "delivery.cleanup",
-                &format!("DB error getting instance snapshot: {}", e),
-            );
-            None
-        }
+    let Some(row) = row else {
+        log_info(
+            "native",
+            "delivery.cleanup_skipped",
+            &format!(
+                "Skipping PTY stop event for {} because the instance row is already gone",
+                current_name
+            ),
+        );
+        return ExitBinding::RowGone;
     };
-    let snapshot = snapshot.map(|mut snapshot| {
-        if let Some(created_at) = snapshot
-            .get("created_at")
-            .and_then(serde_json::Value::as_f64)
-            && let Some(object) = snapshot.as_object_mut()
-        {
-            object.insert(
-                "created_at_bits".to_string(),
-                serde_json::json!(created_at.to_bits()),
-            );
-        }
-        snapshot
-    });
-    // A launch can publish its pid or replace this row after the snapshot.
-    // Key the final delete to the observed incarnation, including a NULL pid;
-    // a failed snapshot read cannot authorize deletion.
-    let delete_key = snapshot.as_ref().and_then(|snapshot| {
-        snapshot["created_at"]
-            .as_f64()
-            .map(|created_at| (created_at, snapshot["pid"].as_i64()))
-    });
+    let incarnation = crate::proctruth::CapturedIncarnation {
+        created_at: row.created_at,
+        pid: row.pid,
+        session_id: row.session_id,
+        agent_id: row.agent_id,
+        binding_ids,
+    };
 
     let was_killed = EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
     let (exit_context, exit_reason) = if was_killed {
@@ -2669,51 +2678,130 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str, proc
     } else {
         ("exit:closed", "closed")
     };
-    if let Err(e) = db.set_status(current_name, "inactive", exit_context) {
-        log_warn(
-            "native",
-            "delivery.set_status_fail",
-            &format!("Failed to set inactive status: {}", e),
-        );
-    }
-
-    if let Err(e) = db.delete_notify_endpoints(current_name) {
-        log_warn(
-            "native",
-            "delivery.cleanup_endpoints_fail",
-            &format!("{}", e),
-        );
-    }
-    if let Err(e) = db.cleanup_subscriptions(current_name) {
-        log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
-    }
     let event_process_id = if process_id.is_empty() {
         None
     } else {
         Some(process_id)
     };
-    if let Err(e) = db.log_life_event(
-        current_name,
-        "stopped",
-        "pty",
-        exit_reason,
-        snapshot,
-        event_process_id,
-    ) {
-        log_warn(
+    let released = db.with_immediate_transaction(|tx| {
+        if !exit_incarnation_holds(tx, current_name, &incarnation)? {
+            return Ok(false);
+        }
+        let snapshot = db.get_instance_snapshot(current_name)?.map(|mut snapshot| {
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert(
+                    "created_at_bits".to_string(),
+                    serde_json::json!(incarnation.created_at.to_bits()),
+                );
+            }
+            snapshot
+        });
+        if let Err(e) = db.set_status(current_name, "inactive", exit_context) {
+            log_warn(
+                "native",
+                "delivery.set_status_fail",
+                &format!("Failed to set inactive status: {}", e),
+            );
+        }
+        if let Err(e) = db.delete_notify_endpoints(current_name) {
+            log_warn(
+                "native",
+                "delivery.cleanup_endpoints_fail",
+                &format!("{}", e),
+            );
+        }
+        if let Err(e) = db.cleanup_subscriptions(current_name) {
+            log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
+        }
+        if let Err(e) = db.log_life_event(
+            current_name,
+            "stopped",
+            "pty",
+            exit_reason,
+            snapshot,
+            event_process_id,
+        ) {
+            log_warn(
+                "native",
+                "delivery.life_event_fail",
+                &format!("Failed to log life event: {}", e),
+            );
+        }
+        // Re-checked after the writes above: anything they set off (a launch
+        // publishing its pid, a replacement row or rebind) keeps the row.
+        if !exit_incarnation_holds(tx, current_name, &incarnation)? {
+            return Ok(false);
+        }
+        let deleted = tx.execute(
+            "DELETE FROM instances WHERE name = ?1 AND created_at = ?2 AND pid IS ?3 \
+             AND session_id IS ?4 AND agent_id IS ?5",
+            rusqlite::params![
+                current_name,
+                incarnation.created_at,
+                incarnation.pid,
+                incarnation.session_id,
+                incarnation.agent_id,
+            ],
+        )?;
+        if deleted == 1 && incarnation.binding_ids.iter().any(|id| id == process_id) {
+            tx.execute(
+                "DELETE FROM process_bindings WHERE process_id = ?1 AND instance_name = ?2",
+                rusqlite::params![process_id, current_name],
+            )?;
+        }
+        Ok(deleted == 1)
+    });
+    match released {
+        Ok(true) => {}
+        Ok(false) => log_info(
             "native",
-            "delivery.life_event_fail",
-            &format!("Failed to log life event: {}", e),
-        );
+            "delivery.cleanup_re_registered",
+            &format!(
+                "{current_name} is another incarnation than this exit read; row and bindings untouched"
+            ),
+        ),
+        Err(e) => eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}"),
     }
-    if let Some((created_at, pid)) = delete_key
-        && let Err(e) = db.conn().execute(
-            "DELETE FROM instances WHERE name = ? AND created_at = ? AND pid IS ?",
-            rusqlite::params![current_name, created_at, pid],
+    ExitBinding::Settled
+}
+
+/// Whether `name`'s row is still exactly the incarnation this exit read:
+/// the same `created_at` bits, `pid`, `session_id`, and `agent_id`, and a
+/// binding epoch that only shrank. Any binding the read never saw, or an
+/// emptied set where the read saw bindings, is a rebind (the same binding
+/// rule as the stop path's captured-incarnation guard). An absent row is
+/// not this incarnation either. Read through `tx` so it decides with the
+/// writes it gates.
+fn exit_incarnation_holds(
+    tx: &rusqlite::Transaction<'_>,
+    name: &str,
+    incarnation: &crate::proctruth::CapturedIncarnation,
+) -> anyhow::Result<bool> {
+    use rusqlite::OptionalExtension;
+    type Identity = (f64, Option<i64>, Option<String>, Option<String>);
+    let current: Option<Identity> = tx
+        .query_row(
+            "SELECT created_at, pid, session_id, agent_id FROM instances WHERE name = ?1",
+            rusqlite::params![name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
+        .optional()?;
+    let Some((created_at, pid, session_id, agent_id)) = current else {
+        return Ok(false);
+    };
+    if created_at.to_bits() != incarnation.created_at.to_bits()
+        || pid != incarnation.pid
+        || session_id != incarnation.session_id
+        || agent_id != incarnation.agent_id
     {
-        eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
+        return Ok(false);
     }
+    let bindings = tx
+        .prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?1")?
+        .query_map(rusqlite::params![name], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(!(bindings.is_empty() && !incarnation.binding_ids.is_empty())
+        && bindings.iter().all(|id| incarnation.binding_ids.contains(id)))
 }
 
 /// Log why PTY exit cleanup was skipped when this thread no longer owns the instance.
@@ -2735,21 +2823,40 @@ pub(crate) fn log_pty_cleanup_skipped(db: &HcomDb, current_name: &str) {
     );
 }
 
+/// PTY exit cleanup for tools with no soft stop. The owned release keys the
+/// binding delete to the incarnation it read (see [`ExitBinding`]); a stale
+/// or unowned exit releases only this process's own binding.
 fn cleanup_pty_exit_default(
     db: &mut HcomDb,
     current_name: &str,
     process_id: &str,
     owns_instance: bool,
 ) {
-    if owns_instance {
-        cleanup_deleted_instance(db, current_name, process_id);
+    let binding = if owns_instance {
+        cleanup_deleted_instance(db, current_name, process_id)
     } else {
         log_pty_cleanup_skipped(db, current_name);
+        ExitBinding::Stale
+    };
+    if process_id.is_empty() {
+        return;
     }
-
-    if !process_id.is_empty()
-        && let Err(e) = db.delete_process_binding(process_id)
-    {
+    let released = match binding {
+        ExitBinding::Settled => return,
+        ExitBinding::Stale => db.delete_process_binding(process_id),
+        // The row this exit read was absent: release the binding only while
+        // it still is, never under a replacement row of the same name.
+        ExitBinding::RowGone => db
+            .conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE process_id = ?1 \
+                 AND NOT EXISTS (SELECT 1 FROM instances WHERE name = ?2)",
+                rusqlite::params![process_id, current_name],
+            )
+            .map(|_| ())
+            .map_err(Into::into),
+    };
+    if let Err(e) = released {
         log_warn("native", "delivery.cleanup_binding_fail", &format!("{}", e));
     }
 }
@@ -2921,6 +3028,51 @@ mod tests {
                 "the PTY event names the old snapshot"
             );
         }
+    }
+
+    /// A replacement incarnation of the same name landing between the PTY
+    /// exit's read and its release — here re-binding the exiting process id,
+    /// as a resume in the same harness does — keeps its row AND its binding.
+    #[test]
+    fn pty_exit_release_spares_replacement_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at, session_id)
+                 VALUES ('buli', 'pi', 'active', 1, 'sess-old')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("proc-exit", "sess-old", "buli")
+            .unwrap();
+        // The replacement lands after the exit read its snapshot, at the
+        // last write before the release.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER replace_during_exit AFTER INSERT ON events
+                 WHEN NEW.type = 'life' AND json_extract(NEW.data, '$.action') = 'stopped'
+                 BEGIN
+                   DELETE FROM instances WHERE name = 'buli';
+                   INSERT INTO instances (name, tool, status, created_at, session_id)
+                     VALUES ('buli', 'pi', 'active', 2, 'sess-new');
+                   INSERT OR REPLACE INTO process_bindings
+                     (process_id, session_id, instance_name, updated_at)
+                     VALUES ('proc-exit', 'sess-new', 'buli', 99);
+                 END;",
+            )
+            .unwrap();
+
+        cleanup_pty_exit_default(&mut db, "buli", "proc-exit", true);
+
+        let row = db
+            .get_instance_full("buli")
+            .unwrap()
+            .expect("replacement row retained");
+        assert_eq!(row.created_at, 2.0);
+        assert_eq!(row.session_id.as_deref(), Some("sess-new"));
+        assert_eq!(db.process_binding_ids("buli").unwrap(), vec!["proc-exit"]);
     }
 
     #[test]
