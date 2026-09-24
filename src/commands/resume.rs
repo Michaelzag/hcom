@@ -478,43 +478,18 @@ fn prepare_resume_plan_from_source(
         Some(tag.clone())
     };
 
-    if tool == "omp" && !is_adoption {
-        let hcom_config = load_hcom_config();
-        let inside_ai_tool = crate::shared::HcomContext::from_os().is_inside_ai_tool();
-        let terminal_mode = launch_flags
-            .terminal
-            .as_deref()
-            .or(Some(hcom_config.terminal.as_str()).filter(|t| !t.is_empty()));
-        let run_here = crate::launcher::will_run_in_current_terminal(
-            1,
-            background,
-            launch_flags.run_here,
-            terminal_mode,
-            inside_ai_tool,
-        );
-        let mut env = crate::launcher::build_launch_env(
-            &hcom_config,
-            crate::launcher::launch_env_regime(run_here, inside_ai_tool),
-        );
-        crate::launcher::apply_tool_config_dir_to_env(&crate::launcher::LaunchTool::Omp, &mut env);
-        ensure_omp_session_file_in_env(
-            &session_id,
-            &snapshot_transcript_path,
-            &env,
-            std::path::Path::new(&snapshot_dir),
-        )?;
-    }
-
     // - Explicit --dir flag wins (validated and canonicalized)
     // - For fork (tracked instance): use current directory (start fresh in new context)
     // - Otherwise: use snapshot/transcript directory, falling back to current
-    // omp refuses a cwd under /tmp: explicit --dir there is refused, a
-    // snapshot dir there is redirected to /build/<seat>/tmp.
+    // omp refuses a cwd under /tmp: explicit --dir there is refused up front
+    // (it's the user's own input); a snapshot dir there is redirected to
+    // /build/<seat>/tmp, created only after the session file check passes.
     let omp_guard = matches!(
         crate::launcher::LaunchTool::from_str(&tool),
         Ok(crate::launcher::LaunchTool::Omp)
     );
     let seat = (!is_adoption).then_some(display_name.as_str());
+    let mut redirected_from: Option<&str> = None;
     let effective_cwd = if let Some(ref dir) = dir_override {
         let path = std::path::Path::new(dir);
         if !path.is_dir() {
@@ -534,16 +509,15 @@ fn prepare_resume_plan_from_source(
             .unwrap_or_else(|_| ".".to_string())
     } else if !snapshot_dir.is_empty() && std::path::Path::new(&snapshot_dir).is_dir() {
         if omp_guard {
-            let guarded = crate::shared::launch_dir::guard_launch_dir(&snapshot_dir, seat, false)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            if guarded != snapshot_dir {
-                eprintln!(
-                    "Warning: original directory '{}' is under /tmp, where omp refuses to start; \
-                     resuming in '{}' instead",
-                    snapshot_dir, guarded
-                );
+            match crate::shared::launch_dir::plan_launch_dir(&snapshot_dir, seat, false)
+                .map_err(|e| anyhow::anyhow!(e))?
+            {
+                Some(target) => {
+                    redirected_from = Some(snapshot_dir.as_str());
+                    target.to_string_lossy().into_owned()
+                }
+                None => snapshot_dir.clone(),
             }
-            guarded
         } else {
             snapshot_dir.clone()
         }
@@ -587,6 +561,19 @@ fn prepare_resume_plan_from_source(
             &env,
             std::path::Path::new(&effective_cwd),
         )?;
+    }
+
+    if let Some(original) = redirected_from {
+        crate::shared::launch_dir::create_redirect_dir(
+            original,
+            std::path::Path::new(&effective_cwd),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!(
+            "Warning: original directory '{}' is under /tmp, where omp refuses to start; \
+             resuming in '{}' instead",
+            original, effective_cwd
+        );
     }
 
     // Merge with original launch args (only applicable for tracked instances).
@@ -4375,7 +4362,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_omp_resume_missing_session_file_refuses() {
-        with_omp_home(|_| {
+        with_omp_home(|home| {
             let db = test_db();
             seed_omp_stopped_snapshot(
                 &db,
@@ -4410,6 +4397,8 @@ mod tests {
                 err.starts_with(&format!("session file not found: {OMP_MISSING_SID}")),
                 "unexpected error: {err}"
             );
+            // The session check runs before the /tmp redirect is created.
+            assert!(!home.join("build").join("mira").exists());
         });
     }
 
@@ -4417,7 +4406,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_omp_resume_session_file_present_succeeds() {
-        with_omp_home(|_| {
+        with_omp_home(|home| {
             write_omp_session_file(&format!("{OMP_MISSING_SID}.jsonl"));
             let db = test_db();
             seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, "");
@@ -4429,6 +4418,36 @@ mod tests {
                 plan.launch.args.contains(&OMP_MISSING_SID.to_string()),
                 "plan must carry --resume <sid>, got: {:?}",
                 plan.launch.args
+            );
+            // Snapshot dir is /tmp: the plan redirects to <build_root>/<seat>/tmp.
+            let redirect = home.join("build").join("mira").join("tmp");
+            assert_eq!(
+                plan.launch.cwd.as_deref(),
+                Some(redirect.to_string_lossy().as_ref())
+            );
+            assert!(redirect.is_dir());
+        });
+    }
+
+    /// A relative PI_CODING_AGENT_DIR resolves against the redirected cwd,
+    /// not the /tmp snapshot dir, so the session file is looked up there.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_omp_resume_relative_agent_dir_resolves_against_redirect() {
+        with_omp_home(|home| {
+            unsafe { std::env::set_var("PI_CODING_AGENT_DIR", "rel-agent") };
+            let redirect = home.join("build").join("mira").join("tmp");
+            let project = redirect.join("rel-agent").join("sessions").join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join(format!("{OMP_MISSING_SID}.jsonl")), "{}").unwrap();
+            let db = test_db();
+            seed_omp_stopped_snapshot(&db, "mira", OMP_MISSING_SID, "");
+            let plan =
+                prepare_resume_plan(&db, "mira", false, &[], &GlobalFlags::default()).unwrap();
+            assert_eq!(
+                plan.launch.cwd.as_deref(),
+                Some(redirect.to_string_lossy().as_ref())
             );
         });
     }

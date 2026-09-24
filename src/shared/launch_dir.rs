@@ -7,14 +7,17 @@
 
 use std::path::{Component, Path, PathBuf};
 
-const DEFAULT_BUILD_ROOT: &str = "/build";
+const BUILD_ROOT: &str = "/build";
 
-fn build_root() -> std::borrow::Cow<'static, str> {
-    std::env::var("HCOM_BUILD_ROOT")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(std::borrow::Cow::Owned)
-        .unwrap_or(std::borrow::Cow::Borrowed(DEFAULT_BUILD_ROOT))
+/// `/build`, or `HCOM_BUILD_ROOT` in unit tests so the redirect stays inside
+/// a tempdir. Production has no override: a configurable root could point
+/// back under `/tmp` and defeat the guard.
+fn build_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("HCOM_BUILD_ROOT").filter(|v| !v.is_empty()) {
+        return PathBuf::from(root);
+    }
+    PathBuf::from(BUILD_ROOT)
 }
 
 /// Check `dir` against the omp `/tmp` start guard.
@@ -23,8 +26,29 @@ fn build_root() -> std::borrow::Cow<'static, str> {
 /// (user-supplied `--dir`) is refused with a message naming the guard;
 /// otherwise `/build/<seat>/tmp` is created and returned instead.
 pub fn guard_launch_dir(dir: &str, seat: Option<&str>, explicit: bool) -> Result<String, String> {
-    let build_root = build_root();
-    guard_launch_dir_in(dir, seat, explicit, Path::new(build_root.as_ref()))
+    guard_launch_dir_in(dir, seat, explicit, &build_root())
+}
+
+/// [`guard_launch_dir`] without the side effect: `Ok(None)` for a dir outside
+/// `/tmp`, `Ok(Some(target))` for an inherited dir to redirect (not yet
+/// created; see [`create_redirect_dir`]), `Err` for an explicit one.
+pub fn plan_launch_dir(
+    dir: &str,
+    seat: Option<&str>,
+    explicit: bool,
+) -> Result<Option<PathBuf>, String> {
+    plan_launch_dir_in(dir, seat, explicit, &build_root())
+}
+
+/// Create the redirect `target` chosen by [`plan_launch_dir`] for `dir`.
+pub fn create_redirect_dir(dir: &str, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target).map_err(|e| {
+        format!(
+            "directory {dir} is under /tmp (omp /tmp start guard) and the redirect \
+             target {} could not be created: {e}",
+            target.display()
+        )
+    })
 }
 
 fn guard_launch_dir_in(
@@ -33,8 +57,23 @@ fn guard_launch_dir_in(
     explicit: bool,
     build_root: &Path,
 ) -> Result<String, String> {
+    match plan_launch_dir_in(dir, seat, explicit, build_root)? {
+        None => Ok(dir.to_string()),
+        Some(target) => {
+            create_redirect_dir(dir, &target)?;
+            Ok(target.to_string_lossy().into_owned())
+        }
+    }
+}
+
+fn plan_launch_dir_in(
+    dir: &str,
+    seat: Option<&str>,
+    explicit: bool,
+    build_root: &Path,
+) -> Result<Option<PathBuf>, String> {
     if !is_under_tmp(Path::new(dir)) {
-        return Ok(dir.to_string());
+        return Ok(None);
     }
     let target = redirect_target(build_root, seat);
     if explicit {
@@ -44,14 +83,7 @@ fn guard_launch_dir_in(
             target.display()
         ));
     }
-    std::fs::create_dir_all(&target).map_err(|e| {
-        format!(
-            "directory {dir} is under /tmp (omp /tmp start guard) and the redirect \
-             target {} could not be created: {e}",
-            target.display()
-        )
-    })?;
-    Ok(target.to_string_lossy().into_owned())
+    Ok(Some(target))
 }
 
 /// `<build_root>/<seat>/tmp`, or `<build_root>/tmp` when the seat is missing
