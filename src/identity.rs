@@ -46,29 +46,34 @@ pub fn base_name_error(name: &str) -> String {
     )
 }
 
-/// Generate actionable error message for instance not found.
-///
-/// For subagent agent_ids, don't suggest `--as` (causes process binding conflicts).
-pub fn instance_not_found_error(name: &str) -> String {
-    if looks_like_agent_id(name) {
-        return format!(
-            "Instance '{name}' not found. Your session may have ended. Stop working and end your turn."
-        );
-    }
-    format!("Instance '{name}' not found. Run 'hcom start --as {name}' to reclaim your identity.")
+/// Whether `name` ever existed as an identity: any `life` event names it.
+pub fn has_life_history(db: &HcomDb, name: &str) -> bool {
+    db.conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE type = 'life' AND instance = ?)",
+            [name],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
 }
 
-/// Like `instance_not_found_error`, but suppresses the `--as` prescription when
-/// the missing name corresponds to a subagent slot. Subagents share their
-/// parent's session_id, so `hcom start --as <subagent_name>` from inside a
-/// subagent bash context rebinds the parent's identity — the prescription
-/// itself is the bug trigger. This variant consults live+historical state via
-/// `HcomDb::was_subagent_name` and returns the same "session may have ended"
-/// text used for raw agent_ids instead.
+/// Actionable error message for an instance that is not found.
+///
+/// Prescribes `hcom start --as <name>` only for a name that existed (has life
+/// history) and was a top-level identity. A subagent slot, raw agent_id or
+/// UUID gets "session may have ended": subagents share their parent's
+/// session_id, so `--as <subagent_name>` from a subagent bash rebinds the
+/// parent's identity. A never-seen name gets the external-sender form: `--as`
+/// from a process holding another identity would rename that identity away.
 pub fn instance_not_found_error_for(db: &HcomDb, name: &str) -> String {
     if looks_like_agent_id(name) || looks_like_uuid(name) || db.was_subagent_name(name) {
         return format!(
             "Instance '{name}' not found. Your session may have ended. Stop working and end your turn."
+        );
+    }
+    if !has_life_history(db, name) {
+        return format!(
+            "Instance '{name}' not found; it has never been an hcom identity. If '{name}' is an external sender (cron/script/manual alert), use 'hcom send --from {name} ...'."
         );
     }
     format!("Instance '{name}' not found. Run 'hcom start --as {name}' to reclaim your identity.")
@@ -608,13 +613,23 @@ mod tests {
     }
 
     #[test]
-    fn test_instance_not_found_error() {
-        // Normal name: suggest --as
-        let err = instance_not_found_error("luna");
-        assert!(err.contains("--as luna"));
+    fn test_instance_not_found_error_for() {
+        let (db, _dir) = make_test_db();
+
+        // Never-seen name: no `start --as` (it would rename the caller's
+        // identity away); point an external sender at --from instead.
+        let err = instance_not_found_error_for(&db, "fill_alarm");
+        assert!(!err.contains("--as"), "{err}");
+        assert!(err.contains("send --from fill_alarm"), "{err}");
+
+        // A name that existed: reclaim with --as.
+        db.log_life_event("luna", "stopped", "test", "exit", None, None)
+            .unwrap();
+        let err = instance_not_found_error_for(&db, "luna");
+        assert!(err.contains("start --as luna"), "{err}");
 
         // Agent ID: don't suggest --as
-        let err = instance_not_found_error("a6d9caf");
+        let err = instance_not_found_error_for(&db, "a6d9caf");
         assert!(err.contains("Stop working"));
         assert!(!err.contains("--as"));
     }
