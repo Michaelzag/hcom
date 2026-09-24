@@ -2539,6 +2539,7 @@ fn build_adopt_plan(
 mod tests {
     use super::*;
     use crate::db::HcomDb;
+    #[test]
     fn omp_reroot_flag_only_arms_for_resume() {
         let existing = tempfile::tempdir().unwrap();
         let gone = existing.path().join("gone");
