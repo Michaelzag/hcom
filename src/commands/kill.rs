@@ -2647,6 +2647,61 @@ mod tests {
         let _ = _guard;
     }
 
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_recognizes_bindingless_pty_stop_for_resolved_incarnation() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = format!("hcom-kill-{}-bindingless-stop", std::process::id());
+        let mut sleeper = seed_bound_row_with_sleeper(
+            &db,
+            &name,
+            "proc-bindingless-stop",
+            "sess-bindingless-stop",
+        );
+        // An exact timestamp isolates the bindingless ownership branch from
+        // the separately tracked snapshot JSON float-precision issue.
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = 42 WHERE name = ?",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            &name,
+            "test",
+            &[std::process::id()],
+            |n, bindings, excluded, capture| {
+                crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, bindings, excluded, capture,
+                )?;
+                let snapshot = db.get_instance_snapshot(n).unwrap();
+                db.log_life_event(n, "stopped", "pty", "killed", snapshot, None)
+                    .unwrap();
+                db.delete_instance(n).unwrap();
+                Ok(())
+            },
+        );
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+        assert_eq!(
+            result.unwrap().teardown,
+            TeardownOutcome::SessionStoppedReleasedRow
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert_killed_by(&db, &name, "pty");
+    }
+
     /// A bindingless re-incarnation finalizing mid-kill is a re-registration,
     /// not this session's self-stop: a null-process_id stopped event is only
     /// trusted when its snapshot carries the RESOLVED incarnation's
