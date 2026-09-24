@@ -861,7 +861,8 @@ pub fn initialize_instance_in_position_file(
                     );
                     true
                 }
-                _ => true,
+                Ok(false) => true,
+                Err(_) => false,
             }
         }
         Err(_) => false,
