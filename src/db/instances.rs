@@ -420,12 +420,17 @@ impl HcomDb {
     /// the live session's row). `None`/empty skips the check (no bindings
     /// to contradict, e.g. binding-less rows).
     ///
+    /// `expected_pid` is the caller's entry-read pid. A concurrent launch
+    /// persisting a different pid refuses the release before any event write.
+    ///
     /// The instance delete is the ownership CAS. Cleanup and event insertion
     /// share its transaction, so an error restores the row for a later retry.
+    #[allow(clippy::too_many_arguments)]
     pub fn finalize_instance_stop(
         &self,
         name: &str,
         created_at: f64,
+        expected_pid: Option<i64>,
         session_id: Option<&str>,
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
@@ -436,6 +441,7 @@ impl HcomDb {
                 tx,
                 name,
                 created_at,
+                expected_pid,
                 session_id,
                 agent_id,
                 event_data,
@@ -464,11 +470,24 @@ impl HcomDb {
         tx: &rusqlite::Transaction<'_>,
         name: &str,
         created_at: f64,
+        expected_pid: Option<i64>,
         session_id: Option<&str>,
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
         expected_process_id: Option<&str>,
     ) -> Result<(bool, Option<i64>)> {
+        // The same write transaction guards both this read and the delete:
+        // a pre-registered launch must not lose its row after spawning.
+        let current_pid: Option<Option<i64>> = tx
+            .query_row(
+                "SELECT pid FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_pid.is_some_and(|pid| pid != expected_pid) {
+            anyhow::bail!("a launch persisted its pid mid-stop; row left intact");
+        }
         let timestamp = chrono_now_iso();
         let data = serde_json::to_string(event_data)?;
         let mut event_id = None;
@@ -818,6 +837,65 @@ impl HcomDb {
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// `name`'s row and its process binding ids (newest first), read in ONE
+    /// snapshot ([`HcomDb::with_read_snapshot`]). `start --as` deletes and
+    /// recreates a row and its bindings in separate commits, so two
+    /// independent reads can pair one incarnation's row with another's
+    /// binding epoch. The ids come back even when no row exists.
+    pub fn get_instance_with_bindings(
+        &self,
+        name: &str,
+    ) -> Result<(Option<InstanceRow>, Vec<String>)> {
+        self.with_read_snapshot(|tx| {
+            let row = tx
+                .prepare_cached("SELECT * FROM instances WHERE name = ?")?
+                .query_row(params![name], InstanceRow::from_row)
+                .optional()?;
+            let ids = tx
+                .prepare_cached(
+                    "SELECT process_id FROM process_bindings \
+                     WHERE instance_name = ? ORDER BY updated_at DESC",
+                )?
+                .query_map(params![name], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((row, ids))
+        })
+    }
+
+    /// Every row (newest first) paired with its process binding ids (newest
+    /// first), all read in ONE snapshot (see
+    /// [`Self::get_instance_with_bindings`]): a bulk operation resolves each
+    /// row against this read instead of re-reading it per name.
+    pub fn iter_instances_with_bindings(&self) -> Result<Vec<(InstanceRow, Vec<String>)>> {
+        self.with_read_snapshot(|tx| {
+            let rows: Vec<InstanceRow> = tx
+                .prepare_cached("SELECT * FROM instances ORDER BY created_at DESC")?
+                .query_map([], InstanceRow::from_row)?
+                .filter_map(|r| r.ok())
+                .collect();
+            let mut bindings: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut stmt = tx.prepare_cached(
+                "SELECT instance_name, process_id FROM process_bindings \
+                 WHERE instance_name IS NOT NULL ORDER BY updated_at DESC",
+            )?;
+            let pairs = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for pair in pairs {
+                let (name, id) = pair?;
+                bindings.entry(name).or_default().push(id);
+            }
+            Ok(rows
+                .into_iter()
+                .map(|row| {
+                    let ids = bindings.remove(&row.name).unwrap_or_default();
+                    (row, ids)
+                })
+                .collect())
+        })
     }
 
     /// Save (INSERT OR REPLACE) an instance row.

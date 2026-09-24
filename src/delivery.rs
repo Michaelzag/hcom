@@ -2641,6 +2641,27 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str, proc
             None
         }
     };
+    let snapshot = snapshot.map(|mut snapshot| {
+        if let Some(created_at) = snapshot
+            .get("created_at")
+            .and_then(serde_json::Value::as_f64)
+            && let Some(object) = snapshot.as_object_mut()
+        {
+            object.insert(
+                "created_at_bits".to_string(),
+                serde_json::json!(created_at.to_bits()),
+            );
+        }
+        snapshot
+    });
+    // A launch can publish its pid or replace this row after the snapshot.
+    // Key the final delete to the observed incarnation, including a NULL pid;
+    // a failed snapshot read cannot authorize deletion.
+    let delete_key = snapshot.as_ref().and_then(|snapshot| {
+        snapshot["created_at"]
+            .as_f64()
+            .map(|created_at| (created_at, snapshot["pid"].as_i64()))
+    });
 
     let was_killed = EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
     let (exit_context, exit_reason) = if was_killed {
@@ -2685,7 +2706,12 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str, proc
             &format!("Failed to log life event: {}", e),
         );
     }
-    if let Err(e) = db.delete_instance(current_name) {
+    if let Some((created_at, pid)) = delete_key
+        && let Err(e) = db.conn().execute(
+            "DELETE FROM instances WHERE name = ? AND created_at = ? AND pid IS ?",
+            rusqlite::params![current_name, created_at, pid],
+        )
+    {
         eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
     }
 }
@@ -2847,6 +2873,54 @@ mod tests {
             .collect();
 
         assert_eq!(events, vec![("samu".to_string(), "killed".to_string())]);
+    }
+
+    #[test]
+    fn pty_cleanup_preserves_row_changed_after_snapshot() {
+        for (mutation, expected_created_at, expected_pid) in [
+            ("pid = 4242", 1.0, Some(4242)),
+            ("created_at = 2", 2.0, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+            db.init_db().unwrap();
+            db.conn().execute(
+                "INSERT INTO instances (name, tool, status, created_at) VALUES ('buli', 'pi', 'active', 1)",
+                [],
+            ).unwrap();
+            db.set_process_binding("new-process", "new-session", "buli")
+                .unwrap();
+            // Publish a launch pid or replace the row after cleanup read its
+            // snapshot, at the last write before the conditional delete.
+            db.conn()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER launch_during_exit AFTER INSERT ON events
+                 WHEN NEW.type = 'life' AND json_extract(NEW.data, '$.action') = 'stopped'
+                 BEGIN UPDATE instances SET {mutation} WHERE name = 'buli'; END;"
+                ))
+                .unwrap();
+
+            cleanup_deleted_instance(&mut db, "buli", "");
+
+            let row = db
+                .get_instance_full("buli")
+                .unwrap()
+                .expect("fresh row retained");
+            assert_eq!(row.created_at, expected_created_at);
+            assert_eq!(row.pid, expected_pid);
+            assert_eq!(db.process_binding_ids("buli").unwrap(), vec!["new-process"]);
+            let snapshot_identity: (f64, Option<i64>) = db.conn().query_row(
+                "SELECT json_extract(data, '$.snapshot.created_at'), json_extract(data, '$.snapshot.pid')
+                 FROM events WHERE type = 'life' AND instance = 'buli'
+                   AND json_extract(data, '$.action') = 'stopped'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(
+                snapshot_identity,
+                (1.0, None),
+                "the PTY event names the old snapshot"
+            );
+        }
     }
 
     #[test]

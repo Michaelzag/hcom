@@ -652,6 +652,13 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
                     "system",
                     "stale_cleanup",
                 ) {
+                    outcome if outcome.is_re_registered() => {
+                        crate::log::log_info(
+                            "cleanup",
+                            "stale_placeholder_stop_skipped",
+                            &crate::hooks::common::skipped_stop_line(&data.name),
+                        );
+                    }
                     crate::hooks::common::StopOutcome::Stopped => {
                         deleted += 1;
                     }

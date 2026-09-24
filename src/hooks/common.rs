@@ -1241,7 +1241,36 @@ pub fn stop_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, true, &[])
+    stop_instance_inner(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        false,
+        0,
+        true,
+        &[],
+        None,
+    )
+}
+pub(crate) fn stop_instance_with_capture(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+    capture: crate::proctruth::ReapCapture,
+) -> StopOutcome {
+    stop_instance_inner(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        false,
+        0,
+        true,
+        &[],
+        Some(capture),
+    )
 }
 
 /// External side effects of a stop: subscription notifications, listener
@@ -1320,6 +1349,7 @@ pub fn stop_instance_without_reap(
                 Some(tx),
                 &mut post,
                 &[],
+                None,
             ) {
                 StopOutcome::Stopped | StopOutcome::AlreadyStopped => {}
                 StopOutcome::RetryableError(e) => anyhow::bail!("{e}"),
@@ -1340,7 +1370,56 @@ pub fn stop_instance_without_reap(
 pub enum StopOutcome {
     Stopped,
     AlreadyStopped,
-    RetryableError(String),
+    RetryableError(StopError),
+}
+
+impl StopOutcome {
+    /// The stop left the row alone because it is another incarnation now: a
+    /// session re-registered the name mid-stop. Not stopped, and not a
+    /// failure to retry against the new row.
+    pub fn is_re_registered(&self) -> bool {
+        matches!(self, Self::RetryableError(error) if error.re_registered)
+    }
+}
+
+/// Why a stop left the row in place. Displays as its message. Only the
+/// incarnation guard constructs the re-registration case, through
+/// [`StopError::re_registered`]; everything else converts from a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopError {
+    message: String,
+    re_registered: bool,
+}
+
+impl StopError {
+    fn re_registered() -> Self {
+        Self {
+            message: "row re-registered during stop".to_string(),
+            re_registered: true,
+        }
+    }
+}
+
+impl From<String> for StopError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            re_registered: false,
+        }
+    }
+}
+
+impl std::fmt::Display for StopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// What a stop or kill site prints for a name whose release it skipped
+/// because the row was re-registered mid-stop (see
+/// [`StopOutcome::is_re_registered`]). Never "Stopped": the new row is live.
+pub(crate) fn skipped_stop_line(display: &str) -> String {
+    format!("{display} skipped: {}", StopError::re_registered())
 }
 
 pub(crate) fn stop_placeholder_instance(
@@ -1349,7 +1428,17 @@ pub(crate) fn stop_placeholder_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, true, &[])
+    stop_instance_inner(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        true,
+        0,
+        true,
+        &[],
+        None,
+    )
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1399,6 +1488,94 @@ fn caller_tree_outside_group(_pid: u32, _exclude: &[u32]) -> bool {
     false
 }
 
+/// The incarnation a stop may release (see [`row_re_registered`]).
+enum BoundIncarnation {
+    /// The row the stop read at entry. Its release CAS compares
+    /// `created_at`, `session_id`, and `agent_id`; bindings keep the
+    /// `expected_process_id` gate.
+    Entry,
+    /// The row a pre-signal capture was taken against, binding epoch
+    /// included; `None` when no row existed at capture time.
+    Captured(Option<crate::proctruth::CapturedIncarnation>),
+}
+
+/// Whether `name`'s row is now another incarnation than the bound one. An
+/// absent row is not: the release CAS reports it as already stopped. The
+/// row identity (`created_at` bits, `session_id`, `agent_id`) decides; a
+/// captured binding epoch only ever adds a refusal. It loses to any binding
+/// the capture never saw (a newer epoch), and a non-empty capture loses to
+/// an empty current set: that set is indistinguishable from a replacement
+/// row that has not bound yet — `soft_finalize_session` with
+/// `keep_process_binding: false` empties the same row's process bindings —
+/// and both refuse. Bindings its own session released since, leaving a
+/// non-empty subset, do not count. Read through `conn`, so inside the
+/// finalize transaction it decides with the writes.
+fn row_re_registered(
+    conn: &rusqlite::Connection,
+    name: &str,
+    entry: &InstanceRow,
+    bound: &BoundIncarnation,
+) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let Some((created_at, session_id, agent_id)) = conn
+        .query_row(
+            "SELECT created_at, session_id, agent_id FROM instances WHERE name = ?",
+            params![name],
+            |row| {
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let (bound_created_at, bound_session_id, bound_agent_id, bound_bindings) = match bound {
+        BoundIncarnation::Entry => (
+            entry.created_at,
+            entry.session_id.as_deref(),
+            entry.agent_id.as_deref(),
+            None,
+        ),
+        BoundIncarnation::Captured(None) => return Ok(true),
+        BoundIncarnation::Captured(Some(captured)) => (
+            captured.created_at,
+            captured.session_id.as_deref(),
+            captured.agent_id.as_deref(),
+            Some(&captured.binding_ids),
+        ),
+    };
+    if created_at.to_bits() != bound_created_at.to_bits()
+        || session_id.as_deref() != bound_session_id
+        || agent_id.as_deref() != bound_agent_id
+    {
+        return Ok(true);
+    }
+    let Some(bound_bindings) = bound_bindings else {
+        return Ok(false);
+    };
+    let mut stmt =
+        conn.prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?")?;
+    let current = stmt
+        .query_map(params![name], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((current.is_empty() && !bound_bindings.is_empty())
+        || current.iter().any(|id| !bound_bindings.contains(id)))
+}
+
+/// The guard's refusal: nothing was signalled or written for the new row.
+fn re_registered_outcome(instance_name: &str) -> StopOutcome {
+    log::log_info(
+        "hooks",
+        "stop_instance.re_registered",
+        &format!("instance={instance_name}; release skipped, row left to its new incarnation"),
+    );
+    StopOutcome::RetryableError(StopError::re_registered())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stop_instance_inner(
     db: &HcomDb,
@@ -1409,6 +1586,7 @@ fn stop_instance_inner(
     depth: u32,
     reap_gate: bool,
     exclude: &[u32],
+    pre_capture: Option<crate::proctruth::ReapCapture>,
 ) -> StopOutcome {
     stop_instance_inner_scoped(
         db,
@@ -1421,6 +1599,7 @@ fn stop_instance_inner(
         None,
         &mut PostCommit::default(),
         exclude,
+        pre_capture,
     )
 }
 
@@ -1448,6 +1627,7 @@ fn stop_instance_inner_scoped(
     tx: Option<&rusqlite::Transaction<'_>>,
     post: &mut PostCommit,
     exclude: &[u32],
+    pre_capture: Option<crate::proctruth::ReapCapture>,
 ) -> StopOutcome {
     if depth >= MAX_STOP_DEPTH {
         log::log_warn(
@@ -1458,19 +1638,70 @@ fn stop_instance_inner_scoped(
                 MAX_STOP_DEPTH, instance_name
             ),
         );
-        return StopOutcome::RetryableError(format!(
-            "recursion limit reached while stopping {instance_name}"
-        ));
+        return StopOutcome::RetryableError(
+            format!("recursion limit reached while stopping {instance_name}").into(),
+        );
     }
 
     let instance_data = match db.get_instance_full(instance_name) {
         Ok(Some(data)) => data,
         Ok(None) => return StopOutcome::AlreadyStopped,
         Err(e) => {
-            return StopOutcome::RetryableError(format!(
-                "could not read instance {instance_name}: {e}"
-            ));
+            return StopOutcome::RetryableError(
+                format!("could not read instance {instance_name}: {e}").into(),
+            );
         }
+    };
+
+    // The one incarnation this stop may release: a threaded pre-signal
+    // capture binds the row it was taken against (bulk kill), every other
+    // stop binds its entry read. A capture taken for another incarnation
+    // authorizes nothing against this row: no signal, no child stop, no
+    // reap, no release. The finalize transaction re-checks it.
+    let bound = match &pre_capture {
+        Some(capture) => BoundIncarnation::Captured(capture.incarnation().cloned()),
+        None => BoundIncarnation::Entry,
+    };
+    if matches!(bound, BoundIncarnation::Captured(_)) {
+        match row_re_registered(db.conn(), instance_name, &instance_data, &bound) {
+            Ok(false) => {}
+            Ok(true) => return re_registered_outcome(instance_name),
+            Err(e) => {
+                return StopOutcome::RetryableError(
+                    format!("could not read instance {instance_name}: {e}").into(),
+                );
+            }
+        }
+    }
+
+    // The headless group step may kill the recorded root before the reap
+    // snapshots its descendants. Capture proven carrier identities first so
+    // reparenting cannot erase that ownership evidence. The capture and the
+    // reap's call-start epoch come from one snapshot: a threaded capture
+    // brings the epoch it was taken with, and this stop's own capture reads
+    // the row and its bindings together.
+    let (capture, binding_ids) = match pre_capture {
+        Some(capture) => {
+            let ids = capture
+                .incarnation()
+                .map(|captured| captured.binding_ids.clone())
+                .unwrap_or_default();
+            (Some(capture), ids)
+        }
+        None if reap_gate => {
+            let (row, ids) = match db.get_instance_with_bindings(instance_name) {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    return StopOutcome::RetryableError(
+                        format!("could not read instance {instance_name}: {e}").into(),
+                    );
+                }
+            };
+            let capture =
+                crate::proctruth::capture_reap_carriers(instance_name, row.as_ref(), &ids, exclude);
+            (Some(capture), ids)
+        }
+        None => (None, Vec::new()),
     };
 
     // Kill headless processes (background=true)
@@ -1622,6 +1853,7 @@ fn stop_instance_inner_scoped(
         "hints": instance_data.hints,
         "pid": instance_data.pid,
         "created_at": instance_data.created_at,
+        "created_at_bits": instance_data.created_at.to_bits(),
         "last_seen": instance_data.last_seen,
         "background": instance_data.background,
         "agent_id": instance_data.agent_id,
@@ -1641,9 +1873,9 @@ fn stop_instance_inner_scoped(
         Some(session_id) => match child_instance_names(db, "parent_session_id", session_id) {
             Ok(children) => children,
             Err(e) => {
-                return StopOutcome::RetryableError(format!(
-                    "could not enumerate session children of {instance_name}: {e}"
-                ));
+                return StopOutcome::RetryableError(
+                    format!("could not enumerate session children of {instance_name}: {e}").into(),
+                );
             }
         },
         None => Vec::new(),
@@ -1651,17 +1883,19 @@ fn stop_instance_inner_scoped(
     let native_children = match child_instance_names(db, "parent_name", instance_name) {
         Ok(children) => children,
         Err(e) => {
-            return StopOutcome::RetryableError(format!(
-                "could not enumerate native children of {instance_name}: {e}"
-            ));
+            return StopOutcome::RetryableError(
+                format!("could not enumerate native children of {instance_name}: {e}").into(),
+            );
         }
     };
 
     // Finish children first while the parent row keeps the teardown retryable.
     // Concurrent callers may repeat this work; every child has its own atomic
     // event/delete gate.
+    // A child re-registered mid-stop is another session's row now, left to
+    // it exactly as a lost release CAS always was; it does not fail the parent.
     for sub_name in session_subagents {
-        if let StopOutcome::RetryableError(error) = stop_instance_inner_scoped(
+        let outcome = stop_instance_inner_scoped(
             db,
             &sub_name,
             initiated_by,
@@ -1672,15 +1906,19 @@ fn stop_instance_inner_scoped(
             tx,
             post,
             exclude,
-        ) {
+            None,
+        );
+        if !outcome.is_re_registered()
+            && let StopOutcome::RetryableError(error) = outcome
+        {
             log::log_warn(
                 "hooks",
                 "finalize.child_stop_incomplete",
                 &format!("parent={instance_name} child={sub_name} err={error}"),
             );
-            return StopOutcome::RetryableError(format!(
-                "could not stop child {sub_name}: {error}"
-            ));
+            return StopOutcome::RetryableError(
+                format!("could not stop child {sub_name}: {error}").into(),
+            );
         }
     }
 
@@ -1688,7 +1926,7 @@ fn stop_instance_inner_scoped(
     // as parent_session_id, so only parent_name links nested children. A row
     // already stopped via the session set is a no-op here.
     for child in native_children {
-        if let StopOutcome::RetryableError(error) = stop_instance_inner_scoped(
+        let outcome = stop_instance_inner_scoped(
             db,
             &child,
             initiated_by,
@@ -1699,46 +1937,50 @@ fn stop_instance_inner_scoped(
             tx,
             post,
             exclude,
-        ) {
+            None,
+        );
+        if !outcome.is_re_registered()
+            && let StopOutcome::RetryableError(error) = outcome
+        {
             log::log_warn(
                 "hooks",
                 "finalize.child_stop_incomplete",
                 &format!("parent={instance_name} child={child} err={error}"),
             );
-            return StopOutcome::RetryableError(format!("could not stop child {child}: {error}"));
+            return StopOutcome::RetryableError(
+                format!("could not stop child {child}: {error}").into(),
+            );
         }
     }
-    // Reap the whole live tree for this name before releasing the row.
+    // Reap the proven in-scope tree for this name before releasing the row.
     // Process truth gates the release: the stopped event is only written
-    // (and the row only deleted) once no process holds the instance — by
-    // name or, for self-bound sessions, by binding process id. The pty
-    // wrapper is signalled first via oldest-first ordering inside reap.
-    // Skipped when the reap gate is off (the kill paths): the caller may be
-    // one of the carriers. Kill has already reaped the carrier set — every
-    // non-self carrier on the self path — and verified it gone (fail-closed)
-    // before this teardown is called, and only after its own incarnation CAS.
-    let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
-    if reap_gate
-        && let Err(survivors) = crate::proctruth::reap_instance_tree_for_excluding(
+    // (and the row only deleted) once no in-scope process holds the instance
+    // by name or binding process id. A foreign holder is excluded and logged
+    // without being signalled. The pty wrapper goes first within the reap.
+    // Skipped when the reap gate is off (the kill paths): kill has already
+    // reaped and verified the eligible carrier set before this teardown,
+    // and only after its own incarnation CAS.
+    if let Some(capture) = capture
+        && let Err(survivors) = crate::proctruth::reap_instance_tree_for_excluding_captured(
             db,
             instance_name,
             &binding_ids,
             exclude,
+            capture,
         )
     {
-        let pids = survivors
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let error = survivors.to_string();
         log::log_warn(
             "hooks",
             "stop_instance.reap_incomplete",
-            &format!("instance={instance_name} survivors={pids}"),
+            &format!("instance={instance_name} err={error}"),
         );
-        return StopOutcome::RetryableError(format!(
-            "could not stop {instance_name}: process(es) still alive after SIGKILL: {pids} — run hcom kill {instance_name} first"
-        ));
+        return StopOutcome::RetryableError(
+            format!(
+                "could not stop {instance_name}: {error} — run hcom kill {instance_name} first"
+            )
+            .into(),
+        );
     }
 
     // Key the release to the current process incarnation: the stopped event
@@ -1764,46 +2006,93 @@ fn stop_instance_inner_scoped(
     if placeholder {
         event_data["placeholder"] = serde_json::json!(true);
     }
-    let finalized = match tx {
-        Some(tx) => db
-            .finalize_instance_stop_in_txn(
-                tx,
-                instance_name,
-                instance_data.created_at,
-                instance_data.session_id.as_deref(),
-                instance_data.agent_id.as_deref(),
-                &event_data,
-                expected_process_id.as_deref(),
-            )
-            .map(|(won, event_id)| {
-                if let Some(event_id) = event_id {
-                    // Deferred: the shared transaction is not committed yet.
-                    post.events
-                        .push((event_id, instance_name.to_string(), event_data.clone()));
-                }
-                won
-            }),
-        None => db.finalize_instance_stop(
-            instance_name,
+    // The release CAS runs under the bound incarnation's identity: a captured
+    // row (bulk kill) or the entry read.
+    let (created_at, pid, session_id, agent_id) = match &bound {
+        BoundIncarnation::Captured(Some(captured)) => (
+            captured.created_at,
+            captured.pid,
+            captured.session_id.as_deref(),
+            captured.agent_id.as_deref(),
+        ),
+        _ => (
             instance_data.created_at,
+            instance_data.pid,
             instance_data.session_id.as_deref(),
             instance_data.agent_id.as_deref(),
-            &event_data,
-            expected_process_id.as_deref(),
         ),
     };
+    // `None`: the row is another incarnation now, so nothing was written.
+    let finalized: Result<Option<bool>> = match tx {
+        Some(tx) => match row_re_registered(tx, instance_name, &instance_data, &bound) {
+            Ok(true) => Ok(None),
+            Ok(false) => db
+                .finalize_instance_stop_in_txn(
+                    tx,
+                    instance_name,
+                    created_at,
+                    pid,
+                    session_id,
+                    agent_id,
+                    &event_data,
+                    expected_process_id.as_deref(),
+                )
+                .map(|(won, event_id)| {
+                    if let Some(event_id) = event_id {
+                        // Deferred: the shared transaction is not committed yet.
+                        post.events
+                            .push((event_id, instance_name.to_string(), event_data.clone()));
+                    }
+                    Some(won)
+                }),
+            Err(e) => Err(e),
+        },
+        None => db
+            .with_immediate_transaction(|tx| {
+                if row_re_registered(tx, instance_name, &instance_data, &bound)? {
+                    return Ok(None);
+                }
+                db.finalize_instance_stop_in_txn(
+                    tx,
+                    instance_name,
+                    created_at,
+                    pid,
+                    session_id,
+                    agent_id,
+                    &event_data,
+                    expected_process_id.as_deref(),
+                )
+                .map(Some)
+            })
+            .map(|finalized| {
+                finalized.map(|(won, event_id)| {
+                    // Best-effort external effect, only once the event is durable.
+                    if let Some(event_id) = event_id {
+                        crate::db::subscriptions::process_logged_event(
+                            db,
+                            event_id,
+                            "life",
+                            instance_name,
+                            &event_data,
+                        );
+                    }
+                    won
+                })
+            }),
+    };
     match finalized {
-        Ok(true) => {}
-        Ok(false) => return StopOutcome::AlreadyStopped,
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => return StopOutcome::AlreadyStopped,
+        Ok(None) => return re_registered_outcome(instance_name),
         Err(e) => {
             log::log_warn(
                 "hooks",
                 "finalize.transaction_failed",
                 &format!("instance={instance_name} err={e}"),
             );
-            return StopOutcome::RetryableError(format!(
-                "could not finalize stop for {instance_name}: {e}"
-            ));
+            return StopOutcome::RetryableError(
+                format!("could not finalize stop for {instance_name}: {e}").into(),
+            );
         }
     }
 
@@ -1830,6 +2119,201 @@ fn stop_instance_inner_scoped(
     StopOutcome::Stopped
 }
 
+#[derive(serde::Deserialize)]
+struct TeardownOwner {
+    pid: u32,
+    process_start: String,
+    // The claim writer before the bits (never in a release) wrote only a
+    // `created_at` float; the comparison falls back to it (see
+    // `yield_to_teardown`).
+    created_at_bits: Option<u64>,
+    session_id: Option<String>,
+}
+
+/// An in-flight kill owns the stopped record before it sends any signal.
+/// Session hooks yield only for the claimed incarnation and live OS identity;
+/// a crashed killer or a re-registered name cannot block the next session end.
+pub(crate) struct TeardownClaim<'a> {
+    db: &'a HcomDb,
+    key: String,
+    value: String,
+}
+
+impl<'a> TeardownClaim<'a> {
+    pub(crate) fn register(
+        db: &'a HcomDb,
+        instance_name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+    ) -> Option<Self> {
+        let pid = std::process::id();
+        let Some(process_start) = crate::sys::process::identity(pid) else {
+            log::log_warn(
+                "kill",
+                "teardown.claim_identity_failed",
+                &format!("pid={pid}"),
+            );
+            return None;
+        };
+        let key = format!("teardown_claim:{instance_name}");
+        let value = serde_json::json!({
+            "pid": pid,
+            "process_start": process_start,
+            // Preserve the exact SQLite f64; JSON's default float parser can
+            // round a fractional timestamp to a neighboring representable value.
+            "created_at_bits": created_at.to_bits(),
+            "session_id": session_id,
+        })
+        .to_string();
+        // The latest killer owns the claim, including when replacing a dead
+        // owner. Earlier guards cannot clear another process's ownership.
+        if let Err(e) = db.kv_set(&key, Some(&value)) {
+            log::log_warn(
+                "kill",
+                "teardown.claim_write_failed",
+                &format!("instance={instance_name} err={e}"),
+            );
+            return None;
+        }
+        Some(Self { db, key, value })
+    }
+}
+
+impl Drop for TeardownClaim<'_> {
+    fn drop(&mut self) {
+        // Compare and delete in one statement: a second killer may have
+        // replaced the claim while this one was signalling.
+        let _ = self.db.conn().execute(
+            "DELETE FROM kv WHERE key = ? AND value = ?",
+            params![self.key, self.value],
+        );
+    }
+}
+
+/// What a session finalizer does about an in-flight kill's teardown claim.
+enum TeardownYield {
+    /// No live killer's claim covers this row — including a dead or
+    /// malformed claim, or one naming another session or incarnation. The
+    /// finalizer owns the teardown.
+    NoClaim,
+    /// A live claim names this session but no `created_at` can be read from
+    /// it (absent, null, non-numeric, not a scalar). The row is held for the
+    /// live kill — no teardown, no exit writes, logged — and the incarnation
+    /// is never guessed.
+    Held,
+    /// Yield to the live kill, carrying the incarnation the finalizer's
+    /// exit writes may target.
+    YieldTo(f64, Option<String>),
+}
+
+/// The [`TeardownYield`] for `instance_name`: [`TeardownYield::YieldTo`]
+/// when a live killer's claim covers this row, carrying the incarnation the
+/// finalizer's exit writes may target.
+///
+/// Bits are authoritative. A claim without them is matched on the exact bit
+/// pattern of its raw `created_at` token (a float decode can change a ULP).
+/// When a live claim names this session but no `created_at` can be read
+/// from it (absent, null, non-numeric, not a scalar), the finalizer fails
+/// closed like the daemon sweep: [`TeardownYield::Held`] holds the row for
+/// the live kill, and never guesses the incarnation.
+fn yield_to_teardown(db: &HcomDb, instance_name: &str) -> TeardownYield {
+    let Some(value) = db
+        .kv_get(&format!("teardown_claim:{instance_name}"))
+        .ok()
+        .flatten()
+    else {
+        return TeardownYield::NoClaim;
+    };
+    let Some(owner) = serde_json::from_str::<TeardownOwner>(&value).ok() else {
+        return TeardownYield::NoClaim;
+    };
+    if !crate::sys::process::has_identity(owner.pid, &owner.process_start) {
+        return TeardownYield::NoClaim;
+    }
+    let Some(row) = db.get_instance_full(instance_name).ok().flatten() else {
+        return TeardownYield::NoClaim;
+    };
+    // Another session is another incarnation, whatever the timestamp says.
+    if row.session_id != owner.session_id {
+        return TeardownYield::NoClaim;
+    }
+    let Some(bits) = owner
+        .created_at_bits
+        .or_else(|| crate::db::raw_created_at_bits(&value))
+    else {
+        log::log_warn(
+            "hooks",
+            "sessionend.teardown_claim_held",
+            &format!(
+                "instance={instance_name} reason=unreadable-created_at; row left to the live kill, no exit writes"
+            ),
+        );
+        return TeardownYield::Held;
+    };
+    if row.created_at.to_bits() != bits {
+        return TeardownYield::NoClaim;
+    }
+    log::log_info(
+        "hooks",
+        "sessionend.yielded_to_teardown",
+        &format!("instance={instance_name}"),
+    );
+    TeardownYield::YieldTo(row.created_at, row.session_id)
+}
+
+/// Keep the one-shot hook's exit state if the kill fails, but never apply
+/// that state to a name reused after the claim check. The immediate write
+/// lock covers the incarnation re-read and both existing same-connection
+/// writers, so a concurrent replacement cannot land between those writes.
+fn persist_yielded_session_exit(
+    db: &HcomDb,
+    instance_name: &str,
+    incarnation: (f64, Option<String>),
+    reason: &str,
+    updates: Option<&serde_json::Map<String, Value>>,
+) {
+    use rusqlite::OptionalExtension;
+
+    let updated = db.with_immediate_transaction(|tx| {
+        let current: Option<(f64, Option<String>)> = tx
+            .query_row(
+                "SELECT created_at, session_id FROM instances WHERE name = ?",
+                params![instance_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if !current.is_some_and(|(created_at, session_id)| {
+            created_at.to_bits() == incarnation.0.to_bits() && session_id == incarnation.1
+        }) {
+            return Ok(false);
+        }
+        lifecycle::set_status(
+            db,
+            instance_name,
+            ST_INACTIVE,
+            &format!("exit:{}", reason),
+            Default::default(),
+        );
+        if let Some(updates) = updates {
+            instances::update_instance_position(db, instance_name, updates);
+        }
+        Ok(true)
+    });
+    match updated {
+        Ok(true) => {}
+        Ok(false) => log::log_info(
+            "hooks",
+            "sessionend.yield_incarnation_changed",
+            &format!("instance={instance_name}; exit writes skipped"),
+        ),
+        Err(error) => log::log_warn(
+            "hooks",
+            "sessionend.yield_write_failed",
+            &format!("instance={instance_name} err={error}"),
+        ),
+    }
+}
+
 /// Soft session end for Antigravity: mark inactive without deleting the `instances` row.
 ///
 /// agy has no process-death hook — its hook set is only PreToolUse/PostToolUse/
@@ -1846,6 +2330,9 @@ fn stop_instance_inner_scoped(
 ///
 /// OMP soft-stop passes `keep_process_binding: true` so the live process can rebind
 /// via `bind_session_to_process` on the next turn. Antigravity passes `false`.
+/// A live kill claim keeps the early exit status and metadata writes, but
+/// leaves the stopped event, bindings, and row release to the kill. A live
+/// claim whose incarnation cannot be read holds the row without those writes.
 pub fn soft_finalize_session(
     db: &HcomDb,
     instance_name: &str,
@@ -1853,6 +2340,20 @@ pub fn soft_finalize_session(
     updates: Option<&serde_json::Map<String, Value>>,
     keep_process_binding: bool,
 ) {
+    match yield_to_teardown(db, instance_name) {
+        TeardownYield::NoClaim => {}
+        TeardownYield::Held => return,
+        TeardownYield::YieldTo(created_at, session_id) => {
+            persist_yielded_session_exit(
+                db,
+                instance_name,
+                (created_at, session_id),
+                reason,
+                updates,
+            );
+            return;
+        }
+    }
     log::log_info(
         "hooks",
         "sessionend.soft",
@@ -1890,6 +2391,7 @@ pub fn soft_finalize_session(
         "hints": instance_data.hints,
         "pid": instance_data.pid,
         "created_at": instance_data.created_at,
+        "created_at_bits": instance_data.created_at.to_bits(),
         "last_seen": instance_data.last_seen,
         "background": instance_data.background,
         "agent_id": instance_data.agent_id,
@@ -1974,6 +2476,10 @@ pub fn finalize_session(
 /// Off Linux a non-empty `exclude` never deletes the row: without /proc the
 /// reap and the headless check see none of the session's other carriers, so
 /// a release would report success blind (see `keep_own_row_off_linux`).
+/// A live kill claim preserves the early exit status and metadata writes
+/// and returns `AlreadyStopped`; the kill owns the stopped event and release.
+/// A live claim whose incarnation cannot be read holds the row the same way,
+/// without the exit writes.
 pub fn finalize_session_excluding(
     db: &HcomDb,
     instance_name: &str,
@@ -1981,6 +2487,20 @@ pub fn finalize_session_excluding(
     updates: Option<&serde_json::Map<String, Value>>,
     exclude: &[u32],
 ) -> StopOutcome {
+    match yield_to_teardown(db, instance_name) {
+        TeardownYield::NoClaim => {}
+        TeardownYield::Held => return StopOutcome::AlreadyStopped,
+        TeardownYield::YieldTo(created_at, session_id) => {
+            persist_yielded_session_exit(
+                db,
+                instance_name,
+                (created_at, session_id),
+                reason,
+                updates,
+            );
+            return StopOutcome::AlreadyStopped;
+        }
+    }
     #[cfg(not(target_os = "linux"))]
     if !exclude.is_empty() {
         return keep_own_row_off_linux(db, instance_name, reason, updates);
@@ -2016,8 +2536,13 @@ pub fn finalize_session_excluding(
         0,
         true,
         exclude,
+        None,
     );
-    if let StopOutcome::RetryableError(e) = &outcome {
+    // A re-registered name belongs to another session now; the guard logged
+    // the skip, and this session's own end is not a refused stop.
+    if !outcome.is_re_registered()
+        && let StopOutcome::RetryableError(e) = &outcome
+    {
         log::log_warn(
             "hooks",
             "sessionend.stop_refused",
@@ -2045,9 +2570,9 @@ fn keep_own_row_off_linux(
         Ok(Some(row)) => row.status,
         Ok(None) => return StopOutcome::AlreadyStopped,
         Err(e) => {
-            return StopOutcome::RetryableError(format!(
-                "could not read instance {instance_name}: {e}"
-            ));
+            return StopOutcome::RetryableError(
+                format!("could not read instance {instance_name}: {e}").into(),
+            );
         }
     };
     log::log_info(
@@ -2932,6 +3457,76 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    #[serial]
+    fn stop_keeps_row_when_launch_persists_pid_mid_reap() {
+        use crate::proctruth::{RoundPoint, arm_round_seam};
+        use std::os::unix::process::CommandExt;
+
+        let _env = isolated_test_env();
+        let (dir, db) = make_test_db();
+        let name = format!("launch-race-{}", std::process::id());
+        insert_test_instance(&db, &name);
+        db.set_process_binding("proc-launch-race", "session-race", &name)
+            .unwrap();
+        // An old carrier ensures the KILL-round seam fires even though the
+        // pre-registered row has no pid yet.
+        let _old = OwnedGroup(
+            std::process::Command::new("sleep")
+                .arg("300")
+                .env("HCOM_INSTANCE_NAME", &name)
+                .env_remove("HCOM_PROCESS_ID")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let launched = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = launched.clone();
+        let launch_db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        let launch_name = name.clone();
+        arm_round_seam(move |point| {
+            if point == RoundPoint::Captured && observed.borrow().is_none() {
+                let child = OwnedGroup(
+                    std::process::Command::new("sleep")
+                        .arg("300")
+                        .env_remove("HCOM_INSTANCE_NAME")
+                        .env_remove("HCOM_PROCESS_ID")
+                        .process_group(0)
+                        .spawn()
+                        .unwrap(),
+                );
+                launch_db
+                    .update_instance_pid(&launch_name, child.0.id())
+                    .unwrap();
+                *observed.borrow_mut() = Some(child);
+            }
+        });
+
+        let outcome = stop_instance(&db, &name, "test", "stop");
+        // Clear the thread-local hook before any assertion can unwind.
+        arm_round_seam(|_| {});
+        assert!(
+            matches!(&outcome, StopOutcome::RetryableError(e) if e.to_string().contains("persisted its pid")),
+            "{outcome:?}"
+        );
+        let pid = launched.borrow().as_ref().expect("seam fired").0.id();
+        assert!(crate::sys::process::is_alive(pid));
+        assert_eq!(
+            db.get_instance_full(&name).unwrap().unwrap().pid,
+            Some(pid as i64)
+        );
+        assert_eq!(
+            db.process_binding_ids(&name).unwrap(),
+            vec!["proc-launch-race"]
+        );
+        let stopped: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped'",
+            params![name], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(stopped, 0);
+    }
+
+    #[test]
     fn test_stale_stop_cannot_delete_reused_name() {
         crate::config::Config::init();
         let (_dir, db) = make_test_db();
@@ -2959,6 +3554,7 @@ mod tests {
             .finalize_instance_stop(
                 "inst",
                 old.created_at,
+                old.pid,
                 old.session_id.as_deref(),
                 old.agent_id.as_deref(),
                 &event,
@@ -3087,6 +3683,202 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped, 1, "the retry winner publishes exactly once");
+    }
+
+    #[test]
+    #[serial]
+    fn session_finalizers_yield_to_live_teardown_claim() {
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        for soft in [false, true] {
+            let name = if soft { "claim-soft" } else { "claim-hard" };
+            insert_test_instance(&db, name);
+            db.set_process_binding("claim-process", "claim-session", name)
+                .unwrap();
+            // Integer timestamps hid the lossy JSON float parser. This
+            // fractional created_at must keep the live claim's identity.
+            let created_at = f64::from_bits(4745294612153761801);
+            db.conn()
+                .execute(
+                    "UPDATE instances SET created_at = ? WHERE name = ?",
+                    params![created_at, name],
+                )
+                .unwrap();
+            let _claim = TeardownClaim::register(&db, name, created_at, None).unwrap();
+            let updates = serde_json::json!({"transcript_path": "/ended/transcript"});
+            if soft {
+                soft_finalize_session(&db, name, "shutdown", updates.as_object(), false);
+            } else {
+                assert_eq!(
+                    finalize_session(&db, name, "shutdown", updates.as_object()),
+                    StopOutcome::AlreadyStopped,
+                );
+            }
+            let row = db
+                .get_instance_full(name)
+                .unwrap()
+                .expect("claimed row retained");
+            assert_eq!(row.status, ST_INACTIVE);
+            assert_eq!(row.status_context, "exit:shutdown");
+            assert_eq!(row.transcript_path, "/ended/transcript");
+            assert_eq!(db.process_binding_ids(name).unwrap(), vec!["claim-process"]);
+            let events: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE instance = ? AND type = 'life' AND json_extract(data, '$.action') = 'stopped'",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(events, 0, "yield leaves the stopped event to the kill");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn yielded_exit_does_not_update_re_registered_name() {
+        let _env = isolated_test_env();
+        for (created_at, session_id) in [(1.0, None), (0.0, Some("replacement-session"))] {
+            let (_dir, db) = make_test_db();
+            insert_test_instance(&db, "reused");
+            let _claim = TeardownClaim::register(&db, "reused", 0.0, None).unwrap();
+            let incarnation = match yield_to_teardown(&db, "reused") {
+                TeardownYield::YieldTo(created_at, session_id) => (created_at, session_id),
+                _ => panic!("live claim matches"),
+            };
+            db.delete_instance("reused").unwrap();
+            insert_test_instance(&db, "reused");
+            db.conn().execute(
+                "UPDATE instances SET created_at = ?, session_id = ?, transcript_path = '/new/session' WHERE name = 'reused'",
+                params![created_at, session_id],
+            ).unwrap();
+
+            let updates = serde_json::json!({"transcript_path": "/old/session"});
+            persist_yielded_session_exit(
+                &db,
+                "reused",
+                incarnation,
+                "shutdown",
+                updates.as_object(),
+            );
+
+            let row = db.get_instance_full("reused").unwrap().unwrap();
+            assert_eq!(row.status, ST_LISTENING);
+            assert_eq!(row.status_context, "start");
+            assert_eq!(row.transcript_path, "/new/session");
+            assert_eq!(row.created_at, created_at);
+            assert_eq!(row.session_id.as_deref(), session_id);
+            let events: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE instance = 'reused'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(events, 0, "a superseded yield writes no event");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn session_finalize_ignores_claim_for_another_incarnation() {
+        let _env = isolated_test_env();
+        for (created_at, session_id) in [(1.0, None), (0.0, Some("new-session"))] {
+            let (_dir, db) = make_test_db();
+            insert_test_instance(&db, "reclaimed");
+            let _claim = TeardownClaim::register(&db, "reclaimed", 0.0, None).unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE instances SET created_at = ?, session_id = ? WHERE name = 'reclaimed'",
+                    params![created_at, session_id],
+                )
+                .unwrap();
+
+            assert_eq!(
+                finalize_session(&db, "reclaimed", "shutdown", None),
+                StopOutcome::Stopped,
+            );
+            assert!(db.get_instance_full("reclaimed").unwrap().is_none());
+            let snapshot = newest_stopped_snapshot(&db, "reclaimed");
+            assert_eq!(snapshot["created_at"], serde_json::json!(created_at));
+            assert_eq!(snapshot["session_id"], serde_json::json!(session_id));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn session_finalizers_ignore_stale_and_malformed_teardown_claims() {
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        for value in [
+            "not-json".to_string(),
+            serde_json::json!({"pid": std::process::id(), "process_start": "wrong-start", "created_at_bits": 0_u64, "session_id": null})
+                .to_string(),
+            serde_json::json!({"pid": u32::MAX, "process_start": "dead", "created_at_bits": 0_u64, "session_id": null}).to_string(),
+        ] {
+            for soft in [false, true] {
+                let name = "stale-claim";
+                insert_test_instance(&db, name);
+                db.set_process_binding("stale-process", "stale-session", name)
+                    .unwrap();
+                db.kv_set(&format!("teardown_claim:{name}"), Some(&value))
+                    .unwrap();
+                if soft {
+                    soft_finalize_session(&db, name, "shutdown", None, false);
+                    assert_eq!(
+                        db.get_instance_full(name).unwrap().unwrap().status,
+                        ST_INACTIVE
+                    );
+                    db.delete_instance(name).unwrap();
+                } else {
+                    assert_eq!(
+                        finalize_session(&db, name, "shutdown", None),
+                        StopOutcome::Stopped
+                    );
+                    assert!(db.get_instance_full(name).unwrap().is_none());
+                }
+                assert!(db.process_binding_ids(name).unwrap().is_empty());
+                let reason: String = db.conn().query_row(
+                    "SELECT json_extract(data, '$.reason') FROM events WHERE instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
+                    [name], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(reason, "exit:shutdown");
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn teardown_claim_drop_clears_only_its_own_owner() {
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        let key = "teardown_claim:claim-owner";
+        db.kv_set(key, Some(r#"{"pid":1,"process_start":"stale"}"#))
+            .unwrap();
+        insert_test_instance(&db, "claim-owner");
+        let claim = TeardownClaim::register(&db, "claim-owner", 0.0, None).unwrap();
+        assert!(
+            !matches!(
+                yield_to_teardown(&db, "claim-owner"),
+                TeardownYield::NoClaim
+            ),
+            "stale owner replaced"
+        );
+        drop(claim);
+        assert!(db.kv_get(key).unwrap().is_none());
+
+        let claim = TeardownClaim::register(&db, "claim-owner", 0.0, None).unwrap();
+        let foreign = serde_json::json!({
+            "pid": std::process::id().wrapping_add(1),
+            "process_start": "another-killer",
+            "created_at_bits": 0_u64,
+            "session_id": null,
+        })
+        .to_string();
+        db.kv_set(key, Some(&foreign)).unwrap();
+        drop(claim);
+        assert_eq!(db.kv_get(key).unwrap().as_deref(), Some(foreign.as_str()));
     }
 
     #[test]

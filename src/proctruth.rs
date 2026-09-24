@@ -14,6 +14,8 @@
 //!   instance — `HCOM_INSTANCE_NAME=<name>` OR `HCOM_PROCESS_ID=<binding>`
 //!   (exact entry match; only those two variables' values are ever read —
 //!   other environ values are never printed).
+//!   Linux also excludes shared broker daemons unless a nested `omp` owns the
+//!   candidate subtree.
 //! - [`reap_instance_tree_for`]: SIGTERM the whole carrier set (oldest first,
 //!   so the pty wrapper goes before its children), wait up to 5 s, SIGKILL
 //!   survivors — fail-closed: success is only reported once no in-scope
@@ -38,7 +40,7 @@
 //! every query reports empty (verified-no-holders) and reap is a no-op.
 
 #[cfg(unix)]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::db::HcomDb;
 
@@ -118,6 +120,10 @@ const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// first hook from `HCOM_PROCESS_ID=omp-<pid>-…`, never carrying
 /// `HCOM_INSTANCE_NAME`) are held by their process id, not their name.
 ///
+/// On Linux a broker (`/proc/<pid>/comm` exactly `omp daemon brok`) is never
+/// a carrier. Its descendants need a nested `omp` between them and their
+/// nearest broker, including the candidate itself.
+///
 /// Only the `HCOM_INSTANCE_NAME` and `HCOM_PROCESS_ID` entries are ever
 /// inspected; no other environ values are read or reported. The calling
 /// process itself is always excluded (a CLI running inside the session
@@ -125,7 +131,7 @@ const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 pub fn processes_for_instance(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
     #[cfg(unix)]
     {
-        enumerate_unix(name, binding_ids)
+        enumerate_unix(name, binding_ids, None)
     }
     #[cfg(not(unix))]
     {
@@ -202,8 +208,322 @@ fn is_bound_process_id(process_id: &str, binding_ids: &[String]) -> bool {
     !process_id.is_empty() && binding_ids.iter().any(|id| id == process_id)
 }
 
+/// Broker-owned daemons inherit the first session's identity but do not belong
+/// to it. Only a nested `omp` below the nearest broker starts a new carrier
+/// subtree. Off Linux and Android there is no `/proc/<pid>/comm` to distinguish
+/// them, so keep the existing identity-only rule.
 #[cfg(unix)]
-fn enumerate_unix(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
+pub(crate) fn carrier_eligible(pid: u32) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        carrier_eligible_with(
+            pid,
+            |pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok(),
+            parent_pid,
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn carrier_eligible_with(
+    pid: u32,
+    comm_of: impl Fn(u32) -> Option<String>,
+    parent_of: impl Fn(u32) -> Option<u32>,
+) -> bool {
+    let mut current = pid;
+    let mut passed_omp = false;
+    // A missing link cannot establish broker ancestry. Bound the walk like
+    // ancestor_or_self_pids in case /proc changes under us.
+    for _ in 0..1024 {
+        let comm = comm_of(current);
+        let comm = comm
+            .as_deref()
+            .map(|value| value.strip_suffix('\n').unwrap_or(value));
+        if comm == Some("omp daemon brok") {
+            return passed_omp;
+        }
+        if comm == Some("omp") {
+            passed_omp = true;
+        }
+        let Some(parent) = parent_of(current) else {
+            return true;
+        };
+        if parent == current {
+            return true;
+        }
+        current = parent;
+    }
+    true
+}
+
+/// Roots and the original PID incarnations are captured before the first
+/// signal of a teardown. A descendant stays in scope if an earlier signal
+/// kills its parent and the kernel reparents it; a reused pid does not.
+#[cfg(unix)]
+struct CarrierTreeScope {
+    roots: Vec<u32>,
+    caller_ancestors: Vec<u32>,
+    known: HashMap<u32, (ProcMatch, String)>,
+    /// Identity carriers seen live outside the proven scope. Only the ones
+    /// still alive at the release decision can block it.
+    dropped_live: std::cell::RefCell<Vec<u32>>,
+    admitted: std::cell::Cell<usize>,
+    excluded: Vec<u32>,
+}
+
+#[cfg(unix)]
+impl CarrierTreeScope {
+    fn drop_unproven(&self, pid: u32) {
+        let mut dropped = self.dropped_live.borrow_mut();
+        if !dropped.contains(&pid) {
+            dropped.push(pid);
+        }
+    }
+}
+
+/// The row a capture was taken against. A stop that threads the capture may
+/// release this incarnation and no other: a `start --as` rebind between the
+/// capture and the release is a different row, whatever its name.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CapturedIncarnation {
+    pub(crate) created_at: f64,
+    pub(crate) pid: Option<i64>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) binding_ids: Vec<String>,
+}
+
+/// The owning roots and carrier set from before the operation's first signal.
+/// Live carriers whose identity is unreadable stay in the set but cannot be
+/// signalled. Callers with a headless group signal capture before that step;
+/// callers with no pre-step capture at reap entry.
+pub(crate) struct ReapCapture {
+    #[cfg(unix)]
+    scope: CarrierTreeScope,
+    #[cfg(unix)]
+    carriers: Vec<ProcMatch>,
+    /// `None` when no row existed at capture time, or when the capture is
+    /// reap-only and deliberately binds no incarnation.
+    incarnation: Option<CapturedIncarnation>,
+}
+
+impl ReapCapture {
+    pub(crate) fn incarnation(&self) -> Option<&CapturedIncarnation> {
+        self.incarnation.as_ref()
+    }
+}
+
+#[cfg(unix)]
+fn carrier_tree_scope(row_pid: Option<i64>, binding_ids: &[String]) -> CarrierTreeScope {
+    let mut roots = vec![std::process::id()];
+    if let Some(pid) = row_pid.and_then(|pid| u32::try_from(pid).ok())
+        && pid != 0
+        && !roots.contains(&pid)
+    {
+        roots.push(pid);
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    for id in binding_ids {
+        // Only the minted omp-<pid>-... shape identifies an owner. A live
+        // process with another comm must not become a root on the strength of
+        // a borrowed or stale binding id.
+        if let Some(pid) = shell_pid_from_process_id(id)
+            && id
+                .strip_prefix("omp-")
+                .is_some_and(|rest| rest.contains('-'))
+            && !process_gone(pid)
+            && std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|comm| comm.trim_end_matches('\n') == "omp")
+            && !roots.contains(&pid)
+        {
+            roots.push(pid);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = binding_ids;
+    CarrierTreeScope {
+        roots,
+        caller_ancestors: caller_ancestor_pids(),
+        known: HashMap::new(),
+        excluded: Vec::new(),
+        dropped_live: std::cell::RefCell::new(Vec::new()),
+        admitted: std::cell::Cell::new(0),
+    }
+}
+
+/// A capture with NO bound incarnation: the row contributes only its
+/// recorded-pid root. The reap conveniences pair that fresh row read with
+/// the caller's call-start binding ids — two reads, never one snapshot — so
+/// their capture must not carry a [`CapturedIncarnation`] a stop could
+/// release against. The reap consumes only scope and carriers.
+fn capture_reap_carriers_unbound(
+    name: &str,
+    row_pid: Option<i64>,
+    binding_ids: &[String],
+    exclude: &[u32],
+) -> ReapCapture {
+    #[cfg(unix)]
+    {
+        let mut scope = carrier_tree_scope(row_pid, binding_ids);
+        let carriers = snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
+        ReapCapture {
+            scope,
+            carriers,
+            incarnation: None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (name, row_pid, binding_ids, exclude);
+        ReapCapture { incarnation: None }
+    }
+}
+
+/// `row` and `binding_ids` must be ONE snapshot of the instance
+/// ([`HcomDb::get_instance_with_bindings`] or
+/// [`HcomDb::iter_instances_with_bindings`]): they become the captured
+/// incarnation. A row paired with another incarnation's binding epoch lets
+/// a stop bound to it release a row nobody resolved.
+pub(crate) fn capture_reap_carriers(
+    name: &str,
+    row: Option<&crate::db::InstanceRow>,
+    binding_ids: &[String],
+    exclude: &[u32],
+) -> ReapCapture {
+    let mut capture =
+        capture_reap_carriers_unbound(name, row.and_then(|row| row.pid), binding_ids, exclude);
+    // The snapshot's row feeds the bound incarnation as well as the roots.
+    capture.incarnation = row.map(|row| CapturedIncarnation {
+        created_at: row.created_at,
+        pid: row.pid,
+        session_id: row.session_id.clone(),
+        agent_id: row.agent_id.clone(),
+        binding_ids: binding_ids.to_vec(),
+    });
+    capture
+}
+
+#[cfg(unix)]
+fn carrier_identity(pid: u32) -> Option<String> {
+    #[cfg(test)]
+    if MISSING_CARRIER_IDENTITY.with(|missing| missing.get() == Some(pid)) {
+        return None;
+    }
+    crate::sys::process::identity(pid)
+}
+
+/// Build a round's live carrier set. Proven members from an earlier snapshot
+/// survive reparenting only with the same OS process identity; new carriers
+/// must pass ancestry and the broker rule at their first snapshot.
+/// An unreadable identity is not death: keep a live carrier in the round
+/// without granting it a signalable identity in `scope.known`.
+#[cfg(unix)]
+fn snapshot_reap_carriers(
+    name: &str,
+    binding_ids: &[String],
+    exclude: &[u32],
+    scope: &mut CarrierTreeScope,
+) -> Vec<ProcMatch> {
+    scope.excluded.clear();
+    scope.excluded.extend_from_slice(exclude);
+    let mut matches = live_carriers_for(name, binding_ids, exclude, Some(scope));
+    matches.retain(|m| {
+        let Some(identity) = carrier_identity(m.pid) else {
+            let alive = crate::sys::process::is_alive(m.pid);
+            if alive {
+                crate::log::log_info(
+                    "proctruth",
+                    "carrier_identity_unavailable",
+                    &format!("pid={} instance={name}", m.pid),
+                );
+            }
+            return alive;
+        };
+        match scope.known.get(&m.pid) {
+            Some((_, original)) => {
+                if original != &identity {
+                    log_carrier_out_of_scope(m.pid, name, scope);
+                    return false;
+                }
+                true
+            }
+            None => {
+                scope.known.insert(m.pid, (m.clone(), identity));
+                true
+            }
+        }
+    });
+    matches
+}
+
+/// An identity holder is signalable only when its parent chain reaches one
+/// of the captured roots. An unreadable or changing chain never proves
+/// ownership. A root itself counts, except if it is a caller ancestor.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn carrier_in_owner_tree_with(
+    pid: u32,
+    scope: &CarrierTreeScope,
+    parent_of: impl Fn(u32) -> Option<u32>,
+) -> bool {
+    if scope.caller_ancestors.last() != Some(&1) {
+        return false;
+    }
+    if scope.caller_ancestors.contains(&pid) {
+        return false;
+    }
+    let mut current = pid;
+    for _ in 0..1024 {
+        if scope.roots.contains(&current) {
+            return true;
+        }
+        let Some(parent) = parent_of(current) else {
+            return false;
+        };
+        if parent == current {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+#[cfg(unix)]
+fn log_carrier_out_of_scope(pid: u32, name: &str, scope: &CarrierTreeScope) {
+    crate::log::log_info(
+        "proctruth",
+        "carrier_out_of_scope",
+        &format!("pid={pid} instance={name} roots={:?}", scope.roots),
+    );
+}
+
+#[cfg(unix)]
+fn carrier_in_signal_scope(pid: u32, name: &str, scope: &CarrierTreeScope) -> bool {
+    if scope
+        .known
+        .get(&pid)
+        .is_some_and(|(_, identity)| carrier_identity(pid).as_ref() == Some(identity))
+    {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if carrier_in_owner_tree_with(pid, scope, parent_pid) {
+        return true;
+    }
+    log_carrier_out_of_scope(pid, name, scope);
+    false
+}
+
+#[cfg(unix)]
+fn enumerate_unix(
+    name: &str,
+    binding_ids: &[String],
+    scope: Option<&CarrierTreeScope>,
+) -> Vec<ProcMatch> {
     let want = format!("HCOM_INSTANCE_NAME={name}");
     let self_pid = std::process::id();
     let btime = system_btime();
@@ -235,6 +555,74 @@ fn enumerate_unix(name: &str, binding_ids: &[String]) -> Vec<ProcMatch> {
         // match (an absent HCOM_PROCESS_ID reads as empty).
         if !carries_name && !is_bound_process_id(&process_id, binding_ids) {
             continue;
+        }
+        let frozen = scope.and_then(|scope| scope.known.get(&pid));
+        if let Some((original, identity)) = frozen {
+            match carrier_identity(pid) {
+                Some(current) if current != *identity => {
+                    if let Some(scope) = scope {
+                        log_carrier_out_of_scope(pid, name, scope);
+                    }
+                    continue;
+                }
+                None => {
+                    // A proven carrier may have lost its parent already.
+                    // Missing identity cannot authorize a signal, but a live
+                    // pid still blocks release even without an ancestry path.
+                    if crate::sys::process::is_alive(pid) {
+                        out.push(ProcMatch {
+                            pid,
+                            process_id,
+                            start_epoch: original.start_epoch,
+                        });
+                    }
+                    continue;
+                }
+                Some(_) => {}
+            }
+        }
+        // A previously scoped descendant may have been reparented by an
+        // earlier signal. Keep its broker decision, but never signal a pid
+        // that has itself become the shared broker.
+        if frozen.is_some() {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if std::fs::read_to_string(format!("/proc/{pid}/comm")).map_or(true, |comm| {
+                comm.trim_end_matches('\n') == "omp daemon brok"
+            }) {
+                if let Some(scope) = scope {
+                    log_carrier_out_of_scope(pid, name, scope);
+                }
+                continue;
+            }
+        } else if !carrier_eligible(pid) {
+            // The broker rule's rejects are not carriers (ffc-vpjpg): shared
+            // daemons inheriting the identity are residue, never unproven
+            // ownership. An excluded one still counts as admitted (b58539b).
+            if let Some(scope) = scope {
+                if scope.excluded.contains(&pid) {
+                    scope.admitted.set(scope.admitted.get() + 1);
+                }
+                log_carrier_out_of_scope(pid, name, scope);
+            }
+            continue;
+        }
+        if scope.is_some_and(|scope| {
+            if !carrier_in_signal_scope(pid, name, scope) {
+                if scope.excluded.contains(&pid) {
+                    scope.admitted.set(scope.admitted.get() + 1);
+                } else {
+                    scope.drop_unproven(pid);
+                }
+                true
+            } else {
+                scope.admitted.set(scope.admitted.get() + 1);
+                false
+            }
+        }) {
+            continue;
+        }
+        if let Some(scope) = scope {
+            scope.admitted.set(scope.admitted.get() + 1);
         }
         // A second pass is unnecessary: process_id defaults to empty when
         // the entry is absent, which simply never matches a binding.
@@ -370,14 +758,45 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
     }
 }
 
-/// Reap every live process holding the instance: carriers of
-/// `HCOM_INSTANCE_NAME=<name>` plus carriers of any of the instance's
-/// binding process ids (the self-bound tree never carries the name).
+/// A reap cannot release ownership while carriers survive or its scope is unproven.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReapError {
+    // The non-Unix reap is a no-op success and never constructs this variant.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Survivors(Vec<u32>),
+    #[cfg(unix)]
+    UnprovenOwnership,
+}
+
+impl std::fmt::Display for ReapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Survivors(pids) => {
+                f.write_str("process(es) still alive after SIGKILL: ")?;
+                for (index, pid) in pids.iter().enumerate() {
+                    if index != 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{pid}")?;
+                }
+                Ok(())
+            }
+            #[cfg(unix)]
+            Self::UnprovenOwnership => {
+                f.write_str("cannot prove process ownership on this host; row left intact")
+            }
+        }
+    }
+}
+
+/// Reap every proven in-scope process holding the instance: descendants of
+/// an owning root carrying `HCOM_INSTANCE_NAME=<name>` or one of its binding
+/// process ids (the self-bound tree never carries the name).
 ///
 /// Oldest first (the pty wrapper predates its children), SIGTERM, wait up to
-/// 5 s, SIGKILL survivors, verify. Verification is by carrier set, not by pid
-/// snapshot: after each wait the tree is re-enumerated for carriers. A
-/// late-appearing carrier is signalable only in reap scope (see
+/// 5 s, SIGKILL survivors, verify. Verification re-enumerates carriers while
+/// retaining earlier proven PID incarnations after reparenting. A late
+/// carrier is signalable only when newly proven in scope (see
 /// [`carrier_in_reap_scope`]): a mid-reap fork carrying one of the call-start
 /// binding ids, one carrying a stale id no current binding claims, or one
 /// with no process id at all (the name-only late fork) is still signalled
@@ -386,9 +805,9 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
 /// binding epoch (a brand-new registration of a newer epoch) is spared and
 /// never blocks; conversely a snapshot pid recycled by an unrelated process
 /// no longer carries the name and is neither signalled nor counted (an EPERM
-/// on such a pid is not survival). Returns the surviving pids on failure — callers must
-/// not report success or release the row while any survive (fail-closed: the
-/// reap must reach `Ok(())` before any `stopped` write or binding release).
+/// on such a pid is not survival). Returns an error when carriers survive or
+/// the caller's ownership chain cannot be proven: the reap must reach `Ok(())`
+/// before any `stopped` write or binding release.
 ///
 /// The calling process is never signalled (see [`processes_for_instance`]).
 /// Zombies are excluded from verification: a SIGKILLed carrier stays visible
@@ -397,11 +816,13 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
 /// would wedge every stop behind an unreaped child.
 ///
 /// Unix only; elsewhere this is a no-op success.
+#[allow(dead_code)] // test-facing: the reap conveniences used by the unix
+// tests; production threads its own pre-signal capture.
 pub fn reap_instance_tree_for(
     db: &HcomDb,
     name: &str,
     binding_ids: &[String],
-) -> Result<(), Vec<u32>> {
+) -> Result<(), ReapError> {
     reap_instance_tree_for_excluding(db, name, binding_ids, &[])
 }
 
@@ -409,15 +830,21 @@ pub fn reap_instance_tree_for(
 /// are never signalled and never count as survivors, at any enumeration
 /// round (initial, KILL re-enumeration, verification).
 ///
+/// In every round a carrier must also be a descendant of the recorded pid,
+/// caller pid, or live minted `omp-<pid>-...` binding owner with comm exactly
+/// `omp`. Roots are fixed at entry; the same roots gate pre-signal rechecks.
+/// Caller ancestors are never signalled, even if also recorded roots. Other
+/// Unix systems cannot prove /proc ancestry and signal no carriers here.
+///
 /// The kill self-path uses this with [`caller_ancestor_pids`]: the caller
-/// runs inside the instance it is killing, so its own session tree must be
-/// spared while every other carrier is still reaped and still blocks success
-/// while it lives. Ordering is fail-closed: the kill runs this reap to
+/// runs inside the instance it is killing, so its own session ancestors
+/// are spared while other eligible carriers are reaped. Ordering is
+/// fail-closed: the kill runs this reap to
 /// `Ok(())` BEFORE writing `stopped` or releasing the row/bindings — a
 /// survivor returns `Err` and leaves ownership state untouched, so a failed
 /// reap can never be converted into a successful exit after the row is
 /// discarded (a kill never reports stopped or releases the row/bindings
-/// while any instance process may still be alive). An empty `exclude` is
+/// while an in-scope instance process may still be alive). An empty `exclude` is
 /// exactly [`reap_instance_tree_for`].
 ///
 /// Reap scope (the re-enumeration / KILL and verification rounds): a carrier
@@ -435,8 +862,8 @@ pub fn reap_instance_tree_for(
 /// (a genuine mid-reap fork inherits the old env), and one carrying a stale
 /// non-empty id that no current binding claims (a late child of the old
 /// instance inheriting an older era's id) — signalled, and while alive a
-/// survivor (fail-closed), so a dying tree that forks or hands out stale ids
-/// late leaves no unmanaged live descendant behind.
+/// survivor (fail-closed), provided its ancestry still reaches an owning
+/// root.
 ///
 /// Round ordering — the read-after-capture rule: every classification round
 /// (the KILL re-enumeration and the final verification alike) CAPTURES its
@@ -473,34 +900,59 @@ pub fn reap_instance_tree_for(
 /// while alive, a survivor (fail-closed).
 /// The row itself is torn down only while the incarnation the kill resolved
 /// against is still the row's (the kill command's teardown CAS).
+/// If every live identity carrier seen is outside the proven scope and no carrier was admitted, release fails closed with the row intact.
 ///
 /// `db` supplies the per-round binding registry read behind the epoch rule.
 /// Unix only; elsewhere this is a no-op success.
+#[allow(dead_code)] // test-facing: the reap conveniences used by the unix
+// tests; production threads its own pre-signal capture.
 pub fn reap_instance_tree_for_excluding(
     db: &HcomDb,
     name: &str,
     binding_ids: &[String],
     exclude: &[u32],
-) -> Result<(), Vec<u32>> {
+) -> Result<(), ReapError> {
+    // The caller's ids are the call-start epoch this convenience reaps; the
+    // row only supplies the recorded-pid root. The two are not one snapshot,
+    // so the capture binds NO incarnation: the reap consumes only scope and
+    // carriers, and nothing releases against it.
+    let row = db.get_instance_full(name).ok().flatten();
+    let capture =
+        capture_reap_carriers_unbound(name, row.and_then(|row| row.pid), binding_ids, exclude);
+    reap_instance_tree_for_excluding_captured(db, name, binding_ids, exclude, capture)
+}
+
+pub(crate) fn reap_instance_tree_for_excluding_captured(
+    db: &HcomDb,
+    name: &str,
+    binding_ids: &[String],
+    exclude: &[u32],
+    capture: ReapCapture,
+) -> Result<(), ReapError> {
     #[cfg(not(unix))]
     {
-        let _ = db;
-        let _ = name;
-        let _ = binding_ids;
-        let _ = exclude;
+        let _ = (db, name, binding_ids, exclude, capture);
         Ok(())
     }
     #[cfg(unix)]
     {
-        let mut matches = live_carriers_for(name, binding_ids, exclude);
-        if matches.is_empty() {
-            return Ok(());
+        let mut scope = capture.scope;
+        // On /proc platforms, an unanchored caller cannot authorize release.
+        // Other Unix hosts retain the baseline empty-reap success.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if scope.caller_ancestors.last() != Some(&1) {
+            return Err(ReapError::UnprovenOwnership);
         }
-        // Carriers of the first snapshot are this reap's own business and
-        // stay in scope at every round; only late-appearing carriers go
-        // through the scope rule below. `spared` captures each late
-        // carrier's spare decision once it is observed.
-        let started: Vec<u32> = matches.iter().map(|m| m.pid).collect();
+        // The first round uses the pre-signal capture itself. Re-enumerating
+        // here would wrongly TERM a carrier that arrived after that capture
+        // (and, on headless paths, after the group signal). An empty first
+        // capture still runs the KILL capture and epoch classification below:
+        // an excluded owner may have forked a carrier since stop entry.
+        let mut matches = capture.carriers;
+        // Only identified first-snapshot carriers belong to this epoch by
+        // fiat. Unidentified carriers still need the fresh-epoch check if
+        // their identity becomes readable in a later round.
+        let started: Vec<u32> = scope.known.keys().copied().collect();
         let mut spared: HashSet<u32> = HashSet::new();
         // Oldest first: pty wrapper before children.
         matches.sort_by(|a, b| {
@@ -511,7 +963,7 @@ pub fn reap_instance_tree_for_excluding(
         for m in &matches {
             // Pid-reuse guard: only signal a snapshot pid that still holds
             // the instance; a recycled pid belongs to someone else now.
-            if pid_carries_instance(m.pid, name, binding_ids) {
+            if pid_carries_instance(m.pid, name, binding_ids, &scope) {
                 signal(m.pid, libc::SIGTERM);
             }
         }
@@ -535,7 +987,8 @@ pub fn reap_instance_tree_for_excluding(
         // [`reap_instance_tree_for_excluding`]). A fresh process spawned
         // after the capture is outside the captured set entirely — never
         // classified here at all.
-        let captured: Vec<ProcMatch> = live_carriers_for(name, binding_ids, exclude);
+        let captured: Vec<ProcMatch> =
+            snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
         #[cfg(test)]
         fire_round_seam(RoundPoint::Captured);
         let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
@@ -546,6 +999,17 @@ pub fn reap_instance_tree_for_excluding(
             })
             .collect();
         if current.is_empty() {
+            // Ownership is unproven only while a dropped carrier still lives:
+            // one seen only before the signal, and dead since, owns nothing.
+            if scope.admitted.get() == 0
+                && scope
+                    .dropped_live
+                    .borrow()
+                    .iter()
+                    .any(|&pid| !process_gone(pid))
+            {
+                return Err(ReapError::UnprovenOwnership);
+            }
             return Ok(());
         }
         current.sort_by(|a, b| {
@@ -568,7 +1032,7 @@ pub fn reap_instance_tree_for_excluding(
             started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
         });
         for m in &current {
-            if pid_carries_instance(m.pid, name, binding_ids) {
+            if pid_carries_instance(m.pid, name, binding_ids, &scope) {
                 signal(m.pid, libc::SIGKILL);
             }
         }
@@ -582,7 +1046,8 @@ pub fn reap_instance_tree_for_excluding(
         // in-scope carrier still alive blocks success (fail-closed), while a
         // spared fresh registration never does — a spared carrier is never
         // counted as a survivor.
-        let captured: Vec<ProcMatch> = live_carriers_for(name, binding_ids, exclude);
+        let captured: Vec<ProcMatch> =
+            snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
         let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
         let still: Vec<u32> = captured
             .into_iter()
@@ -591,7 +1056,11 @@ pub fn reap_instance_tree_for_excluding(
             })
             .map(|m| m.pid)
             .collect();
-        if still.is_empty() { Ok(()) } else { Err(still) }
+        if still.is_empty() {
+            Ok(())
+        } else {
+            Err(ReapError::Survivors(still))
+        }
     }
 }
 
@@ -656,7 +1125,7 @@ fn carrier_in_reap_scope(
 /// firing is a no-op; never compiled outside `cfg(test)`.
 #[cfg(all(test, unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoundPoint {
+pub(crate) enum RoundPoint {
     /// The KILL round has captured its carrier set; its registry read is next.
     Captured,
     /// The KILL round has classified the captured set; the pre-signal
@@ -672,6 +1141,7 @@ type RoundSeamSlot = std::cell::RefCell<Option<Box<dyn FnMut(RoundPoint)>>>;
 #[cfg(all(test, unix))]
 thread_local! {
     static ROUND_SEAM: RoundSeamSlot = std::cell::RefCell::new(None);
+    static MISSING_CARRIER_IDENTITY: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(all(test, unix))]
@@ -681,6 +1151,12 @@ fn fire_round_seam(point: RoundPoint) {
             hook(point);
         }
     });
+}
+
+/// Arm this thread's reap round seam at an exact round boundary.
+#[cfg(all(test, unix))]
+pub(crate) fn arm_round_seam(hook: impl FnMut(RoundPoint) + 'static) {
+    ROUND_SEAM.with(|seam| *seam.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// Shell pid behind a self-bound process id: `omp-<pid>-…` → `<pid>`.
@@ -697,8 +1173,13 @@ fn shell_pid_from_process_id(process_id: &str) -> Option<u32> {
 /// minus the exclusion set (the caller's own session tree in the kill
 /// self-path — never signalled, never a survivor).
 #[cfg(unix)]
-fn live_carriers_for(name: &str, binding_ids: &[String], exclude: &[u32]) -> Vec<ProcMatch> {
-    processes_for_instance(name, binding_ids)
+fn live_carriers_for(
+    name: &str,
+    binding_ids: &[String],
+    exclude: &[u32],
+    scope: Option<&CarrierTreeScope>,
+) -> Vec<ProcMatch> {
+    enumerate_unix(name, binding_ids, scope)
         .into_iter()
         .filter(|m| !is_zombie(m.pid) && !exclude.contains(&m.pid))
         .collect()
@@ -712,7 +1193,7 @@ fn live_carriers_for(name: &str, binding_ids: &[String], exclude: &[u32]) -> Vec
 /// instance's carriers in its group.
 #[cfg(target_os = "linux")]
 pub(crate) fn group_holds_instance_carrier(pgid: u32, name: &str, binding_ids: &[String]) -> bool {
-    live_carriers_for(name, binding_ids, &[])
+    live_carriers_for(name, binding_ids, &[], None)
         .iter()
         .any(|m| process_group_id(m.pid) == Some(pgid))
 }
@@ -732,17 +1213,39 @@ pub(crate) fn pids_outside_group(pgid: u32, pids: &[u32]) -> bool {
     })
 }
 
-/// Pid-reuse guard: true when `pid` still holds the instance — exactly
-/// `HCOM_INSTANCE_NAME=<name>` or exactly `HCOM_PROCESS_ID=<id>` for one of
-/// the binding ids — in its environ. No other environ values are read. An
-/// unreadable environ (exited, or foreign-owned) reads as absent.
+/// Recheck identity and the captured process incarnation before signalling.
+/// Captured carriers keep their scope after their parents die. A live carrier
+/// without a captured OS identity blocks release but is never signalled.
 #[cfg(unix)]
-fn pid_carries_instance(pid: u32, name: &str, binding_ids: &[String]) -> bool {
+fn pid_carries_instance(
+    pid: u32,
+    name: &str,
+    binding_ids: &[String],
+    scope: &CarrierTreeScope,
+) -> bool {
     let want = format!("HCOM_INSTANCE_NAME={name}");
-    std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
+    let carries = std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
         let (carries_name, process_id) = identity_facts(&env, want.as_bytes());
         carries_name || is_bound_process_id(&process_id, binding_ids)
-    })
+    });
+    if !carries {
+        return false;
+    }
+    let Some((_, identity)) = scope.known.get(&pid) else {
+        return false;
+    };
+    if carrier_identity(pid).as_ref() != Some(identity) {
+        log_carrier_out_of_scope(pid, name, scope);
+        return false;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if std::fs::read_to_string(format!("/proc/{pid}/comm")).map_or(true, |comm| {
+        comm.trim_end_matches('\n') == "omp daemon brok"
+    }) {
+        log_carrier_out_of_scope(pid, name, scope);
+        return false;
+    }
+    carrier_in_signal_scope(pid, name, scope)
 }
 
 #[cfg(unix)]
@@ -1070,8 +1573,23 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             );
             continue;
         }
-        // Vanished: snapshot, stopped by=daemon, release.
+        // Vanished: snapshot, stopped by=daemon, release. The exact bit
+        // pattern rides beside created_at so a later reader can match the
+        // incarnation without a lossy float decode.
         let snapshot = db.get_instance_snapshot(&inst.name).unwrap_or(None);
+        let snapshot = snapshot.map(|mut snapshot| {
+            if let Some(created_at) = snapshot
+                .get("created_at")
+                .and_then(serde_json::Value::as_f64)
+                && let Some(object) = snapshot.as_object_mut()
+            {
+                object.insert(
+                    "created_at_bits".to_string(),
+                    serde_json::json!(created_at.to_bits()),
+                );
+            }
+            snapshot
+        });
         let process_id = newest.as_ref().map(|(p, _)| p.as_str());
         let data = serde_json::json!({
             "action": "stopped",
@@ -1083,6 +1601,7 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         match db.finalize_instance_stop(
             &inst.name,
             inst.created_at,
+            inst.pid,
             inst.session_id.as_deref(),
             inst.agent_id.as_deref(),
             &data,
@@ -1140,6 +1659,105 @@ mod tests {
         (h.finish() % 900000) as u32 + 100000
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn broker_carrier_eligibility_decision_table() {
+        let facts = [
+            (10, "omp", 1),
+            (20, "omp daemon brok\n", 10),
+            (21, "chromium", 20),
+            (22, "omp", 20),
+            (23, "sh", 22),
+            (24, "omp daemon brok", 22),
+            (25, "sh", 24),
+            (26, "sh", 10),
+            (27, "omp daemon broker", 10),
+            (28, "omp", 24),
+            (29, "omp daemon bro", 10),
+            (30, "chromium", 9999),
+        ];
+        for (pid, eligible) in [
+            (10, true),  // Owner above the broker.
+            (20, false), // Broker itself, even below an omp.
+            (21, false), // Shared daemon immediately below broker.
+            (22, true),  // Nested omp itself counts.
+            (23, true),  // Nested omp's tool shell.
+            (24, false), // Nearest broker wins over an outer nested omp.
+            (25, false), // Inner broker's daemon.
+            (26, true),  // Ordinary owner child, no broker.
+            (27, true),  // Exact comm match, not prefix match.
+            (28, true),  // A new omp below the inner broker.
+            (29, true),  // Shorter lookalike is not a broker.
+            (30, true),  // Unknown ancestry preserves the existing rule.
+        ] {
+            assert_eq!(
+                carrier_eligible_with(
+                    pid,
+                    |id| facts
+                        .iter()
+                        .find(|(p, _, _)| *p == id)
+                        .map(|(_, c, _)| c.to_string()),
+                    |id| facts
+                        .iter()
+                        .find(|(p, _, _)| *p == id)
+                        .map(|(_, _, parent)| *parent)
+                ),
+                eligible,
+                "pid {pid}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn carrier_tree_scope_requires_descendance_and_never_signals_ancestors() {
+        let scope = CarrierTreeScope {
+            // Caller, recorded instance pid, verified minted omp owner.
+            roots: vec![10, 20, 30],
+            caller_ancestors: vec![10, 2, 1],
+            known: HashMap::new(),
+            excluded: Vec::new(),
+            dropped_live: std::cell::RefCell::new(Vec::new()),
+            admitted: std::cell::Cell::new(0),
+        };
+        let parents = [
+            (10, 2),
+            (20, 1),
+            (21, 20),
+            (22, 21),
+            (30, 1),
+            (31, 30),
+            (40, 1),
+            (41, 40),
+            (50, 50),
+            (2, 1),
+        ];
+        for (pid, eligible) in [
+            (10, false), // Caller root is never signalled.
+            (2, false),  // Nor an ancestor, even if it carried the identity.
+            (20, true),  // Recorded root itself.
+            (21, true),  // Recorded root descendant.
+            (22, true),  // Grandchild.
+            (30, true),  // Verified minted-omp root itself.
+            (31, true),  // Verified minted-omp root descendant.
+            (40, false), // Unrelated process beside the owner.
+            (41, false), // Descendant of that unrelated process.
+            (50, false), // Malformed cyclic ancestry.
+            (60, false), // Missing /proc link.
+        ] {
+            assert_eq!(
+                carrier_in_owner_tree_with(pid, &scope, |current| {
+                    parents
+                        .iter()
+                        .find(|(id, _)| *id == current)
+                        .map(|(_, parent)| *parent)
+                }),
+                eligible,
+                "pid {pid}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     fn spawn_named_sleeper(name: &str, process_id: &str) -> std::process::Child {
         std::process::Command::new("sleep")
@@ -1153,13 +1771,363 @@ mod tests {
             .expect("spawn sleep")
     }
 
-    /// Arm this thread's reap round seam (`fire_round_seam`): `hook` runs on
-    /// the calling thread at the named round boundary. The reaper thread
-    /// arms it before its reap call, so a test lands actions at one exact
-    /// instruction boundary of the round instead of racing the clock.
-    #[cfg(unix)]
-    fn arm_round_seam(hook: impl FnMut(RoundPoint) + 'static) {
-        ROUND_SEAM.with(|seam| *seam.borrow_mut() = Some(Box::new(hook)));
+    #[cfg(target_os = "linux")]
+    fn insert_null_pid_row(db: &HcomDb, name: &str, process_id: &str) {
+        let now = crate::shared::time::now_epoch_f64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id) \
+                 VALUES (?1, 'active', ?2, 'codex', 'sess-carrier')",
+                rusqlite::params![name, now],
+            )
+            .unwrap();
+        db.set_process_binding(process_id, "sess-carrier", name)
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn kill_releases_never_succeed_while_an_unsignalled_identity_carrier_lives() {
+        let db = test_db();
+        let name = unique_name("unproven-release");
+        let process_id = format!("proc-{}", rand_suffix());
+        insert_null_pid_row(&db, &name, &process_id);
+        let carrier = spawn_detached_named_sleeper(&name, &process_id);
+        wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
+        let outcome = crate::hooks::common::stop_instance(&db, &name, "test", "stopped");
+        assert!(matches!(
+            outcome,
+            crate::hooks::common::StopOutcome::RetryableError(_)
+        ));
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_eq!(db.process_binding_ids(&name).unwrap(), vec![process_id]);
+        assert!(!process_gone(carrier));
+        unsafe { libc::kill(carrier as libc::pid_t, libc::SIGKILL) };
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bulk_kill_scope_is_captured_before_the_first_signal() {
+        let db = test_db();
+        let name = unique_name("bulk-pre-signal");
+        let process_id = format!("proc-{}", rand_suffix());
+        insert_null_pid_row(&db, &name, &process_id);
+        let carrier = spawn_detached_named_sleeper(&name, &process_id);
+        wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
+        let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
+        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[]);
+        let result = reap_instance_tree_for_excluding_captured(&db, &name, &bindings, &[], capture);
+        assert!(result.is_err());
+        assert!(!process_gone(carrier));
+        unsafe { libc::kill(carrier as libc::pid_t, libc::SIGKILL) };
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn empty_reap_still_releases_a_vanished_instance() {
+        let db = test_db();
+        let name = unique_name("empty-release");
+        insert_null_pid_row(&db, &name, &format!("proc-{}", rand_suffix()));
+        let outcome = crate::hooks::common::stop_instance(&db, &name, "test", "stopped");
+        assert_eq!(outcome, crate::hooks::common::StopOutcome::Stopped);
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rooted_tree_release_skips_unrootable_identity_carriers() {
+        let db = test_db();
+        let name = unique_name("rooted-release");
+        let token = format!("proc-{}", rand_suffix());
+        insert_null_pid_row(&db, &name, &token);
+        let mut rooted = spawn_named_sleeper(&name, &token);
+        let detached = spawn_detached_named_sleeper(&name, &token);
+        let bindings = db.process_binding_ids(&name).unwrap();
+        wait_for_enumerated(&name, &bindings, rooted.id());
+        wait_for_enumerated(&name, &bindings, detached);
+        let result = reap_instance_tree_for_excluding(&db, &name, &bindings, &[]);
+        assert!(result.is_ok());
+        rooted.wait().ok();
+        assert!(!process_gone(detached));
+        unsafe { libc::kill(detached as libc::pid_t, libc::SIGKILL) };
+    }
+
+    /// Bulk kill against a `start --as` rebind landing between the pre-signal
+    /// capture and the release: the capture binds incarnation A, so B's row,
+    /// bindings, and live process are not its to touch, and the site reports
+    /// the name skipped rather than stopped.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stop_with_capture_refuses_release_when_the_incarnation_rebound() {
+        let db = test_db();
+        let name = unique_name("rebound");
+        let token_a = format!("proc-{}", rand_suffix());
+        insert_null_pid_row(&db, &name, &token_a);
+        // A's own carrier sits in the test's tree, so the capture admits it.
+        let mut carrier_a = spawn_named_sleeper(&name, &token_a);
+        let (row_a, bindings_a) = db.get_instance_with_bindings(&name).unwrap();
+        wait_for_enumerated(&name, &bindings_a, carrier_a.id());
+        let capture = capture_reap_carriers(&name, row_a.as_ref(), &bindings_a, &[]);
+        // The kill's group signal takes A down.
+        carrier_a.kill().ok();
+        carrier_a.wait().ok();
+
+        // `start --as` replaces the row and its bindings with incarnation B.
+        let token_b = format!("proc-{}", rand_suffix());
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM instances WHERE name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        let created_b = crate::shared::time::now_epoch_f64() + 1.0;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id) \
+                 VALUES (?1, 'active', ?2, 'codex', 'sess-rebound')",
+                rusqlite::params![name, created_b],
+            )
+            .unwrap();
+        db.set_process_binding(&token_b, "sess-rebound", &name)
+            .unwrap();
+        let carrier_b = spawn_detached_named_sleeper(&name, &token_b);
+        wait_for_enumerated(&name, std::slice::from_ref(&token_b), carrier_b);
+
+        let outcome =
+            crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
+        let row = db.get_instance_full(&name).unwrap();
+        let b_alive = !process_gone(carrier_b);
+        unsafe { libc::kill(carrier_b as libc::pid_t, libc::SIGKILL) };
+
+        assert!(
+            row.is_some_and(|row| row.created_at.to_bits() == created_b.to_bits()),
+            "B's row must survive a release bound to A's capture"
+        );
+        assert_eq!(db.process_binding_ids(&name).unwrap(), vec![token_b]);
+        assert!(b_alive, "B's process must be unharmed");
+        assert!(outcome.is_re_registered(), "{outcome:?}");
+        let line = crate::hooks::common::skipped_stop_line(&name);
+        assert_eq!(
+            line,
+            format!("{name} skipped: row re-registered during stop")
+        );
+        assert!(!line.contains("Stopped"), "{line}");
+    }
+
+    /// A `start --as` rebind landing after a bulk kill read the name. The
+    /// kill resolved A, row and bindings in one snapshot; the replacement B
+    /// was just created, so it has no bindings yet and no carrier of its
+    /// own. Nothing but the incarnation guard stands between the stop and
+    /// B's live row: B must survive, reported skipped.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bulk_stop_does_not_release_a_replacement_row_with_no_bindings() {
+        let db = test_db();
+        let name = unique_name("rebind-unbound");
+        let token_a = format!("proc-{}", rand_suffix());
+        insert_null_pid_row(&db, &name, &token_a);
+
+        // The bulk kill's one snapshot: A's row with A's binding epoch.
+        let (row_a, bindings_a) = db
+            .iter_instances_with_bindings()
+            .unwrap()
+            .into_iter()
+            .find(|(row, _)| row.name == name)
+            .expect("A in the snapshot");
+
+        // `start --as` by A's own session: row and bindings are deleted and
+        // the row recreated in separate commits, same session, no bindings.
+        db.conn()
+            .execute(
+                "DELETE FROM instances WHERE name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        let created_b = crate::shared::time::now_epoch_f64() + 1.0;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id) \
+                 VALUES (?1, 'active', ?2, 'codex', 'sess-carrier')",
+                rusqlite::params![name, created_b],
+            )
+            .unwrap();
+
+        // The pre-signal capture, built from that snapshot alone.
+        let capture = capture_reap_carriers(&name, Some(&row_a), &bindings_a, &[]);
+        let outcome =
+            crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
+
+        let row = db.get_instance_full(&name).unwrap();
+        assert!(
+            row.is_some_and(|row| row.created_at.to_bits() == created_b.to_bits()),
+            "the live replacement row must survive the stop: {outcome:?}"
+        );
+        assert!(outcome.is_re_registered(), "{outcome:?}");
+    }
+
+    /// The binding epoch only ever adds refusals to the row identity. A
+    /// captured epoch emptied under the same row identity refuses the
+    /// release: an unbound replacement looks exactly like that, so an empty
+    /// set never passes for a non-empty capture.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bulk_stop_refuses_a_captured_epoch_emptied_under_the_same_row() {
+        let db = test_db();
+        let name = unique_name("epoch-emptied");
+        insert_null_pid_row(&db, &name, &format!("proc-{}", rand_suffix()));
+        let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
+        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[]);
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?1",
+                rusqlite::params![name],
+            )
+            .unwrap();
+
+        let outcome =
+            crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
+        assert!(outcome.is_re_registered(), "{outcome:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_some(), "row kept");
+    }
+
+    /// The other side of that rule: a session that shrank its own epoch to a
+    /// non-empty subset is still the captured incarnation, and releases.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bulk_stop_releases_a_captured_epoch_its_session_shrank() {
+        let db = test_db();
+        let name = unique_name("epoch-shrunk");
+        let kept = format!("proc-{}-kept", rand_suffix());
+        let released = format!("proc-{}-released", rand_suffix());
+        insert_null_pid_row(&db, &name, &kept);
+        db.set_process_binding(&released, "sess-carrier", &name)
+            .unwrap();
+        let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
+        assert_eq!(bindings.len(), 2);
+        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[]);
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE process_id = ?1",
+                rusqlite::params![released],
+            )
+            .unwrap();
+
+        let outcome =
+            crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
+        assert_eq!(outcome, crate::hooks::common::StopOutcome::Stopped);
+        assert!(
+            db.get_instance_full(&name).unwrap().is_none(),
+            "row released"
+        );
+    }
+
+    /// A name-carrying sleeper that leads its own session and process group,
+    /// outside the test's tree (the `sh` parent exits). Returns its pid, which
+    /// is also its group id.
+    #[cfg(target_os = "linux")]
+    fn spawn_detached_group_leader(name: &str) -> u32 {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("setsid sleep 300 >/dev/null 2>&1 & echo $!")
+            .env("HCOM_INSTANCE_NAME", name)
+            .env_remove("HCOM_PROCESS_ID")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("spawn group leader");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("group leader pid")
+    }
+
+    /// The orphan arm captures before its group signal. A row-less orphan
+    /// has no row root, so its live group is dropped unproven; once the
+    /// signal kills it nothing lives, and the reap must not refuse on a
+    /// carrier that existed only in the pre-signal snapshot.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unproven_refusal_requires_a_live_carrier_at_decision() {
+        let db = test_db();
+        let name = unique_name("orphan-group");
+        let leader = spawn_detached_group_leader(&name);
+        wait_for_enumerated(&name, &[], leader);
+        let capture = capture_reap_carriers(&name, None, &[], &[]);
+        // The orphan arm's group signal.
+        unsafe { libc::kill(-(leader as libc::pid_t), libc::SIGKILL) };
+        for _ in 0..100 {
+            if process_gone(leader) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(process_gone(leader), "group signal must kill the leader");
+        let result = reap_instance_tree_for_excluding_captured(&db, &name, &[], &[], capture);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// A stale row whose owners are gone while the shared broker still
+    /// carries the identity it inherited from the first session. Broker
+    /// residue is not a carrier (ffc-vpjpg), so it cannot hold the release.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stale_row_releases_when_only_broker_identity_residue_remains() {
+        let db = test_db();
+        let name = unique_name("broker-residue");
+        insert_null_pid_row(&db, &name, &format!("proc-{}", rand_suffix()));
+        // The kernel names a process after the file it was exec'd through.
+        // bash, unlike multicall coreutils, runs under any name; its builtin
+        // `read` blocks on the held pipe without forking.
+        let dir = tempfile::tempdir().unwrap();
+        let broker_exe = dir.path().join("omp daemon brok");
+        let bash = ["/usr/bin/bash", "/bin/bash"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .expect("bash binary");
+        std::os::unix::fs::symlink(bash, &broker_exe).unwrap();
+        let mut broker = std::process::Command::new(&broker_exe)
+            .args(["-c", "read -r -t 300 _"])
+            .env("HCOM_INSTANCE_NAME", &name)
+            .env_remove("HCOM_PROCESS_ID")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn broker stand-in");
+        // The broker rule hides it from `processes_for_instance`, so wait for
+        // the exec itself: comm and environ switch together.
+        let comm_path = format!("/proc/{}/comm", broker.id());
+        let mut comm = String::new();
+        for _ in 0..100 {
+            comm = std::fs::read_to_string(&comm_path).unwrap_or_default();
+            if comm.trim_end() == "omp daemon brok" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let outcome = crate::hooks::common::stop_instance(&db, &name, "test", "stopped");
+        let broker_alive = !process_gone(broker.id());
+        broker.kill().ok();
+        broker.wait().ok();
+
+        assert_eq!(comm.trim_end(), "omp daemon brok");
+        assert_eq!(outcome, crate::hooks::common::StopOutcome::Stopped);
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert!(broker_alive, "the broker is never signalled");
     }
 
     /// The round seam as a rendezvous: the reaper blocks at `point` until
@@ -1253,6 +2221,59 @@ mod tests {
     fn reap_empty_name_is_noop_ok() {
         let db = test_db();
         assert!(reap_instance_tree_for(&db, &unique_name("empty"), &[]).is_ok());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn reap_refuses_unanchored_caller_scope() {
+        let db = test_db();
+        let capture = ReapCapture {
+            scope: CarrierTreeScope {
+                roots: vec![std::process::id()],
+                caller_ancestors: vec![std::process::id()],
+                known: HashMap::new(),
+                excluded: Vec::new(),
+                dropped_live: std::cell::RefCell::new(Vec::new()),
+                admitted: std::cell::Cell::new(0),
+            },
+            carriers: Vec::new(),
+            incarnation: None,
+        };
+        assert!(
+            reap_instance_tree_for_excluding_captured(
+                &db,
+                &unique_name("unanchored"),
+                &[],
+                &[],
+                capture,
+            )
+            .is_err(),
+            "an unproven owner chain must never authorize release",
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn reap_keeps_live_unidentified_carriers_as_unsignalable_survivors() {
+        for previously_identified in [false, true] {
+            let db = test_db();
+            let name = unique_name("missing-identity");
+            let mut child = spawn_named_sleeper(&name, "");
+            let pid = child.id();
+            wait_for_enumerated(&name, &[], pid);
+            if !previously_identified {
+                MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
+            }
+            let capture = capture_reap_carriers(&name, None, &[], &[]);
+            MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
+            let result = reap_instance_tree_for_excluding_captured(&db, &name, &[], &[], capture);
+            MISSING_CARRIER_IDENTITY.with(|missing| missing.set(None));
+            let alive = !process_gone(pid);
+            child.kill().ok();
+            child.wait().ok();
+            assert!(alive, "an unidentified carrier must not be signalled");
+            assert_eq!(result, Err(ReapError::Survivors(vec![pid])));
+        }
     }
 
     #[test]
@@ -1427,7 +2448,15 @@ mod tests {
             "process_id": "proc-old", "snapshot": null,
         });
         let won = db
-            .finalize_instance_stop("stale-row", created, None, None, &data, Some("proc-old"))
+            .finalize_instance_stop(
+                "stale-row",
+                created,
+                None,
+                None,
+                None,
+                &data,
+                Some("proc-old"),
+            )
             .unwrap();
         assert!(!won, "stale process_id must not win the release");
         assert!(
@@ -1469,7 +2498,15 @@ mod tests {
             "process_id": "proc-current", "snapshot": null,
         });
         let won = db
-            .finalize_instance_stop("cur-row", created, None, None, &data, Some("proc-current"))
+            .finalize_instance_stop(
+                "cur-row",
+                created,
+                None,
+                None,
+                None,
+                &data,
+                Some("proc-current"),
+            )
             .unwrap();
         assert!(won, "current process_id releases the row");
         assert!(db.get_instance_full("cur-row").unwrap().is_none());

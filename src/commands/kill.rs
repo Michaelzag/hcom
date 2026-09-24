@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::db::HcomDb;
-use crate::hooks::common::{StopOutcome, stop_instance, stop_instance_without_reap};
+use crate::hooks::common::{StopOutcome, stop_instance_without_reap};
 use crate::identity;
 use crate::log::log_info;
 use crate::paths;
@@ -244,31 +244,40 @@ pub fn kill_tracked_instance(
         name,
         initiator,
         &crate::proctruth::caller_ancestor_pids(),
-        |n, b, e| crate::proctruth::reap_instance_tree_for_excluding(db, n, b, e),
+        |n, b, e, capture| {
+            crate::proctruth::reap_instance_tree_for_excluding_captured(db, n, b, e, capture)
+        },
     )
 }
 
 /// [`kill_tracked_instance`] with an injectable self set and reap:
 /// production passes [`crate::proctruth::caller_ancestor_pids`] and the real
-/// [`crate::proctruth::reap_instance_tree_for_excluding`]; tests pass a fake
-/// set holding a sleeper pid plus the real caller pid, and a reap that can
-/// mutate the row mid-kill (the teardown CAS seam).
+/// [`crate::proctruth::reap_instance_tree_for_excluding_captured`]; tests
+/// pass a fake set holding a sleeper pid plus the real caller pid, and a reap
+/// that can mutate the row mid-kill (the teardown CAS seam).
 #[allow(clippy::too_many_arguments)]
 fn kill_tracked_instance_with_self_pids(
     db: &HcomDb,
     name: &str,
     initiator: &str,
     self_pids: &[u32],
-    reap: impl FnOnce(&str, &[String], &[u32]) -> Result<(), Vec<u32>>,
+    reap: impl FnOnce(
+        &str,
+        &[String],
+        &[u32],
+        crate::proctruth::ReapCapture,
+    ) -> Result<(), crate::proctruth::ReapError>,
 ) -> Result<KillTrackedResult, String> {
-    let inst = db
-        .get_instance_full(name)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Agent '{}' not found", name))?;
+    // The row and its binding epoch come from ONE snapshot: separate reads
+    // can straddle a `start --as` and pair one incarnation's row with
+    // another's bindings.
+    let (inst, binding_ids) = db
+        .get_instance_with_bindings(name)
+        .map_err(|e| e.to_string())?;
+    let inst = inst.ok_or_else(|| format!("Agent '{}' not found", name))?;
     let pid = inst
         .pid
         .ok_or_else(|| format!("No tracked PID for '{}'", name))? as u32;
-    let binding_ids = db.process_binding_ids(name).map_err(|e| e.to_string())?;
 
     // The incarnation this kill resolves against: the row as read plus its
     // binding epoch, and the events watermark read with it. Captured BEFORE
@@ -276,19 +285,31 @@ fn kill_tracked_instance_with_self_pids(
     // is still the row's.
     let incarnation =
         ResolvedIncarnation::capture(db, &inst, &binding_ids).map_err(|e| e.to_string())?;
+    let _teardown_claim = crate::hooks::common::TeardownClaim::register(
+        db,
+        name,
+        incarnation.token.created_at,
+        incarnation.token.session_id.as_deref(),
+    );
 
     // Self-kill check BEFORE any signal: when the caller runs inside the
     // instance it is killing, the carrier set holds the caller's own session
     // tree — signalling it would kill this command mid-run and lose the
     // `stopped` write. That path spares the caller's tree (`excluded` below),
-    // reaps every other carrier FIRST, and fails closed: the row and
-    // bindings are torn down only once no non-self carrier remains.
+    // reaps every other eligible carrier FIRST, and fails closed: the row and
+    // bindings are torn down only once no in-scope non-self carrier remains.
     let self_set: HashSet<u32> = self_pids.iter().copied().collect();
     let excluded: Vec<u32> = crate::proctruth::processes_for_instance(name, &binding_ids)
         .into_iter()
         .map(|m| m.pid)
         .filter(|p| self_set.contains(p))
         .collect();
+    // Capture identity, owner ancestry, and the first carrier set before
+    // kill_instance signals the recorded process group. Its root may die and
+    // reparent eligible descendants before reap begins. Built from the same
+    // snapshot as the incarnation above.
+    let capture =
+        crate::proctruth::capture_reap_carriers(name, Some(&inst), &binding_ids, &excluded);
     if !excluded.is_empty() {
         return kill_self_tracked_instance(
             db,
@@ -298,6 +319,7 @@ fn kill_tracked_instance_with_self_pids(
             &binding_ids,
             &excluded,
             &incarnation,
+            capture,
             reap,
         );
     }
@@ -306,12 +328,11 @@ fn kill_tracked_instance_with_self_pids(
     let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
         kill_instance(db, name, pid, &inst, is_headless);
     // Fail-closed ordering, shared with the self path: reap and verify the
-    // whole carrier set FIRST — a survivor fails the kill with the row and
-    // bindings untouched (reporting success while name-carrying processes
-    // live is the orphan bug) — and only then run the teardown write, and
+    // captured in-scope carrier set FIRST — a survivor fails the kill with
+    // the row and bindings untouched — and only then run the teardown write,
     // only while the resolved incarnation is still the row's (see
     // [`teardown_if_incarnation_unchanged`]).
-    if let Err(survivors) = reap(name, &binding_ids, &[]) {
+    if let Err(survivors) = reap(name, &binding_ids, &[], capture) {
         return Err(survivors_error(name, &survivors));
     }
     let teardown = teardown_if_incarnation_unchanged(db, name, initiator, &incarnation)?;
@@ -329,17 +350,9 @@ fn kill_tracked_instance_with_self_pids(
     })
 }
 
-/// The fail-closed survivor error shared by the self and foreign paths: the
-/// kill reports the survivors and leaves the row and bindings untouched.
-fn survivors_error(name: &str, survivors: &[u32]) -> String {
-    let pids = survivors
-        .iter()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "could not stop {name}: process(es) still alive after SIGKILL: {pids} — run hcom kill {name} first"
-    )
+/// A refused reap leaves the row and bindings available for a retry.
+fn survivors_error(name: &str, error: &crate::proctruth::ReapError) -> String {
+    format!("could not stop {name}: {error} — run hcom kill {name} first")
 }
 
 /// Re-read the incarnation token of `name` through the teardown transaction;
@@ -412,21 +425,25 @@ fn teardown_if_incarnation_unchanged(
 }
 
 /// Why the teardown CAS lost, read-only inside the same teardown
-/// transaction. The session's own exit routinely finalizes the row while the
-/// kill runs — the harness's SessionEnd hook (`by = session`) or the PTY
-/// wrapper's exit cleanup (`by = pty`, see
-/// `delivery::cleanup_deleted_instance`); that is a self-stop, not a
-/// re-registration. Self-stop: a `life`/`stopped` event by one of those for
+/// transaction. A session hook already running before the claim, or the
+/// PTY wrapper's exit cleanup (`by = pty`, see
+/// `delivery::cleanup_deleted_instance`), may finalize the row while the
+/// kill runs. That is a self-stop, not a re-registration: a `life`/`stopped`
+/// event by one of those for
 /// this instance written after the kill resolved its target (id above the
 /// watermark), keyed to one of the resolved bindings — or, when no process
 /// is named, carrying the resolved incarnation's `created_at` in its
-/// snapshot (the same identity the CAS compares, so a re-registered
-/// bindingless incarnation finalizing mid-kill is not mistaken for the
-/// session) — and not a `stale-harness-exit` (a stale harness declining to
+/// snapshot (as its exact `created_at_bits` when present, else the legacy
+/// `created_at` itself — the same identity the CAS compares, so a
+/// re-registered bindingless incarnation finalizing mid-kill is not
+/// mistaken for the session) — and not a `stale-harness-exit` (a stale
 /// touch a rebound row). Then a gone row was released by the session, and a
 /// row with the same `created_at` + `session_id` whose bindings only shrank
 /// was kept by it. Anything else — no such event, a new identity, or any
-/// binding the kill never resolved — is a genuine re-registration.
+/// binding the kill never resolved — is a genuine re-registration. An event
+/// with neither bits nor a readable legacy `created_at` (no snapshot, or a
+/// `created_at` that is absent, null, non-numeric, or not a scalar) names
+/// no incarnation: it is logged and never taken for the resolved one.
 /// `current` is the incarnation the CAS just read in this transaction.
 fn classify_lost_teardown(
     tx: &rusqlite::Transaction<'_>,
@@ -436,27 +453,59 @@ fn classify_lost_teardown(
 ) -> Result<TeardownOutcome> {
     let token = &incarnation.token;
     let mut stmt = tx.prepare(
-        "SELECT json_extract(data, '$.process_id'), \
-                json_extract(data, '$.snapshot.created_at') FROM events \
+        "SELECT id, json_extract(data, '$.process_id'), \
+                json_extract(data, '$.snapshot.created_at_bits'), \
+                json_extract(data, '$.snapshot') FROM events \
          WHERE type = 'life' AND instance = ?1 AND id > ?2 \
            AND json_extract(data, '$.action') = 'stopped' \
            AND json_extract(data, '$.by') IN ('session', 'pty') \
            AND COALESCE(json_extract(data, '$.reason'), '') != 'stale-harness-exit'",
     )?;
-    let mut process_ids = stmt
-        .query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
-            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<f64>>(1)?))
+    let mut process_ids =
+        stmt.query_map(rusqlite::params![name, incarnation.event_watermark], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<i64>>(2)?.map(|bits| bits as u64),
+                r.get::<_, Option<String>>(3)?,
+            ))
         })?;
     let mut self_stop = false;
     for row in &mut process_ids {
-        let (process_id, snapshot_created_at) = row?;
+        let (event_id, process_id, snapshot_created_at_bits, snapshot) = row?;
         let matches = match process_id {
             Some(id) => token.binding_ids.contains(&id),
-            // A null process_id is not proof on its own: the event must
-            // carry the RESOLVED incarnation's created_at. A re-registered
-            // bindingless incarnation snapshots its OWN created_at, so its
-            // exit is a re-registration, not a self-stop.
-            None => snapshot_created_at == Some(token.created_at),
+            None => match snapshot_created_at_bits {
+                // Snapshot bits are an exact JSON integer representation of
+                // the f64 identity; decoding the fractional number can change
+                // its ULP. Bits are authoritative whenever present.
+                Some(bits) => bits == token.created_at.to_bits(),
+                // Mixed-version window: a stopped event written by a pre-v20
+                // binary carries only the legacy `created_at`. Match it on
+                // the exact bit pattern of its raw JSON token — the correctly
+                // rounded decode the backfill uses — so a missing bits field
+                // is never treated as a mismatch.
+                None => match snapshot.as_deref().and_then(crate::db::raw_created_at_bits) {
+                    Some(bits) => bits == token.created_at.to_bits(),
+                    // No incarnation to read: never guessed to be this one.
+                    // Logged, so the conservative report is explained.
+                    None => {
+                        crate::log::log_warn(
+                            "kill",
+                            "teardown.stop_event_unreadable",
+                            &format!(
+                                "instance={name} event={event_id} reason={}",
+                                if snapshot.is_some() {
+                                    "unreadable-created_at"
+                                } else {
+                                    "no-snapshot"
+                                }
+                            ),
+                        );
+                        false
+                    }
+                },
+            },
         };
         if matches {
             self_stop = true;
@@ -506,11 +555,17 @@ fn kill_self_tracked_instance(
     binding_ids: &[String],
     excluded: &[u32],
     incarnation: &ResolvedIncarnation,
-    reap: impl FnOnce(&str, &[String], &[u32]) -> Result<(), Vec<u32>>,
+    capture: crate::proctruth::ReapCapture,
+    reap: impl FnOnce(
+        &str,
+        &[String],
+        &[u32],
+        crate::proctruth::ReapCapture,
+    ) -> Result<(), crate::proctruth::ReapError>,
 ) -> Result<KillTrackedResult, String> {
     // Signal and verify the non-self carriers FIRST. On survivors: bail
     // exactly like the foreign path, before touching the row or bindings.
-    if let Err(survivors) = reap(name, binding_ids, excluded) {
+    if let Err(survivors) = reap(name, binding_ids, excluded, capture) {
         return Err(survivors_error(name, &survivors));
     }
     let teardown = teardown_if_incarnation_unchanged(db, name, initiator, incarnation)?;
@@ -759,34 +814,73 @@ fn pane_info_str(pane_closed: bool, preset_name: &str, pane_id: &str) -> String 
 /// it holds, by name or (self-bound trees) by its process id. Returns true
 /// when anything survived — the caller must keep the pidtrack handle so a
 /// retry can rediscover the orphan.
-fn reap_orphan_tree(db: &HcomDb, orphan: &crate::pidtrack::OrphanProcess) -> bool {
+fn reap_orphan_tree(
+    db: &HcomDb,
+    orphan: &crate::pidtrack::OrphanProcess,
+    captures: Vec<(String, crate::proctruth::ReapCapture)>,
+) -> bool {
     let ids: &[String] = if orphan.process_id.is_empty() {
         &[]
     } else {
         std::slice::from_ref(&orphan.process_id)
     };
     let mut survived = false;
-    for orphan_name in &orphan.names {
-        if let Err(survivors) = crate::proctruth::reap_instance_tree_for(db, orphan_name, ids) {
-            eprintln!(
-                "Processes still alive for '{}' after SIGKILL: {} — run hcom kill {} first",
-                orphan_name,
-                survivors
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                orphan_name,
-            );
+    for (orphan_name, capture) in captures {
+        if let Err(survivors) = crate::proctruth::reap_instance_tree_for_excluding_captured(
+            db,
+            &orphan_name,
+            ids,
+            &[],
+            capture,
+        ) {
+            eprintln!("{}", survivors_error(&orphan_name, &survivors));
             survived = true;
         }
     }
     survived
 }
 
+fn capture_orphan_carriers(
+    db: &HcomDb,
+    orphan: &crate::pidtrack::OrphanProcess,
+) -> Vec<(String, crate::proctruth::ReapCapture)> {
+    orphan
+        .names
+        .iter()
+        .map(|name| {
+            let (row, binding_ids) = db.get_instance_with_bindings(name).unwrap_or_default();
+            (
+                name.clone(),
+                crate::proctruth::capture_reap_carriers(name, row.as_ref(), &binding_ids, &[]),
+            )
+        })
+        .collect()
+}
+
+/// Report a bulk kill's release of `name`; true when it counts against the
+/// kill. A release skipped because the row was re-registered mid-kill is
+/// not a stop either: the new row is live.
+fn report_release_failure(name: &str, outcome: &StopOutcome) -> bool {
+    if outcome.is_re_registered() {
+        eprintln!("{}", crate::hooks::common::skipped_stop_line(name));
+        return true;
+    }
+    if let StopOutcome::RetryableError(e) = outcome {
+        eprintln!("Error releasing '{name}': {e}");
+        return true;
+    }
+    false
+}
+
 /// Kill all instances.
+///
+/// The enumeration is the snapshot: every row and its process bindings are
+/// read in one read transaction, and each row's signal, pre-signal capture,
+/// and release all derive from that one pair. A `start --as` landing after
+/// the snapshot meets the release's incarnation guard; nothing re-reads the
+/// row to resolve it.
 fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<i32> {
-    let instances = db.iter_instances_full()?;
+    let instances = db.iter_instances_with_bindings()?;
     let mut killed = 0;
     let mut failed = 0;
     let mut incomplete = 0;
@@ -794,12 +888,16 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
     // Collect active PIDs for orphan filtering
     let mut active_pids = HashSet::new();
 
-    for inst in &instances {
+    for (inst, binding_ids) in &instances {
         // Skip remote instances
         if inst.origin_device_id.is_some() {
             continue;
         }
 
+        // Before any signal, from the snapshot: binds the release below to
+        // this incarnation, pid-less rows included.
+        let pre_capture =
+            crate::proctruth::capture_reap_carriers(&inst.name, Some(inst), binding_ids, &[]);
         if let Some(pid) = inst.pid {
             active_pids.insert(pid as u32);
             let is_headless = inst.background != 0;
@@ -833,27 +931,32 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
             // The release reaps the whole tree; a failure means live
             // processes remain, so it counts against the kill.
-            if let StopOutcome::RetryableError(e) =
-                stop_instance(db, &inst.name, initiator, "killed")
-            {
-                eprintln!("Error releasing '{}': {e}", inst.name);
-                failed += 1;
-            }
+            let outcome = crate::hooks::common::stop_instance_with_capture(
+                db,
+                &inst.name,
+                initiator,
+                "killed",
+                pre_capture,
+            );
+            failed += report_release_failure(&inst.name, &outcome) as i32;
             println!("  To resume: hcom r {}", inst.name);
         } else {
             // No PID tracked — just clean up
-            if let StopOutcome::RetryableError(e) =
-                stop_instance(db, &inst.name, initiator, "killed")
-            {
-                eprintln!("Error releasing '{}': {e}", inst.name);
-                failed += 1;
-            }
+            let outcome = crate::hooks::common::stop_instance_with_capture(
+                db,
+                &inst.name,
+                initiator,
+                "killed",
+                pre_capture,
+            );
+            failed += report_release_failure(&inst.name, &outcome) as i32;
         }
     }
 
     // Kill orphans too
     let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
     for orphan in &orphans {
+        let pre_capture = capture_orphan_carriers(db, orphan);
         let (result, pane_closed, pane_retry_command) = terminal::kill_process(
             orphan.pid,
             &orphan.terminal_preset,
@@ -895,7 +998,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         // Verify the whole carrier set, not just the recorded group: a
         // self-bound tree never carries the orphan's names. Survivors keep
         // their pidtrack handle for a retry.
-        let reap_failed = reap_orphan_tree(db, orphan);
+        let reap_failed = reap_orphan_tree(db, orphan, pre_capture);
         failed += reap_failed as i32;
         if !reap_failed {
             pidtrack::remove_pid(hcom_dir, orphan.pid);
@@ -916,12 +1019,13 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
     Ok(if failed > 0 || incomplete > 0 { 1 } else { 0 })
 }
 
-/// Kill instances by tag.
+/// Kill instances by tag. Resolved like [`kill_all`]: one snapshot of rows
+/// and bindings feeds each row's signal, capture, and release.
 fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &str) -> Result<i32> {
-    let instances = db.iter_instances_full()?;
+    let instances = db.iter_instances_with_bindings()?;
     let tagged: Vec<_> = instances
         .iter()
-        .filter(|inst| inst.tag.as_deref() == Some(tag) && inst.origin_device_id.is_none())
+        .filter(|(inst, _)| inst.tag.as_deref() == Some(tag) && inst.origin_device_id.is_none())
         .collect();
 
     let mut killed = 0;
@@ -929,7 +1033,10 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     let mut incomplete = 0;
 
     // Kill active instances with this tag
-    for inst in &tagged {
+    for (inst, binding_ids) in &tagged {
+        // Before any signal, from the snapshot (see `kill_all`).
+        let pre_capture =
+            crate::proctruth::capture_reap_carriers(&inst.name, Some(inst), binding_ids, &[]);
         if let Some(pid) = inst.pid {
             let is_headless = inst.background != 0;
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
@@ -960,32 +1067,37 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
             }
             incomplete +=
                 report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-            if let StopOutcome::RetryableError(e) =
-                stop_instance(db, &inst.name, initiator, "killed")
-            {
-                eprintln!("Error releasing '{}': {e}", inst.name);
-                failed += 1;
-            }
+            let outcome = crate::hooks::common::stop_instance_with_capture(
+                db,
+                &inst.name,
+                initiator,
+                "killed",
+                pre_capture,
+            );
+            failed += report_release_failure(&inst.name, &outcome) as i32;
         } else {
             // No PID tracked — clean up DB entry
             println!("No tracked process for '{}', stopping instance.", inst.name);
-            if let StopOutcome::RetryableError(e) =
-                stop_instance(db, &inst.name, initiator, "killed")
-            {
-                eprintln!("Error releasing '{}': {e}", inst.name);
-                failed += 1;
-            }
+            let outcome = crate::hooks::common::stop_instance_with_capture(
+                db,
+                &inst.name,
+                initiator,
+                "killed",
+                pre_capture,
+            );
+            failed += report_release_failure(&inst.name, &outcome) as i32;
         }
     }
 
     // Also kill orphan processes with this tag (stopped but still running)
     let active_pids: HashSet<u32> = tagged
         .iter()
-        .filter_map(|i| i.pid.map(|p| p as u32))
+        .filter_map(|(inst, _)| inst.pid.map(|p| p as u32))
         .collect();
     let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
     let tagged_orphans: Vec<_> = orphans.iter().filter(|o| o.tag == tag).collect();
     for orphan in &tagged_orphans {
+        let pre_capture = capture_orphan_carriers(db, orphan);
         let names = orphan.names.join(", ");
         let (result, pane_closed, pane_retry_command) = terminal::kill_process(
             orphan.pid,
@@ -1019,7 +1131,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         }
         incomplete +=
             report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-        let reap_failed = reap_orphan_tree(db, orphan);
+        let reap_failed = reap_orphan_tree(db, orphan, pre_capture);
         failed += reap_failed as i32;
         if !reap_failed {
             pidtrack::remove_pid(hcom_dir, orphan.pid);
@@ -1057,6 +1169,7 @@ fn kill_single(
                     || o.process_id == target
                     || target_pid == Some(o.pid)
             }) {
+                let pre_capture = capture_orphan_carriers(db, orphan);
                 let (result, pane_closed, pane_retry_command) = terminal::kill_process(
                     orphan.pid,
                     &orphan.terminal_preset,
@@ -1091,7 +1204,7 @@ fn kill_single(
                 // live processes still holding the orphan's names — by name
                 // or, for self-bound trees, by its process id — so the
                 // kill is verified whole-instance, not single-pid.
-                let reap_failed = reap_orphan_tree(db, orphan);
+                let reap_failed = reap_orphan_tree(db, orphan, pre_capture);
                 // Keep the pidtrack handle while survivors live: it is the
                 // only handle by which a retry can rediscover this orphan.
                 // Dropping it on reap failure would force a hand-kill from
@@ -1622,8 +1735,8 @@ mod tests {
     /// and events watermark), captured the way production does.
     #[cfg(unix)]
     fn capture_incarnation(db: &crate::db::HcomDb, name: &str) -> ResolvedIncarnation {
-        let row = db.get_instance_full(name).unwrap().expect("row");
-        ResolvedIncarnation::capture(db, &row, &db.process_binding_ids(name).unwrap()).unwrap()
+        let (row, binding_ids) = db.get_instance_with_bindings(name).unwrap();
+        ResolvedIncarnation::capture(db, &row.expect("row"), &binding_ids).unwrap()
     }
 
     /// A: kill reaps the whole name tree — even processes outside the
@@ -1744,9 +1857,17 @@ mod tests {
         let kill_name = name.clone();
         let killer = std::thread::spawn(move || {
             let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
-            kill_tracked_instance_with_self_pids(&db, &kill_name, "test", &self_set, |n, b, e| {
-                crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e)
-            })
+            kill_tracked_instance_with_self_pids(
+                &db,
+                &kill_name,
+                "test",
+                &self_set,
+                |n, b, e, capture| {
+                    crate::proctruth::reap_instance_tree_for_excluding_captured(
+                        &db, n, b, e, capture,
+                    )
+                },
+            )
         });
 
         // Invariant poll on a second connection: the release must never be
@@ -1856,7 +1977,7 @@ mod tests {
             .unwrap();
         db.set_process_binding("proc-kill-fc", "sess-kill-fc", &name)
             .unwrap();
-        let binding_ids = db.process_binding_ids(&name).unwrap();
+        let (row, binding_ids) = db.get_instance_with_bindings(&name).unwrap();
         let incarnation = capture_incarnation(&db, &name);
 
         // A name-only carrier that outlives the signal budget — reported as
@@ -1874,7 +1995,8 @@ mod tests {
             &binding_ids,
             &excluded,
             &incarnation,
-            |_, _, _| Err(vec![survivor_pid]),
+            crate::proctruth::capture_reap_carriers(&name, row.as_ref(), &binding_ids, &excluded),
+            |_, _, _, _capture| Err(crate::proctruth::ReapError::Survivors(vec![survivor_pid])),
         )
         .err()
         .expect("a non-self survivor must fail the kill");
@@ -1940,11 +2062,16 @@ mod tests {
         wait_for_enumerated(&name, spid);
 
         let self_set = vec![std::process::id()];
-        let result =
-            kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, b, e| {
-                crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e)
-            })
-            .unwrap_or_else(|e| panic!("foreign kill must succeed: {e}"));
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            &name,
+            "test",
+            &self_set,
+            |n, b, e, capture| {
+                crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture)
+            },
+        )
+        .unwrap_or_else(|e| panic!("foreign kill must succeed: {e}"));
         assert_eq!(result.self_excluded, 0, "no self overlap, no self report");
         sleeper.wait().ok();
         assert!(
@@ -1990,7 +2117,7 @@ mod tests {
             .unwrap();
         db.set_process_binding("proc-kill-rb-old", "sess-kill-rb", &name)
             .unwrap();
-        let binding_ids = db.process_binding_ids(&name).unwrap();
+        let (row, binding_ids) = db.get_instance_with_bindings(&name).unwrap();
 
         // The old incarnation's live tree; the real reap below must take it
         // even though the row is rebound before the teardown.
@@ -2008,10 +2135,13 @@ mod tests {
             &binding_ids,
             &excluded,
             &incarnation,
-            |n, b, e| {
+            crate::proctruth::capture_reap_carriers(&name, row.as_ref(), &binding_ids, &excluded),
+            |n, b, e, capture| {
                 // The real reap, then the mid-kill rebind: same name, new
                 // binding epoch (the `start --as` shape).
-                let out = crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e);
+                let out = crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, b, e, capture,
+                );
                 db.conn()
                     .execute(
                         "DELETE FROM process_bindings WHERE instance_name = ?1",
@@ -2119,8 +2249,12 @@ mod tests {
         // Name-only incarnation: no bindings at all, before or after.
 
         let self_set = vec![std::process::id()];
-        let result =
-            kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            &name,
+            "test",
+            &self_set,
+            |n, _, _, _capture| {
                 // The name-only rebind: bindings stay empty, the session
                 // changes.
                 db.conn()
@@ -2130,8 +2264,9 @@ mod tests {
                     )
                     .unwrap();
                 Ok(())
-            })
-            .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
+            },
+        )
+        .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
 
         assert_eq!(result.teardown, TeardownOutcome::RowReRegistered);
         let row = db
@@ -2148,6 +2283,15 @@ mod tests {
             "the plain CAS-skip report is what the CLI prints"
         );
         let _ = _guard;
+    }
+
+    #[cfg(unix)]
+    fn assert_killed_by(db: &HcomDb, name: &str, initiator: &str) {
+        let records: Vec<(String, String)> = db.conn().prepare(
+            "SELECT json_extract(data, '$.reason'), json_extract(data, '$.by') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped'",
+        ).unwrap().query_map(rusqlite::params![name], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(records, vec![("killed".to_string(), initiator.to_string())]);
     }
 
     /// Insert a bound row (recorded pid already dead) with a live
@@ -2176,16 +2320,12 @@ mod tests {
         sleeper
     }
 
-    /// Self-stop, soft: the harness's own shutdown hook (SIGTERM →
-    /// `soft_finalize_session`, the omp/agy path) finalizes the row while the
-    /// kill runs — bindings released, row kept for resume, `stopped` written
-    /// by the session. The kill's CAS genuinely loses (the binding set
-    /// shrank), but nothing re-registered: the report must say the session
-    /// shut itself down and kept its row, not that the row was re-registered.
+    /// The soft shutdown hook yields to the kill's claim, leaving the kill
+    /// to publish the stopped record under its initiator.
     #[test]
     #[cfg(unix)]
     #[serial]
-    fn kill_reports_session_self_stop_when_harness_soft_finalizes_mid_kill() {
+    fn kill_owns_teardown_when_harness_soft_finalizes_mid_kill() {
         let _guard = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
@@ -2195,43 +2335,38 @@ mod tests {
         let mut sleeper =
             seed_bound_row_with_sleeper(&db, &name, "proc-kill-soft", "sess-kill-soft");
         let spid = sleeper.id();
-        let created_at = db.get_instance_full(&name).unwrap().unwrap().created_at;
 
         let self_set = vec![std::process::id()];
-        let result =
-            kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, b, e| {
-                // The real reap, then the harness's own shutdown hook firing
-                // on the SIGTERM: soft finalize, process bindings released.
-                let out = crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e);
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            &name,
+            "test",
+            &self_set,
+            |n, b, e, capture| {
+                // The real reap, then the harness's own shutdown hook.
+                let out = crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, b, e, capture,
+                );
                 crate::hooks::common::soft_finalize_session(&db, n, "shutdown", None, false);
                 out
-            })
-            .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
+            },
+        )
+        .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
 
         sleeper.wait().ok();
-        assert_eq!(result.teardown, TeardownOutcome::SessionStoppedKeptRow);
+        assert_eq!(result.teardown, TeardownOutcome::Completed);
         assert!(!crate::sys::process::is_alive(spid), "sleeper reaped");
-        let row = db
-            .get_instance_full(&name)
-            .unwrap()
-            .expect("the soft stop keeps the row as a resume handle");
-        assert_eq!(row.created_at, created_at, "same incarnation kept");
-        assert_eq!(
-            stopped_events(&db, &name),
-            1,
-            "only the session's own stopped event; the kill wrote none"
-        );
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert_killed_by(&db, &name, "test");
         let _ = _guard;
     }
 
-    /// Self-stop, hard: the harness's own shutdown hook runs the full
-    /// `finalize_session` mid-kill and deletes the row. The kill's CAS loses
-    /// (row gone), but nothing re-registered: the report must say the session
-    /// shut itself down and released its row.
+    /// The hard SessionEnd hook also yields: the kill owns the stopped
+    /// record rather than reporting a session-initiated teardown.
     #[test]
     #[cfg(unix)]
     #[serial]
-    fn kill_reports_session_self_stop_when_harness_finalizes_row_mid_kill() {
+    fn kill_owns_teardown_when_harness_finalizes_row_mid_kill() {
         let _guard = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
@@ -2243,38 +2378,146 @@ mod tests {
         let spid = sleeper.id();
 
         let self_set = vec![std::process::id()];
-        let result =
-            kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, b, e| {
-                // The real reap, then the harness's own SessionEnd: full
-                // finalize, row and bindings deleted.
-                let out = crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e);
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            &name,
+            "test",
+            &self_set,
+            |n, b, e, capture| {
+                // The real reap, then the harness's own SessionEnd.
+                let out = crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, b, e, capture,
+                );
                 assert_eq!(
                     crate::hooks::common::finalize_session(&db, n, "shutdown", None),
-                    StopOutcome::Stopped
+                    StopOutcome::AlreadyStopped
                 );
                 out
-            })
-            .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
+            },
+        )
+        .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
 
         sleeper.wait().ok();
-        assert_eq!(result.teardown, TeardownOutcome::SessionStoppedReleasedRow);
+        assert_eq!(result.teardown, TeardownOutcome::Completed);
         assert!(!crate::sys::process::is_alive(spid), "sleeper reaped");
-        assert!(
-            db.get_instance_full(&name).unwrap().is_none(),
-            "the session released its row"
-        );
-        assert_eq!(
-            stopped_events(&db, &name),
-            1,
-            "only the session's own stopped event; the kill wrote none"
-        );
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert_killed_by(&db, &name, "test");
         let _ = _guard;
     }
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[serial]
+    fn kill_reaps_late_child_after_excluded_only_capture() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = format!("hcom-kill-{}-empty-capture", std::process::id());
+        let mut owner =
+            seed_bound_row_with_sleeper(&db, &name, "proc-empty-capture", "sess-empty-capture");
+        let mut late = None;
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            &name,
+            "test",
+            &[std::process::id(), owner.id()],
+            |n, bindings, excluded, capture| {
+                let child = spawn_named_sleeper(n, "");
+                wait_for_enumerated(n, child.id());
+                late = Some(child);
+                crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, bindings, excluded, capture,
+                )
+            },
+        );
+        let mut late = late.expect("reap callback ran");
+        let late_alive = !crate::proctruth::process_gone(late.id());
+        let owner_alive = crate::sys::process::is_alive(owner.id());
+        late.kill().ok();
+        late.wait().ok();
+        owner.kill().ok();
+        owner.wait().ok();
+        assert!(owner_alive, "the excluded owner must not be signalled");
+        assert!(!late_alive, "the late child must be gone before teardown");
+        assert_eq!(result.unwrap().teardown, TeardownOutcome::Completed);
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert_killed_by(&db, &name, "test");
+    }
 
-    /// Precedence: the session soft-stops itself mid-kill AND a fresh process
-    /// then binds to the kept row (the omp resume shape). The self-stop event
-    /// exists, but a binding the kill never resolved is a genuine
-    /// re-registration — today's report, not the self-stop one.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_failure_after_session_yield_keeps_exit_state_and_bindings() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        for soft in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+            db.init_db().unwrap();
+            let name = format!("hcom-kill-{}-yield-failure-{soft}", std::process::id());
+            let mut survivor =
+                seed_bound_row_with_sleeper(&db, &name, "proc-yield-failure", "sess-yield-failure");
+            let pid = survivor.id();
+            db.conn()
+                .execute(
+                    "UPDATE instances SET status = 'listening' WHERE name = ?",
+                    rusqlite::params![name],
+                )
+                .unwrap();
+            let bindings = db.process_binding_ids(&name).unwrap();
+            let result = kill_tracked_instance_with_self_pids(
+                &db,
+                &name,
+                "test",
+                &[std::process::id()],
+                |n, _, _, _| {
+                    let updates = serde_json::json!({"transcript_path": "/ended/transcript"});
+                    if soft {
+                        crate::hooks::common::soft_finalize_session(
+                            &db,
+                            n,
+                            "shutdown",
+                            updates.as_object(),
+                            false,
+                        );
+                    } else {
+                        assert_eq!(
+                            crate::hooks::common::finalize_session(
+                                &db,
+                                n,
+                                "shutdown",
+                                updates.as_object()
+                            ),
+                            StopOutcome::AlreadyStopped,
+                        );
+                    }
+                    // Model an unkillable survivor after its one-shot hook
+                    // has yielded. The guard drops without replaying the hook.
+                    Err(crate::proctruth::ReapError::Survivors(vec![pid]))
+                },
+            );
+            let alive = crate::sys::process::is_alive(pid);
+            survivor.kill().ok();
+            survivor.wait().ok();
+
+            let error = result.err().expect("survivors fail the kill");
+            assert!(error.contains(&pid.to_string()), "{error}");
+            assert!(alive, "the injected reap leaves its survivor alone");
+            let row = db.get_instance_full(&name).unwrap().expect("row retained");
+            assert_eq!(row.status, crate::shared::ST_INACTIVE);
+            assert_eq!(row.status_context, "exit:shutdown");
+            assert_eq!(row.transcript_path, "/ended/transcript");
+            assert_eq!(db.process_binding_ids(&name).unwrap(), bindings);
+            assert_eq!(stopped_events(&db, &name), 0);
+            assert!(
+                db.kv_get(&format!("teardown_claim:{name}"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    /// Precedence: a PTY stop lands mid-kill, then a fresh process binds to
+    /// the kept row. The new binding is still a genuine re-registration.
     #[test]
     #[cfg(unix)]
     #[serial]
@@ -2289,15 +2532,36 @@ mod tests {
             seed_bound_row_with_sleeper(&db, &name, "proc-kill-sr-old", "sess-kill-sr");
 
         let self_set = vec![std::process::id()];
-        let result =
-            kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, b, e| {
-                let out = crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e);
-                crate::hooks::common::soft_finalize_session(&db, n, "shutdown", None, false);
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            &name,
+            "test",
+            &self_set,
+            |n, b, e, capture| {
+                let out = crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, b, e, capture,
+                );
+                db.log_life_event(
+                    n,
+                    "stopped",
+                    "pty",
+                    "killed",
+                    None,
+                    Some("proc-kill-sr-old"),
+                )
+                .unwrap();
+                db.conn()
+                    .execute(
+                        "DELETE FROM process_bindings WHERE instance_name = ?",
+                        rusqlite::params![n],
+                    )
+                    .unwrap();
                 db.set_process_binding("proc-kill-sr-new", "sess-kill-sr", n)
                     .unwrap();
                 out
-            })
-            .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
+            },
+        )
+        .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
 
         sleeper.wait().ok();
         assert_eq!(result.teardown, TeardownOutcome::RowReRegistered);
@@ -2325,16 +2589,51 @@ mod tests {
         let spid = sleeper.id();
         let mut wrapper_db = crate::db::HcomDb::open_raw(db_path).unwrap();
         let self_set = vec![std::process::id()];
-        let result =
-            kill_tracked_instance_with_self_pids(&db, name, "test", &self_set, |n, b, e| {
-                let out = crate::proctruth::reap_instance_tree_for_excluding(&db, n, b, e);
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            name,
+            "test",
+            &self_set,
+            |n, b, e, capture| {
+                let out = crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, b, e, capture,
+                );
                 exit(&mut wrapper_db, n);
                 out
-            })
-            .unwrap_or_else(|e| panic!("a PTY exit is not a kill failure: {e}"));
+            },
+        )
+        .unwrap_or_else(|e| panic!("a PTY exit is not a kill failure: {e}"));
         sleeper.wait().ok();
         assert!(!crate::sys::process::is_alive(spid), "sleeper reaped");
         result.teardown
+    }
+
+    /// A PTY soft exit can still win teardown while a kill claim is live.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_reports_session_self_stop_when_pty_keeps_row_mid_kill() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        let name = format!("hcom-kill-{}-pty-kept", std::process::id());
+        let outcome = kill_mid_pty_exit(&db_path, &name, "proc-pty-kept", |wrapper, n| {
+            wrapper
+                .log_life_event(n, "stopped", "pty", "killed", None, Some("proc-pty-kept"))
+                .unwrap();
+            wrapper
+                .conn()
+                .execute(
+                    "DELETE FROM process_bindings WHERE instance_name = ?",
+                    rusqlite::params![n],
+                )
+                .unwrap();
+        });
+        assert_eq!(outcome, TeardownOutcome::SessionStoppedKeptRow);
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_killed_by(&db, &name, "pty");
     }
 
     /// Self-stop, PTY: the wrapper's own exit cleanup (`by = pty`, keyed to
@@ -2455,6 +2754,75 @@ mod tests {
         let _ = _guard;
     }
 
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn kill_recognizes_bindingless_pty_stop_for_resolved_incarnation() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = format!("hcom-kill-{}-bindingless-stop", std::process::id());
+        let mut sleeper = seed_bound_row_with_sleeper(
+            &db,
+            &name,
+            "proc-bindingless-stop",
+            "sess-bindingless-stop",
+        );
+        // The bindingless branch is keyed to the exact `created_at` bit
+        // pattern, so the fixture's stopped snapshot carries it the way the
+        // PTY wrapper's exit cleanup writes it (see
+        // `delivery::cleanup_deleted_instance`).
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = 42 WHERE name = ?",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?",
+                rusqlite::params![name],
+            )
+            .unwrap();
+        let result = kill_tracked_instance_with_self_pids(
+            &db,
+            &name,
+            "test",
+            &[std::process::id()],
+            |n, bindings, excluded, capture| {
+                crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, bindings, excluded, capture,
+                )?;
+                let snapshot = db.get_instance_snapshot(n).unwrap().map(|mut snapshot| {
+                    if let Some(created_at) = snapshot
+                        .get("created_at")
+                        .and_then(serde_json::Value::as_f64)
+                        && let Some(object) = snapshot.as_object_mut()
+                    {
+                        object.insert(
+                            "created_at_bits".to_string(),
+                            serde_json::json!(created_at.to_bits()),
+                        );
+                    }
+                    snapshot
+                });
+                db.log_life_event(n, "stopped", "pty", "killed", snapshot, None)
+                    .unwrap();
+                db.delete_instance(n).unwrap();
+                Ok(())
+            },
+        );
+        sleeper.kill().ok();
+        sleeper.wait().ok();
+        assert_eq!(
+            result.unwrap().teardown,
+            TeardownOutcome::SessionStoppedReleasedRow
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert_killed_by(&db, &name, "pty");
+    }
+
     /// A bindingless re-incarnation finalizing mid-kill is a re-registration,
     /// not this session's self-stop: a null-process_id stopped event is only
     /// trusted when its snapshot carries the RESOLVED incarnation's
@@ -2502,6 +2870,507 @@ mod tests {
             "only the fresh incarnation's stopped event; the kill wrote none"
         );
         let _ = _guard;
+    }
+
+    /// The pre-#21 writer's rows still release. 0.7.29 wrote
+    /// `instances.created_at` as a fractional f64 through exactly the writer
+    /// below; every release path binds the value re-read from that same row
+    /// in the same transaction as the delete. One row per release path, each
+    /// asserted GONE afterwards — the ghost-row failure is any path that
+    /// leaves the row behind.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn rows_written_by_the_0_7_29_writer_release_through_close_kill_and_sweep() {
+        // ULP-critical: both float decoders in the stack mangle this one, a
+        // correctly rounded parse does not.
+        const FRACTIONAL: f64 = 1_790_000_000.000_002_1;
+        assert_eq!(FRACTIONAL.to_bits(), 4_745_294_612_153_761_801);
+
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+
+        // (i) close — the byte-identical 0.7.29 production writer.
+
+        let close_name = format!("hcom-close-{}-oldwriter", std::process::id());
+        assert!(
+            crate::instance_binding::initialize_instance_in_position_file(
+                &db,
+                &close_name,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        );
+        let close_row = db
+            .get_instance_full(&close_name)
+            .unwrap()
+            .expect("0.7.29 writer stored the row");
+        assert_ne!(
+            close_row.created_at.fract(),
+            0.0,
+            "0.7.29 wrote a fractional created_at"
+        );
+        let closed = crate::hooks::common::stop_instance(&db, &close_name, "test", "test-close");
+        assert!(
+            db.get_instance_full(&close_name).unwrap().is_none(),
+            "close left a ghost row for {close_name}: {closed:?}"
+        );
+        assert_eq!(closed, crate::hooks::common::StopOutcome::Stopped);
+
+        // (ii) kill — the same writer, pinned to a ULP-critical value.
+        let kill_name = format!("hcom-kill-{}-oldwriter", std::process::id());
+        legacy_row(&db, &kill_name, FRACTIONAL);
+        db.update_instance_pid(&kill_name, dead_pid()).unwrap();
+        db.set_process_binding("proc-oldwriter", &format!("sess-{kill_name}"), &kill_name)
+            .unwrap();
+        let killed = kill_tracked_instance_with_self_pids(
+            &db,
+            &kill_name,
+            "test",
+            &[std::process::id()],
+            |n, bindings, excluded, capture| {
+                crate::proctruth::reap_instance_tree_for_excluding_captured(
+                    &db, n, bindings, excluded, capture,
+                )
+            },
+        )
+        .unwrap_or_else(|e| panic!("a release through kill is not a kill failure: {e}"));
+        assert_eq!(killed.teardown, TeardownOutcome::Completed);
+        assert!(
+            db.get_instance_full(&kill_name).unwrap().is_none(),
+            "kill left a ghost row for {kill_name}"
+        );
+
+        // (iii) sweep — the same deterministic write, released by the daemon.
+        let sweep_name = format!("hcom-sweep-{}-oldwriter", std::process::id());
+        legacy_row(&db, &sweep_name, FRACTIONAL);
+        // Positive death evidence: the `omp-<pid>` binding the sweep reads
+        // (off Linux it skips inactive rows, hence the active status).
+        let evidence_pid = dead_pid();
+        db.set_process_binding(
+            &format!("omp-{evidence_pid}"),
+            &format!("sess-{sweep_name}"),
+            &sweep_name,
+        )
+        .unwrap();
+        let swept = crate::proctruth::sweep_vanished_instances(&db);
+        assert!(
+            swept.contains(&sweep_name),
+            "sweep held the vanished row: {swept:?}"
+        );
+        assert!(
+            db.get_instance_full(&sweep_name).unwrap().is_none(),
+            "sweep left a ghost row for {sweep_name}"
+        );
+        let _ = _guard;
+    }
+
+    /// The 0.7.29 row writer: the same `serde_json::Map` shape
+    /// `initialize_instance_in_position_file` builds (see the
+    /// `data.insert("created_at", json!(now))` there), with `created_at`
+    /// pinned to `now` so the release CAS runs against a fixed,
+    /// ULP-critical value instead of whatever the clock produced. `pid` and
+    /// the bindings are attached afterwards by the release path's caller —
+    /// 0.7.29's `start` filled those in separately too.
+    #[cfg(unix)]
+    fn legacy_row(db: &HcomDb, name: &str, now: f64) {
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!(name));
+        data.insert("last_event_id".into(), serde_json::json!(0));
+        data.insert("directory".into(), serde_json::json!(""));
+        data.insert("last_stop".into(), serde_json::json!(0));
+        data.insert("created_at".into(), serde_json::json!(now));
+        data.insert(
+            "session_id".into(),
+            serde_json::json!(format!("sess-{name}")),
+        );
+        data.insert("transcript_path".into(), serde_json::json!(""));
+        data.insert("name_announced".into(), serde_json::json!(0));
+        data.insert("tag".into(), serde_json::Value::Null);
+        data.insert("status".into(), serde_json::json!("active"));
+        data.insert(
+            "status_time".into(),
+            serde_json::json!(crate::shared::time::now_epoch_i64()),
+        );
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("tool".into(), serde_json::json!("codex"));
+        data.insert("background".into(), serde_json::json!(0));
+        data.insert("wait_timeout".into(), serde_json::json!(86400));
+        assert!(db.save_instance_named(name, &data).unwrap());
+    }
+
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// A bindingless self-stop is recognized on the EXACT `created_at` bit
+    /// pattern, not on a float round trip. Measured on this build,
+    /// `json_extract` decodes 1762720048.770769 exactly (...223), so the
+    /// f64 compare happens to agree here; serde_json's own f64 parser does
+    /// not (it mangles ~1 value in 8, e.g. 1790000000.0000021 -> ...800).
+    /// The integer bit pattern removes the decoder from the comparison
+    /// entirely, and this pins that contract on the bindingless branch: a
+    /// null-`process_id` stop is a self-stop only on the exact bits.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn classify_lost_teardown_matches_bindingless_stops_on_exact_created_at_bits() {
+        const CREATED_AT: f64 = 1_762_720_048.770_769;
+        assert_eq!(CREATED_AT.to_bits(), 4_745_180_191_745_201_223);
+
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = format!("hcom-kill-{}-bits", std::process::id());
+
+        // The session's own stopped record, written through the production
+        // snapshot shape: the fractional created_at beside its exact bit
+        // pattern, and no process named (bindingless).
+        db.log_life_event(
+            &name,
+            "stopped",
+            "session",
+            "exit:normal",
+            Some(serde_json::json!({
+                "name": name,
+                "created_at": CREATED_AT,
+                "created_at_bits": CREATED_AT.to_bits(),
+            })),
+            None,
+        )
+        .unwrap();
+
+        let incarnation = ResolvedIncarnation {
+            token: IncarnationToken::new(CREATED_AT, None, vec![]),
+            event_watermark: 0,
+        };
+        let outcome = db
+            .with_immediate_transaction(|tx| classify_lost_teardown(tx, &name, &incarnation, None))
+            .unwrap();
+        assert_eq!(outcome, TeardownOutcome::SessionStoppedReleasedRow);
+        let _ = _guard;
+    }
+
+    /// The mixed-version window: install does not stop a 0.7.29 process — an
+    /// old relay worker or hook — from writing to the upgraded log, so a
+    /// stopped event can carry `created_at` with NO `created_at_bits`. The
+    /// 0.7.30 teardown classification must still match that row as a
+    /// self-stop on the legacy `created_at` identity: a missing bits field is
+    /// never a mismatch. `created_at_bits` stays authoritative whenever it is
+    /// present, so a row whose bits name another incarnation never falls back
+    /// to `created_at`.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn classify_lost_teardown_matches_a_pre_v20_event_without_bits() {
+        // ULP-critical: serde_json's own f64 parser mangles this one
+        // (...801 -> ...800), a correctly rounded parse does not. The 0.7.29
+        // writer serialized the value through serde.
+        const CREATED_AT: f64 = 1_790_000_000.000_002_1;
+        assert_eq!(CREATED_AT.to_bits(), 4_745_294_612_153_761_801);
+
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+
+        // The stopped record exactly as 0.7.29 wrote it: `created_at` in the
+        // snapshot, no `created_at_bits`.
+        let name = format!("hcom-kill-{}-pre-v20", std::process::id());
+        db.log_life_event(
+            &name,
+            "stopped",
+            "session",
+            "exit:normal",
+            Some(serde_json::json!({ "name": name, "created_at": CREATED_AT })),
+            None,
+        )
+        .unwrap();
+
+        let classify = |against: f64, event_name: &str| {
+            let incarnation = ResolvedIncarnation {
+                token: IncarnationToken::new(against, None, vec![]),
+                event_watermark: 0,
+            };
+            db.with_immediate_transaction(|tx| {
+                classify_lost_teardown(tx, event_name, &incarnation, None)
+            })
+            .unwrap()
+        };
+
+        // Positive: the pre-v20 row is a self-stop on created_at alone.
+        assert_eq!(
+            classify(CREATED_AT, &name),
+            TeardownOutcome::SessionStoppedReleasedRow
+        );
+        // Negative: another incarnation's created_at never matches it.
+        assert_eq!(
+            classify(CREATED_AT + 1000.0, &name),
+            TeardownOutcome::RowReRegistered
+        );
+
+        // Grey: bits are authoritative — a row carrying a different
+        // created_at_bits never falls back to created_at.
+        let bits_name = format!("hcom-kill-{}-pre-v20-bits", std::process::id());
+        db.log_life_event(
+            &bits_name,
+            "stopped",
+            "session",
+            "exit:normal",
+            Some(serde_json::json!({
+                "name": bits_name,
+                "created_at": CREATED_AT,
+                "created_at_bits": (CREATED_AT + 1000.0).to_bits(),
+            })),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            classify(CREATED_AT, &bits_name),
+            TeardownOutcome::RowReRegistered
+        );
+        let _ = _guard;
+    }
+
+    // The legacy `created_at` fallback serves two sites: the kill's
+    // lost-teardown classification (a `stopped` snapshot as SQLite renders
+    // it) and the session finalizers' claim check (the raw kv claim). A token
+    // neither can read names no incarnation and is never taken for one: the
+    // classification logs it and keeps the conservative report, and a live
+    // kill's claim holds the row untouched.
+    #[cfg(unix)]
+    const LEGACY_CREATED_AT: f64 = 1_790_000_000.000_002_1;
+
+    #[cfg(unix)]
+    fn legacy_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    #[cfg(unix)]
+    fn logged(event: &str, needle: &str) -> bool {
+        std::fs::read_to_string(crate::paths::log_path())
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.contains(event) && line.contains(needle))
+    }
+
+    /// Classify a lost teardown (row gone) against one bindingless `stopped`
+    /// event with raw `data`; returns the outcome and the event id.
+    #[cfg(unix)]
+    fn classify_legacy_stop_event(db: &HcomDb, name: &str, data: &str) -> (TeardownOutcome, i64) {
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) \
+                 VALUES ('2026-09-24T00:00:00Z', 'life', ?1, ?2)",
+                rusqlite::params![name, data],
+            )
+            .unwrap();
+        let event_id = db.conn().last_insert_rowid();
+        let incarnation = ResolvedIncarnation {
+            token: IncarnationToken::new(LEGACY_CREATED_AT, None, vec![]),
+            event_watermark: 0,
+        };
+        let outcome = db
+            .with_immediate_transaction(|tx| classify_lost_teardown(tx, name, &incarnation, None))
+            .unwrap();
+        (outcome, event_id)
+    }
+
+    #[cfg(unix)]
+    fn assert_stop_event_not_matched(db: &HcomDb, name: &str, data: &str, reason: &str) {
+        let (outcome, event_id) = classify_legacy_stop_event(db, name, data);
+        assert_eq!(outcome, TeardownOutcome::RowReRegistered, "{data}");
+        assert!(
+            logged(
+                "teardown.stop_event_unreadable",
+                &format!("instance={name} event={event_id} reason={reason}")
+            ),
+            "the unreadable event is logged: {data}"
+        );
+    }
+
+    /// A live kill's claim on `name` (session `sess-legacy`) with no bits
+    /// and `created_at_member` spliced in raw. Both session finalizers must
+    /// hold the row for the kill: no exit writes, no binding release, no
+    /// stopped event, and the hold logged.
+    #[cfg(unix)]
+    fn assert_live_claim_holds_the_row(db: &HcomDb, name: &str, created_at_member: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id) \
+                 VALUES (?1, 'active', ?2, 'codex', 'sess-legacy')",
+                rusqlite::params![name, LEGACY_CREATED_AT],
+            )
+            .unwrap();
+        db.set_process_binding("proc-legacy", "sess-legacy", name)
+            .unwrap();
+        let pid = std::process::id();
+        let start = crate::sys::process::identity(pid).expect("own process identity");
+        let claim = format!(
+            r#"{{"pid":{pid},"process_start":{},"session_id":"sess-legacy"{created_at_member}}}"#,
+            serde_json::Value::String(start)
+        );
+        db.kv_set(&format!("teardown_claim:{name}"), Some(&claim))
+            .unwrap();
+
+        crate::hooks::common::soft_finalize_session(db, name, "shutdown", None, false);
+        assert_eq!(
+            crate::hooks::common::finalize_session(db, name, "shutdown", None),
+            StopOutcome::AlreadyStopped,
+            "{claim}"
+        );
+        let row = db
+            .get_instance_full(name)
+            .unwrap()
+            .expect("row held for the live kill");
+        assert_eq!(row.status, "active", "no exit writes: {claim}");
+        assert_eq!(
+            db.process_binding_ids(name).unwrap(),
+            vec!["proc-legacy".to_string()],
+            "bindings left to the kill: {claim}"
+        );
+        assert_eq!(
+            stopped_events(db, name),
+            0,
+            "the stopped event is the kill's"
+        );
+        assert!(
+            logged(
+                "sessionend.teardown_claim_held",
+                &format!("instance={name} reason=unreadable-created_at")
+            ),
+            "the hold is logged: {claim}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn legacy_created_at_absent_is_never_matched_and_holds_the_row() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-absent", std::process::id());
+        assert_stop_event_not_matched(
+            &db,
+            &format!("{name}-event"),
+            r#"{"action":"stopped","by":"session","reason":"exit:normal","process_id":null,"snapshot":{"name":"x"}}"#,
+            "unreadable-created_at",
+        );
+        assert_live_claim_holds_the_row(&db, &format!("{name}-claim"), "");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn legacy_created_at_null_is_never_matched_and_holds_the_row() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-null", std::process::id());
+        assert_stop_event_not_matched(
+            &db,
+            &format!("{name}-event"),
+            r#"{"action":"stopped","by":"session","reason":"exit:normal","process_id":null,"snapshot":{"created_at":null}}"#,
+            "unreadable-created_at",
+        );
+        assert_live_claim_holds_the_row(&db, &format!("{name}-claim"), r#","created_at":null"#);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn legacy_created_at_non_numeric_string_is_never_matched_and_holds_the_row() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-iso", std::process::id());
+        assert_stop_event_not_matched(
+            &db,
+            &format!("{name}-event"),
+            r#"{"action":"stopped","by":"session","reason":"exit:normal","process_id":null,"snapshot":{"created_at":"2026-09-24T10:00:00Z"}}"#,
+            "unreadable-created_at",
+        );
+        assert_live_claim_holds_the_row(
+            &db,
+            &format!("{name}-claim"),
+            r#","created_at":"2026-09-24T10:00:00Z""#,
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn legacy_created_at_non_scalar_is_never_matched_and_holds_the_row() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-bool", std::process::id());
+        assert_stop_event_not_matched(
+            &db,
+            &format!("{name}-event"),
+            r#"{"action":"stopped","by":"session","reason":"exit:normal","process_id":null,"snapshot":{"created_at":true}}"#,
+            "unreadable-created_at",
+        );
+        assert_live_claim_holds_the_row(&db, &format!("{name}-claim"), r#","created_at":true"#);
+    }
+
+    /// No snapshot at all: what a 0.7.29 PTY exit writes when its snapshot
+    /// read fails (and it deletes the row anyway). Classification only; a
+    /// claim has no snapshot to lose.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn stop_event_without_a_snapshot_is_never_matched() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-nosnap", std::process::id());
+        assert_stop_event_not_matched(
+            &db,
+            &name,
+            r#"{"action":"stopped","by":"pty","reason":"closed","process_id":null}"#,
+            "no-snapshot",
+        );
+    }
+
+    /// A quoted number padded before its delimiter: only a raw claim can
+    /// carry it, and the raw scan cannot read it, so the claim holds the
+    /// row. SQLite renders the same snapshot token compactly, so the
+    /// classification reads it exactly and matches the session's stop.
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn padded_legacy_claim_created_at_holds_the_row() {
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = legacy_db();
+        let name = format!("hcom-kill-{}-legacy-padded", std::process::id());
+        assert_live_claim_holds_the_row(
+            &db,
+            &format!("{name}-claim"),
+            r#","created_at": "1790000000.0000021" "#,
+        );
+        let (outcome, _) = classify_legacy_stop_event(
+            &db,
+            &format!("{name}-event"),
+            r#"{"action":"stopped","by":"session","reason":"exit:normal","process_id":null,"snapshot":{"created_at": "1790000000.0000021" }}"#,
+        );
+        assert_eq!(outcome, TeardownOutcome::SessionStoppedReleasedRow);
     }
 
     /// CAS (iv), the atomicity fix: the incarnation comparison and the
@@ -2571,7 +3440,7 @@ mod tests {
             &name,
             "test",
             &self_set,
-            move |_n, _b, _e| {
+            move |_n, _b, _e, _capture| {
                 // Trigger the concurrent rebind from inside the reap seam
                 // and wait until it HOLDS the write lock: it now owns the
                 // write path until well past where the old comparison ran.

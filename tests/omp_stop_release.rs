@@ -1,7 +1,7 @@
-//! `hcom omp-stop` without `--soft` is the omp owner's own exit release: it
-//! runs inside the exiting session's process tree, so that tree is spared
-//! while every other carrier of the instance is reaped. Linux only: off Linux
-//! the release keeps the row soft-stopped instead (no /proc to reap from).
+//! `hcom omp-stop` without `--soft` releases the omp owner's row from within
+//! its session tree. Its ancestor is spared, and a sibling outside both the
+//! recorded and caller-rooted trees is not signalled even if it carries the
+//! same binding. Linux only: off Linux this release soft-stops the row.
 
 #![cfg(target_os = "linux")]
 
@@ -34,7 +34,7 @@ fn kill_group(child: &mut Child) {
 }
 
 #[test]
-fn omp_stop_release_spares_caller_tree_and_reaps_the_rest() {
+fn omp_stop_release_spares_caller_tree_and_out_of_scope_sibling() {
     let h = Hcom::new();
     // Creates the schema in the isolated HCOM_DIR.
     let (code, _, stderr) = h.run(["status", "--json"]);
@@ -57,8 +57,8 @@ fn omp_stop_release_spares_caller_tree_and_reaps_the_rest() {
     )
     .expect("seed process binding");
 
-    // A tool subprocess of the session: carries the binding, not in the
-    // caller's ancestry.
+    // A leaked desktop-shaped carrier: it has the binding but is a sibling
+    // of the session shell, not a descendant of either owning root.
     let mut sibling = h
         .external_cmd("sleep")
         .arg("300")
@@ -81,10 +81,10 @@ fn omp_stop_release_spares_caller_tree_and_reaps_the_rest() {
         .expect("spawn session shell");
 
     let session_status = wait_with_deadline(&mut session, Duration::from_secs(30));
-    let sibling_status = wait_with_deadline(&mut sibling, Duration::from_secs(10));
     if session_status.is_none() {
         kill_group(&mut session);
     }
+    let sibling_status = sibling.try_wait().expect("poll out-of-scope sibling");
     if sibling_status.is_none() {
         kill_group(&mut sibling);
     }
@@ -115,7 +115,7 @@ fn omp_stop_release_spares_caller_tree_and_reaps_the_rest() {
         .unwrap();
     assert_eq!(stopped, 1, "no stopped event");
     assert!(
-        sibling_status.is_some_and(|s| s.signal().is_some()),
-        "sibling carrier not reaped: {sibling_status:?}"
+        sibling_status.is_none(),
+        "out-of-scope sibling was signalled: {sibling_status:?}"
     );
 }
