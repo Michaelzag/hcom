@@ -775,20 +775,47 @@ fn pane_info_str(pane_closed: bool, preset_name: &str, pane_id: &str) -> String 
 /// it holds, by name or (self-bound trees) by its process id. Returns true
 /// when anything survived — the caller must keep the pidtrack handle so a
 /// retry can rediscover the orphan.
-fn reap_orphan_tree(db: &HcomDb, orphan: &crate::pidtrack::OrphanProcess) -> bool {
+fn reap_orphan_tree(
+    db: &HcomDb,
+    orphan: &crate::pidtrack::OrphanProcess,
+    captures: Vec<(String, crate::proctruth::ReapCapture)>,
+) -> bool {
     let ids: &[String] = if orphan.process_id.is_empty() {
         &[]
     } else {
         std::slice::from_ref(&orphan.process_id)
     };
     let mut survived = false;
-    for orphan_name in &orphan.names {
-        if let Err(survivors) = crate::proctruth::reap_instance_tree_for(db, orphan_name, ids) {
-            eprintln!("{}", survivors_error(orphan_name, &survivors));
+    for (orphan_name, capture) in captures {
+        if let Err(survivors) = crate::proctruth::reap_instance_tree_for_excluding_captured(
+            db,
+            &orphan_name,
+            ids,
+            &[],
+            capture,
+        ) {
+            eprintln!("{}", survivors_error(&orphan_name, &survivors));
             survived = true;
         }
     }
     survived
+}
+
+fn capture_orphan_carriers(
+    db: &HcomDb,
+    orphan: &crate::pidtrack::OrphanProcess,
+) -> Vec<(String, crate::proctruth::ReapCapture)> {
+    orphan
+        .names
+        .iter()
+        .map(|name| {
+            let binding_ids = db.process_binding_ids(name).unwrap_or_default();
+            (
+                name.clone(),
+                crate::proctruth::capture_reap_carriers(db, name, &binding_ids, &[]),
+            )
+        })
+        .collect()
 }
 
 /// Kill all instances.
@@ -863,6 +890,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
     // Kill orphans too
     let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
     for orphan in &orphans {
+        let pre_capture = capture_orphan_carriers(db, orphan);
         let (result, pane_closed, pane_retry_command) = terminal::kill_process(
             orphan.pid,
             &orphan.terminal_preset,
@@ -904,7 +932,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         // Verify the whole carrier set, not just the recorded group: a
         // self-bound tree never carries the orphan's names. Survivors keep
         // their pidtrack handle for a retry.
-        let reap_failed = reap_orphan_tree(db, orphan);
+        let reap_failed = reap_orphan_tree(db, orphan, pre_capture);
         failed += reap_failed as i32;
         if !reap_failed {
             pidtrack::remove_pid(hcom_dir, orphan.pid);
@@ -997,6 +1025,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
     let tagged_orphans: Vec<_> = orphans.iter().filter(|o| o.tag == tag).collect();
     for orphan in &tagged_orphans {
+        let pre_capture = capture_orphan_carriers(db, orphan);
         let names = orphan.names.join(", ");
         let (result, pane_closed, pane_retry_command) = terminal::kill_process(
             orphan.pid,
@@ -1030,7 +1059,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         }
         incomplete +=
             report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) as i32;
-        let reap_failed = reap_orphan_tree(db, orphan);
+        let reap_failed = reap_orphan_tree(db, orphan, pre_capture);
         failed += reap_failed as i32;
         if !reap_failed {
             pidtrack::remove_pid(hcom_dir, orphan.pid);
@@ -1068,6 +1097,7 @@ fn kill_single(
                     || o.process_id == target
                     || target_pid == Some(o.pid)
             }) {
+                let pre_capture = capture_orphan_carriers(db, orphan);
                 let (result, pane_closed, pane_retry_command) = terminal::kill_process(
                     orphan.pid,
                     &orphan.terminal_preset,
@@ -1102,7 +1132,7 @@ fn kill_single(
                 // live processes still holding the orphan's names — by name
                 // or, for self-bound trees, by its process id — so the
                 // kill is verified whole-instance, not single-pid.
-                let reap_failed = reap_orphan_tree(db, orphan);
+                let reap_failed = reap_orphan_tree(db, orphan, pre_capture);
                 // Keep the pidtrack handle while survivors live: it is the
                 // only handle by which a retry can rediscover this orphan.
                 // Dropping it on reap failure would force a hand-kill from
