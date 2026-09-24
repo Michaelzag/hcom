@@ -171,6 +171,10 @@ impl HcomDb {
     /// One-shot v20 backfill: give every `stopped` snapshot that carries
     /// `created_at` the exact f64 bit pattern beside it.
     ///
+    /// This is the whole v20 migration — it also commits `user_version = 20` in
+    /// the same transaction as the rewrites, so an interrupted run rolls back
+    /// completely (stays at v19) and the next open re-migrates.
+    ///
     /// The rows are selected through `json_extract(data, '$.snapshot')` so
     /// the scan sees the snapshot object alone, and the numeric token is
     /// parsed with `str::parse::<f64>` (correctly rounded) — both SQLite's
@@ -196,6 +200,12 @@ impl HcomDb {
                 rusqlite::params![bits as i64, id],
             )?;
         }
+        // Stamp v20 in this same transaction as the rewrites above. Committing
+        // the stamp here — not in a separate try_apply_migrations transaction —
+        // is what makes the backfill interruption-safe: if it dies partway, the
+        // rollback takes the stamp with it and leaves user_version at 19, so the
+        // next open re-migrates instead of trusting a half-backfilled database.
+        tx.execute_batch("PRAGMA user_version = 20")?;
         tx.commit()?;
         Ok(())
     }
@@ -821,7 +831,15 @@ impl HcomDb {
                     [],
                 )?;
             }
-            tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
+            // v20's stamp is deliberately not set here. It belongs to the
+            // created_at_bits backfill and commits atomically with it inside
+            // migrate_created_at_bits; stamping v20 in this separate transaction
+            // would publish it before the backfill runs, so an interrupted
+            // backfill would leave the DB at v20 with no bits and never re-run.
+            // Every earlier version stamps as it lands.
+            if next_version != 20 {
+                tx.execute_batch(&format!("PRAGMA user_version = {}", next_version))?;
+            }
         }
         tx.commit()?;
         Ok(true)
@@ -2049,6 +2067,162 @@ pub(super) mod tests {
             late, post_v20_row,
             "a v20 database is never rescanned by the backfill"
         );
+
+        cleanup_test_db(db_path);
+    }
+
+    /// The v20 backfill must be interruption-safe: its row rewrites run in a
+    /// single transaction, so an abort partway through must roll the whole
+    /// backfill back — no half-migrated snapshots — and a re-run with the
+    /// interruption cleared must converge on the uninterrupted end state:
+    /// user_version 20, exact bits beside every eligible `created_at`, every
+    /// other snapshot key untouched, raw numeric tokens unreformatted.
+    ///
+    /// The interruption is a BEFORE UPDATE trigger that aborts at the moment
+    /// `created_at_bits` is about to land on the last eligible row; the
+    /// backfill scans in rowid order, so the two earlier rows are already
+    /// rewritten inside the still-open transaction when the abort hits.
+    #[test]
+    fn events_migration_interrupted_partway_converges_on_rerun() {
+        const FIRST_TOKEN: &str = "1790000000.0000021";
+        const FIRST_BITS: u64 = 4_745_294_612_153_761_801;
+        const SECOND_TOKEN: &str = "1762720048.770769";
+        const SECOND_BITS: u64 = 4_745_180_191_745_201_223;
+        const THIRD_TOKEN: &str = "1762720048.77077";
+        const THIRD_BITS: u64 = 4_745_180_191_745_201_228;
+        // Guard the fixtures themselves: std parse is the exact decoder.
+        assert_eq!(FIRST_TOKEN.parse::<f64>().unwrap().to_bits(), FIRST_BITS);
+        assert_eq!(SECOND_TOKEN.parse::<f64>().unwrap().to_bits(), SECOND_BITS);
+        assert_eq!(THIRD_TOKEN.parse::<f64>().unwrap().to_bits(), THIRD_BITS);
+
+        let first_row = format!(
+            r#"{{"action":"stopped","by":"session","reason":"exit","process_id":null,"snapshot":{{"name":"first","created_at":{FIRST_TOKEN},"tool":"codex"}}}}"#
+        );
+        let second_row = format!(
+            r#"{{"action":"stopped","by":"session","reason":"exit","process_id":null,"snapshot":{{"name":"second","created_at":"{SECOND_TOKEN}"}}}}"#
+        );
+        let third_row = format!(
+            r#"{{"action":"stopped","by":"session","reason":"exit","process_id":null,"snapshot":{{"name":"third","created_at":{THIRD_TOKEN}}}}}"#
+        );
+
+        let (mut db, db_path) = setup_full_test_db();
+        // Stand the database back at v19 — the shape production opens.
+        db.conn.execute_batch("PRAGMA user_version = 19").unwrap();
+        for (name, data) in [
+            ("first", &first_row),
+            ("second", &second_row),
+            ("third", &third_row),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', ?, ?)",
+                    params!["2026-01-01T00:00:00Z", name, data],
+                )
+                .unwrap();
+        }
+
+        // Arm the interruption on the last eligible row.
+        let last_id: i64 = db
+            .conn
+            .query_row(
+                "SELECT id FROM events WHERE type='life' AND instance='third'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(&format!(
+                "CREATE TRIGGER interrupt_backfill BEFORE UPDATE ON events
+                 WHEN NEW.id = {last_id}
+                      AND json_extract(NEW.data, '$.snapshot.created_at_bits') IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'backfill-interrupted'); END;"
+            ))
+            .unwrap();
+
+        // Production entry: open() -> ensure_schema(), killed partway.
+        let err = db.ensure_schema().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("backfill-interrupted"),
+            "the interruption must surface: {err:#}"
+        );
+
+        // All-or-nothing: the backfill transaction rolled back as a unit, so
+        // no row kept its bits and the originals survive byte-identical.
+        let (with_bits, eligible): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT COUNT(CASE WHEN json_extract(data, '$.snapshot.created_at_bits') IS NOT NULL THEN 1 END),
+                        COUNT(CASE WHEN json_extract(data, '$.snapshot.created_at') IS NOT NULL THEN 1 END)
+                 FROM events WHERE type='life'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(eligible, 3);
+        assert_eq!(with_bits, 0, "no row may be left half-migrated");
+        for (name, original) in [
+            ("first", &first_row),
+            ("second", &second_row),
+            ("third", &third_row),
+        ] {
+            let raw: String = db
+                .conn
+                .query_row(
+                    "SELECT data FROM events WHERE type='life' AND instance=?1",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(raw.as_str(), original.as_str(), "{name}: rollback is clean");
+        }
+
+        // Clear the interruption and re-run exactly what the runner makes:
+        // a fresh open() -> ensure_schema() against the interrupted database.
+        db.conn
+            .execute_batch("DROP TRIGGER interrupt_backfill")
+            .unwrap();
+        drop(db);
+        let db = HcomDb::open_at(&db_path).unwrap();
+
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            20
+        );
+
+        // Converged on the uninterrupted end state.
+        for (name, original, expected_bits, token) in [
+            ("first", &first_row, FIRST_BITS, FIRST_TOKEN),
+            ("second", &second_row, SECOND_BITS, SECOND_TOKEN),
+            ("third", &third_row, THIRD_BITS, THIRD_TOKEN),
+        ] {
+            let raw: String = db
+                .conn
+                .query_row(
+                    "SELECT data FROM events WHERE type='life' AND instance=?1",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                raw.contains(token),
+                "{name}: raw token preserved: {raw}"
+            );
+            let mut migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let bits = migrated["snapshot"]
+                .as_object_mut()
+                .unwrap()
+                .remove("created_at_bits")
+                .unwrap_or_else(|| panic!("{name}: rerun backfilled created_at_bits"));
+            assert_eq!(
+                bits.as_u64(),
+                Some(expected_bits),
+                "{name}: bits derived from the real snapshot.created_at"
+            );
+            let original: serde_json::Value = serde_json::from_str(original).unwrap();
+            assert_eq!(&migrated, &original, "{name}: only the key was added");
+        }
 
         cleanup_test_db(db_path);
     }
