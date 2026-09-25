@@ -10,6 +10,11 @@ use std::path::PathBuf;
 use crate::db::HcomDb;
 use crate::tool::Tool;
 
+/// Minimum wall-clock seconds between two `identity.foreign_refused` log
+/// lines for the same process id. Hooks are separate short-lived processes,
+/// so the throttle state lives in the store's kv table.
+const FOREIGN_REFUSED_LOG_INTERVAL: f64 = 600.0;
+
 /// Per-request execution context.
 ///
 /// Constructed once at entry (hook invocation or CLI command), then passed
@@ -153,11 +158,13 @@ impl HcomContext {
         };
         if !trusted {
             self.process_id = None;
-            crate::log::log_info(
-                "hooks",
-                "identity.foreign_refused",
-                &format!("tool={} refused process id {id}", self.tool.as_str()),
-            );
+            if Self::foreign_refused_log_due(db, &id) {
+                crate::log::log_info(
+                    "hooks",
+                    "identity.foreign_refused",
+                    &format!("tool={} refused process id {id}", self.tool.as_str()),
+                );
+            }
         }
         self.is_launched = self.is_launched
             && trusted
@@ -166,6 +173,27 @@ impl HcomContext {
             } else {
                 crate::proctruth::omp_minted_pid(&id).is_none()
             };
+    }
+
+    /// Whether the `identity.foreign_refused` line for this id may be logged
+    /// now: true when the id was not yet refused-and-logged, or the interval
+    /// since its last logged refusal has elapsed. Any throttle-state failure
+    /// fails OPEN — the line is logged rather than silently suppressed.
+    fn foreign_refused_log_due(db: &HcomDb, id: &str) -> bool {
+        let key = format!("identity_foreign_refused_last:{id}");
+        let now = crate::shared::time::now_epoch_f64();
+        let last = match db.kv_get(&key) {
+            Ok(Some(value)) => value.parse::<f64>().ok(),
+            // Unreadable or malformed state cannot justify suppression.
+            Err(_) | Ok(None) => None,
+        };
+        if last.is_some_and(|last| now - last < FOREIGN_REFUSED_LOG_INTERVAL) {
+            return false;
+        }
+        // A failed stamp write means the next refusal may log again too —
+        // a duplicate line is the safe direction, a missing one is not.
+        let _ = db.kv_set(&key, Some(&now.to_string()));
+        true
     }
 
     // === Derived paths ===
@@ -210,6 +238,7 @@ impl HcomContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn make_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -611,5 +640,121 @@ mod tests {
             assert_eq!(ctx.process_id.as_deref(), Some(id.as_str()));
             assert!(!ctx.is_launched);
         }
+    }
+
+    // === identity.foreign_refused log throttle ===
+
+    /// Count `identity.foreign_refused` log lines naming this id.
+    fn foreign_refused_log_lines(id: &str) -> usize {
+        std::fs::read_to_string(crate::paths::log_path())
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("identity.foreign_refused") && line.contains(id))
+            .count()
+    }
+
+    /// One hook process: a fresh context and a fresh db handle onto the same
+    /// store — hooks are separate short-lived hcom processes, so the throttle
+    /// state must persist across this boundary.
+    fn refuse_as_hook_process(db_path: &std::path::Path, id: &str) {
+        let db = HcomDb::open_raw(db_path).unwrap();
+        let mut ctx = launched_ctx(id);
+        ctx.trust_process_id(&db);
+        assert_eq!(ctx.process_id, None, "the refusal verdict is unchanged");
+        assert!(!ctx.is_launched);
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_logs_each_id_once_per_interval() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        let db_path = db_dir.path().join("test.db");
+        drop(db);
+        let id = "550e8400-e29b-41d4-a716-4466554400aa";
+
+        refuse_as_hook_process(&db_path, id);
+        refuse_as_hook_process(&db_path, id);
+
+        assert_eq!(
+            foreign_refused_log_lines(id),
+            1,
+            "two refusals of the same id within the interval must log one line"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_throttle_is_per_id() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        let db_path = db_dir.path().join("test.db");
+        drop(db);
+        let id_a = "550e8400-e29b-41d4-a716-4466554400bb";
+        let id_b = "550e8400-e29b-41d4-a716-4466554400cc";
+
+        refuse_as_hook_process(&db_path, id_a);
+        refuse_as_hook_process(&db_path, id_b);
+
+        assert_eq!(
+            foreign_refused_log_lines(id_a),
+            1,
+            "a refusal of a different id logs its own line"
+        );
+        assert_eq!(
+            foreign_refused_log_lines(id_b),
+            1,
+            "a refusal of a different id logs its own line"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_logs_again_after_interval() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        drop(db);
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-4466554400dd";
+
+        refuse_as_hook_process(&db_path, id);
+        assert_eq!(foreign_refused_log_lines(id), 1);
+
+        // Inject the clock: backdate the persisted last-logged stamp past the
+        // interval, as if the earlier refusal had happened 10 minutes ago.
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let key = format!("identity_foreign_refused_last:{id}");
+        let backdated = crate::shared::time::now_epoch_f64() - (FOREIGN_REFUSED_LOG_INTERVAL + 1.0);
+        db.kv_set(&key, Some(&backdated.to_string())).unwrap();
+        drop(db);
+
+        refuse_as_hook_process(&db_path, id);
+        assert_eq!(
+            foreign_refused_log_lines(id),
+            2,
+            "after the interval the refusal logs again"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_throttle_fails_open_on_unreadable_state() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-4466554400ee";
+
+        // Corrupt the persisted stamp so the throttle cannot read it; the
+        // refusal must still log (fail OPEN, never suppress silently).
+        let key = format!("identity_foreign_refused_last:{id}");
+        db.kv_set(&key, Some("not-a-timestamp")).unwrap();
+        drop(db);
+
+        refuse_as_hook_process(&db_path, id);
+        assert_eq!(
+            foreign_refused_log_lines(id),
+            1,
+            "unreadable throttle state must not suppress the refusal line"
+        );
     }
 }
