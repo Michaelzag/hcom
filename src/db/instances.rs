@@ -653,27 +653,18 @@ impl HcomDb {
     }
 
     /// Find the most recent stopped instance whose snapshot carries the given
-    /// session_id. life.stopped events are the source of truth: they persist
-    /// across the `session_bindings` cascade, so they're the right thing to
-    /// consult when reclaiming hcom identity by UUID after stop/kill.
+    /// session_id; see [`Self::find_stopped_snapshot_by_session_id`].
     pub fn find_stopped_instance_by_session_id(&self, session_id: &str) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT instance FROM events
-                 WHERE type = 'life'
-                   AND json_extract(data, '$.action') = 'stopped'
-                   AND json_extract(data, '$.snapshot.session_id') = ?
-                 ORDER BY id DESC LIMIT 1",
-                params![session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(Into::into)
+        Ok(self
+            .find_stopped_snapshot_by_session_id(session_id)?
+            .map(|(name, _)| name))
     }
 
-    /// Like [`Self::find_stopped_instance_by_session_id`], but also returns the
-    /// matched event's snapshot, so a caller can rebuild the instance row when
-    /// it was deleted and nothing else survives to recreate it from.
+    /// Find the most recent stopped instance whose snapshot carries the given
+    /// session_id, with that event's snapshot. life.stopped events are the
+    /// source of truth: they persist across the `session_bindings` cascade, so
+    /// they're the right thing to consult when reclaiming hcom identity by UUID
+    /// after stop/kill, and to rebuild the row when nothing else survives.
     pub fn find_stopped_snapshot_by_session_id(
         &self,
         session_id: &str,

@@ -616,20 +616,22 @@ fn bind_session_to_process_body(
             "bind_session_to_process.restore_stopped",
             &format!("stopped_name={stopped_name}, session_id={session_id}"),
         );
-        recreate_instance_from_placeholder(
-            db,
-            &stopped_name,
-            session_id,
-            placeholder_data.as_ref(),
-        );
-        // No placeholder row to copy from: rebuild the swept row from the
-        // stopped snapshot, else the bindings below would name a missing row.
-        if placeholder_data.is_none()
-            && !recreate_instance_from_stopped_snapshot(db, &stopped_name, session_id, &snapshot)
-        {
-            anyhow::bail!(
-                "restore_stopped: could not recreate the instance row for '{stopped_name}'"
-            );
+        match placeholder_data.as_ref() {
+            Some(ph) => recreate_instance_from_placeholder(db, &stopped_name, session_id, Some(ph)),
+            // No placeholder row to copy from: rebuild the swept row from the
+            // stopped snapshot, else the bindings below would name a missing row.
+            None => {
+                if !recreate_instance_from_stopped_snapshot(
+                    db,
+                    &stopped_name,
+                    session_id,
+                    &snapshot,
+                ) {
+                    anyhow::bail!(
+                        "restore_stopped: could not recreate the instance row for '{stopped_name}'"
+                    );
+                }
+            }
         }
 
         if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
