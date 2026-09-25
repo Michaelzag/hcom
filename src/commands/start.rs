@@ -2675,30 +2675,30 @@ mod tests {
         assert_eq!(snapshot["boot_id"], boot_id.as_str());
     }
 
-    /// The valo incident, bare form: a shell inside the live seat `valo` runs
-    /// `hcom start`. Its process is already bound to `valo`, so the bind at the
-    /// end of `start_bare` would move that binding to a brand-new identity and
-    /// leave `valo` a running row with no process. Refuse before any write:
-    /// no name is drawn, no row appears, and the binding stays where it was.
+    /// The valo incident, bare form: a shell inside a live seat runs
+    /// `hcom start`. Its process is already bound to that seat, so the bind at
+    /// the end of `start_bare` would move the binding to a brand-new identity
+    /// and leave the seat a running row with no process. Refuse before any
+    /// write: no name is drawn, no row appears, and the binding stays put.
     #[test]
     #[serial]
     fn test_start_bare_refuses_process_bound_to_live_instance() {
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        bind_caller(&db, "valo", "sess-valo", "omp-4242-aaaa-bbbb", 11);
+        let owner = format!("valo_bare_{}", std::process::id());
+        let process_id = format!("omp-bare-{}", std::process::id());
+        bind_caller(&db, &owner, "sess-bare", &process_id, 11);
 
-        let err = start_bare(&db, &hcom_dir, &caller_ctx("omp-4242-aaaa-bbbb"), None)
+        let err = start_bare(&db, &hcom_dir, &caller_ctx(&process_id), None)
             .expect_err("a process bound to a live seat is not a fresh seat");
 
         assert!(
-            err.to_string().contains("valo") && err.to_string().contains("omp-4242-aaaa-bbbb"),
+            err.to_string().contains(&owner) && err.to_string().contains(&process_id),
             "the refusal names the owning seat and the process: {err}"
         );
         assert_eq!(
-            db.get_process_binding("omp-4242-aaaa-bbbb")
-                .unwrap()
-                .as_deref(),
-            Some("valo"),
+            db.get_process_binding(&process_id).unwrap().as_deref(),
+            Some(owner.as_str()),
             "the live seat keeps its process binding"
         );
         let rows: Vec<String> = db
@@ -2709,7 +2709,7 @@ mod tests {
             .collect();
         assert_eq!(
             rows,
-            vec!["valo".to_string()],
+            vec![owner.clone()],
             "no second identity is minted for the same process"
         );
     }
@@ -2722,80 +2722,76 @@ mod tests {
     fn test_start_bare_refuses_explicit_name_from_bound_live_seat() {
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        bind_caller(&db, "valo", "sess-valo", "omp-4242-aaaa-bbbb", 11);
+        let owner = format!("valo_named_{}", std::process::id());
+        let wanted = format!("meme_named_{}", std::process::id());
+        let process_id = format!("omp-named-{}", std::process::id());
+        bind_caller(&db, &owner, "sess-named", &process_id, 11);
 
-        let err = start_bare(
-            &db,
-            &hcom_dir,
-            &caller_ctx("omp-4242-aaaa-bbbb"),
-            Some("meme"),
-        )
-        .expect_err("a bound process cannot be given a second identity");
+        let err = start_bare(&db, &hcom_dir, &caller_ctx(&process_id), Some(&wanted))
+            .expect_err("a bound process cannot be given a second identity");
 
         assert!(
-            err.to_string().contains("valo"),
+            err.to_string().contains(&owner),
             "the refusal names the owning seat: {err}"
         );
         assert!(
-            db.get_instance_full("meme").unwrap().is_none(),
+            db.get_instance_full(&wanted).unwrap().is_none(),
             "the refused start creates no row for the name it asked for"
         );
         assert_eq!(
-            db.get_process_binding("omp-4242-aaaa-bbbb")
-                .unwrap()
-                .as_deref(),
-            Some("valo"),
+            db.get_process_binding(&process_id).unwrap().as_deref(),
+            Some(owner.as_str()),
             "the live seat keeps its process binding"
         );
     }
 
-    /// `hcom start --as valo` from a shell whose process belongs to a third
-    /// live seat. The reclaim may not take that process binding: the seat that
-    /// holds it is running, and the whole transaction rolls back with the
-    /// target name still unclaimed.
+    /// `hcom start --as <target>` from a shell whose process belongs to a
+    /// third live seat. The reclaim may not take that process binding: the
+    /// seat that holds it is running, and the whole transaction rolls back
+    /// with the target name still unclaimed.
     #[test]
     #[serial]
     fn test_start_rebind_refuses_process_bound_to_another_live_seat() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        log_stopped_snapshot(&db, "valo", "omp", "/tmp/project", "sess-valo", 3);
+        let target = format!("valo_third_{}", std::process::id());
+        let third = format!("meme_third_{}", std::process::id());
+        let process_id = format!("omp-third-{}", std::process::id());
+        log_stopped_snapshot(&db, &target, "omp", "/tmp/project", "sess-third", 3);
         // A plain seat binds its process with no session id, so nothing in the
-        // reclaim resolves to `meme` as the caller's own identity.
+        // reclaim resolves to the third seat as the caller's own identity.
         db.conn()
             .execute(
                 "INSERT INTO instances
                  (name, tool, directory, status, status_time, last_seen, created_at)
-                 VALUES ('meme', 'omp', '/tmp/project', 'active', 0, 0, 1)",
-                [],
+                 VALUES (?1, 'omp', '/tmp/project', 'active', 0, 0, 1)",
+                params![third],
             )
             .unwrap();
-        db.set_process_binding("omp-7777-cccc-dddd", "", "meme")
-            .unwrap();
+        db.set_process_binding(&process_id, "", &third).unwrap();
 
         let ctx = make_ctx(
-            &[("OMPCODE", "1"), ("HCOM_PROCESS_ID", "omp-7777-cccc-dddd")],
+            &[("OMPCODE", "1"), ("HCOM_PROCESS_ID", &process_id)],
             "/tmp/project",
         );
-        let err = start_rebind(&db, "valo", &ctx, None, None)
+        let err = start_rebind(&db, &target, &ctx, None, None)
             .expect_err("a process bound to another live seat is not the caller's to rebind");
 
         assert!(
-            err.to_string().contains("meme"),
+            err.to_string().contains(&third),
             "the refusal names the seat that holds the process: {err}"
         );
         assert_eq!(
-            db.get_process_binding("omp-7777-cccc-dddd")
-                .unwrap()
-                .as_deref(),
-            Some("meme"),
+            db.get_process_binding(&process_id).unwrap().as_deref(),
+            Some(third.as_str()),
             "the third seat keeps its process binding"
         );
         assert!(
-            db.get_instance_full("valo").unwrap().is_none(),
+            db.get_instance_full(&target).unwrap().is_none(),
             "the refused reclaim creates no target row"
         );
         assert!(
-            db.get_instance_full("meme").unwrap().is_some(),
+            db.get_instance_full(&third).unwrap().is_some(),
             "the third seat's row is untouched"
         );
     }
@@ -2809,24 +2805,26 @@ mod tests {
     fn test_start_rebind_adopts_stopped_snapshot_session_id() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        log_stopped_snapshot(&db, "valo", "claude", "/tmp/project", "sid-valo", 3);
+        let target = format!("valo_adopt_{}", std::process::id());
+        let session_id = format!("sid-adopt-{}", std::process::id());
+        log_stopped_snapshot(&db, &target, "claude", "/tmp/project", &session_id, 3);
         let mut ctx = make_claude_ctx(None, "/tmp/project");
         ctx.process_id = None;
 
-        assert_eq!(start_rebind(&db, "valo", &ctx, None, None).unwrap(), 0);
+        assert_eq!(start_rebind(&db, &target, &ctx, None, None).unwrap(), 0);
 
         let row = db
-            .get_instance_full("valo")
+            .get_instance_full(&target)
             .unwrap()
             .expect("reclaimed row");
         assert_eq!(
             row.session_id.as_deref(),
-            Some("sid-valo"),
+            Some(session_id.as_str()),
             "the recreated row is born with the session its identity held"
         );
         assert_eq!(
-            db.get_session_binding("sid-valo").unwrap().as_deref(),
-            Some("valo")
+            db.get_session_binding(&session_id).unwrap().as_deref(),
+            Some(target.as_str())
         );
     }
 
@@ -2838,15 +2836,19 @@ mod tests {
     fn test_start_rebind_does_not_adopt_session_held_by_live_row() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        log_stopped_snapshot(&db, "valo", "claude", "/tmp/project", "sid-valo", 3);
-        bind_caller(&db, "meme", "sid-valo", "omp-8888-eeee-ffff", 5);
+        let target = format!("valo_held_{}", std::process::id());
+        let holder = format!("meme_held_{}", std::process::id());
+        let session_id = format!("sid-held-{}", std::process::id());
+        let process_id = format!("omp-held-{}", std::process::id());
+        log_stopped_snapshot(&db, &target, "claude", "/tmp/project", &session_id, 3);
+        bind_caller(&db, &holder, &session_id, &process_id, 5);
         let mut ctx = make_claude_ctx(None, "/tmp/project");
         ctx.process_id = None;
 
-        assert_eq!(start_rebind(&db, "valo", &ctx, None, None).unwrap(), 0);
+        assert_eq!(start_rebind(&db, &target, &ctx, None, None).unwrap(), 0);
 
         let row = db
-            .get_instance_full("valo")
+            .get_instance_full(&target)
             .unwrap()
             .expect("reclaimed row");
         assert_eq!(
@@ -2854,17 +2856,17 @@ mod tests {
             "a session another live seat holds is not adopted"
         );
         assert_eq!(
-            db.get_session_binding("sid-valo").unwrap().as_deref(),
-            Some("meme"),
+            db.get_session_binding(&session_id).unwrap().as_deref(),
+            Some(holder.as_str()),
             "the live seat keeps the session binding"
         );
         assert_eq!(
-            db.get_instance_full("meme")
+            db.get_instance_full(&holder)
                 .unwrap()
                 .unwrap()
                 .session_id
                 .as_deref(),
-            Some("sid-valo")
+            Some(session_id.as_str())
         );
     }
 
@@ -2876,25 +2878,29 @@ mod tests {
     fn test_start_rebind_prefers_live_row_session_over_stopped_snapshot() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        log_stopped_snapshot(&db, "valo", "claude", "/tmp/project", "sid-old", 3);
-        bind_caller(&db, "valo", "sid-new", "omp-9999-gggg-hhhh", 5);
+        let target = format!("valo_live_{}", std::process::id());
+        let new_session = format!("sid-live-{}", std::process::id());
+        let old_session = format!("sid-old-{}", std::process::id());
+        let process_id = format!("omp-live-{}", std::process::id());
+        log_stopped_snapshot(&db, &target, "claude", "/tmp/project", &old_session, 3);
+        bind_caller(&db, &target, &new_session, &process_id, 5);
         let mut ctx = make_claude_ctx(None, "/tmp/project");
         ctx.process_id = None;
 
-        assert_eq!(start_rebind(&db, "valo", &ctx, None, None).unwrap(), 0);
+        assert_eq!(start_rebind(&db, &target, &ctx, None, None).unwrap(), 0);
 
         let row = db
-            .get_instance_full("valo")
+            .get_instance_full(&target)
             .unwrap()
             .expect("reclaimed row");
         assert_eq!(
             row.session_id.as_deref(),
-            Some("sid-new"),
+            Some(new_session.as_str()),
             "the live row's session wins over the older stopped snapshot"
         );
         assert_eq!(
-            db.get_session_binding("sid-new").unwrap().as_deref(),
-            Some("valo")
+            db.get_session_binding(&new_session).unwrap().as_deref(),
+            Some(target.as_str())
         );
     }
 }
