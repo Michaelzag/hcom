@@ -298,10 +298,12 @@ fn query_plugin(port: u16) -> Option<LiveReply> {
     })
 }
 
+/// Number from a live reply field. Only a JSON number counts: `null` (and any
+/// other shape a host might send) is *unknown*, never a fabricated 0.
 fn json_u64(value: &Value) -> Option<u64> {
     match value {
-        Value::Null => None,
-        other => Some(jnum(Some(other))),
+        Value::Number(n) => n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64)),
+        _ => None,
     }
 }
 
@@ -552,6 +554,15 @@ mod tests {
                         .write_all(b"{\"tokens\":4200,\"contextWindow\":200000,\"percent\":2.1,\"jobs\":3}\n")
                         .unwrap();
                 }
+                // A reply whose job count is not a number: unknown, not 0.
+                "garbage" => {
+                    let mut buf = [0u8; 64];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    stream
+                        .write_all(b"{\"tokens\":null,\"contextWindow\":null,\"percent\":null,\"jobs\":\"many\"}\n")
+                        .unwrap();
+                }
                 _ => unreachable!(),
             }
         });
@@ -661,6 +672,23 @@ mod tests {
             jobs: None,
             idle_seconds: Some(3),
         };
+        let line = format_columns(&ctx);
+        assert!(line.contains("jobs=unknown"), "got: {line}");
+        assert!(!line.contains("jobs=0"), "got: {line}");
+    }
+
+    #[test]
+    fn non_numeric_live_fields_are_unknown_not_zero() {
+        let (port, _rx, handle) = fake_plugin_server("garbage");
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_file(dir.path(), "s.jsonl", CLAUDE_FIXTURE);
+        let ctx = probe(transcript_req(Some(port), path));
+        handle.join().unwrap();
+        assert_eq!(ctx.source, ContextSource::Live);
+        assert_eq!(
+            ctx.jobs, None,
+            "a non-number job count is not a known count"
+        );
         let line = format_columns(&ctx);
         assert!(line.contains("jobs=unknown"), "got: {line}");
         assert!(!line.contains("jobs=0"), "got: {line}");
