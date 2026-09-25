@@ -294,10 +294,32 @@ hcom                                # TUI dashboard
 hcom send -b @luna -- hey           # one-off message to an agent
 hcom list                           # show all active agents
 hcom list --context                 # + per-seat context size, jobs, idle time
+hcom compact <name>                   # compact an idle seat's context (prints tokens before -> after)
+hcom compact <name> --dry-run         # would-compact or every refusal reason; changes nothing
 hcom term [name]                    # view/inject into an agent's PTY screen
 hcom events --wait <filters>         # Block until match for scripting
 hcom update                         # update hcom version
 ```
+
+`hcom compact` is idle-only and names every refusal reason in full (live turn, open
+jobs or in-flight foreground tools, running jobs and queued deliveries, pending hcom
+messages, unknown job data, no delivery path, a prompt that is not verifiably empty)
+before it touches anything. The prompt is read from the seat's PTY screen; for omp,
+hcom parses the editor box itself, so this works on seats whose wrapper is an older
+hcom. A screen that doesn't answer, or shows no input box, is never taken as empty.
+Both the would-compact report and a refusal list tokens, jobs, the delivery path and
+`prompt: empty | has text | unobservable`.
+`--focus "<one line>"` is added to the default focus, which is built from the seat's
+purpose, its current subtask and the open-job labels. `--timeout` (default 600 s) is how
+long it waits for the new compaction record in the seat's session file. Delivery is a
+PTY injection of `/compact <focus>` + Enter over the seat's inject endpoint. Immediately
+before injecting, the seat's row is re-read from the DB and its screen re-queried, and
+any refusal reason then aborts — a turn that starts between that re-check and the
+keystrokes is a residual race we accept, since hcom's full delivery gates live in the
+delivery loop. Remote (`name:DEVICE`) seats are refused as unsupported. Old-plugin
+seats have no separate view of omp's own delivery queue: a job that has finished but
+not yet been delivered has no end record in the session file, so it still counts as
+open.
 
 `hcom run docs --cli` for all commands.
 

@@ -15,7 +15,7 @@
 //!
 //! `jobs` is `unknown` (never `0`) whenever the count is not known.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::time::Duration;
@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 
 use crate::db::HcomDb;
 use crate::shared::ST_LISTENING;
+use crate::shared::time::now_epoch_ms;
 use crate::tool::Tool;
 
 /// One line the live client writes to the plugin's notify port. Anything that
@@ -70,6 +71,9 @@ pub struct SeatContext {
     pub window: Option<u64>,
     pub pct: Option<f64>,
     pub jobs: Option<u64>,
+    /// The session-file scan the fallback counts came from. One scan per
+    /// probe: callers that need both the count and the open jobs read here.
+    pub jobs_scan: JobsScan,
     pub idle_seconds: Option<i64>,
 }
 
@@ -81,6 +85,7 @@ impl SeatContext {
             window: None,
             pct: None,
             jobs: None,
+            jobs_scan: JobsScan::Unknown,
             idle_seconds: None,
         }
     }
@@ -262,6 +267,312 @@ fn tail_usage(tool: &str, transcript_path: &str) -> Option<TailUsage> {
     }
 }
 
+// --- Session-file job scan (the transcript fallback for `jobs`) ----------------
+
+/// One open background job found in a session file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenJob {
+    pub job_id: String,
+    pub kind: String, // details.async.type: "bash" | "task" | "eval" (or whatever the record says)
+    pub label: Option<String>, // label seen on a jobs[] entry for this id, if any
+}
+
+/// One in-flight foreground tool call found in a session file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTool {
+    pub tool_call_id: String,
+    pub tool_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobsScan {
+    /// Missing/unreadable file, or zero job AND zero tool records. Never treat as 0.
+    Unknown,
+    Known {
+        open_jobs: Vec<OpenJob>,
+        open_tools: Vec<OpenTool>,
+    },
+}
+
+/// One job's scan state: the reportable open job plus what its start record
+/// said about expiry (bash starts carry `timeoutSeconds`).
+struct JobStart {
+    job: OpenJob,
+    /// Start time in epoch millis when the record carried one.
+    started_ms: Option<i64>,
+    timeout_seconds: Option<u64>,
+}
+
+/// Substrings every job/tool record carries. Pre-filtering on these skips
+/// most transcript lines (plain messages) before any JSON parsing, so even a
+/// multi-megabyte session file scans cheaply.
+const JOB_LINE_MARKERS: [&str; 7] = [
+    "async",
+    "jobId",
+    "toolCallId",
+    "session_exit",
+    "tool_execution_start",
+    "toolName",
+    "jobs",
+];
+
+fn is_job_line(line: &str) -> bool {
+    JOB_LINE_MARKERS.iter().any(|marker| line.contains(marker))
+}
+
+/// ISO-8601 timestamp (the shape omp writes: `2026-09-14T02:38:19.496Z`) to
+/// epoch milliseconds.
+fn iso_to_ms(timestamp: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// End the jobs one `jobs[]` array (async-result or wait result) names.
+/// Entries carry `jobId` or, on wait results, `id`; prefer `jobId`. An entry
+/// ends its job unless it reports `status: "running"` — and where `status`
+/// is missing the two record kinds differ: async-result entries carry no
+/// status and end the job, wait entries must say so (fail safe). A surviving
+/// entry refreshes the open job's label.
+fn end_jobs(open: &mut Vec<JobStart>, jobs: &Value, missing_status_ends: bool) {
+    let Some(entries) = jobs.as_array() else {
+        return;
+    };
+    for entry in entries {
+        let Some(job_id) = entry
+            .get("jobId")
+            .or_else(|| entry.get("id"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let ends = match entry.get("status").and_then(Value::as_str) {
+            Some(status) => status != "running",
+            None => missing_status_ends,
+        };
+        if ends {
+            open.retain(|j| j.job.job_id != job_id);
+        } else if let Some(label) = entry.get("label").and_then(Value::as_str)
+            && let Some(job) = open.iter_mut().find(|j| j.job.job_id == job_id)
+        {
+            job.job.label = Some(label.to_string());
+        }
+    }
+}
+
+/// A background-job start: `message.details.async = {state: "running", jobId, type}`.
+/// `None` for anything else a toolResult might carry.
+fn job_start(entry: &Value, message: &Value) -> Option<JobStart> {
+    let details = message.get("details");
+    let async_info = details.and_then(|d| d.get("async"))?;
+    if async_info.get("state").and_then(Value::as_str) != Some("running") {
+        return None;
+    }
+    let job_id = async_info.get("jobId").and_then(Value::as_str)?;
+    // Start time: the record's ISO timestamp, falling back to the message's
+    // epoch-millis timestamp. Neither parses: unknown — never expires.
+    let started_ms = entry
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(iso_to_ms)
+        .or_else(|| message.get("timestamp").and_then(Value::as_i64));
+    Some(JobStart {
+        job: OpenJob {
+            job_id: job_id.to_string(),
+            kind: async_info
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            label: None,
+        },
+        started_ms,
+        timeout_seconds: details
+            .and_then(|d| d.get("timeoutSeconds"))
+            .and_then(json_u64),
+    })
+}
+
+/// Bash expiry: a start + `timeoutSeconds` elapsed by `now_ms` ends the job.
+/// Unknown start or no timeout: never expires (fail safe).
+fn expired(job: &JobStart, now_ms: i64) -> bool {
+    match (job.started_ms, job.timeout_seconds) {
+        (Some(start), Some(timeout)) => {
+            i128::from(now_ms) >= i128::from(start) + i128::from(timeout) * 1000
+        }
+        _ => false,
+    }
+}
+
+/// Scan a session JSONL end-to-end for open background jobs and in-flight
+/// foreground tools. `now_ms` is wall-clock epoch milliseconds (bash expiry).
+pub fn scan_session_jobs(path: &Path, now_ms: i64) -> JobsScan {
+    let Ok(file) = std::fs::File::open(path) else {
+        return JobsScan::Unknown;
+    };
+    let mut open: Vec<JobStart> = Vec::new();
+    let mut open_tools: Vec<OpenTool> = Vec::new();
+    let mut seen_record = false;
+
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return JobsScan::Unknown; // unreadable
+        };
+        if !is_job_line(&line) {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue; // malformed records are skipped, never fatal
+        };
+        match entry.get("type").and_then(Value::as_str) {
+            Some("custom") => match entry.get("customType").and_then(Value::as_str) {
+                // Session exit kills everything started before it.
+                Some("session_exit") => {
+                    open.clear();
+                    open_tools.clear();
+                }
+                Some("tool_execution_start") => {
+                    let data = entry.get("data");
+                    let Some(tool_call_id) = data
+                        .and_then(|d| d.get("toolCallId"))
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    seen_record = true;
+                    let tool = OpenTool {
+                        tool_call_id: tool_call_id.to_string(),
+                        tool_name: data
+                            .and_then(|d| d.get("toolName"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    };
+                    open_tools.retain(|t| t.tool_call_id != tool.tool_call_id);
+                    open_tools.push(tool);
+                }
+                _ => {}
+            },
+            // Async-result announces completions: its entries end jobs.
+            Some("custom_message")
+                if entry.get("customType").and_then(Value::as_str) == Some("async-result") =>
+            {
+                if let Some(jobs) = entry
+                    .get("details")
+                    .and_then(|d| d.get("jobs"))
+                    .filter(|jobs| jobs.as_array().is_some_and(|a| !a.is_empty()))
+                {
+                    seen_record = true;
+                    end_jobs(&mut open, jobs, true);
+                }
+            }
+            Some("message") => {
+                let Some(message) = entry.get("message") else {
+                    continue;
+                };
+                if message.get("role").and_then(Value::as_str) != Some("toolResult") {
+                    continue;
+                }
+                // Any toolResult answers — and closes — its foreground call,
+                // including a background job's own toolResult.
+                let tool_call_id = message
+                    .get("toolCallId")
+                    .or_else(|| entry.get("toolCallId"))
+                    .and_then(Value::as_str);
+                if let Some(id) = tool_call_id {
+                    open_tools.retain(|t| t.tool_call_id != id);
+                }
+                // Background-job start.
+                if let Some(start) = job_start(&entry, message) {
+                    seen_record = true;
+                    open.retain(|j| j.job.job_id != start.job.job_id);
+                    open.push(start);
+                }
+                // Wait result: `details.jobs` snapshot keyed `id`, with status.
+                if message.get("toolName").and_then(Value::as_str) == Some("wait")
+                    && let Some(jobs) = message
+                        .get("details")
+                        .and_then(|d| d.get("jobs"))
+                        .filter(|jobs| jobs.as_array().is_some_and(|a| !a.is_empty()))
+                {
+                    seen_record = true;
+                    end_jobs(&mut open, jobs, false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !seen_record {
+        return JobsScan::Unknown;
+    }
+    let open_jobs = open
+        .into_iter()
+        .filter(|j| !expired(j, now_ms))
+        .map(|j| j.job)
+        .collect();
+    JobsScan::Known {
+        open_jobs,
+        open_tools,
+    }
+}
+
+/// One `type=compaction` record from a session file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionRecord {
+    pub timestamp: String, // raw ISO string as recorded
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub method: String,
+}
+
+/// First type=compaction record whose timestamp parses to strictly after
+/// `since_ms` (epoch millis). Full-file streaming scan. None when absent.
+pub fn find_compaction_after(path: &Path, since_ms: i64) -> Option<CompactionRecord> {
+    let file = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return None;
+        };
+        if !line.contains("compaction") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(Value::as_str) != Some("compaction") {
+            continue;
+        }
+        let Some(timestamp) = entry.get("timestamp").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(ts_ms) = iso_to_ms(timestamp) else {
+            continue; // unparseable timestamp: skip the record
+        };
+        if ts_ms <= since_ms {
+            continue;
+        }
+        // Both token counts must be numbers; anything else skips the record.
+        let (Some(before), Some(after)) = (
+            entry.get("tokensBefore").and_then(json_u64),
+            entry.get("tokensAfter").and_then(json_u64),
+        ) else {
+            continue;
+        };
+        return Some(CompactionRecord {
+            timestamp: timestamp.to_string(),
+            tokens_before: before,
+            tokens_after: after,
+            method: entry
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+        });
+    }
+    None
+}
+
 /// One live query against a plugin notify port. Sends [`CONTEXT_QUERY`] and
 /// reads one JSON reply line; `None` on any failure (old plugin closes without
 /// replying, no answer within [`LIVE_QUERY_TIMEOUT`], malformed reply).
@@ -335,6 +646,7 @@ pub fn probe(req: SeatContextRequest) -> SeatContext {
             pct: pct_of(reply.tokens, reply.window, reply.pct),
             jobs: reply.jobs,
             idle_seconds: Some(req.idle_seconds),
+            jobs_scan: JobsScan::Unknown,
         };
     }
 
@@ -343,14 +655,38 @@ pub fn probe(req: SeatContextRequest) -> SeatContext {
     }
 
     let usage = tail_usage(&req.tool, &req.transcript_path);
+    let scan = transcript_scan(&req.tool, &req.transcript_path);
     SeatContext {
         source: ContextSource::Transcript,
         tokens: usage.map(|u| u.tokens),
         window: usage.and_then(|u| u.window),
         pct: usage.and_then(|u| pct_of(Some(u.tokens), u.window, None)),
-        jobs: None,
+        jobs: scan_jobs_count(&scan),
+        jobs_scan: scan,
         idle_seconds: Some(req.idle_seconds),
     }
+}
+
+/// Open job + in-flight tool count of a scan, or `None` when unknown.
+fn scan_jobs_count(scan: &JobsScan) -> Option<u64> {
+    match scan {
+        JobsScan::Known {
+            open_jobs,
+            open_tools,
+        } => Some((open_jobs.len() + open_tools.len()) as u64),
+        JobsScan::Unknown => None,
+    }
+}
+
+/// The session-file scan behind a transcript seat's job count (omp/pi only —
+/// the tools [`tail_usage`] sends to `parse_pi_usage`): open background jobs
+/// plus in-flight foreground tools. Claude/codex session formats are not
+/// parsed for jobs — unknown, never 0.
+fn transcript_scan(tool: &str, transcript_path: &str) -> JobsScan {
+    if !matches!(tool.parse::<Tool>(), Ok(Tool::Omp | Tool::Pi)) {
+        return JobsScan::Unknown;
+    }
+    scan_session_jobs(Path::new(transcript_path), now_epoch_ms())
 }
 
 /// [`probe`] for many seats concurrently (one short-lived query thread each,
@@ -471,6 +807,64 @@ mod tests {
 
     const CODEX_FIXTURE: &str = r#"{"timestamp":"2026-09-25T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10,"total_tokens":160},"model_context_window":200000}}}
 {"timestamp":"2026-09-25T00:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300,"cached_input_tokens":150,"output_tokens":50,"total_tokens":500},"model_context_window":258400}}}
+"#;
+
+    // Session-file job/tool records (omp 18.3 shapes, synthetic content).
+    const JOB_START_BASH: &str = r#"{"type":"message","id":"aa11","parentId":"bb22","timestamp":"2026-09-25T10:00:00.000Z","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":[{"type":"text","text":"Backgrounded as job bg_3"}],"details":{"async":{"state":"running","jobId":"bg_3","type":"bash"},"timeoutSeconds":1800},"isError":false,"timestamp":1758792000000}}
+{"id":"u1","type":"message","message":{"role":"user","content":"hi"}}
+"#;
+
+    const JOB_START_BASH_TIMEOUT: &str = r#"{"type":"message","id":"aa12","parentId":"bb23","timestamp":"2026-09-25T10:00:00.000Z","message":{"role":"toolResult","toolCallId":"call_1b","toolName":"bash","content":[{"type":"text","text":"Backgrounded as job bg_4"}],"details":{"async":{"state":"running","jobId":"bg_4","type":"bash"},"timeoutSeconds":5},"isError":false,"timestamp":1758792000000}}
+"#;
+
+    // Task jobs carry no timeoutSeconds: they never expire.
+    const JOB_START_TASK: &str = r#"{"type":"message","id":"tt11","parentId":"tt00","timestamp":"2026-09-25T10:00:00.000Z","message":{"role":"toolResult","toolCallId":"call_t","toolName":"task","content":[{"type":"text","text":"Backgrounded as job bg_9"}],"details":{"async":{"state":"running","jobId":"bg_9","type":"task"}},"isError":false,"timestamp":1758792000000}}
+"#;
+
+    // Bad ISO top-level timestamp; message.timestamp (epoch ms) carries the time.
+    const JOB_START_EPOCH_FALLBACK: &str = r#"{"type":"message","id":"zz11","timestamp":"not-a-timestamp","message":{"role":"toolResult","toolCallId":"call_z","toolName":"bash","details":{"async":{"state":"running","jobId":"bg_z","type":"bash"},"timeoutSeconds":1},"timestamp":1758792000000}}
+"#;
+
+    // No parseable start time anywhere: must never expire (fail safe).
+    const JOB_START_NO_TIME: &str = r#"{"type":"message","id":"zz22","message":{"role":"toolResult","toolCallId":"call_y","toolName":"bash","details":{"async":{"state":"running","jobId":"bg_y","type":"bash"},"timeoutSeconds":1}}}
+"#;
+
+    const JOB_ASYNC_RESULT: &str = r#"{"type":"custom_message","customType":"async-result","content":"<system-notice>Background job bg_3 has completed.</system-notice>","display":true,"details":{"jobs":[{"jobId":"bg_3","type":"bash","label":"sleep 5","durationMs":5211}]},"attribution":"agent","id":"cc33","timestamp":"2026-09-25T10:00:06.211Z"}
+"#;
+
+    // An async-result entry that does carry status running must not end the job.
+    const JOB_ASYNC_RESULT_RUNNING: &str = r#"{"type":"custom_message","customType":"async-result","content":"<system-notice>Background job bg_3 still running.</system-notice>","display":true,"details":{"jobs":[{"jobId":"bg_3","type":"bash","status":"running","label":"sleep 5"}]},"attribution":"agent","id":"cc34","timestamp":"2026-09-25T10:00:06.211Z"}
+"#;
+
+    const JOB_WAIT_COMPLETED: &str = r###"{"type":"message","id":"dd44","parentId":"ee55","timestamp":"2026-09-25T10:01:00.000Z","message":{"role":"toolResult","toolCallId":"call_2","toolName":"wait","content":[{"type":"text","text":"## Completed (1)"}],"details":{"op":"wait","meta":{"source":{"type":"report","value":"background jobs snapshot"}},"jobs":[{"id":"bg_3","type":"bash","status":"completed","label":"sleep 5","durationMs":5211}]},"isError":false,"timestamp":1758792060000}}
+"###;
+
+    const JOB_WAIT_RUNNING: &str = r###"{"type":"message","id":"dd55","parentId":"ee56","timestamp":"2026-09-25T10:01:00.000Z","message":{"role":"toolResult","toolCallId":"call_3","toolName":"wait","content":[{"type":"text","text":"## Running (1)"}],"details":{"op":"wait","jobs":[{"id":"bg_3","type":"bash","status":"running","label":"sleep 5","durationMs":0}]},"isError":false,"timestamp":1758792060000}}
+"###;
+
+    const JOB_WAIT_NO_STATUS: &str = r###"{"type":"message","id":"dd66","parentId":"ee67","timestamp":"2026-09-25T10:01:00.000Z","message":{"role":"toolResult","toolCallId":"call_4","toolName":"wait","content":[{"type":"text","text":"## (1)"}],"details":{"op":"wait","jobs":[{"id":"bg_3","type":"bash","label":"sleep 5"}]},"isError":false,"timestamp":1758792060000}}
+"###;
+
+    const SESSION_EXIT: &str = r#"{"type":"custom","customType":"session_exit","data":{"reason":"dispose","kind":"normal","recordedAt":"2026-09-25T11:00:00.000Z"},"id":"ee66","timestamp":"2026-09-25T11:00:00.000Z"}
+"#;
+
+    const TOOL_START: &str = r#"{"type":"custom","customType":"tool_execution_start","data":{"toolCallId":"toolu_1","toolName":"bash","startedAt":"2026-09-25T10:02:00.000Z"},"id":"ff77","timestamp":"2026-09-25T10:02:00.000Z"}
+"#;
+
+    const TOOL_RESULT: &str = r#"{"type":"message","id":"gg88","parentId":"ff77","timestamp":"2026-09-25T10:02:05.000Z","message":{"role":"toolResult","toolCallId":"toolu_1","toolName":"bash","content":[{"type":"text","text":"done"}],"isError":false,"timestamp":1758792125000}}
+"#;
+
+    const NO_JOB_FIXTURE: &str = r#"{"id":"u1","type":"message","message":{"role":"user","content":"hi"}}
+{"id":"a1","type":"message","timestamp":"2026-09-25T00:00:00Z","message":{"role":"assistant","content":[],"usage":{"input":10,"output":50,"cacheRead":1000,"cacheWrite":200}}}
+"#;
+
+    const COMPACTION_FIXTURE: &str = r#"{"type":"compaction","id":"ab77","timestamp":"not-a-timestamp","tokensBefore":1,"tokensAfter":2,"method":"local"}
+{"type":"compaction","id":"ab88","timestamp":"2026-09-25T10:30:00.000Z","summary":"synthetic summary","shortSummary":"synthetic short","tokensBefore":90363,"tokensAfter":17405,"method":"local"}
+{"type":"compaction","id":"ab99","timestamp":"2026-09-25T11:15:00.000Z","summary":"synthetic summary two","shortSummary":"synthetic short two","tokensBefore":80000,"tokensAfter":12000,"method":"auto"}
+"#;
+
+    const COMPACTION_BAD_TOKENS: &str = r#"{"type":"compaction","id":"ab66","timestamp":"2026-09-25T10:40:00.000Z","tokensBefore":null,"tokensAfter":500,"method":"local"}
+{"type":"compaction","id":"ab67","timestamp":"2026-09-25T10:45:00.000Z","tokensBefore":700,"tokensAfter":80,"method":"local"}
 "#;
 
     fn fixture_file(dir: &Path, name: &str, body: &str) -> String {
@@ -670,6 +1064,7 @@ mod tests {
             window: None,
             pct: None,
             jobs: None,
+            jobs_scan: JobsScan::Unknown,
             idle_seconds: Some(3),
         };
         let line = format_columns(&ctx);
@@ -703,6 +1098,7 @@ mod tests {
                 window: Some(200),
                 pct: Some(pct),
                 jobs: Some(0),
+                jobs_scan: JobsScan::Unknown,
                 idle_seconds: Some(0),
             })
         };
@@ -739,6 +1135,7 @@ mod tests {
             window: None,
             pct: Some(12.5),
             jobs: Some(0),
+            jobs_scan: JobsScan::Unknown,
             idle_seconds: Some(7),
         };
         let v = to_json(&ctx);
@@ -748,5 +1145,248 @@ mod tests {
         assert_eq!(v["pct"], 12.5);
         assert_eq!(v["jobs"], 0);
         assert_eq!(v["idle_seconds"], 7);
+    }
+
+    fn epoch_ms(iso: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(iso)
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn known_scan(body: &str, now_ms: i64) -> (Vec<OpenJob>, Vec<OpenTool>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_file(dir.path(), "s.jsonl", body);
+        match scan_session_jobs(Path::new(&path), now_ms) {
+            JobsScan::Known {
+                open_jobs,
+                open_tools,
+            } => (open_jobs, open_tools),
+            JobsScan::Unknown => panic!("fixture has job/tool records; must scan as Known"),
+        }
+    }
+
+    #[test]
+    fn scan_reports_open_bash_job() {
+        let (jobs, tools) = known_scan(JOB_START_BASH, epoch_ms("2026-09-25T10:00:10.000Z"));
+        assert_eq!(
+            jobs,
+            vec![OpenJob {
+                job_id: "bg_3".to_string(),
+                kind: "bash".to_string(),
+                label: None,
+            }]
+        );
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn scan_async_result_ends_job() {
+        let body = format!("{JOB_START_BASH}{JOB_ASYNC_RESULT}");
+        let (jobs, _) = known_scan(&body, epoch_ms("2026-09-25T10:00:10.000Z"));
+        assert!(jobs.is_empty(), "async-result entries end their job");
+    }
+
+    #[test]
+    fn scan_wait_result_completed_ends_job() {
+        let body = format!("{JOB_START_BASH}{JOB_WAIT_COMPLETED}");
+        let (jobs, _) = known_scan(&body, epoch_ms("2026-09-25T10:00:10.000Z"));
+        assert!(
+            jobs.is_empty(),
+            "a wait entry keyed id with status completed ends the job"
+        );
+    }
+
+    #[test]
+    fn scan_wait_result_running_keeps_job_and_label() {
+        let body = format!("{JOB_START_BASH}{JOB_WAIT_RUNNING}");
+        let (jobs, _) = known_scan(&body, epoch_ms("2026-09-25T10:00:10.000Z"));
+        assert_eq!(
+            jobs,
+            vec![OpenJob {
+                job_id: "bg_3".to_string(),
+                kind: "bash".to_string(),
+                label: Some("sleep 5".to_string()),
+            }],
+            "status running leaves the job open and records its label"
+        );
+    }
+
+    #[test]
+    fn scan_wait_entry_without_status_keeps_job_open() {
+        let body = format!("{JOB_START_BASH}{JOB_WAIT_NO_STATUS}");
+        let (jobs, _) = known_scan(&body, epoch_ms("2026-09-25T10:00:10.000Z"));
+        assert_eq!(
+            jobs.len(),
+            1,
+            "a wait entry without status must fail safe to open"
+        );
+    }
+
+    #[test]
+    fn scan_async_result_running_entry_keeps_job_open() {
+        let body = format!("{JOB_START_BASH}{JOB_ASYNC_RESULT_RUNNING}");
+        let (jobs, _) = known_scan(&body, epoch_ms("2026-09-25T10:00:10.000Z"));
+        assert_eq!(jobs.len(), 1, "status running never ends a job");
+    }
+
+    #[test]
+    fn scan_bash_job_expires_after_timeout() {
+        let (jobs, _) = known_scan(JOB_START_BASH_TIMEOUT, epoch_ms("2026-09-25T10:00:10.000Z"));
+        assert!(jobs.is_empty(), "the 5s timeout has passed by 10:00:10");
+    }
+
+    #[test]
+    fn scan_bash_job_open_before_timeout() {
+        let (jobs, _) = known_scan(JOB_START_BASH_TIMEOUT, epoch_ms("2026-09-25T10:00:01.000Z"));
+        assert_eq!(jobs.len(), 1, "still inside the 5s timeout at 10:00:01");
+    }
+
+    #[test]
+    fn scan_session_exit_kills_earlier_state_only() {
+        let body = format!("{JOB_START_BASH}{TOOL_START}{SESSION_EXIT}{JOB_START_TASK}");
+        let (jobs, tools) = known_scan(&body, epoch_ms("2026-09-25T10:00:10.000Z"));
+        assert_eq!(
+            jobs,
+            vec![OpenJob {
+                job_id: "bg_9".to_string(),
+                kind: "task".to_string(),
+                label: None,
+            }],
+            "the job started before session_exit is dead; the one after is open"
+        );
+        assert!(
+            tools.is_empty(),
+            "the foreground tool started before session_exit is dead"
+        );
+    }
+
+    #[test]
+    fn scan_in_flight_foreground_tool() {
+        let (jobs, tools) = known_scan(TOOL_START, epoch_ms("2026-09-25T10:02:00.000Z"));
+        assert!(jobs.is_empty());
+        assert_eq!(
+            tools,
+            vec![OpenTool {
+                tool_call_id: "toolu_1".to_string(),
+                tool_name: "bash".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn scan_foreground_tool_ends_with_tool_result() {
+        let body = format!("{TOOL_START}{TOOL_RESULT}");
+        let (jobs, tools) = known_scan(&body, epoch_ms("2026-09-25T10:02:10.000Z"));
+        assert!(jobs.is_empty());
+        assert!(tools.is_empty(), "the toolResult closes the in-flight tool");
+    }
+
+    #[test]
+    fn scan_unknown_without_records_or_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_file(dir.path(), "s.jsonl", NO_JOB_FIXTURE);
+        assert_eq!(
+            scan_session_jobs(Path::new(&path), 0),
+            JobsScan::Unknown,
+            "no job/tool records at all: unknown, never 0"
+        );
+        let missing = dir.path().join("missing.jsonl");
+        assert_eq!(scan_session_jobs(&missing, 0), JobsScan::Unknown);
+    }
+
+    #[test]
+    fn scan_start_time_fallback_and_fail_safe_expiry() {
+        // Bad ISO, epoch-millis message.timestamp: the timeout still applies.
+        let (jobs, _) = known_scan(
+            JOB_START_EPOCH_FALLBACK,
+            epoch_ms("2026-09-25T12:00:00.000Z"),
+        );
+        assert!(
+            jobs.is_empty(),
+            "message.timestamp fallback expires the job"
+        );
+        // No parseable start at all: open forever (fail safe).
+        let (jobs, _) = known_scan(JOB_START_NO_TIME, epoch_ms("2026-09-25T12:00:00.000Z"));
+        assert_eq!(jobs.len(), 1, "unknown start time must fail safe to open");
+    }
+
+    #[test]
+    fn probe_transcript_jobs_fallback_for_omp() {
+        let dir = tempfile::tempdir().unwrap();
+        // A task job (no timeout) so the wall clock can never expire it.
+        let path = fixture_file(dir.path(), "open.jsonl", JOB_START_TASK);
+        let ctx = probe(SeatContextRequest {
+            plugin_port: None,
+            transcript_path: path,
+            tool: "omp".to_string(),
+            remote: false,
+            idle_seconds: 42,
+        });
+        assert_eq!(ctx.source, ContextSource::Transcript);
+        assert_eq!(ctx.jobs, Some(1), "one open background job");
+
+        let path = fixture_file(dir.path(), "none.jsonl", NO_JOB_FIXTURE);
+        let ctx = probe(SeatContextRequest {
+            plugin_port: None,
+            transcript_path: path,
+            tool: "omp".to_string(),
+            remote: false,
+            idle_seconds: 42,
+        });
+        assert_eq!(ctx.source, ContextSource::Transcript);
+        assert_eq!(ctx.jobs, None, "no recognizable records: unknown, never 0");
+    }
+
+    #[test]
+    fn probe_transcript_jobs_unknown_for_claude() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_file(dir.path(), "open.jsonl", JOB_START_TASK);
+        let ctx = probe(SeatContextRequest {
+            plugin_port: None,
+            transcript_path: path,
+            tool: "claude".to_string(),
+            remote: false,
+            idle_seconds: 42,
+        });
+        assert_eq!(ctx.source, ContextSource::Transcript);
+        assert_eq!(
+            ctx.jobs, None,
+            "claude session files are not scanned for jobs"
+        );
+    }
+
+    #[test]
+    fn find_compaction_after_returns_first_past_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_file(dir.path(), "c.jsonl", COMPACTION_FIXTURE);
+        let since = epoch_ms("2026-09-25T11:00:00.000Z");
+        let rec = find_compaction_after(Path::new(&path), since).expect("compaction after since");
+        assert_eq!(
+            rec.timestamp, "2026-09-25T11:15:00.000Z",
+            "raw ISO string as recorded"
+        );
+        assert_eq!(rec.tokens_before, 80_000);
+        assert_eq!(rec.tokens_after, 12_000);
+        assert_eq!(rec.method, "auto");
+        // Nothing strictly after 12:00, nothing in a file without compactions.
+        let late = epoch_ms("2026-09-25T12:00:00.000Z");
+        assert_eq!(find_compaction_after(Path::new(&path), late), None);
+        let plain = fixture_file(dir.path(), "plain.jsonl", NO_JOB_FIXTURE);
+        assert_eq!(find_compaction_after(Path::new(&plain), since), None);
+        assert_eq!(
+            find_compaction_after(&dir.path().join("missing.jsonl"), since),
+            None
+        );
+    }
+
+    #[test]
+    fn find_compaction_after_skips_unusable_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_file(dir.path(), "cb.jsonl", COMPACTION_BAD_TOKENS);
+        let since = epoch_ms("2026-09-25T10:00:00.000Z");
+        let rec = find_compaction_after(Path::new(&path), since).expect("usable compaction");
+        assert_eq!(rec.tokens_before, 700, "the null-tokens record is skipped");
+        assert_eq!(rec.tokens_after, 80);
+        assert_eq!(rec.method, "local");
     }
 }
