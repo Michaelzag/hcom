@@ -4,6 +4,8 @@
 //! launch metadata capture, placeholder/canonical binding, and instance-row
 //! initialization for newly launched or recovered sessions.
 
+use anyhow::Context;
+
 use crate::db::{HcomDb, InstanceRow};
 use crate::instance_names::{PLACEHOLDER_CONTEXT, PLACEHOLDER_STATUS};
 use crate::instances::update_instance_position;
@@ -399,17 +401,77 @@ fn recreate_instance_from_placeholder(
     );
 }
 
+/// Recreate a missing instance row from the `life.stopped` snapshot that matched
+/// its session, for a restore with no placeholder row to copy from. Returns
+/// false when the row still does not exist afterwards.
+fn recreate_instance_from_stopped_snapshot(
+    db: &HcomDb,
+    target_name: &str,
+    session_id: &str,
+    snapshot: &serde_json::Value,
+) -> bool {
+    if db.get_instance_full(target_name).ok().flatten().is_some() {
+        return true;
+    }
+    let field = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    };
+    let background = snapshot
+        .get("background")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        != 0;
+    initialize_instance_in_position_file(
+        db,
+        target_name,
+        Some(session_id),
+        None,
+        None,
+        None,
+        field("transcript_path"),
+        field("tool"),
+        background,
+        field("tag"),
+        None,
+        None,
+        None,
+        field("directory"),
+    )
+}
+
 /// Bind session_id to canonical instance for process_id.
 /// Handles 4 paths: canonical exists (with placeholder merge/switch), placeholder bind,
 /// and two no-op paths.
+///
+/// `Ok(Some(name))` means the `name` row exists and its session binding (and
+/// process binding, when `process_id` is given) were written. A failed row
+/// recreation or binding write is logged here once and returned as an `Err`,
+/// never a name; callers must not mint a replacement identity on `Err`.
 pub fn bind_session_to_process(
     db: &HcomDb,
     session_id: &str,
     process_id: Option<&str>,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
+    bind_session_to_process_body(db, session_id, process_id).inspect_err(|e| {
+        crate::log::log_error(
+            "binding",
+            "bind_session_to_process.failed",
+            &format!("session_id={session_id}, process_id={process_id:?}, err={e:#}"),
+        );
+    })
+}
+
+fn bind_session_to_process_body(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: Option<&str>,
+) -> anyhow::Result<Option<String>> {
     if session_id.is_empty() {
         crate::log::log_info("binding", "bind_session_to_process.no_session_id", "");
-        return None;
+        return Ok(None);
     }
 
     crate::log::log_info(
@@ -534,22 +596,20 @@ pub fn bind_session_to_process(
 
         update_instance_position(db, canonical_name, &resume_updates);
 
-        if let Some(pid) = process_id
-            && let Err(e) = db.set_process_binding(pid, session_id, canonical_name)
-        {
-            crate::log::log_error(
-                "binding",
-                "bind_canonical.set_process_binding",
-                &format!("{e}"),
-            );
+        if let Some(pid) = process_id {
+            db.set_process_binding(pid, session_id, canonical_name)
+                .with_context(|| {
+                    format!("bind_canonical.set_process_binding for '{canonical_name}'")
+                })?;
         }
 
-        return Some(canonical_name.clone());
+        return Ok(Some(canonical_name.clone()));
     }
 
     // Path 2: session_bindings CASCADE'd on delete — recover canonical name from life.stopped
     if canonical.is_none()
-        && let Ok(Some(stopped_name)) = db.find_stopped_instance_by_session_id(session_id)
+        && let Ok(Some((stopped_name, snapshot))) =
+            db.find_stopped_snapshot_by_session_id(session_id)
     {
         crate::log::log_info(
             "binding",
@@ -562,6 +622,15 @@ pub fn bind_session_to_process(
             session_id,
             placeholder_data.as_ref(),
         );
+        // No placeholder row to copy from: rebuild the swept row from the
+        // stopped snapshot, else the bindings below would name a missing row.
+        if placeholder_data.is_none()
+            && !recreate_instance_from_stopped_snapshot(db, &stopped_name, session_id, &snapshot)
+        {
+            anyhow::bail!(
+                "restore_stopped: could not recreate the instance row for '{stopped_name}'"
+            );
+        }
 
         if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
             crate::log::log_error("binding", "restore_stopped.clear_session", &format!("{e}"));
@@ -569,17 +638,13 @@ pub fn bind_session_to_process(
         let mut updates = serde_json::Map::new();
         updates.insert("session_id".into(), serde_json::json!(session_id));
         update_instance_position(db, &stopped_name, &updates);
-        if let Err(e) = db.rebind_session(session_id, &stopped_name) {
-            crate::log::log_error("binding", "restore_stopped.rebind_session", &format!("{e}"));
-        }
-        if let Some(pid) = process_id
-            && let Err(e) = db.set_process_binding(pid, session_id, &stopped_name)
-        {
-            crate::log::log_error(
-                "binding",
-                "restore_stopped.set_process_binding",
-                &format!("{e}"),
-            );
+        db.rebind_session(session_id, &stopped_name)
+            .with_context(|| format!("restore_stopped.rebind_session for '{stopped_name}'"))?;
+        if let Some(pid) = process_id {
+            db.set_process_binding(pid, session_id, &stopped_name)
+                .with_context(|| {
+                    format!("restore_stopped.set_process_binding for '{stopped_name}'")
+                })?;
         }
 
         retire_true_placeholder_after_canonical_bind(
@@ -589,7 +654,7 @@ pub fn bind_session_to_process(
             placeholder_data.as_ref(),
         );
 
-        return Some(stopped_name);
+        return Ok(Some(stopped_name));
     }
 
     // Path 3: No canonical, but placeholder exists — bind session to placeholder
@@ -608,28 +673,18 @@ pub fn bind_session_to_process(
         updates.insert("session_id".into(), serde_json::json!(session_id));
         update_instance_position(db, ph_name, &updates);
 
-        if let Err(e) = db.rebind_session(session_id, ph_name) {
-            crate::log::log_error(
-                "binding",
-                "bind_placeholder.rebind_session",
-                &format!("{e}"),
-            );
-        }
-        if let Some(pid) = process_id
-            && let Err(e) = db.set_process_binding(pid, session_id, ph_name)
-        {
-            crate::log::log_error(
-                "binding",
-                "bind_placeholder.set_process_binding",
-                &format!("{e}"),
-            );
+        db.rebind_session(session_id, ph_name)
+            .with_context(|| format!("bind_placeholder.rebind_session for '{ph_name}'"))?;
+        if let Some(pid) = process_id {
+            db.set_process_binding(pid, session_id, ph_name)
+                .with_context(|| format!("bind_placeholder.set_process_binding for '{ph_name}'"))?;
         }
 
-        return Some(ph_name.clone());
+        return Ok(Some(ph_name.clone()));
     }
 
     crate::log::log_info("binding", "bind_session_to_process.return_none", "");
-    None
+    Ok(None)
 }
 
 /// Rebind process/session after soft-finalize cleared bindings but left the
@@ -1218,7 +1273,7 @@ mod tests {
 
         db.set_process_binding("pid-123", "", "luna").unwrap();
 
-        let result = bind_session_to_process(&db, "sid-456", Some("pid-123"));
+        let result = bind_session_to_process(&db, "sid-456", Some("pid-123")).unwrap();
         assert_eq!(result, Some("luna".to_string()));
 
         let inst = db.get_instance_full("luna").unwrap().unwrap();
@@ -1254,7 +1309,7 @@ mod tests {
 
         db.set_process_binding("pid-123", "", "temp").unwrap();
 
-        let result = bind_session_to_process(&db, "sid-789", Some("pid-123"));
+        let result = bind_session_to_process(&db, "sid-789", Some("pid-123")).unwrap();
         assert_eq!(result, Some("miso".to_string()));
 
         assert!(db.get_instance_full("temp").unwrap().is_none());
@@ -1289,7 +1344,7 @@ mod tests {
         db.set_process_binding("pid-123", "sid-old", "temp")
             .unwrap();
 
-        let result = bind_session_to_process(&db, "sid-789", Some("pid-123"));
+        let result = bind_session_to_process(&db, "sid-789", Some("pid-123")).unwrap();
         assert_eq!(result, Some("miso".to_string()));
 
         let placeholder = db.get_instance_full("temp").unwrap().unwrap();
@@ -1310,7 +1365,7 @@ mod tests {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
 
-        let result = bind_session_to_process(&db, "sid-999", None);
+        let result = bind_session_to_process(&db, "sid-999", None).unwrap();
         assert_eq!(result, None);
 
         cleanup(path);
@@ -1509,7 +1564,7 @@ mod tests {
         assert!(db.get_instance_full("miso").unwrap().is_none());
         assert_eq!(db.get_session_binding("sid-resume").unwrap(), None);
 
-        let result = bind_session_to_process(&db, "sid-resume", Some("pid-agy"));
+        let result = bind_session_to_process(&db, "sid-resume", Some("pid-agy")).unwrap();
         assert_eq!(result, Some("miso".to_string()));
 
         let restored = db.get_instance_full("miso").unwrap().unwrap();
@@ -1517,6 +1572,84 @@ mod tests {
         assert_eq!(restored.tool, "antigravity");
         assert_eq!(restored.tag.as_deref(), Some("work"));
         assert!(db.get_instance_full("nova").unwrap().is_none());
+
+        cleanup(path);
+    }
+
+    /// Process bindings that name an instance row which does not exist.
+    fn ghost_process_bindings(db: &HcomDb) -> Vec<(String, String)> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT process_id, instance_name FROM process_bindings
+                 WHERE instance_name NOT IN (SELECT name FROM instances)",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn test_restore_stopped_recreates_swept_row_from_snapshot() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        // Only the stopped snapshot survives: no row, no placeholder, no binding.
+        let snapshot = serde_json::json!({
+            "session_id": "ses-ghost",
+            "tool": "omp",
+            "directory": "/tmp/proof-dir",
+            "tag": "crew",
+            "background": 0,
+            "transcript_path": "",
+        });
+        db.log_life_event(
+            "valo",
+            "stopped",
+            "daemon",
+            "vanished",
+            Some(snapshot),
+            None,
+        )
+        .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-ghost", Some("omp-777-aa-bb")).unwrap();
+        assert_eq!(result, Some("valo".to_string()));
+
+        let valo = db.get_instance_full("valo").unwrap().expect("valo row");
+        assert_eq!(valo.session_id.as_deref(), Some("ses-ghost"));
+        assert_eq!(valo.tool, "omp");
+        assert_eq!(valo.directory, "/tmp/proof-dir");
+        assert_eq!(valo.tag.as_deref(), Some("crew"));
+        assert_eq!(
+            db.get_session_binding("ses-ghost").unwrap(),
+            Some("valo".to_string())
+        );
+        assert_eq!(
+            db.get_process_binding("omp-777-aa-bb").unwrap(),
+            Some("valo".to_string())
+        );
+        assert!(ghost_process_bindings(&db).is_empty());
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bind_placeholder_fk_failure_is_an_error_not_a_name() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        // A process binding that names a row which no longer exists.
+        db.set_process_binding("pid-ghost", "", "ghost").unwrap();
+
+        let result = bind_session_to_process(&db, "ses-unknown", Some("pid-ghost"));
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        assert_eq!(db.get_session_binding("ses-unknown").unwrap(), None);
+        assert!(db.get_instance_full("ghost").unwrap().is_none());
 
         cleanup(path);
     }
@@ -1554,7 +1687,7 @@ mod tests {
         db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
         db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
 
-        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc"));
+        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc")).unwrap();
         assert_eq!(result, Some("fano".to_string()));
 
         assert!(db.get_instance_full("mozi").unwrap().is_none());
@@ -1608,7 +1741,7 @@ mod tests {
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-99"}"#)
             .unwrap();
 
-        let result = bind_session_to_process(&db, "ses-oc-pid", Some("pid-oc"));
+        let result = bind_session_to_process(&db, "ses-oc-pid", Some("pid-oc")).unwrap();
         assert_eq!(result, Some("fano".to_string()));
 
         // Placeholder gone; pid + launch_context now live on the canonical so the
@@ -1665,7 +1798,7 @@ mod tests {
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-101"}"#)
             .unwrap();
 
-        let result = bind_session_to_process(&db, "ses-oc-ready", Some("pid-oc-ready"));
+        let result = bind_session_to_process(&db, "ses-oc-ready", Some("pid-oc-ready")).unwrap();
         assert_eq!(result, Some("fano".to_string()));
 
         assert!(db.get_instance_full("mozi").unwrap().is_none());
@@ -1716,7 +1849,7 @@ mod tests {
         db.save_instance_named("busy", &busy_data).unwrap();
         db.set_process_binding("pid-busy", "", "busy").unwrap();
 
-        let result = bind_session_to_process(&db, "ses-keep", Some("pid-busy"));
+        let result = bind_session_to_process(&db, "ses-keep", Some("pid-busy")).unwrap();
         assert_eq!(result, Some("fano".to_string()));
 
         assert!(
@@ -1799,7 +1932,7 @@ mod tests {
         db.save_instance_named("mozi", &mozi_data).unwrap();
         db.set_process_binding("pid-oc", "", "mozi").unwrap();
 
-        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc"));
+        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc")).unwrap();
         assert_eq!(result, Some("fano".to_string()));
 
         assert!(db.get_instance_full("mozi").unwrap().is_some());
@@ -1825,10 +1958,10 @@ mod tests {
         db.save_instance_named("luna", &data).unwrap();
         db.set_process_binding("pid-1", "", "luna").unwrap();
 
-        let r1 = bind_session_to_process(&db, "sess-1", Some("pid-1"));
+        let r1 = bind_session_to_process(&db, "sess-1", Some("pid-1")).unwrap();
         assert_eq!(r1, Some("luna".to_string()));
 
-        let r2 = bind_session_to_process(&db, "sess-1", Some("pid-1"));
+        let r2 = bind_session_to_process(&db, "sess-1", Some("pid-1")).unwrap();
         assert_eq!(r2, Some("luna".to_string()));
 
         let inst = db.get_instance_full("luna").unwrap().unwrap();

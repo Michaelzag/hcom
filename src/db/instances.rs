@@ -671,6 +671,30 @@ impl HcomDb {
             .map_err(Into::into)
     }
 
+    /// Like [`Self::find_stopped_instance_by_session_id`], but also returns the
+    /// matched event's snapshot, so a caller can rebuild the instance row when
+    /// it was deleted and nothing else survives to recreate it from.
+    pub fn find_stopped_snapshot_by_session_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, serde_json::Value)>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT instance, json_extract(data, '$.snapshot') FROM events
+                 WHERE type = 'life'
+                   AND json_extract(data, '$.action') = 'stopped'
+                   AND json_extract(data, '$.snapshot.session_id') = ?
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        found
+            .map(|(name, snapshot)| Ok((name, serde_json::from_str(&snapshot)?)))
+            .transpose()
+    }
+
     /// Convert a row from INSTANCE_COLUMNS SELECT to JSON.
     fn instance_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
         Ok(serde_json::json!({

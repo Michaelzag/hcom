@@ -368,7 +368,11 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     };
 
     let mut instance_name = if let Some(pid) = ctx.process_id.as_deref() {
-        instance_binding::bind_session_to_process(db, session_id, Some(pid))
+        match instance_binding::bind_session_to_process(db, session_id, Some(pid)) {
+            Ok(name) => name,
+            // Already logged; no fallback identity over a failed bind.
+            Err(_) => return hook_noop(),
+        }
     } else {
         None
     };

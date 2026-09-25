@@ -409,6 +409,75 @@ fn start_handler_uses_central_binding_for_existing_session() {
     cleanup(path);
 }
 
+/// A swept seat restarting on its old session keeps its name: only the
+/// stopped snapshot survives (no row, no placeholder, no binding), and the
+/// start hook rebuilds the row instead of minting a new identity.
+#[test]
+#[serial_test::serial]
+fn start_handler_restores_swept_row_from_stopped_snapshot() {
+    let _env = isolated_omp_env();
+    let (db, path) = setup_test_db();
+    let temp = tempfile::TempDir::new().unwrap();
+
+    let snapshot = serde_json::json!({
+        "session_id": "sid-swept",
+        "tool": "omp",
+        "directory": temp.path().to_string_lossy(),
+        "background": 0,
+        "transcript_path": "",
+    });
+    db.log_life_event(
+        "valo",
+        "stopped",
+        "daemon",
+        "vanished",
+        Some(snapshot),
+        None,
+    )
+    .unwrap();
+
+    let env = std::collections::HashMap::from([
+        ("HCOM_PROCESS_ID".to_string(), "omp-777-aa-bb".to_string()),
+        ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+        ("HCOM_TOOL".to_string(), "omp".to_string()),
+    ]);
+    let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+
+    let (code, output) = handle_start(
+        &ctx,
+        &db,
+        &[
+            "--session-id".to_string(),
+            "sid-swept".to_string(),
+            "--cwd".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ],
+    );
+    assert_eq!(code, 0);
+    let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(response.get("name").and_then(|v| v.as_str()), Some("valo"));
+
+    let valo = db.get_instance_full("valo").unwrap().expect("valo row");
+    assert_eq!(valo.tool, "omp");
+    assert_eq!(valo.session_id.as_deref(), Some("sid-swept"));
+    assert_eq!(
+        db.get_session_binding("sid-swept").unwrap(),
+        Some("valo".to_string())
+    );
+    assert_eq!(
+        db.get_process_binding("omp-777-aa-bb").unwrap(),
+        Some("valo".to_string())
+    );
+    // No minted identity: valo is the only row.
+    let rows: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+
+    cleanup(path);
+}
+
 #[test]
 fn soft_stop_keeps_instance_row_and_process_binding() {
     let (db, path) = setup_test_db();
