@@ -133,6 +133,40 @@ impl HcomDb {
         }
     }
 
+    /// Owner of `process_id`'s binding when that owner's row is live: present,
+    /// local, and not a legacy `stopped` row. `None` when the id is unbound or
+    /// its owner has no live row (a ghost binding).
+    pub fn live_process_binding_owner(&self, process_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT pb.instance_name FROM process_bindings pb
+             JOIN instances i ON i.name = pb.instance_name
+             WHERE pb.process_id = ?
+               AND i.status != 'stopped'
+               AND COALESCE(i.origin_device_id, '') = ''",
+        )?;
+
+        match stmt.query_row(params![process_id], |row| row.get::<_, String>(0)) {
+            Ok(name) => Ok(Some(name)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every process binding whose owner row is live (see
+    /// `live_process_binding_owner`), as `(process_id, instance_name)`.
+    pub fn live_process_bindings(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT pb.process_id, pb.instance_name FROM process_bindings pb
+             JOIN instances i ON i.name = pb.instance_name
+             WHERE i.status != 'stopped'
+               AND COALESCE(i.origin_device_id, '') = ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Return all instance names whose current transcript path exactly matches.
     ///
     /// Duplicate matches are returned deliberately so identity resolution can
