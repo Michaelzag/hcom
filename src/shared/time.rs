@@ -25,6 +25,14 @@ pub fn now_epoch_i64() -> i64 {
         .unwrap_or(0)
 }
 
+/// Current time as i64 milliseconds since epoch (for session-record timestamps).
+pub fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Current time as ISO 8601 string with microsecond precision (for TEXT timestamp columns).
 pub fn now_iso() -> String {
     chrono::Utc::now()

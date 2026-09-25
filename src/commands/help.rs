@@ -210,6 +210,36 @@ const TITLE_HELP: &[HelpEntry] = &[
     ("title --clear", "Clear both"),
 ];
 
+const COMPACT_HELP: &[HelpEntry] = &[
+    (
+        "compact <name>",
+        "Compact an idle seat's context (injects /compact <focus> + Enter)",
+    ),
+    ("", "Prints tokens before -> after from the new compaction record."),
+    (
+        "compact <name> --focus \"<one line>\"",
+        "Extra focus, added to the default focus",
+    ),
+    ("compact <name> --dry-run", "Would-compact or every refusal reason; changes nothing"),
+    ("compact <name> --timeout <s>", "Seconds to wait for the new record (default 600)"),
+    ("", ""),
+    ("Idle-only. Every reason that applies is named:", ""),
+    ("", "  a live turn (seat not idle/listening)"),
+    ("", "  open background jobs or in-flight foreground tools (session file)"),
+    ("", "  running jobs and queued deliveries (live plugin snapshot)"),
+    ("", "  pending hcom messages"),
+    ("", "  unknown job data (no records, no live answer)"),
+    ("", "  no delivery path (no inject endpoint)"),
+    ("", "Remote (name:DEVICE) seats are unsupported and refused outright."),
+    ("", ""),
+    ("", "  Old-plugin seats have no separate view of omp's own delivery queue:"),
+    (
+        "",
+        "  a job that has finished but not yet been delivered has no end record",
+    ),
+    ("  in the session file, so it still counts as open.", ""),
+];
+
 const SEND_HELP: &[HelpEntry] = &[
     ("  send @name -- message text", "Direct message"),
     ("  send @name1 @name2 -- message", "Multiple targets"),
@@ -1081,6 +1111,7 @@ pub fn get_command_help(name: &str) -> String {
         "hooks" => None,
         "term" => Some(TERM_HELP),
         "title" => Some(TITLE_HELP),
+        "compact" => Some(COMPACT_HELP),
         _ => None,
     };
 

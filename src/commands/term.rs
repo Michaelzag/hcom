@@ -137,7 +137,7 @@ fn inject_text(db: &HcomDb, name: &str, text: &str, enter: bool) -> i32 {
 }
 
 /// Send screen query to inject port, get back parsed JSON.
-fn query_screen(port: i32) -> Option<serde_json::Value> {
+pub(crate) fn query_screen(port: i32) -> Option<serde_json::Value> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(2))).ok();

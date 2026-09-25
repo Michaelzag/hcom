@@ -17,6 +17,7 @@ pub mod stop;
 
 // Diagnostics
 pub mod bundle;
+pub mod compact;
 pub mod events;
 pub mod list;
 pub mod status;
