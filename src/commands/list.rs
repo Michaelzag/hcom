@@ -9,6 +9,7 @@ use std::io::IsTerminal;
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::context::{self, SeatContext};
 use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
 use crate::identity::{get_full_name, resolve_display_name};
@@ -53,6 +54,10 @@ pub struct ListArgs {
     /// Limit results (with --stopped)
     #[arg(long)]
     pub last: Option<usize>,
+    /// Per-seat context size, in-flight jobs and idle time (opt-in; nothing is
+    /// collected or stored without it)
+    #[arg(long)]
+    pub context: bool,
 }
 
 /// Get unread message count for a single instance.
@@ -80,6 +85,25 @@ fn get_unread_counts_batch(db: &HcomDb, instances: &[InstanceRow]) -> HashMap<St
         }
     }
     counts
+}
+
+/// Everything `hcom list --context` needs about one seat: the plugin port for a
+/// live query, the transcript path for the fallback, and hcom's own idle
+/// tracking. Read-only — the flag stores nothing.
+fn seat_context_request(db: &HcomDb, data: &InstanceRow, now: i64) -> context::SeatContextRequest {
+    let cs = get_instance_status(data, db);
+    context::SeatContextRequest {
+        plugin_port: context::plugin_port(db, &data.name),
+        transcript_path: data.transcript_path.clone(),
+        tool: data.tool.clone(),
+        remote: is_remote_instance(data) || data.name.contains(':'),
+        idle_seconds: context::idle_seconds_for(
+            &cs.status,
+            data.status_time,
+            data.idle_since.as_deref(),
+            now,
+        ),
+    }
 }
 
 /// Main entry point for `hcom list` command.
@@ -176,6 +200,12 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     payload["session_id"] = serde_json::json!(sid);
                 }
 
+                if args.context {
+                    let now = crate::shared::time::now_epoch_i64();
+                    let seat = context::probe(seat_context_request(db, &data, now));
+                    payload["context"] = context::to_json(&seat);
+                }
+
                 if let Some(field) = field_name {
                     println!("{}", extract_field_value(&payload, field));
                 } else if sh_output {
@@ -184,6 +214,11 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     println!("{}", serde_json::to_string(&payload).unwrap_or_default());
                 } else {
                     print_instance_details(db, &data, &lookup_name);
+                    if args.context {
+                        let now = crate::shared::time::now_epoch_i64();
+                        let seat = context::probe(seat_context_request(db, &data, now));
+                        println!("  {}", context::format_columns(&seat));
+                    }
                 }
                 return 0;
             }
@@ -230,6 +265,25 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         return 0;
     }
 
+    // `--context`: one short-lived query per seat, concurrently. Nothing above
+    // this point pays for it, and nothing here is stored.
+    let seat_contexts: Option<HashMap<String, SeatContext>> = if args.context {
+        let now = crate::shared::time::now_epoch_i64();
+        let requests: Vec<_> = sorted_instances
+            .iter()
+            .map(|row| seat_context_request(db, row, now))
+            .collect();
+        Some(
+            sorted_instances
+                .iter()
+                .map(|row| row.name.clone())
+                .zip(context::probe_seats(requests))
+                .collect(),
+        )
+    } else {
+        None
+    };
+
     if json_output || format_template.is_some() {
         let mut result_list: Vec<serde_json::Value> = Vec::new();
 
@@ -250,7 +304,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(serde_json::json!({}));
 
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "name": full_name,
                 "status": status,
                 "status_context": data.status_context,
@@ -275,6 +329,11 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "process_bound": process_bound,
                 "launch_context": launch_context,
             });
+            if let Some(contexts) = &seat_contexts
+                && let Some(seat) = contexts.get(&data.name)
+            {
+                payload["context"] = context::to_json(seat);
+            }
             result_list.push(payload);
         }
 
@@ -473,6 +532,12 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         let title_suffix = list_title_suffix(data, &line_head);
 
         println!("{line_head}{title_suffix}");
+
+        if let Some(contexts) = &seat_contexts
+            && let Some(seat) = contexts.get(&data.name)
+        {
+            println!("    {}", context::format_columns(seat));
+        }
 
         if verbose_output {
             let session_id = data.session_id.as_deref().unwrap_or("(none)");

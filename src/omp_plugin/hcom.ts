@@ -327,13 +327,96 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		return !candidateSessionId || !sessionId || candidateSessionId === sessionId;
 	}
 
+	/** The job-snapshot fields the context query reads. */
+	interface AsyncJobSnapshotView {
+		running: readonly unknown[];
+		delivery: { queued: number; delivering: boolean };
+	}
+
+	// `getAsyncJobSnapshot()` is newer than the SDK types hcom pins for the
+	// plugin typecheck (17.0.6); the omp this runs inside (>= 18.0) has it. Type
+	// the context once with the method optional so a host without it reports the
+	// job count as unknown instead of throwing.
+	function asyncJobSnapshot(ctx: ExtensionContext): AsyncJobSnapshotView | null {
+		const host: ExtensionContext & {
+			getAsyncJobSnapshot?: () => AsyncJobSnapshotView | null;
+		} = ctx;
+		return host.getAsyncJobSnapshot?.() ?? null;
+	}
+
+	// One reply line for hcom's `list --context` query (`{"q":"context"}\n`).
+	// Usage is null when the seat cannot compute it and the job count is null
+	// when the session has no job manager; hcom renders both as unknown, never 0.
+	function contextReply(): string {
+		try {
+			const usage = currentCtx?.getContextUsage() ?? null;
+			const snapshot = currentCtx ? asyncJobSnapshot(currentCtx) : null;
+			const jobs = snapshot
+				? snapshot.running.length +
+					snapshot.delivery.queued +
+					(snapshot.delivery.delivering ? 1 : 0)
+				: null;
+			return JSON.stringify({
+				tokens: usage ? usage.tokens : null,
+				contextWindow: usage ? usage.contextWindow : null,
+				percent: usage ? usage.percent : null,
+				jobs,
+			});
+		} catch (error) {
+			log("WARN", "notify_server.context_query_failed", instanceName, {
+				error: String(error),
+			});
+			return JSON.stringify({ tokens: null, contextWindow: null, percent: null, jobs: null });
+		}
+	}
+
 	function startNotifyServer(): Promise<number | null> {
 		if (notifyServer && notifyPort) return Promise.resolve(notifyPort);
 		return new Promise((resolve) => {
 			const server = createServer((socket) => {
-				socket.end();
-				log("DEBUG", "notify_server.wake", instanceName, { pending_ack: pendingAckId });
-				if (currentCtx) void deliverPending(currentCtx);
+				let settled = false;
+				// Connection that sends no context request: end it and deliver
+				// pending messages, exactly as before. Every existing wake sender
+				// connect-drops, so "close" below is what fires this.
+				const wake = () => {
+					if (settled) return;
+					settled = true;
+					try {
+						socket.end();
+					} catch {}
+					log("DEBUG", "notify_server.wake", instanceName, { pending_ack: pendingAckId });
+					if (currentCtx) void deliverPending(currentCtx);
+				};
+				let buffer = "";
+				socket.setEncoding("utf8");
+				socket.on("data", (chunk: Buffer | string) => {
+					if (settled) return;
+					buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+					const newline = buffer.indexOf("\n");
+					if (newline < 0) return;
+					let reply: string | null = null;
+					try {
+						const request: unknown = JSON.parse(buffer.slice(0, newline).trim());
+						if (
+							request &&
+							typeof request === "object" &&
+							"q" in request &&
+							request.q === "context"
+						) {
+							reply = contextReply();
+						}
+					} catch {}
+					if (reply === null) {
+						// Not a context query — keep today's wake behavior.
+						wake();
+						return;
+					}
+					settled = true;
+					socket.end(`${reply}\n`);
+					log("DEBUG", "notify_server.context_query", instanceName, {});
+				});
+				socket.on("close", wake);
+				socket.on("error", () => {});
 			});
 			server.on("error", (error) => {
 				log("ERROR", "notify_server.start_failed", instanceName, { error: String(error) });
