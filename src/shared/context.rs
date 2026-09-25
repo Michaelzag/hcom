@@ -181,9 +181,10 @@ impl HcomContext {
     /// [`FOREIGN_REFUSED_LOG_INTERVAL`], safe across concurrent hook
     /// processes. Returns whether the line was written.
     fn log_foreign_refused(db: &HcomDb, id: &str, tool: &str) -> bool {
-        if !Self::foreign_refused_claim(db, id) {
+        let stamp = Self::foreign_refused_claim(db, id);
+        let Some(stamp) = stamp else {
             return false;
-        }
+        };
         let written = crate::log::log_checked(
             "INFO",
             "hooks",
@@ -196,30 +197,40 @@ impl HcomContext {
             // line on a lost write. A failed release leaves the claim in
             // place — the interval then suppresses one line, the cost of
             // a log filesystem that stayed broken.
-            let _ = db.conn().execute(
-                "DELETE FROM kv WHERE key = ?1",
-                rusqlite::params![Self::foreign_refused_key(id)],
-            );
+            Self::foreign_refused_release(db, id, &stamp);
         }
         written
     }
 
+    /// Delete this invocation's claim only, by comparing the stored stamp
+    /// against the exact text this claim wrote. A release must never
+    /// touch a stamp another hook process wrote: a differing (or absent)
+    /// value deletes nothing, so a losing hook cannot reopen the winner's
+    /// interval.
+    fn foreign_refused_release(db: &HcomDb, id: &str, stamp: &str) {
+        let _ = db.conn().execute(
+            "DELETE FROM kv WHERE key = ?1 AND value = ?2",
+            rusqlite::params![Self::foreign_refused_key(id), stamp],
+        );
+    }
+
     /// Atomically claim the `identity.foreign_refused` line for this id:
-    /// true exactly once per interval, with the loser of a concurrent claim
-    /// seeing false. The single UPSERT is the linearization point — the
-    /// stamp never moves backwards (an older `now` cannot overwrite a newer
-    /// stamp) and two hook processes claiming together cannot both win.
-    /// Any SQL failure fails OPEN (claims and logs anyway): unreadable or
-    /// malformed state cannot justify suppression.
-    fn foreign_refused_claim(db: &HcomDb, id: &str) -> bool {
+    /// Some(stamp) exactly once per interval, with the loser of a
+    /// concurrent claim seeing None. The single UPSERT is the
+    /// linearization point — the stamp never moves backwards (an older
+    /// `now` cannot overwrite a newer stamp) and two hook processes
+    /// claiming together cannot both win. Any SQL failure fails OPEN
+    /// (claims and logs anyway): unreadable or malformed state cannot
+    /// justify suppression.
+    fn foreign_refused_claim(db: &HcomDb, id: &str) -> Option<String> {
         let key = Self::foreign_refused_key(id);
-        let now = crate::shared::time::now_epoch_f64();
+        let now_ms = Self::foreign_refused_now_ms();
         let claimed = db.conn().execute(
             "INSERT INTO kv (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value
-             WHERE CAST(kv.value AS REAL) IS NULL
-                OR CAST(kv.value AS REAL) <= ?2 - ?3",
-            rusqlite::params![key, now, FOREIGN_REFUSED_LOG_INTERVAL],
+             WHERE kv.value GLOB '*[^0-9]*' OR kv.value = ''
+                OR CAST(kv.value AS INTEGER) <= ?2 - ?3",
+            rusqlite::params![key, now_ms, (FOREIGN_REFUSED_LOG_INTERVAL * 1000.0) as i64],
         );
         match claimed {
             Ok(1) => {
@@ -229,15 +240,20 @@ impl HcomContext {
                 let _ = db.conn().execute(
                     "DELETE FROM kv
                      WHERE key LIKE 'identity_foreign_refused_last:%' ESCAPE '\\'
-                        AND CAST(value AS REAL) < ?1 - ?2",
-                    rusqlite::params![now, FOREIGN_REFUSED_LOG_INTERVAL],
+                        AND (value GLOB '*[^0-9]*' OR value = ''
+                             OR CAST(value AS INTEGER) < ?1 - ?2)",
+                    rusqlite::params![now_ms, (FOREIGN_REFUSED_LOG_INTERVAL * 1000.0) as i64],
                 );
-                true
+                Some(now_ms.to_string())
             }
-            Ok(_) => false,
+            Ok(_) => None,
             // Unreadable throttle state must not suppress the line.
-            Err(_) => true,
+            Err(_) => Some(now_ms.to_string()),
         }
+    }
+
+    fn foreign_refused_now_ms() -> i64 {
+        (crate::shared::time::now_epoch_f64() * 1000.0) as i64
     }
 
     fn foreign_refused_key(id: &str) -> String {
@@ -770,11 +786,14 @@ mod tests {
         refuse_as_hook_process(&db_path, id);
         assert_eq!(foreign_refused_log_lines(id), 1);
 
-        // Inject the clock: backdate the persisted last-logged stamp past the
-        // interval, as if the earlier refusal had happened 10 minutes ago.
+        // Inject the clock: backdate the persisted last-logged stamp past
+        // the interval (milliseconds), as if the earlier refusal had
+        // happened 10 minutes ago.
         let db = HcomDb::open_raw(&db_path).unwrap();
         let key = format!("identity_foreign_refused_last:{id}");
-        let backdated = crate::shared::time::now_epoch_f64() - (FOREIGN_REFUSED_LOG_INTERVAL + 1.0);
+        let backdated = HcomContext::foreign_refused_now_ms()
+            - (FOREIGN_REFUSED_LOG_INTERVAL * 1000.0) as i64
+            - 1;
         db.kv_set(&key, Some(&backdated.to_string())).unwrap();
         drop(db);
 
@@ -854,9 +873,9 @@ mod tests {
         let db_path = db_dir.path().join("test.db");
         let id = "550e8400-e29b-41d4-a716-446655440044";
         let expired_key = format!("identity_foreign_refused_last:{id}");
-        let expired_ts =
-            crate::shared::time::now_epoch_f64() - (FOREIGN_REFUSED_LOG_INTERVAL * 2.0);
-        db.kv_set(&expired_key, Some(&expired_ts.to_string()))
+        let expired_ms =
+            HcomContext::foreign_refused_now_ms() - (FOREIGN_REFUSED_LOG_INTERVAL * 2000.0) as i64;
+        db.kv_set(&expired_key, Some(&expired_ms.to_string()))
             .unwrap();
         drop(db);
 
@@ -881,41 +900,42 @@ mod tests {
         drop(db);
         let db_path = db_dir.path().join("test.db");
         let id = "550e8400-e29b-41d4-a716-446655440066";
-
-        // A refusal stamps now. A second claim whose clock reads older
-        // (skewed hook process) must not move the stamp backwards.
-        refuse_as_hook_process(&db_path, id);
         let key = format!("identity_foreign_refused_last:{id}");
+
+        // A refusal stamps now (integer epoch milliseconds).
+        refuse_as_hook_process(&db_path, id);
         let db = HcomDb::open_raw(&db_path).unwrap();
         let newer = db.kv_get(&key).unwrap().unwrap();
-        let newer: f64 = newer.parse().unwrap();
+        let newer_ms: i64 = newer.parse().unwrap();
         drop(db);
 
-        // Inject the skew: backdate so the WHERE clause would let an
-        // older claimant overwrite, then prove it cannot win against the
-        // newer stamp — the stamp stays at `newer`.
-        let skewed_older = newer - (FOREIGN_REFUSED_LOG_INTERVAL + 1.0);
+        // A claim from a skewed (older) clock must lose outright: the
+        // newer stamp is inside its interval, so the WHERE clause blocks
+        // the update and the stamp never moves backwards.
+        let skewed_older_ms = newer_ms - (FOREIGN_REFUSED_LOG_INTERVAL * 1000.0) as i64 - 1;
         let db = HcomDb::open_raw(&db_path).unwrap();
-        let changed = db.conn().execute(
-            "INSERT INTO kv (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value
-             WHERE CAST(kv.value AS REAL) IS NULL
-                OR CAST(kv.value AS REAL) <= ?2 - ?3",
-            rusqlite::params![key, skewed_older, FOREIGN_REFUSED_LOG_INTERVAL],
-        );
+        // Inject the clock skew by rewriting the stamp through the seam's
+        // own parameters: an older claimant with this `now` loses.
+        db.conn()
+            .execute(
+                "INSERT INTO kv (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                 WHERE kv.value GLOB '*[^0-9]*' OR kv.value = ''
+                    OR CAST(kv.value AS INTEGER) <= ?2 - ?3",
+                rusqlite::params![
+                    key,
+                    skewed_older_ms,
+                    (FOREIGN_REFUSED_LOG_INTERVAL * 1000.0) as i64
+                ],
+            )
+            .unwrap();
         drop(db);
 
-        // Either the skewed claim lost outright (0 changes), or it must
-        // not have lowered the stamp. The stored stamp never regresses.
         let db = HcomDb::open_raw(&db_path).unwrap();
-        let stored: f64 = db.kv_get(&key).unwrap().unwrap().parse().unwrap();
-        match changed {
-            Ok(n) => assert_eq!(n, 0, "an older claim must not touch a newer stamp"),
-            Err(e) => panic!("claim failed: {e}"),
-        }
-        assert!(
-            stored >= newer,
-            "the stored stamp ({stored}) must never move backwards from {newer}"
+        let stored: i64 = db.kv_get(&key).unwrap().unwrap().parse().unwrap();
+        assert_eq!(
+            stored, newer_ms,
+            "an older claim must never move the stamp backwards"
         );
     }
 
@@ -953,6 +973,75 @@ mod tests {
             foreign_refused_log_lines(id),
             1,
             "after a released claim the next refusal logs"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_release_deletes_only_own_stamp() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        drop(db);
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-446655440088";
+
+        // Hook A claims and logs.
+        refuse_as_hook_process(&db_path, id);
+        let key = format!("identity_foreign_refused_last:{id}");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let hook_a_stamp = db.kv_get(&key).unwrap().unwrap();
+        drop(db);
+
+        // Hook B's claim loses (A's stamp is fresh, inside the interval).
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let mut ctx = launched_ctx(id);
+        assert!(!ctx.trust_process_id_inner(&db), "B's claim must lose");
+        drop(db);
+
+        // A later hook whose log write fails must not release A's claim:
+        // its stamp differs, so its compare-and-delete removes nothing
+        // and A's interval survives.
+        let stale_stamp = format!("{}.0", hook_a_stamp.parse::<f64>().unwrap() - 1.0);
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        HcomContext::foreign_refused_release(&db, id, &stale_stamp);
+        drop(db);
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        assert_eq!(
+            db.kv_get(&key).unwrap().as_deref(),
+            Some(hook_a_stamp.as_str()),
+            "a release with a different stamp must not delete another hook's claim"
+        );
+
+        // And a third hook cannot log inside A's interval.
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let mut ctx = launched_ctx(id);
+        assert!(
+            !ctx.trust_process_id_inner(&db),
+            "A's claim must still hold the interval"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_numeric_prefix_malformed_value_fails_open() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-446655440099";
+
+        // SQLite's CAST reads the numeric prefix of this junk value, so
+        // the old WHERE would treat a far-future stamp as valid and
+        // suppress the line. It is malformed and must fail OPEN.
+        let key = format!("identity_foreign_refused_last:{id}");
+        db.kv_set(&key, Some("99999999999junk")).unwrap();
+        drop(db);
+
+        refuse_as_hook_process(&db_path, id);
+        assert_eq!(
+            foreign_refused_log_lines(id),
+            1,
+            "a numeric-prefixed malformed stamp must not suppress the line"
         );
     }
 }
