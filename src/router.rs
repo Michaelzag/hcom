@@ -901,9 +901,12 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         "title" => clap_dispatch!(crate::commands::title::TitleArgs, cmd, &cmd_argv, |args| {
             crate::commands::title::cmd_title(&db, &args, Some(&ctx))
         }),
-        "compact" => clap_dispatch!(crate::commands::compact::CompactArgs, cmd, &cmd_argv, |args| {
-            crate::commands::compact::cmd_compact(&db, &args, Some(&ctx))
-        }),
+        "compact" => clap_dispatch!(
+            crate::commands::compact::CompactArgs,
+            cmd,
+            &cmd_argv,
+            |args| { crate::commands::compact::cmd_compact(&db, &args, Some(&ctx)) }
+        ),
         "relay" => clap_dispatch!(crate::commands::relay::RelayArgs, cmd, &cmd_argv, |args| {
             crate::commands::relay::cmd_relay(&db, &args, Some(&ctx))
         }),

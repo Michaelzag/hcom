@@ -23,8 +23,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::db::HcomDb;
-use crate::shared::time::now_epoch_ms;
 use crate::shared::ST_LISTENING;
+use crate::shared::time::now_epoch_ms;
 use crate::tool::Tool;
 
 /// One line the live client writes to the plugin's notify port. Anything that
@@ -273,7 +273,7 @@ fn tail_usage(tool: &str, transcript_path: &str) -> Option<TailUsage> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenJob {
     pub job_id: String,
-    pub kind: String,          // details.async.type: "bash" | "task" | "eval" (or whatever the record says)
+    pub kind: String, // details.async.type: "bash" | "task" | "eval" (or whatever the record says)
     pub label: Option<String>, // label seen on a jobs[] entry for this id, if any
 }
 
@@ -352,10 +352,10 @@ fn end_jobs(open: &mut Vec<JobStart>, jobs: &Value, missing_status_ends: bool) {
         };
         if ends {
             open.retain(|j| j.job.job_id != job_id);
-        } else if let Some(label) = entry.get("label").and_then(Value::as_str) {
-            if let Some(job) = open.iter_mut().find(|j| j.job.job_id == job_id) {
-                job.job.label = Some(label.to_string());
-            }
+        } else if let Some(label) = entry.get("label").and_then(Value::as_str)
+            && let Some(job) = open.iter_mut().find(|j| j.job.job_id == job_id)
+        {
+            job.job.label = Some(label.to_string());
         }
     }
 }
@@ -387,7 +387,9 @@ fn job_start(entry: &Value, message: &Value) -> Option<JobStart> {
             label: None,
         },
         started_ms,
-        timeout_seconds: details.and_then(|d| d.get("timeoutSeconds")).and_then(json_u64),
+        timeout_seconds: details
+            .and_then(|d| d.get("timeoutSeconds"))
+            .and_then(json_u64),
     })
 }
 
@@ -518,7 +520,7 @@ pub fn scan_session_jobs(path: &Path, now_ms: i64) -> JobsScan {
 /// One `type=compaction` record from a session file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionRecord {
-    pub timestamp: String,     // raw ISO string as recorded
+    pub timestamp: String, // raw ISO string as recorded
     pub tokens_before: u64,
     pub tokens_after: u64,
     pub method: String,
@@ -1295,8 +1297,14 @@ mod tests {
     #[test]
     fn scan_start_time_fallback_and_fail_safe_expiry() {
         // Bad ISO, epoch-millis message.timestamp: the timeout still applies.
-        let (jobs, _) = known_scan(JOB_START_EPOCH_FALLBACK, epoch_ms("2026-09-25T12:00:00.000Z"));
-        assert!(jobs.is_empty(), "message.timestamp fallback expires the job");
+        let (jobs, _) = known_scan(
+            JOB_START_EPOCH_FALLBACK,
+            epoch_ms("2026-09-25T12:00:00.000Z"),
+        );
+        assert!(
+            jobs.is_empty(),
+            "message.timestamp fallback expires the job"
+        );
         // No parseable start at all: open forever (fail safe).
         let (jobs, _) = known_scan(JOB_START_NO_TIME, epoch_ms("2026-09-25T12:00:00.000Z"));
         assert_eq!(jobs.len(), 1, "unknown start time must fail safe to open");
@@ -1341,7 +1349,10 @@ mod tests {
             idle_seconds: 42,
         });
         assert_eq!(ctx.source, ContextSource::Transcript);
-        assert_eq!(ctx.jobs, None, "claude session files are not scanned for jobs");
+        assert_eq!(
+            ctx.jobs, None,
+            "claude session files are not scanned for jobs"
+        );
     }
 
     #[test]
