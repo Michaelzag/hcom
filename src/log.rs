@@ -60,7 +60,7 @@ fn rotate_if_needed(path: &std::path::Path) {
 /// optional fields.
 /// plus optional structured fields.
 pub fn log(level: &str, subsystem: &str, event: &str, message: &str) {
-    log_with_fields(level, subsystem, event, message, &[]);
+    let _ = log_with_fields(level, subsystem, event, message, &[]);
 }
 
 /// Log with additional structured key-value fields.
@@ -73,7 +73,7 @@ pub fn log_with_fields(
     event: &str,
     message: &str,
     fields: &[(&str, &str)],
-) {
+) -> bool {
     let path = crate::paths::log_path();
 
     // Ensure directory exists
@@ -120,13 +120,23 @@ pub fn log_with_fields(
 
     let log_line = match serde_json::to_string(&serde_json::Value::Object(obj)) {
         Ok(line) => line,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     // Append to file (atomic for ≤4KB on APFS/ext4)
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{}", log_line);
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut file) => writeln!(file, "{}", log_line).is_ok(),
+        Err(_) => false,
     }
+}
+
+/// Log a structured event, reporting whether the line reached the file.
+///
+/// Same as [`log`], but returns false when the line could not be written
+/// (serialization or file failure) so callers that burn a one-shot resource
+/// on the way (throttle claims) can release it instead of losing the event.
+pub fn log_checked(level: &str, subsystem: &str, event: &str, message: &str) -> bool {
+    log_with_fields(level, subsystem, event, message, &[])
 }
 
 /// Log info message.

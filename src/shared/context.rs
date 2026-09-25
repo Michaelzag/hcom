@@ -147,24 +147,25 @@ impl HcomContext {
     /// a proven OMP-minted id belongs to a plain or nested session. Other
     /// tools keep their existing synthetic-id carriage and launch claims.
     pub fn trust_process_id(&mut self, db: &HcomDb) {
+        let _ = self.trust_process_id_inner(db);
+    }
+
+    /// `trust_process_id` reporting whether this call emitted the
+    /// `identity.foreign_refused` log line.
+    fn trust_process_id_inner(&mut self, db: &HcomDb) -> bool {
         let Some(id) = self.process_id.clone() else {
             self.is_launched = false;
-            return;
+            return false;
         };
         let trusted = if self.tool == Tool::Omp {
             crate::proctruth::trusted_process_id_for_omp(db, &id)
         } else {
             crate::proctruth::trusted_process_id(db, &id)
         };
+        let mut logged = false;
         if !trusted {
             self.process_id = None;
-            if Self::foreign_refused_log_due(db, &id) {
-                crate::log::log_info(
-                    "hooks",
-                    "identity.foreign_refused",
-                    &format!("tool={} refused process id {id}", self.tool.as_str()),
-                );
-            }
+            logged = Self::log_foreign_refused(db, &id, self.tool.as_str());
         }
         self.is_launched = self.is_launched
             && trusted
@@ -173,27 +174,74 @@ impl HcomContext {
             } else {
                 crate::proctruth::omp_minted_pid(&id).is_none()
             };
+        logged
     }
 
-    /// Whether the `identity.foreign_refused` line for this id may be logged
-    /// now: true when the id was not yet refused-and-logged, or the interval
-    /// since its last logged refusal has elapsed. Any throttle-state failure
-    /// fails OPEN — the line is logged rather than silently suppressed.
-    fn foreign_refused_log_due(db: &HcomDb, id: &str) -> bool {
-        let key = format!("identity_foreign_refused_last:{id}");
-        let now = crate::shared::time::now_epoch_f64();
-        let last = match db.kv_get(&key) {
-            Ok(Some(value)) => value.parse::<f64>().ok(),
-            // Unreadable or malformed state cannot justify suppression.
-            Err(_) | Ok(None) => None,
-        };
-        if last.is_some_and(|last| now - last < FOREIGN_REFUSED_LOG_INTERVAL) {
+    /// Throttled `identity.foreign_refused` line: one per process id per
+    /// [`FOREIGN_REFUSED_LOG_INTERVAL`], safe across concurrent hook
+    /// processes. Returns whether the line was written.
+    fn log_foreign_refused(db: &HcomDb, id: &str, tool: &str) -> bool {
+        if !Self::foreign_refused_claim(db, id) {
             return false;
         }
-        // A failed stamp write means the next refusal may log again too —
-        // a duplicate line is the safe direction, a missing one is not.
-        let _ = db.kv_set(&key, Some(&now.to_string()));
-        true
+        let written = crate::log::log_checked(
+            "INFO",
+            "hooks",
+            "identity.foreign_refused",
+            &format!("tool={tool} refused process id {id}"),
+        );
+        if !written {
+            // The line never reached the file: release the claim so the
+            // next refusal can log instead of burning this interval's only
+            // line on a lost write. A failed release leaves the claim in
+            // place — the interval then suppresses one line, the cost of
+            // a log filesystem that stayed broken.
+            let _ = db.conn().execute(
+                "DELETE FROM kv WHERE key = ?1",
+                rusqlite::params![Self::foreign_refused_key(id)],
+            );
+        }
+        written
+    }
+
+    /// Atomically claim the `identity.foreign_refused` line for this id:
+    /// true exactly once per interval, with the loser of a concurrent claim
+    /// seeing false. The single UPSERT is the linearization point — the
+    /// stamp never moves backwards (an older `now` cannot overwrite a newer
+    /// stamp) and two hook processes claiming together cannot both win.
+    /// Any SQL failure fails OPEN (claims and logs anyway): unreadable or
+    /// malformed state cannot justify suppression.
+    fn foreign_refused_claim(db: &HcomDb, id: &str) -> bool {
+        let key = Self::foreign_refused_key(id);
+        let now = crate::shared::time::now_epoch_f64();
+        let claimed = db.conn().execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE CAST(kv.value AS REAL) IS NULL
+                OR CAST(kv.value AS REAL) <= ?2 - ?3",
+            rusqlite::params![key, now, FOREIGN_REFUSED_LOG_INTERVAL],
+        );
+        match claimed {
+            Ok(1) => {
+                // Winning claim: prune other ids' expired stamps so a parade
+                // of novel ids cannot grow kv without bound. Best-effort —
+                // a failed prune only delays cleanup.
+                let _ = db.conn().execute(
+                    "DELETE FROM kv
+                     WHERE key LIKE 'identity_foreign_refused_last:%' ESCAPE '\\'
+                        AND CAST(value AS REAL) < ?1 - ?2",
+                    rusqlite::params![now, FOREIGN_REFUSED_LOG_INTERVAL],
+                );
+                true
+            }
+            Ok(_) => false,
+            // Unreadable throttle state must not suppress the line.
+            Err(_) => true,
+        }
+    }
+
+    fn foreign_refused_key(id: &str) -> String {
+        format!("identity_foreign_refused_last:{id}")
     }
 
     // === Derived paths ===
@@ -238,6 +286,8 @@ impl HcomContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
     use serial_test::serial;
 
     fn make_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -755,6 +805,154 @@ mod tests {
             foreign_refused_log_lines(id),
             1,
             "unreadable throttle state must not suppress the refusal line"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_race_two_hook_processes_one_log_line() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        drop(db);
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-4466554400ff";
+        let both_gated = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let winner_logged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let db_path = db_path.clone();
+            let both_gated = both_gated.clone();
+            let winner_logged = winner_logged.clone();
+            let id = id.to_string();
+            joins.push(std::thread::spawn(move || {
+                let db = HcomDb::open_raw(&db_path).unwrap();
+                let mut ctx = launched_ctx(&id);
+                // Deterministic interleaving: both hook processes hold at
+                // this gate, then claim-and-log together.
+                both_gated.wait();
+                if ctx.trust_process_id_inner(&db) {
+                    winner_logged.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        // Main thread joins the gate so both hooks claim together.
+        both_gated.wait();
+        for j in joins {
+            j.join().unwrap();
+        }
+
+        assert_eq!(winner_logged.load(Ordering::SeqCst), 1);
+        assert_eq!(foreign_refused_log_lines(id), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_prunes_expired_stamps_on_claim() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-446655440044";
+        let expired_key = format!("identity_foreign_refused_last:{id}");
+        let expired_ts =
+            crate::shared::time::now_epoch_f64() - (FOREIGN_REFUSED_LOG_INTERVAL * 2.0);
+        db.kv_set(&expired_key, Some(&expired_ts.to_string()))
+            .unwrap();
+        drop(db);
+
+        // A winning claim for a fresh id must prune the expired stamp.
+        let new_id = "550e8400-e29b-41d4-a716-446655440055";
+        refuse_as_hook_process(&db_path, new_id);
+        assert_eq!(foreign_refused_log_lines(new_id), 1);
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        assert_eq!(
+            db.kv_get(&expired_key).unwrap(),
+            None,
+            "an expired stamp for another id must be pruned after a winning claim"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_stamp_is_monotonic() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        drop(db);
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-446655440066";
+
+        // A refusal stamps now. A second claim whose clock reads older
+        // (skewed hook process) must not move the stamp backwards.
+        refuse_as_hook_process(&db_path, id);
+        let key = format!("identity_foreign_refused_last:{id}");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let newer = db.kv_get(&key).unwrap().unwrap();
+        let newer: f64 = newer.parse().unwrap();
+        drop(db);
+
+        // Inject the skew: backdate so the WHERE clause would let an
+        // older claimant overwrite, then prove it cannot win against the
+        // newer stamp — the stamp stays at `newer`.
+        let skewed_older = newer - (FOREIGN_REFUSED_LOG_INTERVAL + 1.0);
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let changed = db.conn().execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE CAST(kv.value AS REAL) IS NULL
+                OR CAST(kv.value AS REAL) <= ?2 - ?3",
+            rusqlite::params![key, skewed_older, FOREIGN_REFUSED_LOG_INTERVAL],
+        );
+        drop(db);
+
+        // Either the skewed claim lost outright (0 changes), or it must
+        // not have lowered the stamp. The stored stamp never regresses.
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let stored: f64 = db.kv_get(&key).unwrap().unwrap().parse().unwrap();
+        match changed {
+            Ok(n) => assert_eq!(n, 0, "an older claim must not touch a newer stamp"),
+            Err(e) => panic!("claim failed: {e}"),
+        }
+        assert!(
+            stored >= newer,
+            "the stored stamp ({stored}) must never move backwards from {newer}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_failed_log_write_releases_claim() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        drop(db);
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-446655440077";
+
+        // Break the log destination so the log write must fail: replace
+        // the log file with a directory, so open(append) fails.
+        let log_path = hcom_dir.join(".tmp").join("logs").join("hcom.log");
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&log_path).unwrap();
+
+        refuse_as_hook_process(&db_path, id);
+
+        // The claim must have been released: no stamp survives a failed
+        // log write, so the next refusal can log again.
+        let key = format!("identity_foreign_refused_last:{id}");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        assert_eq!(
+            db.kv_get(&key).unwrap(),
+            None,
+            "a failed log write must release the claim"
+        );
+
+        // Repair the log destination; the next refusal logs again.
+        std::fs::remove_dir(&log_path).unwrap();
+        refuse_as_hook_process(&db_path, id);
+        assert_eq!(
+            foreign_refused_log_lines(id),
+            1,
+            "after a released claim the next refusal logs"
         );
     }
 }
