@@ -393,10 +393,7 @@ fn carrier_tree_scope(
         // Only the minted omp-<pid>-... shape identifies an owner. A live
         // process with another comm must not become a root on the strength of
         // a borrowed or stale binding id.
-        if let Some(pid) = shell_pid_from_process_id(id)
-            && id
-                .strip_prefix("omp-")
-                .is_some_and(|rest| rest.contains('-'))
+        if let Some(pid) = minted_root_pid(id)
             && !process_gone(pid)
             && std::fs::read_to_string(format!("/proc/{pid}/comm"))
                 .is_ok_and(|comm| comm.trim_end_matches('\n') == "omp")
@@ -424,27 +421,164 @@ fn carrier_tree_scope(
 /// their capture must not carry a [`CapturedIncarnation`] a stop could
 /// release against. The reap consumes only scope and carriers.
 fn capture_reap_carriers_unbound(
+    db: &HcomDb,
     name: &str,
     row_pid: Option<i64>,
     binding_ids: &[String],
     owners: &[OmpOwnerBinding],
     exclude: &[u32],
-) -> ReapCapture {
+) -> Result<ReapCapture, ReapError> {
     #[cfg(unix)]
     {
         let mut scope = carrier_tree_scope(row_pid, binding_ids, owners);
         let carriers = snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
-        ReapCapture {
+        // The root set is final and the carriers are captured: the last point
+        // before the caller's first signal, so this is where a foreign live
+        // owner is refused.
+        refuse_foreign_live_owner(db, name, &scope, &carriers)?;
+        Ok(ReapCapture {
             scope,
             carriers,
             incarnation: None,
-        }
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = (name, row_pid, binding_ids, owners, exclude);
-        ReapCapture { incarnation: None }
+        let _ = (db, name, row_pid, binding_ids, owners, exclude);
+        Ok(ReapCapture { incarnation: None })
     }
+}
+
+/// The pid a minted binding id names, parsed exactly as [`carrier_tree_scope`]
+/// parses it to admit a root: the loose `omp-<head>-…` head plus the
+/// mandatory trailing `-`. "A minted pid" therefore means the same thing in
+/// the root admission and in the foreign-owner guard.
+#[cfg(unix)]
+fn minted_root_pid(id: &str) -> Option<u32> {
+    let pid = shell_pid_from_process_id(id)?;
+    id.strip_prefix("omp-")
+        .is_some_and(|rest| rest.contains('-'))
+        .then_some(pid)
+}
+
+/// minted pid → the live rows whose bindings name it. One pid can back
+/// several minted ids (the plugin re-mints inside the same omp process), so
+/// the map keeps every owner, not just the first.
+#[cfg(unix)]
+fn minted_pid_owners(db: &HcomDb) -> Result<HashMap<u32, Vec<String>>, ReapError> {
+    let bindings = db
+        .live_process_bindings()
+        .map_err(|e| ReapError::BindingRegistryUnreadable(e.to_string()))?;
+    let mut owners: HashMap<u32, Vec<String>> = HashMap::new();
+    for (id, owner) in bindings {
+        if let Some(pid) = minted_root_pid(&id) {
+            let entry = owners.entry(pid).or_default();
+            if !entry.contains(&owner) {
+                entry.push(owner);
+            }
+        }
+    }
+    Ok(owners)
+}
+
+/// Who, if anyone, holds `pid` under a live row other than `name`, and by
+/// which proof. Both arms are deliberately id-based: an `HCOM_INSTANCE_NAME`
+/// conflict and a row-pid collision are NOT this guard's business, because
+/// both are sticky across legitimate session switches and would refuse
+/// legitimate stops.
+#[cfg(unix)]
+fn foreign_live_owner(
+    db: &HcomDb,
+    minted: &HashMap<u32, Vec<String>>,
+    name: &str,
+    pid: u32,
+) -> Result<Option<(String, &'static str)>, ReapError> {
+    // One read of the identity this process actually carries, reused by both
+    // of its arms: the exact id, and the minted pid that id names.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let process_id = identity_facts_of(pid, name)
+        .map(|(_, process_id)| process_id)
+        .unwrap_or_default();
+    // No /proc to read: only the candidate-pid arm below can run off-Linux.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let process_id = String::new();
+
+    // The carried id itself, then the minted pid behind it.
+    if !process_id.is_empty() {
+        let owner = db
+            .live_process_binding_owner(&process_id)
+            .map_err(|e| ReapError::BindingRegistryUnreadable(e.to_string()))?;
+        if let Some(owner) = owner
+            && owner != name
+        {
+            return Ok(Some((owner, "binding")));
+        }
+        if let Some(minted_pid) = minted_root_pid(&process_id)
+            && let Some(owners) = minted.get(&minted_pid)
+            && let Some(owner) = owners.iter().find(|owner| owner.as_str() != name)
+        {
+            return Ok(Some((owner.clone(), "minted_pid")));
+        }
+    }
+
+    // The candidate pid itself, whatever it was admitted for.
+    if let Some(owners) = minted.get(&pid)
+        && let Some(owner) = owners.iter().find(|owner| owner.as_str() != name)
+    {
+        return Ok(Some((owner.clone(), "minted_pid")));
+    }
+    Ok(None)
+}
+
+/// No teardown may signal a process another live row holds. It is checked in
+/// two places, and the coverage is exactly:
+///
+/// - every admitted root except this command's own pid (`roots[0]`, which
+///   inherits the caller's identity and is never a target), plus every
+///   first-capture carrier — a descendant of a foreign-owned root is
+///   signalable too, so roots and carriers together are the whole candidate
+///   set. A conflict here refuses the teardown at capture time, before the
+///   caller's first signal, pane close, or reap.
+/// - every carrier first seen by the KILL round's own capture, which never
+///   went through the check above: a conflict there SKIPS the KILL (see the
+///   call site) and the carrier surfaces as a survivor.
+/// - NOT covered: co-members of a recorded process group reached only by the
+///   headless or kill group signal, which never pass through either set. And
+///   a candidate whose `/proc/<pid>/environ` is unreadable runs only the
+///   candidate-pid arm, since there is no carried id to resolve.
+/// - When two live rows both hold minted ids for the same pid, BOTH rows'
+///   teardowns refuse: the conflict is symmetric, so the stale binding has to
+///   be removed before either side can be stopped. That is the fail-closed
+///   choice, and it is the one that cannot signal the wrong owner.
+///
+/// An unreadable registry fails closed: the teardown returns an error and
+/// sends nothing.
+#[cfg(unix)]
+fn refuse_foreign_live_owner(
+    db: &HcomDb,
+    name: &str,
+    scope: &CarrierTreeScope,
+    carriers: &[ProcMatch],
+) -> Result<(), ReapError> {
+    let minted = minted_pid_owners(db)?;
+    let candidates = scope
+        .roots
+        .iter()
+        .skip(1)
+        .copied()
+        .chain(carriers.iter().map(|carrier| carrier.pid));
+    for pid in candidates {
+        let Some((owner, via)) = foreign_live_owner(db, &minted, name, pid)? else {
+            continue;
+        };
+        crate::log::log_info(
+            "proctruth",
+            "reap_refused_foreign_owner",
+            &format!("instance={name} pid={pid} owner={owner} via={via}"),
+        );
+        return Err(ReapError::ForeignLiveOwner { pid, owner });
+    }
+    Ok(())
 }
 
 /// `row` and `binding_ids` must be ONE snapshot of the instance
@@ -452,20 +586,26 @@ fn capture_reap_carriers_unbound(
 /// [`HcomDb::iter_instances_with_bindings`]): they become the captured
 /// incarnation. A row paired with another incarnation's binding epoch lets
 /// a stop bound to it release a row nobody resolved.
+///
+/// The capture is a gate, not only a snapshot: `Err` means the teardown must
+/// send no signal at all, which is why every production caller handles it
+/// before its first group signal, pane close, or reap.
 pub(crate) fn capture_reap_carriers(
+    db: &HcomDb,
     name: &str,
     row: Option<&crate::db::InstanceRow>,
     binding_ids: &[String],
     owners: &[OmpOwnerBinding],
     exclude: &[u32],
-) -> ReapCapture {
+) -> Result<ReapCapture, ReapError> {
     let mut capture = capture_reap_carriers_unbound(
+        db,
         name,
         row.and_then(|row| row.pid),
         binding_ids,
         owners,
         exclude,
-    );
+    )?;
     // The snapshot's row feeds the bound incarnation as well as the roots.
     capture.incarnation = row.map(|row| CapturedIncarnation {
         created_at: row.created_at,
@@ -474,7 +614,7 @@ pub(crate) fn capture_reap_carriers(
         agent_id: row.agent_id.clone(),
         binding_ids: binding_ids.to_vec(),
     });
-    capture
+    Ok(capture)
 }
 
 #[cfg(unix)]
@@ -907,6 +1047,16 @@ pub enum ReapError {
     Survivors(Vec<u32>),
     #[cfg(unix)]
     UnprovenOwnership,
+    /// A candidate pid belongs to another instance whose row is still live.
+    /// The teardown is refused before its first signal: the row and every
+    /// binding stay exactly as they were.
+    #[cfg(unix)]
+    ForeignLiveOwner { pid: u32, owner: String },
+    /// The binding registry could not be read, so no foreign owner can be
+    /// ruled out. Refused like the conflict itself: fail closed, signal
+    /// nothing.
+    #[cfg(unix)]
+    BindingRegistryUnreadable(String),
 }
 
 impl std::fmt::Display for ReapError {
@@ -926,6 +1076,16 @@ impl std::fmt::Display for ReapError {
             Self::UnprovenOwnership => {
                 f.write_str("cannot prove process ownership on this host; row left intact")
             }
+            #[cfg(unix)]
+            Self::ForeignLiveOwner { pid, owner } => write!(
+                f,
+                "refusing to signal pid {pid}: it belongs to live instance '{owner}'; nothing was signalled"
+            ),
+            #[cfg(unix)]
+            Self::BindingRegistryUnreadable(error) => write!(
+                f,
+                "cannot read the process binding registry: {error}; nothing was signalled"
+            ),
         }
     }
 }
@@ -1507,12 +1667,13 @@ pub fn reap_instance_tree_for_excluding(
     let row = db.get_instance_full(name).ok().flatten();
     let owners = omp_owner_bindings(db, name);
     let capture = capture_reap_carriers_unbound(
+        db,
         name,
         row.and_then(|row| row.pid),
         binding_ids,
         &owners,
         exclude,
-    );
+    )?;
     reap_instance_tree_for_excluding_captured(db, name, binding_ids, exclude, capture)
 }
 
@@ -1624,6 +1785,42 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
         let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
         current.retain(|m| {
             started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
+        });
+
+        // A carrier first seen in THIS capture never went through the
+        // pre-signal guard, so it is re-proved here — the last point before a
+        // KILL goes out. A late carrier another live row holds is not
+        // signalled: it is logged once and left to the survivor check below,
+        // which fails the release closed while it lives. A registry the
+        // guard cannot read signals no late carrier at all. First-capture
+        // carriers were refused at capture time and keep today's behaviour.
+        let minted = if current.iter().any(|m| !started.contains(&m.pid)) {
+            minted_pid_owners(db).ok()
+        } else {
+            None
+        };
+        current.retain(|m| {
+            if started.contains(&m.pid) {
+                return true;
+            }
+            match minted.as_ref() {
+                // No registry read: an unproven late carrier is never signalled.
+                None => false,
+                Some(minted) => match foreign_live_owner(db, minted, name, m.pid) {
+                    Ok(None) => true,
+                    Ok(Some((owner, via))) => {
+                        crate::log::log_info(
+                            "proctruth",
+                            "reap_skipped_foreign_owner",
+                            &format!("instance={name} pid={} owner={owner} via={via}", m.pid),
+                        );
+                        false
+                    }
+                    // Fail closed: a registry that cannot answer is not a
+                    // clean bill of health for this carrier.
+                    Err(_) => false,
+                },
+            }
         });
         for m in &current {
             if pid_carries_instance(m.pid, name, binding_ids, &scope) {
@@ -2082,6 +2279,14 @@ thread_local! {
 ///   (`HCOM_PROCESS_ID`) → HELD.
 /// - an unparseable binding process id contributes no pid evidence and never
 ///   counts toward death → HELD unless other evidence proves death.
+/// - a registered notify endpoint (kind other than `inject`) that still accepts
+///   a TCP connect AND whose listener is proven to be the seat's (its owner or
+///   the owner's child has the row's session transcript open; for a
+///   session-less row, an omp/hcom owner no other live row is bound to) →
+///   HELD: the seat process serves it, which `/proc` cannot otherwise see when
+///   no carrier carries an HCOM marker. An accept whose owner cannot be
+///   determined also holds; an accept from an unrelated owner is no evidence.
+///   See `held_by_live_notify_endpoint`.
 ///
 /// A vanished row gets `stopped by=daemon reason=vanished` with the instance
 /// snapshot, then the row is released — the notice systemd-oomd kills
@@ -2189,6 +2394,14 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             );
             continue;
         }
+        // /proc sees nothing for a seat with no HCOM-marked carrier, but its
+        // own notify endpoint is served by the seat process: a listener proven
+        // to be the seat's is positive evidence of life the pid table cannot
+        // supply (the valo 16:03 false stop). Last hold, so rows already held
+        // by a cheap /proc check never pay for a connect.
+        if held_by_live_notify_endpoint(db, &inst.name, inst.session_id.as_deref()) {
+            continue;
+        }
         #[cfg(test)]
         if let Some(hook) = SWEEP_RELEASE_GAP_HOOK.with(std::cell::Cell::take) {
             hook(db, &inst.name);
@@ -2253,6 +2466,338 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         }
     }
     swept
+}
+
+/// Endpoint liveness probe for the sweep's last hold: is any of the row's
+/// registered endpoints still served by the row's own seat? Cheap first: a
+/// refused connect on loopback is a dead endpoint and costs no /proc scan.
+/// An accept only proves that somebody holds the port, so the listener's
+/// owner must then be proven to be the seat ([`endpoint_owner`]): a proven
+/// owner holds the row, an unrelated owner is no evidence (another service
+/// may have bound the port after the seat's listener died), and an owner
+/// that cannot be determined holds the row on the accept alone, since the
+/// sweep fails toward keeping.
+///
+/// Every wake kind answers a bare connect-and-close by design (the omp
+/// plugin runs one idempotent `deliverPending` pass and closes), so the
+/// accept is a wake, not a protocol exchange. `inject` is skipped: it is a
+/// request/response RPC whose empty connection feeds an empty payload to the
+/// PTY writer and runs the injected-approval check, so probing it is not a
+/// no-op. Logs the branch taken for every accepting endpoint and returns
+/// whether the row is held — a failed endpoint query holds the row too.
+fn held_by_live_notify_endpoint(db: &HcomDb, name: &str, session_id: Option<&str>) -> bool {
+    let endpoints = match db.notify_endpoint_ports(name) {
+        Ok(endpoints) => endpoints,
+        Err(e) => {
+            crate::log::log(
+                "DEBUG",
+                "daemon",
+                "sweep.held",
+                &format!("name={} reason=endpoint-query-failed err={}", name, e),
+            );
+            return true;
+        }
+    };
+    for (kind, port) in endpoints {
+        if kind == "inject" {
+            continue;
+        }
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250))
+            .is_err()
+        {
+            continue;
+        }
+        match endpoint_owner(db, name, session_id, port) {
+            EndpointOwner::Owned { pid, via } => {
+                crate::log::log(
+                    "DEBUG",
+                    "daemon",
+                    "sweep.held",
+                    &format!(
+                        "name={name} reason=notify-endpoint-owned kind={kind} port={port} owner_pid={pid} via={via}"
+                    ),
+                );
+                return true;
+            }
+            EndpointOwner::Undeterminable(why) => {
+                crate::log::log(
+                    "DEBUG",
+                    "daemon",
+                    "sweep.held",
+                    &format!(
+                        "name={name} reason=notify-endpoint-accepts-owner-undeterminable kind={kind} port={port} why={why}"
+                    ),
+                );
+                return true;
+            }
+            EndpointOwner::Unrelated { pid, why } => {
+                crate::log::log_info(
+                    "daemon",
+                    "sweep.endpoint_not_owned",
+                    &format!(
+                        "name={name} kind={kind} port={port} owner_pid={pid} why={why}: no evidence"
+                    ),
+                );
+            }
+        }
+    }
+    false
+}
+
+/// What the process behind an accepting endpoint port proves about a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Only the Linux /proc probe proves or refutes an owner.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum EndpointOwner {
+    /// The listener is the row's own seat; `via` names the proof.
+    Owned { pid: u32, via: &'static str },
+    /// Another process holds the port: no evidence for the row.
+    Unrelated { pid: u32, why: &'static str },
+    /// Neither could be proven (`why`), so the accept alone holds the row.
+    Undeterminable(&'static str),
+}
+
+/// Who serves the loopback listener on `port`, judged against the row.
+///
+/// The LISTEN socket is found in `/proc/net/tcp{,6}` and its inode mapped to
+/// the pids whose `/proc/<pid>/fd` link to it. A row with a session is owned
+/// only when a holder, or a holder's direct child (the pty listener lives in
+/// the hcom wrapper, whose child is the tool), has that session's transcript
+/// (`<session_id>.jsonl`) open: proof tied to this row, not just to some
+/// seat. A row with no session is owned when a holder or its direct parent
+/// is an omp/hcom process that no other live row is bound to. Anything else
+/// is unrelated. A socket or holder that cannot be found (another user's
+/// process, another network namespace, a race with the close) is
+/// undeterminable.
+#[cfg(target_os = "linux")]
+fn endpoint_owner(db: &HcomDb, name: &str, session_id: Option<&str>, port: u16) -> EndpointOwner {
+    let inodes = loopback_listener_inodes(port);
+    if inodes.is_empty() {
+        return EndpointOwner::Undeterminable("listener-not-in-proc-net");
+    }
+    let holders = socket_holder_pids(&inodes);
+    let Some(&first) = holders.first() else {
+        return EndpointOwner::Undeterminable("listener-holder-not-found");
+    };
+    if let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) {
+        let transcript = format!("{session_id}.jsonl");
+        if let Some(&pid) = holders
+            .iter()
+            .find(|&&pid| holds_session_transcript(pid, &transcript))
+        {
+            return EndpointOwner::Owned {
+                pid,
+                via: "session-fd",
+            };
+        }
+        if let Some((pid, _child)) = direct_children(&holders)
+            .into_iter()
+            .find(|&(_, child)| holds_session_transcript(child, &transcript))
+        {
+            return EndpointOwner::Owned {
+                pid,
+                via: "session-fd-child",
+            };
+        }
+        return EndpointOwner::Unrelated {
+            pid: first,
+            why: "session-transcript-not-open",
+        };
+    }
+    let minted = match minted_pid_owners(db) {
+        Ok(minted) => minted,
+        Err(_) => return EndpointOwner::Undeterminable("binding-registry-unreadable"),
+    };
+    let mut verdict = EndpointOwner::Unrelated {
+        pid: first,
+        why: "not-omp-or-hcom",
+    };
+    'holders: for &pid in &holders {
+        let lineage: Vec<u32> = std::iter::once(pid).chain(parent_pid(pid)).collect();
+        for &candidate in &lineage {
+            match foreign_live_owner(db, &minted, name, candidate) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    verdict = EndpointOwner::Unrelated {
+                        pid,
+                        why: "bound-to-another-row",
+                    };
+                    continue 'holders;
+                }
+                Err(_) => return EndpointOwner::Undeterminable("binding-registry-unreadable"),
+            }
+        }
+        if lineage
+            .iter()
+            .any(|&candidate| is_omp_or_hcom_process(candidate))
+        {
+            return EndpointOwner::Owned {
+                pid,
+                via: "omp-process",
+            };
+        }
+    }
+    verdict
+}
+
+/// No /proc to map a socket to its owner: the accept alone holds the row.
+#[cfg(not(target_os = "linux"))]
+fn endpoint_owner(db: &HcomDb, name: &str, session_id: Option<&str>, port: u16) -> EndpointOwner {
+    let _ = (db, name, session_id, port);
+    EndpointOwner::Undeterminable("no-proc")
+}
+
+/// Inodes of the LISTEN sockets on `port` that accept a connect to
+/// 127.0.0.1: bound to 127.0.0.1, to the IPv4 wildcard, to the IPv6
+/// wildcard, or to the v4-mapped loopback/wildcard. Addresses in
+/// `/proc/net/tcp{,6}` are the in-memory (network order) words printed as
+/// native-endian hex, the port is plain hex, and state `0A` is LISTEN.
+#[cfg(target_os = "linux")]
+fn loopback_listener_inodes(port: u16) -> Vec<u64> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn address_bytes<const N: usize>(hex: &str) -> Option<[u8; N]> {
+        if hex.len() != N * 2 {
+            return None;
+        }
+        let mut bytes = [0u8; N];
+        for (word, chunk) in bytes.chunks_mut(4).enumerate() {
+            let value = u32::from_str_radix(hex.get(word * 8..word * 8 + 8)?, 16).ok()?;
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        Some(bytes)
+    }
+    fn accepts_loopback_v4(addr: Ipv4Addr) -> bool {
+        addr == Ipv4Addr::LOCALHOST || addr.is_unspecified()
+    }
+
+    let mut inodes = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            // sl, local_address, rem_address, st, tx:rx, tr:when, retrnsmt,
+            // uid, timeout, inode.
+            let mut fields = line.split_whitespace();
+            let (Some(local), Some(state), Some(inode)) =
+                (fields.nth(1), fields.nth(1), fields.nth(5))
+            else {
+                continue;
+            };
+            let Some((addr_hex, port_hex)) = local.split_once(':') else {
+                continue;
+            };
+            if state != "0A" || u16::from_str_radix(port_hex, 16) != Ok(port) {
+                continue;
+            }
+            let accepts = match addr_hex.len() {
+                8 => address_bytes::<4>(addr_hex).is_some_and(|b| accepts_loopback_v4(b.into())),
+                32 => address_bytes::<16>(addr_hex).is_some_and(|b| {
+                    let addr = Ipv6Addr::from(b);
+                    addr.is_unspecified() || addr.to_ipv4_mapped().is_some_and(accepts_loopback_v4)
+                }),
+                _ => false,
+            };
+            if accepts
+                && let Ok(inode) = inode.parse::<u64>()
+                && inode != 0
+            {
+                inodes.push(inode);
+            }
+        }
+    }
+    inodes
+}
+
+/// Pids with an fd open on one of the socket `inodes`. A process whose fd
+/// table cannot be read (another user's, or exited) is skipped, so an empty
+/// result means "not found", never "nobody".
+#[cfg(target_os = "linux")]
+fn socket_holder_pids(inodes: &[u64]) -> Vec<u32> {
+    let targets: Vec<String> = inodes
+        .iter()
+        .map(|inode| format!("socket:[{inode}]"))
+        .collect();
+    let mut holders = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return holders;
+    };
+    for entry in dir.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        let holds = fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path()).is_ok_and(|link| {
+                targets
+                    .iter()
+                    .any(|target| link.as_os_str() == target.as_str())
+            })
+        });
+        if holds {
+            holders.push(pid);
+        }
+    }
+    holders
+}
+
+/// `(parent, child)` for every live process whose parent is in `parents`.
+#[cfg(target_os = "linux")]
+fn direct_children(parents: &[u32]) -> Vec<(u32, u32)> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| {
+            let parent = parent_pid(pid)?;
+            parents.contains(&parent).then_some((parent, pid))
+        })
+        .collect()
+}
+
+/// Whether `pid` has a file open whose path ends in `transcript`
+/// (`<session_id>.jsonl`) right after a path separator or a non-alphanumeric
+/// prefix (`<ts>_<session_id>.jsonl`), so a longer id never matches a shorter
+/// one. A transcript deleted while open still counts.
+#[cfg(target_os = "linux")]
+fn holds_session_transcript(pid: u32, transcript: &str) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten().any(|fd| {
+        std::fs::read_link(fd.path()).is_ok_and(|link| {
+            let path = link.as_os_str().as_bytes();
+            let path = path.strip_suffix(b" (deleted)").unwrap_or(path);
+            path.strip_suffix(transcript.as_bytes())
+                .is_some_and(|head| head.last().is_none_or(|b| !b.is_ascii_alphanumeric()))
+        })
+    })
+}
+
+/// An omp or hcom process: `/proc/<pid>/comm`, or the basename of argv[0],
+/// is exactly `omp` or `hcom`.
+#[cfg(target_os = "linux")]
+fn is_omp_or_hcom_process(pid: u32) -> bool {
+    const NAMES: [&str; 2] = ["omp", "hcom"];
+    let comm_matches = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| NAMES.contains(&comm.trim_end_matches('\n')));
+    comm_matches
+        || std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+            let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
+            let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or_default();
+            NAMES.iter().any(|name| name.as_bytes() == base)
+        })
 }
 
 #[cfg(test)]
@@ -2534,7 +3079,7 @@ mod tests {
         let carrier = spawn_detached_named_sleeper(&name, &process_id);
         wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
         let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
-        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[], &[]);
+        let capture = capture_reap_carriers(&db, &name, row.as_ref(), &bindings, &[], &[]).unwrap();
         let result = reap_instance_tree_for_excluding_captured(&db, &name, &bindings, &[], capture);
         assert!(result.is_err());
         assert!(!process_gone(carrier));
@@ -2586,7 +3131,8 @@ mod tests {
         let mut carrier_a = spawn_named_sleeper(&name, &token_a);
         let (row_a, bindings_a) = db.get_instance_with_bindings(&name).unwrap();
         wait_for_enumerated(&name, &bindings_a, carrier_a.id());
-        let capture = capture_reap_carriers(&name, row_a.as_ref(), &bindings_a, &[], &[]);
+        let capture =
+            capture_reap_carriers(&db, &name, row_a.as_ref(), &bindings_a, &[], &[]).unwrap();
         // The kill's group signal takes A down.
         carrier_a.kill().ok();
         carrier_a.wait().ok();
@@ -2684,7 +3230,8 @@ mod tests {
             .unwrap();
 
         // The pre-signal capture, built from that snapshot alone.
-        let capture = capture_reap_carriers(&name, Some(&row_a), &bindings_a, &[], &[]);
+        let capture =
+            capture_reap_carriers(&db, &name, Some(&row_a), &bindings_a, &[], &[]).unwrap();
         let outcome =
             crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
 
@@ -2710,7 +3257,7 @@ mod tests {
         let name = unique_name("epoch-emptied");
         insert_null_pid_row(&db, &name, &format!("proc-{}", rand_suffix()));
         let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
-        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[], &[]);
+        let capture = capture_reap_carriers(&db, &name, row.as_ref(), &bindings, &[], &[]).unwrap();
         db.conn()
             .execute(
                 "DELETE FROM process_bindings WHERE instance_name = ?1",
@@ -2741,7 +3288,7 @@ mod tests {
             .unwrap();
         let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
         assert_eq!(bindings.len(), 2);
-        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[], &[]);
+        let capture = capture_reap_carriers(&db, &name, row.as_ref(), &bindings, &[], &[]).unwrap();
         db.conn()
             .execute(
                 "DELETE FROM process_bindings WHERE process_id = ?1",
@@ -2790,7 +3337,7 @@ mod tests {
         let name = unique_name("orphan-group");
         let leader = spawn_detached_group_leader(&name);
         wait_for_enumerated(&name, &[], leader);
-        let capture = capture_reap_carriers(&name, None, &[], &[], &[]);
+        let capture = capture_reap_carriers(&db, &name, None, &[], &[], &[]).unwrap();
         // The orphan arm's group signal.
         unsafe { libc::kill(-(leader as libc::pid_t), libc::SIGKILL) };
         for _ in 0..100 {
@@ -2990,7 +3537,7 @@ mod tests {
             if !previously_identified {
                 MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
             }
-            let capture = capture_reap_carriers(&name, None, &[], &[], &[]);
+            let capture = capture_reap_carriers(&db, &name, None, &[], &[], &[]).unwrap();
             MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
             let result = reap_instance_tree_for_excluding_captured(&db, &name, &[], &[], capture);
             MISSING_CARRIER_IDENTITY.with(|missing| missing.set(None));
@@ -3463,6 +4010,226 @@ mod tests {
         assert!(db.get_instance_full(&name).unwrap().is_some());
         sleeper.kill().ok();
         sleeper.wait().ok();
+    }
+
+    /// A valo-shaped row: no recorded pid, a dead minted-omp binding plus a
+    /// launcher UUID binding, and no process carrying an HCOM marker, so every
+    /// /proc signal says gone. Its `plugin` endpoint is `port`.
+    #[cfg(unix)]
+    fn insert_valo_row(db: &crate::db::HcomDb, name: &str, session_id: Option<&str>, port: u16) {
+        let dead = dead_pid();
+        insert_row(db, name, "active", None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET session_id = ?1 WHERE name = ?2",
+                rusqlite::params![session_id, name],
+            )
+            .unwrap();
+        db.set_process_binding(&format!("omp-{}-a4a1-1174", dead), "sess-a", name)
+            .unwrap();
+        db.set_process_binding("3f1c8a52-0b7d-4e2a-9c31-6d0f5b7a1e42", "sess-b", name)
+            .unwrap();
+        age_row(db, name);
+        db.upsert_notify_endpoint(name, "plugin", port).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn life_events(db: &crate::db::HcomDb, name: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Open a transcript named the way omp names it (`<ts>_<session>.jsonl`)
+    /// in a fresh directory; the process holds it while the handle lives.
+    #[cfg(unix)]
+    fn open_transcript(session_id: &str) -> (tempfile::TempDir, std::fs::File) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(
+            dir.path()
+                .join(format!("2026-09-25T16-03-17-000Z_{session_id}.jsonl")),
+        )
+        .unwrap();
+        (dir, file)
+    }
+
+    /// The valo 16:03 row: every /proc signal says gone, but the process
+    /// serving its endpoint has the row's own session transcript open. That
+    /// is proof the listener is this seat: the row survives with its
+    /// bindings, and no `stopped` life event is written.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sweep_holds_a_row_whose_endpoint_owner_has_its_session_open() {
+        let db = test_db();
+        let name = unique_name("valo");
+        let session_id = format!("{name}-session");
+        let _transcript = open_transcript(&session_id);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        insert_valo_row(
+            &db,
+            &name,
+            Some(&session_id),
+            listener.local_addr().unwrap().port(),
+        );
+
+        let swept = sweep_vanished_instances(&db);
+
+        assert!(!swept.contains(&name), "{swept:?}");
+        assert!(
+            db.get_instance_full(&name).unwrap().is_some(),
+            "the seat's own endpoint holds the row"
+        );
+        assert_eq!(
+            db.process_binding_ids(&name).unwrap().len(),
+            2,
+            "bindings survive the hold"
+        );
+        assert_eq!(
+            life_events(&db, &name),
+            0,
+            "no stopped record for a held row"
+        );
+    }
+
+    /// The port now answers for a process holding ANOTHER session's
+    /// transcript: the accept proves somebody owns the port, not that this
+    /// seat still does, so the row is released.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sweep_releases_a_row_whose_endpoint_owner_holds_another_session() {
+        let db = test_db();
+        let name = unique_name("valo-other");
+        let _other = open_transcript(&format!("{name}-other-session"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        insert_valo_row(
+            &db,
+            &name,
+            Some(&format!("{name}-session")),
+            listener.local_addr().unwrap().port(),
+        );
+
+        let swept = sweep_vanished_instances(&db);
+
+        assert!(swept.contains(&name), "{swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+    }
+
+    /// A session-less row whose port was taken by an unrelated local service
+    /// (a child `sleep` that inherited the listener, nothing omp or hcom
+    /// about it) is released: an unrelated owner is no evidence.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sweep_releases_a_row_whose_port_an_unrelated_process_holds() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let db = test_db();
+        let name = unique_name("valo-reused");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fd = listener.as_raw_fd();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("300");
+        // SAFETY: fcntl is async-signal-safe. It clears close-on-exec on the
+        // listener in the forked child only, so `sleep` inherits the socket.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut holder = command.spawn().unwrap();
+        drop(listener);
+        insert_valo_row(&db, &name, None, port);
+
+        let swept = sweep_vanished_instances(&db);
+        holder.kill().ok();
+        holder.wait().ok();
+
+        assert!(swept.contains(&name), "{swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+    }
+
+    /// A listener that accepts but whose owner /proc cannot name (here the
+    /// socket rides in an unreceived SCM_RIGHTS message, as unreadable as one
+    /// held by another user's process): ownership is undeterminable, so the
+    /// accept alone holds the row.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sweep_holds_a_row_whose_accepting_listener_has_no_findable_owner() {
+        use std::os::fd::AsRawFd;
+
+        let db = test_db();
+        let name = unique_name("valo-unknown");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd_len = std::mem::size_of::<std::os::fd::RawFd>() as u32;
+        // SAFETY: every pointer handed to sendmsg points into a buffer that
+        // outlives the call; the u64 control buffer is aligned for cmsghdr
+        // and larger than CMSG_SPACE for one fd.
+        unsafe {
+            let mut byte = [0u8; 1];
+            let mut iov = libc::iovec {
+                iov_base: byte.as_mut_ptr().cast(),
+                iov_len: byte.len(),
+            };
+            let mut control = [0u64; 8];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = libc::CMSG_SPACE(fd_len) as _;
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_len) as _;
+            std::ptr::write_unaligned(
+                libc::CMSG_DATA(cmsg).cast::<std::os::fd::RawFd>(),
+                listener.as_raw_fd(),
+            );
+            assert_eq!(libc::sendmsg(tx.as_raw_fd(), &msg, 0), 1);
+        }
+        drop(listener);
+        insert_valo_row(&db, &name, Some(&format!("{name}-session")), port);
+
+        let swept = sweep_vanished_instances(&db);
+        drop((tx, rx));
+
+        assert!(!swept.contains(&name), "{swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_eq!(life_events(&db, &name), 0);
+    }
+
+    /// The hold is liveness, not a blanket exemption: once the seat's
+    /// endpoint is closed the next sweep releases the row.
+    #[test]
+    #[cfg(unix)]
+    fn sweep_releases_a_row_once_its_notify_endpoint_is_closed() {
+        let db = test_db();
+        let name = unique_name("valo-gone");
+        let session_id = format!("{name}-session");
+        let _transcript = open_transcript(&session_id);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        insert_valo_row(
+            &db,
+            &name,
+            Some(&session_id),
+            listener.local_addr().unwrap().port(),
+        );
+        assert!(!sweep_vanished_instances(&db).contains(&name));
+
+        drop(listener);
+        let swept = sweep_vanished_instances(&db);
+
+        assert!(swept.contains(&name), "a closed endpoint releases the row");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
     }
 
     /// Push a row's `last_seen` outside the sweep's fresh grace.
@@ -4049,6 +4816,74 @@ mod tests {
             "a fresh process spawned after the round's capture is spared \
              end-to-end (pid {late_pid} was signalled: {late_status:?})"
         );
+        late.kill().ok();
+        late.wait().ok();
+    }
+
+    /// Foreign-owner guard (KILL round): a carrier first seen by the KILL
+    /// round's own capture never went through the pre-signal guard, so it is
+    /// re-proved there — the last point before a KILL goes out. One carrying
+    /// another live row's process id is not signalled: it survives, and the
+    /// release fails closed on it as a survivor, which is the only honest
+    /// outcome while a process this teardown may not touch is still alive.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn kill_round_leaves_a_late_carrier_another_live_row_holds() {
+        let (_dir, db) = file_test_db();
+        let db_path = db.path().to_path_buf();
+        let name = unique_name("lateforeign");
+        let other = unique_name("otherlive");
+        let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
+        let foreign_binding = format!("proc-foreign-{}", rand_suffix());
+        // The other holder: a live row of its own, holding the id the late
+        // carrier carries.
+        insert_null_pid_row(&db, &other, &foreign_binding);
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_pid = first.id();
+        wait_for_enumerated(&name, &[], first_pid);
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let (hook, hit, release) = rendezvous_at(RoundPoint::Captured);
+        let reap_name = name.clone();
+        let reap_bindings = binding_ids.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+            arm_round_seam(hook);
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
+        });
+        // Past the full TERM wait (`first` is SIGSTOPped and cannot exit):
+        // the KILL round has captured its carrier set, and this late carrier
+        // is not in it.
+        hit.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("KILL round reaches its capture boundary");
+        let mut late = spawn_named_sleeper(&name, &foreign_binding);
+        let late_pid = late.id();
+        // Let the child exec before releasing the round: a pre-exec child
+        // carries no identity yet, so the round only sees it as a carrier.
+        wait_for_enumerated(&name, &[], late_pid);
+        release.send(()).ok();
+
+        let result = reaper.join().expect("reap thread");
+        first.wait().ok();
+        assert!(
+            !crate::sys::process::is_alive(first_pid),
+            "in-scope initial carrier is reaped"
+        );
+        // try_wait, not is_alive: a SIGKILLed-but-unreaped child is a zombie
+        // and reads alive — None means the late carrier was never signalled.
+        let late_status = late.try_wait().unwrap();
+        assert!(
+            late_status.is_none(),
+            "a late carrier another live row holds must not be signalled \
+             (pid {late_pid} was signalled: {late_status:?})"
+        );
+        match result {
+            Err(ReapError::Survivors(survivors)) => assert!(
+                survivors.contains(&late_pid),
+                "the spared carrier is the one that fails the release closed: {survivors:?}"
+            ),
+            other => panic!("the release must fail closed while it lives: {other:?}"),
+        }
         late.kill().ok();
         late.wait().ok();
     }

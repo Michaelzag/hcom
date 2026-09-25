@@ -469,8 +469,12 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         None => return hook_noop(),
     };
 
-    let instance_name =
-        instance_binding::bind_session_to_process(db, session_id, ctx.process_id.as_deref());
+    // A failed bind is already logged; no orphan identity over it.
+    let Ok(instance_name) =
+        instance_binding::bind_session_to_process(db, session_id, ctx.process_id.as_deref())
+    else {
+        return hook_noop();
+    };
 
     log::log_info(
         "hooks",

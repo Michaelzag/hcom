@@ -341,13 +341,19 @@ fn kill_tracked_instance_with_self_pids(
     // kill_instance signals the recorded process group. Its root may die and
     // reparent eligible descendants before reap begins. Built from the same
     // snapshot as the incarnation above.
+    // The capture is also the gate: a refusal returns before `kill_instance`
+    // closes the pane or signals the group, and before the reap, leaving the
+    // row and its bindings untouched (the teardown claim above is dropped
+    // with the early return).
     let capture = crate::proctruth::capture_reap_carriers(
+        db,
         name,
         Some(&inst),
         &binding_ids,
         &owners,
         &excluded,
-    );
+    )
+    .map_err(|e| refused_capture_error(name, &e))?;
     if !excluded.is_empty() {
         return kill_self_tracked_instance(
             db,
@@ -391,6 +397,12 @@ fn kill_tracked_instance_with_self_pids(
 /// A refused reap leaves the row and bindings available for a retry.
 fn survivors_error(name: &str, error: &crate::proctruth::ReapError) -> String {
     format!("could not stop {name}: {error} — run hcom kill {name} first")
+}
+
+/// A refused capture names the other owner and leaves the row and its
+/// bindings alone: there is no `hcom kill <name>` retry to run.
+fn refused_capture_error(name: &str, error: &crate::proctruth::ReapError) -> String {
+    format!("could not stop {name}: {error}")
 }
 
 /// Re-read the incarnation token of `name` through the teardown transaction;
@@ -888,25 +900,24 @@ fn reap_orphan_tree(
 fn capture_orphan_carriers(
     db: &HcomDb,
     orphan: &crate::pidtrack::OrphanProcess,
-) -> Vec<(String, crate::proctruth::ReapCapture)> {
-    orphan
-        .names
-        .iter()
-        .map(|name| {
-            let (row, binding_ids) = db.get_instance_with_bindings(name).unwrap_or_default();
-            let owners = crate::proctruth::omp_owner_bindings(db, name);
-            (
-                name.clone(),
-                crate::proctruth::capture_reap_carriers(
-                    name,
-                    row.as_ref(),
-                    &binding_ids,
-                    &owners,
-                    &[],
-                ),
-            )
-        })
-        .collect()
+) -> Result<Vec<(String, crate::proctruth::ReapCapture)>, crate::proctruth::ReapError> {
+    let mut captures = Vec::new();
+    for name in &orphan.names {
+        let (row, binding_ids) = db.get_instance_with_bindings(name).unwrap_or_default();
+        let owners = crate::proctruth::omp_owner_bindings(db, name);
+        captures.push((
+            name.clone(),
+            crate::proctruth::capture_reap_carriers(
+                db,
+                name,
+                row.as_ref(),
+                &binding_ids,
+                &owners,
+                &[],
+            )?,
+        ));
+    }
+    Ok(captures)
 }
 
 /// Report a bulk kill's release of `name`; true when it counts against the
@@ -946,18 +957,36 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
             continue;
         }
 
+        // Claimed as an active pid BEFORE the capture gate: a refused row's
+        // process must stay out of the orphan pass below, which would
+        // otherwise rediscover it as an orphan and signal it.
+        if let Some(pid) = inst.pid {
+            active_pids.insert(pid as u32);
+        }
+
         // Before any signal, from the snapshot: binds the release below to
-        // this incarnation, pid-less rows included.
+        // this incarnation, pid-less rows included. A refused capture skips
+        // this row entirely — no group signal, no pane close, no release —
+        // and counts against the kill through the release-failure channel.
         let owners = crate::proctruth::omp_owner_bindings(db, &inst.name);
-        let pre_capture = crate::proctruth::capture_reap_carriers(
+        let pre_capture = match crate::proctruth::capture_reap_carriers(
+            db,
             &inst.name,
             Some(inst),
             binding_ids,
             &owners,
             &[],
-        );
+        ) {
+            Ok(capture) => capture,
+            Err(e) => {
+                failed += report_release_failure(
+                    &inst.name,
+                    &StopOutcome::RetryableError(e.to_string().into()),
+                ) as i32;
+                continue;
+            }
+        };
         if let Some(pid) = inst.pid {
-            active_pids.insert(pid as u32);
             let is_headless = inst.background != 0;
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
                 kill_instance(db, &inst.name, pid as u32, inst, is_headless);
@@ -1014,7 +1043,16 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
     // Kill orphans too
     let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
     for orphan in &orphans {
-        let pre_capture = capture_orphan_carriers(db, orphan);
+        // A refused capture leaves the orphan alone: the pidtrack handle stays
+        // so a retry can rediscover it, and no pane is closed.
+        let pre_capture = match capture_orphan_carriers(db, orphan) {
+            Ok(captures) => captures,
+            Err(e) => {
+                eprintln!("{}", refused_capture_error(&orphan.names.join(", "), &e));
+                failed += 1;
+                continue;
+            }
+        };
         let (result, pane_closed, pane_retry_command) = terminal::kill_process(
             orphan.pid,
             &orphan.terminal_preset,
@@ -1094,13 +1132,23 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     for (inst, binding_ids) in &tagged {
         // Before any signal, from the snapshot (see `kill_all`).
         let owners = crate::proctruth::omp_owner_bindings(db, &inst.name);
-        let pre_capture = crate::proctruth::capture_reap_carriers(
+        let pre_capture = match crate::proctruth::capture_reap_carriers(
+            db,
             &inst.name,
             Some(inst),
             binding_ids,
             &owners,
             &[],
-        );
+        ) {
+            Ok(capture) => capture,
+            Err(e) => {
+                failed += report_release_failure(
+                    &inst.name,
+                    &StopOutcome::RetryableError(e.to_string().into()),
+                ) as i32;
+                continue;
+            }
+        };
         if let Some(pid) = inst.pid {
             let is_headless = inst.background != 0;
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
@@ -1161,7 +1209,15 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
     let tagged_orphans: Vec<_> = orphans.iter().filter(|o| o.tag == tag).collect();
     for orphan in &tagged_orphans {
-        let pre_capture = capture_orphan_carriers(db, orphan);
+        // A refused capture leaves the orphan alone (see `kill_all`).
+        let pre_capture = match capture_orphan_carriers(db, orphan) {
+            Ok(captures) => captures,
+            Err(e) => {
+                eprintln!("{}", refused_capture_error(&orphan.names.join(", "), &e));
+                failed += 1;
+                continue;
+            }
+        };
         let names = orphan.names.join(", ");
         let (result, pane_closed, pane_retry_command) = terminal::kill_process(
             orphan.pid,
@@ -1233,7 +1289,11 @@ fn kill_single(
                     || o.process_id == target
                     || target_pid == Some(o.pid)
             }) {
-                let pre_capture = capture_orphan_carriers(db, orphan);
+                // A refused capture returns before `kill_process` closes the
+                // pane or signals the group; the pidtrack handle stays so a
+                // retry can rediscover the orphan.
+                let pre_capture = capture_orphan_carriers(db, orphan)
+                    .map_err(|e| anyhow::Error::msg(refused_capture_error(target, &e)))?;
                 let (result, pane_closed, pane_retry_command) = terminal::kill_process(
                     orphan.pid,
                     &orphan.terminal_preset,
@@ -2060,12 +2120,14 @@ mod tests {
             &excluded,
             &incarnation,
             crate::proctruth::capture_reap_carriers(
+                &db,
                 &name,
                 row.as_ref(),
                 &binding_ids,
                 &[],
                 &excluded,
-            ),
+            )
+            .unwrap(),
             |_, _, _, _capture| Err(crate::proctruth::ReapError::Survivors(vec![survivor_pid])),
         )
         .err()
@@ -2206,12 +2268,14 @@ mod tests {
             &excluded,
             &incarnation,
             crate::proctruth::capture_reap_carriers(
+                &db,
                 &name,
                 row.as_ref(),
                 &binding_ids,
                 &[],
                 &excluded,
-            ),
+            )
+            .unwrap(),
             |n, b, e, capture| {
                 // The real reap, then the mid-kill rebind: same name, new
                 // binding epoch (the `start --as` shape).

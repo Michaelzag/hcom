@@ -505,11 +505,16 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     let Some(session_id) = payload.session_id.as_deref().filter(|sid| !sid.is_empty()) else {
         return json!({ "env": cursor_session_env(ctx) });
     };
-    let instance_name = ctx
-        .process_id
-        .as_deref()
-        .and_then(|pid| instance_binding::bind_session_to_process(db, session_id, Some(pid)))
-        .or_else(|| resolve_instance(db, ctx, payload).map(|instance| instance.name));
+    let bound = match ctx.process_id.as_deref() {
+        Some(pid) => match instance_binding::bind_session_to_process(db, session_id, Some(pid)) {
+            Ok(name) => name,
+            // Already logged; no resolve_instance fallback over a failed bind.
+            Err(_) => return json!({ "env": cursor_session_env(ctx) }),
+        },
+        None => None,
+    };
+    let instance_name =
+        bound.or_else(|| resolve_instance(db, ctx, payload).map(|instance| instance.name));
     let Some(instance_name) = instance_name else {
         return json!({ "env": cursor_session_env(ctx) });
     };

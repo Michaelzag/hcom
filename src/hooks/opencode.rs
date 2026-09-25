@@ -207,16 +207,15 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     }
 
     // Normal binding path
-    let instance_name =
-        match instance_binding::bind_session_to_process(db, &session_id, Some(&process_id)) {
-            Some(name) => name,
-            None => {
-                return (
-                    0,
-                    r#"{"error":"No instance bound to this process"}"#.to_string(),
-                );
-            }
-        };
+    // A failed bind is already logged; it reports unbound like no binding.
+    let Ok(Some(instance_name)) =
+        instance_binding::bind_session_to_process(db, &session_id, Some(&process_id))
+    else {
+        return (
+            0,
+            r#"{"error":"No instance bound to this process"}"#.to_string(),
+        );
+    };
     let tool = instance_tool(db, &instance_name);
 
     // Rebind session and initialize

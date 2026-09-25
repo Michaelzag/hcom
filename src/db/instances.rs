@@ -653,22 +653,37 @@ impl HcomDb {
     }
 
     /// Find the most recent stopped instance whose snapshot carries the given
-    /// session_id. life.stopped events are the source of truth: they persist
-    /// across the `session_bindings` cascade, so they're the right thing to
-    /// consult when reclaiming hcom identity by UUID after stop/kill.
+    /// session_id; see [`Self::find_stopped_snapshot_by_session_id`].
     pub fn find_stopped_instance_by_session_id(&self, session_id: &str) -> Result<Option<String>> {
-        self.conn
+        Ok(self
+            .find_stopped_snapshot_by_session_id(session_id)?
+            .map(|(name, _)| name))
+    }
+
+    /// Find the most recent stopped instance whose snapshot carries the given
+    /// session_id, with that event's snapshot. life.stopped events are the
+    /// source of truth: they persist across the `session_bindings` cascade, so
+    /// they're the right thing to consult when reclaiming hcom identity by UUID
+    /// after stop/kill, and to rebuild the row when nothing else survives.
+    pub fn find_stopped_snapshot_by_session_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, serde_json::Value)>> {
+        let found = self
+            .conn
             .query_row(
-                "SELECT instance FROM events
+                "SELECT instance, json_extract(data, '$.snapshot') FROM events
                  WHERE type = 'life'
                    AND json_extract(data, '$.action') = 'stopped'
                    AND json_extract(data, '$.snapshot.session_id') = ?
                  ORDER BY id DESC LIMIT 1",
                 params![session_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        found
+            .map(|(name, snapshot)| Ok((name, serde_json::from_str(&snapshot)?)))
+            .transpose()
     }
 
     /// Convert a row from INSTANCE_COLUMNS SELECT to JSON.

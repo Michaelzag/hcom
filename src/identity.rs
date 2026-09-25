@@ -391,14 +391,16 @@ fn resolve_identity_with_expectation(
                         // Opportunistic Codex session binding for command-time recovery.
                         // Native SessionStart is the primary binding path; this keeps
                         // resume/orphan flows tolerant if a command arrives first.
-                        // Uses bind_session_to_process for proper resume/placeholder handling.
+                        // Uses bind_session_to_process for proper resume/placeholder handling;
+                        // a failed bind (logged there) keeps the pre-bound name.
                         let mut final_name = inst_name.clone();
                         if !has_session
                             && let Some(thread_id) = codex_thread_id
                             && !thread_id.is_empty()
-                            && let Some(resolved) = crate::instance_binding::bind_session_to_process(
-                                db, thread_id, process_id,
-                            )
+                            && let Ok(Some(resolved)) =
+                                crate::instance_binding::bind_session_to_process(
+                                    db, thread_id, process_id,
+                                )
                         {
                             final_name = resolved;
                         }

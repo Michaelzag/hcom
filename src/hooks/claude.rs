@@ -1203,7 +1203,8 @@ fn bind_and_bootstrap(
     process_id: &str,
 ) -> Result<Option<Value>, String> {
     let mut instance_name =
-        instance_binding::bind_session_to_process(db, session_id, Some(process_id));
+        instance_binding::bind_session_to_process(db, session_id, Some(process_id))
+            .map_err(|e| format!("bind_session_to_process failed: {e:#}"))?;
 
     // Orphaned PTY: process_id exists but no binding (e.g., after /clear)
     if instance_name.is_none() {

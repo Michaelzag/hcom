@@ -131,8 +131,15 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
         &session_id,
         Some(&process_id),
     ) {
-        Some(name) => name,
-        None => match instance_name_from_env(ctx).and_then(|name| {
+        Ok(Some(name)) => name,
+        // A failed bind (already logged) must not mint a replacement identity.
+        Err(_) => {
+            return (
+                0,
+                r#"{"error":"No instance bound to this process"}"#.to_string(),
+            );
+        }
+        Ok(None) => match instance_name_from_env(ctx).and_then(|name| {
             instance_binding::recover_process_binding_for_instance(
                 db,
                 &name,

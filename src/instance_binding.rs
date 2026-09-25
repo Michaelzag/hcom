@@ -4,6 +4,8 @@
 //! launch metadata capture, placeholder/canonical binding, and instance-row
 //! initialization for newly launched or recovered sessions.
 
+use anyhow::Context;
+
 use crate::db::{HcomDb, InstanceRow};
 use crate::instance_names::{PLACEHOLDER_CONTEXT, PLACEHOLDER_STATUS};
 use crate::instances::update_instance_position;
@@ -399,17 +401,161 @@ fn recreate_instance_from_placeholder(
     );
 }
 
+/// Identity metadata a reclaim or restore carries over: the identity's tool
+/// and directory, and its delivery cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RebindTargetMetadata {
+    pub(crate) tool: String,
+    pub(crate) directory: String,
+    pub(crate) last_event_id: i64,
+}
+
+/// Load rebind metadata from the live row first, then the newest stopped
+/// snapshot. `start --as` and the stopped-snapshot rebuild in
+/// [`bind_session_to_process`] both restore the identity's cursor from here.
+///
+/// The snapshot is selected by action in SQL, not from a window of recent
+/// life events, so a stop behind later life events is still found instead of
+/// the caller falling back to a fresh cursor. A `stopped` event with no
+/// snapshot object (a stale-harness exit) carries no metadata and is skipped.
+pub(crate) fn load_rebind_target_metadata(
+    db: &HcomDb,
+    name: &str,
+) -> anyhow::Result<RebindTargetMetadata> {
+    use rusqlite::OptionalExtension;
+
+    if let Some(inst) = db.get_instance_full(name)? {
+        return Ok(RebindTargetMetadata {
+            tool: inst.tool,
+            directory: inst.directory,
+            last_event_id: inst.last_event_id,
+        });
+    }
+
+    let snapshot: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT json_extract(data, '$.snapshot') FROM events
+             WHERE type = 'life'
+               AND instance = ?
+               AND json_extract(data, '$.action') = 'stopped'
+               AND json_type(data, '$.snapshot') = 'object'
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(snapshot) = snapshot else {
+        anyhow::bail!("No rebind metadata found for '{}'", name);
+    };
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot)?;
+    let text = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    Ok(RebindTargetMetadata {
+        tool: text("tool"),
+        directory: text("directory"),
+        last_event_id: snapshot
+            .get("last_event_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+    })
+}
+
+/// Recreate a missing instance row from the `life.stopped` snapshot that matched
+/// its session, for a restore with no placeholder row to copy from.
+///
+/// The row resumes the identity where it stopped: its delivery cursor is the
+/// one `start --as` restores ([`load_rebind_target_metadata`], read while the
+/// row is still missing), so messages sent while it was stopped stay pending,
+/// and the snapshot's per-seat settings (tag, hints, timeouts) carry over.
+/// The row is created and given that cursor in one write transaction, so it
+/// is never visible with the fresh cursor initialization assigns. Errors
+/// when the row cannot be created with that cursor.
+fn recreate_instance_from_stopped_snapshot(
+    db: &HcomDb,
+    target_name: &str,
+    session_id: &str,
+    snapshot: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let field = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    };
+    let int = |key: &str| snapshot.get(key).and_then(|v| v.as_i64());
+    db.with_immediate_transaction(|_tx| {
+        if db.get_instance_full(target_name)?.is_some() {
+            return Ok(());
+        }
+        let restored = load_rebind_target_metadata(db, target_name)?;
+        if !initialize_instance_in_position_file(
+            db,
+            target_name,
+            Some(session_id),
+            None,
+            None,
+            None,
+            field("transcript_path"),
+            field("tool"),
+            int("background").unwrap_or(0) != 0,
+            field("tag"),
+            int("wait_timeout"),
+            int("subagent_timeout"),
+            field("hints"),
+            field("directory"),
+        ) {
+            anyhow::bail!(
+                "restore_stopped: could not recreate the instance row for '{target_name}'"
+            );
+        }
+        let mut updates = serde_json::Map::new();
+        updates.insert(
+            "last_event_id".into(),
+            serde_json::json!(restored.last_event_id),
+        );
+        db.update_instance_fields(target_name, &updates)
+            .with_context(|| {
+                format!("restore_stopped: could not restore the cursor for '{target_name}'")
+            })
+    })
+}
+
 /// Bind session_id to canonical instance for process_id.
 /// Handles 4 paths: canonical exists (with placeholder merge/switch), placeholder bind,
 /// and two no-op paths.
+///
+/// `Ok(Some(name))` means the `name` row exists and its session binding (and
+/// process binding, when `process_id` is given) were written. A failed row
+/// recreation or binding write is logged here once and returned as an `Err`,
+/// never a name; callers must not mint a replacement identity on `Err`.
 pub fn bind_session_to_process(
     db: &HcomDb,
     session_id: &str,
     process_id: Option<&str>,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
+    bind_session_to_process_body(db, session_id, process_id).inspect_err(|e| {
+        crate::log::log_error(
+            "binding",
+            "bind_session_to_process.failed",
+            &format!("session_id={session_id}, process_id={process_id:?}, err={e:#}"),
+        );
+    })
+}
+
+fn bind_session_to_process_body(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: Option<&str>,
+) -> anyhow::Result<Option<String>> {
     if session_id.is_empty() {
         crate::log::log_info("binding", "bind_session_to_process.no_session_id", "");
-        return None;
+        return Ok(None);
     }
 
     crate::log::log_info(
@@ -534,34 +680,34 @@ pub fn bind_session_to_process(
 
         update_instance_position(db, canonical_name, &resume_updates);
 
-        if let Some(pid) = process_id
-            && let Err(e) = db.set_process_binding(pid, session_id, canonical_name)
-        {
-            crate::log::log_error(
-                "binding",
-                "bind_canonical.set_process_binding",
-                &format!("{e}"),
-            );
+        if let Some(pid) = process_id {
+            db.set_process_binding(pid, session_id, canonical_name)
+                .with_context(|| {
+                    format!("bind_canonical.set_process_binding for '{canonical_name}'")
+                })?;
         }
 
-        return Some(canonical_name.clone());
+        return Ok(Some(canonical_name.clone()));
     }
 
     // Path 2: session_bindings CASCADE'd on delete — recover canonical name from life.stopped
     if canonical.is_none()
-        && let Ok(Some(stopped_name)) = db.find_stopped_instance_by_session_id(session_id)
+        && let Ok(Some((stopped_name, snapshot))) =
+            db.find_stopped_snapshot_by_session_id(session_id)
     {
         crate::log::log_info(
             "binding",
             "bind_session_to_process.restore_stopped",
             &format!("stopped_name={stopped_name}, session_id={session_id}"),
         );
-        recreate_instance_from_placeholder(
-            db,
-            &stopped_name,
-            session_id,
-            placeholder_data.as_ref(),
-        );
+        match placeholder_data.as_ref() {
+            Some(ph) => recreate_instance_from_placeholder(db, &stopped_name, session_id, Some(ph)),
+            // No placeholder row to copy from: rebuild the swept row from the
+            // stopped snapshot, else the bindings below would name a missing row.
+            None => {
+                recreate_instance_from_stopped_snapshot(db, &stopped_name, session_id, &snapshot)?
+            }
+        }
 
         if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
             crate::log::log_error("binding", "restore_stopped.clear_session", &format!("{e}"));
@@ -569,17 +715,13 @@ pub fn bind_session_to_process(
         let mut updates = serde_json::Map::new();
         updates.insert("session_id".into(), serde_json::json!(session_id));
         update_instance_position(db, &stopped_name, &updates);
-        if let Err(e) = db.rebind_session(session_id, &stopped_name) {
-            crate::log::log_error("binding", "restore_stopped.rebind_session", &format!("{e}"));
-        }
-        if let Some(pid) = process_id
-            && let Err(e) = db.set_process_binding(pid, session_id, &stopped_name)
-        {
-            crate::log::log_error(
-                "binding",
-                "restore_stopped.set_process_binding",
-                &format!("{e}"),
-            );
+        db.rebind_session(session_id, &stopped_name)
+            .with_context(|| format!("restore_stopped.rebind_session for '{stopped_name}'"))?;
+        if let Some(pid) = process_id {
+            db.set_process_binding(pid, session_id, &stopped_name)
+                .with_context(|| {
+                    format!("restore_stopped.set_process_binding for '{stopped_name}'")
+                })?;
         }
 
         retire_true_placeholder_after_canonical_bind(
@@ -589,7 +731,7 @@ pub fn bind_session_to_process(
             placeholder_data.as_ref(),
         );
 
-        return Some(stopped_name);
+        return Ok(Some(stopped_name));
     }
 
     // Path 3: No canonical, but placeholder exists — bind session to placeholder
@@ -608,28 +750,18 @@ pub fn bind_session_to_process(
         updates.insert("session_id".into(), serde_json::json!(session_id));
         update_instance_position(db, ph_name, &updates);
 
-        if let Err(e) = db.rebind_session(session_id, ph_name) {
-            crate::log::log_error(
-                "binding",
-                "bind_placeholder.rebind_session",
-                &format!("{e}"),
-            );
-        }
-        if let Some(pid) = process_id
-            && let Err(e) = db.set_process_binding(pid, session_id, ph_name)
-        {
-            crate::log::log_error(
-                "binding",
-                "bind_placeholder.set_process_binding",
-                &format!("{e}"),
-            );
+        db.rebind_session(session_id, ph_name)
+            .with_context(|| format!("bind_placeholder.rebind_session for '{ph_name}'"))?;
+        if let Some(pid) = process_id {
+            db.set_process_binding(pid, session_id, ph_name)
+                .with_context(|| format!("bind_placeholder.set_process_binding for '{ph_name}'"))?;
         }
 
-        return Some(ph_name.clone());
+        return Ok(Some(ph_name.clone()));
     }
 
     crate::log::log_info("binding", "bind_session_to_process.return_none", "");
-    None
+    Ok(None)
 }
 
 /// Rebind process/session after soft-finalize cleared bindings but left the
@@ -1218,7 +1350,7 @@ mod tests {
 
         db.set_process_binding("pid-123", "", "luna").unwrap();
 
-        let result = bind_session_to_process(&db, "sid-456", Some("pid-123"));
+        let result = bind_session_to_process(&db, "sid-456", Some("pid-123")).unwrap();
         assert_eq!(result, Some("luna".to_string()));
 
         let inst = db.get_instance_full("luna").unwrap().unwrap();
@@ -1254,7 +1386,7 @@ mod tests {
 
         db.set_process_binding("pid-123", "", "temp").unwrap();
 
-        let result = bind_session_to_process(&db, "sid-789", Some("pid-123"));
+        let result = bind_session_to_process(&db, "sid-789", Some("pid-123")).unwrap();
         assert_eq!(result, Some("miso".to_string()));
 
         assert!(db.get_instance_full("temp").unwrap().is_none());
@@ -1289,7 +1421,7 @@ mod tests {
         db.set_process_binding("pid-123", "sid-old", "temp")
             .unwrap();
 
-        let result = bind_session_to_process(&db, "sid-789", Some("pid-123"));
+        let result = bind_session_to_process(&db, "sid-789", Some("pid-123")).unwrap();
         assert_eq!(result, Some("miso".to_string()));
 
         let placeholder = db.get_instance_full("temp").unwrap().unwrap();
@@ -1310,7 +1442,7 @@ mod tests {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
 
-        let result = bind_session_to_process(&db, "sid-999", None);
+        let result = bind_session_to_process(&db, "sid-999", None).unwrap();
         assert_eq!(result, None);
 
         cleanup(path);
@@ -1509,7 +1641,7 @@ mod tests {
         assert!(db.get_instance_full("miso").unwrap().is_none());
         assert_eq!(db.get_session_binding("sid-resume").unwrap(), None);
 
-        let result = bind_session_to_process(&db, "sid-resume", Some("pid-agy"));
+        let result = bind_session_to_process(&db, "sid-resume", Some("pid-agy")).unwrap();
         assert_eq!(result, Some("miso".to_string()));
 
         let restored = db.get_instance_full("miso").unwrap().unwrap();
@@ -1517,6 +1649,151 @@ mod tests {
         assert_eq!(restored.tool, "antigravity");
         assert_eq!(restored.tag.as_deref(), Some("work"));
         assert!(db.get_instance_full("nova").unwrap().is_none());
+
+        cleanup(path);
+    }
+
+    /// Process bindings that name an instance row which does not exist.
+    fn ghost_process_bindings(db: &HcomDb) -> Vec<(String, String)> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT process_id, instance_name FROM process_bindings
+                 WHERE instance_name NOT IN (SELECT name FROM instances)",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn test_restore_stopped_recreates_swept_row_from_snapshot() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        // Only the stopped snapshot survives: no row, no placeholder, no binding.
+        let snapshot = serde_json::json!({
+            "session_id": "ses-ghost",
+            "tool": "omp",
+            "directory": "/tmp/proof-dir",
+            "tag": "crew",
+            "background": 0,
+            "transcript_path": "",
+            "hints": "reply in the crew thread",
+        });
+        db.log_life_event(
+            "valo",
+            "stopped",
+            "daemon",
+            "vanished",
+            Some(snapshot),
+            None,
+        )
+        .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-ghost", Some("omp-777-aa-bb")).unwrap();
+        assert_eq!(result, Some("valo".to_string()));
+
+        let valo = db.get_instance_full("valo").unwrap().expect("valo row");
+        assert_eq!(valo.session_id.as_deref(), Some("ses-ghost"));
+        assert_eq!(valo.tool, "omp");
+        assert_eq!(valo.directory, "/tmp/proof-dir");
+        assert_eq!(valo.tag.as_deref(), Some("crew"));
+        assert_eq!(valo.hints.as_deref(), Some("reply in the crew thread"));
+        assert_eq!(
+            db.get_session_binding("ses-ghost").unwrap(),
+            Some("valo".to_string())
+        );
+        assert_eq!(
+            db.get_process_binding("omp-777-aa-bb").unwrap(),
+            Some("valo".to_string())
+        );
+        assert!(ghost_process_bindings(&db).is_empty());
+
+        cleanup(path);
+    }
+
+    /// The rebuilt row resumes delivery where its identity stopped: messages
+    /// sent while it was stopped are still pending for it, and nothing it had
+    /// read before the stop comes back.
+    #[test]
+    #[serial]
+    fn test_restore_stopped_rebuild_keeps_messages_sent_while_stopped() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let broadcast = |text: &str| {
+            db.log_event(
+                "message",
+                "nova",
+                &serde_json::json!({"from": "nova", "scope": "broadcast", "text": text}),
+            )
+            .unwrap()
+        };
+
+        let read_before_stop = broadcast("read before the stop");
+        let mut valo_data = serde_json::Map::new();
+        valo_data.insert("name".into(), serde_json::json!("valo"));
+        valo_data.insert("session_id".into(), serde_json::json!("ses-cursor"));
+        valo_data.insert("tool".into(), serde_json::json!("omp"));
+        valo_data.insert("created_at".into(), serde_json::json!(now_epoch_i64()));
+        valo_data.insert("status".into(), serde_json::json!("listening"));
+        valo_data.insert("last_event_id".into(), serde_json::json!(read_before_stop));
+        db.save_instance_named("valo", &valo_data).unwrap();
+
+        // The sweep's release: snapshot, stopped event, row gone.
+        let snapshot = db.get_instance_snapshot("valo").unwrap();
+        db.log_life_event("valo", "stopped", "daemon", "vanished", snapshot, None)
+            .unwrap();
+        db.delete_instance("valo").unwrap();
+
+        let sent_while_stopped = broadcast("broadcast while stopped");
+        let mention_while_stopped = db
+            .log_event(
+                "message",
+                "nova",
+                &serde_json::json!({
+                    "from": "nova",
+                    "scope": "mentions",
+                    "mentions": ["valo"],
+                    "text": "mention while stopped",
+                }),
+            )
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-cursor", Some("omp-778-aa-bb")).unwrap();
+        assert_eq!(result, Some("valo".to_string()));
+
+        let valo = db.get_instance_full("valo").unwrap().expect("valo row");
+        assert_eq!(
+            valo.last_event_id, read_before_stop,
+            "the rebuilt row keeps its stopped snapshot's cursor"
+        );
+        let pending: Vec<i64> = db
+            .get_unread_messages("valo")
+            .iter()
+            .filter_map(|m| m.event_id)
+            .collect();
+        assert_eq!(pending, vec![sent_while_stopped, mention_while_stopped]);
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bind_placeholder_fk_failure_is_an_error_not_a_name() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        // A process binding that names a row which no longer exists.
+        db.set_process_binding("pid-ghost", "", "ghost").unwrap();
+
+        let result = bind_session_to_process(&db, "ses-unknown", Some("pid-ghost"));
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        assert_eq!(db.get_session_binding("ses-unknown").unwrap(), None);
+        assert!(db.get_instance_full("ghost").unwrap().is_none());
 
         cleanup(path);
     }
@@ -1554,7 +1831,7 @@ mod tests {
         db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
         db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
 
-        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc"));
+        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc")).unwrap();
         assert_eq!(result, Some("fano".to_string()));
 
         assert!(db.get_instance_full("mozi").unwrap().is_none());
@@ -1608,7 +1885,7 @@ mod tests {
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-99"}"#)
             .unwrap();
 
-        let result = bind_session_to_process(&db, "ses-oc-pid", Some("pid-oc"));
+        let result = bind_session_to_process(&db, "ses-oc-pid", Some("pid-oc")).unwrap();
         assert_eq!(result, Some("fano".to_string()));
 
         // Placeholder gone; pid + launch_context now live on the canonical so the
@@ -1665,7 +1942,7 @@ mod tests {
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-101"}"#)
             .unwrap();
 
-        let result = bind_session_to_process(&db, "ses-oc-ready", Some("pid-oc-ready"));
+        let result = bind_session_to_process(&db, "ses-oc-ready", Some("pid-oc-ready")).unwrap();
         assert_eq!(result, Some("fano".to_string()));
 
         assert!(db.get_instance_full("mozi").unwrap().is_none());
@@ -1716,7 +1993,7 @@ mod tests {
         db.save_instance_named("busy", &busy_data).unwrap();
         db.set_process_binding("pid-busy", "", "busy").unwrap();
 
-        let result = bind_session_to_process(&db, "ses-keep", Some("pid-busy"));
+        let result = bind_session_to_process(&db, "ses-keep", Some("pid-busy")).unwrap();
         assert_eq!(result, Some("fano".to_string()));
 
         assert!(
@@ -1799,7 +2076,7 @@ mod tests {
         db.save_instance_named("mozi", &mozi_data).unwrap();
         db.set_process_binding("pid-oc", "", "mozi").unwrap();
 
-        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc"));
+        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc")).unwrap();
         assert_eq!(result, Some("fano".to_string()));
 
         assert!(db.get_instance_full("mozi").unwrap().is_some());
@@ -1825,10 +2102,10 @@ mod tests {
         db.save_instance_named("luna", &data).unwrap();
         db.set_process_binding("pid-1", "", "luna").unwrap();
 
-        let r1 = bind_session_to_process(&db, "sess-1", Some("pid-1"));
+        let r1 = bind_session_to_process(&db, "sess-1", Some("pid-1")).unwrap();
         assert_eq!(r1, Some("luna".to_string()));
 
-        let r2 = bind_session_to_process(&db, "sess-1", Some("pid-1"));
+        let r2 = bind_session_to_process(&db, "sess-1", Some("pid-1")).unwrap();
         assert_eq!(r2, Some("luna".to_string()));
 
         let inst = db.get_instance_full("luna").unwrap().unwrap();
