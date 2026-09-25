@@ -1,0 +1,22 @@
+{
+  "lines": [
+    "",
+    "╭── π > ◕ Opus 5.5 👁 > 🗑 compact-proof/work > (sub) ▶─3%─────────────────────────────────╎┃───1M───╮",
+    "╰─ /comp                                                                                          ─╯",
+    "❯ 🗜  compact         Compact: context 3% used                                                      █",
+    "  🖥  computer        Computer: off                                                                 █",
+    "  🛡  security        Plan, run, inspect, import, and compare OMP-native security scans             █",
+    "  ⑂  git             Open the git UI (split diff viewer, staging, commit composer)                 █",
+    "  ➦  handoff         Summarize the session into a handoff document and compact in place            █",
+    "  ⚖  omfg            Forge a TTSR rule from a complaint to stop a recurring behavior               █",
+    "  ↻  reload-plugins  Reload all plugins (skills, commands, hooks, tools, agents, MCP)              │",
+    "  📤 record          Start or stop recording this screen to a replayable file (omp play)           │",
+    "  ↻  loop            Loop: off                                                                     │",
+    "  📋 dump            Copy session transcript to clipboard (and write LLM request JSON to tmp)      │"
+  ],
+  "size": [13, 100],
+  "cursor": [2, 8],
+  "ready": true,
+  "prompt_empty": false,
+  "input_text": null
+}

@@ -8,9 +8,14 @@
 //! Safety is idle-only. Before anything is injected, every reason that
 //! applies is named — live turn, open background jobs, in-flight foreground
 //! tools, running jobs / queued deliveries, pending hcom messages, unknown job
-//! data, no delivery path. All of them, not just the first. The facts are
-//! re-read immediately before the injection, and the seat's input box must be
-//! empty (with a short poll for it to clear).
+//! data, no delivery path, a prompt that is not verifiably empty. All of them,
+//! not just the first. Immediately before the injection every fact is read
+//! again — the seat row from the DB, the prompt from a fresh screen query —
+//! and any reason then aborts it.
+//!
+//! The prompt is read client-side from the screen query's rows
+//! ([`screen::omp_input_text`]), so it works against a seat whose PTY wrapper
+//! is an older hcom binary. A prompt that can't be read is never empty.
 //!
 //! `--dry-run` runs the whole preflight and prints what it would do, changing
 //! nothing.
@@ -20,22 +25,30 @@
 //! session file, so it still counts as open.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
+
+use serde_json::Value;
 
 use crate::commands::term;
 use crate::context::{
     self, CompactionRecord, ContextSource, JobsScan, OpenJob, OpenTool, SeatContext,
     SeatContextRequest,
 };
-use crate::db::HcomDb;
+use crate::db::{HcomDb, InstanceRow};
 use crate::instance_lifecycle::get_instance_status;
 use crate::instances::is_remote_instance;
+use crate::pty::screen;
 use crate::shared::time::now_epoch_ms;
 use crate::shared::{CommandContext, ST_LISTENING};
+use crate::tool::Tool;
 
 /// Parsed arguments for `hcom compact`.
 #[derive(clap::Parser, Debug)]
-#[command(name = "compact", about = "Compact an idle seat's context via PTY injection")]
+#[command(
+    name = "compact",
+    about = "Compact an idle seat's context via PTY injection"
+)]
 pub struct CompactArgs {
     /// Seat name
     pub name: String,
@@ -50,10 +63,6 @@ pub struct CompactArgs {
     pub timeout: u64,
 }
 
-/// How long the seat's input box is given to clear before we refuse.
-const PROMPT_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
-/// Poll interval while waiting for the input box to clear.
-const PROMPT_CLEAR_POLL: Duration = Duration::from_millis(200);
 /// Interval between re-reads of the session file while waiting for the record.
 const RECORD_POLL: Duration = Duration::from_secs(2);
 /// Longest job label carried into a refusal line.
@@ -75,6 +84,28 @@ pub struct Preflight {
     pub pending_messages: usize,
     /// The seat's inject endpoint port; `None` means nothing to deliver to.
     pub inject_port: Option<i32>,
+    /// What the seat's input box holds, from its PTY screen.
+    pub prompt: Prompt,
+}
+
+/// What the seat's input box holds, read from its PTY screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prompt {
+    Empty,
+    HasText,
+    /// No screen answer, or no input box found on it: never taken as empty.
+    Unobservable,
+}
+
+impl Prompt {
+    /// The value of the report's `prompt:` line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Prompt::Empty => "empty",
+            Prompt::HasText => "has text",
+            Prompt::Unobservable => "unobservable",
+        }
+    }
 }
 
 /// The preflight plus what the report needs (display context).
@@ -83,7 +114,6 @@ struct Facts {
     preflight: Preflight,
     ctx: SeatContext,
 }
-
 
 /// One applicable refusal, carrying the data its line renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,8 +134,10 @@ pub enum Reason {
     UnknownJobs,
     /// No inject endpoint: nothing to deliver through.
     NoDeliveryPath,
-    /// The seat's input box holds text: injecting would prepend to it.
+    /// The seat's input box holds text: injecting would append to it.
     PromptNotEmpty,
+    /// The seat's input box could not be read, so it is not known to be empty.
+    PromptUnobservable,
 }
 
 impl Reason {
@@ -117,12 +149,16 @@ impl Reason {
             Reason::OpenJobs(jobs) => format!(
                 "{} open job(s) ({})",
                 jobs.len(),
-                jobs.iter().map(render_job_ref).collect::<Vec<_>>().join(", ")
+                jobs.iter()
+                    .map(render_job_ref)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Reason::OpenTools(tools) => format!(
                 "{} in-flight foreground tool(s) ({})",
                 tools.len(),
-                tools.iter()
+                tools
+                    .iter()
                     .map(|t| format!("{} {}", t.tool_call_id, t.tool_name))
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -134,10 +170,13 @@ impl Reason {
             Reason::UnknownJobs => "unknown: no job data (no recognizable job or tool records \
                  in session file; no live plugin answer)"
                 .to_string(),
-            Reason::NoDeliveryPath => "no delivery path (no inject endpoint registered)"
-                .to_string(),
-            Reason::PromptNotEmpty => {
-                "prompt not empty (seat input busy; refusing to inject)".to_string()
+            Reason::NoDeliveryPath => {
+                "no delivery path (no inject endpoint registered)".to_string()
+            }
+            Reason::PromptNotEmpty => "prompt not empty (text in the seat's input box)".to_string(),
+            Reason::PromptUnobservable => {
+                "prompt not verifiably empty (no screen answer, or no input box found on it)"
+                    .to_string()
             }
         }
     }
@@ -145,7 +184,12 @@ impl Reason {
 
 /// `<job_id> <kind>`, plus ` "<label>"` when the job carries one.
 fn render_job_ref(job: &OpenJob) -> String {
-    match job.label.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+    match job
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
         Some(label) => {
             let label: String = label.chars().take(LABEL_MAX_CHARS).collect();
             format!("{} {} \"{}\"", job.job_id, job.kind, label)
@@ -197,6 +241,12 @@ pub fn refusal_reasons(p: &Preflight) -> Vec<Reason> {
         reasons.push(Reason::NoDeliveryPath);
     }
 
+    match p.prompt {
+        Prompt::Empty => {}
+        Prompt::HasText => reasons.push(Reason::PromptNotEmpty),
+        Prompt::Unobservable => reasons.push(Reason::PromptUnobservable),
+    }
+
     reasons
 }
 
@@ -224,14 +274,22 @@ pub fn build_focus(
     if !open_jobs.is_empty() {
         parts.push(format!(
             "open jobs: {}",
-            open_jobs.iter().map(render_job_ref).collect::<Vec<_>>().join(", ")
+            open_jobs
+                .iter()
+                .map(render_job_ref)
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     if let Some(e) = extra.map(str::trim).filter(|s| !s.is_empty()) {
         parts.push(format!("next: {e}"));
     }
     // Collapse every whitespace run (including \r and \n) to one space.
-    parts.join(" | ").split_whitespace().collect::<Vec<_>>().join(" ")
+    parts
+        .join(" | ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ── Rendering ────────────────────────────────────────────────────────────────
@@ -282,29 +340,38 @@ pub fn render_delivery(inject_port: Option<i32>) -> String {
     }
 }
 
-/// The whole `would-compact` report.
-fn render_would_compact(
-    name: &str,
-    facts: &Facts,
-    focus: &str,
-) -> String {
+/// The facts lines both reports carry: tokens, jobs, delivery path, prompt.
+fn render_facts(facts: &Facts) -> String {
     format!(
-        "would-compact {name}\n  reasons: none\n  {}\n  {}\n  {}\n  focus: {focus}",
+        "  {}\n  {}\n  {}\n  prompt: {}",
         render_tokens(&facts.ctx),
         render_jobs(&facts.ctx, &facts.preflight.scan),
         render_delivery(facts.preflight.inject_port),
+        facts.preflight.prompt.as_str(),
     )
 }
 
-/// The refusal block: header plus one indented line per reason.
-pub fn render_refusal(name: &str, reasons: &[Reason]) -> String {
+/// The whole `would-compact` report.
+fn render_would_compact(name: &str, facts: &Facts, focus: &str) -> String {
+    format!(
+        "would-compact {name}\n  reasons: none\n{}\n  focus: {focus}",
+        render_facts(facts)
+    )
+}
+
+/// The refusal block: header, one indented line per reason, then the facts
+/// lines when the facts were read.
+pub fn render_refusal(name: &str, reasons: &[Reason], facts: Option<&str>) -> String {
     let mut out = format!("refuse: compact {name}");
     for reason in reasons {
         out.push_str(&format!("\n  - {}", reason.render()));
     }
+    if let Some(facts) = facts {
+        out.push('\n');
+        out.push_str(facts);
+    }
     out
 }
-
 
 // ── Execution ────────────────────────────────────────────────────────────────
 
@@ -320,8 +387,13 @@ pub enum Outcome {
 /// Why a run did not compact.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fail {
-    /// Preflight (or the pre-inject re-check) refused. Carries the full list.
-    Refused { reasons: Vec<Reason> },
+    /// Preflight (or the pre-inject re-check) refused. Carries the full list,
+    /// and the rendered facts lines when the facts were read (a remote seat's
+    /// never are).
+    Refused {
+        reasons: Vec<Reason>,
+        facts: Option<String>,
+    },
     /// No new compaction record within the timeout.
     Timeout,
     /// A message printed verbatim, exit code 1.
@@ -340,11 +412,20 @@ fn inject_port(db: &HcomDb, name: &str) -> Option<i32> {
         .ok()
 }
 
+/// The seat's row, or `no such seat`.
+fn read_row(db: &HcomDb, name: &str) -> Result<InstanceRow, Fail> {
+    db.get_instance_full(name)
+        .map_err(|e| Fail::Error(e.to_string()))?
+        .ok_or_else(|| Fail::Error(format!("no such seat: {name}")))
+}
 
-/// Read every fact the refusal rules and the report need, right now.
-fn gather(db: &HcomDb, row: &crate::db::InstanceRow, name: &str) -> Facts {
-    let status = get_instance_status(row, db).status;
-    let port = inject_port(db, name);
+/// Read every fact the refusal rules and the report need, right now, plus
+/// the seat row they came from. The slow reads (live plugin query,
+/// whole-file session scan) run first; the row is then read again for the
+/// status and the screen is queried last, so a turn that started in the
+/// meantime is seen.
+fn gather(db: &HcomDb, name: &str) -> Result<(InstanceRow, Facts), Fail> {
+    let row = read_row(db, name)?;
     let ctx = context::probe(SeatContextRequest {
         plugin_port: context::plugin_port(db, name),
         transcript_path: row.transcript_path.clone(),
@@ -357,45 +438,82 @@ fn gather(db: &HcomDb, row: &crate::db::InstanceRow, name: &str) -> Facts {
     } else {
         None
     };
-    Facts {
+    let pending_messages = db.get_unread_messages(name).len();
+    let inject_port = inject_port(db, name);
+
+    let row = read_row(db, name)?;
+    let status = get_instance_status(&row, db).status;
+    let screen = inject_port.and_then(term::query_screen);
+    let prompt = read_prompt(&row.tool, screen.as_ref());
+    let facts = Facts {
         preflight: Preflight {
             status,
             live_jobs,
             scan: ctx.jobs_scan.clone(),
-            pending_messages: db.get_unread_messages(name).len(),
-            inject_port: port,
+            pending_messages,
+            inject_port,
+            prompt,
         },
         ctx,
+    };
+    Ok((row, facts))
+}
+
+/// The seat's prompt, from its screen-query answer. For omp the box is
+/// parsed here from the rows, because the wrapper's own `input_text` is
+/// always null for omp; other tools carry the wrapper's `input_text`.
+/// Anything that can't be read is `Unobservable`, never `Empty`.
+fn read_prompt(tool: &str, screen: Option<&Value>) -> Prompt {
+    let Some(screen) = screen else {
+        return Prompt::Unobservable;
+    };
+    let text = match Tool::from_str(tool) {
+        Ok(Tool::Omp) => omp_prompt_text(screen),
+        _ => screen
+            .get("input_text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    match text {
+        Some(text) if text.trim().is_empty() => Prompt::Empty,
+        Some(_) => Prompt::HasText,
+        None => Prompt::Unobservable,
     }
 }
 
-/// True when the seat's input box still holds text. `None` input (no parser
-/// for this tool) reads as empty, same as `hcom term` does.
-fn prompt_is_busy(port: i32) -> bool {
-    let deadline = Instant::now() + PROMPT_CLEAR_TIMEOUT;
-    loop {
-        let busy = term::query_screen(port)
-            .and_then(|screen| {
-                screen
-                    .get("input_text")
-                    .and_then(|v| v.as_str())
-                    .map(|s| !s.trim().is_empty())
-            })
-            .unwrap_or(false);
-        if !busy || Instant::now() >= deadline {
-            return busy;
-        }
-        std::thread::sleep(PROMPT_CLEAR_POLL);
+/// omp's editor text from a screen-query answer's `lines` and `cursor`.
+fn omp_prompt_text(screen: &Value) -> Option<String> {
+    let lines = screen
+        .get("lines")?
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    let cursor = screen.get("cursor")?.as_array()?;
+    let at = |i: usize| {
+        cursor
+            .get(i)?
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+    };
+    screen::omp_input_text(&lines, (at(0)?, at(1)?))
+}
+
+/// `Err(Refused)` naming every reason that applies to `facts`, if any does.
+fn refuse_on(facts: &Facts) -> Result<(), Fail> {
+    let reasons = refusal_reasons(&facts.preflight);
+    if reasons.is_empty() {
+        return Ok(());
     }
+    Err(Fail::Refused {
+        reasons,
+        facts: Some(render_facts(facts)),
+    })
 }
 
 /// The compaction record written after `since_ms`, polled until it appears or
 /// `timeout` seconds pass.
-fn wait_for_compaction(
-    path: &Path,
-    since_ms: i64,
-    timeout: Duration,
-) -> Option<CompactionRecord> {
+fn wait_for_compaction(path: &Path, since_ms: i64, timeout: Duration) -> Option<CompactionRecord> {
     let started = Instant::now();
     loop {
         if let Some(record) = context::find_compaction_after(path, since_ms) {
@@ -412,24 +530,19 @@ fn wait_for_compaction(
 /// Run the whole command, returning its outcome instead of printing it.
 pub fn execute(db: &HcomDb, args: &CompactArgs) -> Result<Outcome, Fail> {
     let name = &args.name;
-    let row = db
-        .get_instance_full(name)
-        .map_err(|e| Fail::Error(e.to_string()))?
-        .ok_or_else(|| Fail::Error(format!("no such seat: {name}")))?;
+    let row = read_row(db, name)?;
 
     // Remote first, before any scanning: relay-mirrored seats have no local
     // PTY to inject into and no local session file to read.
     if is_remote_instance(&row) || name.contains(':') {
         return Err(Fail::Refused {
             reasons: vec![Reason::Remote],
+            facts: None,
         });
     }
 
-    let facts = gather(db, &row, name);
-    let reasons = refusal_reasons(&facts.preflight);
-    if !reasons.is_empty() {
-        return Err(Fail::Refused { reasons });
-    }
+    let (row, facts) = gather(db, name)?;
+    refuse_on(&facts)?;
 
     let focus = build_focus(
         row.purpose.as_deref(),
@@ -444,23 +557,12 @@ pub fn execute(db: &HcomDb, args: &CompactArgs) -> Result<Outcome, Fail> {
         });
     }
 
-    // Re-read the facts immediately before injecting: a turn that started
-    // since the preflight must be caught here.
-    let recheck = gather(db, &row, name);
-    let reasons = refusal_reasons(&recheck.preflight);
-    if !reasons.is_empty() {
-        return Err(Fail::Refused { reasons });
-    }
-
-    let port = recheck
-        .preflight
-        .inject_port
-        .expect("NoDeliveryPath already refused above");
-    if prompt_is_busy(port) {
-        return Err(Fail::Refused {
-            reasons: vec![Reason::PromptNotEmpty],
-        });
-    }
+    // Final re-check, immediately before injecting: the row is re-read from
+    // the DB and the screen re-queried. A turn that started during the first
+    // check (the plugin writes `active` to the row) or text typed since then
+    // refuses here; only the gap between this read and the keystrokes is left.
+    let (row, facts) = gather(db, name)?;
+    refuse_on(&facts)?;
 
     let command = if focus.is_empty() {
         "/compact".to_string()
@@ -504,8 +606,8 @@ pub fn cmd_compact(db: &HcomDb, args: &CompactArgs, _ctx: Option<&CommandContext
             );
             0
         }
-        Err(Fail::Refused { reasons }) => {
-            println!("{}", render_refusal(&args.name, &reasons));
+        Err(Fail::Refused { reasons, facts }) => {
+            println!("{}", render_refusal(&args.name, &reasons, facts.as_deref()));
             1
         }
         Err(Fail::Timeout) => {
@@ -525,9 +627,10 @@ pub fn cmd_compact(db: &HcomDb, args: &CompactArgs, _ctx: Option<&CommandContext
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// One completed background job: start record + async-result that ends it.
     /// Scans as Known { open_jobs: 0, open_tools: 0 }.
@@ -545,6 +648,11 @@ mod tests {
     const COMPACTION: &str = r#"{"type":"compaction","id":"ab99","timestamp":"2099-01-01T00:00:00.000Z","summary":"synthetic","shortSummary":"synthetic short","tokensBefore":90363,"tokensAfter":17405,"method":"local"}
 "#;
 
+    /// Real omp 18.3.1 screen-query answers from an old wrapper
+    /// (`input_text: null`): an empty editor, and one holding typed text.
+    const EMPTY_SCREEN: &str = include_str!("../pty/omp_screens/empty.json");
+    const TEXT_SCREEN: &str = include_str!("../pty/omp_screens/text.json");
+
     /// A preflight with every reason switched off.
     fn clean() -> Preflight {
         Preflight {
@@ -556,6 +664,7 @@ mod tests {
             },
             pending_messages: 0,
             inject_port: Some(41234),
+            prompt: Prompt::Empty,
         }
     }
 
@@ -653,9 +762,11 @@ mod tests {
         p.scan = JobsScan::Unknown;
         assert_eq!(
             lines(&refusal_reasons(&p)),
-            ["unknown: no job data (no recognizable job or tool records in session file; \
+            [
+                "unknown: no job data (no recognizable job or tool records in session file; \
               no live plugin answer)"
-                .to_string()]
+                    .to_string()
+            ]
         );
     }
 
@@ -677,6 +788,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reason_prompt_not_empty_alone() {
+        let mut p = clean();
+        p.prompt = Prompt::HasText;
+        assert_eq!(
+            lines(&refusal_reasons(&p)),
+            ["prompt not empty (text in the seat's input box)".to_string()]
+        );
+    }
+
+    #[test]
+    fn reason_prompt_unobservable_alone() {
+        let mut p = clean();
+        p.prompt = Prompt::Unobservable;
+        assert_eq!(
+            lines(&refusal_reasons(&p)),
+            [
+                "prompt not verifiably empty (no screen answer, or no input box found on it)"
+                    .to_string()
+            ]
+        );
+    }
+
     // --- 2. several reasons, in order ---------------------------------------
 
     #[test]
@@ -693,6 +827,7 @@ mod tests {
         p.live_jobs = Some(1);
         p.pending_messages = 2;
         p.inject_port = None;
+        p.prompt = Prompt::Unobservable;
         assert_eq!(
             lines(&refusal_reasons(&p)),
             [
@@ -702,6 +837,8 @@ mod tests {
                 "1 running job(s) / queued deliveries (live plugin snapshot)".to_string(),
                 "2 pending hcom message(s)".to_string(),
                 "no delivery path (no inject endpoint registered)".to_string(),
+                "prompt not verifiably empty (no screen answer, or no input box found on it)"
+                    .to_string(),
             ]
         );
     }
@@ -724,7 +861,10 @@ mod tests {
         assert!(!focus.contains('\n') && !focus.contains('\r'), "{focus}");
         assert!(focus.contains("purpose: ship the release"), "{focus}");
         assert!(focus.contains("current: fix the flaky test"), "{focus}");
-        assert!(focus.contains("open jobs: bg_3 bash \"run suite\""), "{focus}");
+        assert!(
+            focus.contains("open jobs: bg_3 bash \"run suite\""),
+            "{focus}"
+        );
         assert!(focus.contains("next: then tag and push"), "{focus}");
     }
 
@@ -755,15 +895,19 @@ mod tests {
             )
             .unwrap();
         if let Some(port) = inject {
-            db.conn()
-                .execute(
-                    "INSERT INTO notify_endpoints (instance, kind, port, updated_at)
-                     VALUES ('luna', 'inject', ?1, 0)",
-                    rusqlite::params![port],
-                )
-                .unwrap();
+            add_inject(&db, port);
         }
         Seat { _dir: dir, db }
+    }
+
+    fn add_inject(db: &HcomDb, port: i32) {
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at)
+                 VALUES ('luna', 'inject', ?1, 0)",
+                rusqlite::params![port],
+            )
+            .unwrap();
     }
 
     fn event_count(db: &HcomDb) -> i64 {
@@ -787,44 +931,72 @@ mod tests {
         listener.local_addr().unwrap().port() as i32
     }
 
-    /// A stub inject endpoint: accepts, reads, closes without replying.
-    fn stub_endpoint() -> (i32, Arc<AtomicUsize>) {
+    /// A stub of the seat's PTY wrapper on its inject endpoint. A
+    /// `\x00SCREEN\n` query runs `on_query`, then gets `screen` back; any other
+    /// payload is keystrokes, counted as an injection.
+    fn wrapper_stub_with(
+        screen: &'static str,
+        on_query: impl Fn() + Send + 'static,
+    ) -> (i32, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port() as i32;
-        let count = Arc::new(AtomicUsize::new(0));
-        let seen = Arc::clone(&count);
+        let injections = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&injections);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                seen.fetch_add(1, Ordering::SeqCst);
-                use std::io::Read;
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
+                let mut data = Vec::new();
+                let _ = stream.read_to_end(&mut data);
+                if data == b"\x00SCREEN\n" {
+                    on_query();
+                    let _ = stream.write_all(screen.as_bytes());
+                } else {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
             }
         });
-        (port, count)
+        (port, injections)
+    }
+
+    fn wrapper_stub(screen: &'static str) -> (i32, Arc<AtomicUsize>) {
+        wrapper_stub_with(screen, || {})
     }
 
     // --- 5. dry run changes nothing -------------------------------------------
 
     #[test]
     fn dry_run_reports_and_injects_nothing() {
-        let s = seat("listening", COMPLETED_JOB, Some(dead_port()));
+        let (port, injections) = wrapper_stub(EMPTY_SCREEN);
+        let s = seat("listening", COMPLETED_JOB, Some(port));
         let before = event_count(&s.db);
-        let outcome = execute(&s.db, &CompactArgs {
-            dry_run: true,
-            ..args("luna")
-        })
+        let outcome = execute(
+            &s.db,
+            &CompactArgs {
+                dry_run: true,
+                ..args("luna")
+            },
+        )
         .expect("would-compact");
         match outcome {
             Outcome::WouldCompact { report } => {
-                assert!(report.starts_with("would-compact luna\n  reasons: none\n"), "{report}");
-                assert!(report.contains("jobs: 0 (source: session-file fallback)"), "{report}");
-                assert!(report.contains("delivery path: pty inject (inject endpoint port "), "{report}");
+                assert!(
+                    report.starts_with("would-compact luna\n  reasons: none\n"),
+                    "{report}"
+                );
+                assert!(
+                    report.contains("jobs: 0 (source: session-file fallback)"),
+                    "{report}"
+                );
+                assert!(
+                    report.contains("delivery path: pty inject (inject endpoint port "),
+                    "{report}"
+                );
+                assert!(report.contains("\n  prompt: empty\n"), "{report}");
             }
             other => panic!("expected WouldCompact, got {other:?}"),
         }
         assert_eq!(event_count(&s.db), before, "dry-run wrote events");
+        assert_eq!(injections.load(Ordering::SeqCst), 0, "dry-run injected");
     }
 
     #[test]
@@ -839,10 +1011,17 @@ mod tests {
         )
         .expect_err("refused");
         match fail {
-            Fail::Refused { reasons } => {
-                let text = lines(&reasons);
-                assert!(text.contains(&"not idle/listening (status=active)".to_string()), "{text:?}");
-                assert!(text.contains(&"1 open job(s) (bg_3 bash)".to_string()), "{text:?}");
+            Fail::Refused { reasons, .. } => {
+                assert_eq!(
+                    reasons,
+                    vec![
+                        Reason::NotIdle {
+                            status: "active".to_string()
+                        },
+                        Reason::OpenJobs(vec![job("bg_3", "bash", None)]),
+                        Reason::PromptUnobservable,
+                    ]
+                );
             }
             other => panic!("expected Refused, got {other:?}"),
         }
@@ -850,24 +1029,28 @@ mod tests {
 
     #[test]
     fn an_in_flight_foreground_tool_refuses_with_its_own_line() {
-        let (port, connections) = stub_endpoint();
+        let (port, injections) = wrapper_stub(EMPTY_SCREEN);
         let s = seat("listening", OPEN_TOOL, Some(port));
         let fail = execute(&s.db, &args("luna")).expect_err("refused");
         match fail {
-            Fail::Refused { reasons } => assert_eq!(
-                reasons[0].render(),
-                "1 in-flight foreground tool(s) (toolu_1 bash)"
+            Fail::Refused { reasons, .. } => assert_eq!(
+                lines(&reasons),
+                ["1 in-flight foreground tool(s) (toolu_1 bash)".to_string()]
             ),
             other => panic!("expected Refused, got {other:?}"),
         }
-        assert_eq!(connections.load(Ordering::SeqCst), 0, "refused seat was contacted");
+        assert_eq!(
+            injections.load(Ordering::SeqCst),
+            0,
+            "refused seat was injected"
+        );
     }
 
     // --- 6. real run ---------------------------------------------------------
 
     #[test]
     fn real_run_injects_and_waits_for_the_record() {
-        let (port, connections) = stub_endpoint();
+        let (port, injections) = wrapper_stub(EMPTY_SCREEN);
         let body = format!("{COMPLETED_JOB}{COMPACTION}");
         let s = seat("listening", &body, Some(port));
         let outcome = execute(&s.db, &args("luna")).expect("compacted");
@@ -881,8 +1064,8 @@ mod tests {
             other => panic!("expected Compacted, got {other:?}"),
         }
         assert!(
-            connections.load(Ordering::SeqCst) >= 1,
-            "the inject endpoint was never contacted"
+            injections.load(Ordering::SeqCst) >= 1,
+            "nothing was injected"
         );
     }
 
@@ -890,7 +1073,7 @@ mod tests {
 
     #[test]
     fn no_record_within_the_timeout_times_out() {
-        let (port, _) = stub_endpoint();
+        let (port, _) = wrapper_stub(EMPTY_SCREEN);
         let s = seat("listening", COMPLETED_JOB, Some(port));
         let fail = execute(
             &s.db,
@@ -903,19 +1086,146 @@ mod tests {
         assert_eq!(fail, Fail::Timeout);
     }
 
-    // --- 8. refusal never reaches the PTY -----------------------------------
+    // --- 8. refusal never reaches the keyboard ------------------------------
 
     #[test]
-    fn a_working_seat_is_refused_before_any_connection() {
-        let (port, connections) = stub_endpoint();
+    fn a_working_seat_is_refused_before_any_injection() {
+        let (port, injections) = wrapper_stub(EMPTY_SCREEN);
         let body = format!("{COMPLETED_JOB}{COMPACTION}");
         let s = seat("active", &body, Some(port));
         let fail = execute(&s.db, &args("luna")).expect_err("refused");
         match fail {
-            Fail::Refused { reasons } => assert_eq!(reasons[0].render(), "not idle/listening (status=active)"),
+            Fail::Refused { reasons, .. } => assert_eq!(
+                lines(&reasons),
+                ["not idle/listening (status=active)".to_string()]
+            ),
             other => panic!("expected Refused, got {other:?}"),
         }
-        assert_eq!(connections.load(Ordering::SeqCst), 0, "refused seat was contacted");
+        assert_eq!(
+            injections.load(Ordering::SeqCst),
+            0,
+            "refused seat was injected"
+        );
+    }
+
+    /// A turn that starts while the first check runs — the plugin writes
+    /// `active` to the row — must be caught by the re-check before injecting.
+    #[test]
+    fn a_turn_started_during_the_first_check_refuses_before_injecting() {
+        let s = seat("listening", COMPLETED_JOB, None);
+        let db_path = s._dir.path().join("hcom.db");
+        let started = AtomicBool::new(false);
+        // The first check reads the status, then queries the screen: the
+        // turn starts right then.
+        let (port, injections) = wrapper_stub_with(EMPTY_SCREEN, move || {
+            if !started.swap(true, Ordering::SeqCst) {
+                rusqlite::Connection::open(&db_path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE instances SET status = 'active', status_context = 'tool:bash',
+                                              status_time = ?1 WHERE name = 'luna'",
+                        rusqlite::params![now_epoch_ms()],
+                    )
+                    .unwrap();
+            }
+        });
+        add_inject(&s.db, port);
+        let fail = execute(
+            &s.db,
+            &CompactArgs {
+                timeout: 1,
+                ..args("luna")
+            },
+        )
+        .expect_err("refused");
+        match fail {
+            Fail::Refused { reasons, .. } => assert_eq!(
+                lines(&reasons),
+                ["not idle/listening (status=active)".to_string()]
+            ),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_eq!(
+            injections.load(Ordering::SeqCst),
+            0,
+            "injected into a running turn"
+        );
+    }
+
+    #[test]
+    fn a_prompt_holding_text_refuses_and_is_left_alone() {
+        let (port, injections) = wrapper_stub(TEXT_SCREEN);
+        let s = seat("listening", COMPLETED_JOB, Some(port));
+        for dry_run in [true, false] {
+            let fail = execute(
+                &s.db,
+                &CompactArgs {
+                    dry_run,
+                    ..args("luna")
+                },
+            )
+            .expect_err("refused");
+            match fail {
+                Fail::Refused { reasons, facts } => {
+                    assert_eq!(reasons, vec![Reason::PromptNotEmpty]);
+                    let facts = facts.expect("facts lines");
+                    assert!(facts.ends_with("\n  prompt: has text"), "{facts}");
+                }
+                other => panic!("expected Refused, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            injections.load(Ordering::SeqCst),
+            0,
+            "typed into the user's text"
+        );
+    }
+
+    #[test]
+    fn a_screen_that_answers_nothing_is_not_an_empty_prompt() {
+        let (port, injections) = wrapper_stub("");
+        let s = seat("listening", COMPLETED_JOB, Some(port));
+        let fail = execute(&s.db, &args("luna")).expect_err("refused");
+        match fail {
+            Fail::Refused { reasons, facts } => {
+                assert_eq!(reasons, vec![Reason::PromptUnobservable]);
+                let facts = facts.expect("facts lines");
+                assert!(facts.ends_with("\n  prompt: unobservable"), "{facts}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_eq!(injections.load(Ordering::SeqCst), 0, "injected blind");
+    }
+
+    #[test]
+    fn read_prompt_never_takes_an_unread_box_as_empty() {
+        let screen = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        assert_eq!(read_prompt("omp", None), Prompt::Unobservable);
+        assert_eq!(
+            read_prompt("omp", Some(&screen(EMPTY_SCREEN))),
+            Prompt::Empty
+        );
+        assert_eq!(
+            read_prompt("omp", Some(&screen(TEXT_SCREEN))),
+            Prompt::HasText
+        );
+        assert_eq!(
+            read_prompt("omp", Some(&screen(r#"{"input_text": null}"#))),
+            Prompt::Unobservable
+        );
+        // Other tools carry the wrapper's own parse of the box.
+        assert_eq!(
+            read_prompt("claude", Some(&screen(r#"{"input_text": ""}"#))),
+            Prompt::Empty
+        );
+        assert_eq!(
+            read_prompt("claude", Some(&screen(r#"{"input_text": "hi"}"#))),
+            Prompt::HasText
+        );
+        assert_eq!(
+            read_prompt("claude", Some(&screen(r#"{"input_text": null}"#))),
+            Prompt::Unobservable
+        );
     }
 
     #[test]
@@ -928,16 +1238,24 @@ mod tests {
     #[test]
     fn a_remote_seat_is_refused_outright() {
         let s = seat("listening", COMPLETED_JOB, Some(dead_port()));
-        s.db.conn().execute(
-            "INSERT INTO instances (name, tool, status, status_context, status_time,
-                                    created_at, origin_device_id)
-             VALUES ('luna:BOXE', 'omp', 'listening', 'ready', ?1, 0, 'laptop')",
-            rusqlite::params![now_epoch_ms()],
-        ).unwrap();
+        s.db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time,
+                                        created_at, origin_device_id)
+                 VALUES ('luna:BOXE', 'omp', 'listening', 'ready', ?1, 0, 'laptop')",
+                rusqlite::params![now_epoch_ms()],
+            )
+            .unwrap();
         let fail = execute(&s.db, &args("luna:BOXE")).expect_err("remote");
-        assert_eq!(fail, Fail::Refused { reasons: vec![Reason::Remote] });
         assert_eq!(
-            render_refusal("luna:BOXE", &[Reason::Remote]),
+            fail,
+            Fail::Refused {
+                reasons: vec![Reason::Remote],
+                facts: None
+            }
+        );
+        assert_eq!(
+            render_refusal("luna:BOXE", &[Reason::Remote], None),
             "refuse: compact luna:BOXE\n  - remote seat (relay compaction unsupported)"
         );
     }
@@ -994,10 +1312,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn render_would_compact_report_is_the_documented_shape() {
-        let facts = Facts {
-            preflight: clean(),
+    fn live_facts(prompt: Prompt) -> Facts {
+        Facts {
+            preflight: Preflight { prompt, ..clean() },
             ctx: SeatContext {
                 source: ContextSource::Live,
                 tokens: Some(182_340),
@@ -1007,14 +1324,33 @@ mod tests {
                 jobs_scan: JobsScan::Unknown,
                 idle_seconds: None,
             },
-        };
+        }
+    }
+
+    #[test]
+    fn render_would_compact_report_is_the_documented_shape() {
         assert_eq!(
-            render_would_compact("luna", &facts, "purpose: ship it"),
+            render_would_compact("luna", &live_facts(Prompt::Empty), "purpose: ship it"),
             "would-compact luna\n  reasons: none\n  \
              tokens: 182340 / 258400 (70.6%)\n  \
              jobs: 0 (source: live plugin)\n  \
              delivery path: pty inject (inject endpoint port 41234)\n  \
+             prompt: empty\n  \
              focus: purpose: ship it"
+        );
+    }
+
+    #[test]
+    fn render_refusal_names_the_reasons_then_the_facts() {
+        let facts = render_facts(&live_facts(Prompt::HasText));
+        assert_eq!(
+            render_refusal("luna", &[Reason::PromptNotEmpty], Some(&facts)),
+            "refuse: compact luna\n  \
+             - prompt not empty (text in the seat's input box)\n  \
+             tokens: 182340 / 258400 (70.6%)\n  \
+             jobs: 0 (source: live plugin)\n  \
+             delivery path: pty inject (inject endpoint port 41234)\n  \
+             prompt: has text"
         );
     }
 }

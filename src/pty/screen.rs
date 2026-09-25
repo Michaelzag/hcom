@@ -145,6 +145,60 @@ fn is_block_border(line: &str) -> bool {
     trimmed.chars().count() >= 20 && trimmed.chars().all(|c| c == '▀' || c == '▄')
 }
 
+/// Text in omp's editor, parsed from a screen query's `lines` and `cursor`
+/// (`[row, col]`). `None` means the editor frame could not be located; a
+/// caller must then treat the prompt as not verifiably empty.
+///
+/// omp 18.3's editor is the bottom-most frame of this shape (captured from a
+/// real seat; `src/pty/omp_screens/` holds the captures):
+///
+/// ```text
+/// ╭── π > ◕ Opus 5.5 … ──╮    top border, carrying the status bar
+/// │  first wrapped row   │    zero or more, when the text wraps
+/// ╰─ last row           ─╯    the last text row doubles as the bottom border
+/// ```
+///
+/// An empty editor is a lone `╰─` + blanks + `─╯` row under the top border.
+/// Other rows can sit below the frame (the slash-command menu does), so the
+/// frame is found bottom-up by its last row, and the cursor must be on one of
+/// its text rows: that is what marks it as the focused editor rather than
+/// some other box. Wrapped rows are joined with a space.
+///
+/// Pure over the query's fields so `hcom compact` can run it client-side
+/// against a seat whose PTY wrapper is an older hcom binary. The omp arm of
+/// [`ScreenTracker::get_input_box_text`] stays `None`: the plugin owns omp
+/// delivery after bootstrap.
+pub fn omp_input_text<S: AsRef<str>>(lines: &[S], cursor: (usize, usize)) -> Option<String> {
+    let row = |i: usize| lines[i].as_ref().trim_end();
+    let (bottom, last) = (0..lines.len()).rev().find_map(|i| {
+        let text = row(i).strip_prefix("╰─ ")?.strip_suffix(" ─╯")?;
+        Some((i, text))
+    })?;
+
+    let mut texts = vec![last];
+    let mut top = bottom;
+    loop {
+        top = top.checked_sub(1)?;
+        let line = row(top);
+        if line.starts_with('╭') && line.ends_with('╮') {
+            break;
+        }
+        texts.push(line.strip_prefix('│')?.strip_suffix('│')?);
+    }
+
+    let (cursor_row, _) = cursor;
+    if cursor_row <= top || cursor_row > bottom {
+        return None;
+    }
+    let rows: Vec<&str> = texts
+        .iter()
+        .rev()
+        .map(|t| trim_with_nbsp(t))
+        .filter(|t| !t.is_empty())
+        .collect();
+    Some(rows.join(" "))
+}
+
 /// Screen tracker with vt100 emulation
 pub struct ScreenTracker {
     parser: vt100::Parser,
@@ -2042,5 +2096,105 @@ mod tests {
     fn output_stable_zero_always_true() {
         let t = make_tracker(24, 80, "");
         assert!(t.is_output_stable(0));
+    }
+
+    // ---- omp editor (real omp 18.3.1 screen-query captures) ----
+    //
+    // Each fixture is `hcom term <seat> --json` from a live omp 18.3.1 seat,
+    // rows copied verbatim. The rows above the editor (welcome box, startup
+    // notices) are cut, the cursor row rebased to match; `welcome_box_only`
+    // keeps just that box and the cursor as captured.
+
+    fn omp_capture(json: &str) -> (Vec<String>, (usize, usize)) {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let lines = v["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect();
+        let at = |i: usize| v["cursor"][i].as_u64().unwrap() as usize;
+        (lines, (at(0), at(1)))
+    }
+
+    fn omp_text(json: &str) -> Option<String> {
+        let (lines, cursor) = omp_capture(json);
+        omp_input_text(&lines, cursor)
+    }
+
+    #[test]
+    fn omp_empty_editor_reads_as_empty() {
+        assert_eq!(
+            omp_text(include_str!("omp_screens/empty.json")),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn omp_typed_text_is_read_back() {
+        assert_eq!(
+            omp_text(include_str!("omp_screens/text.json")).as_deref(),
+            Some("hello from the r2 capture")
+        );
+    }
+
+    #[test]
+    fn omp_wrapped_text_joins_every_row() {
+        assert_eq!(
+            omp_text(include_str!("omp_screens/wrapped.json")).as_deref(),
+            Some(
+                "hello from the r2 capture and then a much longer tail that keeps going past \
+                 the editor width so omp has to wrap it onto a second row; alpha bravo charlie \
+                 delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa \
+                 quebec romeo sierra tango uniform victor whiskey xray yankee zulu end"
+            )
+        );
+        assert_eq!(
+            omp_text(include_str!("omp_screens/narrow_wrapped.json")).as_deref(),
+            Some(
+                "narrow pane check: this sentence is long enough to wrap across three editor \
+                 rows when the terminal is only one hundred columns wide, so the parser must \
+                 join every row of the frame plus one more clause that pushes the draft onto \
+                 a third visual row of the editor"
+            )
+        );
+    }
+
+    #[test]
+    fn omp_menu_below_the_editor_is_not_the_editor() {
+        assert_eq!(
+            omp_text(include_str!("omp_screens/slash_menu.json")).as_deref(),
+            Some("/comp")
+        );
+    }
+
+    #[test]
+    fn omp_screen_without_the_editor_frame_is_unobservable() {
+        assert_eq!(
+            omp_text(include_str!("omp_screens/welcome_box_only.json")),
+            None
+        );
+        assert_eq!(
+            omp_input_text(&["$ ls", "Cargo.toml  src", "$"], (2, 2)),
+            None
+        );
+        assert_eq!(omp_input_text::<&str>(&[], (0, 0)), None);
+    }
+
+    #[test]
+    fn omp_frame_missing_its_top_border_is_unobservable() {
+        let (mut lines, cursor) = omp_capture(include_str!("omp_screens/wrapped.json"));
+        assert!(lines[1].starts_with('╭'), "fixture row 1 is the top border");
+        lines[1] = "streamed output".to_string();
+        assert_eq!(omp_input_text(&lines, cursor), None);
+    }
+
+    #[test]
+    fn omp_cursor_off_the_editor_text_rows_is_unobservable() {
+        // empty.json: row 1 is the top border, row 2 the editor's only row.
+        let (lines, (row, col)) = omp_capture(include_str!("omp_screens/empty.json"));
+        assert_eq!(row, 2);
+        assert_eq!(omp_input_text(&lines, (1, col)), None);
+        assert_eq!(omp_input_text(&lines, (3, col)), None);
     }
 }
