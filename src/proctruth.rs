@@ -3207,7 +3207,7 @@ mod tests {
     fn spawn_refused_over_orphan_naming_pid() {
         let db = test_db();
         let name = unique_name("orphan");
-        let mut sleeper = spawn_named_sleeper(&name, "proc-old");
+        let mut sleeper = spawn_named_sleeper(&name, &format!("proc-old-{}", rand_suffix()));
         let pid = sleeper.id();
         wait_for_enumerated(&name, &[], pid);
         let start = processes_for_instance(&name, &[], &[])
@@ -3234,7 +3234,7 @@ mod tests {
         // Old process_id, but started AFTER the newest binding: a current
         // subtree child (subagents inherit the parent process id), not an
         // orphan.
-        let mut sleeper = spawn_named_sleeper(&name, "proc-old");
+        let mut sleeper = spawn_named_sleeper(&name, &format!("proc-old-{}", rand_suffix()));
         let pid = sleeper.id();
         wait_for_enumerated(&name, &[], pid);
         db.set_process_binding("proc-new", "sess", &name).unwrap();
@@ -3407,10 +3407,12 @@ mod tests {
         let db = test_db();
         let name = unique_name("rebind");
         insert_row(&db, &name, "active", Some(dead_pid()));
-        db.set_process_binding("proc-old", "sess-old", &name)
-            .unwrap();
+        // Ids derive from the unique row name so no sibling test's live
+        // carrier can share them (the hook is a plain fn and cannot capture).
+        let old_id = format!("proc-old-{name}");
+        db.set_process_binding(&old_id, "sess-old", &name).unwrap();
         fn rebind(db: &HcomDb, name: &str) {
-            db.set_process_binding("proc-new", "sess-new", name)
+            db.set_process_binding(&format!("proc-new-{name}"), "sess-new", name)
                 .unwrap();
         }
         SWEEP_RELEASE_GAP_HOOK.with(|hook| hook.set(Some(rebind)));
@@ -3424,10 +3426,7 @@ mod tests {
         );
         let mut bindings = db.process_binding_ids(&name).unwrap();
         bindings.sort();
-        assert_eq!(
-            bindings,
-            vec!["proc-new".to_string(), "proc-old".to_string()]
-        );
+        assert_eq!(bindings, vec![format!("proc-new-{name}"), old_id]);
         let stopped: i64 = db
             .conn()
             .query_row(
@@ -3658,7 +3657,7 @@ mod tests {
         let name = unique_name("subholder");
         insert_row(&db, &name, "active", Some(dead_pid()));
         db.set_process_binding("proc-new", "sess", &name).unwrap();
-        let mut sleeper = spawn_named_sleeper(&name, "proc-old");
+        let mut sleeper = spawn_named_sleeper(&name, &format!("proc-old-{}", rand_suffix()));
         wait_for_enumerated(&name, &[], sleeper.id());
         let swept = sweep_vanished_instances(&db);
         assert!(
