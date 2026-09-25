@@ -9,6 +9,7 @@ use std::io::IsTerminal;
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::context::{self, SeatContext};
 use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
 use crate::identity::{get_full_name, resolve_display_name};
@@ -53,6 +54,10 @@ pub struct ListArgs {
     /// Limit results (with --stopped)
     #[arg(long)]
     pub last: Option<usize>,
+    /// Per-seat context size, in-flight jobs and idle time (opt-in; nothing is
+    /// collected or stored without it)
+    #[arg(long)]
+    pub context: bool,
 }
 
 /// Get unread message count for a single instance.
@@ -80,6 +85,27 @@ fn get_unread_counts_batch(db: &HcomDb, instances: &[InstanceRow]) -> HashMap<St
         }
     }
     counts
+}
+
+/// Everything `hcom list --context` needs about one seat: the plugin port for a
+/// live query, the transcript path for the fallback, and hcom's own idle
+/// tracking. Read-only — the flag stores nothing.
+fn seat_context_request(db: &HcomDb, data: &InstanceRow, now: i64) -> context::SeatContextRequest {
+    let cs = get_instance_status(data, db);
+    context::SeatContextRequest {
+        plugin_port: context::plugin_port(db, &data.name),
+        transcript_path: data.transcript_path.clone(),
+        tool: data.tool.clone(),
+        // Relay-mirrored rows only: a `name:DEVICE`-shaped name on a local row
+        // is still a local seat and is probed like any other.
+        remote: is_remote_instance(data),
+        idle_seconds: context::idle_seconds_for(
+            &cs.status,
+            data.status_time,
+            data.idle_since.as_deref(),
+            now,
+        ),
+    }
 }
 
 /// Main entry point for `hcom list` command.
@@ -176,6 +202,17 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     payload["session_id"] = serde_json::json!(sid);
                 }
 
+                // Probe once: the JSON payload and the printed columns share it.
+                let seat = if args.context {
+                    let now = crate::shared::time::now_epoch_i64();
+                    Some(context::probe(seat_context_request(db, &data, now)))
+                } else {
+                    None
+                };
+                if let Some(seat) = &seat {
+                    payload["context"] = context::to_json(seat);
+                }
+
                 if let Some(field) = field_name {
                     println!("{}", extract_field_value(&payload, field));
                 } else if sh_output {
@@ -184,6 +221,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     println!("{}", serde_json::to_string(&payload).unwrap_or_default());
                 } else {
                     print_instance_details(db, &data, &lookup_name);
+                    if let Some(seat) = &seat {
+                        println!("  {}", context::format_columns(seat));
+                    }
                 }
                 return 0;
             }
@@ -230,6 +270,25 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         return 0;
     }
 
+    // `--context`: one short-lived query per seat, concurrently. Nothing above
+    // this point pays for it, and nothing here is stored.
+    let seat_contexts: Option<HashMap<String, SeatContext>> = if args.context {
+        let now = crate::shared::time::now_epoch_i64();
+        let requests: Vec<_> = sorted_instances
+            .iter()
+            .map(|row| seat_context_request(db, row, now))
+            .collect();
+        Some(
+            sorted_instances
+                .iter()
+                .map(|row| row.name.clone())
+                .zip(context::probe_seats(requests))
+                .collect(),
+        )
+    } else {
+        None
+    };
+
     if json_output || format_template.is_some() {
         let mut result_list: Vec<serde_json::Value> = Vec::new();
 
@@ -250,7 +309,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(serde_json::json!({}));
 
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "name": full_name,
                 "status": status,
                 "status_context": data.status_context,
@@ -275,6 +334,11 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "process_bound": process_bound,
                 "launch_context": launch_context,
             });
+            if let Some(contexts) = &seat_contexts
+                && let Some(seat) = contexts.get(&data.name)
+            {
+                payload["context"] = context::to_json(seat);
+            }
             result_list.push(payload);
         }
 
@@ -473,6 +537,12 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         let title_suffix = list_title_suffix(data, &line_head);
 
         println!("{line_head}{title_suffix}");
+
+        if let Some(contexts) = &seat_contexts
+            && let Some(seat) = contexts.get(&data.name)
+        {
+            println!("    {}", context::format_columns(seat));
+        }
 
         if verbose_output {
             let session_id = data.session_id.as_deref().unwrap_or("(none)");
@@ -1114,5 +1184,102 @@ mod tests {
         let suffix = list_title_suffix(&row, "◉ luna");
         assert!(suffix.contains("zagdb: rc.48 roll"), "got: {suffix}");
         assert!(suffix.contains("probing WAL"), "got: {suffix}");
+    }
+
+    const CLAUDE_USAGE_LINE: &str = "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"usage\":{\"input_tokens\":5,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":900,\"output_tokens\":20}}}\n";
+
+    /// Remote-ness is the instance row's origin (`is_remote_instance`), never
+    /// the name's shape: a local seat named `x:DEVICE` is probed like any other.
+    #[test]
+    fn seat_context_request_remote_from_origin_not_name_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let transcript = dir.path().join("s.jsonl");
+        std::fs::write(&transcript, CLAUDE_USAGE_LINE).unwrap();
+        let transcript = transcript.to_string_lossy().into_owned();
+
+        let mut local = row_with_title(None, None);
+        local.name = "luna:ABCD".to_string();
+        local.transcript_path = transcript.clone();
+        let req = seat_context_request(&db, &local, 0);
+        assert!(!req.remote, "a colon in the name is not a relay mirror");
+        let probed = context::probe(req);
+        assert_eq!(probed.source, context::ContextSource::Transcript);
+        assert_eq!(probed.tokens, Some(1005), "the local seat is read normally");
+
+        let mut mirrored = row_with_title(None, None);
+        mirrored.name = "peso:WXYZ".to_string();
+        mirrored.origin_device_id = Some("device-abc".to_string());
+        mirrored.transcript_path = transcript;
+        let req = seat_context_request(&db, &mirrored, 0);
+        assert!(req.remote, "a relay-mirrored row reports no local truth");
+        let probed = context::probe(req);
+        assert_eq!(probed.source, context::ContextSource::None);
+        assert_eq!(probed.tokens, None);
+    }
+
+    /// The single-seat view shares one probe between the JSON payload and the
+    /// printed columns, so the plugin is queried exactly once.
+    #[test]
+    fn single_seat_context_probes_the_plugin_once() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 64];
+                        let _ = stream.read(&mut buf);
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all(
+                            b"{\"tokens\":1234,\"contextWindow\":100000,\"percent\":1.2,\"jobs\":0}\n",
+                        );
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            }
+        });
+
+        let now = crate::shared::time::now_epoch_i64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                     (name, tool, status, status_time, last_stop, created_at, directory, session_id)
+                 VALUES ('luna', 'omp', 'listening', ?1, ?1, ?2, '/home/test', 'sid-luna')",
+                rusqlite::params![now, now as f64],
+            )
+            .unwrap();
+        db.upsert_notify_endpoint("luna", "plugin", port).unwrap();
+
+        let args = ListArgs {
+            name: Some("luna".to_string()),
+            field: None,
+            stopped: false,
+            json: false,
+            verbose: false,
+            names: false,
+            sh: false,
+            format: None,
+            all: false,
+            last: None,
+            context: true,
+        };
+        assert_eq!(cmd_list(&db, &args, None), 0);
+        server.join().unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a single-seat --context must query the plugin exactly once"
+        );
     }
 }

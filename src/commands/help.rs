@@ -162,6 +162,10 @@ const LIST_HELP: &[HelpEntry] = &[
         "  hooks_bound, process_bound, transcript_path, background_log_file,",
     ),
     ("", "  launch_context, purpose, current"),
+    (
+        "  --context",
+        "Per-seat context: tokens/window/%, jobs, idle, source",
+    ),
     ("", ""),
     ("list [self|<name>]", "Single agent details"),
     (

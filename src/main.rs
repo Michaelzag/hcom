@@ -10,6 +10,7 @@ mod claude_actor;
 mod cli_context;
 pub mod commands;
 mod config;
+mod context;
 pub mod core;
 mod db;
 mod delivery;
