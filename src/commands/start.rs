@@ -513,7 +513,7 @@ fn start_rebind(
     let planned_target = target_data.as_ref().map(|row| row.created_at.to_bits());
     let tool = ctx.tool.as_str();
     let cwd_override = ctx.cwd.to_string_lossy().to_string();
-    let binding_sid = session_id.as_deref().unwrap_or("");
+    let stopped_sid = load_stopped_snapshot_session_id(db, &target_name);
 
     // Test seam: a competing reclaim of the same name commits here, after
     // this rebind planned and before it writes.
@@ -531,7 +531,27 @@ fn start_rebind(
     // nothing written — the caller keeps its row, cursor and bindings, and
     // no anchor pid or binding lands on a row this call did not create.
     let committed = db.with_immediate_transaction(|_tx| {
+        // A process bound to a live seat other than the one this call renames
+        // away belongs to that seat. Taking it here would move a running
+        // identity's process binding onto the reclaimed name, so the whole
+        // transaction rolls back with the caller's own identity untouched.
+        if let Some(pid) = &ctx.process_id
+            && let Some(owner) = db.live_process_binding_owner(pid)?
+            && owner != target_name
+            && owner != current_name
+        {
+            bail!(
+                "refusing to bind this process ({pid}) to '{target_name}': it is bound to live instance '{owner}'. \
+                 Run 'hcom start --as <name>' from a shell outside that seat."
+            );
+        }
         let occupant = db.get_instance_full(&target_name)?;
+        // The row about to be replaced is the newest statement of which
+        // session this identity holds; its stopped snapshots are older history.
+        let occupant_sid = occupant
+            .as_ref()
+            .and_then(|row| row.session_id.clone())
+            .filter(|sid| !sid.is_empty());
         if !kept_remote_row
             && let Some(occupant) = occupant
             && Some(occupant.created_at.to_bits()) != planned_target
@@ -561,6 +581,22 @@ fn start_rebind(
         if !current_name.is_empty() && current_name != target_name {
             db.delete_instance(&current_name)?;
         }
+
+        // A reclaim resolved no session of its own: the caller has no process
+        // binding, no row, and no Claude env id. Without the target's own
+        // session the recreated row is born unbound, so the reclaimed
+        // identity's hook traffic has no session to resolve against. Adopt
+        // the session the target holds right now, else the one its newest
+        // stop recorded — unless another live identity still holds it.
+        if session_id.is_none() {
+            let candidate = occupant_sid.as_deref().or(stopped_sid.as_deref());
+            if let Some(sid) = candidate
+                && session_id_adoptable(db, sid, &target_name)?
+            {
+                session_id = Some(sid.to_string());
+            }
+        }
+        let binding_sid = session_id.clone().unwrap_or_default();
 
         if !instance_binding::initialize_instance_in_position_file(
             db,
@@ -615,12 +651,12 @@ fn start_rebind(
             }
         }
         let created_refused_binding = if let Some(process_id) = &ctx.process_id {
-            db.set_process_binding(process_id, binding_sid, &target_name)?;
+            db.set_process_binding(process_id, &binding_sid, &target_name)?;
             false
         } else if restored_pid.is_some()
             && let Some(process_id) = claimable_refused_id
         {
-            claim_unbound_process_id(db, process_id, binding_sid, &target_name)?
+            claim_unbound_process_id(db, process_id, &binding_sid, &target_name)?
         } else {
             false
         };
@@ -955,6 +991,47 @@ fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMe
     bail!("No rebind metadata found for '{}'", name)
 }
 
+/// The session id the identity named `name` carried in its newest
+/// `life.stopped` snapshot, if any.
+///
+/// `hcom start --as <name>` from a shell with no session id of its own has
+/// nothing to bind the recreated row to, so the reclaimed identity comes back
+/// without the session its hook traffic is keyed by. The stopped snapshot is
+/// the only durable record of that id once the row is gone.
+fn load_stopped_snapshot_session_id(db: &HcomDb, name: &str) -> Option<String> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT json_extract(data, '$.snapshot.session_id') FROM events
+             WHERE type='life' AND instance=? AND json_extract(data, '$.action')='stopped'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .ok()?;
+    let sid: String = stmt
+        .query_row(rusqlite::params![name], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten()?;
+    (!sid.is_empty()).then_some(sid)
+}
+
+/// Whether `sid` may be adopted by `target_name`: it is unbound, already held
+/// by the target itself, or bound by a session that no other live row carries.
+/// A session another live identity is using must never be handed to a second
+/// row, however the reclaim resolved its own session.
+fn session_id_adoptable(db: &HcomDb, sid: &str, target_name: &str) -> Result<bool> {
+    if let Some(holder) = db.get_session_binding(sid)?
+        && holder != target_name
+    {
+        return Ok(false);
+    }
+    let mut stmt = db.conn().prepare(
+        "SELECT 1 FROM instances WHERE session_id = ? AND name != ? AND status != 'stopped' LIMIT 1",
+    )?;
+    Ok(!stmt.exists(rusqlite::params![sid, target_name])?)
+}
+
 /// Resolve the Claude session id visible to a CLI invocation.
 ///
 /// Two sources, in order:
@@ -1010,6 +1087,22 @@ fn start_bare(
     let explicit_name = explicit_name
         .map(|name| identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
     let explicit_name = explicit_name.as_deref();
+
+    // A process already bound to a live seat is that seat. Binding it to a
+    // second identity here would silently steal it — the valo incident, where
+    // the live seat lost its process binding and a second row was minted for
+    // the same process. Refuse before any write: no name is generated, no
+    // placeholder or row is created, and the operator is told which seat holds
+    // the process.
+    if let Some(pid) = &ctx.process_id
+        && let Some(owner) = db.live_process_binding_owner(pid)?
+        && explicit_name != Some(owner.as_str())
+    {
+        bail!(
+            "refusing to bind this process ({pid}) to a new identity: it is bound to live instance '{owner}'. \
+             Use 'hcom start --as <name>' to rename '{owner}', or run 'hcom start' from a shell outside that seat."
+        );
+    }
 
     // Skip vanilla detection if --name is provided with an existing instance
     let has_valid_identity = explicit_name
@@ -2600,5 +2693,228 @@ mod tests {
         assert_eq!(snapshot["pid"], pid);
         assert_eq!(snapshot["pid_start_time"], start_time);
         assert_eq!(snapshot["boot_id"], boot_id.as_str());
+    }
+
+    /// The valo incident, bare form: a shell inside the live seat `valo` runs
+    /// `hcom start`. Its process is already bound to `valo`, so the bind at the
+    /// end of `start_bare` would move that binding to a brand-new identity and
+    /// leave `valo` a running row with no process. Refuse before any write:
+    /// no name is drawn, no row appears, and the binding stays where it was.
+    #[test]
+    #[serial]
+    fn test_start_bare_refuses_process_bound_to_live_instance() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        bind_caller(&db, "valo", "sess-valo", "omp-4242-aaaa-bbbb", 11);
+
+        let err = start_bare(&db, &hcom_dir, &caller_ctx("omp-4242-aaaa-bbbb"), None)
+            .expect_err("a process bound to a live seat is not a fresh seat");
+
+        assert!(
+            err.to_string().contains("valo") && err.to_string().contains("omp-4242-aaaa-bbbb"),
+            "the refusal names the owning seat and the process: {err}"
+        );
+        assert_eq!(
+            db.get_process_binding("omp-4242-aaaa-bbbb")
+                .unwrap()
+                .as_deref(),
+            Some("valo"),
+            "the live seat keeps its process binding"
+        );
+        let rows: Vec<String> = db
+            .iter_instances_full()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["valo".to_string()],
+            "no second identity is minted for the same process"
+        );
+    }
+
+    /// The same seat asking for a different identity by name: the explicit
+    /// name names a row that does not exist, so the existing
+    /// "already started" path cannot catch it. Still a theft.
+    #[test]
+    #[serial]
+    fn test_start_bare_refuses_explicit_name_from_bound_live_seat() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        bind_caller(&db, "valo", "sess-valo", "omp-4242-aaaa-bbbb", 11);
+
+        let err = start_bare(
+            &db,
+            &hcom_dir,
+            &caller_ctx("omp-4242-aaaa-bbbb"),
+            Some("meme"),
+        )
+        .expect_err("a bound process cannot be given a second identity");
+
+        assert!(
+            err.to_string().contains("valo"),
+            "the refusal names the owning seat: {err}"
+        );
+        assert!(
+            db.get_instance_full("meme").unwrap().is_none(),
+            "the refused start creates no row for the name it asked for"
+        );
+        assert_eq!(
+            db.get_process_binding("omp-4242-aaaa-bbbb")
+                .unwrap()
+                .as_deref(),
+            Some("valo"),
+            "the live seat keeps its process binding"
+        );
+    }
+
+    /// `hcom start --as valo` from a shell whose process belongs to a third
+    /// live seat. The reclaim may not take that process binding: the seat that
+    /// holds it is running, and the whole transaction rolls back with the
+    /// target name still unclaimed.
+    #[test]
+    #[serial]
+    fn test_start_rebind_refuses_process_bound_to_another_live_seat() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        log_stopped_snapshot(&db, "valo", "omp", "/tmp/project", "sess-valo", 3);
+        // A plain seat binds its process with no session id, so nothing in the
+        // reclaim resolves to `meme` as the caller's own identity.
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, directory, status, status_time, last_seen, created_at)
+                 VALUES ('meme', 'omp', '/tmp/project', 'active', 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("omp-7777-cccc-dddd", "", "meme")
+            .unwrap();
+
+        let ctx = make_ctx(
+            &[("OMPCODE", "1"), ("HCOM_PROCESS_ID", "omp-7777-cccc-dddd")],
+            "/tmp/project",
+        );
+        let err = start_rebind(&db, "valo", &ctx, None, None)
+            .expect_err("a process bound to another live seat is not the caller's to rebind");
+
+        assert!(
+            err.to_string().contains("meme"),
+            "the refusal names the seat that holds the process: {err}"
+        );
+        assert_eq!(
+            db.get_process_binding("omp-7777-cccc-dddd")
+                .unwrap()
+                .as_deref(),
+            Some("meme"),
+            "the third seat keeps its process binding"
+        );
+        assert!(
+            db.get_instance_full("valo").unwrap().is_none(),
+            "the refused reclaim creates no target row"
+        );
+        assert!(
+            db.get_instance_full("meme").unwrap().is_some(),
+            "the third seat's row is untouched"
+        );
+    }
+
+    /// F5: reclaiming a stopped identity from a shell with no session id of
+    /// its own must not leave the recreated row session-less. The stopped
+    /// snapshot is the only durable record of the session the reclaimed
+    /// identity's hook traffic is keyed by, so the rebind adopts it.
+    #[test]
+    #[serial]
+    fn test_start_rebind_adopts_stopped_snapshot_session_id() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        log_stopped_snapshot(&db, "valo", "claude", "/tmp/project", "sid-valo", 3);
+        let mut ctx = make_claude_ctx(None, "/tmp/project");
+        ctx.process_id = None;
+
+        assert_eq!(start_rebind(&db, "valo", &ctx, None, None).unwrap(), 0);
+
+        let row = db
+            .get_instance_full("valo")
+            .unwrap()
+            .expect("reclaimed row");
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("sid-valo"),
+            "the recreated row is born with the session its identity held"
+        );
+        assert_eq!(
+            db.get_session_binding("sid-valo").unwrap().as_deref(),
+            Some("valo")
+        );
+    }
+
+    /// A session another live identity is using is never adopted, however the
+    /// reclaim resolved its own session: the recreated row stays unbound and
+    /// the other seat's session binding is untouched.
+    #[test]
+    #[serial]
+    fn test_start_rebind_does_not_adopt_session_held_by_live_row() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        log_stopped_snapshot(&db, "valo", "claude", "/tmp/project", "sid-valo", 3);
+        bind_caller(&db, "meme", "sid-valo", "omp-8888-eeee-ffff", 5);
+        let mut ctx = make_claude_ctx(None, "/tmp/project");
+        ctx.process_id = None;
+
+        assert_eq!(start_rebind(&db, "valo", &ctx, None, None).unwrap(), 0);
+
+        let row = db
+            .get_instance_full("valo")
+            .unwrap()
+            .expect("reclaimed row");
+        assert_eq!(
+            row.session_id, None,
+            "a session another live seat holds is not adopted"
+        );
+        assert_eq!(
+            db.get_session_binding("sid-valo").unwrap().as_deref(),
+            Some("meme"),
+            "the live seat keeps the session binding"
+        );
+        assert_eq!(
+            db.get_instance_full("meme")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("sid-valo")
+        );
+    }
+
+    /// The row being replaced is newer than its own stopped snapshot: a
+    /// reclaim that adopted the snapshot's id would hand the recreated row a
+    /// session older than the one the identity actually held.
+    #[test]
+    #[serial]
+    fn test_start_rebind_prefers_live_row_session_over_stopped_snapshot() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        log_stopped_snapshot(&db, "valo", "claude", "/tmp/project", "sid-old", 3);
+        bind_caller(&db, "valo", "sid-new", "omp-9999-gggg-hhhh", 5);
+        let mut ctx = make_claude_ctx(None, "/tmp/project");
+        ctx.process_id = None;
+
+        assert_eq!(start_rebind(&db, "valo", &ctx, None, None).unwrap(), 0);
+
+        let row = db
+            .get_instance_full("valo")
+            .unwrap()
+            .expect("reclaimed row");
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("sid-new"),
+            "the live row's session wins over the older stopped snapshot"
+        );
+        assert_eq!(
+            db.get_session_binding("sid-new").unwrap().as_deref(),
+            Some("valo")
+        );
     }
 }
