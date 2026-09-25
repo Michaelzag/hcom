@@ -1679,15 +1679,28 @@ fn stop_instance_inner_scoped(
         None if reap_gate => match db.get_instance_with_bindings(instance_name) {
             Ok((row, ids)) => {
                 let owners = crate::proctruth::omp_owner_bindings(db, instance_name);
-                let capture = row.as_ref().map(|row| {
-                    crate::proctruth::capture_reap_carriers(
-                        instance_name,
-                        Some(row),
-                        &ids,
-                        &owners,
-                        exclude,
-                    )
-                });
+                let capture = match row.as_ref() {
+                    Some(row) => {
+                        match crate::proctruth::capture_reap_carriers(
+                            db,
+                            instance_name,
+                            Some(row),
+                            &ids,
+                            &owners,
+                            exclude,
+                        ) {
+                            Ok(capture) => Some(capture),
+                            // A foreign live owner refuses the whole stop:
+                            // this is ahead of the headless group signal, the
+                            // reap, and the release, so nothing is signalled
+                            // and the row keeps every binding.
+                            Err(e) => {
+                                return StopOutcome::RetryableError(e.to_string().into());
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 (row, capture)
             }
             Err(e) => return read_error(&e),

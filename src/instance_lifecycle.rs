@@ -660,20 +660,29 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
                 if let Some(hook) = PLACEHOLDER_STOP_GAP_HOOK.with(std::cell::Cell::take) {
                     hook(db, &data.name);
                 }
-                let capture = crate::proctruth::capture_reap_carriers(
+                // A refused capture reaches the existing refused-warn channel
+                // below instead of the stop: no signal, and the placeholder
+                // row keeps its bindings for the next cleanup pass.
+                let outcome = match crate::proctruth::capture_reap_carriers(
+                    db,
                     &data.name,
                     Some(data),
                     binding_ids,
                     &owners,
                     &[],
-                );
-                match crate::hooks::common::stop_placeholder_instance(
-                    db,
-                    &data.name,
-                    "system",
-                    "stale_cleanup",
-                    capture,
                 ) {
+                    Ok(capture) => crate::hooks::common::stop_placeholder_instance(
+                        db,
+                        &data.name,
+                        "system",
+                        "stale_cleanup",
+                        capture,
+                    ),
+                    Err(e) => {
+                        crate::hooks::common::StopOutcome::RetryableError(e.to_string().into())
+                    }
+                };
+                match outcome {
                     outcome if outcome.is_re_registered() => {
                         crate::log::log_info(
                             "cleanup",

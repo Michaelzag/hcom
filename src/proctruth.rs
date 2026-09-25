@@ -393,10 +393,7 @@ fn carrier_tree_scope(
         // Only the minted omp-<pid>-... shape identifies an owner. A live
         // process with another comm must not become a root on the strength of
         // a borrowed or stale binding id.
-        if let Some(pid) = shell_pid_from_process_id(id)
-            && id
-                .strip_prefix("omp-")
-                .is_some_and(|rest| rest.contains('-'))
+        if let Some(pid) = minted_root_pid(id)
             && !process_gone(pid)
             && std::fs::read_to_string(format!("/proc/{pid}/comm"))
                 .is_ok_and(|comm| comm.trim_end_matches('\n') == "omp")
@@ -424,27 +421,147 @@ fn carrier_tree_scope(
 /// their capture must not carry a [`CapturedIncarnation`] a stop could
 /// release against. The reap consumes only scope and carriers.
 fn capture_reap_carriers_unbound(
+    db: &HcomDb,
     name: &str,
     row_pid: Option<i64>,
     binding_ids: &[String],
     owners: &[OmpOwnerBinding],
     exclude: &[u32],
-) -> ReapCapture {
+) -> Result<ReapCapture, ReapError> {
     #[cfg(unix)]
     {
         let mut scope = carrier_tree_scope(row_pid, binding_ids, owners);
         let carriers = snapshot_reap_carriers(name, binding_ids, exclude, &mut scope);
-        ReapCapture {
+        // The root set is final and the carriers are captured: the last point
+        // before the caller's first signal, so this is where a foreign live
+        // owner is refused.
+        refuse_foreign_live_owner(db, name, &scope, &carriers)?;
+        Ok(ReapCapture {
             scope,
             carriers,
             incarnation: None,
-        }
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = (name, row_pid, binding_ids, owners, exclude);
-        ReapCapture { incarnation: None }
+        let _ = (db, name, row_pid, binding_ids, owners, exclude);
+        Ok(ReapCapture { incarnation: None })
     }
+}
+
+/// The pid a minted binding id names, parsed exactly as [`carrier_tree_scope`]
+/// parses it to admit a root: the loose `omp-<head>-…` head plus the
+/// mandatory trailing `-`. "A minted pid" therefore means the same thing in
+/// the root admission and in the foreign-owner guard.
+#[cfg(unix)]
+fn minted_root_pid(id: &str) -> Option<u32> {
+    let pid = shell_pid_from_process_id(id)?;
+    id.strip_prefix("omp-")
+        .is_some_and(|rest| rest.contains('-'))
+        .then_some(pid)
+}
+
+/// minted pid → the live rows whose bindings name it. One pid can back
+/// several minted ids (the plugin re-mints inside the same omp process), so
+/// the map keeps every owner, not just the first.
+#[cfg(unix)]
+fn minted_pid_owners(db: &HcomDb) -> Result<HashMap<u32, Vec<String>>, ReapError> {
+    let bindings = db
+        .live_process_bindings()
+        .map_err(|e| ReapError::BindingRegistryUnreadable(e.to_string()))?;
+    let mut owners: HashMap<u32, Vec<String>> = HashMap::new();
+    for (id, owner) in bindings {
+        if let Some(pid) = minted_root_pid(&id) {
+            let entry = owners.entry(pid).or_default();
+            if !entry.contains(&owner) {
+                entry.push(owner);
+            }
+        }
+    }
+    Ok(owners)
+}
+
+/// Who, if anyone, holds `pid` under a live row other than `name`, and by
+/// which proof. Both arms are deliberately id-based: an `HCOM_INSTANCE_NAME`
+/// conflict and a row-pid collision are NOT this guard's business, because
+/// both are sticky across legitimate session switches and would refuse
+/// legitimate stops.
+#[cfg(unix)]
+fn foreign_live_owner(
+    db: &HcomDb,
+    minted: &HashMap<u32, Vec<String>>,
+    name: &str,
+    pid: u32,
+) -> Result<Option<(String, &'static str)>, ReapError> {
+    // One read of the identity this process actually carries, reused by both
+    // of its arms: the exact id, and the minted pid that id names.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let process_id = identity_facts_of(pid, name)
+        .map(|(_, process_id)| process_id)
+        .unwrap_or_default();
+    // No /proc to read: only the candidate-pid arm below can run off-Linux.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let process_id = String::new();
+
+    // The carried id itself, then the minted pid behind it.
+    if !process_id.is_empty() {
+        let owner = db
+            .live_process_binding_owner(&process_id)
+            .map_err(|e| ReapError::BindingRegistryUnreadable(e.to_string()))?;
+        if let Some(owner) = owner
+            && owner != name
+        {
+            return Ok(Some((owner, "binding")));
+        }
+        if let Some(minted_pid) = minted_root_pid(&process_id)
+            && let Some(owners) = minted.get(&minted_pid)
+            && let Some(owner) = owners.iter().find(|owner| owner.as_str() != name)
+        {
+            return Ok(Some((owner.clone(), "minted_pid")));
+        }
+    }
+
+    // The candidate pid itself, whatever it was admitted for.
+    if let Some(owners) = minted.get(&pid)
+        && let Some(owner) = owners.iter().find(|owner| owner.as_str() != name)
+    {
+        return Ok(Some((owner.clone(), "minted_pid")));
+    }
+    Ok(None)
+}
+
+/// No teardown may signal a process another live row holds. Candidates are
+/// every admitted root but this command's own pid (`roots[0]`, which inherits
+/// the caller's identity and is never a target) plus every captured carrier:
+/// a descendant of a foreign-owned root is signalable too, so roots and
+/// carriers together are the whole candidate set. An unreadable registry
+/// fails closed: the teardown returns an error and sends nothing.
+#[cfg(unix)]
+fn refuse_foreign_live_owner(
+    db: &HcomDb,
+    name: &str,
+    scope: &CarrierTreeScope,
+    carriers: &[ProcMatch],
+) -> Result<(), ReapError> {
+    let minted = minted_pid_owners(db)?;
+    let candidates = scope
+        .roots
+        .iter()
+        .skip(1)
+        .copied()
+        .chain(carriers.iter().map(|carrier| carrier.pid));
+    for pid in candidates {
+        let Some((owner, via)) = foreign_live_owner(db, &minted, name, pid)? else {
+            continue;
+        };
+        crate::log::log_info(
+            "proctruth",
+            "reap_refused_foreign_owner",
+            &format!("instance={name} pid={pid} owner={owner} via={via}"),
+        );
+        return Err(ReapError::ForeignLiveOwner { pid, owner });
+    }
+    Ok(())
 }
 
 /// `row` and `binding_ids` must be ONE snapshot of the instance
@@ -452,20 +569,26 @@ fn capture_reap_carriers_unbound(
 /// [`HcomDb::iter_instances_with_bindings`]): they become the captured
 /// incarnation. A row paired with another incarnation's binding epoch lets
 /// a stop bound to it release a row nobody resolved.
+///
+/// The capture is a gate, not only a snapshot: `Err` means the teardown must
+/// send no signal at all, which is why every production caller handles it
+/// before its first group signal, pane close, or reap.
 pub(crate) fn capture_reap_carriers(
+    db: &HcomDb,
     name: &str,
     row: Option<&crate::db::InstanceRow>,
     binding_ids: &[String],
     owners: &[OmpOwnerBinding],
     exclude: &[u32],
-) -> ReapCapture {
+) -> Result<ReapCapture, ReapError> {
     let mut capture = capture_reap_carriers_unbound(
+        db,
         name,
         row.and_then(|row| row.pid),
         binding_ids,
         owners,
         exclude,
-    );
+    )?;
     // The snapshot's row feeds the bound incarnation as well as the roots.
     capture.incarnation = row.map(|row| CapturedIncarnation {
         created_at: row.created_at,
@@ -474,7 +597,7 @@ pub(crate) fn capture_reap_carriers(
         agent_id: row.agent_id.clone(),
         binding_ids: binding_ids.to_vec(),
     });
-    capture
+    Ok(capture)
 }
 
 #[cfg(unix)]
@@ -907,6 +1030,16 @@ pub enum ReapError {
     Survivors(Vec<u32>),
     #[cfg(unix)]
     UnprovenOwnership,
+    /// A candidate pid belongs to another instance whose row is still live.
+    /// The teardown is refused before its first signal: the row and every
+    /// binding stay exactly as they were.
+    #[cfg(unix)]
+    ForeignLiveOwner { pid: u32, owner: String },
+    /// The binding registry could not be read, so no foreign owner can be
+    /// ruled out. Refused like the conflict itself: fail closed, signal
+    /// nothing.
+    #[cfg(unix)]
+    BindingRegistryUnreadable(String),
 }
 
 impl std::fmt::Display for ReapError {
@@ -926,6 +1059,16 @@ impl std::fmt::Display for ReapError {
             Self::UnprovenOwnership => {
                 f.write_str("cannot prove process ownership on this host; row left intact")
             }
+            #[cfg(unix)]
+            Self::ForeignLiveOwner { pid, owner } => write!(
+                f,
+                "refusing to signal pid {pid}: it belongs to live instance '{owner}'; nothing was signalled"
+            ),
+            #[cfg(unix)]
+            Self::BindingRegistryUnreadable(error) => write!(
+                f,
+                "cannot read the process binding registry: {error}; nothing was signalled"
+            ),
         }
     }
 }
@@ -1507,12 +1650,13 @@ pub fn reap_instance_tree_for_excluding(
     let row = db.get_instance_full(name).ok().flatten();
     let owners = omp_owner_bindings(db, name);
     let capture = capture_reap_carriers_unbound(
+        db,
         name,
         row.and_then(|row| row.pid),
         binding_ids,
         &owners,
         exclude,
-    );
+    )?;
     reap_instance_tree_for_excluding_captured(db, name, binding_ids, exclude, capture)
 }
 
@@ -2591,7 +2735,7 @@ mod tests {
         let carrier = spawn_detached_named_sleeper(&name, &process_id);
         wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
         let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
-        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[], &[]);
+        let capture = capture_reap_carriers(&db, &name, row.as_ref(), &bindings, &[], &[]).unwrap();
         let result = reap_instance_tree_for_excluding_captured(&db, &name, &bindings, &[], capture);
         assert!(result.is_err());
         assert!(!process_gone(carrier));
@@ -2643,7 +2787,8 @@ mod tests {
         let mut carrier_a = spawn_named_sleeper(&name, &token_a);
         let (row_a, bindings_a) = db.get_instance_with_bindings(&name).unwrap();
         wait_for_enumerated(&name, &bindings_a, carrier_a.id());
-        let capture = capture_reap_carriers(&name, row_a.as_ref(), &bindings_a, &[], &[]);
+        let capture =
+            capture_reap_carriers(&db, &name, row_a.as_ref(), &bindings_a, &[], &[]).unwrap();
         // The kill's group signal takes A down.
         carrier_a.kill().ok();
         carrier_a.wait().ok();
@@ -2741,7 +2886,8 @@ mod tests {
             .unwrap();
 
         // The pre-signal capture, built from that snapshot alone.
-        let capture = capture_reap_carriers(&name, Some(&row_a), &bindings_a, &[], &[]);
+        let capture =
+            capture_reap_carriers(&db, &name, Some(&row_a), &bindings_a, &[], &[]).unwrap();
         let outcome =
             crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
 
@@ -2767,7 +2913,7 @@ mod tests {
         let name = unique_name("epoch-emptied");
         insert_null_pid_row(&db, &name, &format!("proc-{}", rand_suffix()));
         let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
-        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[], &[]);
+        let capture = capture_reap_carriers(&db, &name, row.as_ref(), &bindings, &[], &[]).unwrap();
         db.conn()
             .execute(
                 "DELETE FROM process_bindings WHERE instance_name = ?1",
@@ -2798,7 +2944,7 @@ mod tests {
             .unwrap();
         let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
         assert_eq!(bindings.len(), 2);
-        let capture = capture_reap_carriers(&name, row.as_ref(), &bindings, &[], &[]);
+        let capture = capture_reap_carriers(&db, &name, row.as_ref(), &bindings, &[], &[]).unwrap();
         db.conn()
             .execute(
                 "DELETE FROM process_bindings WHERE process_id = ?1",
@@ -2847,7 +2993,7 @@ mod tests {
         let name = unique_name("orphan-group");
         let leader = spawn_detached_group_leader(&name);
         wait_for_enumerated(&name, &[], leader);
-        let capture = capture_reap_carriers(&name, None, &[], &[], &[]);
+        let capture = capture_reap_carriers(&db, &name, None, &[], &[], &[]).unwrap();
         // The orphan arm's group signal.
         unsafe { libc::kill(-(leader as libc::pid_t), libc::SIGKILL) };
         for _ in 0..100 {
@@ -3047,7 +3193,7 @@ mod tests {
             if !previously_identified {
                 MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
             }
-            let capture = capture_reap_carriers(&name, None, &[], &[], &[]);
+            let capture = capture_reap_carriers(&db, &name, None, &[], &[], &[]).unwrap();
             MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pid)));
             let result = reap_instance_tree_for_excluding_captured(&db, &name, &[], &[], capture);
             MISSING_CARRIER_IDENTITY.with(|missing| missing.set(None));

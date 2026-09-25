@@ -421,8 +421,23 @@ fn stop_read_instance(
     reason: &str,
 ) -> crate::hooks::common::StopOutcome {
     let owners = crate::proctruth::omp_owner_bindings(db, &inst.name);
-    let capture =
-        crate::proctruth::capture_reap_carriers(&inst.name, Some(inst), binding_ids, &owners, &[]);
+    // The capture is the gate: a refusal returns here, before the headless
+    // group signal, the reap, and the release, leaving the row and its
+    // bindings untouched. The caller's existing error channel prints the
+    // owner named in the message and exits 1.
+    let capture = match crate::proctruth::capture_reap_carriers(
+        db,
+        &inst.name,
+        Some(inst),
+        binding_ids,
+        &owners,
+        &[],
+    ) {
+        Ok(capture) => capture,
+        Err(e) => {
+            return crate::hooks::common::StopOutcome::RetryableError(e.to_string().into());
+        }
+    };
     crate::hooks::common::stop_instance_with_capture(db, &inst.name, initiator, reason, capture)
 }
 
