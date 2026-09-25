@@ -89,6 +89,22 @@ impl HcomDb {
             )
             .is_ok()
     }
+
+    /// Every notify endpoint registered for an instance as `(kind, port)`,
+    /// ordered by kind. Callers that need a single kind keep using
+    /// [`HcomDb::has_notify_endpoint_kind`]; this is the port list for
+    /// liveness probes that must not guess the kind.
+    pub fn notify_endpoint_ports(&self, instance: &str) -> Result<Vec<(String, u16)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT kind, port FROM notify_endpoints WHERE instance = ? ORDER BY kind",
+        )?;
+        let rows = stmt
+            .query_map(params![instance], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u16))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]

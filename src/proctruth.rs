@@ -2082,6 +2082,9 @@ thread_local! {
 ///   (`HCOM_PROCESS_ID`) → HELD.
 /// - an unparseable binding process id contributes no pid evidence and never
 ///   counts toward death → HELD unless other evidence proves death.
+/// - a registered notify endpoint (kind other than `inject`) that still accepts
+///   a TCP connect → HELD: the endpoint is served by the seat process itself,
+///   which `/proc` cannot see when no carrier carries an HCOM marker.
 ///
 /// A vanished row gets `stopped by=daemon reason=vanished` with the instance
 /// snapshot, then the row is released — the notice systemd-oomd kills
@@ -2189,6 +2192,14 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             );
             continue;
         }
+        // /proc sees nothing for a seat with no HCOM-marked carrier, but its
+        // own notify endpoint is served by the seat process: an accepted
+        // connect is positive evidence of life the pid table cannot supply
+        // (the valo 16:03 false stop). Last hold, so rows already held by a
+        // cheap /proc check never pay for a connect.
+        if held_by_live_notify_endpoint(db, &inst.name) {
+            continue;
+        }
         #[cfg(test)]
         if let Some(hook) = SWEEP_RELEASE_GAP_HOOK.with(std::cell::Cell::take) {
             hook(db, &inst.name);
@@ -2253,6 +2264,52 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         }
     }
     swept
+}
+
+/// Endpoint liveness probe for the sweep's last hold: does any of the row's
+/// registered endpoints still accept a TCP connect on loopback? Every wake
+/// kind answers a bare connect-and-close by design (the omp plugin runs one
+/// idempotent `deliverPending` pass and closes), so the accept is a wake, not
+/// a protocol exchange. `inject` is skipped: it is a request/response RPC
+/// whose empty connection feeds an empty payload to the PTY writer and runs
+/// the injected-approval check, so probing it is not a no-op. Logs the hold
+/// reason and returns whether the row is held — a failed endpoint query
+/// holds the row too, since the sweep fails toward keeping.
+fn held_by_live_notify_endpoint(db: &HcomDb, name: &str) -> bool {
+    let endpoints = match db.notify_endpoint_ports(name) {
+        Ok(endpoints) => endpoints,
+        Err(e) => {
+            crate::log::log(
+                "DEBUG",
+                "daemon",
+                "sweep.held",
+                &format!("name={} reason=endpoint-query-failed err={}", name, e),
+            );
+            return true;
+        }
+    };
+    for (kind, port) in endpoints {
+        if kind == "inject" || port == 0 {
+            continue;
+        }
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let alive =
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(250))
+                .is_ok();
+        if alive {
+            crate::log::log(
+                "DEBUG",
+                "daemon",
+                "sweep.held",
+                &format!(
+                    "name={} reason=notify-endpoint-alive kind={} port={}",
+                    name, kind, port
+                ),
+            );
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -3463,6 +3520,74 @@ mod tests {
         assert!(db.get_instance_full(&name).unwrap().is_some());
         sleeper.kill().ok();
         sleeper.wait().ok();
+    }
+
+    /// A valo-shaped row: no recorded pid, a dead minted-shell binding plus a
+    /// launcher UUID binding, and no process carrying an HCOM marker — every
+    /// /proc signal says gone. The seat's own `plugin` endpoint still accepts
+    /// a connect, which is positive evidence of life: the row must survive and
+    /// no `stopped` life event may be written.
+    #[test]
+    #[cfg(unix)]
+    fn sweep_holds_a_row_whose_notify_endpoint_still_accepts() {
+        let db = test_db();
+        let name = unique_name("valo");
+        let dead = dead_pid();
+        insert_row(&db, &name, "active", None);
+        db.set_process_binding(&format!("omp-{}-a4a1-1174", dead), "sess-a", &name)
+            .unwrap();
+        db.set_process_binding("3f1c8a52-0b7d-4e2a-9c31-6d0f5b7a1e42", "sess-b", &name)
+            .unwrap();
+        age_row(&db, &name);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        db.upsert_notify_endpoint(&name, "plugin", port).unwrap();
+
+        let swept = sweep_vanished_instances(&db);
+
+        assert!(!swept.contains(&name), "{swept:?}");
+        assert!(
+            db.get_instance_full(&name).unwrap().is_some(),
+            "a live notify endpoint holds the row"
+        );
+        let mut bindings = db.process_binding_ids(&name).unwrap();
+        bindings.sort();
+        assert_eq!(bindings.len(), 2, "bindings survive the hold");
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "no stopped record for a held row");
+    }
+
+    /// The same row once the endpoint is gone: the hold is liveness, not a
+    /// blanket exemption, so the next sweep releases it.
+    #[test]
+    #[cfg(unix)]
+    fn sweep_releases_a_row_once_its_notify_endpoint_is_closed() {
+        let db = test_db();
+        let name = unique_name("valo-gone");
+        let dead = dead_pid();
+        insert_row(&db, &name, "active", None);
+        db.set_process_binding(&format!("omp-{}-a4a1-1174", dead), "sess-a", &name)
+            .unwrap();
+        db.set_process_binding("3f1c8a52-0b7d-4e2a-9c31-6d0f5b7a1e42", "sess-b", &name)
+            .unwrap();
+        age_row(&db, &name);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        db.upsert_notify_endpoint(&name, "plugin", port).unwrap();
+        assert!(!sweep_vanished_instances(&db).contains(&name));
+
+        drop(listener);
+        let swept = sweep_vanished_instances(&db);
+
+        assert!(swept.contains(&name), "a closed endpoint releases the row");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
     }
 
     /// Push a row's `last_seen` outside the sweep's fresh grace.
