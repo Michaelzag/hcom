@@ -513,7 +513,6 @@ fn start_rebind(
     let planned_target = target_data.as_ref().map(|row| row.created_at.to_bits());
     let tool = ctx.tool.as_str();
     let cwd_override = ctx.cwd.to_string_lossy().to_string();
-    let stopped_sid = load_stopped_snapshot_session_id(db, &target_name);
 
     // Test seam: a competing reclaim of the same name commits here, after
     // this rebind planned and before it writes.
@@ -589,6 +588,12 @@ fn start_rebind(
         // the session the target holds right now, else the one its newest
         // stop recorded — unless another live identity still holds it.
         if session_id.is_none() {
+            // The stopped snapshot is only consulted once the row is gone, so
+            // the read stays here rather than in the planning phase above.
+            let stopped_sid = crate::commands::resume::load_stopped_snapshot(db, &target_name)
+                .ok()
+                .map(|data| data.1)
+                .filter(|sid| !sid.is_empty());
             let candidate = occupant_sid.as_deref().or(stopped_sid.as_deref());
             if let Some(sid) = candidate
                 && session_id_adoptable(db, sid, &target_name)?
@@ -989,31 +994,6 @@ fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMe
     }
 
     bail!("No rebind metadata found for '{}'", name)
-}
-
-/// The session id the identity named `name` carried in its newest
-/// `life.stopped` snapshot, if any.
-///
-/// `hcom start --as <name>` from a shell with no session id of its own has
-/// nothing to bind the recreated row to, so the reclaimed identity comes back
-/// without the session its hook traffic is keyed by. The stopped snapshot is
-/// the only durable record of that id once the row is gone.
-fn load_stopped_snapshot_session_id(db: &HcomDb, name: &str) -> Option<String> {
-    let mut stmt = db
-        .conn()
-        .prepare(
-            "SELECT json_extract(data, '$.snapshot.session_id') FROM events
-             WHERE type='life' AND instance=? AND json_extract(data, '$.action')='stopped'
-             ORDER BY id DESC LIMIT 1",
-        )
-        .ok()?;
-    let sid: String = stmt
-        .query_row(rusqlite::params![name], |row| {
-            row.get::<_, Option<String>>(0)
-        })
-        .ok()
-        .flatten()?;
-    (!sid.is_empty()).then_some(sid)
 }
 
 /// Whether `sid` may be adopted by `target_name`: it is unbound, already held
