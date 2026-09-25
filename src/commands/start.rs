@@ -455,7 +455,7 @@ fn start_rebind(
         return Ok(1);
     }
 
-    let target_meta = load_rebind_target_metadata(db, &target_name).ok();
+    let target_meta = instance_binding::load_rebind_target_metadata(db, &target_name).ok();
     if let Some(meta) = &target_meta {
         ensure_rebind_compatible(&target_name, meta, ctx)?;
     }
@@ -547,10 +547,13 @@ fn start_rebind(
         let occupant = db.get_instance_full(&target_name)?;
         // The row about to be replaced is the newest statement of which
         // session this identity holds; its stopped snapshots are older history.
-        let occupant_sid = occupant
-            .as_ref()
-            .and_then(|row| row.session_id.clone())
-            .filter(|sid| !sid.is_empty());
+        // The session travels with its transcript, from the same source.
+        let occupant_session = occupant.as_ref().and_then(|row| {
+            row.session_id
+                .clone()
+                .filter(|sid| !sid.is_empty())
+                .map(|sid| (sid, row.transcript_path.clone()))
+        });
         if !kept_remote_row
             && let Some(occupant) = occupant
             && Some(occupant.created_at.to_bits()) != planned_target
@@ -586,19 +589,21 @@ fn start_rebind(
         // session the recreated row is born unbound, so the reclaimed
         // identity's hook traffic has no session to resolve against. Adopt
         // the session the target holds right now, else the one its newest
-        // stop recorded — unless another live identity still holds it.
+        // stop recorded — unless another live identity still holds it. The
+        // adopted session keeps the transcript recorded beside it.
+        let mut adopted_transcript: Option<String> = None;
         if session_id.is_none() {
             // The stopped snapshot is only consulted once the row is gone, so
             // the read stays here rather than in the planning phase above.
-            let stopped_sid = crate::commands::resume::load_stopped_snapshot(db, &target_name)
+            let stopped_session = crate::commands::resume::load_stopped_snapshot(db, &target_name)
                 .ok()
-                .map(|data| data.1)
-                .filter(|sid| !sid.is_empty());
-            let candidate = occupant_sid.as_deref().or(stopped_sid.as_deref());
-            if let Some(sid) = candidate
-                && session_id_adoptable(db, sid, &target_name)?
+                .map(|data| (data.1, data.9))
+                .filter(|(sid, _)| !sid.is_empty());
+            if let Some((sid, transcript)) = occupant_session.or(stopped_session)
+                && session_id_adoptable(db, &sid, &target_name)?
             {
-                session_id = Some(sid.to_string());
+                session_id = Some(sid);
+                adopted_transcript = Some(transcript).filter(|path| !path.is_empty());
             }
         }
         let binding_sid = session_id.clone().unwrap_or_default();
@@ -610,7 +615,7 @@ fn start_rebind(
             None, // parent_session_id
             None, // parent_name
             None, // agent_id
-            None, // transcript_path
+            adopted_transcript.as_deref(),
             Some(tool),
             false, // background
             None,  // tag
@@ -909,16 +914,9 @@ fn trust_restored_binding(
     probe.process_id
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RebindTargetMetadata {
-    tool: String,
-    directory: String,
-    last_event_id: i64,
-}
-
 fn ensure_rebind_compatible(
     target_name: &str,
-    meta: &RebindTargetMetadata,
+    meta: &instance_binding::RebindTargetMetadata,
     ctx: &HcomContext,
 ) -> Result<()> {
     let current_tool = ctx.tool.as_str();
@@ -948,52 +946,6 @@ fn same_path(left: &str, right: &str) -> bool {
 
 fn normalize_path_for_compare(path: &str) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
-}
-
-/// Load rebind metadata from the live row first, then the latest stopped snapshot.
-fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMetadata> {
-    if let Some(inst) = db.get_instance_full(name)? {
-        return Ok(RebindTargetMetadata {
-            tool: inst.tool,
-            directory: inst.directory,
-            last_event_id: inst.last_event_id,
-        });
-    }
-
-    let mut stmt = db.conn().prepare(
-        "SELECT data FROM events WHERE type='life' AND instance=? ORDER BY id DESC LIMIT 10",
-    )?;
-
-    let rows: Vec<String> = stmt
-        .query_map(rusqlite::params![name], |row| row.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for data_str in &rows {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
-            && data.get("action").and_then(|v| v.as_str()) == Some("stopped")
-            && let Some(snapshot) = data.get("snapshot")
-        {
-            return Ok(RebindTargetMetadata {
-                tool: snapshot
-                    .get("tool")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                directory: snapshot
-                    .get("directory")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                last_event_id: snapshot
-                    .get("last_event_id")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0),
-            });
-        }
-    }
-
-    bail!("No rebind metadata found for '{}'", name)
 }
 
 /// Whether `sid` may be adopted by `target_name`: it is unbound, already held
@@ -2826,6 +2778,76 @@ mod tests {
             db.get_session_binding(&session_id).unwrap().as_deref(),
             Some(target.as_str())
         );
+    }
+
+    /// A reclaim resumes the identity from its stopped snapshot even when
+    /// later life events (here failed relaunches) followed the stop: the
+    /// cursor is the snapshot's, never the current maximum, so a message sent
+    /// while the identity was stopped is still pending; and the adopted
+    /// session keeps the transcript recorded beside it.
+    #[test]
+    #[serial]
+    fn test_start_rebind_restores_snapshot_cursor_and_transcript_behind_later_life_events() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("valo_cursor_{}", std::process::id());
+        let session_id = format!("sid-cursor-{}", std::process::id());
+        let transcript = format!("/tmp/project/{session_id}.jsonl");
+        let broadcast = |text: &str| {
+            db.log_event(
+                "message",
+                "nova",
+                &json!({"from": "nova", "scope": "broadcast", "text": text}),
+            )
+            .unwrap()
+        };
+
+        let read_before_stop = broadcast("read before the stop");
+        db.log_event(
+            "life",
+            &target,
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "claude",
+                    "directory": "/tmp/project",
+                    "session_id": session_id,
+                    "transcript_path": transcript,
+                    "last_event_id": read_before_stop
+                }
+            }),
+        )
+        .unwrap();
+        for _ in 0..12 {
+            db.log_event(
+                "life",
+                &target,
+                &json!({"action": "launch_failed", "reason": "ready_never_observed"}),
+            )
+            .unwrap();
+        }
+        let sent_while_stopped = broadcast("broadcast while stopped");
+        let mut ctx = make_claude_ctx(None, "/tmp/project");
+        ctx.process_id = None;
+
+        assert_eq!(start_rebind(&db, &target, &ctx, None, None).unwrap(), 0);
+
+        let row = db
+            .get_instance_full(&target)
+            .unwrap()
+            .expect("reclaimed row");
+        assert_eq!(
+            row.last_event_id, read_before_stop,
+            "the reclaim resumes from the stopped snapshot's cursor"
+        );
+        assert!(
+            db.get_unread_messages(&target)
+                .iter()
+                .any(|m| m.event_id == Some(sent_while_stopped)),
+            "the message sent while stopped is still pending"
+        );
+        assert_eq!(row.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(row.transcript_path, transcript);
     }
 
     /// A session another live identity is using is never adopted, however the

@@ -401,45 +401,129 @@ fn recreate_instance_from_placeholder(
     );
 }
 
+/// Identity metadata a reclaim or restore carries over: the identity's tool
+/// and directory, and its delivery cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RebindTargetMetadata {
+    pub(crate) tool: String,
+    pub(crate) directory: String,
+    pub(crate) last_event_id: i64,
+}
+
+/// Load rebind metadata from the live row first, then the newest stopped
+/// snapshot. `start --as` and the stopped-snapshot rebuild in
+/// [`bind_session_to_process`] both restore the identity's cursor from here.
+///
+/// The snapshot is selected by action in SQL, not from a window of recent
+/// life events, so a stop behind later life events is still found instead of
+/// the caller falling back to a fresh cursor. A `stopped` event with no
+/// snapshot object (a stale-harness exit) carries no metadata and is skipped.
+pub(crate) fn load_rebind_target_metadata(
+    db: &HcomDb,
+    name: &str,
+) -> anyhow::Result<RebindTargetMetadata> {
+    use rusqlite::OptionalExtension;
+
+    if let Some(inst) = db.get_instance_full(name)? {
+        return Ok(RebindTargetMetadata {
+            tool: inst.tool,
+            directory: inst.directory,
+            last_event_id: inst.last_event_id,
+        });
+    }
+
+    let snapshot: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT json_extract(data, '$.snapshot') FROM events
+             WHERE type = 'life'
+               AND instance = ?
+               AND json_extract(data, '$.action') = 'stopped'
+               AND json_type(data, '$.snapshot') = 'object'
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(snapshot) = snapshot else {
+        anyhow::bail!("No rebind metadata found for '{}'", name);
+    };
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot)?;
+    let text = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    Ok(RebindTargetMetadata {
+        tool: text("tool"),
+        directory: text("directory"),
+        last_event_id: snapshot
+            .get("last_event_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+    })
+}
+
 /// Recreate a missing instance row from the `life.stopped` snapshot that matched
-/// its session, for a restore with no placeholder row to copy from. Returns
-/// false when the row still does not exist afterwards.
+/// its session, for a restore with no placeholder row to copy from.
+///
+/// The row resumes the identity where it stopped: its delivery cursor is the
+/// one `start --as` restores ([`load_rebind_target_metadata`], read while the
+/// row is still missing), so messages sent while it was stopped stay pending,
+/// and the snapshot's per-seat settings (tag, hints, timeouts) carry over.
+/// The row is created and given that cursor in one write transaction, so it
+/// is never visible with the fresh cursor initialization assigns. Errors
+/// when the row cannot be created with that cursor.
 fn recreate_instance_from_stopped_snapshot(
     db: &HcomDb,
     target_name: &str,
     session_id: &str,
     snapshot: &serde_json::Value,
-) -> bool {
-    if db.get_instance_full(target_name).ok().flatten().is_some() {
-        return true;
-    }
+) -> anyhow::Result<()> {
     let field = |key: &str| {
         snapshot
             .get(key)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
     };
-    let background = snapshot
-        .get("background")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        != 0;
-    initialize_instance_in_position_file(
-        db,
-        target_name,
-        Some(session_id),
-        None,
-        None,
-        None,
-        field("transcript_path"),
-        field("tool"),
-        background,
-        field("tag"),
-        None,
-        None,
-        None,
-        field("directory"),
-    )
+    let int = |key: &str| snapshot.get(key).and_then(|v| v.as_i64());
+    db.with_immediate_transaction(|_tx| {
+        if db.get_instance_full(target_name)?.is_some() {
+            return Ok(());
+        }
+        let restored = load_rebind_target_metadata(db, target_name)?;
+        if !initialize_instance_in_position_file(
+            db,
+            target_name,
+            Some(session_id),
+            None,
+            None,
+            None,
+            field("transcript_path"),
+            field("tool"),
+            int("background").unwrap_or(0) != 0,
+            field("tag"),
+            int("wait_timeout"),
+            int("subagent_timeout"),
+            field("hints"),
+            field("directory"),
+        ) {
+            anyhow::bail!(
+                "restore_stopped: could not recreate the instance row for '{target_name}'"
+            );
+        }
+        let mut updates = serde_json::Map::new();
+        updates.insert(
+            "last_event_id".into(),
+            serde_json::json!(restored.last_event_id),
+        );
+        db.update_instance_fields(target_name, &updates)
+            .with_context(|| {
+                format!("restore_stopped: could not restore the cursor for '{target_name}'")
+            })
+    })
 }
 
 /// Bind session_id to canonical instance for process_id.
@@ -621,16 +705,7 @@ fn bind_session_to_process_body(
             // No placeholder row to copy from: rebuild the swept row from the
             // stopped snapshot, else the bindings below would name a missing row.
             None => {
-                if !recreate_instance_from_stopped_snapshot(
-                    db,
-                    &stopped_name,
-                    session_id,
-                    &snapshot,
-                ) {
-                    anyhow::bail!(
-                        "restore_stopped: could not recreate the instance row for '{stopped_name}'"
-                    );
-                }
+                recreate_instance_from_stopped_snapshot(db, &stopped_name, session_id, &snapshot)?
             }
         }
 
@@ -1607,6 +1682,7 @@ mod tests {
             "tag": "crew",
             "background": 0,
             "transcript_path": "",
+            "hints": "reply in the crew thread",
         });
         db.log_life_event(
             "valo",
@@ -1626,6 +1702,7 @@ mod tests {
         assert_eq!(valo.tool, "omp");
         assert_eq!(valo.directory, "/tmp/proof-dir");
         assert_eq!(valo.tag.as_deref(), Some("crew"));
+        assert_eq!(valo.hints.as_deref(), Some("reply in the crew thread"));
         assert_eq!(
             db.get_session_binding("ses-ghost").unwrap(),
             Some("valo".to_string())
@@ -1635,6 +1712,71 @@ mod tests {
             Some("valo".to_string())
         );
         assert!(ghost_process_bindings(&db).is_empty());
+
+        cleanup(path);
+    }
+
+    /// The rebuilt row resumes delivery where its identity stopped: messages
+    /// sent while it was stopped are still pending for it, and nothing it had
+    /// read before the stop comes back.
+    #[test]
+    #[serial]
+    fn test_restore_stopped_rebuild_keeps_messages_sent_while_stopped() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let broadcast = |text: &str| {
+            db.log_event(
+                "message",
+                "nova",
+                &serde_json::json!({"from": "nova", "scope": "broadcast", "text": text}),
+            )
+            .unwrap()
+        };
+
+        let read_before_stop = broadcast("read before the stop");
+        let mut valo_data = serde_json::Map::new();
+        valo_data.insert("name".into(), serde_json::json!("valo"));
+        valo_data.insert("session_id".into(), serde_json::json!("ses-cursor"));
+        valo_data.insert("tool".into(), serde_json::json!("omp"));
+        valo_data.insert("created_at".into(), serde_json::json!(now_epoch_i64()));
+        valo_data.insert("status".into(), serde_json::json!("listening"));
+        valo_data.insert("last_event_id".into(), serde_json::json!(read_before_stop));
+        db.save_instance_named("valo", &valo_data).unwrap();
+
+        // The sweep's release: snapshot, stopped event, row gone.
+        let snapshot = db.get_instance_snapshot("valo").unwrap();
+        db.log_life_event("valo", "stopped", "daemon", "vanished", snapshot, None)
+            .unwrap();
+        db.delete_instance("valo").unwrap();
+
+        let sent_while_stopped = broadcast("broadcast while stopped");
+        let mention_while_stopped = db
+            .log_event(
+                "message",
+                "nova",
+                &serde_json::json!({
+                    "from": "nova",
+                    "scope": "mentions",
+                    "mentions": ["valo"],
+                    "text": "mention while stopped",
+                }),
+            )
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-cursor", Some("omp-778-aa-bb")).unwrap();
+        assert_eq!(result, Some("valo".to_string()));
+
+        let valo = db.get_instance_full("valo").unwrap().expect("valo row");
+        assert_eq!(
+            valo.last_event_id, read_before_stop,
+            "the rebuilt row keeps its stopped snapshot's cursor"
+        );
+        let pending: Vec<i64> = db
+            .get_unread_messages("valo")
+            .iter()
+            .filter_map(|m| m.event_id)
+            .collect();
+        assert_eq!(pending, vec![sent_while_stopped, mention_while_stopped]);
 
         cleanup(path);
     }
