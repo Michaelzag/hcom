@@ -530,12 +530,29 @@ fn foreign_live_owner(
     Ok(None)
 }
 
-/// No teardown may signal a process another live row holds. Candidates are
-/// every admitted root but this command's own pid (`roots[0]`, which inherits
-/// the caller's identity and is never a target) plus every captured carrier:
-/// a descendant of a foreign-owned root is signalable too, so roots and
-/// carriers together are the whole candidate set. An unreadable registry
-/// fails closed: the teardown returns an error and sends nothing.
+/// No teardown may signal a process another live row holds. It is checked in
+/// two places, and the coverage is exactly:
+///
+/// - every admitted root except this command's own pid (`roots[0]`, which
+///   inherits the caller's identity and is never a target), plus every
+///   first-capture carrier — a descendant of a foreign-owned root is
+///   signalable too, so roots and carriers together are the whole candidate
+///   set. A conflict here refuses the teardown at capture time, before the
+///   caller's first signal, pane close, or reap.
+/// - every carrier first seen by the KILL round's own capture, which never
+///   went through the check above: a conflict there SKIPS the KILL (see the
+///   call site) and the carrier surfaces as a survivor.
+/// - NOT covered: co-members of a recorded process group reached only by the
+///   headless or kill group signal, which never pass through either set. And
+///   a candidate whose `/proc/<pid>/environ` is unreadable runs only the
+///   candidate-pid arm, since there is no carried id to resolve.
+/// - When two live rows both hold minted ids for the same pid, BOTH rows'
+///   teardowns refuse: the conflict is symmetric, so the stale binding has to
+///   be removed before either side can be stopped. That is the fail-closed
+///   choice, and it is the one that cannot signal the wrong owner.
+///
+/// An unreadable registry fails closed: the teardown returns an error and
+/// sends nothing.
 #[cfg(unix)]
 fn refuse_foreign_live_owner(
     db: &HcomDb,
@@ -1768,6 +1785,42 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
         let fresh_epoch = fresh_epoch_ids(db, name, binding_ids);
         current.retain(|m| {
             started.contains(&m.pid) || carrier_in_reap_scope(m, &fresh_epoch, &mut spared)
+        });
+
+        // A carrier first seen in THIS capture never went through the
+        // pre-signal guard, so it is re-proved here — the last point before a
+        // KILL goes out. A late carrier another live row holds is not
+        // signalled: it is logged once and left to the survivor check below,
+        // which fails the release closed while it lives. A registry the
+        // guard cannot read signals no late carrier at all. First-capture
+        // carriers were refused at capture time and keep today's behaviour.
+        let minted = if current.iter().any(|m| !started.contains(&m.pid)) {
+            minted_pid_owners(db).ok()
+        } else {
+            None
+        };
+        current.retain(|m| {
+            if started.contains(&m.pid) {
+                return true;
+            }
+            match minted.as_ref() {
+                // No registry read: an unproven late carrier is never signalled.
+                None => false,
+                Some(minted) => match foreign_live_owner(db, minted, name, m.pid) {
+                    Ok(None) => true,
+                    Ok(Some((owner, via))) => {
+                        crate::log::log_info(
+                            "proctruth",
+                            "reap_skipped_foreign_owner",
+                            &format!("instance={name} pid={} owner={owner} via={via}", m.pid),
+                        );
+                        false
+                    }
+                    // Fail closed: a registry that cannot answer is not a
+                    // clean bill of health for this carrier.
+                    Err(_) => false,
+                },
+            }
         });
         for m in &current {
             if pid_carries_instance(m.pid, name, binding_ids, &scope) {
@@ -4320,6 +4373,74 @@ mod tests {
             "a fresh process spawned after the round's capture is spared \
              end-to-end (pid {late_pid} was signalled: {late_status:?})"
         );
+        late.kill().ok();
+        late.wait().ok();
+    }
+
+    /// Foreign-owner guard (KILL round): a carrier first seen by the KILL
+    /// round's own capture never went through the pre-signal guard, so it is
+    /// re-proved there — the last point before a KILL goes out. One carrying
+    /// another live row's process id is not signalled: it survives, and the
+    /// release fails closed on it as a survivor, which is the only honest
+    /// outcome while a process this teardown may not touch is still alive.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn kill_round_leaves_a_late_carrier_another_live_row_holds() {
+        let (_dir, db) = file_test_db();
+        let db_path = db.path().to_path_buf();
+        let name = unique_name("lateforeign");
+        let other = unique_name("otherlive");
+        let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
+        let foreign_binding = format!("proc-foreign-{}", rand_suffix());
+        // The other holder: a live row of its own, holding the id the late
+        // carrier carries.
+        insert_null_pid_row(&db, &other, &foreign_binding);
+        let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_pid = first.id();
+        wait_for_enumerated(&name, &[], first_pid);
+        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+
+        let (hook, hit, release) = rendezvous_at(RoundPoint::Captured);
+        let reap_name = name.clone();
+        let reap_bindings = binding_ids.clone();
+        let reaper = std::thread::spawn(move || {
+            let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+            arm_round_seam(hook);
+            reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
+        });
+        // Past the full TERM wait (`first` is SIGSTOPped and cannot exit):
+        // the KILL round has captured its carrier set, and this late carrier
+        // is not in it.
+        hit.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("KILL round reaches its capture boundary");
+        let mut late = spawn_named_sleeper(&name, &foreign_binding);
+        let late_pid = late.id();
+        // Let the child exec before releasing the round: a pre-exec child
+        // carries no identity yet, so the round only sees it as a carrier.
+        wait_for_enumerated(&name, &[], late_pid);
+        release.send(()).ok();
+
+        let result = reaper.join().expect("reap thread");
+        first.wait().ok();
+        assert!(
+            !crate::sys::process::is_alive(first_pid),
+            "in-scope initial carrier is reaped"
+        );
+        // try_wait, not is_alive: a SIGKILLed-but-unreaped child is a zombie
+        // and reads alive — None means the late carrier was never signalled.
+        let late_status = late.try_wait().unwrap();
+        assert!(
+            late_status.is_none(),
+            "a late carrier another live row holds must not be signalled \
+             (pid {late_pid} was signalled: {late_status:?})"
+        );
+        match result {
+            Err(ReapError::Survivors(survivors)) => assert!(
+                survivors.contains(&late_pid),
+                "the spared carrier is the one that fails the release closed: {survivors:?}"
+            ),
+            other => panic!("the release must fail closed while it lives: {other:?}"),
+        }
         late.kill().ok();
         late.wait().ok();
     }
