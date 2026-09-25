@@ -2289,7 +2289,7 @@ fn held_by_live_notify_endpoint(db: &HcomDb, name: &str) -> bool {
         }
     };
     for (kind, port) in endpoints {
-        if kind == "inject" || port == 0 {
+        if kind == "inject" {
             continue;
         }
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
