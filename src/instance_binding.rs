@@ -359,7 +359,7 @@ fn retire_true_placeholder_after_canonical_bind(
     let Some(ph_name) = placeholder_name else {
         return;
     };
-    if ph_name == canonical_name {
+    if ph_name == canonical_name || !is_true_launch_placeholder(placeholder_data) {
         return;
     }
 
@@ -370,48 +370,85 @@ fn retire_true_placeholder_after_canonical_bind(
     delete_true_placeholder_if_migrated(db, ph_name, canonical_name, placeholder_data);
 }
 
-/// Retire a session-bearing identity displaced by a session switch inside one
-/// live process: mark it `inactive` with context `exit:session_switch`, drop
-/// its session bindings, and log the same status event Path 1b writes.
-/// Factored out of Path 1b so every binding move (Path 2 `restore_stopped`
-/// included) retires the row it moves off instead of stranding it.
-///
-/// The row is left alone while another process binding still points at it
-/// (that process legitimately holds the identity), and when the row itself
-/// is already gone (a dangling binding names nothing to retire).
-fn retire_displaced_session_identity(
+/// Whether another live process still holds this row. A stale binding alone
+/// cannot keep an abandoned identity alive; a live carrier of that binding can.
+fn held_by_another_live_process(
     db: &HcomDb,
+    name: &str,
+    moving_process_id: &str,
+) -> anyhow::Result<bool> {
+    let others = db.other_process_bindings_for_instance(name, moving_process_id)?;
+    if others.is_empty() {
+        return Ok(false);
+    }
+    let owners = crate::proctruth::omp_owner_bindings(db, name);
+    Ok(
+        crate::proctruth::processes_for_instance("", &others, &owners)
+            .into_iter()
+            .any(|carrier| {
+                !crate::proctruth::process_gone(carrier.pid)
+                    && others.iter().any(|id| {
+                        carrier.process_id == *id
+                            || crate::proctruth::omp_minted_pid(id) == Some(carrier.pid)
+                    })
+            }),
+    )
+}
+
+/// Release the displaced session's row with the same snapshotted `life.stopped`
+/// event and control-plane cleanup as a regular stop, but without signalling.
+/// Called after the moving process has bound its new name, in that same
+/// immediate transaction. The caller dispatches the event after commit.
+fn release_displaced_session_identity(
+    db: &HcomDb,
+    tx: &rusqlite::Transaction<'_>,
     displaced_name: &str,
     moving_process_id: &str,
-) -> anyhow::Result<()> {
-    if db.get_instance_full(displaced_name)?.is_none() {
-        crate::log::log_info(
-            "binding",
-            "session_switch.displaced_row_missing",
-            &format!("displaced={displaced_name}"),
-        );
-        return Ok(());
-    }
-    if !db
-        .other_process_bindings_for_instance(displaced_name, moving_process_id)?
-        .is_empty()
+) -> anyhow::Result<Option<(i64, serde_json::Value)>> {
+    let Some(row) = db.get_instance_full(displaced_name)? else {
+        return Ok(None);
+    };
+    if row.session_id.is_none()
+        || held_by_another_live_process(db, displaced_name, moving_process_id)?
     {
-        crate::log::log_info(
-            "binding",
-            "session_switch.keep_shared_identity",
-            &format!("displaced={displaced_name} still held by another process binding"),
-        );
-        return Ok(());
+        return Ok(None);
     }
-    crate::instance_lifecycle::set_status(
-        db,
+    let mut snapshot = db
+        .get_instance_snapshot(displaced_name)?
+        .with_context(|| format!("session switch: missing snapshot for '{displaced_name}'"))?;
+    snapshot["name"] = serde_json::json!(displaced_name);
+    snapshot["parent_session_id"] = serde_json::json!(row.parent_session_id);
+    snapshot["created_at_bits"] = serde_json::json!(row.created_at.to_bits());
+    snapshot["last_seen"] = serde_json::json!(row.last_seen);
+    snapshot["name_announced"] = serde_json::json!(row.name_announced);
+    let event = serde_json::json!({
+        "action": "stopped",
+        "by": "session_switch",
+        "reason": "exit:session_switch",
+        "process_id": moving_process_id,
+        "snapshot": snapshot,
+    });
+    let (won, event_id) = db.finalize_instance_stop_in_txn(
+        tx,
         displaced_name,
-        ST_INACTIVE,
-        "exit:session_switch",
-        Default::default(),
-    );
-    db.delete_session_bindings_for_instance(displaced_name)?;
-    Ok(())
+        row.created_at,
+        row.pid,
+        row.session_id.as_deref(),
+        row.agent_id.as_deref(),
+        &event,
+        None,
+        None,
+    )?;
+    if !won {
+        anyhow::bail!("session switch: could not release '{displaced_name}'");
+    }
+    Ok(event_id.map(|id| (id, event)))
+}
+
+fn notify_session_switch_stop(db: &HcomDb, name: &str, event: Option<(i64, serde_json::Value)>) {
+    if let Some((id, data)) = event {
+        crate::db::subscriptions::process_logged_event(db, id, "life", name, &data);
+    }
 }
 
 /// Recreate a missing instance row from an active placeholder (resume after stop/kill).
@@ -662,8 +699,12 @@ fn bind_session_to_process_body(
         if let Some(ref ph_name) = placeholder_name
             && ph_name != canonical_name
         {
-            let migrated = migrate_placeholder_notify(db, ph_name, canonical_name);
-
+            let true_placeholder = is_true_launch_placeholder(placeholder_data.as_ref());
+            let migrated = if true_placeholder {
+                migrate_placeholder_notify(db, ph_name, canonical_name)
+            } else {
+                false
+            };
             if is_true_launch_placeholder(placeholder_data.as_ref()) {
                 // Path 1a: True placeholder merge
                 if let Some(ref ph_data) = placeholder_data {
@@ -691,39 +732,38 @@ fn bind_session_to_process_body(
                         placeholder_data.as_ref(),
                     );
                 }
-            } else {
-                // Path 1b: Session switch — retire the real old identity. Unlike a true
-                // launch placeholder (deletion above stays gated on endpoint migration),
-                // this is a live old identity: retire it regardless of migration outcome,
-                // else a migrate failure leaves a duplicate active/listening row and a
-                // stale session binding. Endpoints may remain imperfect on the old name,
-                // but the delivery loop re-registers under the canonical name.
-                if !migrated {
-                    crate::log::log_info(
-                        "binding",
-                        "bind_canonical.session_switch_migrate_failed",
-                        &format!("endpoints may remain on {ph_name}; retiring identity anyway"),
-                    );
-                }
-                if let Err(e) =
-                    retire_displaced_session_identity(db, ph_name, process_id.unwrap_or(""))
-                {
-                    crate::log::log_error(
-                        "binding",
-                        "bind_canonical.delete_session_bindings",
-                        &format!("{e}"),
-                    );
-                }
             }
         }
 
         update_instance_position(db, canonical_name, &resume_updates);
 
         if let Some(pid) = process_id {
-            db.set_process_binding(pid, session_id, canonical_name)
-                .with_context(|| {
-                    format!("bind_canonical.set_process_binding for '{canonical_name}'")
-                })?;
+            let released = db.with_immediate_transaction(|tx| {
+                db.set_process_binding(pid, session_id, canonical_name)
+                    .with_context(|| {
+                        format!("bind_canonical.set_process_binding for '{canonical_name}'")
+                    })?;
+                if let Some(displaced) = &placeholder_name
+                    && displaced != canonical_name
+                    && !is_true_launch_placeholder(placeholder_data.as_ref())
+                {
+                    if !held_by_another_live_process(db, displaced, pid)? {
+                        // The live process and its terminal move with this
+                        // binding; a shared row still belongs to its holder.
+                        migrate_placeholder_runtime_state(
+                            db,
+                            canonical_name,
+                            placeholder_data.as_ref(),
+                        );
+                        migrate_placeholder_notify(db, displaced, canonical_name);
+                    }
+                    return release_displaced_session_identity(db, tx, displaced, pid);
+                }
+                Ok(None)
+            })?;
+            if let Some(displaced) = &placeholder_name {
+                notify_session_switch_stop(db, displaced, released);
+            }
         }
 
         return Ok(Some(canonical_name.clone()));
@@ -739,13 +779,17 @@ fn bind_session_to_process_body(
             "bind_session_to_process.restore_stopped",
             &format!("stopped_name={stopped_name}, session_id={session_id}"),
         );
-        match placeholder_data.as_ref() {
-            Some(ph) => recreate_instance_from_placeholder(db, &stopped_name, session_id, Some(ph)),
-            // No placeholder row to copy from: rebuild the swept row from the
-            // stopped snapshot, else the bindings below would name a missing row.
-            None => {
-                recreate_instance_from_stopped_snapshot(db, &stopped_name, session_id, &snapshot)?
-            }
+        if is_true_launch_placeholder(placeholder_data.as_ref()) {
+            recreate_instance_from_placeholder(
+                db,
+                &stopped_name,
+                session_id,
+                placeholder_data.as_ref(),
+            );
+        } else {
+            // A real old session is not the restored identity: take the
+            // stopped name's cursor and settings, never the displaced row's.
+            recreate_instance_from_stopped_snapshot(db, &stopped_name, session_id, &snapshot)?;
         }
 
         if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
@@ -757,21 +801,32 @@ fn bind_session_to_process_body(
         db.rebind_session(session_id, &stopped_name)
             .with_context(|| format!("restore_stopped.rebind_session for '{stopped_name}'"))?;
         if let Some(pid) = process_id {
-            // The binding move and the displaced row's retirement commit in one
-            // immediate transaction: no observable state has the binding moved
-            // while the old row is still live.
-            db.with_immediate_transaction(|_tx| {
+            // Move, migrate endpoints (unless another live owner holds X),
+            // and release X together under one immediate transaction.
+            let released = db.with_immediate_transaction(|tx| {
                 db.set_process_binding(pid, session_id, &stopped_name)
                     .with_context(|| {
                         format!("restore_stopped.set_process_binding for '{stopped_name}'")
                     })?;
                 if let Some(displaced) = &placeholder_name
                     && displaced != &stopped_name
+                    && !is_true_launch_placeholder(placeholder_data.as_ref())
                 {
-                    retire_displaced_session_identity(db, displaced, pid)?;
+                    if !held_by_another_live_process(db, displaced, pid)? {
+                        migrate_placeholder_runtime_state(
+                            db,
+                            &stopped_name,
+                            placeholder_data.as_ref(),
+                        );
+                        migrate_placeholder_notify(db, displaced, &stopped_name);
+                    }
+                    return release_displaced_session_identity(db, tx, displaced, pid);
                 }
-                Ok(())
+                Ok(None)
             })?;
+            if let Some(displaced) = &placeholder_name {
+                notify_session_switch_stop(db, displaced, released);
+            }
         }
 
         retire_true_placeholder_after_canonical_bind(
@@ -795,13 +850,16 @@ fn bind_session_to_process_body(
         updates.insert("session_id".into(), serde_json::json!(session_id));
         update_instance_position(db, ph_name, &updates);
 
-        // The row keeps its name but takes a new session: drop the old session's
-        // session_bindings row (else a later resume of the old session would bind
-        // to a row that now carries a different session) and point the new
-        // session at this row. `rebind_instance_session` also clears the new
-        // session's column value off any other row.
-        db.rebind_instance_session(ph_name, session_id)
-            .with_context(|| format!("bind_placeholder.rebind_session for '{ph_name}'"))?;
+        // Shared rows retain the other live process's session binding. Only
+        // the sole holder may replace the old session on this row.
+        let shared = held_by_another_live_process(db, ph_name, process_id.unwrap_or(""))?;
+        if shared {
+            db.rebind_session(session_id, ph_name)
+                .with_context(|| format!("bind_placeholder.rebind_session for '{ph_name}'"))?;
+        } else {
+            db.rebind_instance_session(ph_name, session_id)
+                .with_context(|| format!("bind_placeholder.rebind_session for '{ph_name}'"))?;
+        }
         if let Some(pid) = process_id {
             db.set_process_binding(pid, session_id, ph_name)
                 .with_context(|| format!("bind_placeholder.set_process_binding for '{ph_name}'"))?;
@@ -1271,6 +1329,66 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 
+    fn assert_released_session(db: &HcomDb, name: &str, sid: &str, cursor: i64, transcript: &str) {
+        assert!(db.get_instance_full(name).unwrap().is_none());
+        assert!(!db.has_session_binding(name));
+        assert!(!db.has_process_binding_for_instance(name));
+        let endpoints: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ?",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(endpoints, 0);
+        let event: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = ?
+             AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC LIMIT 1",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(event["by"], "session_switch");
+        assert_eq!(event["reason"], "exit:session_switch");
+        assert_eq!(event["snapshot"]["session_id"], sid);
+        assert_eq!(event["snapshot"]["last_event_id"], cursor);
+        assert_eq!(event["snapshot"]["transcript_path"], transcript);
+        assert_eq!(
+            db.find_stopped_snapshot_by_session_id(sid)
+                .unwrap()
+                .unwrap()
+                .0,
+            name
+        );
+    }
+
+    #[cfg(unix)]
+    fn live_holder(id: &str) -> std::process::Child {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .env("HCOM_PROCESS_ID", id)
+            .spawn()
+            .unwrap();
+        let bound = vec![id.to_string()];
+        for _ in 0..100 {
+            if crate::proctruth::processes_for_instance("", &bound, &[])
+                .iter()
+                .any(|carrier| carrier.pid == child.id())
+            {
+                return child;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("test holder did not become visible");
+    }
+
     #[test]
     fn auto_subscribe_eligibility_follows_released_specs() {
         assert!(auto_subscribe_eligible("pi"));
@@ -1448,10 +1566,19 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_session_path1b_session_switch_marks_old_inactive() {
+    fn test_bind_session_path1b_switch_releases_and_restores_old_session() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
         let now = now_epoch_i64();
+        let read = db
+            .log_event(
+                "message",
+                "sender",
+                &serde_json::json!({
+                    "from": "sender", "scope": "broadcast", "text": "already read"
+                }),
+            )
+            .unwrap();
 
         let mut canonical_data = serde_json::Map::new();
         canonical_data.insert("name".into(), serde_json::json!("miso"));
@@ -1461,29 +1588,58 @@ mod tests {
         db.save_instance_named("miso", &canonical_data).unwrap();
         db.rebind_session("sid-789", "miso").unwrap();
 
-        let mut ph_data = serde_json::Map::new();
-        ph_data.insert("name".into(), serde_json::json!("temp"));
-        ph_data.insert("session_id".into(), serde_json::json!("sid-old"));
-        ph_data.insert("created_at".into(), serde_json::json!(now));
-        ph_data.insert("status".into(), serde_json::json!("listening"));
-        db.save_instance_named("temp", &ph_data).unwrap();
+        let mut x_data = serde_json::Map::new();
+        x_data.insert("name".into(), serde_json::json!("temp"));
+        x_data.insert("session_id".into(), serde_json::json!("sid-old"));
+        x_data.insert("tool".into(), serde_json::json!("omp"));
+        x_data.insert(
+            "transcript_path".into(),
+            serde_json::json!("/sessions/old.jsonl"),
+        );
+        x_data.insert("last_event_id".into(), serde_json::json!(read));
+        x_data.insert("created_at".into(), serde_json::json!(now));
+        x_data.insert("status".into(), serde_json::json!("listening"));
+        db.save_instance_named("temp", &x_data).unwrap();
         db.rebind_session("sid-old", "temp").unwrap();
         db.set_process_binding("pid-123", "sid-old", "temp")
             .unwrap();
+        db.upsert_notify_endpoint("temp", "plugin", 53001).unwrap();
 
-        let result = bind_session_to_process(&db, "sid-789", Some("pid-123")).unwrap();
-        assert_eq!(result, Some("miso".to_string()));
-
-        let placeholder = db.get_instance_full("temp").unwrap().unwrap();
-        assert_eq!(placeholder.status, ST_INACTIVE);
-        assert_eq!(placeholder.status_context, "exit:session_switch");
-
-        assert_eq!(db.get_session_binding("sid-old").unwrap(), None);
         assert_eq!(
-            db.get_process_binding("pid-123").unwrap(),
-            Some("miso".to_string())
+            bind_session_to_process(&db, "sid-789", Some("pid-123")).unwrap(),
+            Some("miso".into())
         );
+        assert_eq!(
+            db.get_process_binding("pid-123").unwrap().as_deref(),
+            Some("miso")
+        );
+        assert_released_session(&db, "temp", "sid-old", read, "/sessions/old.jsonl");
 
+        let pending = db
+            .log_event(
+                "message",
+                "sender",
+                &serde_json::json!({
+                    "from": "sender", "scope": "broadcast", "text": "sent during switch"
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            bind_session_to_process(&db, "sid-old", Some("pid-123")).unwrap(),
+            Some("temp".into())
+        );
+        let restored = db.get_instance_full("temp").unwrap().unwrap();
+        assert_eq!(restored.session_id.as_deref(), Some("sid-old"));
+        assert_eq!(restored.last_event_id, read);
+        assert!(
+            db.get_unread_messages("temp")
+                .iter()
+                .any(|m| m.event_id == Some(pending))
+        );
+        assert_eq!(
+            db.get_process_binding("pid-123").unwrap().as_deref(),
+            Some("temp")
+        );
         cleanup(path);
     }
 
@@ -1492,12 +1648,25 @@ mod tests {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
         let now = now_epoch_i64();
-
+        let cursor = db
+            .log_event(
+                "message",
+                "sender",
+                &serde_json::json!({
+                    "from": "sender", "scope": "broadcast", "text": "already read"
+                }),
+            )
+            .unwrap();
         // Live seat X on session S1, held by this process.
         let mut x_data = serde_json::Map::new();
         x_data.insert("name".into(), serde_json::json!("xrow"));
         x_data.insert("session_id".into(), serde_json::json!("sid-old"));
         x_data.insert("tool".into(), serde_json::json!("omp"));
+        x_data.insert(
+            "transcript_path".into(),
+            serde_json::json!("/sessions/x.jsonl"),
+        );
+        x_data.insert("last_event_id".into(), serde_json::json!(cursor));
         x_data.insert("created_at".into(), serde_json::json!(now));
         x_data.insert("status".into(), serde_json::json!("listening"));
         db.save_instance_named("xrow", &x_data).unwrap();
@@ -1505,6 +1674,8 @@ mod tests {
         db.set_process_binding("pid-live", "sid-old", "xrow")
             .unwrap();
 
+        #[cfg(unix)]
+        let mut switching = live_holder("pid-live");
         // Session S2's stopped name Y: only the life.stopped snapshot survives.
         let snapshot = serde_json::json!({
             "session_id": "sid-new",
@@ -1518,7 +1689,7 @@ mod tests {
         let result = bind_session_to_process(&db, "sid-new", Some("pid-live")).unwrap();
         assert_eq!(result, Some("yrow".to_string()));
 
-        // Y took the process binding; X retired exactly like a Path 1b switch.
+        // Y took the process binding; X has a resumable stop snapshot.
         assert_eq!(
             db.get_process_binding("pid-live").unwrap(),
             Some("yrow".to_string())
@@ -1528,36 +1699,33 @@ mod tests {
             Some("yrow".to_string())
         );
 
-        let x = db.get_instance_full("xrow").unwrap().unwrap();
-        assert_eq!(x.status, ST_INACTIVE);
-        assert_eq!(x.status_context, "exit:session_switch");
-        assert!(!db.has_session_binding("xrow"));
-        assert!(!db.has_process_binding_for_instance("xrow"));
-
-        // The retirement wrote the same status life event Path 1b writes.
-        let event: String = db
-            .conn()
-            .query_row(
-                "SELECT data FROM events WHERE type = 'status' AND instance = ?
-                 ORDER BY id DESC LIMIT 1",
-                rusqlite::params!["xrow"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_released_session(&db, "xrow", "sid-old", cursor, "/sessions/x.jsonl");
+        assert_eq!(db.get_session_binding("sid-old").unwrap(), None);
+        let restored = bind_session_to_process(&db, "sid-old", Some("pid-live")).unwrap();
+        assert_eq!(restored.as_deref(), Some("xrow"));
         assert_eq!(
-            event.get("new_status").and_then(|v| v.as_str()),
-            Some("inactive")
+            db.get_instance_full("xrow").unwrap().unwrap().last_event_id,
+            cursor
         );
         assert_eq!(
-            event.get("new_context").and_then(|v| v.as_str()),
-            Some("exit:session_switch")
+            db.get_process_binding("pid-live").unwrap().as_deref(),
+            Some("xrow")
         );
+        #[cfg(unix)]
+        {
+            assert!(
+                switching.try_wait().unwrap().is_none(),
+                "switch sent a signal"
+            );
+            switching.kill().unwrap();
+            switching.wait().unwrap();
+        }
 
         cleanup(path);
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_bind_session_path2_switch_shared_row_not_retired() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1576,6 +1744,8 @@ mod tests {
         // Another process legitimately holds X too.
         db.set_process_binding("pid-other", "sid-old", "xrow")
             .unwrap();
+        let mut holder = live_holder("pid-other");
+        db.upsert_notify_endpoint("xrow", "plugin", 53002).unwrap();
 
         let snapshot = serde_json::json!({
             "session_id": "sid-new",
@@ -1604,6 +1774,21 @@ mod tests {
             Some("xrow".to_string())
         );
 
+        let endpoints: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = 'xrow'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(endpoints, 1);
+        assert!(
+            holder.try_wait().unwrap().is_none(),
+            "other process was signalled"
+        );
+        holder.kill().unwrap();
+        holder.wait().unwrap();
         cleanup(path);
     }
 
@@ -1632,27 +1817,24 @@ mod tests {
         db.log_life_event("yrow", "stopped", "test", "exit", Some(snapshot), None)
             .unwrap();
 
-        let result = bind_session_to_process(&db, "sid-new", Some("pid-live")).unwrap();
-        assert_eq!(result, Some("yrow".to_string()));
-
-        // The move and the retirement commit in one immediate transaction, so
-        // one read snapshot never sees the binding moved while X is still live.
-        db.with_read_snapshot(|txn| {
-            let bound: String = txn.query_row(
-                "SELECT instance_name FROM process_bindings WHERE process_id = ?",
-                rusqlite::params!["pid-live"],
-                |row| row.get(0),
-            )?;
-            let status: String = txn.query_row(
-                "SELECT status FROM instances WHERE name = ?",
-                rusqlite::params!["xrow"],
-                |row| row.get(0),
-            )?;
-            assert_eq!(bound, "yrow");
-            assert_eq!(status, ST_INACTIVE);
-            Ok(())
-        })
-        .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER refuse_x_stop BEFORE INSERT ON events
+             WHEN NEW.type = 'life' AND NEW.instance = 'xrow'
+               AND json_extract(NEW.data, '$.action') = 'stopped'
+             BEGIN SELECT RAISE(FAIL, 'cannot publish stop'); END;",
+            )
+            .unwrap();
+        assert!(bind_session_to_process(&db, "sid-new", Some("pid-live")).is_err());
+        assert_eq!(
+            db.get_process_binding("pid-live").unwrap().as_deref(),
+            Some("xrow")
+        );
+        assert!(db.get_instance_full("xrow").unwrap().is_some());
+        assert_eq!(
+            db.get_session_binding("sid-old").unwrap().as_deref(),
+            Some("xrow")
+        );
 
         cleanup(path);
     }
@@ -1692,6 +1874,114 @@ mod tests {
             Some("xrow".to_string())
         );
 
+        cleanup(path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_bind_session_path3_preserves_other_live_process_session() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let mut x = serde_json::Map::new();
+        x.insert("name".into(), serde_json::json!("xrow"));
+        x.insert("session_id".into(), serde_json::json!("sid-old"));
+        x.insert("tool".into(), serde_json::json!("omp"));
+        x.insert("created_at".into(), serde_json::json!(now_epoch_i64()));
+        x.insert("status".into(), serde_json::json!("listening"));
+        db.save_instance_named("xrow", &x).unwrap();
+        db.rebind_session("sid-old", "xrow").unwrap();
+        db.set_process_binding("pid-live", "sid-old", "xrow")
+            .unwrap();
+        db.set_process_binding("pid-other", "sid-old", "xrow")
+            .unwrap();
+        let mut holder = live_holder("pid-other");
+
+        assert_eq!(
+            bind_session_to_process(&db, "sid-brand-new", Some("pid-live"))
+                .unwrap()
+                .as_deref(),
+            Some("xrow")
+        );
+        assert_eq!(
+            db.get_session_binding("sid-old").unwrap().as_deref(),
+            Some("xrow")
+        );
+        assert_eq!(
+            db.get_session_binding("sid-brand-new").unwrap().as_deref(),
+            Some("xrow")
+        );
+        assert_eq!(
+            db.get_process_binding("pid-other").unwrap().as_deref(),
+            Some("xrow")
+        );
+        assert_eq!(
+            bind_session_to_process(&db, "sid-old", Some("pid-other"))
+                .unwrap()
+                .as_deref(),
+            Some("xrow")
+        );
+        assert!(holder.try_wait().unwrap().is_none());
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        cleanup(path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_bind_session_path1b_preserves_other_live_process_row() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        for (name, sid) in [("xrow", "sid-old"), ("yrow", "sid-new")] {
+            let mut row = serde_json::Map::new();
+            row.insert("name".into(), serde_json::json!(name));
+            row.insert("session_id".into(), serde_json::json!(sid));
+            row.insert("tool".into(), serde_json::json!("omp"));
+            row.insert("created_at".into(), serde_json::json!(now_epoch_i64()));
+            row.insert("status".into(), serde_json::json!("listening"));
+            db.save_instance_named(name, &row).unwrap();
+            db.rebind_session(sid, name).unwrap();
+        }
+        db.set_process_binding("pid-live", "sid-old", "xrow")
+            .unwrap();
+        db.set_process_binding("pid-other", "sid-old", "xrow")
+            .unwrap();
+        db.upsert_notify_endpoint("xrow", "plugin", 53003).unwrap();
+        let mut holder = live_holder("pid-other");
+
+        assert_eq!(
+            bind_session_to_process(&db, "sid-new", Some("pid-live"))
+                .unwrap()
+                .as_deref(),
+            Some("yrow")
+        );
+        assert_eq!(
+            db.get_process_binding("pid-live").unwrap().as_deref(),
+            Some("yrow")
+        );
+        assert_eq!(
+            db.get_process_binding("pid-other").unwrap().as_deref(),
+            Some("xrow")
+        );
+        assert_eq!(
+            db.get_session_binding("sid-old").unwrap().as_deref(),
+            Some("xrow")
+        );
+        assert_eq!(
+            db.get_instance_full("xrow").unwrap().unwrap().status,
+            ST_LISTENING
+        );
+        let endpoints: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = 'xrow'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(endpoints, 1);
+        assert!(holder.try_wait().unwrap().is_none());
+        holder.kill().unwrap();
+        holder.wait().unwrap();
         cleanup(path);
     }
 

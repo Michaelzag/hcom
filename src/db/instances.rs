@@ -584,12 +584,14 @@ impl HcomDb {
 
         if let Some(session_id) = session_id {
             tx.execute(
-                "DELETE FROM session_bindings WHERE session_id = ?",
-                params![session_id],
+                "DELETE FROM session_bindings WHERE session_id = ? AND instance_name = ?",
+                params![session_id, name],
             )?;
+            // A session switch can already have moved this process to a new
+            // row with the same session id. Only release bindings of this row.
             tx.execute(
-                "DELETE FROM process_bindings WHERE session_id = ?",
-                params![session_id],
+                "DELETE FROM process_bindings WHERE session_id = ? AND instance_name = ?",
+                params![session_id, name],
             )?;
         }
         tx.execute(
