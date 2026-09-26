@@ -39,19 +39,13 @@ pub struct ListenArgs {
 
 // Filter parsing, SQL generation, and expansion are imported from crate::core::filters
 
-/// Initialize heartbeat for the listening instance.
-/// Writes last_stop + wait_timeout to instances table
-fn init_heartbeat(db: &HcomDb, instance_name: &str, timeout: f64) {
-    let now = crate::shared::time::now_epoch_i64();
-
-    let mut updates = serde_json::Map::new();
-    updates.insert("last_stop".into(), serde_json::json!(now));
-    updates.insert("wait_timeout".into(), serde_json::json!(timeout as i64));
-    instances::update_instance_position(db, instance_name, &updates);
-}
-
 /// Update heartbeat timestamp.
 /// Writes last_stop to instances table so stale-cleanup sees the agent as alive.
+///
+/// Deliberately leaves `wait_timeout` alone: that column is the instance's
+/// persistent idle-wait setting (read by the Claude Stop-hook poll and
+/// `hcom config -i`), not a per-call value. A listen timeout written there
+/// would outlive this call and shorten every later idle wait (#132).
 fn update_heartbeat(db: &HcomDb, instance_name: &str) {
     let now = crate::shared::time::now_epoch_i64();
 
@@ -285,7 +279,7 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
         let _ = db.upsert_notify_endpoint(&instance_name, "listen", port);
     }
 
-    init_heartbeat(db, &instance_name, timeout);
+    update_heartbeat(db, &instance_name);
 
     // Setup SIGTERM handler for clean shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -527,7 +521,7 @@ fn listen_with_filter(
         let _ = db.upsert_notify_endpoint(instance_name, "listen_filter", server.port());
     }
 
-    init_heartbeat(db, instance_name, timeout);
+    update_heartbeat(db, instance_name);
 
     let start_time = std::time::Instant::now();
 
@@ -674,7 +668,110 @@ fn filter_listen_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::expand_sql_preset;
+    use super::*;
+    use serial_test::serial;
+    use std::path::PathBuf;
+
+    type TestEnv = (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        crate::hooks::test_helpers::EnvGuard,
+    );
+
+    fn setup_test_db() -> (HcomDb, PathBuf, TestEnv) {
+        use std::sync::atomic::AtomicU64;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let env = crate::hooks::test_helpers::isolated_test_env();
+        let db_path = std::env::temp_dir().join(format!(
+            "test_hcom_listen_{}_{}.db",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = HcomDb::open_at(&db_path).unwrap();
+        (db, db_path, env)
+    }
+
+    fn cleanup_test_db(path: PathBuf) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    fn listen_args(extra: &[&str]) -> ListenArgs {
+        use clap::Parser;
+        ListenArgs::try_parse_from(["listen"].iter().chain(extra)).unwrap()
+    }
+
+    fn row(db: &HcomDb) -> crate::db::InstanceRow {
+        db.get_instance_full("luna").unwrap().unwrap()
+    }
+
+    /// #132: a short `hcom listen` must not become the instance's persistent
+    /// idle-wait timeout, in message mode or filter mode.
+    #[test]
+    #[serial]
+    fn listen_timeout_does_not_overwrite_instance_wait_timeout() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, wait_timeout, last_stop) \
+                 VALUES ('luna', 1000.0, 86400, 0)",
+                [],
+            )
+            .unwrap();
+        let ctx = CommandContext {
+            explicit_name: Some("luna".into()),
+            identity: None,
+            go: false,
+        };
+
+        // Message mode, quiet timeout.
+        cmd_listen(&db, &listen_args(&["1"]), Some(&ctx));
+        assert_eq!(row(&db).wait_timeout, Some(86400));
+        assert!(row(&db).last_stop > 0, "listen must still write heartbeat");
+
+        // Filter mode, quiet timeout.
+        let filtered = listen_args(&["--timeout", "1", "--from", "nobody"]);
+        cmd_listen(&db, &filtered, Some(&ctx));
+        assert_eq!(row(&db).wait_timeout, Some(86400));
+
+        // Message mode, message delivered.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        crate::commands::send::send_message(
+            &db,
+            &crate::shared::SenderIdentity {
+                kind: crate::shared::SenderKind::Instance,
+                name: "nova".into(),
+                instance_data: None,
+                session_id: None,
+            },
+            "@luna hi",
+            None,
+            Some(&["luna".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(cmd_listen(&db, &listen_args(&["20"]), Some(&ctx)), 0);
+        assert_eq!(row(&db).wait_timeout, Some(86400));
+
+        // An unset timeout stays unset so the global HCOM_TIMEOUT still applies.
+        db.conn()
+            .execute(
+                "UPDATE instances SET wait_timeout = NULL WHERE name = 'luna'",
+                [],
+            )
+            .unwrap();
+        cmd_listen(&db, &listen_args(&["1"]), Some(&ctx));
+        assert_eq!(row(&db).wait_timeout, None);
+
+        cleanup_test_db(path);
+    }
 
     fn ctx(name: &str) -> CommandContext {
         CommandContext {
