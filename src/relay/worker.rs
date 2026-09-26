@@ -17,12 +17,12 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::log;
-use crate::relay::client::RelayCommand;
+use crate::relay::client::{MqttRelay, RelayCommand, RunEnd};
 
 // ── PID file helpers ────────────────────────────────────────────────
 
@@ -162,6 +162,7 @@ pub fn observe_pid_file() -> Option<(u32, bool)> {
 /// (reinstall, `cargo install`, package upgrade). A replaced worker exits
 /// cleanly so the next spawn — or the service manager — runs the new binary.
 #[cfg(unix)]
+#[derive(Clone)]
 struct BinaryIdentity {
     path: PathBuf,
     dev: u64,
@@ -215,6 +216,13 @@ impl BinaryIdentity {
 /// Uninhabited: `capture` always returns None, so no value ever exists.
 #[cfg(not(unix))]
 enum BinaryIdentity {}
+
+#[cfg(not(unix))]
+impl Clone for BinaryIdentity {
+    fn clone(&self) -> Self {
+        match *self {}
+    }
+}
 
 #[cfg(not(unix))]
 impl BinaryIdentity {
@@ -365,42 +373,19 @@ pub fn run() -> i32 {
     };
     let managed = config.relay_worker_managed;
 
+    // One command channel for the worker's whole lifetime. The notify
+    // listener and the watchdog hold its senders across MQTT sessions, so a
+    // shutdown requested while a session is down still reaches the next one.
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+
     // A managed worker never exits for "relay disabled" or a failed connect:
     // that would crashloop the service manager. It idles holding the lock and
     // re-reads config until relay is enabled and connect succeeds.
-    let (relay, connection, cmd_tx) = loop {
-        if !super::is_relay_enabled(&config) {
-            if !managed {
-                eprintln!("Error: Relay not configured or disabled");
-                return 1;
-            }
-            log::log_info(
-                "relay",
-                "relay_worker.idle",
-                "relay not configured or disabled; waiting",
-            );
-            match managed_idle(&shutdown, binary.as_ref(), true) {
-                Some(c) => config = c,
-                None => return 0,
-            }
-            continue;
-        }
-
-        match super::client::MqttRelay::connect(&config) {
-            Ok(r) => break r,
-            Err(e) if managed => {
-                log::log_warn("relay", "relay_worker.connect_err", &e.to_string());
-                match managed_idle(&shutdown, binary.as_ref(), false) {
-                    Some(c) => config = c,
-                    None => return 0,
-                }
-            }
-            Err(e) => {
-                eprintln!("Error: Failed to connect: {e}");
-                return 1;
-            }
-        }
-    };
+    let (mut relay, mut connection) =
+        match connect_session(&mut config, &cmd_rx, &shutdown, binary.as_ref(), managed) {
+            Ok(session) => session,
+            Err(code) => return code,
+        };
 
     // Bind TCP notify listener for CLI → daemon push wake.
     // CLI callers (hcom send, hooks) connect to trigger immediate push.
@@ -408,12 +393,62 @@ pub fn run() -> i32 {
 
     // Spawn auto-exit watchdog thread (also monitors shutdown flag)
     let cmd_tx_watchdog = cmd_tx;
+    let shutdown_watchdog = Arc::clone(&shutdown);
+    let binary_watchdog = binary.clone();
     std::thread::spawn(move || {
-        auto_exit_watchdog(cmd_tx_watchdog, shutdown, binary, managed);
+        auto_exit_watchdog(cmd_tx_watchdog, shutdown_watchdog, binary_watchdog, managed);
     });
 
-    // Run relay event loop (blocks until shutdown)
-    relay.run(connection);
+    // Session loop: `relay.run` is one MQTT session. When the session ends or
+    // errors, reconnect with bounded exponential backoff (1s..60s with jitter,
+    // reset after a healthy session) instead of exiting — an unmanaged worker
+    // has no supervisor to bring it back. Every deliberate stop still exits:
+    // shutdown signal, watchdog auto-exit, binary replacement, and the
+    // connect-block exits (relay disabled/unconfigured without a service
+    // manager, connect failure). See `RunEnd`.
+    let mut reconnect_delay = Duration::from_secs(1);
+    let mut reconnect_attempt: u32 = 0;
+    let mut exit_code = 0;
+    loop {
+        let session_started = Instant::now();
+        match relay.run(connection) {
+            RunEnd::Shutdown => break,
+            RunEnd::Ended(reason) => {
+                log::log_info("relay", "relay.session_ended", &reason);
+                if session_started.elapsed() >= HEALTHY_SESSION {
+                    reconnect_delay = Duration::from_secs(1);
+                    reconnect_attempt = 0;
+                }
+                reconnect_attempt += 1;
+                let delay = jittered(reconnect_delay);
+                log::log_info(
+                    "relay",
+                    "relay.reconnect_attempt",
+                    &format!(
+                        "session restart, attempt {reconnect_attempt}, next in {}s",
+                        delay.as_secs()
+                    ),
+                );
+                if !wait_to_reconnect(&shutdown, binary.as_ref(), delay) {
+                    break;
+                }
+                reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+                // Re-enter the connect block with fresh config: relay may
+                // have been disabled or reconfigured while the session ran.
+                match HcomConfig::load(None) {
+                    Ok(c) => config = c,
+                    Err(e) => log::log_warn("relay", "relay_worker.config_err", &e.to_string()),
+                }
+                match connect_session(&mut config, &cmd_rx, &shutdown, binary.as_ref(), managed) {
+                    Ok(session) => (relay, connection) = session,
+                    Err(code) => {
+                        exit_code = code;
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     // Clear notify port so CLI callers stop trying to connect
     if notify_port.is_some()
@@ -423,7 +458,104 @@ pub fn run() -> i32 {
     }
 
     log::log_info("relay", "relay_worker.stop", "exited cleanly");
-    0
+    exit_code
+}
+
+/// The connect block: decide from config whether to build an MQTT session,
+/// idling while a managed worker waits for relay to be enabled or a failed
+/// connect to clear. Returns the session, or the exit code the worker must
+/// return — the deliberate exits kept exactly as they were: relay
+/// disabled/unconfigured and connect failure exit with 1 when no service
+/// manager owns the worker; a managed idle cut short by shutdown or binary
+/// replacement exits with 0.
+fn connect_session<'a>(
+    config: &mut HcomConfig,
+    cmd_rx: &'a std::sync::mpsc::Receiver<RelayCommand>,
+    shutdown: &AtomicBool,
+    binary: Option<&BinaryIdentity>,
+    managed: bool,
+) -> Result<(MqttRelay<'a>, rumqttc::v5::Connection), i32> {
+    loop {
+        if !super::is_relay_enabled(config) {
+            if !managed {
+                eprintln!("Error: Relay not configured or disabled");
+                return Err(1);
+            }
+            log::log_info(
+                "relay",
+                "relay_worker.idle",
+                "relay not configured or disabled; waiting",
+            );
+            match managed_idle(shutdown, binary, true) {
+                Some(c) => *config = c,
+                None => return Err(0),
+            }
+            continue;
+        }
+
+        match MqttRelay::connect(config, cmd_rx) {
+            Ok(session) => return Ok(session),
+            Err(e) if managed => {
+                log::log_warn("relay", "relay_worker.connect_err", &e.to_string());
+                match managed_idle(shutdown, binary, false) {
+                    Some(c) => *config = c,
+                    None => return Err(0),
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: Failed to connect: {e}");
+                return Err(1);
+            }
+        }
+    }
+}
+
+/// Cap for the worker's reconnect backoff between MQTT sessions.
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
+/// A session at least this long proves the connection is basically healthy:
+/// the next reconnect starts over from the minimum delay.
+const HEALTHY_SESSION: Duration = Duration::from_secs(5 * 60);
+
+/// Full-jitter a reconnect delay: the wait is drawn from [delay/2, delay], so
+/// workers that lost the same broker do not stampede it when it comes back.
+fn jittered(delay: Duration) -> Duration {
+    let roll = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| f64::from(d.subsec_nanos() % 1_000_000) / 1_000_000.0)
+        .unwrap_or(1.0);
+    delay / 2 + (delay - delay / 2).mul_f64(roll)
+}
+
+/// Interruptible wait between MQTT sessions. Heartbeats every second — a
+/// retrying worker is alive and must not read as stale — and aborts the
+/// moment a shutdown signal or a binary replacement arrives, so the reconnect
+/// backoff can never hold the process hostage. Returns false when the worker
+/// must exit.
+fn wait_to_reconnect(
+    shutdown: &AtomicBool,
+    binary: Option<&BinaryIdentity>,
+    delay: Duration,
+) -> bool {
+    let deadline = Instant::now() + delay;
+    let mut db = HcomDb::open().ok();
+    let mut last_heartbeat = Instant::now();
+    while Instant::now() < deadline {
+        if shutdown.load(Ordering::Relaxed) || binary_replaced(binary) {
+            return false;
+        }
+        if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+            if db.is_none() {
+                db = HcomDb::open().ok();
+            }
+            if let Some(d) = &db {
+                super::write_worker_heartbeat(d);
+            }
+            last_heartbeat = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
 }
 
 /// Managed-mode wait: tick every second checking the shutdown flag and binary
@@ -1272,5 +1404,81 @@ mod tests {
         let _ = stubborn.wait();
         assert_eq!(outcome, WorkerStop::Killed);
         assert_eq!(status.and_then(|s| s.signal()), Some(libc::SIGKILL));
+    }
+
+    /// The reconnect backoff must never hold the process hostage: a shutdown
+    /// arriving during the wait aborts it promptly, so the reconnect loop can
+    /// not swallow SIGTERM.
+    #[test]
+    #[serial]
+    fn reconnect_backoff_aborts_on_shutdown() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                shutdown.store(true, Ordering::Relaxed);
+            })
+        };
+        let started = Instant::now();
+        assert!(!wait_to_reconnect(&shutdown, None, Duration::from_secs(30)));
+        let elapsed = started.elapsed();
+        let _ = setter.join();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "reconnect backoff ignored shutdown for {elapsed:?}"
+        );
+    }
+
+    /// A shutdown requested before the wait must exit immediately.
+    #[test]
+    #[serial]
+    fn reconnect_backoff_exits_when_shutdown_already_set() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let shutdown = AtomicBool::new(true);
+        let started = Instant::now();
+        assert!(!wait_to_reconnect(&shutdown, None, Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A binary replaced during the reconnect backoff still exits.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn reconnect_backoff_exits_when_binary_replaced() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let path = dir.path().join("worker-binary");
+        std::fs::write(&path, b"old").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let identity = BinaryIdentity {
+            path: path.clone(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        std::fs::remove_file(&path).unwrap();
+        let shutdown = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(!wait_to_reconnect(
+            &shutdown,
+            Some(&identity),
+            Duration::from_secs(30)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Jitter keeps every wait within [delay/2, delay].
+    #[test]
+    fn reconnect_jitter_stays_within_bounds() {
+        let delay = Duration::from_secs(16);
+        for _ in 0..200 {
+            let j = jittered(delay);
+            assert!(
+                j >= delay / 2 && j <= delay,
+                "jittered {j:?} outside [{:?}, {delay:?}]",
+                delay / 2
+            );
+        }
     }
 }

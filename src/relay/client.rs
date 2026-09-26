@@ -92,8 +92,182 @@ impl Backoff {
     }
 }
 
+/// Why [`MqttRelay::run`] returned. Every deliberate stop the worker must
+/// honour — shutdown signal, watchdog auto-exit, binary replacement, command
+/// channel collapse — comes back as [`RunEnd::Shutdown`] and the process ends
+/// exactly as before. [`RunEnd::Ended`] means the MQTT session ended or
+/// errored and the worker must reconnect with a fresh one.
+#[derive(Debug)]
+pub enum RunEnd {
+    /// Deliberate shutdown: the worker exits after its cleanup.
+    Shutdown,
+    /// The session ended; the payload is what to log as `relay.session_ended`.
+    Ended(String),
+}
+
+/// Recover the inner `io::Error` of a connection error, if it carries one.
+fn io_error_in(err: &rumqttc::v5::ConnectionError) -> Option<&std::io::Error> {
+    use rumqttc::v5::StateError;
+    use rumqttc::v5::mqttbytes::Error as MqttError;
+    match err {
+        rumqttc::v5::ConnectionError::Io(e) => Some(e),
+        rumqttc::v5::ConnectionError::MqttState(StateError::Io(e)) => Some(e),
+        rumqttc::v5::ConnectionError::MqttState(StateError::Deserialization(MqttError::Io(e))) => {
+            Some(e)
+        }
+        _ => None,
+    }
+}
+
+/// Human-readable, correctly labelled form of a connection error.
+///
+/// rumqttc 0.25.1 reports socket *write* failures as
+/// `MqttState(Deserialization(Io(..)))` — v5/framed.rs maps `feed`/`flush`
+/// errors onto `StateError::Deserialization` — so a dead socket's EPIPE would
+/// otherwise log as "Deserialization". Classify by the inner io kind instead:
+/// EPIPE can only come from a write (a read on a dead socket returns EOF).
+fn classify_conn_error(err: &rumqttc::v5::ConnectionError) -> String {
+    use std::io::ErrorKind;
+    match io_error_in(err) {
+        Some(io) if io.kind() == ErrorKind::BrokenPipe => {
+            format!("write error: broken pipe (EPIPE) on the MQTT socket: {io}")
+        }
+        Some(io) => format!("io error ({:?}): {io}", io.kind()),
+        None => format!("{err:?}"),
+    }
+}
+
+/// The `hcom relay` status detail while disconnected: live retry state,
+/// rewritten at every attempt so the status never freezes on the first error
+/// of an outage. Once the worker has been down for
+/// [`MqttRelay::LIVENESS_TIMEOUT`] the detail also says so.
+fn reconnecting_detail(
+    attempt: u32,
+    next_in: Duration,
+    last_error: &str,
+    down_for: Duration,
+) -> String {
+    let mut detail = format!(
+        "reconnecting (attempt {attempt}, next in {}s, last error: {last_error}",
+        next_in.as_secs()
+    );
+    if down_for >= MqttRelay::LIVENESS_TIMEOUT {
+        detail.push_str(&format!("; not connected for {}s", down_for.as_secs()));
+    }
+    detail.push(')');
+    detail
+}
+
+/// Disconnect bookkeeping for one MQTT session. Drives the
+/// `relay.disconnected` / `relay.reconnect_attempt` / `relay.connected` log
+/// events and the live `hcom relay` status detail: one `relay.disconnected`
+/// line per disconnect epoch (the first error after a healthy period, or a
+/// server disconnect) and one `relay.reconnect_attempt` line per reconnect
+/// attempt. The old first-error-and-every-10th sparseness hid whole retry
+/// loops.
+struct DisconnectEpoch {
+    /// Last observed session state: true between ConnAck and the drop.
+    connected: bool,
+    /// When the current period without a connection began (session start
+    /// until the first ConnAck).
+    down_since: Instant,
+    /// Failed (re)connect attempts in the current disconnect epoch.
+    attempt: u32,
+    /// Whether the current epoch's `relay.disconnected` line was logged.
+    epoch_logged: bool,
+    consecutive_errors: u32,
+    last_error: String,
+}
+
+impl DisconnectEpoch {
+    fn new() -> Self {
+        Self {
+            connected: false,
+            down_since: Instant::now(),
+            attempt: 0,
+            epoch_logged: false,
+            consecutive_errors: 0,
+            last_error: String::new(),
+        }
+    }
+
+    /// A connection error — one more failed (re)connect attempt. Logs the
+    /// `relay.reconnect_attempt` line immediately (one line per attempt at the
+    /// connection thread's 1s..60s cadence) and refreshes the status detail.
+    fn note_error(&mut self, err: &rumqttc::v5::ConnectionError, next_in: Duration) {
+        self.consecutive_errors += 1;
+        let cause = classify_conn_error(err);
+        self.open_epoch(&cause, log::log_warn);
+        self.attempt += 1;
+        self.last_error = cause;
+        let detail = reconnecting_detail(
+            self.attempt,
+            next_in,
+            &self.last_error,
+            self.down_since.elapsed(),
+        );
+        log::log_warn("relay", "relay.reconnect_attempt", &detail);
+        if let Ok(db) = HcomDb::open() {
+            set_relay_status(&db, "error", Some(&detail), true);
+        }
+    }
+
+    /// The broker sent DISCONNECT: the session is down before the socket
+    /// errors out.
+    fn note_server_disconnect(&mut self) {
+        self.open_epoch("server disconnect", log::log_info);
+        self.last_error = "server disconnect".to_string();
+    }
+
+    /// Start a disconnect epoch unless already in one, logging its
+    /// `relay.disconnected` line exactly once.
+    fn open_epoch(&mut self, cause: &str, level: fn(&str, &str, &str)) {
+        if self.connected {
+            self.connected = false;
+            self.down_since = Instant::now();
+            self.attempt = 0;
+        }
+        if !self.epoch_logged {
+            self.epoch_logged = true;
+            level(
+                "relay",
+                "relay.disconnected",
+                &format!("{cause} (consecutive={})", self.consecutive_errors),
+            );
+        }
+    }
+
+    /// ConnAck: the session is up again. Logs `relay.connected` with the
+    /// downtime when this ends a disconnect epoch.
+    fn note_connected(&mut self) {
+        let down = self.down_since.elapsed();
+        let was_down = self.epoch_logged || self.attempt > 0;
+        if was_down {
+            log::log_info(
+                "relay",
+                "relay.connected",
+                &format!(
+                    "MQTT connected (reconnected after {}s down)",
+                    down.as_secs()
+                ),
+            );
+        } else {
+            log::log_info("relay", "relay.connected", "MQTT connected");
+        }
+        self.connected = true;
+        self.attempt = 0;
+        self.consecutive_errors = 0;
+        self.epoch_logged = false;
+        self.last_error.clear();
+    }
+}
+
 /// MQTT relay client. Manages connection, subscriptions, push/pull, and lifecycle.
-pub struct MqttRelay {
+///
+/// One instance is one MQTT session. `cmd_rx` is borrowed from the worker,
+/// which keeps the channel alive across sessions so a shutdown requested
+/// while a session is down still reaches the next one.
+pub struct MqttRelay<'a> {
     client: Client,
     relay_id: String,
     device_uuid: String,
@@ -103,28 +277,31 @@ pub struct MqttRelay {
     /// Replay guard (clock-skew + nonce LRU).
     replay_guard: Mutex<ReplayGuard>,
     /// Channel to receive commands (push, shutdown) from external callers.
-    cmd_rx: mpsc::Receiver<RelayCommand>,
+    cmd_rx: &'a mpsc::Receiver<RelayCommand>,
     /// Push interval (seconds between automatic push cycles).
     push_interval: Duration,
 }
 
-impl MqttRelay {
+impl<'a> MqttRelay<'a> {
     const INBOUND_PUSH_DEBOUNCE: Duration = Duration::from_millis(150);
 
     /// If no MQTT event (success or error) arrives within this duration, the
-    /// connection is presumed dead and the worker exits. Set to 2x the MQTT
+    /// connection thread is presumed stuck or dead and the session is ended
+    /// so the worker can reconnect with a fresh one. Set to 2x the MQTT
     /// keepalive (30s) to allow for normal idle periods where only PingResp
-    /// events flow.
+    /// events flow. Also the "has not been connected" threshold past which
+    /// `hcom relay` status must say so.
     const LIVENESS_TIMEOUT: Duration = Duration::from_secs(90);
 
-    /// Create and connect the MQTT relay client.
+    /// Build the MQTT relay client for one MQTT session.
     ///
-    /// Returns (MqttRelay, Connection, command_sender). The Connection must be
-    /// polled in a loop (its iterator drives the network I/O). The command_sender
-    /// lets external code trigger pushes or shutdown.
+    /// Returns (MqttRelay, Connection). The Connection must be polled in a
+    /// loop (its iterator drives the network I/O). Commands arrive on the
+    /// worker-lifetime `cmd_rx` channel.
     pub fn connect(
         config: &HcomConfig,
-    ) -> Result<(Self, Connection, mpsc::Sender<RelayCommand>), String> {
+        cmd_rx: &'a mpsc::Receiver<RelayCommand>,
+    ) -> Result<(Self, Connection), String> {
         if !is_relay_enabled(config) {
             return Err("relay not configured or disabled".into());
         }
@@ -169,8 +346,6 @@ impl MqttRelay {
         // Create client + connection (cap=10 for outgoing message buffer)
         let (client, connection) = Client::new(mqttoptions, 10);
 
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-
         let relay = MqttRelay {
             client,
             relay_id,
@@ -187,7 +362,7 @@ impl MqttRelay {
             &format!("connecting to {}:{}", host, port),
         );
 
-        Ok((relay, connection, cmd_tx))
+        Ok((relay, connection))
     }
 
     /// Subscribe to relay topics. Called on initial connect and after every reconnect.
@@ -204,12 +379,14 @@ impl MqttRelay {
         Ok(())
     }
 
-    /// Run the main relay event loop. Blocks until shutdown.
+    /// Run one MQTT session: the main relay event loop. Blocks until the
+    /// session ends — see [`RunEnd`]: a deliberate shutdown (the worker
+    /// exits) or a dead/errored session (the worker reconnects).
     ///
     /// Spawns a throttled thread for the Connection polling and interleaves
     /// MQTT events with commands in the main worker loop.
     /// Uses manual exponential backoff on connection errors.
-    pub fn run(self, connection: Connection) {
+    pub fn run(self, connection: Connection) -> RunEnd {
         // Forward MQTT events from the blocking connection poller to the main
         // loop. Sleeping in this thread after errors throttles rumqttc reconnects
         // while the main worker loop stays responsive and keeps heartbeating.
@@ -233,15 +410,13 @@ impl MqttRelay {
         });
 
         let mut backoff = Backoff::new();
-        let mut backoff_until = Instant::now();
         let mut last_push = Instant::now();
         let mut pending_push_at: Option<Instant> = None;
-        let mut connected = false;
+        let mut epoch = DisconnectEpoch::new();
         // Track last time we received ANY event (success or error) from the
         // connection thread. If this goes stale, the connection thread is dead
-        // and we should exit so a fresh worker can spawn.
+        // or wedged and the session is ended so the worker can reconnect.
         let mut last_event_from_conn = Instant::now();
-        let mut consecutive_errors: u32 = 0;
 
         // Heartbeat: write epoch timestamp to KV every ~1s so readers can detect
         // unclean exits (SIGKILL, panic) that leave a stale pidfile behind. Held
@@ -273,63 +448,73 @@ impl MqttRelay {
                 Ok(RelayCommand::Shutdown) => {
                     log::log_info("relay", "relay.shutdown", "shutdown requested");
                     self.shutdown_graceful(&event_rx);
-                    return;
+                    return RunEnd::Shutdown;
                 }
                 Ok(RelayCommand::Push) => {
-                    self.do_push_cycle(connected);
+                    self.do_push_cycle(epoch.connected);
                     last_push = Instant::now();
                     pending_push_at = None;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log::log_info("relay", "relay.shutdown", "command channel closed");
                     self.shutdown_graceful(&event_rx);
-                    return;
+                    return RunEnd::Shutdown;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
 
             // Periodic push
-            if connected && last_push.elapsed() >= self.push_interval {
-                self.do_push_cycle(connected);
+            if epoch.connected && last_push.elapsed() >= self.push_interval {
+                self.do_push_cycle(epoch.connected);
                 last_push = Instant::now();
                 pending_push_at = None;
             }
 
-            if connected && pending_push_at.is_some_and(|deadline| Instant::now() >= deadline) {
-                self.do_push_cycle(connected);
+            if epoch.connected && pending_push_at.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.do_push_cycle(epoch.connected);
                 last_push = Instant::now();
                 pending_push_at = None;
             }
 
-            // During backoff, skip event processing and just sleep.
-            // Reset liveness timer so intentional backoff periods don't trigger
-            // false alarms — the connection thread may be queuing errors that
-            // we'll drain after backoff expires.
-            if Instant::now() < backoff_until {
-                last_event_from_conn = Instant::now();
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-
-            // Liveness check: if no event (success or error) from the connection
-            // thread for well beyond the keepalive interval, the thread is stuck
-            // or dead but hasn't closed the channel. Exit so a fresh worker spawns.
-            // Only checked outside backoff — during backoff, events queue in the
-            // channel and last_event_from_conn is held fresh above.
+            // Liveness check — every tick, including during reconnect backoff
+            // (the old code reset this timer there, so it could never fire):
+            // if no event (success or error) arrives from the connection
+            // thread for well beyond the keepalive interval, the thread is
+            // stuck or dead but hasn't closed the channel. End the session so
+            // the worker reconnects, and say so in the status detail instead
+            // of leaving a stale error frozen there.
             if last_event_from_conn.elapsed() > Self::LIVENESS_TIMEOUT {
+                let silent = last_event_from_conn.elapsed();
                 log::log_warn(
                     "relay",
                     "relay.liveness_timeout",
                     &format!(
-                        "no MQTT events for {}s, connection presumed dead — exiting",
-                        last_event_from_conn.elapsed().as_secs()
+                        "no MQTT events for {}s, connection presumed dead — ending session",
+                        silent.as_secs()
                     ),
                 );
+                let cause = format!(
+                    "no MQTT events for {}s (connection presumed dead)",
+                    silent.as_secs()
+                );
                 if let Ok(db) = HcomDb::open() {
-                    set_relay_status(&db, "error", Some("liveness timeout"), true);
+                    set_relay_status(
+                        &db,
+                        "error",
+                        Some(&reconnecting_detail(
+                            epoch.attempt,
+                            backoff.wait_duration(),
+                            &cause,
+                            epoch.down_since.elapsed(),
+                        )),
+                        true,
+                    );
                 }
-                self.shutdown_graceful(&event_rx);
-                return;
+                return RunEnd::Ended(format!(
+                    "liveness timeout: no MQTT events for {}s",
+                    silent.as_secs()
+                ));
             }
 
             // Drain queued MQTT events (up to a cap), then poll once with
@@ -351,8 +536,7 @@ impl MqttRelay {
                         drained = true;
                         backoff.reset();
                         last_event_from_conn = Instant::now();
-                        consecutive_errors = 0;
-                        if self.handle_event(event, &mut connected) {
+                        if self.handle_event(event, &mut epoch) {
                             trigger_push = true;
                         }
                     }
@@ -360,30 +544,11 @@ impl MqttRelay {
                         drain_count += 1;
                         drained = true;
                         last_event_from_conn = Instant::now();
-                        consecutive_errors += 1;
-                        let err_msg = format!("{:?}", conn_err);
-
-                        // Log first error, then every 10th
-                        if connected
-                            || consecutive_errors <= 1
-                            || consecutive_errors.is_multiple_of(10)
-                        {
-                            log::log_warn(
-                                "relay",
-                                "relay.disconnected",
-                                &format!("{} (consecutive={})", err_msg, consecutive_errors),
-                            );
-                        }
-
-                        if connected {
-                            connected = false;
-                            if let Ok(db) = HcomDb::open() {
-                                set_relay_status(&db, "error", Some(&err_msg), true);
-                            }
-                        }
+                        epoch.note_error(&conn_err, backoff.wait_duration());
+                        backoff.increase();
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        // Queue fully drained — safe to apply backoff if needed.
+                        // Queue fully drained.
                         break;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -394,16 +559,7 @@ impl MqttRelay {
             }
             if channel_disconnected {
                 log::log_info("relay", "relay.shutdown", "connection thread ended");
-                self.shutdown_graceful(&event_rx);
-                return;
-            }
-
-            // Apply backoff whenever the latest observed state is an error.
-            // The connection thread also throttles actual reconnect polling;
-            // this sleep prevents the main loop from hot-draining error bursts.
-            if drained && consecutive_errors > 0 {
-                backoff_until = Instant::now() + backoff.wait_duration();
-                backoff.increase();
+                return RunEnd::Ended("connection thread ended".to_string());
             }
 
             if trigger_push {
@@ -418,8 +574,7 @@ impl MqttRelay {
                     Ok(Ok(event)) => {
                         backoff.reset();
                         last_event_from_conn = Instant::now();
-                        consecutive_errors = 0;
-                        if self.handle_event(event, &mut connected) {
+                        if self.handle_event(event, &mut epoch) {
                             let next_push = last_push + Self::INBOUND_PUSH_DEBOUNCE;
                             pending_push_at = Some(
                                 pending_push_at
@@ -429,27 +584,7 @@ impl MqttRelay {
                     }
                     Ok(Err(conn_err)) => {
                         last_event_from_conn = Instant::now();
-                        consecutive_errors += 1;
-                        let err_msg = format!("{:?}", conn_err);
-
-                        if connected
-                            || consecutive_errors <= 1
-                            || consecutive_errors.is_multiple_of(10)
-                        {
-                            log::log_warn(
-                                "relay",
-                                "relay.disconnected",
-                                &format!("{} (consecutive={})", err_msg, consecutive_errors),
-                            );
-                        }
-
-                        if connected {
-                            connected = false;
-                            if let Ok(db) = HcomDb::open() {
-                                set_relay_status(&db, "error", Some(&err_msg), true);
-                            }
-                        }
-                        backoff_until = Instant::now() + backoff.wait_duration();
+                        epoch.note_error(&conn_err, backoff.wait_duration());
                         backoff.increase();
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -457,8 +592,7 @@ impl MqttRelay {
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         log::log_info("relay", "relay.shutdown", "connection thread ended");
-                        self.shutdown_graceful(&event_rx);
-                        return;
+                        return RunEnd::Ended("connection thread ended".to_string());
                     }
                 }
             }
@@ -466,12 +600,11 @@ impl MqttRelay {
     }
 
     /// Handle a single MQTT event.
-    fn handle_event(&self, event: Event, connected: &mut bool) -> bool {
+    fn handle_event(&self, event: Event, epoch: &mut DisconnectEpoch) -> bool {
         match event {
             Event::Incoming(incoming) => match incoming {
                 Packet::ConnAck(_connack) => {
-                    *connected = true;
-                    log::log_info("relay", "relay.connected", "MQTT connected");
+                    epoch.note_connected();
                     if let Ok(db) = HcomDb::open() {
                         set_relay_status(&db, "ok", None, true);
                     }
@@ -489,8 +622,7 @@ impl MqttRelay {
                     self.handle_incoming_message(&topic, &payload)
                 }
                 Packet::Disconnect(_) => {
-                    *connected = false;
-                    log::log_info("relay", "relay.disconnected", "server disconnect");
+                    epoch.note_server_disconnect();
                     false
                 }
                 _ => false, // PingResp, SubAck, PubAck — ignore
@@ -938,5 +1070,62 @@ mod tests {
 
         assert!(payload["state"].is_null());
         assert_eq!(payload["events"], json!([]));
+    }
+
+    /// rumqttc 0.25.1 reports a socket write failure as
+    /// `MqttState(Deserialization(Io(..)))` (v5/framed.rs maps `feed`/`flush`
+    /// errors there). A write-side EPIPE must be labelled as a write error,
+    /// never as "Deserialization".
+    #[test]
+    fn epipe_is_labeled_a_write_error_not_deserialization() {
+        use rumqttc::v5::StateError;
+        use rumqttc::v5::mqttbytes::Error as MqttError;
+        let err = rumqttc::v5::ConnectionError::MqttState(StateError::Deserialization(
+            MqttError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        ));
+        let label = classify_conn_error(&err);
+        assert!(label.contains("write error"), "{label}");
+        assert!(label.contains("broken pipe"), "{label}");
+        assert!(!label.to_lowercase().contains("deserialization"), "{label}");
+    }
+
+    /// Non-write io errors keep their io kind in the label.
+    #[test]
+    fn io_errors_carry_their_kind() {
+        let err = rumqttc::v5::ConnectionError::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        ));
+        let label = classify_conn_error(&err);
+        assert!(label.starts_with("io error (ConnectionRefused)"), "{label}");
+    }
+
+    /// The disconnected status detail is rewritten per attempt (never a frozen
+    /// first error) and says "not connected for" past the liveness threshold.
+    #[test]
+    fn reconnecting_detail_is_live_and_reports_long_downtime() {
+        let short = reconnecting_detail(
+            3,
+            Duration::from_secs(8),
+            "write error: broken pipe (EPIPE)",
+            Duration::from_secs(20),
+        );
+        assert_eq!(
+            short,
+            "reconnecting (attempt 3, next in 8s, last error: write error: broken pipe (EPIPE))"
+        );
+
+        let long = reconnecting_detail(
+            12,
+            Duration::from_secs(60),
+            "io error (ConnectionRefused): refused",
+            Duration::from_secs(125),
+        );
+        assert!(
+            long.starts_with(
+                "reconnecting (attempt 12, next in 60s, last error: io error (ConnectionRefused): refused"
+            ),
+            "{long}"
+        );
+        assert!(long.contains("not connected for 125s"), "{long}");
     }
 }
