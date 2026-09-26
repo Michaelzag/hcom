@@ -481,6 +481,28 @@ impl HcomDb {
             .is_ok()
     }
 
+    /// Process ids besides `exclude_process_id` still bound to `instance_name`.
+    /// A binding move off `instance_name` must not retire it while another
+    /// process legitimately holds it (session-switch strand fix).
+    pub fn other_process_bindings_for_instance(
+        &self,
+        instance_name: &str,
+        exclude_process_id: &str,
+    ) -> Result<Vec<String>> {
+        if instance_name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT process_id FROM process_bindings WHERE instance_name = ? AND process_id != ?",
+        )?;
+        let owners = stmt
+            .query_map(params![instance_name, exclude_process_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(owners)
+    }
+
     /// Set process binding (map process_id -> instance/session).
     /// Set process binding. Empty session_id is stored as NULL.
     pub fn set_process_binding(
