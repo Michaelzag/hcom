@@ -238,73 +238,70 @@ impl HcomDb {
     /// currently missing or empty so late-bound PTY metadata can be persisted
     /// without clobbering richer hook-captured context.
     pub fn store_launch_context(&self, name: &str, context_json: &str) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
-            let existing_json: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT launch_context FROM instances WHERE name = ?",
-                    params![name],
-                    |row| row.get(0),
-                )
-                .optional()?;
+        self.with_immediate_transaction(|tx| {
+            self.store_launch_context_in_txn(tx, name, context_json)
+        })
+    }
 
-            let existing_json = existing_json.unwrap_or_default();
-            if existing_json.is_empty() {
-                self.conn.execute(
-                    "UPDATE instances SET launch_context = ? WHERE name = ?",
-                    params![context_json, name],
-                )?;
-                return Ok(());
-            }
+    /// [`Self::store_launch_context`] on the caller's transaction, with no
+    /// BEGIN of its own; the caller's transaction makes the merge atomic.
+    pub fn store_launch_context_in_txn(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        name: &str,
+        context_json: &str,
+    ) -> Result<()> {
+        let existing_json: Option<String> = tx
+            .query_row(
+                "SELECT launch_context FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
 
-            let mut existing = match serde_json::from_str::<
-                serde_json::Map<String, serde_json::Value>,
-            >(&existing_json)
-            {
-                Ok(map) => map,
-                Err(_) => return Ok(()),
-            };
-            let incoming = match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
-                context_json,
-            ) {
-                Ok(map) => map,
-                Err(_) => return Ok(()),
-            };
+        let existing_json = existing_json.unwrap_or_default();
+        if existing_json.is_empty() {
+            tx.execute(
+                "UPDATE instances SET launch_context = ? WHERE name = ?",
+                params![context_json, name],
+            )?;
+            return Ok(());
+        }
 
-            let mut changed = false;
-            for (key, value) in incoming {
-                let should_fill = existing.get(&key).is_none_or(|current| {
-                    current.is_null() || current.as_str().is_some_and(str::is_empty)
-                });
-                if should_fill {
-                    existing.insert(key, value);
-                    changed = true;
-                }
-            }
+        let mut existing = match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            &existing_json,
+        ) {
+            Ok(map) => map,
+            Err(_) => return Ok(()),
+        };
+        let incoming = match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            context_json,
+        ) {
+            Ok(map) => map,
+            Err(_) => return Ok(()),
+        };
 
-            if changed {
-                self.conn.execute(
-                    "UPDATE instances SET launch_context = ? WHERE name = ?",
-                    params![
-                        serde_json::to_string(&existing).unwrap_or_else(|_| "{}".to_string()),
-                        name
-                    ],
-                )?;
-            }
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
+        let mut changed = false;
+        for (key, value) in incoming {
+            let should_fill = existing.get(&key).is_none_or(|current| {
+                current.is_null() || current.as_str().is_some_and(str::is_empty)
+            });
+            if should_fill {
+                existing.insert(key, value);
+                changed = true;
             }
         }
+
+        if changed {
+            tx.execute(
+                "UPDATE instances SET launch_context = ? WHERE name = ?",
+                params![
+                    serde_json::to_string(&existing).unwrap_or_else(|_| "{}".to_string()),
+                    name
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     /// Get instance tag (for display name computation).

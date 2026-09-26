@@ -82,10 +82,11 @@ fn claude_children_for_session(txn: &Transaction<'_>, session_id: &str) -> Resul
 }
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
-
-#[cfg(test)]
-static TEST_MIGRATE_NOTIFY_FAIL: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// Injected endpoint-migration failure. Thread-scoped, so a test that sets
+    /// it never fails a switch another test runs at the same time.
+    static TEST_MIGRATE_NOTIFY_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 impl HcomDb {
     /// Delete process binding (for cleanup)
@@ -194,12 +195,31 @@ impl HcomDb {
             return Ok(());
         }
 
+        let tx = self.conn.unchecked_transaction()?;
+        self.migrate_notify_endpoints_in_txn(&tx, old_name, new_name)?;
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    /// [`Self::migrate_notify_endpoints`] on the caller's transaction, with no
+    /// BEGIN of its own: the endpoints move in the caller's commit, so no
+    /// reader ever finds them on neither row.
+    pub fn migrate_notify_endpoints_in_txn(
+        &self,
+        tx: &Transaction<'_>,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        if old_name == new_name {
+            return Ok(());
+        }
+
         #[cfg(test)]
-        if TEST_MIGRATE_NOTIFY_FAIL.load(Ordering::SeqCst) {
+        if TEST_MIGRATE_NOTIFY_FAIL.with(std::cell::Cell::get) {
             return Err(anyhow::anyhow!("test_injected_migrate_notify_fail"));
         }
 
-        let tx = self.conn.unchecked_transaction()?;
         // Drop target rows for kinds the source will bring (source wins), keeping
         // target-only kinds like `plugin`.
         tx.execute(
@@ -213,7 +233,6 @@ impl HcomDb {
             "UPDATE notify_endpoints SET instance = ?2 WHERE instance = ?1",
             params![old_name, new_name],
         )?;
-        tx.commit()?;
 
         Ok(())
     }
@@ -764,7 +783,7 @@ impl HcomDb {
 #[cfg(test)]
 impl HcomDb {
     pub fn set_test_migrate_notify_fail(fail: bool) {
-        TEST_MIGRATE_NOTIFY_FAIL.store(fail, Ordering::SeqCst);
+        TEST_MIGRATE_NOTIFY_FAIL.with(|flag| flag.set(fail));
     }
 }
 
