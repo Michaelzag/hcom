@@ -331,13 +331,22 @@ pending-message lookup, have not finished within 1500 ms it refuses "plugin
 busy: checks exceeded 1500 ms", releases its reservation, and does not start.
 If hcom sees no reply within 5 s it prints "no reply from plugin within 5 s;
 the seat was NOT asked to compact" and exits non-zero — true by construction,
-because the plugin never starts past its smaller budget. A second real request
-while one is reserved refuses "compaction already in progress" (a dry run
-reports the same reason and never reserves). The start reply carries
+because the plugin never starts past its smaller budget. The plugin's timing
+is injectable (`now()` + `setTimer`/`clearTimer`, real clocks and one unref'd
+timer in production), so its tests advance a fake clock explicitly and never
+sleep. A second real request while one is reserved refuses "compaction already
+in progress (started Ns ago)" (a dry run reports the same reason, with the
+reservation's age, and never reserves). The start reply carries
 `started_at` (plugin epoch ms); hcom accepts a compaction record only when its
 timestamp is at or after that instant minus 1 s and strictly newer than the
-newest record it saw before the request. A reservation older than the 600 s
-max `--timeout` plus 30 s is released so a hung compact cannot wedge the seat.
+newest record it saw before the request. The reservation is released only
+when omp's `ctx.compact()` promise settles (resolve or reject); a refused
+request releases it immediately, since it never started anything. There is
+deliberately no stale bound and no wall-clock coupling to `--timeout`: the
+reservation mirrors omp's compaction state, so if omp's compact promise never
+settles, omp itself cannot compact again either and "compaction already in
+progress (started Ns ago)" is the true answer until the seat restarts — the
+age in every refusal and dry run makes such a wedged seat visible.
 omp 18.3.1's extension context does not expose `isCompacting` (that flag is on
 AgentSession); the plugin honors it if a host adds it, and otherwise only its
 own reservation can see an in-progress compact.

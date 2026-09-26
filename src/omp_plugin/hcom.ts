@@ -403,97 +403,93 @@ export function handleCompactQuery(
 export const PLUGIN_COMPACT_BUDGET_MS = 1500;
 /** CLI reply deadline for `{"q":"compact"}`. Context probes stay at 500 ms. */
 export const CLI_COMPACT_REPLY_DEADLINE_MS = 5000;
-/** Documented max of `hcom compact --timeout` (the clap default, 600 s). */
-export const CLI_COMPACT_MAX_TIMEOUT_MS = 600_000;
-/** Margin past that max so a CLI still inside it is not overtaken. */
-export const COMPACT_RESERVATION_MARGIN_MS = 30_000;
-/** A reservation older than this is stale: a hung compact must not wedge the seat. */
-export const COMPACT_RESERVATION_STALE_MS =
-	CLI_COMPACT_MAX_TIMEOUT_MS + COMPACT_RESERVATION_MARGIN_MS;
 
 export const COMPACT_ALREADY = "compaction already in progress";
 export const COMPACT_BUDGET_REFUSAL = `plugin busy: checks exceeded ${PLUGIN_COMPACT_BUDGET_MS} ms`;
 
-/** One seat's compact reservation. Taken synchronously, released on settle. */
+/**
+ * The held-reservation refusal names the hold's age
+ * (`compaction already in progress (started Ns ago)`), in dry runs and
+ * refusals alike, so a wedged seat is visible.
+ */
+export function compactAlreadyInProgress(reservedAtMs: number, nowMs: number): string {
+	const ageS = Math.max(0, Math.floor((nowMs - reservedAtMs) / 1000));
+	return `${COMPACT_ALREADY} (started ${ageS}s ago)`;
+}
+
+/**
+ * Injectable timing. Production uses [`systemClock`]; tests pass a
+ * controllable fake and advance it explicitly, so no compact-path test
+ * depends on real timers, real sleeps, or event-loop liveness.
+ */
+export interface CompactClock {
+	/** Monotonic ms (`performance.now()` in production): the check budget. */
+	now(): number;
+	/** Epoch ms (`Date.now()` in production): `started_at` and the hold's age. */
+	epoch(): number;
+	/** Arm `fn` after `ms`. Production unrefs it so it never holds the process. */
+	setTimer(fn: () => void, ms: number): unknown;
+	/** Cancel a timer armed by `setTimer`. */
+	clearTimer(handle: unknown): void;
+}
+
+/** Production timing: real clocks and one unref'd timer per budget race. */
+export const systemClock: CompactClock = {
+	now: () => performance.now(),
+	epoch: () => Date.now(),
+	setTimer(fn, ms) {
+		const timer = setTimeout(fn, ms);
+		timer.unref();
+		return timer;
+	},
+	clearTimer(handle) {
+		clearTimeout(handle as NodeJS.Timeout);
+	},
+};
+
+/**
+ * One seat's compact reservation. Taken synchronously on a real request,
+ * released ONLY when the `ctx.compact()` promise settles (resolve or reject)
+ * — or immediately when the request refuses, since a refused request never
+ * started anything. There is deliberately no stale bound: the reservation
+ * mirrors omp's real compaction state, so a compact whose promise never
+ * settles keeps refusing "compaction already in progress (started Ns ago)"
+ * until the seat restarts (omp itself cannot compact again either).
+ */
 export interface CompactGate {
 	/** Epoch ms when the live reservation was taken; null when free. */
 	reservedAt: number | null;
 	/** Identity of the current claim. A settle only releases its own token. */
 	token: number;
-	timer: NodeJS.Timeout | null;
 }
 
 export function createCompactGate(): CompactGate {
-	return { reservedAt: null, token: 0, timer: null };
+	return { reservedAt: null, token: 0 };
 }
 
 export interface CompactRequestRun {
 	gate: CompactGate;
 	query: CompactRequest;
 	ctx: CompactCheckContext | null;
-	/** Undelivered hcom-message count. Delayed in tests to exceed the budget. */
+	/** Undelivered hcom-message count. Slowed in tests to exceed the budget. */
 	fetchPending: () => Promise<number>;
 	/** Reply line, without the trailing newline. Called before `ctx.compact`. */
 	writeReply: (reply: string) => void;
-	now?: () => number;
-	mono?: () => number;
-	budgetMs?: number;
-	staleMs?: number;
+	/** Timing dependency; defaults to [`systemClock`]. */
+	clock?: CompactClock;
 	onCompactFailed?: (error: unknown) => void;
-	onStale?: (reservedAt: number) => void;
 }
 
 function refuseReply(reasons: string[]): string {
 	return JSON.stringify({ ok: false, refuse: reasons });
 }
 
-function clearStaleTimer(gate: CompactGate): void {
-	if (gate.timer !== null) {
-		clearTimeout(gate.timer);
-		gate.timer = null;
-	}
-}
-
 /** Drop `token`'s reservation. A newer claim (different token) is left alone. */
 function releaseOwned(gate: CompactGate, token: number): boolean {
 	if (gate.token !== token || gate.reservedAt === null) return false;
 	gate.reservedAt = null;
-	clearStaleTimer(gate);
 	gate.token += 1;
 	return true;
-}
-
-function armStaleTimer(
-	gate: CompactGate,
-	token: number,
-	staleMs: number,
-	onStale?: (reservedAt: number) => void,
-): void {
-	clearStaleTimer(gate);
-	const timer = setTimeout(() => {
-		if (gate.token !== token || gate.reservedAt === null) return;
-		const reservedAt = gate.reservedAt;
-		gate.reservedAt = null;
-		gate.timer = null;
-		gate.token += 1;
-		onStale?.(reservedAt);
-	}, staleMs);
-	timer.unref();
-	gate.timer = timer;
-}
-
-function releaseIfStale(
-	gate: CompactGate,
-	nowMs: number,
-	staleMs: number,
-	onStale?: (reservedAt: number) => void,
-): void {
-	if (gate.reservedAt === null || nowMs - gate.reservedAt < staleMs) return;
-	const reservedAt = gate.reservedAt;
-	gate.reservedAt = null;
-	clearStaleTimer(gate);
-	gate.token += 1;
-	onStale?.(reservedAt);
 }
 
 class CompactBudgetExceeded extends Error {
@@ -507,19 +503,18 @@ async function awaitWithinBudget<T>(
 	work: Promise<T>,
 	budgetMs: number,
 	startedMono: number,
-	mono: () => number,
+	clock: CompactClock,
 ): Promise<T> {
-	const left = budgetMs - (mono() - startedMono);
+	const left = budgetMs - (clock.now() - startedMono);
 	if (left <= 0) throw new CompactBudgetExceeded();
-	let timer: NodeJS.Timeout | undefined;
+	let timer: unknown;
 	const timeout = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => reject(new CompactBudgetExceeded()), left);
-		timer.unref();
+		timer = clock.setTimer(() => reject(new CompactBudgetExceeded()), left);
 	});
 	try {
 		return await Promise.race([work, timeout]);
 	} finally {
-		clearTimeout(timer);
+		clock.clearTimer(timer);
 	}
 }
 
@@ -555,20 +550,23 @@ function fireCompact(
 // One compact request: reserve synchronously (real runs only) before any
 // await, refuse when a reservation is already held, and never start once the
 // check budget has passed. The reply is written before `ctx.compact` is fired;
-// the reservation drops when that promise settles, on any refusal, or when it
-// goes stale (CLI max --timeout plus margin).
+// the reservation drops when that promise settles (resolve OR reject), or the
+// moment the request refuses. There is no stale bound: the reservation mirrors
+// omp's compaction state, never the wall clock.
 export async function serveCompactRequest(run: CompactRequestRun): Promise<{ start: boolean }> {
-	const now = run.now ?? Date.now;
-	const mono = run.mono ?? (() => performance.now());
-	const budgetMs = run.budgetMs ?? PLUGIN_COMPACT_BUDGET_MS;
-	const staleMs = run.staleMs ?? COMPACT_RESERVATION_STALE_MS;
-	const receivedMono = mono();
-	const receivedEpoch = now();
+	const clock = run.clock ?? systemClock;
+	const budgetMs = PLUGIN_COMPACT_BUDGET_MS;
+	const receivedMono = clock.now();
+	const receivedEpoch = clock.epoch();
 	const gate = run.gate;
 
 	// Synchronous, before any await: a second real request must see the hold.
-	releaseIfStale(gate, receivedEpoch, staleMs, run.onStale);
-	if (gate.reservedAt !== null || (typeof run.ctx?.isCompacting === "function" && run.ctx.isCompacting())) {
+	// A dry run reports the same reason — with the hold's age — and never reserves.
+	if (gate.reservedAt !== null) {
+		run.writeReply(refuseReply([compactAlreadyInProgress(gate.reservedAt, receivedEpoch)]));
+		return { start: false };
+	}
+	if (typeof run.ctx?.isCompacting === "function" && run.ctx.isCompacting()) {
 		run.writeReply(refuseReply([COMPACT_ALREADY]));
 		return { start: false };
 	}
@@ -578,12 +576,11 @@ export async function serveCompactRequest(run: CompactRequestRun): Promise<{ sta
 		gate.token += 1;
 		owned = gate.token;
 		gate.reservedAt = receivedEpoch;
-		armStaleTimer(gate, owned, staleMs, run.onStale);
 	}
 
 	let pendingCount = 0;
 	try {
-		pendingCount = await awaitWithinBudget(run.fetchPending(), budgetMs, receivedMono, mono);
+		pendingCount = await awaitWithinBudget(run.fetchPending(), budgetMs, receivedMono, clock);
 	} catch (error) {
 		if (owned !== null) releaseOwned(gate, owned);
 		if (error instanceof CompactBudgetExceeded) {
@@ -595,7 +592,7 @@ export async function serveCompactRequest(run: CompactRequestRun): Promise<{ sta
 		return { start: false };
 	}
 
-	if (mono() - receivedMono > budgetMs) {
+	if (clock.now() - receivedMono > budgetMs) {
 		if (owned !== null) releaseOwned(gate, owned);
 		run.writeReply(refuseReply([COMPACT_BUDGET_REFUSAL]));
 		return { start: false };
@@ -610,12 +607,12 @@ export async function serveCompactRequest(run: CompactRequestRun): Promise<{ sta
 
 	// Last synchronous step before the reply: a budget that expired while the
 	// checks were finishing still refuses, and never starts.
-	if (mono() - receivedMono > budgetMs) {
+	if (clock.now() - receivedMono > budgetMs) {
 		if (owned !== null) releaseOwned(gate, owned);
 		run.writeReply(refuseReply([COMPACT_BUDGET_REFUSAL]));
 		return { start: false };
 	}
-	const startedAt = now();
+	const startedAt = clock.epoch();
 	run.writeReply(JSON.stringify({ ok: true, compacting: true, started_at: startedAt }));
 	if (run.ctx && owned !== null) {
 		fireCompact(run.ctx, run.query, gate, owned, run.onCompactFailed);
@@ -679,7 +676,8 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	// One `{"q":"compact"}` request. Reservation and the check budget live in
 	// `serveCompactRequest`: the reply is written before `ctx.compact` runs,
-	// and a failure to compact is logged, not returned (the reply already left).
+	// the reservation is held until that promise settles, and a failure to
+	// compact is logged, not returned (the reply already left).
 	async function runCompactQuery(socket: Socket, query: CompactRequest): Promise<void> {
 		const outcome = await serveCompactRequest({
 			gate: compactGate,
@@ -696,11 +694,6 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			},
 			onCompactFailed: (error) => {
 				log("ERROR", "plugin.compact_failed", instanceName, { error: String(error) });
-			},
-			onStale: (reservedAt) => {
-				log("WARN", "plugin.compact_reservation_stale", instanceName, {
-					reserved_at: reservedAt,
-				});
 			},
 		});
 		log("DEBUG", "notify_server.compact_query", instanceName, {

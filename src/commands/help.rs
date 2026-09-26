@@ -224,10 +224,10 @@ const COMPACT_HELP: &[HelpEntry] = &[
         "  omp ctx.compact(), its own live checks at request time.",
     ),
     ("", "One compact at a time. A second request refuses"),
-    (
-        "",
-        "  \"compaction already in progress\" and does not start.",
-    ),
+    ("", "  \"compaction already in progress (started Ns ago)\""),
+    ("", "  and never starts. The hold releases only when omp's"),
+    ("", "  compact settles (or on a refusal): no stale bound,"),
+    ("", "  and the age in every refusal shows a wedged seat."),
     (
         "",
         "Plugin checks finish within 1500 ms or the plugin refuses",
