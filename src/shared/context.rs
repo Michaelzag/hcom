@@ -10,6 +10,11 @@ use std::path::PathBuf;
 use crate::db::HcomDb;
 use crate::tool::Tool;
 
+/// Minimum wall-clock seconds between two `identity.foreign_refused` log
+/// lines for the same process id. Hooks are separate short-lived processes,
+/// so the throttle state lives in the store's kv table.
+const FOREIGN_REFUSED_LOG_INTERVAL: f64 = 600.0;
+
 /// Per-request execution context.
 ///
 /// Constructed once at entry (hook invocation or CLI command), then passed
@@ -142,22 +147,25 @@ impl HcomContext {
     /// a proven OMP-minted id belongs to a plain or nested session. Other
     /// tools keep their existing synthetic-id carriage and launch claims.
     pub fn trust_process_id(&mut self, db: &HcomDb) {
+        let _ = self.trust_process_id_inner(db);
+    }
+
+    /// `trust_process_id` reporting whether this call emitted the
+    /// `identity.foreign_refused` log line.
+    fn trust_process_id_inner(&mut self, db: &HcomDb) -> bool {
         let Some(id) = self.process_id.clone() else {
             self.is_launched = false;
-            return;
+            return false;
         };
         let trusted = if self.tool == Tool::Omp {
             crate::proctruth::trusted_process_id_for_omp(db, &id)
         } else {
             crate::proctruth::trusted_process_id(db, &id)
         };
+        let mut logged = false;
         if !trusted {
             self.process_id = None;
-            crate::log::log_info(
-                "hooks",
-                "identity.foreign_refused",
-                &format!("tool={} refused process id {id}", self.tool.as_str()),
-            );
+            logged = Self::log_foreign_refused(db, &id, self.tool.as_str());
         }
         self.is_launched = self.is_launched
             && trusted
@@ -166,6 +174,90 @@ impl HcomContext {
             } else {
                 crate::proctruth::omp_minted_pid(&id).is_none()
             };
+        logged
+    }
+
+    /// Throttled `identity.foreign_refused` line: one per process id per
+    /// [`FOREIGN_REFUSED_LOG_INTERVAL`], safe across concurrent hook
+    /// processes. Returns whether the line was written.
+    fn log_foreign_refused(db: &HcomDb, id: &str, tool: &str) -> bool {
+        let stamp = Self::foreign_refused_claim(db, id);
+        let Some(stamp) = stamp else {
+            return false;
+        };
+        let written = crate::log::log_checked(
+            "INFO",
+            "hooks",
+            "identity.foreign_refused",
+            &format!("tool={tool} refused process id {id}"),
+        );
+        if !written {
+            // The line never reached the file: release the claim so the
+            // next refusal can log instead of burning this interval's only
+            // line on a lost write. A failed release leaves the claim in
+            // place — the interval then suppresses one line, the cost of
+            // a log filesystem that stayed broken.
+            Self::foreign_refused_release(db, id, &stamp);
+        }
+        written
+    }
+
+    /// Delete this invocation's claim only, by comparing the stored stamp
+    /// against the exact text this claim wrote. A release must never
+    /// touch a stamp another hook process wrote: a differing (or absent)
+    /// value deletes nothing, so a losing hook cannot reopen the winner's
+    /// interval.
+    fn foreign_refused_release(db: &HcomDb, id: &str, stamp: &str) {
+        let _ = db.conn().execute(
+            "DELETE FROM kv WHERE key = ?1 AND value = ?2",
+            rusqlite::params![Self::foreign_refused_key(id), stamp],
+        );
+    }
+
+    /// Atomically claim the `identity.foreign_refused` line for this id:
+    /// Some(stamp) exactly once per interval, with the loser of a
+    /// concurrent claim seeing None. The single UPSERT is the
+    /// linearization point — the stamp never moves backwards (an older
+    /// `now` cannot overwrite a newer stamp) and two hook processes
+    /// claiming together cannot both win. Any SQL failure fails OPEN
+    /// (claims and logs anyway): unreadable or malformed state cannot
+    /// justify suppression.
+    fn foreign_refused_claim(db: &HcomDb, id: &str) -> Option<String> {
+        let key = Self::foreign_refused_key(id);
+        let now_ms = Self::foreign_refused_now_ms();
+        let claimed = db.conn().execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE kv.value GLOB '*[^0-9]*' OR kv.value = ''
+                OR CAST(kv.value AS INTEGER) <= ?2 - ?3",
+            rusqlite::params![key, now_ms, (FOREIGN_REFUSED_LOG_INTERVAL * 1000.0) as i64],
+        );
+        match claimed {
+            Ok(1) => {
+                // Winning claim: prune other ids' expired stamps so a parade
+                // of novel ids cannot grow kv without bound. Best-effort —
+                // a failed prune only delays cleanup.
+                let _ = db.conn().execute(
+                    "DELETE FROM kv
+                     WHERE key LIKE 'identity_foreign_refused_last:%' ESCAPE '\\'
+                        AND (value GLOB '*[^0-9]*' OR value = ''
+                             OR CAST(value AS INTEGER) < ?1 - ?2)",
+                    rusqlite::params![now_ms, (FOREIGN_REFUSED_LOG_INTERVAL * 1000.0) as i64],
+                );
+                Some(now_ms.to_string())
+            }
+            Ok(_) => None,
+            // Unreadable throttle state must not suppress the line.
+            Err(_) => Some(now_ms.to_string()),
+        }
+    }
+
+    fn foreign_refused_now_ms() -> i64 {
+        (crate::shared::time::now_epoch_f64() * 1000.0) as i64
+    }
+
+    fn foreign_refused_key(id: &str) -> String {
+        format!("identity_foreign_refused_last:{id}")
     }
 
     // === Derived paths ===
@@ -210,6 +302,9 @@ impl HcomContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    use serial_test::serial;
 
     fn make_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -611,5 +706,342 @@ mod tests {
             assert_eq!(ctx.process_id.as_deref(), Some(id.as_str()));
             assert!(!ctx.is_launched);
         }
+    }
+
+    // === identity.foreign_refused log throttle ===
+
+    /// Count `identity.foreign_refused` log lines naming this id.
+    fn foreign_refused_log_lines(id: &str) -> usize {
+        std::fs::read_to_string(crate::paths::log_path())
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("identity.foreign_refused") && line.contains(id))
+            .count()
+    }
+
+    /// One hook process: a fresh context and a fresh db handle onto the same
+    /// store — hooks are separate short-lived hcom processes, so the throttle
+    /// state must persist across this boundary.
+    fn refuse_as_hook_process(db_path: &std::path::Path, id: &str) {
+        let db = HcomDb::open_raw(db_path).unwrap();
+        let mut ctx = launched_ctx(id);
+        ctx.trust_process_id(&db);
+        assert_eq!(ctx.process_id, None, "the refusal verdict is unchanged");
+        assert!(!ctx.is_launched);
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_logs_each_id_once_per_interval() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        let db_path = db_dir.path().join("test.db");
+        drop(db);
+        let id = "550e8400-e29b-41d4-a716-4466554400aa";
+
+        refuse_as_hook_process(&db_path, id);
+        refuse_as_hook_process(&db_path, id);
+
+        assert_eq!(
+            foreign_refused_log_lines(id),
+            1,
+            "two refusals of the same id within the interval must log one line"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_throttle_is_per_id() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        let db_path = db_dir.path().join("test.db");
+        drop(db);
+        let id_a = "550e8400-e29b-41d4-a716-4466554400bb";
+        let id_b = "550e8400-e29b-41d4-a716-4466554400cc";
+
+        refuse_as_hook_process(&db_path, id_a);
+        refuse_as_hook_process(&db_path, id_b);
+
+        assert_eq!(
+            foreign_refused_log_lines(id_a),
+            1,
+            "a refusal of a different id logs its own line"
+        );
+        assert_eq!(
+            foreign_refused_log_lines(id_b),
+            1,
+            "a refusal of a different id logs its own line"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_logs_again_after_interval() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        drop(db);
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-4466554400dd";
+
+        refuse_as_hook_process(&db_path, id);
+        assert_eq!(foreign_refused_log_lines(id), 1);
+
+        // Inject the clock: backdate the persisted last-logged stamp past
+        // the interval (milliseconds), as if the earlier refusal had
+        // happened 10 minutes ago.
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let key = format!("identity_foreign_refused_last:{id}");
+        let backdated = HcomContext::foreign_refused_now_ms()
+            - (FOREIGN_REFUSED_LOG_INTERVAL * 1000.0) as i64
+            - 1;
+        db.kv_set(&key, Some(&backdated.to_string())).unwrap();
+        drop(db);
+
+        refuse_as_hook_process(&db_path, id);
+        assert_eq!(
+            foreign_refused_log_lines(id),
+            2,
+            "after the interval the refusal logs again"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_throttle_fails_open_on_unreadable_state() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-4466554400ee";
+
+        // Corrupt the persisted stamp so the throttle cannot read it; the
+        // refusal must still log (fail OPEN, never suppress silently).
+        let key = format!("identity_foreign_refused_last:{id}");
+        db.kv_set(&key, Some("not-a-timestamp")).unwrap();
+        drop(db);
+
+        refuse_as_hook_process(&db_path, id);
+        assert_eq!(
+            foreign_refused_log_lines(id),
+            1,
+            "unreadable throttle state must not suppress the refusal line"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_race_two_hook_processes_one_log_line() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        drop(db);
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-4466554400ff";
+        let both_gated = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let winner_logged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let db_path = db_path.clone();
+            let both_gated = both_gated.clone();
+            let winner_logged = winner_logged.clone();
+            let id = id.to_string();
+            joins.push(std::thread::spawn(move || {
+                let db = HcomDb::open_raw(&db_path).unwrap();
+                let mut ctx = launched_ctx(&id);
+                // Deterministic interleaving: both hook processes hold at
+                // this gate, then claim-and-log together.
+                both_gated.wait();
+                if ctx.trust_process_id_inner(&db) {
+                    winner_logged.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        // Main thread joins the gate so both hooks claim together.
+        both_gated.wait();
+        for j in joins {
+            j.join().unwrap();
+        }
+
+        assert_eq!(winner_logged.load(Ordering::SeqCst), 1);
+        assert_eq!(foreign_refused_log_lines(id), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_prunes_expired_stamps_on_claim() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-446655440044";
+        let expired_key = format!("identity_foreign_refused_last:{id}");
+        let expired_ms =
+            HcomContext::foreign_refused_now_ms() - (FOREIGN_REFUSED_LOG_INTERVAL * 2000.0) as i64;
+        db.kv_set(&expired_key, Some(&expired_ms.to_string()))
+            .unwrap();
+        drop(db);
+
+        // A winning claim for a fresh id must prune the expired stamp.
+        let new_id = "550e8400-e29b-41d4-a716-446655440055";
+        refuse_as_hook_process(&db_path, new_id);
+        assert_eq!(foreign_refused_log_lines(new_id), 1);
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        assert_eq!(
+            db.kv_get(&expired_key).unwrap(),
+            None,
+            "an expired stamp for another id must be pruned after a winning claim"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_stamp_is_monotonic() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        drop(db);
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-446655440066";
+        let key = format!("identity_foreign_refused_last:{id}");
+
+        // A refusal stamps now (integer epoch milliseconds).
+        refuse_as_hook_process(&db_path, id);
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let newer = db.kv_get(&key).unwrap().unwrap();
+        let newer_ms: i64 = newer.parse().unwrap();
+        drop(db);
+
+        // A claim from a skewed (older) clock must lose outright: the
+        // newer stamp is inside its interval, so the WHERE clause blocks
+        // the update and the stamp never moves backwards.
+        let skewed_older_ms = newer_ms - (FOREIGN_REFUSED_LOG_INTERVAL * 1000.0) as i64 - 1;
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        // Inject the clock skew by rewriting the stamp through the seam's
+        // own parameters: an older claimant with this `now` loses.
+        db.conn()
+            .execute(
+                "INSERT INTO kv (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                 WHERE kv.value GLOB '*[^0-9]*' OR kv.value = ''
+                    OR CAST(kv.value AS INTEGER) <= ?2 - ?3",
+                rusqlite::params![
+                    key,
+                    skewed_older_ms,
+                    (FOREIGN_REFUSED_LOG_INTERVAL * 1000.0) as i64
+                ],
+            )
+            .unwrap();
+        drop(db);
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let stored: i64 = db.kv_get(&key).unwrap().unwrap().parse().unwrap();
+        assert_eq!(
+            stored, newer_ms,
+            "an older claim must never move the stamp backwards"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_failed_log_write_releases_claim() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        drop(db);
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-446655440077";
+
+        // Break the log destination so the log write must fail: replace
+        // the log file with a directory, so open(append) fails.
+        let log_path = hcom_dir.join(".tmp").join("logs").join("hcom.log");
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&log_path).unwrap();
+
+        refuse_as_hook_process(&db_path, id);
+
+        // The claim must have been released: no stamp survives a failed
+        // log write, so the next refusal can log again.
+        let key = format!("identity_foreign_refused_last:{id}");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        assert_eq!(
+            db.kv_get(&key).unwrap(),
+            None,
+            "a failed log write must release the claim"
+        );
+
+        // Repair the log destination; the next refusal logs again.
+        std::fs::remove_dir(&log_path).unwrap();
+        refuse_as_hook_process(&db_path, id);
+        assert_eq!(
+            foreign_refused_log_lines(id),
+            1,
+            "after a released claim the next refusal logs"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_release_deletes_only_own_stamp() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        drop(db);
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-446655440088";
+
+        // Hook A claims and logs.
+        refuse_as_hook_process(&db_path, id);
+        let key = format!("identity_foreign_refused_last:{id}");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let hook_a_stamp = db.kv_get(&key).unwrap().unwrap();
+        drop(db);
+
+        // Hook B's claim loses (A's stamp is fresh, inside the interval).
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let mut ctx = launched_ctx(id);
+        assert!(!ctx.trust_process_id_inner(&db), "B's claim must lose");
+        drop(db);
+
+        // A later hook whose log write fails must not release A's claim:
+        // its stamp differs, so its compare-and-delete removes nothing
+        // and A's interval survives.
+        let stale_stamp = format!("{}.0", hook_a_stamp.parse::<f64>().unwrap() - 1.0);
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        HcomContext::foreign_refused_release(&db, id, &stale_stamp);
+        drop(db);
+
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        assert_eq!(
+            db.kv_get(&key).unwrap().as_deref(),
+            Some(hook_a_stamp.as_str()),
+            "a release with a different stamp must not delete another hook's claim"
+        );
+
+        // And a third hook cannot log inside A's interval.
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        let mut ctx = launched_ctx(id);
+        assert!(
+            !ctx.trust_process_id_inner(&db),
+            "A's claim must still hold the interval"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn foreign_refused_numeric_prefix_malformed_value_fails_open() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_dir) = make_test_db();
+        let db_path = db_dir.path().join("test.db");
+        let id = "550e8400-e29b-41d4-a716-446655440099";
+
+        // SQLite's CAST reads the numeric prefix of this junk value, so
+        // the old WHERE would treat a far-future stamp as valid and
+        // suppress the line. It is malformed and must fail OPEN.
+        let key = format!("identity_foreign_refused_last:{id}");
+        db.kv_set(&key, Some("99999999999junk")).unwrap();
+        drop(db);
+
+        refuse_as_hook_process(&db_path, id);
+        assert_eq!(
+            foreign_refused_log_lines(id),
+            1,
+            "a numeric-prefixed malformed stamp must not suppress the line"
+        );
     }
 }
