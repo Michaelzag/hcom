@@ -23,8 +23,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::db::HcomDb;
-use crate::shared::ST_LISTENING;
 use crate::shared::time::now_epoch_ms;
+use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_ERROR, ST_INACTIVE, ST_LAUNCHING, ST_LISTENING};
 use crate::tool::Tool;
 
 /// One line the live client writes to the plugin's notify port. Anything that
@@ -708,8 +708,21 @@ pub fn probe_seats(reqs: Vec<SeatContextRequest>) -> Vec<SeatContext> {
 }
 
 /// Idle duration for the context view: hcom's own tracking — `idle_since` when
-/// set, else time since `status_time` for listening seats. A working seat is
-/// not idle (0).
+/// set, else time since `status_time` for a seat that is not working.
+///
+/// `status` is the EFFECTIVE status `hcom list` displays (see
+/// [`crate::instance_lifecycle::get_instance_status`]), not the raw DB value:
+/// a row whose DB status is still `listening` but which list shows as
+/// `inactive: stale` arrives here as `inactive` and gets a real idle value.
+/// There is exactly one staleness rule — the one in `get_instance_status` —
+/// this function only classifies the status it is given.
+///
+/// Classification (every value in [`crate::shared::STATUS_ORDER`]);
+/// idle means "not working":
+/// - idle (counted): `listening`, `inactive` (including stale).
+/// - working (0): `active`, `blocked`, `launching`, `error`.
+/// - anything else (legacy `pending`/`stopped`/`unknown`, never a live
+///   status): 0 — an unrecognized status is never reported as idle.
 pub fn idle_seconds_for(status: &str, status_time: i64, idle_since: Option<&str>, now: i64) -> i64 {
     if let Some(since) = idle_since
         .map(str::trim)
@@ -718,7 +731,13 @@ pub fn idle_seconds_for(status: &str, status_time: i64, idle_since: Option<&str>
     {
         return (now - since as i64).max(0);
     }
-    if status == ST_LISTENING && status_time > 0 {
+    let idle = match status {
+        ST_LISTENING | ST_INACTIVE => true,
+        ST_ACTIVE | ST_BLOCKED | ST_LAUNCHING | ST_ERROR => false,
+        // Unknown/legacy statuses: never report idle.
+        _ => false,
+    };
+    if idle && status_time > 0 {
         return (now - status_time).max(0);
     }
     0
@@ -1118,13 +1137,49 @@ mod tests {
     #[test]
     fn idle_seconds_from_status_time_for_listening() {
         assert_eq!(idle_seconds_for(ST_LISTENING, 100, None, 130), 30);
-        assert_eq!(idle_seconds_for("active", 100, None, 130), 0);
+        assert_eq!(idle_seconds_for(ST_ACTIVE, 100, None, 130), 0);
         assert_eq!(
             idle_seconds_for(ST_LISTENING, 100, Some("110"), 130),
             20,
             "explicit idle_since wins over status_time"
         );
         assert_eq!(idle_seconds_for(ST_LISTENING, 0, None, 130), 0);
+    }
+
+    #[test]
+    fn idle_seconds_counts_inactive_and_stale_but_never_working() {
+        // A plain inactive seat counts from status_time.
+        assert_eq!(idle_seconds_for(ST_INACTIVE, 100, None, 130), 30);
+        // `hcom list` shows a DB-listening seat with a dead heartbeat as
+        // "inactive: stale" and passes that EFFECTIVE status here, so the
+        // stale seat gets a real idle value matching its "Xh ago".
+        assert_eq!(
+            idle_seconds_for(ST_INACTIVE, 100, None, 100 + 7 * 3600),
+            7 * 3600
+        );
+        // Working states stay 0: every value in STATUS_ORDER is classified.
+        for working in [ST_ACTIVE, ST_BLOCKED, ST_LAUNCHING, ST_ERROR] {
+            assert_eq!(
+                idle_seconds_for(working, 100, None, 130),
+                0,
+                "{working} is working"
+            );
+        }
+        // Unknown/legacy statuses never report idle.
+        for unknown in ["pending", "stopped", "unknown", ""] {
+            assert_eq!(
+                idle_seconds_for(unknown, 100, None, 130),
+                0,
+                "{unknown} is unknown"
+            );
+        }
+        // idle_since wins over status_time for inactive seats too.
+        assert_eq!(idle_seconds_for(ST_INACTIVE, 100, Some("110"), 130), 20);
+        // status_time 0 means unknown, not a huge idle.
+        assert_eq!(idle_seconds_for(ST_INACTIVE, 0, None, 130), 0);
+        // A future timestamp clamps to 0 rather than going negative.
+        assert_eq!(idle_seconds_for(ST_LISTENING, 200, None, 130), 0);
+        assert_eq!(idle_seconds_for(ST_INACTIVE, 200, None, 130), 0);
     }
 
     #[test]
