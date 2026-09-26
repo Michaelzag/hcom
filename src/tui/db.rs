@@ -94,8 +94,8 @@ impl DbDataSource {
             // Harden before opening: the TUI is the no-arg default entry point,
             // so it must apply the same owner-only permission boundary as the
             // CLI rather than letting SQLite create/leave a broad db.
-            let hcom_dir = paths::hcom_dir();
-            if let Err(e) = paths::ensure_private_directory(&hcom_dir)
+            let hcom_dir = self.db_path.parent().unwrap_or(std::path::Path::new("."));
+            if let Err(e) = paths::ensure_private_directory(hcom_dir)
                 .and_then(|()| paths::ensure_private_db(&self.db_path))
             {
                 self.last_error = Some(format!("secure {}: {}", self.db_path.display(), e));
