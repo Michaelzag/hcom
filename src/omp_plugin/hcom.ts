@@ -317,6 +317,11 @@ export interface CompactCheckContext {
 	isIdle(): boolean;
 	hasPendingMessages(): boolean;
 	getAsyncJobSnapshot?: () => AsyncJobSnapshotView | null;
+	// omp 18.3.1 ExtensionContext does not expose isCompacting (it lives on
+	// AgentSession). Honored when a host adds it; otherwise only this
+	// reservation can see an in-progress compact.
+	isCompacting?: () => boolean;
+	compact?(focus?: string): Promise<void>;
 }
 
 // One reply line for hcom's `list --context` query (`{"q":"context"}\n`).
@@ -389,6 +394,237 @@ export function handleCompactQuery(
 	return { reply: JSON.stringify({ ok: true, compacting: true }), start: true };
 }
 
+// Deadline contract, kept next to each other. The plugin budget is strictly
+// smaller than the CLI reply deadline (src/context.rs COMPACT_QUERY_TIMEOUT,
+// src/commands/compact.rs), so a CLI timeout means this plugin already refused
+// or never saw the request — it does not start a compact past the budget.
+// Invariant: PLUGIN_COMPACT_BUDGET_MS < CLI_COMPACT_REPLY_DEADLINE_MS.
+/** Plugin check budget, from request receipt, monotonic clock. */
+export const PLUGIN_COMPACT_BUDGET_MS = 1500;
+/** CLI reply deadline for `{"q":"compact"}`. Context probes stay at 500 ms. */
+export const CLI_COMPACT_REPLY_DEADLINE_MS = 5000;
+/** Documented max of `hcom compact --timeout` (the clap default, 600 s). */
+export const CLI_COMPACT_MAX_TIMEOUT_MS = 600_000;
+/** Margin past that max so a CLI still inside it is not overtaken. */
+export const COMPACT_RESERVATION_MARGIN_MS = 30_000;
+/** A reservation older than this is stale: a hung compact must not wedge the seat. */
+export const COMPACT_RESERVATION_STALE_MS =
+	CLI_COMPACT_MAX_TIMEOUT_MS + COMPACT_RESERVATION_MARGIN_MS;
+
+export const COMPACT_ALREADY = "compaction already in progress";
+export const COMPACT_BUDGET_REFUSAL = `plugin busy: checks exceeded ${PLUGIN_COMPACT_BUDGET_MS} ms`;
+
+/** One seat's compact reservation. Taken synchronously, released on settle. */
+export interface CompactGate {
+	/** Epoch ms when the live reservation was taken; null when free. */
+	reservedAt: number | null;
+	/** Identity of the current claim. A settle only releases its own token. */
+	token: number;
+	timer: NodeJS.Timeout | null;
+}
+
+export function createCompactGate(): CompactGate {
+	return { reservedAt: null, token: 0, timer: null };
+}
+
+export interface CompactRequestRun {
+	gate: CompactGate;
+	query: CompactRequest;
+	ctx: CompactCheckContext | null;
+	/** Undelivered hcom-message count. Delayed in tests to exceed the budget. */
+	fetchPending: () => Promise<number>;
+	/** Reply line, without the trailing newline. Called before `ctx.compact`. */
+	writeReply: (reply: string) => void;
+	now?: () => number;
+	mono?: () => number;
+	budgetMs?: number;
+	staleMs?: number;
+	onCompactFailed?: (error: unknown) => void;
+	onStale?: (reservedAt: number) => void;
+}
+
+function refuseReply(reasons: string[]): string {
+	return JSON.stringify({ ok: false, refuse: reasons });
+}
+
+function clearStaleTimer(gate: CompactGate): void {
+	if (gate.timer !== null) {
+		clearTimeout(gate.timer);
+		gate.timer = null;
+	}
+}
+
+/** Drop `token`'s reservation. A newer claim (different token) is left alone. */
+function releaseOwned(gate: CompactGate, token: number): boolean {
+	if (gate.token !== token || gate.reservedAt === null) return false;
+	gate.reservedAt = null;
+	clearStaleTimer(gate);
+	gate.token += 1;
+	return true;
+}
+
+function armStaleTimer(
+	gate: CompactGate,
+	token: number,
+	staleMs: number,
+	onStale?: (reservedAt: number) => void,
+): void {
+	clearStaleTimer(gate);
+	const timer = setTimeout(() => {
+		if (gate.token !== token || gate.reservedAt === null) return;
+		const reservedAt = gate.reservedAt;
+		gate.reservedAt = null;
+		gate.timer = null;
+		gate.token += 1;
+		onStale?.(reservedAt);
+	}, staleMs);
+	timer.unref();
+	gate.timer = timer;
+}
+
+function releaseIfStale(
+	gate: CompactGate,
+	nowMs: number,
+	staleMs: number,
+	onStale?: (reservedAt: number) => void,
+): void {
+	if (gate.reservedAt === null || nowMs - gate.reservedAt < staleMs) return;
+	const reservedAt = gate.reservedAt;
+	gate.reservedAt = null;
+	clearStaleTimer(gate);
+	gate.token += 1;
+	onStale?.(reservedAt);
+}
+
+class CompactBudgetExceeded extends Error {
+	constructor() {
+		super("compact checks exceeded budget");
+		this.name = "CompactBudgetExceeded";
+	}
+}
+
+async function awaitWithinBudget<T>(
+	work: Promise<T>,
+	budgetMs: number,
+	startedMono: number,
+	mono: () => number,
+): Promise<T> {
+	const left = budgetMs - (mono() - startedMono);
+	if (left <= 0) throw new CompactBudgetExceeded();
+	let timer: NodeJS.Timeout | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new CompactBudgetExceeded()), left);
+		timer.unref();
+	});
+	try {
+		return await Promise.race([work, timeout]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+function fireCompact(
+	ctx: CompactCheckContext,
+	query: CompactRequest,
+	gate: CompactGate,
+	token: number,
+	onCompactFailed?: (error: unknown) => void,
+): void {
+	const focus = typeof query.focus === "string" ? query.focus : "";
+	const fail = (error: unknown) => {
+		releaseOwned(gate, token);
+		onCompactFailed?.(error);
+	};
+	if (typeof ctx.compact !== "function") {
+		fail(new Error("ctx.compact is not a function"));
+		return;
+	}
+	try {
+		const pending = ctx.compact(focus || undefined);
+		void Promise.resolve(pending).then(
+			() => {
+				releaseOwned(gate, token);
+			},
+			(error: unknown) => fail(error),
+		);
+	} catch (error) {
+		fail(error);
+	}
+}
+
+// One compact request: reserve synchronously (real runs only) before any
+// await, refuse when a reservation is already held, and never start once the
+// check budget has passed. The reply is written before `ctx.compact` is fired;
+// the reservation drops when that promise settles, on any refusal, or when it
+// goes stale (CLI max --timeout plus margin).
+export async function serveCompactRequest(run: CompactRequestRun): Promise<{ start: boolean }> {
+	const now = run.now ?? Date.now;
+	const mono = run.mono ?? (() => performance.now());
+	const budgetMs = run.budgetMs ?? PLUGIN_COMPACT_BUDGET_MS;
+	const staleMs = run.staleMs ?? COMPACT_RESERVATION_STALE_MS;
+	const receivedMono = mono();
+	const receivedEpoch = now();
+	const gate = run.gate;
+
+	// Synchronous, before any await: a second real request must see the hold.
+	releaseIfStale(gate, receivedEpoch, staleMs, run.onStale);
+	if (gate.reservedAt !== null || (typeof run.ctx?.isCompacting === "function" && run.ctx.isCompacting())) {
+		run.writeReply(refuseReply([COMPACT_ALREADY]));
+		return { start: false };
+	}
+	const real = run.query.dry !== true;
+	let owned: number | null = null;
+	if (real) {
+		gate.token += 1;
+		owned = gate.token;
+		gate.reservedAt = receivedEpoch;
+		armStaleTimer(gate, owned, staleMs, run.onStale);
+	}
+
+	let pendingCount = 0;
+	try {
+		pendingCount = await awaitWithinBudget(run.fetchPending(), budgetMs, receivedMono, mono);
+	} catch (error) {
+		if (owned !== null) releaseOwned(gate, owned);
+		if (error instanceof CompactBudgetExceeded) {
+			run.writeReply(refuseReply([COMPACT_BUDGET_REFUSAL]));
+			return { start: false };
+		}
+		// A thrown lookup is not a start. Reply so the CLI is not left hanging.
+		run.writeReply(refuseReply(["job state unknown"]));
+		return { start: false };
+	}
+
+	if (mono() - receivedMono > budgetMs) {
+		if (owned !== null) releaseOwned(gate, owned);
+		run.writeReply(refuseReply([COMPACT_BUDGET_REFUSAL]));
+		return { start: false };
+	}
+
+	const answer = handleCompactQuery(run.query, run.ctx, pendingCount);
+	if (!answer.start) {
+		if (owned !== null) releaseOwned(gate, owned);
+		run.writeReply(answer.reply);
+		return { start: false };
+	}
+
+	// Last synchronous step before the reply: a budget that expired while the
+	// checks were finishing still refuses, and never starts.
+	if (mono() - receivedMono > budgetMs) {
+		if (owned !== null) releaseOwned(gate, owned);
+		run.writeReply(refuseReply([COMPACT_BUDGET_REFUSAL]));
+		return { start: false };
+	}
+	const startedAt = now();
+	run.writeReply(JSON.stringify({ ok: true, compacting: true, started_at: startedAt }));
+	if (run.ctx && owned !== null) {
+		fireCompact(run.ctx, run.query, gate, owned, run.onCompactFailed);
+	} else if (owned !== null) {
+		releaseOwned(gate, owned);
+	}
+	return { start: true };
+}
+
 export default function hcomExtension(pi: ExtensionAPI) {
 	let instanceName: string | null = null;
 	let sessionId: string | null = null;
@@ -399,6 +635,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	let notifyServer: Server | null = null;
 	let notifyPort: number | null = null;
 	let currentCtx: ExtensionContext | null = null;
+	// One reservation for this seat. Taken synchronously on a real compact
+	// request, before the pending-message lookup, so a second request cannot
+	// also be acknowledged.
+	const compactGate = createCompactGate();
 	let pendingAckId: number | null = null;
 	let ackInFlight: Promise<boolean> | null = null;
 	let bindingGeneration = 0;
@@ -437,30 +677,36 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	// One `{"q":"compact"}` request: the live checks, the reply line, and — on a
-	// real run — `ctx.compact(focus)` fired after that reply and never awaited
-	// here. A failure to start is logged through the plugin's log path, not
-	// returned: the reply already promised the compact.
+	// One `{"q":"compact"}` request. Reservation and the check budget live in
+	// `serveCompactRequest`: the reply is written before `ctx.compact` runs,
+	// and a failure to compact is logged, not returned (the reply already left).
 	async function runCompactQuery(socket: Socket, query: CompactRequest): Promise<void> {
-		const ctx = currentCtx;
-		const pending = await fetchPending();
-		const answer = handleCompactQuery(query, ctx, pending ? pending.messages.length : 0);
-		try {
-			socket.end(`${answer.reply}\n`);
-		} catch {}
+		const outcome = await serveCompactRequest({
+			gate: compactGate,
+			query,
+			ctx: currentCtx,
+			fetchPending: async () => {
+				const pending = await fetchPending();
+				return pending ? pending.messages.length : 0;
+			},
+			writeReply: (reply) => {
+				try {
+					socket.end(`${reply}\n`);
+				} catch {}
+			},
+			onCompactFailed: (error) => {
+				log("ERROR", "plugin.compact_failed", instanceName, { error: String(error) });
+			},
+			onStale: (reservedAt) => {
+				log("WARN", "plugin.compact_reservation_stale", instanceName, {
+					reserved_at: reservedAt,
+				});
+			},
+		});
 		log("DEBUG", "notify_server.compact_query", instanceName, {
 			dry: query.dry === true,
-			start: answer.start,
+			start: outcome.start,
 		});
-		if (!answer.start || !ctx) return;
-		const focus = typeof query.focus === "string" ? query.focus : "";
-		try {
-			void ctx.compact(focus || undefined).catch((error: unknown) => {
-				log("ERROR", "plugin.compact_failed", instanceName, { error: String(error) });
-			});
-		} catch (error) {
-			log("ERROR", "plugin.compact_failed", instanceName, { error: String(error) });
-		}
 	}
 
 	function startNotifyServer(): Promise<number | null> {

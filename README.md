@@ -322,7 +322,26 @@ unobservable`.
 `--focus "<one line>"` is added to the default focus, which is built from the seat's
 purpose, its current subtask and the open-job labels. `--timeout` (default 600 s) is how
 long it waits for the new compaction record in the seat's session file, whatever the
-delivery path. Immediately before a PTY injection, the seat's row is re-read from the DB
+delivery path.
+The plugin and the CLI share a deadline contract, and the plugin budget is
+strictly smaller: `PLUGIN_COMPACT_BUDGET_MS` is 1500 and the CLI compact reply
+deadline is 5000 ms (`CLI_COMPACT_REPLY_DEADLINE_MS` / `COMPACT_QUERY_TIMEOUT`;
+the 500 ms context probe is unchanged). If the plugin's checks, including its
+pending-message lookup, have not finished within 1500 ms it refuses "plugin
+busy: checks exceeded 1500 ms", releases its reservation, and does not start.
+If hcom sees no reply within 5 s it prints "no reply from plugin within 5 s;
+the seat was NOT asked to compact" and exits non-zero — true by construction,
+because the plugin never starts past its smaller budget. A second real request
+while one is reserved refuses "compaction already in progress" (a dry run
+reports the same reason and never reserves). The start reply carries
+`started_at` (plugin epoch ms); hcom accepts a compaction record only when its
+timestamp is at or after that instant minus 1 s and strictly newer than the
+newest record it saw before the request. A reservation older than the 600 s
+max `--timeout` plus 30 s is released so a hung compact cannot wedge the seat.
+omp 18.3.1's extension context does not expose `isCompacting` (that flag is on
+AgentSession); the plugin honors it if a host adds it, and otherwise only its
+own reservation can see an in-progress compact.
+Immediately before a PTY injection, the seat's row is re-read from the DB
 and its screen re-queried, and any refusal reason then aborts — a turn that starts
 between that re-check and the keystrokes is a residual race we accept, since hcom's full
 delivery gates live in the delivery loop. Remote (`name:DEVICE`) seats are refused as

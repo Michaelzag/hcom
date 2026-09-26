@@ -18,7 +18,16 @@ import type {
 process.env.HCOM_DIR = mkdtempSync(join(process.env.TMPDIR || tmpdir(), "hcom-plugin-test-"));
 // Dynamic on purpose: a static import hoists above the HCOM_DIR assignment and
 // the plugin's load-time identity resolution would log into the real HCOM_DIR.
-const { compactRefusals, contextReplyBody, handleCompactQuery } = await import("./hcom.ts");
+const {
+	compactRefusals,
+	contextReplyBody,
+	handleCompactQuery,
+	serveCompactRequest,
+	createCompactGate,
+	PLUGIN_COMPACT_BUDGET_MS,
+	CLI_COMPACT_REPLY_DEADLINE_MS,
+	COMPACT_RESERVATION_STALE_MS,
+} = await import("./hcom.ts");
 
 type Stub = {
 	/** default: idle */
@@ -177,4 +186,317 @@ test("a context reply with unknown usage and jobs is nulls, not zeroes", () => {
 		jobs: null,
 		caps: ["compact"],
 	});
+});
+
+// --- reservation and check budget ---------------------------------------------
+
+function cleanCtx(extra: Partial<CompactCheckContext> = {}): CompactCheckContext {
+	return {
+		...stubCtx({ snapshot: snapshot(0, 0, false) }),
+		compact: async () => {},
+		...extra,
+	};
+}
+
+async function flush(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+}
+
+test("the plugin budget is strictly under the CLI deadline", () => {
+	assert.equal(PLUGIN_COMPACT_BUDGET_MS, 1500);
+	assert.equal(CLI_COMPACT_REPLY_DEADLINE_MS, 5000);
+	assert.ok(PLUGIN_COMPACT_BUDGET_MS < CLI_COMPACT_REPLY_DEADLINE_MS);
+	assert.equal(COMPACT_RESERVATION_STALE_MS, 630_000);
+});
+
+test("a slow lookup refuses and never compacts", async () => {
+	// The lookup never settles. The refusal is the product budget race, which
+	// this test awaits — it does not sleep past a guess.
+	const gate = createCompactGate();
+	const pending = Promise.withResolvers<number>();
+	let calls = 0;
+	const replies: string[] = [];
+	await serveCompactRequest({
+		gate,
+		query: {},
+		ctx: cleanCtx({
+			compact: async () => {
+				calls += 1;
+			},
+		}),
+		fetchPending: () => pending.promise,
+		writeReply: (reply) => replies.push(reply),
+		budgetMs: 20,
+		staleMs: 60_000,
+	});
+	assert.equal(calls, 0);
+	assert.equal(gate.reservedAt, null);
+	assert.deepEqual(JSON.parse(replies[0] ?? ""), {
+		ok: false,
+		refuse: ["plugin busy: checks exceeded 1500 ms"],
+	});
+});
+
+test("an elapsed budget is re-checked before start and never compacts", async () => {
+	const gate = createCompactGate();
+	let mono = 0;
+	let calls = 0;
+	const replies: string[] = [];
+	await serveCompactRequest({
+		gate,
+		query: {},
+		ctx: cleanCtx({
+			compact: async () => {
+				calls += 1;
+			},
+		}),
+		fetchPending: async () => {
+			mono = 40;
+			return 0;
+		},
+		mono: () => mono,
+		writeReply: (reply) => replies.push(reply),
+		budgetMs: 30,
+		staleMs: 60_000,
+	});
+	assert.equal(calls, 0);
+	assert.equal(gate.reservedAt, null);
+	assert.deepEqual(JSON.parse(replies[0] ?? "").refuse, [
+		"plugin busy: checks exceeded 1500 ms",
+	]);
+});
+
+test("two overlapping real requests produce one start and one already in progress", async () => {
+	const gate = createCompactGate();
+	const replies: string[] = [];
+	let calls = 0;
+	const compacting = Promise.withResolvers<void>();
+	const ctx = cleanCtx({
+		compact: () => {
+			calls += 1;
+			return compacting.promise;
+		},
+	});
+	const pending = Promise.withResolvers<number>();
+	const first = serveCompactRequest({
+		gate,
+		query: { dry: false },
+		ctx,
+		fetchPending: () => pending.promise,
+		writeReply: (reply) => replies.push(reply),
+		budgetMs: 500,
+		staleMs: 60_000,
+	});
+	const second = serveCompactRequest({
+		gate,
+		query: {},
+		ctx,
+		fetchPending: async () => 0,
+		writeReply: (reply) => replies.push(reply),
+		budgetMs: 500,
+		staleMs: 60_000,
+	});
+	assert.equal(replies.length, 1);
+	assert.deepEqual(JSON.parse(replies[0] ?? ""), {
+		ok: false,
+		refuse: ["compaction already in progress"],
+	});
+	assert.equal(calls, 0);
+	pending.resolve(0);
+	await first;
+	await second;
+	assert.equal(calls, 1);
+	assert.equal(replies.length, 2);
+	const started = JSON.parse(replies[1] ?? "");
+	assert.equal(started.ok, true);
+	assert.equal(started.compacting, true);
+	assert.equal(typeof started.started_at, "number");
+	assert.notEqual(gate.reservedAt, null);
+	compacting.resolve();
+	await flush();
+	assert.equal(gate.reservedAt, null);
+});
+
+test("the reservation is released when compact resolves", async () => {
+	const gate = createCompactGate();
+	await serveCompactRequest({
+		gate,
+		query: {},
+		ctx: cleanCtx(),
+		fetchPending: async () => 0,
+		writeReply: () => {},
+		budgetMs: 500,
+		staleMs: 60_000,
+	});
+	await flush();
+	assert.equal(gate.reservedAt, null);
+});
+
+test("the reservation is released when compact rejects", async () => {
+	const gate = createCompactGate();
+	const failures: unknown[] = [];
+	await serveCompactRequest({
+		gate,
+		query: {},
+		ctx: cleanCtx({
+			compact: () => Promise.reject(new Error("compact failed")),
+		}),
+		fetchPending: async () => 0,
+		writeReply: () => {},
+		onCompactFailed: (error) => failures.push(error),
+		budgetMs: 500,
+		staleMs: 60_000,
+	});
+	await flush();
+	assert.equal(gate.reservedAt, null);
+	assert.equal(failures.length, 1);
+});
+
+test("the reservation is released after a refusal", async () => {
+	const gate = createCompactGate();
+	let calls = 0;
+	const replies: string[] = [];
+	await serveCompactRequest({
+		gate,
+		query: {},
+		ctx: cleanCtx({
+			isIdle: () => false,
+			compact: async () => {
+				calls += 1;
+			},
+		}),
+		fetchPending: async () => {
+			assert.notEqual(gate.reservedAt, null);
+			return 0;
+		},
+		writeReply: (reply) => replies.push(reply),
+		budgetMs: 500,
+		staleMs: 60_000,
+	});
+	assert.equal(calls, 0);
+	assert.equal(gate.reservedAt, null);
+	assert.deepEqual(JSON.parse(replies[0] ?? ""), { ok: false, refuse: ["live turn"] });
+});
+
+test("a dry run never reserves", async () => {
+	const gate = createCompactGate();
+	await serveCompactRequest({
+		gate,
+		query: { dry: true },
+		ctx: cleanCtx(),
+		fetchPending: async () => {
+			assert.equal(gate.reservedAt, null);
+			return 0;
+		},
+		writeReply: () => {},
+		budgetMs: 500,
+		staleMs: 60_000,
+	});
+	assert.equal(gate.reservedAt, null);
+});
+
+test("a dry run reports already in progress and does not take the reservation", async () => {
+	const gate = createCompactGate();
+	const heldAt = Date.now();
+	gate.reservedAt = heldAt;
+	gate.token = 3;
+	const replies: string[] = [];
+	await serveCompactRequest({
+		gate,
+		query: { dry: true },
+		ctx: cleanCtx(),
+		fetchPending: async () => 0,
+		writeReply: (reply) => replies.push(reply),
+		budgetMs: 500,
+		staleMs: 60_000,
+	});
+	assert.equal(gate.reservedAt, heldAt);
+	assert.equal(gate.token, 3);
+	assert.deepEqual(JSON.parse(replies[0] ?? ""), {
+		ok: false,
+		refuse: ["compaction already in progress"],
+	});
+});
+
+test("omp already compacting refuses without reserving", async () => {
+	const gate = createCompactGate();
+	let calls = 0;
+	const replies: string[] = [];
+	await serveCompactRequest({
+		gate,
+		query: {},
+		ctx: cleanCtx({
+			isCompacting: () => true,
+			compact: async () => {
+				calls += 1;
+			},
+		}),
+		fetchPending: async () => {
+			throw new Error("checks must not run");
+		},
+		writeReply: (reply) => replies.push(reply),
+		budgetMs: 500,
+		staleMs: 60_000,
+	});
+	assert.equal(calls, 0);
+	assert.equal(gate.reservedAt, null);
+	assert.deepEqual(JSON.parse(replies[0] ?? "").refuse, ["compaction already in progress"]);
+});
+
+test("a stale reservation is released and logged", async () => {
+	const gate = createCompactGate();
+	gate.reservedAt = 1_000;
+	gate.token = 4;
+	const logged: number[] = [];
+	let calls = 0;
+	const replies: string[] = [];
+	const now = 1_000 + COMPACT_RESERVATION_STALE_MS;
+	await serveCompactRequest({
+		gate,
+		query: {},
+		ctx: cleanCtx({
+			compact: async () => {
+				calls += 1;
+			},
+		}),
+		fetchPending: async () => 0,
+		writeReply: (reply) => replies.push(reply),
+		now: () => now,
+		staleMs: COMPACT_RESERVATION_STALE_MS,
+		onStale: (at) => logged.push(at),
+		budgetMs: 500,
+	});
+	await flush();
+	assert.deepEqual(logged, [1_000]);
+	assert.equal(calls, 1);
+	assert.equal(gate.reservedAt, null);
+	assert.equal(JSON.parse(replies[0] ?? "").compacting, true);
+});
+
+test("the stale timer releases a hung reservation", async () => {
+	// The bound is a real plugin timer. The test awaits that callback rather
+	// than sleeping past a guess; a fake clock cannot see the timer the plugin arms.
+	const gate = createCompactGate();
+	const released = Promise.withResolvers<number>();
+	const compacting = Promise.withResolvers<void>();
+	await serveCompactRequest({
+		gate,
+		query: {},
+		ctx: cleanCtx({
+			compact: () => compacting.promise,
+		}),
+		fetchPending: async () => 0,
+		writeReply: () => {},
+		staleMs: 20,
+		onStale: (at) => released.resolve(at),
+		budgetMs: 500,
+	});
+	assert.notEqual(gate.reservedAt, null);
+	const reservedAt = await released.promise;
+	assert.equal(typeof reservedAt, "number");
+	assert.equal(gate.reservedAt, null);
+	compacting.resolve();
+	await flush();
+	assert.equal(gate.reservedAt, null);
 });

@@ -18,7 +18,7 @@
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -31,9 +31,23 @@ use crate::tool::Tool;
 /// sends no request (every existing wake sender) keeps the wake behavior.
 const CONTEXT_QUERY: &str = "{\"q\":\"context\"}\n";
 
-/// Per-seat budget for the live query (connect + one reply line). Seats are
-/// queried concurrently, so this bounds `hcom list --context` as a whole.
+/// Per-seat budget for the live context query (connect + one reply line). Seats
+/// are queried concurrently, so this bounds `hcom list --context` as a whole.
+/// Compact requests do not use this; see [`COMPACT_QUERY_TIMEOUT`].
 const LIVE_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Plugin check budget (`PLUGIN_COMPACT_BUDGET_MS` in `src/omp_plugin/hcom.ts`).
+/// Kept next to [`COMPACT_QUERY_TIMEOUT`]. Invariant: plugin budget < CLI deadline,
+/// so a compact-reply timeout means the seat was not asked to compact.
+pub const PLUGIN_COMPACT_BUDGET: Duration = Duration::from_millis(1_500);
+/// Reply deadline for a `{"q":"compact"}` request. The 500 ms context probe is
+/// unchanged.
+pub const COMPACT_QUERY_TIMEOUT: Duration = Duration::from_millis(5_000);
+/// A compaction record at or after `started_at` minus this skew can belong to
+/// the request; anything older cannot.
+pub const COMPACT_RECORD_SKEW_MS: i64 = 1_000;
+
+const _: () = assert!(PLUGIN_COMPACT_BUDGET.as_millis() < COMPACT_QUERY_TIMEOUT.as_millis());
 
 /// Sanity cap on the reply line; a context reply is far smaller.
 const MAX_REPLY_BYTES: usize = 4096;
@@ -122,10 +136,20 @@ struct LiveReply {
 pub enum CompactAnswer {
     /// `{"ok":true,"would":true}` — a dry run: it would compact.
     Would,
-    /// `{"ok":true,"compacting":true}` — compaction started in-process.
-    Compacting,
+    /// `{"ok":true,"compacting":true,"started_at":<epoch ms>}` — compaction
+    /// started in-process. `started_at` is the plugin's clock at the decision.
+    Compacting { started_at: i64 },
     /// `{"ok":false,"refuse":[...]}` — every live check that said no, verbatim.
     Refused(Vec<String>),
+}
+
+/// Why a compact query produced no answer hcom can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactQueryError {
+    /// Connect, read, or write timed out, or the peer closed before a reply line.
+    NoReply,
+    /// Bytes arrived but were not a compact answer hcom can act on.
+    Unusable,
 }
 
 /// Newest usage found in a transcript tail. `window` only where the file
@@ -539,40 +563,25 @@ pub struct CompactionRecord {
     pub method: String,
 }
 
-/// First type=compaction record whose timestamp parses to strictly after
-/// `since_ms` (epoch millis). Full-file streaming scan. None when absent.
-pub fn find_compaction_after(path: &Path, since_ms: i64) -> Option<CompactionRecord> {
-    let file = std::fs::File::open(path).ok()?;
-    for line in std::io::BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            return None;
-        };
-        if !line.contains("compaction") {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if entry.get("type").and_then(Value::as_str) != Some("compaction") {
-            continue;
-        }
-        let Some(timestamp) = entry.get("timestamp").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(ts_ms) = iso_to_ms(timestamp) else {
-            continue; // unparseable timestamp: skip the record
-        };
-        if ts_ms <= since_ms {
-            continue;
-        }
-        // Both token counts must be numbers; anything else skips the record.
-        let (Some(before), Some(after)) = (
-            entry.get("tokensBefore").and_then(json_u64),
-            entry.get("tokensAfter").and_then(json_u64),
-        ) else {
-            continue;
-        };
-        return Some(CompactionRecord {
+/// One usable `type=compaction` line: epoch ms plus the record. `None` for
+/// anything that is not a usable compaction (skipped, never fatal).
+fn compaction_from_line(line: &str) -> Option<(i64, CompactionRecord)> {
+    if !line.contains("compaction") {
+        return None;
+    }
+    let entry: Value = serde_json::from_str(line).ok()?;
+    if entry.get("type").and_then(Value::as_str) != Some("compaction") {
+        return None;
+    }
+    let timestamp = entry.get("timestamp").and_then(Value::as_str)?;
+    let ts_ms = iso_to_ms(timestamp)?;
+    let (before, after) = (
+        entry.get("tokensBefore").and_then(json_u64)?,
+        entry.get("tokensAfter").and_then(json_u64)?,
+    );
+    Some((
+        ts_ms,
+        CompactionRecord {
             timestamp: timestamp.to_string(),
             tokens_before: before,
             tokens_after: after,
@@ -581,27 +590,106 @@ pub fn find_compaction_after(path: &Path, since_ms: i64) -> Option<CompactionRec
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_string(),
-        });
+        },
+    ))
+}
+
+/// First type=compaction record whose timestamp parses to strictly after
+/// `since_ms` (epoch millis). Full-file streaming scan. None when absent.
+pub fn find_compaction_after(path: &Path, since_ms: i64) -> Option<CompactionRecord> {
+    let file = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return None;
+        };
+        let Some((ts_ms, record)) = compaction_from_line(&line) else {
+            continue;
+        };
+        if ts_ms > since_ms {
+            return Some(record);
+        }
+    }
+    None
+}
+
+/// Epoch ms of the newest usable compaction record, if the file has one.
+/// Scanned before a plugin compact request so a record already on disk cannot
+/// be reported as this request's.
+pub fn newest_compaction_ms(path: &Path) -> Option<i64> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut newest: Option<i64> = None;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return None;
+        };
+        if let Some((ts_ms, _)) = compaction_from_line(&line) {
+            newest = Some(newest.map_or(ts_ms, |seen| seen.max(ts_ms)));
+        }
+    }
+    newest
+}
+
+/// First usable compaction record that belongs to a plugin-path start:
+/// timestamp `>= started_at - `[`COMPACT_RECORD_SKEW_MS`] and strictly newer
+/// than the newest record seen before the request (`pre_newest_ms`).
+pub fn find_compaction_for_plugin_start(
+    path: &Path,
+    pre_newest_ms: Option<i64>,
+    started_at_ms: i64,
+) -> Option<CompactionRecord> {
+    let lower = started_at_ms.saturating_sub(COMPACT_RECORD_SKEW_MS);
+    let file = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return None;
+        };
+        let Some((ts_ms, record)) = compaction_from_line(&line) else {
+            continue;
+        };
+        let newer_than_pre = match pre_newest_ms {
+            Some(pre) => ts_ms > pre,
+            None => true,
+        };
+        if ts_ms >= lower && newer_than_pre {
+            return Some(record);
+        }
     }
     None
 }
 
 /// One live query against a plugin notify port: one request line in, one JSON
-/// reply line out. `None` on any failure (old plugin closes without replying,
-/// no answer within [`LIVE_QUERY_TIMEOUT`], malformed reply).
-fn query_line(port: u16, request: &str) -> Option<Value> {
+/// reply line out. `Err` on any failure (old plugin closes without replying,
+/// no answer within `timeout`, malformed reply).
+fn query_line(port: u16, request: &str, timeout: Duration) -> Result<Value, CompactQueryError> {
+    let deadline = Instant::now() + timeout;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, LIVE_QUERY_TIMEOUT).ok()?;
-    stream.set_read_timeout(Some(LIVE_QUERY_TIMEOUT)).ok()?;
-    stream.set_write_timeout(Some(LIVE_QUERY_TIMEOUT)).ok()?;
-    stream.write_all(request.as_bytes()).ok()?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|_| CompactQueryError::NoReply)?;
+    let remaining = |stream: &TcpStream| -> Result<(), CompactQueryError> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(CompactQueryError::NoReply);
+        }
+        stream
+            .set_read_timeout(Some(left))
+            .map_err(|_| CompactQueryError::NoReply)?;
+        stream
+            .set_write_timeout(Some(left))
+            .map_err(|_| CompactQueryError::NoReply)?;
+        Ok(())
+    };
+    remaining(&stream)?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| CompactQueryError::NoReply)?;
 
     let mut reply = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         if reply.len() >= MAX_REPLY_BYTES {
-            return None;
+            return Err(CompactQueryError::Unusable);
         }
+        remaining(&stream)?;
         match stream.read(&mut byte) {
             Ok(0) => break,
             Ok(_) => {
@@ -610,15 +698,18 @@ fn query_line(port: u16, request: &str) -> Option<Value> {
                 }
                 reply.push(byte[0]);
             }
-            Err(_) => return None,
+            Err(_) => return Err(CompactQueryError::NoReply),
         }
     }
-    serde_json::from_slice(&reply).ok()
+    if reply.is_empty() {
+        return Err(CompactQueryError::NoReply);
+    }
+    serde_json::from_slice(&reply).map_err(|_| CompactQueryError::Unusable)
 }
 
 /// The seat's context: [`CONTEXT_QUERY`] over the plugin's notify port.
 fn query_plugin(port: u16) -> Option<LiveReply> {
-    let value = query_line(port, CONTEXT_QUERY)?;
+    let value = query_line(port, CONTEXT_QUERY, LIVE_QUERY_TIMEOUT).ok()?;
     Some(LiveReply {
         tokens: value.get("tokens").and_then(json_u64),
         window: value.get("contextWindow").and_then(json_u64),
@@ -630,29 +721,39 @@ fn query_plugin(port: u16) -> Option<LiveReply> {
 
 /// One compact request against a plugin notify port
 /// (`{"q":"compact","focus":"<one line>","dry":...}`), answered with
-/// [`CompactAnswer`]. `None` when the plugin does not answer or answers a
-/// shape hcom cannot act on — nothing then starts anything.
-pub fn query_plugin_compact(port: u16, focus: &str, dry: bool) -> Option<CompactAnswer> {
+/// [`CompactAnswer`]. The reply deadline is [`COMPACT_QUERY_TIMEOUT`] (5 s),
+/// not the 500 ms context probe. [`CompactQueryError::NoReply`] is a timeout
+/// or disconnect: the plugin's check budget is strictly smaller, so the seat
+/// was not asked to compact.
+pub fn query_plugin_compact(
+    port: u16,
+    focus: &str,
+    dry: bool,
+) -> Result<CompactAnswer, CompactQueryError> {
     let request = serde_json::json!({ "q": "compact", "focus": focus, "dry": dry });
-    let value = query_line(port, &format!("{request}\n"))?;
+    let value = query_line(port, &format!("{request}\n"), COMPACT_QUERY_TIMEOUT)?;
     match value.get("ok") {
         Some(Value::Bool(true)) if value.get("would").and_then(Value::as_bool) == Some(true) => {
-            Some(CompactAnswer::Would)
+            Ok(CompactAnswer::Would)
         }
         Some(Value::Bool(true))
             if value.get("compacting").and_then(Value::as_bool) == Some(true) =>
         {
-            Some(CompactAnswer::Compacting)
+            let started_at = value
+                .get("started_at")
+                .and_then(json_i64)
+                .ok_or(CompactQueryError::Unusable)?;
+            Ok(CompactAnswer::Compacting { started_at })
         }
         Some(Value::Bool(false)) => {
             let refuse = json_strings(value.get("refuse"));
             if refuse.is_empty() {
-                None
+                Err(CompactQueryError::Unusable)
             } else {
-                Some(CompactAnswer::Refused(refuse))
+                Ok(CompactAnswer::Refused(refuse))
             }
         }
-        _ => None,
+        _ => Err(CompactQueryError::Unusable),
     }
 }
 
@@ -661,6 +762,14 @@ pub fn query_plugin_compact(port: u16, focus: &str, dry: bool) -> Option<Compact
 fn json_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Number(n) => n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64)),
+        _ => None,
+    }
+}
+
+/// Integer epoch ms from a live reply field (`started_at`).
+fn json_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
         _ => None,
     }
 }
@@ -1517,5 +1626,48 @@ mod tests {
         assert_eq!(rec.tokens_before, 700, "the null-tokens record is skipped");
         assert_eq!(rec.tokens_after, 80);
         assert_eq!(rec.method, "local");
+    }
+
+    #[test]
+    fn plugin_start_matching_honors_started_at_and_the_pre_request_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_file(dir.path(), "c.jsonl", COMPACTION_FIXTURE);
+        let path = Path::new(&path);
+        let at_1030 = epoch_ms("2026-09-25T10:30:00.000Z");
+        let at_1115 = epoch_ms("2026-09-25T11:15:00.000Z");
+        assert_eq!(newest_compaction_ms(path), Some(at_1115));
+
+        // Newer than the 10:30 record, and within 1 s before started_at.
+        let rec = find_compaction_for_plugin_start(path, Some(at_1030), at_1115 + 500)
+            .expect("skew covers 11:15");
+        assert_eq!(rec.timestamp, "2026-09-25T11:15:00.000Z");
+        assert_eq!(rec.tokens_before, 80_000);
+
+        // Exactly the skew boundary: started_at - 1000 ms == 11:15.
+        assert!(
+            find_compaction_for_plugin_start(path, Some(at_1030), at_1115 + COMPACT_RECORD_SKEW_MS)
+                .is_some()
+        );
+        // One millisecond past the skew: 11:15 is too old for this start.
+        assert_eq!(
+            find_compaction_for_plugin_start(
+                path,
+                Some(at_1030),
+                at_1115 + COMPACT_RECORD_SKEW_MS + 1
+            ),
+            None
+        );
+
+        // Already the newest record before the request: not this compact's,
+        // even when started_at's skew would otherwise cover it.
+        assert_eq!(
+            find_compaction_for_plugin_start(path, Some(at_1115), at_1115),
+            None
+        );
+        assert_eq!(
+            find_compaction_for_plugin_start(path, Some(at_1115), at_1030),
+            None
+        );
+        assert_eq!(newest_compaction_ms(Path::new("missing.jsonl")), None);
     }
 }

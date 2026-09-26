@@ -223,6 +223,26 @@ const COMPACT_HELP: &[HelpEntry] = &[
         "",
         "  omp ctx.compact(), its own live checks at request time.",
     ),
+    ("", "One compact at a time. A second request refuses"),
+    (
+        "",
+        "  \"compaction already in progress\" and does not start.",
+    ),
+    (
+        "",
+        "Plugin checks finish within 1500 ms or the plugin refuses",
+    ),
+    ("", "  and does not start. hcom waits 5 s for that reply."),
+    (
+        "",
+        "  Budget 1500 ms < deadline 5 s, so a timeout means the",
+    ),
+    ("", "  seat was not asked to compact."),
+    (
+        "",
+        "A start reply carries started_at; only a newer record at",
+    ),
+    ("", "  or after that instant minus 1 s is accepted."),
     (
         "",
         "Fallback: inject /compact <focus> + Enter over the seat's inject",

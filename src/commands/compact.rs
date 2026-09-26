@@ -79,6 +79,11 @@ pub struct CompactArgs {
 const RECORD_POLL: Duration = Duration::from_secs(2);
 /// Longest job label carried into a refusal line.
 const LABEL_MAX_CHARS: usize = 40;
+/// CLI-side timeout or disconnect on a compact request. True by construction:
+/// the plugin check budget ([`context::PLUGIN_COMPACT_BUDGET`], 1500 ms) is
+/// strictly below the compact reply deadline ([`context::COMPACT_QUERY_TIMEOUT`],
+/// 5000 ms), so this deadline passing means the seat was not asked to compact.
+const COMPACT_NO_REPLY: &str = "no reply from plugin within 5 s; the seat was NOT asked to compact";
 
 // ── Facts ─────────────────────────────────────────────────────────────────────
 
@@ -556,7 +561,7 @@ fn refuse_on(facts: &Facts) -> Result<(), Fail> {
 }
 
 /// The compaction record written after `since_ms`, polled until it appears or
-/// `timeout` seconds pass.
+/// `timeout` seconds pass. Inject path only.
 fn wait_for_compaction(path: &Path, since_ms: i64, timeout: Duration) -> Option<CompactionRecord> {
     let started = Instant::now();
     loop {
@@ -571,10 +576,34 @@ fn wait_for_compaction(path: &Path, since_ms: i64, timeout: Duration) -> Option<
     }
 }
 
+/// Plugin path: a record at or after `started_at` minus skew, and strictly
+/// newer than the newest record seen before the request.
+fn wait_for_plugin_record(
+    path: &Path,
+    pre_newest_ms: Option<i64>,
+    started_at_ms: i64,
+    timeout: Duration,
+) -> Option<CompactionRecord> {
+    let started = Instant::now();
+    loop {
+        if let Some(record) =
+            context::find_compaction_for_plugin_start(path, pre_newest_ms, started_at_ms)
+        {
+            return Some(record);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return None;
+        }
+        std::thread::sleep(RECORD_POLL.min(timeout - elapsed));
+    }
+}
+
 /// The plugin path: the seat's plugin compacts in-process through omp's
 /// `ctx.compact()`, so nothing is typed and its own live checks run at request
-/// time. Its refusals are surfaced verbatim; the wait for the new compaction
-/// record is the inject path's, unchanged.
+/// time. Its refusals are surfaced verbatim. The wait accepts a record whose
+/// timestamp is `>= started_at` minus 1 s and newer than the newest record
+/// seen before the request — not merely newer than the CLI's own clock.
 fn execute_plugin(
     name: &str,
     port: u16,
@@ -583,14 +612,21 @@ fn execute_plugin(
     focus: &str,
     args: &CompactArgs,
 ) -> Result<Outcome, Fail> {
-    // Record the instant before the request so the wait only accepts a record
-    // the seat writes in response to this compact.
-    let start_ms = now_epoch_ms();
-    let answer = context::query_plugin_compact(port, focus, args.dry_run).ok_or_else(|| {
-        Fail::Error(format!(
-            "no reply from the plugin's compact request (port {port})"
-        ))
-    })?;
+    let path = Path::new(transcript_path);
+    // Before the request leaves: a record already in the file is not this
+    // compact's, even if its timestamp is in the future.
+    let pre_newest = context::newest_compaction_ms(path);
+    let answer = match context::query_plugin_compact(port, focus, args.dry_run) {
+        Ok(answer) => answer,
+        Err(context::CompactQueryError::NoReply) => {
+            return Err(Fail::Error(COMPACT_NO_REPLY.to_string()));
+        }
+        Err(context::CompactQueryError::Unusable) => {
+            return Err(Fail::Error(format!(
+                "unusable reply from the plugin's compact request (port {port})"
+            )));
+        }
+    };
     match answer {
         context::CompactAnswer::Refused(reasons) => Err(Fail::Refused {
             reasons: reasons.into_iter().map(Reason::Plugin).collect(),
@@ -599,15 +635,16 @@ fn execute_plugin(
         context::CompactAnswer::Would if args.dry_run => Ok(Outcome::WouldCompact {
             report: render_would_compact(name, facts, focus),
         }),
-        context::CompactAnswer::Compacting if !args.dry_run => {
+        context::CompactAnswer::Compacting { started_at } if !args.dry_run => {
             // Tell the user the compact is in before the wait, not after it.
             println!(
                 "compact started on {name} via plugin; waiting up to {}s for a new compaction record",
                 args.timeout
             );
-            match wait_for_compaction(
-                Path::new(transcript_path),
-                start_ms,
+            match wait_for_plugin_record(
+                path,
+                pre_newest,
+                started_at,
                 Duration::from_secs(args.timeout),
             ) {
                 Some(record) => Ok(Outcome::Compacted { record }),
@@ -688,12 +725,22 @@ pub fn execute(db: &HcomDb, args: &CompactArgs) -> Result<Outcome, Fail> {
     }
 }
 
+/// Exit code for a compact outcome. `Fail::Error` (including the 5 s deadline)
+/// and a refusal are 1; a record timeout is 2.
+fn outcome_exit(result: &Result<Outcome, Fail>) -> i32 {
+    match result {
+        Ok(_) => 0,
+        Err(Fail::Timeout) => 2,
+        Err(_) => 1,
+    }
+}
+
 /// Main entry point for `hcom compact`. Returns the exit code.
 pub fn cmd_compact(db: &HcomDb, args: &CompactArgs, _ctx: Option<&CommandContext>) -> i32 {
-    match execute(db, args) {
+    let result = execute(db, args);
+    match &result {
         Ok(Outcome::WouldCompact { report }) => {
             println!("{report}");
-            0
         }
         Ok(Outcome::Compacted { record }) => {
             println!(
@@ -704,24 +751,21 @@ pub fn cmd_compact(db: &HcomDb, args: &CompactArgs, _ctx: Option<&CommandContext
                 record.method,
                 record.timestamp
             );
-            0
         }
         Err(Fail::Refused { reasons, facts }) => {
-            println!("{}", render_refusal(&args.name, &reasons, facts.as_deref()));
-            1
+            println!("{}", render_refusal(&args.name, reasons, facts.as_deref()));
         }
         Err(Fail::Timeout) => {
             println!(
                 "timeout: no new compaction record within {}s for {}",
                 args.timeout, args.name
             );
-            2
         }
         Err(Fail::Error(message)) => {
             println!("{message}");
-            1
         }
     }
+    outcome_exit(&result)
 }
 
 #[cfg(test)]
@@ -1057,6 +1101,17 @@ mod tests {
         context: &'static str,
         compact: &'static str,
     ) -> (u16, std::sync::mpsc::Receiver<String>) {
+        plugin_stub_with(context, compact.to_string(), || {})
+    }
+
+    /// [`plugin_stub`], running `on_compact` after the request is recorded and
+    /// before the reply is written. Used to append the compaction record the
+    /// wait is about to look for.
+    fn plugin_stub_with(
+        context: &'static str,
+        compact: String,
+        on_compact: impl Fn() + Send + 'static,
+    ) -> (u16, std::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1087,6 +1142,7 @@ mod tests {
                     }
                     Some("compact") => {
                         let _ = tx.send(request);
+                        on_compact();
                         let _ = stream.write_all(format!("{compact}\n").as_bytes());
                     }
                     _ => {}
@@ -1094,6 +1150,44 @@ mod tests {
             }
         });
         (port, rx)
+    }
+
+    /// Context replies, then holds a compact connection for `hold` (or drops
+    /// it immediately when `hold` is zero) without writing a compact reply.
+    fn holding_plugin(context: &'static str, hold: Duration) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if byte[0] == b'\n' {
+                                break;
+                            }
+                            request.push(byte[0]);
+                        }
+                    }
+                }
+                let query = serde_json::from_str::<Value>(&String::from_utf8_lossy(&request))
+                    .ok()
+                    .and_then(|v| v.get("q").and_then(Value::as_str).map(str::to_string));
+                match query.as_deref() {
+                    Some("context") => {
+                        let _ = stream.write_all(format!("{context}\n").as_bytes());
+                    }
+                    Some("compact") if hold.is_zero() => drop(stream),
+                    Some("compact") => std::thread::sleep(hold),
+                    _ => {}
+                }
+            }
+        });
+        port
     }
 
     fn event_count(db: &HcomDb) -> i64 {
@@ -1461,16 +1555,42 @@ mod tests {
 
     #[test]
     fn plugin_caps_select_the_plugin_path() {
-        let (port, seen) = plugin_stub(CAPS_CONTEXT, r#"{"ok":true,"compacting":true}"#);
-        // A plain-terminal seat: no inject endpoint at all.
-        let body = format!("{COMPLETED_JOB}{COMPACTION}");
-        let s = seat("listening", &body, None);
+        let s = seat("listening", COMPLETED_JOB, None);
+        let path: String =
+            s.db.conn()
+                .query_row(
+                    "SELECT transcript_path FROM instances WHERE name = 'luna'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        // The record is timestamped before the CLI's clock, so a wait keyed
+        // only on `now` would miss it. `started_at` minus skew still covers
+        // it, and nothing was in the file before the request.
+        let now = now_epoch_ms();
+        let started_at = now - 2_000;
+        let record_ms = now - 500;
+        let record_iso = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(record_ms)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let reply = format!(r#"{{"ok":true,"compacting":true,"started_at":{started_at}}}"#);
+        let record_line = format!(
+            r#"{{"type":"compaction","id":"ab99","timestamp":"{record_iso}","summary":"synthetic","shortSummary":"synthetic short","tokensBefore":90363,"tokensAfter":17405,"method":"local"}}"#
+        );
+        let (port, seen) = plugin_stub_with(CAPS_CONTEXT, reply, move || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{record_line}").unwrap();
+        });
         add_plugin(&s.db, port);
         let outcome = execute(&s.db, &args("luna")).expect("compacted");
         match outcome {
             Outcome::Compacted { record } => {
                 assert_eq!(record.tokens_before, 90363);
                 assert_eq!(record.tokens_after, 17405);
+                assert_eq!(record.timestamp, record_iso);
             }
             other => panic!("expected Compacted, got {other:?}"),
         }
@@ -1479,6 +1599,54 @@ mod tests {
         let request: Value = serde_json::from_str(&seen[0]).unwrap();
         assert_eq!(request.get("q").and_then(Value::as_str), Some("compact"));
         assert_eq!(request.get("dry").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn a_compacting_reply_without_started_at_is_unusable() {
+        let (port, seen) = plugin_stub(CAPS_CONTEXT, r#"{"ok":true,"compacting":true}"#);
+        let s = seat("listening", COMPLETED_JOB, None);
+        add_plugin(&s.db, port);
+        let fail = execute(&s.db, &args("luna")).expect_err("unusable");
+        match fail {
+            Fail::Error(message) => {
+                assert!(message.contains("unusable reply"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert_eq!(seen_requests(&seen).len(), 1);
+    }
+
+    #[test]
+    fn compact_disconnect_says_the_seat_was_not_asked_and_exits_nonzero() {
+        let port = holding_plugin(CAPS_CONTEXT, Duration::ZERO);
+        let s = seat("listening", COMPLETED_JOB, None);
+        add_plugin(&s.db, port);
+        let fail = execute(&s.db, &args("luna")).expect_err("disconnect");
+        assert_eq!(fail, Fail::Error(COMPACT_NO_REPLY.to_string()));
+        assert_eq!(outcome_exit(&Err(fail)), 1);
+        assert_eq!(cmd_compact(&s.db, &args("luna"), None), 1);
+    }
+
+    #[test]
+    fn compact_reply_deadline_is_5s_and_a_hang_does_not_ask_the_seat_to_compact() {
+        assert_eq!(context::COMPACT_QUERY_TIMEOUT, Duration::from_millis(5_000));
+        assert!(context::PLUGIN_COMPACT_BUDGET < context::COMPACT_QUERY_TIMEOUT);
+        let port = holding_plugin(CAPS_CONTEXT, Duration::from_secs(8));
+        let s = seat("listening", COMPLETED_JOB, None);
+        add_plugin(&s.db, port);
+        let started = Instant::now();
+        let fail = execute(&s.db, &args("luna")).expect_err("deadline");
+        let elapsed = started.elapsed();
+        assert_eq!(fail, Fail::Error(COMPACT_NO_REPLY.to_string()));
+        assert_eq!(outcome_exit(&Err(fail)), 1);
+        assert!(
+            elapsed >= Duration::from_millis(4_500),
+            "deadline fired too soon: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "deadline was not 5 s: {elapsed:?}"
+        );
     }
 
     #[test]
