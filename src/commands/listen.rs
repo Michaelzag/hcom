@@ -108,6 +108,28 @@ fn build_prefix(intent: Option<&str>, thread: Option<&str>, event_id: Option<i64
     }
 }
 
+/// Status after listen returns. Adhoc has no hooks to move it back out of
+/// active, so it records what happened as inactive, like every other adhoc
+/// command. This is deliberately not an `exit:*` context: a quiet poll is not
+/// a process exit, and exit contexts are reaped after 60s regardless of PID.
+fn set_listen_done_status(
+    db: &HcomDb,
+    instance_name: &str,
+    instance_data: &serde_json::Value,
+    context: &str,
+) {
+    let status = if is_adhoc(instance_data) {
+        ST_INACTIVE
+    } else {
+        ST_ACTIVE
+    };
+    set_status(db, instance_name, status, context, Default::default());
+}
+
+fn is_adhoc(instance_data: &serde_json::Value) -> bool {
+    instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc")
+}
+
 fn expand_sql_preset(sql: &str) -> Result<String, &'static str> {
     let Some(name) = sql.strip_prefix("stopped:") else {
         return Ok(sql.to_string());
@@ -357,28 +379,12 @@ fn listen_loop(
                 instances::update_instance_position(db, instance_name, &updates);
             }
 
-            // Set status based on tool type
-            let tool = instance_data
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("claude");
-            if tool == "adhoc" {
-                set_status(
-                    db,
-                    instance_name,
-                    ST_INACTIVE,
-                    "message received",
-                    Default::default(),
-                );
+            let context = if is_adhoc(instance_data) {
+                "message received"
             } else {
-                set_status(
-                    db,
-                    instance_name,
-                    ST_ACTIVE,
-                    "finished listening",
-                    Default::default(),
-                );
-            }
+                "finished listening"
+            };
+            set_listen_done_status(db, instance_name, instance_data, context);
 
             if json_output {
                 for msg in &messages {
@@ -400,14 +406,8 @@ fn listen_loop(
         // consume that budget under load even when a message is already queued.
         let elapsed = start_time.elapsed().as_secs_f64();
         if elapsed >= timeout {
-            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
-                set_status(
-                    db,
-                    instance_name,
-                    ST_INACTIVE,
-                    "exit:timeout",
-                    Default::default(),
-                );
+            if is_adhoc(instance_data) {
+                set_listen_done_status(db, instance_name, instance_data, "listen timeout");
             }
             if !json_output {
                 eprintln!("\n[Timeout: no messages after {timeout}s]");
@@ -580,14 +580,8 @@ fn filter_listen_loop(
             if !json_output {
                 eprintln!("\n[Timeout: no match after {timeout}s]");
             }
-            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
-                set_status(
-                    db,
-                    instance_name,
-                    ST_INACTIVE,
-                    "exit:timeout",
-                    Default::default(),
-                );
+            if is_adhoc(instance_data) {
+                set_listen_done_status(db, instance_name, instance_data, "listen timeout");
             }
             return 0;
         }
@@ -624,13 +618,7 @@ fn filter_listen_loop(
                     } else {
                         println!("\n{}", msg.text);
                     }
-                    set_status(
-                        db,
-                        instance_name,
-                        ST_ACTIVE,
-                        "filter matched",
-                        Default::default(),
-                    );
+                    set_listen_done_status(db, instance_name, instance_data, "filter matched");
                     return 0;
                 }
             }
@@ -655,13 +643,7 @@ fn filter_listen_loop(
                     let formatted = format_messages_json(db, &owned, instance_name);
                     println!("\n{formatted}");
                 }
-                set_status(
-                    db,
-                    instance_name,
-                    ST_ACTIVE,
-                    "message received",
-                    Default::default(),
-                );
+                set_listen_done_status(db, instance_name, instance_data, "message received");
                 return 0;
             }
         }
@@ -693,6 +675,71 @@ fn filter_listen_loop(
 #[cfg(test)]
 mod tests {
     use super::expand_sql_preset;
+
+    fn ctx(name: &str) -> CommandContext {
+        CommandContext {
+            explicit_name: Some(name.into()),
+            identity: None,
+            go: false,
+        }
+    }
+
+    fn backdate_status(db: &HcomDb, secs: i64) {
+        db.conn()
+            .execute(
+                "UPDATE instances SET status_time = ? WHERE name = 'luna'",
+                [crate::shared::time::now_epoch_i64() - secs],
+            )
+            .unwrap();
+    }
+
+    fn cleanup_keeps_luna(db: &HcomDb) -> bool {
+        crate::instance_lifecycle::cleanup_stale_instances(db, 3600, 3600);
+        db.get_instance_full("luna").unwrap().is_some()
+    }
+
+    /// #118: a quiet poll is not an exit. An adhoc identity that polls with
+    /// `listen` must outlive the 60s exit-cleanup tier in both listen modes,
+    /// while observed exits and the ordinary inactive tier still reap it.
+    #[test]
+    #[serial]
+    fn adhoc_quiet_listen_is_not_an_exit() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, tool) VALUES ('luna', 1000.0, 'adhoc')",
+                [],
+            )
+            .unwrap();
+
+        for args in [
+            listen_args(&["1"]),
+            listen_args(&["--timeout", "1", "--from", "nobody"]),
+        ] {
+            assert_eq!(cmd_listen(&db, &args, Some(&ctx("luna"))), 0);
+            assert_eq!(row(&db).status, ST_INACTIVE);
+            assert_eq!(row(&db).status_context, "listen timeout");
+            backdate_status(&db, 120);
+            assert!(cleanup_keeps_luna(&db), "{args:?} reaped after 120s");
+        }
+
+        // Ordinary inactive tier still applies (adhoc rows carry no PID).
+        backdate_status(&db, 3700);
+        assert!(!cleanup_keeps_luna(&db));
+
+        // An observed exit is still reaped on the short tier.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, tool, status, status_context) \
+                 VALUES ('luna', 1000.0, 'adhoc', 'inactive', 'exit:closed')",
+                [],
+            )
+            .unwrap();
+        backdate_status(&db, 120);
+        assert!(!cleanup_keeps_luna(&db));
+
+        cleanup_test_db(path);
+    }
 
     #[test]
     fn stopped_sql_preset_expands_and_escapes_name() {
