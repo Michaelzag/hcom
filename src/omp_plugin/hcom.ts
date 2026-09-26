@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { createServer, type Server } from "node:net";
+import { createServer, type Server, type Socket } from "node:net";
 
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`;
 const LOG_PATH = `${HCOM_DIR}/.tmp/logs/hcom.log`;
@@ -291,6 +291,104 @@ function armExitRelease(reg: OmpIdentityRegistry, name: string, reason: string):
 	});
 }
 
+// ── Notify-port queries ──────────────────────────────────────────────────────
+
+/** The job-snapshot fields the context and compact queries read. */
+export interface AsyncJobSnapshotView {
+	running: readonly unknown[];
+	delivery: { queued: number; delivering: boolean };
+}
+
+/** The context-usage fields the context query reports. */
+export interface ContextUsageView {
+	tokens: number;
+	contextWindow: number;
+	percent: number;
+}
+
+/** The ExtensionContext pieces the context query reads (stubbed in tests). */
+export interface ContextQueryContext {
+	getContextUsage?: () => ContextUsageView | undefined;
+	getAsyncJobSnapshot?: () => AsyncJobSnapshotView | null;
+}
+
+/** The ExtensionContext pieces the compact request checks (stubbed in tests). */
+export interface CompactCheckContext {
+	isIdle(): boolean;
+	hasPendingMessages(): boolean;
+	getAsyncJobSnapshot?: () => AsyncJobSnapshotView | null;
+}
+
+// One reply line for hcom's `list --context` query (`{"q":"context"}\n`).
+// Usage is null when the seat cannot compute it and the job count is null
+// when the session has no job manager; hcom renders both as unknown, never 0.
+// `caps` names what this plugin does beyond answering — the CLI keys the
+// plugin-side compact path off it. `getAsyncJobSnapshot` is called optionally:
+// a host without it reports the job count as unknown instead of throwing.
+export function contextReplyBody(ctx: ContextQueryContext | null): string {
+	const usage = ctx?.getContextUsage?.() ?? null;
+	const snapshot = ctx?.getAsyncJobSnapshot?.() ?? null;
+	const jobs = snapshot
+		? snapshot.running.length +
+			snapshot.delivery.queued +
+			(snapshot.delivery.delivering ? 1 : 0)
+		: null;
+	return JSON.stringify({
+		tokens: usage ? usage.tokens : null,
+		contextWindow: usage ? usage.contextWindow : null,
+		percent: usage ? usage.percent : null,
+		jobs,
+		caps: ["compact"],
+	});
+}
+
+/** One parsed `{"q":"compact","focus":"<one line>","dry":...}` request. */
+export interface CompactRequest {
+	focus?: unknown;
+	dry?: unknown;
+}
+
+// Every reason the plugin refuses to compact, in report order. Live state
+// only, read at request time: the session file has no truth a live snapshot
+// lacks (it cannot even see a job cancelled without a completion record).
+export function compactRefusals(
+	ctx: CompactCheckContext | null,
+	undeliveredHcomMessages: number,
+): string[] {
+	if (!ctx) return ["job state unknown"];
+	const refusals: string[] = [];
+	if (!ctx.isIdle()) refusals.push("live turn");
+	const snapshot = ctx.getAsyncJobSnapshot?.() ?? null;
+	if (snapshot) {
+		const running = snapshot.running.length;
+		if (running > 0) refusals.push(`${running} running jobs`);
+		const queued = snapshot.delivery.queued + (snapshot.delivery.delivering ? 1 : 0);
+		if (queued > 0) refusals.push(`${queued} queued deliveries`);
+	}
+	if (ctx.hasPendingMessages()) refusals.push("pending messages");
+	if (undeliveredHcomMessages > 0) refusals.push("pending hcom messages");
+	if (!snapshot) refusals.push("job state unknown");
+	return refusals;
+}
+
+// One `{"q":"compact"}` reply line, and whether the caller must now start
+// `ctx.compact(focus)`. The caller replies first and only then fires it —
+// never awaited inside the socket handler.
+export function handleCompactQuery(
+	query: CompactRequest,
+	ctx: CompactCheckContext | null,
+	undeliveredHcomMessages: number,
+): { reply: string; start: boolean } {
+	const refusals = compactRefusals(ctx, undeliveredHcomMessages);
+	if (refusals.length > 0) {
+		return { reply: JSON.stringify({ ok: false, refuse: refusals }), start: false };
+	}
+	if (query.dry === true) {
+		return { reply: JSON.stringify({ ok: true, would: true }), start: false };
+	}
+	return { reply: JSON.stringify({ ok: true, compacting: true }), start: true };
+}
+
 export default function hcomExtension(pi: ExtensionAPI) {
 	let instanceName: string | null = null;
 	let sessionId: string | null = null;
@@ -327,46 +425,41 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		return !candidateSessionId || !sessionId || candidateSessionId === sessionId;
 	}
 
-	/** The job-snapshot fields the context query reads. */
-	interface AsyncJobSnapshotView {
-		running: readonly unknown[];
-		delivery: { queued: number; delivering: boolean };
-	}
-
-	// `getAsyncJobSnapshot()` is newer than the SDK types hcom pins for the
-	// plugin typecheck (17.0.6); the omp this runs inside (>= 18.0) has it. Type
-	// the context once with the method optional so a host without it reports the
-	// job count as unknown instead of throwing.
-	function asyncJobSnapshot(ctx: ExtensionContext): AsyncJobSnapshotView | null {
-		const host: ExtensionContext & {
-			getAsyncJobSnapshot?: () => AsyncJobSnapshotView | null;
-		} = ctx;
-		return host.getAsyncJobSnapshot?.() ?? null;
-	}
-
 	// One reply line for hcom's `list --context` query (`{"q":"context"}\n`).
-	// Usage is null when the seat cannot compute it and the job count is null
-	// when the session has no job manager; hcom renders both as unknown, never 0.
 	function contextReply(): string {
 		try {
-			const usage = currentCtx?.getContextUsage() ?? null;
-			const snapshot = currentCtx ? asyncJobSnapshot(currentCtx) : null;
-			const jobs = snapshot
-				? snapshot.running.length +
-					snapshot.delivery.queued +
-					(snapshot.delivery.delivering ? 1 : 0)
-				: null;
-			return JSON.stringify({
-				tokens: usage ? usage.tokens : null,
-				contextWindow: usage ? usage.contextWindow : null,
-				percent: usage ? usage.percent : null,
-				jobs,
-			});
+			return contextReplyBody(currentCtx);
 		} catch (error) {
 			log("WARN", "notify_server.context_query_failed", instanceName, {
 				error: String(error),
 			});
-			return JSON.stringify({ tokens: null, contextWindow: null, percent: null, jobs: null });
+			return contextReplyBody(null);
+		}
+	}
+
+	// One `{"q":"compact"}` request: the live checks, the reply line, and — on a
+	// real run — `ctx.compact(focus)` fired after that reply and never awaited
+	// here. A failure to start is logged through the plugin's log path, not
+	// returned: the reply already promised the compact.
+	async function runCompactQuery(socket: Socket, query: CompactRequest): Promise<void> {
+		const ctx = currentCtx;
+		const pending = await fetchPending();
+		const answer = handleCompactQuery(query, ctx, pending ? pending.messages.length : 0);
+		try {
+			socket.end(`${answer.reply}\n`);
+		} catch {}
+		log("DEBUG", "notify_server.compact_query", instanceName, {
+			dry: query.dry === true,
+			start: answer.start,
+		});
+		if (!answer.start || !ctx) return;
+		const focus = typeof query.focus === "string" ? query.focus : "";
+		try {
+			void ctx.compact(focus || undefined).catch((error: unknown) => {
+				log("ERROR", "plugin.compact_failed", instanceName, { error: String(error) });
+			});
+		} catch (error) {
+			log("ERROR", "plugin.compact_failed", instanceName, { error: String(error) });
 		}
 	}
 
@@ -394,26 +487,28 @@ export default function hcomExtension(pi: ExtensionAPI) {
 					buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
 					const newline = buffer.indexOf("\n");
 					if (newline < 0) return;
-					let reply: string | null = null;
+					let request: unknown = null;
 					try {
-						const request: unknown = JSON.parse(buffer.slice(0, newline).trim());
-						if (
-							request &&
-							typeof request === "object" &&
-							"q" in request &&
-							request.q === "context"
-						) {
-							reply = contextReply();
-						}
+						request = JSON.parse(buffer.slice(0, newline).trim());
 					} catch {}
-					if (reply === null) {
-						// Not a context query — keep today's wake behavior.
-						wake();
+					const q =
+						request && typeof request === "object" && "q" in request ? request.q : null;
+					if (q === "context") {
+						settled = true;
+						socket.end(`${contextReply()}\n`);
+						log("DEBUG", "notify_server.context_query", instanceName, {});
 						return;
 					}
-					settled = true;
-					socket.end(`${reply}\n`);
-					log("DEBUG", "notify_server.context_query", instanceName, {});
+					if (q === "compact") {
+						settled = true;
+						void runCompactQuery(
+							socket,
+							request && typeof request === "object" ? (request as CompactRequest) : {},
+						);
+						return;
+					}
+					// Not a query this plugin answers — keep today's wake behavior.
+					wake();
 				});
 				socket.on("close", wake);
 				socket.on("error", () => {});

@@ -106,13 +106,26 @@ pub struct SeatContextRequest {
 }
 
 /// The plugin's reply line: flat `{tokens, contextWindow, percent, jobs}`,
-/// each field `null` when the seat could not compute it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// each field `null` when the seat could not compute it. `caps` names what the
+/// plugin can do beyond answering; empty for old plugins.
+#[derive(Debug, Clone, PartialEq)]
 struct LiveReply {
     tokens: Option<u64>,
     window: Option<u64>,
     pct: Option<f64>,
     jobs: Option<u64>,
+    caps: Vec<String>,
+}
+
+/// What a plugin answered to a `{"q":"compact"}` request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompactAnswer {
+    /// `{"ok":true,"would":true}` — a dry run: it would compact.
+    Would,
+    /// `{"ok":true,"compacting":true}` — compaction started in-process.
+    Compacting,
+    /// `{"ok":false,"refuse":[...]}` — every live check that said no, verbatim.
+    Refused(Vec<String>),
 }
 
 /// Newest usage found in a transcript tail. `window` only where the file
@@ -573,15 +586,15 @@ pub fn find_compaction_after(path: &Path, since_ms: i64) -> Option<CompactionRec
     None
 }
 
-/// One live query against a plugin notify port. Sends [`CONTEXT_QUERY`] and
-/// reads one JSON reply line; `None` on any failure (old plugin closes without
-/// replying, no answer within [`LIVE_QUERY_TIMEOUT`], malformed reply).
-fn query_plugin(port: u16) -> Option<LiveReply> {
+/// One live query against a plugin notify port: one request line in, one JSON
+/// reply line out. `None` on any failure (old plugin closes without replying,
+/// no answer within [`LIVE_QUERY_TIMEOUT`], malformed reply).
+fn query_line(port: u16, request: &str) -> Option<Value> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&addr, LIVE_QUERY_TIMEOUT).ok()?;
     stream.set_read_timeout(Some(LIVE_QUERY_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(LIVE_QUERY_TIMEOUT)).ok()?;
-    stream.write_all(CONTEXT_QUERY.as_bytes()).ok()?;
+    stream.write_all(request.as_bytes()).ok()?;
 
     let mut reply = Vec::new();
     let mut byte = [0u8; 1];
@@ -600,13 +613,47 @@ fn query_plugin(port: u16) -> Option<LiveReply> {
             Err(_) => return None,
         }
     }
-    let value: Value = serde_json::from_slice(&reply).ok()?;
+    serde_json::from_slice(&reply).ok()
+}
+
+/// The seat's context: [`CONTEXT_QUERY`] over the plugin's notify port.
+fn query_plugin(port: u16) -> Option<LiveReply> {
+    let value = query_line(port, CONTEXT_QUERY)?;
     Some(LiveReply {
         tokens: value.get("tokens").and_then(json_u64),
         window: value.get("contextWindow").and_then(json_u64),
         pct: value.get("percent").and_then(Value::as_f64),
         jobs: value.get("jobs").and_then(json_u64),
+        caps: json_strings(value.get("caps")),
     })
+}
+
+/// One compact request against a plugin notify port
+/// (`{"q":"compact","focus":"<one line>","dry":...}`), answered with
+/// [`CompactAnswer`]. `None` when the plugin does not answer or answers a
+/// shape hcom cannot act on — nothing then starts anything.
+pub fn query_plugin_compact(port: u16, focus: &str, dry: bool) -> Option<CompactAnswer> {
+    let request = serde_json::json!({ "q": "compact", "focus": focus, "dry": dry });
+    let value = query_line(port, &format!("{request}\n"))?;
+    match value.get("ok") {
+        Some(Value::Bool(true)) if value.get("would").and_then(Value::as_bool) == Some(true) => {
+            Some(CompactAnswer::Would)
+        }
+        Some(Value::Bool(true))
+            if value.get("compacting").and_then(Value::as_bool) == Some(true) =>
+        {
+            Some(CompactAnswer::Compacting)
+        }
+        Some(Value::Bool(false)) => {
+            let refuse = json_strings(value.get("refuse"));
+            if refuse.is_empty() {
+                None
+            } else {
+                Some(CompactAnswer::Refused(refuse))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Number from a live reply field. Only a JSON number counts: `null` (and any
@@ -616,6 +663,21 @@ fn json_u64(value: &Value) -> Option<u64> {
         Value::Number(n) => n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64)),
         _ => None,
     }
+}
+
+/// Strings from a live reply field. Only a JSON string counts; anything else
+/// (and a missing field) is empty, never invented.
+fn json_strings(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Usage percent: the seat's own number when reported, else computed from
@@ -632,39 +694,51 @@ fn pct_of(tokens: Option<u64>, window: Option<u64>, reported: Option<f64>) -> Op
 
 /// Gather one seat's context: live query first, transcript tail as fallback.
 pub fn probe(req: SeatContextRequest) -> SeatContext {
+    probe_with_caps(req).0
+}
+
+/// [`probe`] plus the plugin's advertised capabilities (`caps` in its context
+/// reply): empty when the plugin is old or did not answer.
+pub fn probe_with_caps(req: SeatContextRequest) -> (SeatContext, Vec<String>) {
     if req.remote {
-        return SeatContext::unknown();
+        return (SeatContext::unknown(), Vec::new());
     }
 
     if let Some(port) = req.plugin_port
         && let Some(reply) = query_plugin(port)
     {
-        return SeatContext {
-            source: ContextSource::Live,
-            tokens: reply.tokens,
-            window: reply.window,
-            pct: pct_of(reply.tokens, reply.window, reply.pct),
-            jobs: reply.jobs,
-            idle_seconds: Some(req.idle_seconds),
-            jobs_scan: JobsScan::Unknown,
-        };
+        return (
+            SeatContext {
+                source: ContextSource::Live,
+                tokens: reply.tokens,
+                window: reply.window,
+                pct: pct_of(reply.tokens, reply.window, reply.pct),
+                jobs: reply.jobs,
+                idle_seconds: Some(req.idle_seconds),
+                jobs_scan: JobsScan::Unknown,
+            },
+            reply.caps,
+        );
     }
 
     if req.transcript_path.is_empty() || !Path::new(&req.transcript_path).is_file() {
-        return SeatContext::unknown();
+        return (SeatContext::unknown(), Vec::new());
     }
 
     let usage = tail_usage(&req.tool, &req.transcript_path);
     let scan = transcript_scan(&req.tool, &req.transcript_path);
-    SeatContext {
-        source: ContextSource::Transcript,
-        tokens: usage.map(|u| u.tokens),
-        window: usage.and_then(|u| u.window),
-        pct: usage.and_then(|u| pct_of(Some(u.tokens), u.window, None)),
-        jobs: scan_jobs_count(&scan),
-        jobs_scan: scan,
-        idle_seconds: Some(req.idle_seconds),
-    }
+    (
+        SeatContext {
+            source: ContextSource::Transcript,
+            tokens: usage.map(|u| u.tokens),
+            window: usage.and_then(|u| u.window),
+            pct: usage.and_then(|u| pct_of(Some(u.tokens), u.window, None)),
+            jobs: scan_jobs_count(&scan),
+            jobs_scan: scan,
+            idle_seconds: Some(req.idle_seconds),
+        },
+        Vec::new(),
+    )
 }
 
 /// Open job + in-flight tool count of a scan, or `None` when unknown.

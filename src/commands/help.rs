@@ -213,11 +213,23 @@ const TITLE_HELP: &[HelpEntry] = &[
 const COMPACT_HELP: &[HelpEntry] = &[
     (
         "compact <name>",
-        "Compact an idle seat's context (injects /compact <focus> + Enter)",
+        "Compact an idle seat's context (prints tokens before -> after)",
     ),
     (
         "",
-        "Prints tokens before -> after from the new compaction record.",
+        "Plugin path first: the seat's plugin compacts in-process through",
+    ),
+    (
+        "",
+        "  omp ctx.compact(), its own live checks at request time.",
+    ),
+    (
+        "",
+        "Fallback: inject /compact <focus> + Enter over the seat's inject",
+    ),
+    (
+        "",
+        "  endpoint, with hcom's checks (session file, prompt, screen).",
     ),
     (
         "compact <name> --focus \"<one line>\"",
@@ -244,11 +256,23 @@ const COMPACT_HELP: &[HelpEntry] = &[
     ),
     ("", "  pending hcom messages"),
     ("", "  unknown job data (no records, no live answer)"),
-    ("", "  no delivery path (no inject endpoint)"),
+    (
+        "",
+        "  no delivery path: seat not launched under hcom and its plugin",
+    ),
+    (
+        "",
+        "    predates plugin-compact; it gains it on its next omp start",
+    ),
+    (
+        "",
+        "    (e.g. hcom r <name>), or type /compact in its terminal",
+    ),
     (
         "",
         "  a prompt not verifiably empty (text typed, or no input box readable)",
     ),
+    ("", "    (inject path only: the plugin path types nothing)"),
     (
         "",
         "Reports end with prompt: empty | has text | unobservable.",
