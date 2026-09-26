@@ -1539,6 +1539,81 @@ fn launch_pty_or_background(
     }
 }
 
+/// A name row holding a launch that registered but has not bound yet.
+pub(crate) struct UnclaimedIncarnation {
+    /// Session the in-progress launch is resuming.
+    pub session_id: String,
+    /// Whole seconds since the row was registered.
+    pub registered_secs_ago: u64,
+}
+
+impl UnclaimedIncarnation {
+    /// Refusal naming the seat, the session being launched and its age —
+    /// the one message both the resume append gate and the launch name
+    /// check refuse a second resume with.
+    pub(crate) fn refusal(&self, name: &str) -> String {
+        format!(
+            "'{name}' has a launch in progress (session {}, registered {}s ago); \
+             wait for it to bind or stop it first",
+            self.session_id, self.registered_secs_ago
+        )
+    }
+}
+
+/// `name`'s row when it is a registered-but-unclaimed incarnation — inactive,
+/// carrying a launch reservation (`new` context, or the launch-placeholder
+/// equivalent) for a session, with its incarnation's process binding still
+/// inside the placeholder window — else `None`. The one predicate both
+/// [`resolve_explicit_name_conflict`] and the resume append gate refuse a
+/// second resume of the same name with, instead of deleting or replacing
+/// the first launch's row.
+pub(crate) fn registered_unclaimed_incarnation(
+    db: &HcomDb,
+    name: &str,
+) -> Result<Option<UnclaimedIncarnation>> {
+    let Some(row) = db.get_instance_full(name)? else {
+        return Ok(None);
+    };
+    let reserving = (row.status == crate::shared::ST_INACTIVE
+        || row.status == instance_names::PLACEHOLDER_STATUS)
+        && row.status_context == instance_names::PLACEHOLDER_CONTEXT;
+    if !reserving {
+        return Ok(None);
+    }
+    let Some(session_id) = row.session_id.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if fresh_incarnation_binding(db, name, row.created_at)?.is_none() {
+        return Ok(None);
+    }
+    let registered_secs_ago =
+        (crate::shared::time::now_epoch_f64() - row.created_at).max(0.0) as u64;
+    Ok(Some(UnclaimedIncarnation {
+        session_id,
+        registered_secs_ago,
+    }))
+}
+
+/// `name`'s newest process binding when it was registered for the incarnation
+/// created at `created_at` and is still inside the placeholder window: a
+/// concurrent launch/resume in its pre-spawn gap. Returns the claiming
+/// process id.
+fn fresh_incarnation_binding(db: &HcomDb, name: &str, created_at: f64) -> Result<Option<String>> {
+    let Some((claimer, bound_at)) = db.newest_process_binding(name)? else {
+        return Ok(None);
+    };
+    if bound_at < created_at {
+        return Ok(None);
+    }
+    if crate::shared::time::now_epoch_f64() - bound_at
+        < crate::instance_lifecycle::CLEANUP_PLACEHOLDER_THRESHOLD as f64
+    {
+        Ok(Some(claimer))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Resolve a naming conflict for an explicit instance name.
 ///
 /// - Name is free → Ok(()).
@@ -1549,6 +1624,9 @@ fn launch_pty_or_background(
 ///   (a resume plan's reservation, or the row a concurrent resume of the same
 ///   session registered) is kept. Deleting it would reopen the session to a
 ///   second seat; [`register_launch_instance`] decides whether to use it.
+///   And except a different session's [`registered_unclaimed_incarnation`]:
+///   refusing keeps the first launch's row; deleting it orphaned the first
+///   launch's process.
 /// - Name held by a `pending` placeholder reservation → Ok(()) without
 ///   deleting. This is *our own* reservation: the fork/resume path calls
 ///   `reserve_generated_name` (under flock, against an unused name) before the
@@ -1581,6 +1659,9 @@ pub(crate) fn resolve_explicit_name_conflict(
         let own_reservation = status_context == "new"
             && session_id.is_some_and(|sid| !sid.is_empty() && row_session == Some(sid));
         if !own_reservation {
+            if let Some(unclaimed) = registered_unclaimed_incarnation(db, name)? {
+                bail!("{}", unclaimed.refusal(name));
+            }
             db.delete_instance(name).map_err(|e| {
                 anyhow::anyhow!("Failed to clear inactive resume row '{}': {}", name, e)
             })?;
@@ -1673,11 +1754,7 @@ fn refuse_held_session(db: &HcomDb, name: &str, session_id: &str) -> Result<()> 
     let Some(row) = db.get_instance_full(name)? else {
         return Ok(());
     };
-    if let Some((claimer, bound_at)) = db.newest_process_binding(name)?
-        && bound_at >= row.created_at
-        && crate::shared::time::now_epoch_f64() - bound_at
-            < crate::instance_lifecycle::CLEANUP_PLACEHOLDER_THRESHOLD as f64
-    {
+    if let Some(claimer) = fresh_incarnation_binding(db, name, row.created_at)? {
         bail!(
             "'{name}' is already being launched for session {session_id} \
              (process {claimer}); not launching it twice"
@@ -4003,6 +4080,70 @@ mod tests {
         assert_eq!(row.created_at, 7.0);
         assert_eq!(row.session_id.as_deref(), Some(RACE_SESSION));
         assert_eq!(bound_instance(&db, "proc-luna").as_deref(), Some("luna"));
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_refuses_a_different_session_launch_in_progress() {
+        // Overlap case: session A's launch registered `luna` (inactive `new`
+        // with its incarnation binding) and has not bound yet. A second resume
+        // of `luna` for session B must refuse and leave A's row alone — never
+        // delete it.
+        let db = launcher_test_db();
+        let created_at = crate::shared::time::now_epoch_f64();
+        let mut row = serde_json::Map::new();
+        row.insert("session_id".into(), json!(RACE_SESSION));
+        row.insert("tool".into(), json!("omp"));
+        row.insert("status".into(), json!(crate::shared::ST_INACTIVE));
+        row.insert("status_context".into(), json!("new"));
+        row.insert("created_at".into(), json!(created_at));
+        row.insert("last_event_id".into(), json!(41));
+        row.insert("pid".into(), json!(4242));
+        db.save_instance_named("luna", &row).unwrap();
+        db.set_process_binding("proc-first", "", "luna").unwrap();
+
+        let err = resolve_explicit_name_conflict(&db, "luna", Some("omp-session-b"))
+            .expect_err("a second resume must not delete the first launch's row")
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "'luna' has a launch in progress (session {RACE_SESSION}, registered "
+            )) && err.contains("ago); wait for it to bind or stop it first"),
+            "unexpected: {err}"
+        );
+        let kept = db
+            .get_instance_full("luna")
+            .unwrap()
+            .expect("first row kept");
+        assert_eq!(kept.session_id.as_deref(), Some(RACE_SESSION));
+        assert_eq!(kept.created_at, created_at);
+        assert_eq!(kept.last_event_id, 41);
+        assert_eq!(kept.pid, Some(4242));
+        assert_eq!(bound_instance(&db, "proc-first").as_deref(), Some("luna"));
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_consumes_a_stale_failed_launch() {
+        // Outside the placeholder window the row is a stale failed launch, not
+        // an incarnation in progress: still consumed as before.
+        let db = launcher_test_db();
+        let old = crate::shared::time::now_epoch_f64() - 1000.0;
+        let mut row = serde_json::Map::new();
+        row.insert("session_id".into(), json!(RACE_SESSION));
+        row.insert("tool".into(), json!("omp"));
+        row.insert("status".into(), json!(crate::shared::ST_INACTIVE));
+        row.insert("status_context".into(), json!("new"));
+        row.insert("created_at".into(), json!(old));
+        db.save_instance_named("luna", &row).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at) \
+                 VALUES ('proc-old', NULL, 'luna', ?1)",
+                rusqlite::params![old],
+            )
+            .unwrap();
+
+        assert!(resolve_explicit_name_conflict(&db, "luna", Some("omp-session-b")).is_ok());
+        assert!(db.get_instance("luna").unwrap().is_none());
     }
 
     #[test]

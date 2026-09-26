@@ -972,6 +972,14 @@ fn append_restored_snapshot(
         {
             bail!("'{name}' is still active — run hcom kill {name} first");
         }
+        // Another launch registered this name but has not bound yet: replacing
+        // its row here would orphan the first launch (and the launch's own name
+        // check refuses against the same row). This check and the write below
+        // share the one `BEGIN IMMEDIATE` transaction, so a row that appears
+        // after the check serializes against it instead of being clobbered.
+        if let Some(unclaimed) = crate::launcher::registered_unclaimed_incarnation(db, name)? {
+            bail!("{}", unclaimed.refusal(name));
+        }
         if let Some(holder) = live_session_holder(db, session_id)? {
             bail!(
                 "{RESTORE_EARLIER_FLAG}: earlier session {session_id} of '{name}' is live as \
@@ -5542,6 +5550,162 @@ mod tests {
             assert_eq!(stopped_events(&db, "lave").len(), before);
             let row = db.get_instance_full("lave").unwrap().unwrap();
             assert_eq!(row.session_id.as_deref(), Some(OMP_OTHER_SID));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_refuses_a_launch_in_progress_for_the_seat() {
+        // Sequential case: session A's launch registered `lave` (inactive `new`
+        // with its incarnation binding) and has not bound yet. Restoring an
+        // earlier session for `lave` must refuse and leave A's row unchanged —
+        // never replace it.
+        with_omp_home(|home| {
+            let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
+            let (_, plan) =
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+            let created_at = crate::shared::time::now_epoch_f64();
+            let mut data = serde_json::Map::new();
+            data.insert("session_id".into(), json!(OMP_OTHER_SID));
+            data.insert("tool".into(), json!("omp"));
+            data.insert("status".into(), json!(ST_INACTIVE));
+            data.insert("status_context".into(), json!("new"));
+            data.insert("created_at".into(), json!(created_at));
+            data.insert("last_event_id".into(), json!(OMP_DEAD_CURSOR));
+            data.insert("pid".into(), json!(4242));
+            db.save_instance_named("lave", &data).unwrap();
+            db.set_process_binding("proc-first", "", "lave").unwrap();
+            let before = stopped_events(&db, "lave").len();
+
+            let err = append_restored_snapshot(&db, "lave", &plan)
+                .expect_err("a registered launch must not be overwritten")
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "'lave' has a launch in progress (session {OMP_OTHER_SID}, registered "
+                )) && err.contains("ago); wait for it to bind or stop it first"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(stopped_events(&db, "lave").len(), before);
+            let row = db
+                .get_instance_full("lave")
+                .unwrap()
+                .expect("first row kept");
+            assert_eq!(row.session_id.as_deref(), Some(OMP_OTHER_SID));
+            assert_eq!(row.created_at, created_at);
+            assert_eq!(row.last_event_id, OMP_DEAD_CURSOR);
+            assert_eq!(row.pid, Some(4242));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_replaces_a_stale_failed_launch_row() {
+        // A `new` row whose incarnation binding aged out of the placeholder
+        // window is a stale failed launch, not an incarnation in progress:
+        // the restore still replaces it.
+        with_omp_home(|home| {
+            let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
+            let (_, plan) =
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+            let old = crate::shared::time::now_epoch_f64() - 1000.0;
+            let mut data = serde_json::Map::new();
+            data.insert("session_id".into(), json!(OMP_OTHER_SID));
+            data.insert("tool".into(), json!("omp"));
+            data.insert("status".into(), json!(ST_INACTIVE));
+            data.insert("status_context".into(), json!("new"));
+            data.insert("created_at".into(), json!(old));
+            db.save_instance_named("lave", &data).unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at) \
+                     VALUES ('proc-old', NULL, 'lave', ?1)",
+                    rusqlite::params![old],
+                )
+                .unwrap();
+            let before = stopped_events(&db, "lave").len();
+
+            let restored = append_restored_snapshot(&db, "lave", &plan)
+                .unwrap()
+                .expect("a stale failed launch must not block the restore");
+            assert!(
+                restored.contains(OMP_EARLIER_SID),
+                "unexpected report: {restored}"
+            );
+            assert_eq!(stopped_events(&db, "lave").len(), before + 1);
+            let row = db.get_instance_full("lave").unwrap().expect("reservation");
+            assert_eq!(row.session_id.as_deref(), Some(OMP_EARLIER_SID));
+            assert!(row.created_at > old);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_restore_earlier_append_serializes_against_a_concurrent_registration() {
+        // A row committed for the seat after the append's lock acquisition must
+        // be seen by its check, never clobbered by its write: the whole append
+        // holds one `BEGIN IMMEDIATE` transaction. A second connection
+        // registers `lave` for another session while holding the write lock;
+        // the append blocks on the lock, then refuses against the committed row
+        // and writes nothing.
+        with_omp_home(|home| {
+            // File-backed store with a known path: the second connection needs
+            // the path, which the `test_db` helper does not keep.
+            let store = tempfile::tempdir().unwrap();
+            let db_path = store.path().join("race.db");
+            let db = HcomDb::open_raw(&db_path).unwrap();
+            db.init_db().unwrap();
+            write_omp_session_file(&format!("2026-01-01T00-00-00Z_{OMP_EARLIER_SID}.jsonl"));
+            let a_dir = home.join("seat-dir");
+            std::fs::create_dir_all(&a_dir).unwrap();
+            let a_dir = a_dir.to_string_lossy().to_string();
+            insert_omp_stopped_event(&db, "lave", OMP_EARLIER_SID, &a_dir, OMP_EARLIER_CURSOR);
+            insert_omp_stopped_event(&db, "lave", OMP_MISSING_SID, "/tmp", OMP_DEAD_CURSOR);
+            insert_omp_stopped_event(&db, "lave", OMP_MISSING_SID, "/tmp", OMP_DEAD_CURSOR);
+            let (_, plan) =
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+            let before = stopped_events(&db, "lave").len();
+
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+            let db_path_clone = db_path.clone();
+            let writer = std::thread::spawn(move || {
+                let db2 = HcomDb::open_raw(&db_path_clone).unwrap();
+                db2.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+                let created_at = crate::shared::time::now_epoch_f64();
+                let mut data = serde_json::Map::new();
+                data.insert("session_id".into(), json!(OMP_OTHER_SID));
+                data.insert("tool".into(), json!("omp"));
+                data.insert("status".into(), json!(ST_INACTIVE));
+                data.insert("status_context".into(), json!("new"));
+                data.insert("created_at".into(), json!(created_at));
+                db2.save_instance_named("lave", &data).unwrap();
+                db2.set_process_binding("proc-first", "", "lave").unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                db2.conn().execute_batch("COMMIT").unwrap();
+                created_at
+            });
+            locked_rx.recv().unwrap();
+            let err = append_restored_snapshot(&db, "lave", &plan)
+                .expect_err("a row committed before the check must be refused, not replaced")
+                .to_string();
+            let created_at = writer.join().unwrap();
+            assert!(
+                err.contains(&format!(
+                    "'lave' has a launch in progress (session {OMP_OTHER_SID}, registered "
+                )) && err.contains("ago); wait for it to bind or stop it first"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(stopped_events(&db, "lave").len(), before);
+            let row = db
+                .get_instance_full("lave")
+                .unwrap()
+                .expect("registered row kept");
+            assert_eq!(row.session_id.as_deref(), Some(OMP_OTHER_SID));
+            assert_eq!(row.created_at, created_at);
         });
     }
 
