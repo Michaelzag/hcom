@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { createServer, type Server } from "node:net";
+import { createServer, type Server, type Socket } from "node:net";
 
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`;
 const LOG_PATH = `${HCOM_DIR}/.tmp/logs/hcom.log`;
@@ -291,6 +291,337 @@ function armExitRelease(reg: OmpIdentityRegistry, name: string, reason: string):
 	});
 }
 
+// ── Notify-port queries ──────────────────────────────────────────────────────
+
+/** The job-snapshot fields the context and compact queries read. */
+export interface AsyncJobSnapshotView {
+	running: readonly unknown[];
+	delivery: { queued: number; delivering: boolean };
+}
+
+/** The context-usage fields the context query reports. */
+export interface ContextUsageView {
+	tokens: number;
+	contextWindow: number;
+	percent: number;
+}
+
+/** The ExtensionContext pieces the context query reads (stubbed in tests). */
+export interface ContextQueryContext {
+	getContextUsage?: () => ContextUsageView | undefined;
+	getAsyncJobSnapshot?: () => AsyncJobSnapshotView | null;
+}
+
+/** The ExtensionContext pieces the compact request checks (stubbed in tests). */
+export interface CompactCheckContext {
+	isIdle(): boolean;
+	hasPendingMessages(): boolean;
+	getAsyncJobSnapshot?: () => AsyncJobSnapshotView | null;
+	// omp 18.3.1 ExtensionContext does not expose isCompacting (it lives on
+	// AgentSession). Honored when a host adds it; otherwise only this
+	// reservation can see an in-progress compact.
+	isCompacting?: () => boolean;
+	compact?(focus?: string): Promise<void>;
+}
+
+// One reply line for hcom's `list --context` query (`{"q":"context"}\n`).
+// Usage is null when the seat cannot compute it and the job count is null
+// when the session has no job manager; hcom renders both as unknown, never 0.
+// `caps` names what this plugin does beyond answering — the CLI keys the
+// plugin-side compact path off it. `getAsyncJobSnapshot` is called optionally:
+// a host without it reports the job count as unknown instead of throwing.
+export function contextReplyBody(ctx: ContextQueryContext | null): string {
+	const usage = ctx?.getContextUsage?.() ?? null;
+	const snapshot = ctx?.getAsyncJobSnapshot?.() ?? null;
+	const jobs = snapshot
+		? snapshot.running.length +
+			snapshot.delivery.queued +
+			(snapshot.delivery.delivering ? 1 : 0)
+		: null;
+	return JSON.stringify({
+		tokens: usage ? usage.tokens : null,
+		contextWindow: usage ? usage.contextWindow : null,
+		percent: usage ? usage.percent : null,
+		jobs,
+		caps: ["compact"],
+	});
+}
+
+/** One parsed `{"q":"compact","focus":"<one line>","dry":...}` request. */
+export interface CompactRequest {
+	focus?: unknown;
+	dry?: unknown;
+}
+
+// Every reason the plugin refuses to compact, in report order. Live state
+// only, read at request time: the session file has no truth a live snapshot
+// lacks (it cannot even see a job cancelled without a completion record).
+export function compactRefusals(
+	ctx: CompactCheckContext | null,
+	undeliveredHcomMessages: number,
+): string[] {
+	if (!ctx) return ["job state unknown"];
+	const refusals: string[] = [];
+	if (!ctx.isIdle()) refusals.push("live turn");
+	const snapshot = ctx.getAsyncJobSnapshot?.() ?? null;
+	if (snapshot) {
+		const running = snapshot.running.length;
+		if (running > 0) refusals.push(`${running} running jobs`);
+		const queued = snapshot.delivery.queued + (snapshot.delivery.delivering ? 1 : 0);
+		if (queued > 0) refusals.push(`${queued} queued deliveries`);
+	}
+	if (ctx.hasPendingMessages()) refusals.push("pending messages");
+	if (undeliveredHcomMessages > 0) refusals.push("pending hcom messages");
+	if (!snapshot) refusals.push("job state unknown");
+	return refusals;
+}
+
+// One `{"q":"compact"}` reply line, and whether the caller must now start
+// `ctx.compact(focus)`. The caller replies first and only then fires it —
+// never awaited inside the socket handler.
+export function handleCompactQuery(
+	query: CompactRequest,
+	ctx: CompactCheckContext | null,
+	undeliveredHcomMessages: number,
+): { reply: string; start: boolean } {
+	const refusals = compactRefusals(ctx, undeliveredHcomMessages);
+	if (refusals.length > 0) {
+		return { reply: JSON.stringify({ ok: false, refuse: refusals }), start: false };
+	}
+	if (query.dry === true) {
+		return { reply: JSON.stringify({ ok: true, would: true }), start: false };
+	}
+	return { reply: JSON.stringify({ ok: true, compacting: true }), start: true };
+}
+
+// Deadline contract, kept next to each other. The plugin budget is strictly
+// smaller than the CLI reply deadline (src/context.rs COMPACT_QUERY_TIMEOUT,
+// src/commands/compact.rs), so a CLI timeout means this plugin already refused
+// or never saw the request — it does not start a compact past the budget.
+// Invariant: PLUGIN_COMPACT_BUDGET_MS < CLI_COMPACT_REPLY_DEADLINE_MS.
+/** Plugin check budget, from request receipt, monotonic clock. */
+export const PLUGIN_COMPACT_BUDGET_MS = 1500;
+/** CLI reply deadline for `{"q":"compact"}`. Context probes stay at 500 ms. */
+export const CLI_COMPACT_REPLY_DEADLINE_MS = 5000;
+
+export const COMPACT_ALREADY = "compaction already in progress";
+export const COMPACT_BUDGET_REFUSAL = `plugin busy: checks exceeded ${PLUGIN_COMPACT_BUDGET_MS} ms`;
+
+/**
+ * The held-reservation refusal names the hold's age
+ * (`compaction already in progress (started Ns ago)`), in dry runs and
+ * refusals alike, so a wedged seat is visible.
+ */
+export function compactAlreadyInProgress(reservedAtMs: number, nowMs: number): string {
+	const ageS = Math.max(0, Math.floor((nowMs - reservedAtMs) / 1000));
+	return `${COMPACT_ALREADY} (started ${ageS}s ago)`;
+}
+
+/**
+ * Injectable timing. Production uses [`systemClock`]; tests pass a
+ * controllable fake and advance it explicitly, so no compact-path test
+ * depends on real timers, real sleeps, or event-loop liveness.
+ */
+export interface CompactClock {
+	/** Monotonic ms (`performance.now()` in production): the check budget. */
+	now(): number;
+	/** Epoch ms (`Date.now()` in production): `started_at` and the hold's age. */
+	epoch(): number;
+	/** Arm `fn` after `ms`. Production unrefs it so it never holds the process. */
+	setTimer(fn: () => void, ms: number): unknown;
+	/** Cancel a timer armed by `setTimer`. */
+	clearTimer(handle: unknown): void;
+}
+
+/** Production timing: real clocks and one unref'd timer per budget race. */
+export const systemClock: CompactClock = {
+	now: () => performance.now(),
+	epoch: () => Date.now(),
+	setTimer(fn, ms) {
+		const timer = setTimeout(fn, ms);
+		timer.unref();
+		return timer;
+	},
+	clearTimer(handle) {
+		clearTimeout(handle as NodeJS.Timeout);
+	},
+};
+
+/**
+ * One seat's compact reservation. Taken synchronously on a real request,
+ * released ONLY when the `ctx.compact()` promise settles (resolve or reject)
+ * — or immediately when the request refuses, since a refused request never
+ * started anything. There is deliberately no stale bound: the reservation
+ * mirrors omp's real compaction state, so a compact whose promise never
+ * settles keeps refusing "compaction already in progress (started Ns ago)"
+ * until the seat restarts (omp itself cannot compact again either).
+ */
+export interface CompactGate {
+	/** Epoch ms when the live reservation was taken; null when free. */
+	reservedAt: number | null;
+	/** Identity of the current claim. A settle only releases its own token. */
+	token: number;
+}
+
+export function createCompactGate(): CompactGate {
+	return { reservedAt: null, token: 0 };
+}
+
+export interface CompactRequestRun {
+	gate: CompactGate;
+	query: CompactRequest;
+	ctx: CompactCheckContext | null;
+	/** Undelivered hcom-message count. Slowed in tests to exceed the budget. */
+	fetchPending: () => Promise<number>;
+	/** Reply line, without the trailing newline. Called before `ctx.compact`. */
+	writeReply: (reply: string) => void;
+	/** Timing dependency; defaults to [`systemClock`]. */
+	clock?: CompactClock;
+	onCompactFailed?: (error: unknown) => void;
+}
+
+function refuseReply(reasons: string[]): string {
+	return JSON.stringify({ ok: false, refuse: reasons });
+}
+
+/** Drop `token`'s reservation. A newer claim (different token) is left alone. */
+function releaseOwned(gate: CompactGate, token: number): boolean {
+	if (gate.token !== token || gate.reservedAt === null) return false;
+	gate.reservedAt = null;
+	gate.token += 1;
+	return true;
+}
+
+class CompactBudgetExceeded extends Error {
+	constructor() {
+		super("compact checks exceeded budget");
+		this.name = "CompactBudgetExceeded";
+	}
+}
+
+async function awaitWithinBudget<T>(
+	work: Promise<T>,
+	budgetMs: number,
+	startedMono: number,
+	clock: CompactClock,
+): Promise<T> {
+	const left = budgetMs - (clock.now() - startedMono);
+	if (left <= 0) throw new CompactBudgetExceeded();
+	let timer: unknown;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = clock.setTimer(() => reject(new CompactBudgetExceeded()), left);
+	});
+	try {
+		return await Promise.race([work, timeout]);
+	} finally {
+		clock.clearTimer(timer);
+	}
+}
+
+function fireCompact(
+	ctx: CompactCheckContext,
+	query: CompactRequest,
+	gate: CompactGate,
+	token: number,
+	onCompactFailed?: (error: unknown) => void,
+): void {
+	const focus = typeof query.focus === "string" ? query.focus : "";
+	const fail = (error: unknown) => {
+		releaseOwned(gate, token);
+		onCompactFailed?.(error);
+	};
+	if (typeof ctx.compact !== "function") {
+		fail(new Error("ctx.compact is not a function"));
+		return;
+	}
+	try {
+		const pending = ctx.compact(focus || undefined);
+		void Promise.resolve(pending).then(
+			() => {
+				releaseOwned(gate, token);
+			},
+			(error: unknown) => fail(error),
+		);
+	} catch (error) {
+		fail(error);
+	}
+}
+
+// One compact request: reserve synchronously (real runs only) before any
+// await, refuse when a reservation is already held, and never start once the
+// check budget has passed. The reply is written before `ctx.compact` is fired;
+// the reservation drops when that promise settles (resolve OR reject), or the
+// moment the request refuses. There is no stale bound: the reservation mirrors
+// omp's compaction state, never the wall clock.
+export async function serveCompactRequest(run: CompactRequestRun): Promise<{ start: boolean }> {
+	const clock = run.clock ?? systemClock;
+	const budgetMs = PLUGIN_COMPACT_BUDGET_MS;
+	const receivedMono = clock.now();
+	const receivedEpoch = clock.epoch();
+	const gate = run.gate;
+
+	// Synchronous, before any await: a second real request must see the hold.
+	// A dry run reports the same reason — with the hold's age — and never reserves.
+	if (gate.reservedAt !== null) {
+		run.writeReply(refuseReply([compactAlreadyInProgress(gate.reservedAt, receivedEpoch)]));
+		return { start: false };
+	}
+	if (typeof run.ctx?.isCompacting === "function" && run.ctx.isCompacting()) {
+		run.writeReply(refuseReply([COMPACT_ALREADY]));
+		return { start: false };
+	}
+	const real = run.query.dry !== true;
+	let owned: number | null = null;
+	if (real) {
+		gate.token += 1;
+		owned = gate.token;
+		gate.reservedAt = receivedEpoch;
+	}
+
+	let pendingCount = 0;
+	try {
+		pendingCount = await awaitWithinBudget(run.fetchPending(), budgetMs, receivedMono, clock);
+	} catch (error) {
+		if (owned !== null) releaseOwned(gate, owned);
+		if (error instanceof CompactBudgetExceeded) {
+			run.writeReply(refuseReply([COMPACT_BUDGET_REFUSAL]));
+			return { start: false };
+		}
+		// A thrown lookup is not a start. Reply so the CLI is not left hanging.
+		run.writeReply(refuseReply(["job state unknown"]));
+		return { start: false };
+	}
+
+	if (clock.now() - receivedMono > budgetMs) {
+		if (owned !== null) releaseOwned(gate, owned);
+		run.writeReply(refuseReply([COMPACT_BUDGET_REFUSAL]));
+		return { start: false };
+	}
+
+	const answer = handleCompactQuery(run.query, run.ctx, pendingCount);
+	if (!answer.start) {
+		if (owned !== null) releaseOwned(gate, owned);
+		run.writeReply(answer.reply);
+		return { start: false };
+	}
+
+	// Last synchronous step before the reply: a budget that expired while the
+	// checks were finishing still refuses, and never starts.
+	if (clock.now() - receivedMono > budgetMs) {
+		if (owned !== null) releaseOwned(gate, owned);
+		run.writeReply(refuseReply([COMPACT_BUDGET_REFUSAL]));
+		return { start: false };
+	}
+	const startedAt = clock.epoch();
+	run.writeReply(JSON.stringify({ ok: true, compacting: true, started_at: startedAt }));
+	if (run.ctx && owned !== null) {
+		fireCompact(run.ctx, run.query, gate, owned, run.onCompactFailed);
+	} else if (owned !== null) {
+		releaseOwned(gate, owned);
+	}
+	return { start: true };
+}
+
 export default function hcomExtension(pi: ExtensionAPI) {
 	let instanceName: string | null = null;
 	let sessionId: string | null = null;
@@ -301,6 +632,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	let notifyServer: Server | null = null;
 	let notifyPort: number | null = null;
 	let currentCtx: ExtensionContext | null = null;
+	// One reservation for this seat. Taken synchronously on a real compact
+	// request, before the pending-message lookup, so a second request cannot
+	// also be acknowledged.
+	const compactGate = createCompactGate();
 	let pendingAckId: number | null = null;
 	let ackInFlight: Promise<boolean> | null = null;
 	let bindingGeneration = 0;
@@ -327,47 +662,44 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		return !candidateSessionId || !sessionId || candidateSessionId === sessionId;
 	}
 
-	/** The job-snapshot fields the context query reads. */
-	interface AsyncJobSnapshotView {
-		running: readonly unknown[];
-		delivery: { queued: number; delivering: boolean };
-	}
-
-	// `getAsyncJobSnapshot()` is newer than the SDK types hcom pins for the
-	// plugin typecheck (17.0.6); the omp this runs inside (>= 18.0) has it. Type
-	// the context once with the method optional so a host without it reports the
-	// job count as unknown instead of throwing.
-	function asyncJobSnapshot(ctx: ExtensionContext): AsyncJobSnapshotView | null {
-		const host: ExtensionContext & {
-			getAsyncJobSnapshot?: () => AsyncJobSnapshotView | null;
-		} = ctx;
-		return host.getAsyncJobSnapshot?.() ?? null;
-	}
-
 	// One reply line for hcom's `list --context` query (`{"q":"context"}\n`).
-	// Usage is null when the seat cannot compute it and the job count is null
-	// when the session has no job manager; hcom renders both as unknown, never 0.
 	function contextReply(): string {
 		try {
-			const usage = currentCtx?.getContextUsage() ?? null;
-			const snapshot = currentCtx ? asyncJobSnapshot(currentCtx) : null;
-			const jobs = snapshot
-				? snapshot.running.length +
-					snapshot.delivery.queued +
-					(snapshot.delivery.delivering ? 1 : 0)
-				: null;
-			return JSON.stringify({
-				tokens: usage ? usage.tokens : null,
-				contextWindow: usage ? usage.contextWindow : null,
-				percent: usage ? usage.percent : null,
-				jobs,
-			});
+			return contextReplyBody(currentCtx);
 		} catch (error) {
 			log("WARN", "notify_server.context_query_failed", instanceName, {
 				error: String(error),
 			});
-			return JSON.stringify({ tokens: null, contextWindow: null, percent: null, jobs: null });
+			return contextReplyBody(null);
 		}
+	}
+
+	// One `{"q":"compact"}` request. Reservation and the check budget live in
+	// `serveCompactRequest`: the reply is written before `ctx.compact` runs,
+	// the reservation is held until that promise settles, and a failure to
+	// compact is logged, not returned (the reply already left).
+	async function runCompactQuery(socket: Socket, query: CompactRequest): Promise<void> {
+		const outcome = await serveCompactRequest({
+			gate: compactGate,
+			query,
+			ctx: currentCtx,
+			fetchPending: async () => {
+				const pending = await fetchPending();
+				return pending ? pending.messages.length : 0;
+			},
+			writeReply: (reply) => {
+				try {
+					socket.end(`${reply}\n`);
+				} catch {}
+			},
+			onCompactFailed: (error) => {
+				log("ERROR", "plugin.compact_failed", instanceName, { error: String(error) });
+			},
+		});
+		log("DEBUG", "notify_server.compact_query", instanceName, {
+			dry: query.dry === true,
+			start: outcome.start,
+		});
 	}
 
 	function startNotifyServer(): Promise<number | null> {
@@ -394,26 +726,28 @@ export default function hcomExtension(pi: ExtensionAPI) {
 					buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
 					const newline = buffer.indexOf("\n");
 					if (newline < 0) return;
-					let reply: string | null = null;
+					let request: unknown = null;
 					try {
-						const request: unknown = JSON.parse(buffer.slice(0, newline).trim());
-						if (
-							request &&
-							typeof request === "object" &&
-							"q" in request &&
-							request.q === "context"
-						) {
-							reply = contextReply();
-						}
+						request = JSON.parse(buffer.slice(0, newline).trim());
 					} catch {}
-					if (reply === null) {
-						// Not a context query — keep today's wake behavior.
-						wake();
+					const q =
+						request && typeof request === "object" && "q" in request ? request.q : null;
+					if (q === "context") {
+						settled = true;
+						socket.end(`${contextReply()}\n`);
+						log("DEBUG", "notify_server.context_query", instanceName, {});
 						return;
 					}
-					settled = true;
-					socket.end(`${reply}\n`);
-					log("DEBUG", "notify_server.context_query", instanceName, {});
+					if (q === "compact") {
+						settled = true;
+						void runCompactQuery(
+							socket,
+							request && typeof request === "object" ? (request as CompactRequest) : {},
+						);
+						return;
+					}
+					// Not a query this plugin answers — keep today's wake behavior.
+					wake();
 				});
 				socket.on("close", wake);
 				socket.on("error", () => {});

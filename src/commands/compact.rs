@@ -1,24 +1,36 @@
-//! `hcom compact` — compact an idle seat's context via PTY injection.
+//! `hcom compact` — compact an idle seat's context, plugin path first.
 //!
 //! Compaction is not something hcom can do to a seat from the outside: the
-//! seat's own tool has to run `/compact`. So delivery is a PTY injection of
-//! `/compact <focus>` + Enter over the seat's inject endpoint, and the answer
-//! is read back from the seat's session file (a `type=compaction` record).
+//! seat's own tool has to run it. Two ways to ask:
 //!
-//! Safety is idle-only. Before anything is injected, every reason that
+//! - PLUGIN PATH: the seat's plugin answers its context query with
+//!   `caps: ["compact"]`. hcom sends it a `{"q":"compact",...}` request and the
+//!   plugin compacts in-process through omp's `ctx.compact()`. Nothing is
+//!   typed, so there is no prompt to check and no inject endpoint to need, and
+//!   the job facts come from the plugin's own live snapshot at request time.
+//! - INJECT PATH: otherwise a PTY injection of `/compact <focus>` + Enter over
+//!   the seat's inject endpoint (seats hcom launched under its PTY wrapper),
+//!   unchanged from before.
+//!
+//! Either way the answer is read back from the seat's session file (a
+//! `type=compaction` record).
+//!
+//! Safety is idle-only. Before anything is delivered, every reason that
 //! applies is named — live turn, open background jobs, in-flight foreground
 //! tools, running jobs / queued deliveries, pending hcom messages, unknown job
 //! data, no delivery path, a prompt that is not verifiably empty. All of them,
-//! not just the first. Immediately before the injection every fact is read
-//! again — the seat row from the DB, the prompt from a fresh screen query —
-//! and any reason then aborts it.
+//! not just the first. On the inject path every fact is read again immediately
+//! before the injection — the seat row from the DB, the prompt from a fresh
+//! screen query — and any reason then aborts it. On the plugin path the
+//! plugin's own checks run at request time instead.
 //!
 //! The prompt is read client-side from the screen query's rows
 //! ([`screen::omp_input_text`]), so it works against a seat whose PTY wrapper
 //! is an older hcom binary. A prompt that can't be read is never empty.
 //!
 //! `--dry-run` runs the whole preflight and prints what it would do, changing
-//! nothing.
+//! nothing. On the plugin path it is a `dry: true` request: the plugin's live
+//! checks still run and its refusals are still shown.
 //!
 //! Old-plugin seats have no separate view of omp's own delivery queue: a job
 //! that has finished but not yet been delivered has no end record in the
@@ -67,6 +79,11 @@ pub struct CompactArgs {
 const RECORD_POLL: Duration = Duration::from_secs(2);
 /// Longest job label carried into a refusal line.
 const LABEL_MAX_CHARS: usize = 40;
+/// CLI-side timeout or disconnect on a compact request. True by construction:
+/// the plugin check budget ([`context::PLUGIN_COMPACT_BUDGET`], 1500 ms) is
+/// strictly below the compact reply deadline ([`context::COMPACT_QUERY_TIMEOUT`],
+/// 5000 ms), so this deadline passing means the seat was not asked to compact.
+const COMPACT_NO_REPLY: &str = "no reply from plugin within 5 s; the seat was NOT asked to compact";
 
 // ── Facts ─────────────────────────────────────────────────────────────────────
 
@@ -82,6 +99,11 @@ pub struct Preflight {
     pub scan: JobsScan,
     /// hcom messages not yet delivered to this seat.
     pub pending_messages: usize,
+    /// The seat's plugin notify port when its context answer advertises the
+    /// plugin-side compact path (`caps` contains `compact`): the plugin path.
+    /// `None` — an old plugin, or no live answer — falls back to the inject
+    /// endpoint below.
+    pub plugin_compact_port: Option<u16>,
     /// The seat's inject endpoint port; `None` means nothing to deliver to.
     pub inject_port: Option<i32>,
     /// What the seat's input box holds, from its PTY screen.
@@ -132,12 +154,14 @@ pub enum Reason {
     PendingMessages(usize),
     /// Neither the scan nor a live answer knows anything about jobs.
     UnknownJobs,
-    /// No inject endpoint: nothing to deliver through.
+    /// Neither the plugin path nor an inject endpoint: nothing to deliver to.
     NoDeliveryPath,
     /// The seat's input box holds text: injecting would append to it.
     PromptNotEmpty,
     /// The seat's input box could not be read, so it is not known to be empty.
     PromptUnobservable,
+    /// A live refusal the seat's own plugin returned, carried verbatim.
+    Plugin(String),
 }
 
 impl Reason {
@@ -171,13 +195,17 @@ impl Reason {
                  in session file; no live plugin answer)"
                 .to_string(),
             Reason::NoDeliveryPath => {
-                "no delivery path (no inject endpoint registered)".to_string()
+                "no delivery path: seat not launched under hcom and its plugin predates \
+                 plugin-compact; it gains it on its next omp start (e.g. hcom r <name>), \
+                 or type /compact in its terminal"
+                    .to_string()
             }
             Reason::PromptNotEmpty => "prompt not empty (text in the seat's input box)".to_string(),
             Reason::PromptUnobservable => {
                 "prompt not verifiably empty (no screen answer, or no input box found on it)"
                     .to_string()
             }
+            Reason::Plugin(text) => text.clone(),
         }
     }
 }
@@ -203,6 +231,9 @@ fn render_job_ref(job: &OpenJob) -> String {
 /// first.
 pub fn refusal_reasons(p: &Preflight) -> Vec<Reason> {
     let mut reasons = Vec::new();
+    // The plugin path compacts in-process: its own live snapshot is the job
+    // truth at request time, and nothing is typed anywhere.
+    let plugin_path = p.plugin_compact_port.is_some();
 
     if p.status != ST_LISTENING {
         reasons.push(Reason::NotIdle {
@@ -210,21 +241,23 @@ pub fn refusal_reasons(p: &Preflight) -> Vec<Reason> {
         });
     }
 
-    if let JobsScan::Known {
-        open_jobs,
-        open_tools,
-    } = &p.scan
-    {
-        if !open_jobs.is_empty() {
-            reasons.push(Reason::OpenJobs(open_jobs.clone()));
+    if !plugin_path {
+        if let JobsScan::Known {
+            open_jobs,
+            open_tools,
+        } = &p.scan
+        {
+            if !open_jobs.is_empty() {
+                reasons.push(Reason::OpenJobs(open_jobs.clone()));
+            }
+            if !open_tools.is_empty() {
+                reasons.push(Reason::OpenTools(open_tools.clone()));
+            }
         }
-        if !open_tools.is_empty() {
-            reasons.push(Reason::OpenTools(open_tools.clone()));
-        }
-    }
 
-    if let Some(n) = p.live_jobs.filter(|n| *n > 0) {
-        reasons.push(Reason::LiveJobs(n));
+        if let Some(n) = p.live_jobs.filter(|n| *n > 0) {
+            reasons.push(Reason::LiveJobs(n));
+        }
     }
 
     if p.pending_messages > 0 {
@@ -233,18 +266,23 @@ pub fn refusal_reasons(p: &Preflight) -> Vec<Reason> {
 
     // No scan records AND no live answer at all: a live answer of 0 already
     // proves the seat is idle, so only total ignorance refuses here.
-    if matches!(p.scan, JobsScan::Unknown) && p.live_jobs.is_none() {
+    if !plugin_path && matches!(p.scan, JobsScan::Unknown) && p.live_jobs.is_none() {
         reasons.push(Reason::UnknownJobs);
     }
 
-    if p.inject_port.is_none() {
+    if !plugin_path && p.inject_port.is_none() {
         reasons.push(Reason::NoDeliveryPath);
     }
 
-    match p.prompt {
-        Prompt::Empty => {}
-        Prompt::HasText => reasons.push(Reason::PromptNotEmpty),
-        Prompt::Unobservable => reasons.push(Reason::PromptUnobservable),
+    // The prompt check protects an injection: it applies only where something
+    // would be typed. The plugin path types nothing, and neither does a seat
+    // with no delivery path at all.
+    if !plugin_path && p.inject_port.is_some() {
+        match p.prompt {
+            Prompt::Empty => {}
+            Prompt::HasText => reasons.push(Reason::PromptNotEmpty),
+            Prompt::Unobservable => reasons.push(Reason::PromptUnobservable),
+        }
     }
 
     reasons
@@ -332,9 +370,13 @@ pub fn render_jobs(ctx: &SeatContext, scan: &JobsScan) -> String {
     )
 }
 
+/// `delivery path: plugin (port N)` on the plugin path, else
 /// `delivery path: pty inject (inject endpoint port N)`.
-pub fn render_delivery(inject_port: Option<i32>) -> String {
-    match inject_port {
+pub fn render_delivery(preflight: &Preflight) -> String {
+    if let Some(port) = preflight.plugin_compact_port {
+        return format!("delivery path: plugin (port {port})");
+    }
+    match preflight.inject_port {
         Some(port) => format!("delivery path: pty inject (inject endpoint port {port})"),
         None => "delivery path: pty inject (no inject endpoint port)".to_string(),
     }
@@ -346,7 +388,7 @@ fn render_facts(facts: &Facts) -> String {
         "  {}\n  {}\n  {}\n  prompt: {}",
         render_tokens(&facts.ctx),
         render_jobs(&facts.ctx, &facts.preflight.scan),
-        render_delivery(facts.preflight.inject_port),
+        render_delivery(&facts.preflight),
         facts.preflight.prompt.as_str(),
     )
 }
@@ -426,8 +468,9 @@ fn read_row(db: &HcomDb, name: &str) -> Result<InstanceRow, Fail> {
 /// meantime is seen.
 fn gather(db: &HcomDb, name: &str) -> Result<(InstanceRow, Facts), Fail> {
     let row = read_row(db, name)?;
-    let ctx = context::probe(SeatContextRequest {
-        plugin_port: context::plugin_port(db, name),
+    let plugin_port = context::plugin_port(db, name);
+    let (ctx, caps) = context::probe_with_caps(SeatContextRequest {
+        plugin_port,
         transcript_path: row.transcript_path.clone(),
         tool: row.tool.clone(),
         remote: false,
@@ -440,6 +483,11 @@ fn gather(db: &HcomDb, name: &str) -> Result<(InstanceRow, Facts), Fail> {
     };
     let pending_messages = db.get_unread_messages(name).len();
     let inject_port = inject_port(db, name);
+    let plugin_compact_port = if caps.iter().any(|cap| cap == "compact") {
+        plugin_port
+    } else {
+        None
+    };
 
     let row = read_row(db, name)?;
     let status = get_instance_status(&row, db).status;
@@ -451,6 +499,7 @@ fn gather(db: &HcomDb, name: &str) -> Result<(InstanceRow, Facts), Fail> {
             live_jobs,
             scan: ctx.jobs_scan.clone(),
             pending_messages,
+            plugin_compact_port,
             inject_port,
             prompt,
         },
@@ -512,7 +561,7 @@ fn refuse_on(facts: &Facts) -> Result<(), Fail> {
 }
 
 /// The compaction record written after `since_ms`, polled until it appears or
-/// `timeout` seconds pass.
+/// `timeout` seconds pass. Inject path only.
 fn wait_for_compaction(path: &Path, since_ms: i64, timeout: Duration) -> Option<CompactionRecord> {
     let started = Instant::now();
     loop {
@@ -524,6 +573,88 @@ fn wait_for_compaction(path: &Path, since_ms: i64, timeout: Duration) -> Option<
             return None;
         }
         std::thread::sleep(RECORD_POLL.min(timeout - elapsed));
+    }
+}
+
+/// Plugin path: a record at or after `started_at` minus skew, and strictly
+/// newer than the newest record seen before the request.
+fn wait_for_plugin_record(
+    path: &Path,
+    pre_newest_ms: Option<i64>,
+    started_at_ms: i64,
+    timeout: Duration,
+) -> Option<CompactionRecord> {
+    let started = Instant::now();
+    loop {
+        if let Some(record) =
+            context::find_compaction_for_plugin_start(path, pre_newest_ms, started_at_ms)
+        {
+            return Some(record);
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return None;
+        }
+        std::thread::sleep(RECORD_POLL.min(timeout - elapsed));
+    }
+}
+
+/// The plugin path: the seat's plugin compacts in-process through omp's
+/// `ctx.compact()`, so nothing is typed and its own live checks run at request
+/// time. Its refusals are surfaced verbatim. The wait accepts a record whose
+/// timestamp is `>= started_at` minus 1 s and newer than the newest record
+/// seen before the request — not merely newer than the CLI's own clock.
+fn execute_plugin(
+    name: &str,
+    port: u16,
+    transcript_path: &str,
+    facts: &Facts,
+    focus: &str,
+    args: &CompactArgs,
+) -> Result<Outcome, Fail> {
+    let path = Path::new(transcript_path);
+    // Before the request leaves: a record already in the file is not this
+    // compact's, even if its timestamp is in the future.
+    let pre_newest = context::newest_compaction_ms(path);
+    let answer = match context::query_plugin_compact(port, focus, args.dry_run) {
+        Ok(answer) => answer,
+        Err(context::CompactQueryError::NoReply) => {
+            return Err(Fail::Error(COMPACT_NO_REPLY.to_string()));
+        }
+        Err(context::CompactQueryError::Unusable) => {
+            return Err(Fail::Error(format!(
+                "unusable reply from the plugin's compact request (port {port})"
+            )));
+        }
+    };
+    match answer {
+        context::CompactAnswer::Refused(reasons) => Err(Fail::Refused {
+            reasons: reasons.into_iter().map(Reason::Plugin).collect(),
+            facts: Some(render_facts(facts)),
+        }),
+        context::CompactAnswer::Would if args.dry_run => Ok(Outcome::WouldCompact {
+            report: render_would_compact(name, facts, focus),
+        }),
+        context::CompactAnswer::Compacting { started_at } if !args.dry_run => {
+            // Tell the user the compact is in before the wait, not after it.
+            println!(
+                "compact started on {name} via plugin; waiting up to {}s for a new compaction record",
+                args.timeout
+            );
+            match wait_for_plugin_record(
+                path,
+                pre_newest,
+                started_at,
+                Duration::from_secs(args.timeout),
+            ) {
+                Some(record) => Ok(Outcome::Compacted { record }),
+                None => Err(Fail::Timeout),
+            }
+        }
+        answer => Err(Fail::Error(format!(
+            "unexpected plugin answer to a {} compact request: {answer:?}",
+            if args.dry_run { "dry-run" } else { "real" }
+        ))),
     }
 }
 
@@ -550,6 +681,12 @@ pub fn execute(db: &HcomDb, args: &CompactArgs) -> Result<Outcome, Fail> {
         &facts.preflight.scan,
         args.focus.as_deref(),
     );
+
+    // Plugin path first: the plugin compacts in-process and re-checks the live
+    // state at request time, so there is no injection to re-check before.
+    if let Some(port) = facts.preflight.plugin_compact_port {
+        return execute_plugin(name, port, &row.transcript_path, &facts, &focus, args);
+    }
 
     if args.dry_run {
         return Ok(Outcome::WouldCompact {
@@ -588,12 +725,22 @@ pub fn execute(db: &HcomDb, args: &CompactArgs) -> Result<Outcome, Fail> {
     }
 }
 
+/// Exit code for a compact outcome. `Fail::Error` (including the 5 s deadline)
+/// and a refusal are 1; a record timeout is 2.
+fn outcome_exit(result: &Result<Outcome, Fail>) -> i32 {
+    match result {
+        Ok(_) => 0,
+        Err(Fail::Timeout) => 2,
+        Err(_) => 1,
+    }
+}
+
 /// Main entry point for `hcom compact`. Returns the exit code.
 pub fn cmd_compact(db: &HcomDb, args: &CompactArgs, _ctx: Option<&CommandContext>) -> i32 {
-    match execute(db, args) {
+    let result = execute(db, args);
+    match &result {
         Ok(Outcome::WouldCompact { report }) => {
             println!("{report}");
-            0
         }
         Ok(Outcome::Compacted { record }) => {
             println!(
@@ -604,24 +751,21 @@ pub fn cmd_compact(db: &HcomDb, args: &CompactArgs, _ctx: Option<&CommandContext
                 record.method,
                 record.timestamp
             );
-            0
         }
         Err(Fail::Refused { reasons, facts }) => {
-            println!("{}", render_refusal(&args.name, &reasons, facts.as_deref()));
-            1
+            println!("{}", render_refusal(&args.name, reasons, facts.as_deref()));
         }
         Err(Fail::Timeout) => {
             println!(
                 "timeout: no new compaction record within {}s for {}",
                 args.timeout, args.name
             );
-            2
         }
         Err(Fail::Error(message)) => {
             println!("{message}");
-            1
         }
     }
+    outcome_exit(&result)
 }
 
 #[cfg(test)]
@@ -653,7 +797,7 @@ mod tests {
     const EMPTY_SCREEN: &str = include_str!("../pty/omp_screens/empty.json");
     const TEXT_SCREEN: &str = include_str!("../pty/omp_screens/text.json");
 
-    /// A preflight with every reason switched off.
+    /// A preflight with every reason switched off (inject path).
     fn clean() -> Preflight {
         Preflight {
             status: "listening".to_string(),
@@ -663,6 +807,7 @@ mod tests {
                 open_tools: Vec::new(),
             },
             pending_messages: 0,
+            plugin_compact_port: None,
             inject_port: Some(41234),
             prompt: Prompt::Empty,
         }
@@ -784,7 +929,34 @@ mod tests {
         p.inject_port = None;
         assert_eq!(
             lines(&refusal_reasons(&p)),
-            ["no delivery path (no inject endpoint registered)".to_string()]
+            [
+                "no delivery path: seat not launched under hcom and its plugin predates \
+              plugin-compact; it gains it on its next omp start (e.g. hcom r <name>), \
+              or type /compact in its terminal"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_plugin_path_checks_no_jobs_and_no_prompt() {
+        let mut p = clean();
+        p.plugin_compact_port = Some(41235);
+        p.inject_port = None;
+        p.scan = known(vec![job("bg_3", "bash", Some("sleep 5"))], Vec::new());
+        p.live_jobs = Some(2);
+        p.prompt = Prompt::Unobservable;
+        // The plugin's own live checks own the job facts at request time, and
+        // nothing is typed: only the hcom-side checks remain here.
+        assert!(refusal_reasons(&p).is_empty());
+        p.status = "active".to_string();
+        p.pending_messages = 1;
+        assert_eq!(
+            lines(&refusal_reasons(&p)),
+            [
+                "not idle/listening (status=active)".to_string(),
+                "1 pending hcom message(s)".to_string(),
+            ]
         );
     }
 
@@ -836,8 +1008,9 @@ mod tests {
                 "1 in-flight foreground tool(s) (toolu_1 bash)".to_string(),
                 "1 running job(s) / queued deliveries (live plugin snapshot)".to_string(),
                 "2 pending hcom message(s)".to_string(),
-                "no delivery path (no inject endpoint registered)".to_string(),
-                "prompt not verifiably empty (no screen answer, or no input box found on it)"
+                "no delivery path: seat not launched under hcom and its plugin predates \
+              plugin-compact; it gains it on its next omp start (e.g. hcom r <name>), \
+              or type /compact in its terminal"
                     .to_string(),
             ]
         );
@@ -908,6 +1081,113 @@ mod tests {
                 rusqlite::params![port],
             )
             .unwrap();
+    }
+
+    fn add_plugin(db: &HcomDb, port: u16) {
+        db.conn()
+            .execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at)
+                 VALUES ('luna', 'plugin', ?1, 0)",
+                rusqlite::params![port as i32],
+            )
+            .unwrap();
+    }
+
+    /// A stub of the seat's plugin on its notify port: the context query is
+    /// answered with `context`, and every compact request is recorded (raw
+    /// request line, in order, sent before its reply) and answered with
+    /// `compact`. Anything else just closes, like a plugin that only wakes.
+    fn plugin_stub(
+        context: &'static str,
+        compact: &'static str,
+    ) -> (u16, std::sync::mpsc::Receiver<String>) {
+        plugin_stub_with(context, compact.to_string(), || {})
+    }
+
+    /// [`plugin_stub`], running `on_compact` after the request is recorded and
+    /// before the reply is written. Used to append the compaction record the
+    /// wait is about to look for.
+    fn plugin_stub_with(
+        context: &'static str,
+        compact: String,
+        on_compact: impl Fn() + Send + 'static,
+    ) -> (u16, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if byte[0] == b'\n' {
+                                break;
+                            }
+                            request.push(byte[0]);
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                match serde_json::from_str::<Value>(&request)
+                    .ok()
+                    .and_then(|v| v.get("q").and_then(Value::as_str).map(str::to_string))
+                    .as_deref()
+                {
+                    Some("context") => {
+                        let _ = stream.write_all(format!("{context}\n").as_bytes());
+                    }
+                    Some("compact") => {
+                        let _ = tx.send(request);
+                        on_compact();
+                        let _ = stream.write_all(format!("{compact}\n").as_bytes());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (port, rx)
+    }
+
+    /// Context replies, then holds a compact connection for `hold` (or drops
+    /// it immediately when `hold` is zero) without writing a compact reply.
+    fn holding_plugin(context: &'static str, hold: Duration) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                loop {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if byte[0] == b'\n' {
+                                break;
+                            }
+                            request.push(byte[0]);
+                        }
+                    }
+                }
+                let query = serde_json::from_str::<Value>(&String::from_utf8_lossy(&request))
+                    .ok()
+                    .and_then(|v| v.get("q").and_then(Value::as_str).map(str::to_string));
+                match query.as_deref() {
+                    Some("context") => {
+                        let _ = stream.write_all(format!("{context}\n").as_bytes());
+                    }
+                    Some("compact") if hold.is_zero() => drop(stream),
+                    Some("compact") => std::thread::sleep(hold),
+                    _ => {}
+                }
+            }
+        });
+        port
     }
 
     fn event_count(db: &HcomDb) -> i64 {
@@ -1260,7 +1540,226 @@ mod tests {
         );
     }
 
-    // --- 9. render helpers ----------------------------------------------------
+    // --- 9. plugin path -------------------------------------------------------
+
+    /// A plugin that advertises the plugin-side compact path in its context
+    /// reply (`caps` carries "compact").
+    const CAPS_CONTEXT: &str =
+        r#"{"tokens":182340,"contextWindow":258400,"percent":70.6,"jobs":0,"caps":["compact"]}"#;
+    /// A v0.7.39 plugin: it answers the context query, but predates the cap.
+    const OLD_CONTEXT: &str = r#"{"tokens":182340,"contextWindow":258400,"percent":70.6,"jobs":0}"#;
+
+    fn seen_requests(rx: &std::sync::mpsc::Receiver<String>) -> Vec<String> {
+        rx.try_iter().collect()
+    }
+
+    #[test]
+    fn plugin_caps_select_the_plugin_path() {
+        let s = seat("listening", COMPLETED_JOB, None);
+        let path: String =
+            s.db.conn()
+                .query_row(
+                    "SELECT transcript_path FROM instances WHERE name = 'luna'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        // The record is timestamped before the CLI's clock, so a wait keyed
+        // only on `now` would miss it. `started_at` minus skew still covers
+        // it, and nothing was in the file before the request.
+        let now = now_epoch_ms();
+        let started_at = now - 2_000;
+        let record_ms = now - 500;
+        let record_iso = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(record_ms)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let reply = format!(r#"{{"ok":true,"compacting":true,"started_at":{started_at}}}"#);
+        let record_line = format!(
+            r#"{{"type":"compaction","id":"ab99","timestamp":"{record_iso}","summary":"synthetic","shortSummary":"synthetic short","tokensBefore":90363,"tokensAfter":17405,"method":"local"}}"#
+        );
+        let (port, seen) = plugin_stub_with(CAPS_CONTEXT, reply, move || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{record_line}").unwrap();
+        });
+        add_plugin(&s.db, port);
+        let outcome = execute(&s.db, &args("luna")).expect("compacted");
+        match outcome {
+            Outcome::Compacted { record } => {
+                assert_eq!(record.tokens_before, 90363);
+                assert_eq!(record.tokens_after, 17405);
+                assert_eq!(record.timestamp, record_iso);
+            }
+            other => panic!("expected Compacted, got {other:?}"),
+        }
+        let seen = seen_requests(&seen);
+        assert_eq!(seen.len(), 1, "one compact request expected, got {seen:?}");
+        let request: Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(request.get("q").and_then(Value::as_str), Some("compact"));
+        assert_eq!(request.get("dry").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn a_compacting_reply_without_started_at_is_unusable() {
+        let (port, seen) = plugin_stub(CAPS_CONTEXT, r#"{"ok":true,"compacting":true}"#);
+        let s = seat("listening", COMPLETED_JOB, None);
+        add_plugin(&s.db, port);
+        let fail = execute(&s.db, &args("luna")).expect_err("unusable");
+        match fail {
+            Fail::Error(message) => {
+                assert!(message.contains("unusable reply"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert_eq!(seen_requests(&seen).len(), 1);
+    }
+
+    #[test]
+    fn compact_disconnect_says_the_seat_was_not_asked_and_exits_nonzero() {
+        let port = holding_plugin(CAPS_CONTEXT, Duration::ZERO);
+        let s = seat("listening", COMPLETED_JOB, None);
+        add_plugin(&s.db, port);
+        let fail = execute(&s.db, &args("luna")).expect_err("disconnect");
+        assert_eq!(fail, Fail::Error(COMPACT_NO_REPLY.to_string()));
+        assert_eq!(outcome_exit(&Err(fail)), 1);
+        assert_eq!(cmd_compact(&s.db, &args("luna"), None), 1);
+    }
+
+    #[test]
+    fn compact_reply_deadline_is_5s_and_a_hang_does_not_ask_the_seat_to_compact() {
+        assert_eq!(context::COMPACT_QUERY_TIMEOUT, Duration::from_millis(5_000));
+        assert!(context::PLUGIN_COMPACT_BUDGET < context::COMPACT_QUERY_TIMEOUT);
+        let port = holding_plugin(CAPS_CONTEXT, Duration::from_secs(8));
+        let s = seat("listening", COMPLETED_JOB, None);
+        add_plugin(&s.db, port);
+        let started = Instant::now();
+        let fail = execute(&s.db, &args("luna")).expect_err("deadline");
+        let elapsed = started.elapsed();
+        assert_eq!(fail, Fail::Error(COMPACT_NO_REPLY.to_string()));
+        assert_eq!(outcome_exit(&Err(fail)), 1);
+        assert!(
+            elapsed >= Duration::from_millis(4_500),
+            "deadline fired too soon: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "deadline was not 5 s: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_path_dry_run_reports_the_plugin_delivery_path() {
+        let (port, seen) = plugin_stub(CAPS_CONTEXT, r#"{"ok":true,"would":true}"#);
+        let s = seat("listening", COMPLETED_JOB, None);
+        add_plugin(&s.db, port);
+        let outcome = execute(
+            &s.db,
+            &CompactArgs {
+                dry_run: true,
+                ..args("luna")
+            },
+        )
+        .expect("would-compact");
+        match outcome {
+            Outcome::WouldCompact { report } => {
+                assert!(
+                    report.starts_with("would-compact luna\n  reasons: none\n"),
+                    "{report}"
+                );
+                assert!(report.contains("jobs: 0 (source: live plugin)"), "{report}");
+                assert!(
+                    report.contains(&format!("delivery path: plugin (port {port})")),
+                    "{report}"
+                );
+            }
+            other => panic!("expected WouldCompact, got {other:?}"),
+        }
+        // Dry run: exactly one request, and it carries dry:true — never dry:false.
+        let seen = seen_requests(&seen);
+        assert_eq!(seen.len(), 1, "one dry request expected, got {seen:?}");
+        let request: Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(request.get("dry").and_then(Value::as_bool), Some(true));
+        assert!(!seen[0].contains("\"dry\":false"), "{}", seen[0]);
+    }
+
+    #[test]
+    fn the_plugin_refusal_list_is_surfaced_verbatim() {
+        let (port, seen) = plugin_stub(
+            CAPS_CONTEXT,
+            r#"{"ok":false,"refuse":["live turn","2 running jobs"]}"#,
+        );
+        let s = seat("listening", COMPLETED_JOB, None);
+        add_plugin(&s.db, port);
+        let fail = execute(&s.db, &args("luna")).expect_err("refused");
+        match fail {
+            Fail::Refused { reasons, facts } => {
+                assert_eq!(
+                    lines(&reasons),
+                    ["live turn".to_string(), "2 running jobs".to_string()]
+                );
+                let facts = facts.expect("facts lines");
+                assert!(
+                    facts.contains(&format!("delivery path: plugin (port {port})")),
+                    "{facts}"
+                );
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        let seen = seen_requests(&seen);
+        assert_eq!(seen.len(), 1);
+        let request: Value = serde_json::from_str(&seen[0]).unwrap();
+        assert_eq!(request.get("dry").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn an_old_plugin_without_caps_falls_back_to_the_inject_path() {
+        let (port, seen) = plugin_stub(OLD_CONTEXT, "");
+        let (inject, injections) = wrapper_stub(EMPTY_SCREEN);
+        let body = format!("{COMPLETED_JOB}{COMPACTION}");
+        let s = seat("listening", &body, Some(inject));
+        add_plugin(&s.db, port);
+        let outcome = execute(&s.db, &args("luna")).expect("compacted");
+        assert!(matches!(outcome, Outcome::Compacted { .. }));
+        assert!(
+            injections.load(Ordering::SeqCst) >= 1,
+            "the inject path was not used"
+        );
+        assert!(
+            seen_requests(&seen).is_empty(),
+            "a plugin without the compact cap was asked to compact"
+        );
+    }
+
+    #[test]
+    fn neither_plugin_compact_nor_inject_names_the_no_delivery_refusal() {
+        let s = seat("listening", COMPLETED_JOB, None);
+        let fail = execute(
+            &s.db,
+            &CompactArgs {
+                dry_run: true,
+                ..args("luna")
+            },
+        )
+        .expect_err("refused");
+        match fail {
+            Fail::Refused { reasons, .. } => {
+                assert_eq!(
+                    lines(&reasons),
+                    [
+                        "no delivery path: seat not launched under hcom and its plugin predates \
+              plugin-compact; it gains it on its next omp start (e.g. hcom r <name>), \
+              or type /compact in its terminal"
+                            .to_string()
+                    ]
+                );
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    // --- 10. render helpers ---------------------------------------------------
 
     #[test]
     fn render_tokens_variants() {

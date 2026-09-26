@@ -301,25 +301,62 @@ hcom events --wait <filters>         # Block until match for scripting
 hcom update                         # update hcom version
 ```
 
-`hcom compact` is idle-only and names every refusal reason in full (live turn, open
-jobs or in-flight foreground tools, running jobs and queued deliveries, pending hcom
-messages, unknown job data, no delivery path, a prompt that is not verifiably empty)
-before it touches anything. The prompt is read from the seat's PTY screen; for omp,
-hcom parses the editor box itself, so this works on seats whose wrapper is an older
-hcom. A screen that doesn't answer, or shows no input box, is never taken as empty.
-Both the would-compact report and a refusal list tokens, jobs, the delivery path and
-`prompt: empty | has text | unobservable`.
+`hcom compact` is idle-only and names every refusal reason in full before it touches
+anything. Delivery is plugin path first: when the seat's plugin answers hcom's context
+query with `caps: ["compact"]`, hcom asks that plugin to compact in-process through omp's
+`ctx.compact()` — nothing is typed, and the plugin's own live checks (live turn, running
+jobs, queued deliveries, pending messages, pending hcom messages, unknown job state) run
+at request time, their refusals shown verbatim. Fallback for plugins that predate the
+capability: a PTY injection of `/compact <focus>` + Enter over the seat's inject endpoint,
+with hcom's own checks (live turn, open jobs or in-flight foreground tools, running jobs
+and queued deliveries, pending hcom messages, unknown job data, a prompt that is not
+verifiably empty). A seat with neither delivery path refuses with "no delivery path: seat
+not launched under hcom and its plugin predates plugin-compact; it gains it on its next
+omp start (e.g. hcom r \<name\>), or type /compact in its terminal". The prompt is read
+from the seat's PTY screen (inject path only: nothing is typed otherwise); for omp, hcom
+parses the editor box itself, so this works on seats whose wrapper is an older hcom. A
+screen that doesn't answer, or shows no input box, is never taken as empty. Both the
+would-compact report and a refusal list tokens, jobs, the delivery path (`plugin (port
+N)` or `pty inject (inject endpoint port N)`) and `prompt: empty | has text |
+unobservable`.
 `--focus "<one line>"` is added to the default focus, which is built from the seat's
 purpose, its current subtask and the open-job labels. `--timeout` (default 600 s) is how
-long it waits for the new compaction record in the seat's session file. Delivery is a
-PTY injection of `/compact <focus>` + Enter over the seat's inject endpoint. Immediately
-before injecting, the seat's row is re-read from the DB and its screen re-queried, and
-any refusal reason then aborts — a turn that starts between that re-check and the
-keystrokes is a residual race we accept, since hcom's full delivery gates live in the
-delivery loop. Remote (`name:DEVICE`) seats are refused as unsupported. Old-plugin
-seats have no separate view of omp's own delivery queue: a job that has finished but
-not yet been delivered has no end record in the session file, so it still counts as
-open.
+long it waits for the new compaction record in the seat's session file, whatever the
+delivery path.
+The plugin and the CLI share a deadline contract, and the plugin budget is
+strictly smaller: `PLUGIN_COMPACT_BUDGET_MS` is 1500 and the CLI compact reply
+deadline is 5000 ms (`CLI_COMPACT_REPLY_DEADLINE_MS` / `COMPACT_QUERY_TIMEOUT`;
+the 500 ms context probe is unchanged). If the plugin's checks, including its
+pending-message lookup, have not finished within 1500 ms it refuses "plugin
+busy: checks exceeded 1500 ms", releases its reservation, and does not start.
+If hcom sees no reply within 5 s it prints "no reply from plugin within 5 s;
+the seat was NOT asked to compact" and exits non-zero — true by construction,
+because the plugin never starts past its smaller budget. The plugin's timing
+is injectable (`now()` + `setTimer`/`clearTimer`, real clocks and one unref'd
+timer in production), so its tests advance a fake clock explicitly and never
+sleep. A second real request while one is reserved refuses "compaction already
+in progress (started Ns ago)" (a dry run reports the same reason, with the
+reservation's age, and never reserves). The start reply carries
+`started_at` (plugin epoch ms); hcom accepts a compaction record only when its
+timestamp is at or after that instant minus 1 s and strictly newer than the
+newest record it saw before the request. The reservation is released only
+when omp's `ctx.compact()` promise settles (resolve or reject); a refused
+request releases it immediately, since it never started anything. There is
+deliberately no stale bound and no wall-clock coupling to `--timeout`: the
+reservation mirrors omp's compaction state, so if omp's compact promise never
+settles, omp itself cannot compact again either and "compaction already in
+progress (started Ns ago)" is the true answer until the seat restarts — the
+age in every refusal and dry run makes such a wedged seat visible.
+omp 18.3.1's extension context does not expose `isCompacting` (that flag is on
+AgentSession); the plugin honors it if a host adds it, and otherwise only its
+own reservation can see an in-progress compact.
+Immediately before a PTY injection, the seat's row is re-read from the DB
+and its screen re-queried, and any refusal reason then aborts — a turn that starts
+between that re-check and the keystrokes is a residual race we accept, since hcom's full
+delivery gates live in the delivery loop. Remote (`name:DEVICE`) seats are refused as
+unsupported. Old-plugin seats have no separate view of omp's own delivery queue: a job
+that has finished but not yet been delivered has no end record in the session file, so it
+still counts as open.
 
 `hcom run docs --cli` for all commands.
 

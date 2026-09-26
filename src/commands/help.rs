@@ -213,11 +213,43 @@ const TITLE_HELP: &[HelpEntry] = &[
 const COMPACT_HELP: &[HelpEntry] = &[
     (
         "compact <name>",
-        "Compact an idle seat's context (injects /compact <focus> + Enter)",
+        "Compact an idle seat's context (prints tokens before -> after)",
     ),
     (
         "",
-        "Prints tokens before -> after from the new compaction record.",
+        "Plugin path first: the seat's plugin compacts in-process through",
+    ),
+    (
+        "",
+        "  omp ctx.compact(), its own live checks at request time.",
+    ),
+    ("", "One compact at a time. A second request refuses"),
+    ("", "  \"compaction already in progress (started Ns ago)\""),
+    ("", "  and never starts. The hold releases only when omp's"),
+    ("", "  compact settles (or on a refusal): no stale bound,"),
+    ("", "  and the age in every refusal shows a wedged seat."),
+    (
+        "",
+        "Plugin checks finish within 1500 ms or the plugin refuses",
+    ),
+    ("", "  and does not start. hcom waits 5 s for that reply."),
+    (
+        "",
+        "  Budget 1500 ms < deadline 5 s, so a timeout means the",
+    ),
+    ("", "  seat was not asked to compact."),
+    (
+        "",
+        "A start reply carries started_at; only a newer record at",
+    ),
+    ("", "  or after that instant minus 1 s is accepted."),
+    (
+        "",
+        "Fallback: inject /compact <focus> + Enter over the seat's inject",
+    ),
+    (
+        "",
+        "  endpoint, with hcom's checks (session file, prompt, screen).",
     ),
     (
         "compact <name> --focus \"<one line>\"",
@@ -244,11 +276,23 @@ const COMPACT_HELP: &[HelpEntry] = &[
     ),
     ("", "  pending hcom messages"),
     ("", "  unknown job data (no records, no live answer)"),
-    ("", "  no delivery path (no inject endpoint)"),
+    (
+        "",
+        "  no delivery path: seat not launched under hcom and its plugin",
+    ),
+    (
+        "",
+        "    predates plugin-compact; it gains it on its next omp start",
+    ),
+    (
+        "",
+        "    (e.g. hcom r <name>), or type /compact in its terminal",
+    ),
     (
         "",
         "  a prompt not verifiably empty (text typed, or no input box readable)",
     ),
+    ("", "    (inject path only: the plugin path types nothing)"),
     (
         "",
         "Reports end with prompt: empty | has text | unobservable.",
