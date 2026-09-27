@@ -3,6 +3,7 @@
 //! `relay.disconnected` / `relay.reconnect_attempt` / `relay.connected` log
 //! events, a live `hcom relay` status while disconnected, and no restart.
 //! Shutdown arriving while the worker is in reconnect backoff still exits.
+#![cfg(unix)]
 
 mod support;
 
