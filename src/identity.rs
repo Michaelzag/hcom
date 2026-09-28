@@ -198,15 +198,13 @@ pub fn resolve_display_name_or_stopped(db: &HcomDb, input_name: &str) -> Option<
     None
 }
 
-/// Fleet-first resolution of a bare input for a CLI command.
+/// Fleet resolution of a bare input for a CLI command.
 ///
-/// * [`CliResolve::Hit`] — the one live candidate fleet-wide: the local
-///   row's bare name, or a live mirror's `x:DEV` form. The command proceeds
-///   under that name.
-/// * [`CliResolve::Refused`] — ambiguous, or live only on suffix-only
-///   devices; the message names the exact suffixed form(s) to use.
-/// * [`CliResolve::Miss`] — live nowhere: the caller's own local behavior
-///   stands (a stopped local row, a tag-name, an unknown name).
+/// * [`CliResolve::Hit`] — the one live matching candidate fleet-wide:
+///   a local base or tagged display-name match, or a live mirror `x:DEV`.
+/// * [`CliResolve::Refused`] — more than one candidate, or only suffix-only
+///   candidates; the message names every addressable form.
+/// * [`CliResolve::Miss`] — live nowhere: the caller's local fallback stands.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CliResolve {
     Hit(String),
@@ -214,12 +212,12 @@ pub enum CliResolve {
     Miss,
 }
 
-/// The one fleet entry every command's name lookup runs FIRST, so a bare
-/// name cannot mean one seat on the CLI and another on the send path.
+/// The shared resolver every named CLI command uses. A local match by base
+/// name or tagged display name and a remote match are equally eligible;
+/// neither silently overrides the other.
 ///
-/// Input that is empty or already device-qualified is `Miss`: every
-/// `:DEVICE` flow keeps its exact behavior. Otherwise the shared resolver
-/// decides over the live fleet (see [`crate::fleet_names`]).
+/// An empty or already device-qualified input is `Miss`, preserving every
+/// explicit `:DEVICE` flow. Otherwise resolve the live fleet.
 pub fn fleet_first(db: &HcomDb, input: &str) -> CliResolve {
     if input.is_empty() || input.contains(':') {
         return CliResolve::Miss;
@@ -1212,6 +1210,24 @@ mod tests {
         let err = refusal(&db, "luna");
         assert!(err.contains("@luna,"), "local shown as bare @luna: {err}");
         assert!(err.contains(&remote_form("luna", DEV_A)), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tagged_local_display_and_remote_same_base_refuse_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_instance(&db, "x", Some("sess-1"), None);
+        db.conn()
+            .execute("UPDATE instances SET tag = 'grp' WHERE name = 'x'", [])
+            .unwrap();
+        let remote = remote_form("grp-x", DEV_A);
+        insert_mirror(&db, &remote, DEV_A, "listening");
+        let err = refusal(&db, "grp-x");
+        assert!(err.contains("@x (local display @grp-x)"), "{err}");
+        assert!(err.contains(&format!("@{remote}")), "{err}");
+        assert_eq!(cli_target(&db, &remote).unwrap(), remote);
+        assert_eq!(cli_target(&db, "x").unwrap(), "x");
     }
 
     #[test]

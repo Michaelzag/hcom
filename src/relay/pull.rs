@@ -1523,4 +1523,497 @@ mod tests {
             "old-format event keeps today's base-name behavior on A; A unread: {a_unread_old:?}"
         );
     }
+
+    /// ffc-ravoc acceptance: the ordinary unit target uses three isolated
+    /// device databases, real sealed relay import and the real send/launch
+    /// paths. It never opens an MQTT connection or contacts a public broker.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn isolated_relay_seven_decision_cells_and_stopped_a_fresh_b_named_move_reply() {
+        use crate::commands::send::send_message;
+        use crate::hooks::test_helpers::EnvGuard;
+        use crate::identity::{self, CliResolve};
+        use crate::launcher::{self, LaunchParams};
+        use crate::relay::push::build_push_payload;
+        use crate::relay::{read_device_uuid, state_topic};
+        use crate::router::GlobalFlags;
+        use crate::shared::{SenderIdentity, SenderKind};
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = EnvGuard::new();
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let homes: Vec<_> = dirs.iter().map(|dir| dir.path().to_path_buf()).collect();
+        let hcoms: Vec<_> = homes.iter().map(|home| home.join(".hcom")).collect();
+        let uuids = [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "f3a70268-8ffa-4f0c-9e37-62f78acfcc1e",
+        ];
+        let use_side = |side: usize| {
+            unsafe {
+                std::env::set_var("HOME", &homes[side]);
+                std::env::set_var("HCOM_DIR", &hcoms[side]);
+                std::env::set_var("HCOM_BUILD_ROOT", homes[side].join("build"));
+            }
+            crate::config::Config::reset();
+            crate::config::Config::init();
+        };
+        for (side, hcom) in hcoms.iter().enumerate() {
+            std::fs::create_dir_all(hcom.join(".tmp")).unwrap();
+            std::fs::write(hcom.join(".tmp/device_id"), uuids[side]).unwrap();
+            std::fs::write(
+                hcom.join("config.toml"),
+                format!("[relay]\nsuffix_only_devices = \"{}\"\n", uuids[2]),
+            )
+            .unwrap();
+            crate::paths::test_roots::register(&homes[side]);
+        }
+        use_side(0);
+        let db_a = HcomDb::open().unwrap();
+        assert_eq!(read_device_uuid().as_deref(), Some(uuids[0]));
+        use_side(1);
+        let db_b = HcomDb::open().unwrap();
+        assert_eq!(read_device_uuid().as_deref(), Some(uuids[1]));
+        use_side(2);
+        let db_c = HcomDb::open().unwrap();
+        assert_eq!(read_device_uuid().as_deref(), Some(uuids[2]));
+        let short_a = device_short_id_for_db(&db_a, uuids[0]);
+        let short_b = device_short_id_for_db(&db_b, uuids[1]);
+        let short_c = device_short_id_for_db(&db_c, uuids[2]);
+        assert_ne!(short_a, short_b);
+        assert_ne!(short_b, short_c);
+        assert_ne!(short_a, short_c);
+        let x_b = format!("x:{short_b}");
+        let x_c = format!("x:{short_c}");
+
+        let seed = |db: &HcomDb, name: &str, tag: Option<&str>| {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, tag, status, status_context, status_time, created_at, tool)
+                     VALUES (?1, ?2, 'listening', 'ready', ?3, ?4, 'claude')",
+                    rusqlite::params![
+                        name,
+                        tag,
+                        crate::shared::time::now_epoch_i64(),
+                        crate::shared::time::now_epoch_f64()
+                    ],
+                )
+                .unwrap();
+        };
+        // The same push builder and authenticated import path as a real relay
+        // worker, with no network. Imported rows and event cursors are never
+        // seeded by hand.
+        let relay_id = "isolated-ravoc-acceptance";
+        let psk = fixture_psk();
+        let exchange = |from: &HcomDb, from_uuid: &str, to: &HcomDb, to_uuid: &str| {
+            let (state, events, _, _) = build_push_payload(from, from_uuid);
+            let topic = state_topic(relay_id, from_uuid);
+            let payload = json!({"state": state, "events": events});
+            let sealed = crate::relay::crypto::seal(
+                &psk,
+                relay_id,
+                &topic,
+                &serde_json::to_vec(&payload).unwrap(),
+                crate::shared::time::now_epoch_f64() as u64,
+            )
+            .unwrap();
+            let mut guard = ReplayGuard::default();
+            handle_state_message(
+                to,
+                from_uuid,
+                &sealed,
+                to_uuid,
+                &mut InboundContext {
+                    psk: &psk,
+                    relay_id,
+                    topic: &topic,
+                    replay_guard: &mut guard,
+                },
+            );
+        };
+        let sender = |name: &str, kind| SenderIdentity {
+            kind,
+            name: name.into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let external = sender("boss", SenderKind::External);
+        let refusal = |db: &HcomDb, name: &str| match identity::fleet_first(db, name) {
+            CliResolve::Refused(msg) => msg,
+            other => panic!("expected {name} refused, got {other:?}"),
+        };
+        let unread = |db: &HcomDb, name: &str, text: &str| {
+            db.get_unread_messages(name)
+                .iter()
+                .any(|msg| msg.text == text)
+        };
+        let check_named_actions = |target: &str, local: &str, remote: &str| {
+            let check = |error: &str| {
+                assert!(
+                    error.contains(&format!("@{local}")) && error.contains(&format!("@{remote}")),
+                    "{target}: {error}"
+                );
+            };
+            check(&identity::cli_target(&db_a, target).unwrap_err());
+            check(
+                &crate::commands::resume::do_resume(target, false, &[], &GlobalFlags::default())
+                    .unwrap_err()
+                    .to_string(),
+            );
+            check(
+                &crate::commands::kill::run(&[target.into()], &GlobalFlags::default())
+                    .unwrap_err()
+                    .to_string(),
+            );
+            assert_eq!(
+                crate::commands::stop::cmd_stop(
+                    &db_a,
+                    &crate::commands::stop::StopArgs {
+                        targets: vec![target.into()],
+                    },
+                    None,
+                ),
+                1
+            );
+            assert_eq!(
+                crate::commands::term::cmd_term(
+                    &db_a,
+                    &crate::commands::term::TermArgs {
+                        args: vec!["inject".into(), target.into(), "hello".into()],
+                    },
+                    None,
+                ),
+                1
+            );
+            match crate::commands::compact::execute(
+                &db_a,
+                &crate::commands::compact::CompactArgs {
+                    name: target.into(),
+                    focus: None,
+                    dry_run: true,
+                    timeout: 1,
+                },
+            )
+            .unwrap_err()
+            {
+                crate::commands::compact::Fail::Error(msg) => check(&msg),
+                other => panic!("compact {target} should refuse both seats, got {other:?}"),
+            }
+            assert!(
+                db_a.get_instance_full(local).unwrap().is_some(),
+                "none of the refused commands may act on local {local}"
+            );
+            assert_eq!(
+                crate::commands::list::cmd_list(
+                    &db_a,
+                    &crate::commands::list::ListArgs {
+                        name: Some(target.into()),
+                        json: true,
+                        field: None,
+                        stopped: false,
+                        verbose: false,
+                        names: false,
+                        sh: false,
+                        format: None,
+                        all: false,
+                        last: None,
+                        context: false,
+                    },
+                    None,
+                ),
+                0,
+                "list {target} shows both candidates instead of refusing"
+            );
+        };
+
+        // Cell 1: one live remote seat resolves and receives a bare @x.
+        seed(&db_b, "x", None);
+        exchange(&db_b, uuids[1], &db_a, uuids[0]);
+        use_side(0);
+        assert_eq!(identity::cli_target(&db_a, "x").unwrap(), x_b);
+        assert_eq!(
+            send_message(&db_a, &external, "@x one-remote", None, None).unwrap(),
+            vec![x_b.clone()]
+        );
+        exchange(&db_a, uuids[0], &db_b, uuids[1]);
+        assert!(unread(&db_b, "x", "@x one-remote"));
+
+        // Cell 2: same-named local and remote seats are both candidates.
+        seed(&db_a, "x", None);
+        use_side(0);
+        let err = send_message(&db_a, &external, "@x collision", None, None).unwrap_err();
+        assert!(
+            (err.contains("@x,") || err.ends_with("@x")) && err.contains(&format!("@{x_b}")),
+            "{err}"
+        );
+        let cli_err = refusal(&db_a, "x");
+        assert!(
+            cli_err.contains("@x,") && cli_err.contains(&x_b),
+            "{cli_err}"
+        );
+        check_named_actions("x", "x", &x_b);
+        // Explicit device addresses bypass the shared bare-name resolver for
+        // all named actions even when a local seat shares the base name.
+        assert_eq!(identity::fleet_first(&db_a, &x_b), CliResolve::Miss);
+        assert_eq!(identity::cli_target(&db_a, &x_b).unwrap(), x_b);
+        let resume_exact =
+            crate::commands::resume::do_resume(&x_b, false, &[], &GlobalFlags::default())
+                .unwrap_err()
+                .to_string();
+        assert!(
+            resume_exact.contains("relay worker not running"),
+            "{resume_exact}"
+        );
+        let kill_exact =
+            crate::commands::kill::run(std::slice::from_ref(&x_b), &GlobalFlags::default())
+                .unwrap_err()
+                .to_string();
+        assert!(
+            kill_exact.contains("relay worker not running"),
+            "{kill_exact}"
+        );
+        assert_eq!(
+            crate::commands::stop::cmd_stop(
+                &db_a,
+                &crate::commands::stop::StopArgs {
+                    targets: vec![x_b.clone()],
+                },
+                None,
+            ),
+            1,
+            "remote stop is unsupported, not redirected to local x"
+        );
+        assert_eq!(
+            crate::commands::term::cmd_term(
+                &db_a,
+                &crate::commands::term::TermArgs {
+                    args: vec!["inject".into(), x_b.clone(), "hello".into()],
+                },
+                None,
+            ),
+            1,
+            "exact remote term inject reaches the relay worker gate"
+        );
+        assert!(matches!(
+            crate::commands::compact::execute(
+                &db_a,
+                &crate::commands::compact::CompactArgs {
+                    name: x_b.clone(),
+                    focus: None,
+                    dry_run: true,
+                    timeout: 1,
+                },
+            ),
+            Err(crate::commands::compact::Fail::Refused {
+                reasons,
+                facts: None
+            }) if reasons == vec![crate::commands::compact::Reason::Remote]
+        ));
+
+        // Tagged local display names enter the SAME collision set. Neither
+        // local nor remote silently wins; the explicit remote name still works.
+        seed(&db_a, "t", Some("grp"));
+        seed(&db_b, "grp-t", None);
+        exchange(&db_b, uuids[1], &db_a, uuids[0]);
+        use_side(0);
+        let grp_remote = format!("grp-t:{short_b}");
+        let err = send_message(&db_a, &external, "@grp-t collision", None, None).unwrap_err();
+        assert!(err.contains("@t (local display @grp-t)"), "{err}");
+        assert!(err.contains(&format!("@{grp_remote}")), "{err}");
+        assert_eq!(
+            identity::cli_target(&db_a, &grp_remote).unwrap(),
+            grp_remote
+        );
+        check_named_actions("grp-t", "t", &grp_remote);
+        assert_eq!(identity::fleet_first(&db_a, &grp_remote), CliResolve::Miss);
+        assert_eq!(
+            crate::commands::list::cmd_list(
+                &db_a,
+                &crate::commands::list::ListArgs {
+                    name: Some(grp_remote.clone()),
+                    json: true,
+                    field: None,
+                    stopped: false,
+                    verbose: false,
+                    names: false,
+                    sh: false,
+                    format: None,
+                    all: false,
+                    last: None,
+                    context: false,
+                },
+                None,
+            ),
+            0
+        );
+        assert_eq!(
+            send_message(
+                &db_a,
+                &external,
+                "@grp-t explicit",
+                None,
+                Some(&[grp_remote])
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+
+        // Cell 5: @x:B reaches only B's x, never A's same-named local x.
+        assert_eq!(
+            send_message(
+                &db_a,
+                &external,
+                "@x exact",
+                None,
+                Some(std::slice::from_ref(&x_b))
+            )
+            .unwrap(),
+            vec![x_b.clone()]
+        );
+        exchange(&db_a, uuids[0], &db_b, uuids[1]);
+        assert!(unread(&db_b, "x", "@x exact"));
+        assert!(!unread(&db_a, "x", "@x exact"));
+
+        // Cell 3: x only on suffix-only C cannot be selected by bare name.
+        db_a.delete_instance("x").unwrap();
+        db_b.delete_instance("x").unwrap();
+        exchange(&db_b, uuids[1], &db_a, uuids[0]);
+        seed(&db_c, "x", None);
+        exchange(&db_c, uuids[2], &db_a, uuids[0]);
+        use_side(0);
+        let err = refusal(&db_a, "x");
+        assert!(err.contains(&x_c), "{err}");
+
+        // Cell 4: a suffix-only seat plus a normal seat refuses both.
+        seed(&db_b, "x", None);
+        exchange(&db_b, uuids[1], &db_a, uuids[0]);
+        let err = refusal(&db_a, "x");
+        assert!(err.contains(&x_b) && err.contains(&x_c), "{err}");
+
+        // Cell 6: a stopped local x does not capture a bare @x.
+        seed(&db_a, "x", None);
+        db_a.conn()
+            .execute(
+                "UPDATE instances SET status = 'stopped' WHERE name = 'x'",
+                [],
+            )
+            .unwrap();
+        db_c.delete_instance("x").unwrap();
+        exchange(&db_c, uuids[2], &db_a, uuids[0]);
+        use_side(0);
+        assert_eq!(identity::cli_target(&db_a, "x").unwrap(), x_b);
+        assert_eq!(
+            send_message(&db_a, &external, "@x stopped-local", None, None).unwrap(),
+            vec![x_b.clone()]
+        );
+        exchange(&db_a, uuids[0], &db_b, uuids[1]);
+        assert!(unread(&db_b, "x", "@x stopped-local"));
+
+        // Cell 7: a fresh launch is refused when the name lives on C, even
+        // though that device is suffix-only for bare-name resolution.
+        seed(&db_c, "guard", None);
+        exchange(&db_c, uuids[2], &db_b, uuids[1]);
+        let err = launcher::resolve_explicit_name_conflict(&db_b, "guard", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("guard:{short_c}")), "{err}");
+
+        // The third device was suffix-only for cells 3, 4 and 7. It is a
+        // normal fleet device for the move: otherwise the bare reply would
+        // correctly refuse a sender living only on a suffix-only device.
+        for hcom in &hcoms {
+            std::fs::write(
+                hcom.join("config.toml"),
+                "[relay]\nsuffix_only_devices = \"\"\n",
+            )
+            .unwrap();
+        }
+
+        // Move the very same x: stop B's earlier test seat, make A's x live,
+        // stop it on A, then use the real launch pipeline with --as x on B.
+        db_b.delete_instance("x").unwrap();
+        exchange(&db_b, uuids[1], &db_a, uuids[0]);
+        db_a.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening' WHERE name = 'x'",
+                [],
+            )
+            .unwrap();
+        exchange(&db_a, uuids[0], &db_b, uuids[1]);
+        assert!(launcher::resolve_explicit_name_conflict(&db_b, "x", None).is_err());
+        db_a.delete_instance("x").unwrap();
+        db_a.log_life_event("x", "stopped", "test", "move", None, None)
+            .unwrap();
+        exchange(&db_a, uuids[0], &db_b, uuids[1]);
+        assert!(
+            db_b.get_instance_full(&format!("x:{short_a}"))
+                .unwrap()
+                .is_none()
+        );
+
+        let fakebin = homes[1].join("fakebin");
+        std::fs::create_dir_all(&fakebin).unwrap();
+        let fake_claude = fakebin.join("claude");
+        std::fs::write(&fake_claude, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        use_side(1);
+        let old_path = std::env::var_os("PATH");
+        let mut paths = vec![fakebin];
+        paths.extend(std::env::split_paths(
+            old_path.as_deref().unwrap_or_default(),
+        ));
+        unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+        let launched = launcher::launch(
+            &db_b,
+            LaunchParams {
+                tool: "claude".into(),
+                args: vec!["-p".into(), "hello".into()],
+                name: Some("x".into()),
+                terminal: Some("print".into()),
+                ..LaunchParams::default()
+            },
+        );
+        unsafe {
+            match old_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let launched = launched.expect("explicit-name fresh launch on B");
+        assert_eq!(launched.launched, 1, "{launched:?}");
+        assert!(db_b.get_instance_full("x").unwrap().is_some());
+        db_b.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening', status_context = 'ready' WHERE name = 'x'",
+                [],
+            )
+            .unwrap();
+
+        // A third device addresses moved B by bare name, and B replies by
+        // the sender's bare name after both sides import real relay states.
+        seed(&db_c, "sender", None);
+        exchange(&db_b, uuids[1], &db_c, uuids[2]);
+        use_side(2);
+        let x_on_c = format!("x:{short_b}");
+        assert_eq!(identity::cli_target(&db_c, "x").unwrap(), x_on_c);
+        let third_sender = sender("sender", SenderKind::Instance);
+        assert_eq!(
+            send_message(&db_c, &third_sender, "@x from-third", None, None).unwrap(),
+            vec![x_on_c]
+        );
+        exchange(&db_c, uuids[2], &db_b, uuids[1]);
+        assert!(unread(&db_b, "x", "@x from-third"));
+
+        use_side(1);
+        let moved_sender = sender("x", SenderKind::Instance);
+        let sender_on_b = format!("sender:{short_c}");
+        assert_eq!(
+            send_message(&db_b, &moved_sender, "@sender reply", None, None).unwrap(),
+            vec![sender_on_b]
+        );
+        exchange(&db_b, uuids[1], &db_c, uuids[2]);
+        assert!(unread(&db_c, "sender", "@sender reply"));
+    }
 }

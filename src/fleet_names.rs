@@ -33,6 +33,8 @@ pub const LIVE_ROW_PREDICATE: &str = "status != 'stopped' AND status_context != 
 pub struct BareCandidate {
     pub exact: String,
     pub suffix_only: bool,
+    /// True when this local row's full tagged display name matches the input.
+    pub display_match: bool,
 }
 
 /// Outcome of resolving a bare name against the live candidate set.
@@ -55,7 +57,11 @@ pub enum BareOutcome {
 fn refuse_message(base: &str, normal: &[&BareCandidate], solo: &[&BareCandidate]) -> String {
     let mut forms: Vec<String> = Vec::with_capacity(normal.len() + solo.len());
     for c in normal.iter().chain(solo.iter()) {
-        forms.push(format!("@{}", c.exact));
+        if c.display_match {
+            forms.push(format!("@{} (local display @{base})", c.exact));
+        } else {
+            forms.push(format!("@{}", c.exact));
+        }
     }
     let list = forms.join(", ");
     if solo.is_empty() {
@@ -71,8 +77,8 @@ fn refuse_message(base: &str, normal: &[&BareCandidate], solo: &[&BareCandidate]
     }
 }
 
-/// Resolve a bare `base` against live candidates (case-insensitive base
-/// match — see `live_candidates`).
+/// Resolve a bare `base` against live candidates (case-insensitive base or
+/// tagged local display-name match — see `live_candidates`).
 ///
 /// Partition candidates into normal (not suffix-only) and solo (suffix-only):
 /// - none at all → [`BareOutcome::NoCandidate`]
@@ -88,6 +94,9 @@ pub fn resolve_bare_name(base: &str, candidates: &[BareCandidate]) -> BareOutcom
     let matching: Vec<&BareCandidate> = candidates
         .iter()
         .filter(|c| {
+            if c.display_match {
+                return true;
+            }
             match crate::relay::control::split_device_suffix(&c.exact) {
                 // Local row: its whole name is the base.
                 None => c.exact.to_lowercase() == base_lower,
@@ -163,19 +172,11 @@ impl SuffixOnly {
         self.shorts.is_empty() && self.uuids.is_empty()
     }
 
-    /// Case-insensitive short-id match; also true when a listed UUID shortens
-    /// to this short id via the canonical `device_short_id` derivation
-    /// (relay/mod.rs — hash_to_name CVCV, attempt 0).
+    /// Case-insensitive match against explicitly listed short ids only.
+    /// A UUID's derived short can collide with another device, so a UUID
+    /// listing must never imply a short-id listing.
     pub fn short_is_listed(&self, short: &str) -> bool {
-        let short_upper = short.to_uppercase();
-        if self.shorts.contains(&short_upper) {
-            return true;
-        }
-        !self.uuids.is_empty()
-            && self
-                .uuids
-                .iter()
-                .any(|uuid| crate::relay::device_short_id(uuid) == short_upper)
+        self.shorts.contains(&short.to_uppercase())
     }
 
     /// True when `uuid` is listed (case-insensitive), or when its canonical
@@ -221,9 +222,10 @@ impl FleetCtx {
     }
 }
 
-/// Live candidate rows for bare `base` (case-insensitive base match):
-/// - the local live row named exactly `base` (suffix-only flag from the
-///   config list via the own device id), and
+/// Live candidate rows for bare `base` (case-insensitive base or local
+/// tagged display-name match):
+/// - a local live row named `base` or displayed as `tag-name` matching `base`
+///   (suffix-only flag from the own device id), and
 /// - live mirror rows (origin_device_id set) whose base after
 ///   `split_device_suffix` equals `base`, with the suffix-only flag from
 ///   the config list for that mirror's device (origin uuid first, short id
@@ -233,24 +235,32 @@ pub fn live_candidates(db: &HcomDb, base: &str, ctx: &FleetCtx) -> Vec<BareCandi
 
     // Local live row: no origin_device_id (NULL or empty string — the column
     // defaults to '', while the typed read path filters empty to None).
-    if let Ok(names) = db
+    if let Ok(rows) = db
         .conn()
         .prepare(&format!(
-            "SELECT name FROM instances
+            "SELECT name, tag FROM instances
              WHERE {LIVE_ROW_PREDICATE}
                AND (origin_device_id IS NULL OR origin_device_id = '')
-               AND LOWER(name) = LOWER(?1)"
+               AND (LOWER(name) = LOWER(?1)
+                    OR LOWER(tag || '-' || name) = LOWER(?1))"
         ))
         .and_then(|mut stmt| {
-            stmt.query_map([base], |row| row.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+            stmt.query_map([base], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
         })
     {
-        for name in names {
+        for (name, tag) in rows {
+            let display_match = tag
+                .as_deref()
+                .is_some_and(|tag| format!("{tag}-{name}").eq_ignore_ascii_case(base))
+                && !name.eq_ignore_ascii_case(base);
             let suffix_only = !ctx.own_uuid.is_empty() && ctx.so.device_is_listed(&ctx.own_uuid);
             out.push(BareCandidate {
                 exact: name,
                 suffix_only,
+                display_match,
             });
         }
     }
@@ -281,6 +291,7 @@ pub fn live_candidates(db: &HcomDb, base: &str, ctx: &FleetCtx) -> Vec<BareCandi
             out.push(BareCandidate {
                 exact: name,
                 suffix_only,
+                display_match: false,
             });
         }
     }
@@ -300,6 +311,7 @@ mod tests {
         BareCandidate {
             exact: exact.to_string(),
             suffix_only,
+            display_match: false,
         }
     }
 
@@ -424,18 +436,34 @@ mod tests {
         assert!(!got[0].suffix_only);
     }
 
-    // Decision cell 7: device_is_listed is true for a listed UUID and its short.
+    // Decision cell 7: an exact UUID or an explicitly listed short identifies
+    // the device; a UUID listing does not implicitly list its derived short.
     #[test]
-    fn device_is_listed_true_for_uuid_and_short() {
-        let so = SuffixOnly::parse("f3a70268-8ffa-4f0c-9e37-62f78acfcc1e");
-        assert!(so.device_is_listed("f3a70268-8ffa-4f0c-9e37-62f78acfcc1e"));
-        // Case-insensitive UUID match.
-        assert!(so.device_is_listed("F3A70268-8FFA-4F0C-9E37-62F78ACFCC1E"));
-        // The canonical short id derived from that UUID is also listed.
-        let short = crate::relay::device_short_id("f3a70268-8ffa-4f0c-9e37-62f78acfcc1e");
-        assert!(so.short_is_listed(&short));
-        // An unlisted device is not listed.
-        assert!(!so.device_is_listed("00000000-0000-0000-0000-000000000000"));
+    fn device_is_listed_true_for_uuid_and_explicit_short() {
+        let uuid = "f3a70268-8ffa-4f0c-9e37-62f78acfcc1e";
+        let by_uuid = SuffixOnly::parse(uuid);
+        assert!(by_uuid.device_is_listed(uuid));
+        assert!(by_uuid.device_is_listed(&uuid.to_uppercase()));
+        let short = crate::relay::device_short_id(uuid);
+        assert!(!by_uuid.short_is_listed(&short));
+        let by_short = SuffixOnly::parse(&short);
+        assert!(by_short.device_is_listed(uuid));
+        assert!(by_short.short_is_listed(&short));
+        assert!(!by_uuid.device_is_listed("00000000-0000-0000-0000-000000000000"));
+    }
+
+    #[test]
+    fn uuid_listing_does_not_mark_colliding_unlisted_device_suffix_only() {
+        let listed_uuid = "0000003f-0000-4000-8000-000000000000";
+        let colliding_uuid = "0000008f-0000-4000-8000-000000000000";
+        let short = crate::relay::device_short_id(listed_uuid);
+        assert_eq!(short, crate::relay::device_short_id(colliding_uuid));
+        let by_uuid = SuffixOnly::parse(listed_uuid);
+        assert!(by_uuid.mirror_is_suffix_only(listed_uuid, &short));
+        assert!(!by_uuid.device_is_listed(colliding_uuid));
+        assert!(!by_uuid.mirror_is_suffix_only(colliding_uuid, &short));
+        let by_short = SuffixOnly::parse(&short);
+        assert!(by_short.mirror_is_suffix_only(colliding_uuid, &short));
     }
 
     /// A mirror row's suffix is a second, independent leg: a row can carry a

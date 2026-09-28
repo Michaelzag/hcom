@@ -171,7 +171,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             .unwrap_or((None, None))
     };
 
-    // Single instance query: hcom list <name|self> [field] [--json]
+    // Named query: an ambiguous bare name shows every live matching row.
     if let Some(target) = target_name {
         let is_self = target == "self";
 
@@ -180,95 +180,123 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
 
-        let lookup_name = if is_self {
-            current_name.clone().unwrap_or_default()
+        let lookup_names = if is_self {
+            vec![current_name.clone().unwrap_or_default()]
         } else {
-            // Fleet-first: a bare name live on one other device resolves to
-            // that device's `X:DEV` form and prints the mirror row's data.
-            match identity::cli_target(db, target) {
-                Ok(name) => name,
-                Err(msg) => {
-                    eprintln!("Error: {msg}");
-                    return 1;
-                }
+            match identity::fleet_first(db, target) {
+                identity::CliResolve::Hit(name) => vec![name],
+                identity::CliResolve::Refused(_) => crate::fleet_names::live_candidates(
+                    db,
+                    target,
+                    &crate::fleet_names::FleetCtx::load(),
+                )
+                .into_iter()
+                .map(|candidate| candidate.exact)
+                .collect(),
+                identity::CliResolve::Miss => vec![
+                    identity::resolve_display_name(db, target).unwrap_or_else(|| target.into()),
+                ],
             }
         };
 
-        if lookup_name.is_empty() {
+        if lookup_names.is_empty() || lookup_names.iter().any(String::is_empty) {
             eprintln!("Error: No name to look up.");
             return 1;
         }
-
-        match db.get_instance_full(&lookup_name) {
-            Ok(Some(data)) => {
-                let mut payload = serde_json::json!({
-                    "name": lookup_name,
-                    "session_id": data.session_id,
-                    "status": data.status,
-                    "directory": data.directory,
-                    "transcript_path": data.transcript_path,
-                    "parent_name": data.parent_name,
-                    "agent_id": data.agent_id,
-                    "tool": data.tool,
-                    "purpose": data.purpose.as_deref().filter(|s| !s.is_empty()),
-                    "current": data.current.as_deref().filter(|s| !s.is_empty()),
-                });
-
-                if is_self
-                    && let Some(id) = &sender_identity
-                    && let Some(sid) = &id.session_id
-                {
-                    payload["session_id"] = serde_json::json!(sid);
-                }
-
-                // Probe once: the JSON payload and the printed columns share it.
-                let seat = if args.context {
-                    let now = crate::shared::time::now_epoch_i64();
-                    Some(context::probe(seat_context_request(db, &data, now)))
-                } else {
-                    None
-                };
-                if let Some(seat) = &seat {
-                    payload["context"] = context::to_json(seat);
-                }
-
-                if let Some(field) = field_name {
-                    println!("{}", extract_field_value(&payload, field));
-                } else if sh_output {
-                    print_sh_exports(&payload);
-                } else if json_output {
-                    println!("{}", serde_json::to_string(&payload).unwrap_or_default());
-                } else {
-                    print_instance_details(db, &data, &lookup_name);
-                    if let Some(seat) = &seat {
-                        println!("  {}", context::format_columns(seat));
-                    }
-                }
-                return 0;
-            }
-            _ => {
-                if is_self {
-                    let payload = serde_json::json!({
+        let multiple = lookup_names.len() > 1;
+        let mut results = Vec::new();
+        for lookup_name in lookup_names {
+            match db.get_instance_full(&lookup_name) {
+                Ok(Some(data)) => {
+                    let display = get_full_name(&data);
+                    let mut payload = serde_json::json!({
                         "name": lookup_name,
-                        "session_id": sender_identity.as_ref().and_then(|id| id.session_id.as_deref()).unwrap_or(""),
+                        "display_name": &display,
+                        "session_id": data.session_id,
+                        "status": data.status,
+                        "directory": data.directory,
+                        "transcript_path": data.transcript_path,
+                        "parent_name": data.parent_name,
+                        "agent_id": data.agent_id,
+                        "tool": data.tool,
+                        "purpose": data.purpose.as_deref().filter(|s| !s.is_empty()),
+                        "current": data.current.as_deref().filter(|s| !s.is_empty()),
                     });
+
+                    if is_self
+                        && let Some(id) = &sender_identity
+                        && let Some(sid) = &id.session_id
+                    {
+                        payload["session_id"] = serde_json::json!(sid);
+                    }
+
+                    // Probe once: the JSON payload and the printed columns share it.
+                    let seat = if args.context {
+                        let now = crate::shared::time::now_epoch_i64();
+                        Some(context::probe(seat_context_request(db, &data, now)))
+                    } else {
+                        None
+                    };
+                    if let Some(seat) = &seat {
+                        payload["context"] = context::to_json(seat);
+                    }
+
                     if let Some(field) = field_name {
                         println!("{}", extract_field_value(&payload, field));
                     } else if sh_output {
                         print_sh_exports(&payload);
                     } else if json_output {
-                        println!("{}", serde_json::to_string(&payload).unwrap_or_default());
+                        if multiple {
+                            results.push(payload);
+                        } else {
+                            println!("{}", serde_json::to_string(&payload).unwrap_or_default());
+                        }
                     } else {
-                        println!("{lookup_name}");
+                        if multiple && display != lookup_name {
+                            print_instance_details(
+                                db,
+                                &data,
+                                &format!("{lookup_name} (local display {display})"),
+                            );
+                        } else {
+                            print_instance_details(db, &data, &lookup_name);
+                        }
+                        if let Some(seat) = &seat {
+                            println!("  {}", context::format_columns(seat));
+                        }
                     }
-                    return 0;
-                } else {
-                    eprintln!("Error: Not found: {target}");
-                    eprintln!("Use 'hcom list' to see active agents.");
-                    return 1;
+                    if !multiple {
+                        return 0;
+                    }
+                }
+                _ => {
+                    if is_self {
+                        let payload = serde_json::json!({
+                            "name": lookup_name,
+                            "session_id": sender_identity.as_ref().and_then(|id| id.session_id.as_deref()).unwrap_or(""),
+                        });
+                        if let Some(field) = field_name {
+                            println!("{}", extract_field_value(&payload, field));
+                        } else if sh_output {
+                            print_sh_exports(&payload);
+                        } else if json_output {
+                            println!("{}", serde_json::to_string(&payload).unwrap_or_default());
+                        } else {
+                            println!("{lookup_name}");
+                        }
+                        return 0;
+                    } else {
+                        eprintln!("Error: Not found: {target}");
+                        eprintln!("Use 'hcom list' to see active agents.");
+                        return 1;
+                    }
                 }
             }
         }
+        if json_output && field_name.is_none() && !sh_output {
+            println!("{}", serde_json::to_string(&results).unwrap_or_default());
+        }
+        return 0;
     }
 
     // Full listing mode
@@ -1396,11 +1424,11 @@ mod tests {
         assert_eq!(cmd_list(&db, &list_args("luna"), None), 0);
     }
 
-    /// A live local row is a candidate, not a short-circuit: with a live
-    /// mirror of the same base name the command refuses, naming both forms.
+    /// A live local row and a live mirror are both shown by the read-only
+    /// named list query, while seat-acting CLI commands still refuse.
     #[test]
     #[serial_test::serial]
-    fn a_live_local_name_and_a_live_mirror_are_refused_with_both_forms() {
+    fn a_live_local_name_and_a_live_mirror_are_listed_with_both_forms() {
         let _env = crate::hooks::test_helpers::isolated_test_env();
         let (_dir, db) = fleet_db();
         insert_local(&db, "luna");
@@ -1409,7 +1437,7 @@ mod tests {
         let err = identity::cli_target(&db, "luna").expect_err("ambiguous");
         assert!(err.contains("@luna,"), "{err}");
         assert!(err.contains(&form), "{err}");
-        assert_eq!(cmd_list(&db, &list_args("luna"), None), 1);
+        assert_eq!(cmd_list(&db, &list_args("luna"), None), 0);
     }
 
     /// A stopped local row is never a candidate, so the name belongs to the
@@ -1434,7 +1462,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn a_bare_name_live_on_two_remote_devices_is_refused_with_both_forms() {
+    fn a_bare_name_live_on_two_remote_devices_lists_both_forms() {
         let _env = crate::hooks::test_helpers::isolated_test_env();
         let (_dir, db) = fleet_db();
         insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
@@ -1442,7 +1470,7 @@ mod tests {
         let err = identity::cli_target(&db, "luna").expect_err("ambiguous");
         assert!(err.contains(&remote_form("luna", FLEET_DEV)), "{err}");
         assert!(err.contains(&remote_form("luna", FLEET_DEV_B)), "{err}");
-        assert_eq!(cmd_list(&db, &list_args("luna"), None), 1);
+        assert_eq!(cmd_list(&db, &list_args("luna"), None), 0);
     }
 
     /// A name live nowhere keeps today's not-found error.

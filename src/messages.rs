@@ -221,19 +221,13 @@ fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String 
 /// Match a target against instance names.
 ///
 /// Resolution order:
-/// 1. Bare base name (no `:`) via the fleet-wide resolver over live
-///    candidates built from `instances`, with the same policy
-///    `fleet_names::live_candidates` applies: a local row named exactly the
-///    base (suffix-only flag from the own device), plus mirror rows whose
-///    `split_device_suffix` base matches (flag from the mirror's origin
-///    device uuid OR its short suffix). A `:`-name with an invalid device
-///    suffix is not a candidate — the resolver would drop it anyway.
-///    Single → that exact name; Refuse → error naming the exact suffixed
-///    form(s); NoCandidate → legacy branches below unchanged.
-/// 2. Exact base name
-/// 3. Exact full display name ({tag}-{name})
-/// 4. Exact tag group when the target ends in `-`
-/// 5. Unique remote prefix when the target contains `:`
+/// 1. A bare input uses the fleet resolver over every live matching seat:
+///    local base or full tagged display name, and remote base names. One
+///    candidate resolves; multiple candidates refuse and name all exact
+///    forms (including a local tagged seat); suffix-only devices count.
+/// 2. An explicit device-qualified name bypasses the fleet resolver.
+/// 3. Legacy exact, tag-group and unique remote-prefix matching when the
+///    fleet has no candidates for the bare input.
 ///
 /// Special case: bigboss:SUFFIX resolves to bigboss (virtual identity, device-agnostic).
 fn match_target(
@@ -245,13 +239,16 @@ fn match_target(
         let mut candidates: Vec<BareCandidate> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
         for inst in instances {
-            if inst.name.eq_ignore_ascii_case(target) {
-                // Local row named exactly the bare base.
+            if inst.origin.is_none()
+                && (inst.name.eq_ignore_ascii_case(target)
+                    || inst.full_name().eq_ignore_ascii_case(target))
+            {
                 if seen.insert(inst.name.as_str()) {
                     candidates.push(BareCandidate {
                         exact: inst.name.clone(),
                         suffix_only: !fleet.own_uuid.is_empty()
                             && fleet.so.device_is_listed(&fleet.own_uuid),
+                        display_match: !inst.name.eq_ignore_ascii_case(target),
                     });
                 }
             } else if let Some((base, suffix)) = split_device_suffix(&inst.name) {
@@ -263,6 +260,7 @@ fn match_target(
                             inst.origin.as_deref().unwrap_or_default(),
                             suffix,
                         ),
+                        display_match: false,
                     });
                 }
             }
@@ -270,8 +268,7 @@ fn match_target(
         match resolve_bare_name(target, &candidates) {
             BareOutcome::Single(exact) => return Ok(vec![exact]),
             BareOutcome::Refuse(msg) => return Err(msg),
-            // No live candidate: fall through to the legacy branches below
-            // (tag-name precedence and friends are unchanged).
+            // No live candidate: fall through to the legacy branches below.
             BareOutcome::NoCandidate => {}
         }
     }
@@ -1131,6 +1128,20 @@ mod tests {
             match_target("api-luna", &instances, &fleet()).unwrap(),
             vec!["luna"]
         );
+    }
+
+    #[test]
+    fn test_compute_scope_tagged_local_and_remote_same_display_refuse_both() {
+        let mut remote = info("grp-x:DEVB", None);
+        remote.origin = Some("device-b".into());
+        let instances = vec![info("x", Some("grp")), remote];
+        let err = compute_scope("hey @grp-x", &instances, None, &fleet()).unwrap_err();
+        assert!(err.contains("@x (local display @grp-x)"), "{err}");
+        assert!(err.contains("@grp-x:DEVB"), "{err}");
+        let exact = compute_scope("hey @grp-x:DEVB", &instances, None, &fleet()).unwrap();
+        assert_eq!(exact.mentions, vec!["grp-x:DEVB"]);
+        let local = compute_scope("hey @x", &instances, None, &fleet()).unwrap();
+        assert_eq!(local.mentions, vec!["x"]);
     }
 
     #[test]
