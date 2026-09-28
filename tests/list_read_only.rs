@@ -224,24 +224,24 @@ fn list_shows_mail_queued_for_unread_messages() {
         "no queue line without unread mail:\n{stdout}"
     );
 
-	// One unconsumed message above the seat's read cursor, stored exactly as
-	// `hcom send` stores it: routed, with delivered_to and mentions naming
-	// the seat (send.rs stamps both; the unread count keys off delivered_to).
-	let queued = serde_json::json!({
-		"from": "lola",
-		"text": "hold the door",
-		"intent": "request",
-		"scope": "mentions",
-		"mentions": [name],
-		"delivered_to": [name],
-	});
-	fixture_db(&h)
-		.execute(
-			"INSERT INTO events (type, timestamp, instance, data)
-			 VALUES ('message', ?1, ?2, ?3)",
-			rusqlite::params![now_epoch_f64().to_string(), name, queued.to_string()],
-		)
-		.expect("seed unread message event");
+    // One unconsumed message above the seat's read cursor, stored exactly as
+    // `hcom send` stores it: routed, with delivered_to and mentions naming
+    // the seat (send.rs stamps both; the unread count keys off delivered_to).
+    let queued = serde_json::json!({
+        "from": "lola",
+        "text": "hold the door",
+        "intent": "request",
+        "scope": "mentions",
+        "mentions": [name],
+        "delivered_to": [name],
+    });
+    fixture_db(&h)
+        .execute(
+            "INSERT INTO events (type, timestamp, instance, data)
+             VALUES ('message', ?1, ?2, ?3)",
+            rusqlite::params![now_epoch_f64().to_string(), name, queued.to_string()],
+        )
+        .expect("seed unread message event");
 
     let (code, stdout, stderr) = h.run(["list"]);
     assert_eq!(
