@@ -113,6 +113,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 }
                 crate::hooks::common::StopOutcome::RetryableError(e) => {
                     eprintln!("Error stopping {display}: {e}");
+                    orphan_notes.extend(released.iter().map(|(name, orphans)| {
+                        crate::proctruth::describe_unsignalled_orphans(name, orphans)
+                    }));
                     failed_names.push(display.clone());
                 }
             }
@@ -222,6 +225,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 }
                 crate::hooks::common::StopOutcome::RetryableError(e) => {
                     eprintln!("Error stopping {display}: {e}");
+                    orphan_notes.extend(released.iter().map(|(name, orphans)| {
+                        crate::proctruth::describe_unsignalled_orphans(name, orphans)
+                    }));
                     failed_names.push(display.clone());
                 }
             }
@@ -313,6 +319,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 }
                 crate::hooks::common::StopOutcome::RetryableError(e) => {
                     eprintln!("Error stopping {display}: {e}");
+                    orphan_notes.extend(released.iter().map(|(name, orphans)| {
+                        crate::proctruth::describe_unsignalled_orphans(name, orphans)
+                    }));
                     failed_names.push(display.clone());
                 }
             }
@@ -420,6 +429,12 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         | crate::hooks::common::StopOutcome::AlreadyStopped => {}
         crate::hooks::common::StopOutcome::RetryableError(e) => {
             eprintln!("Error stopping {display}: {e}");
+            for (name, orphans) in &released {
+                println!(
+                    "{}",
+                    crate::proctruth::describe_unsignalled_orphans(name, orphans)
+                );
+            }
             return 1;
         }
     }
@@ -474,7 +489,10 @@ fn stop_read_instance(
 }
 
 /// Run the stop `capture` gates, then gather every row it released with no
-/// signal: `name` itself when `orphans` is non-empty, then its children.
+/// signal: `name` itself when `orphans` is non-empty and the release landed,
+/// then its children. A failed release never lists `name` (its row is still
+/// there); children the stop released before failing stay listed so the
+/// caller reports their still-running orphans on the error path too.
 fn release_captured(
     db: &HcomDb,
     name: &str,
@@ -490,7 +508,13 @@ fn release_captured(
         db, name, initiator, reason, capture,
     );
     let mut released = Vec::new();
-    if !orphans.is_empty() {
+    if !orphans.is_empty()
+        && matches!(
+            outcome,
+            crate::hooks::common::StopOutcome::Stopped
+                | crate::hooks::common::StopOutcome::AlreadyStopped
+        )
+    {
         released.push((name.to_string(), orphans));
     }
     released.extend(children);
@@ -499,9 +523,10 @@ fn release_captured(
 
 /// Release `name`'s row with no signal to anyone when it has no live root
 /// and its only live carriers are orphans — the release the daemon sweep
-/// performs on its own. None when there is no row or the row is not
-/// orphan-only (nothing was done, so a live row gets the caller's plain
-/// refusal); otherwise every row released that way (this one first, then
+/// performs on its own. None when there is no row, the row is not
+/// orphan-only, or a descendant child row cannot be proven orphan-only
+/// (nothing was done, so a live row gets the caller's plain refusal);
+/// otherwise every row released that way (this one first, then
 /// any orphan-only children) with the orphans left running, or an error:
 /// the row could not be read, the capture refused (the F2 foreign-owner
 /// guard), or the release did not land.
@@ -525,6 +550,13 @@ pub(crate) fn release_orphaned_row(
     };
     // The carriers changed since the classification: not orphan-only now.
     if !capture.signal_free() {
+        return None;
+    }
+    // A signal-free release takes every descendant child row with it: refuse
+    // without changing anything when one cannot be proven orphan-only, so
+    // the caller keeps its plain "still active" refusal.
+    if let Some(blocker) = crate::hooks::common::signal_free_release_blocker(db, name) {
+        log_info("lifecycle", "stop.orphan_release_refused", &blocker);
         return None;
     }
     match release_captured(db, name, initiator, reason, capture, orphans) {

@@ -56,6 +56,19 @@ pub(crate) struct PreparedResume {
     /// `--restore-earlier`: the earlier snapshot appended as a corrective
     /// `life.stopped` event for the seat right before launch.
     restored_snapshot: Option<RestoredSnapshot>,
+    /// Preview only: a stale orphan-only row the plan read but must not
+    /// release. The preview describes it; the executing path
+    /// (`--go` / `execute_prepared_resume`) releases it via
+    /// [`crate::commands::stop::release_orphaned_row`] before launching.
+    /// Always `None` on an executing plan.
+    pending_orphan_release: Option<PendingOrphanRelease>,
+}
+
+/// A stale orphan-only row a preview plan classified read-only
+/// ([`crate::proctruth::orphaned_row_carriers`]) but left in place.
+struct PendingOrphanRelease {
+    name: String,
+    orphans: Vec<crate::proctruth::OrphanCarrier>,
 }
 
 /// The `--restore-earlier` part of a plan: what [`append_restored_snapshot`]
@@ -220,7 +233,7 @@ fn run_resume(
         if ctx.is_inside_ai_tool()
             && !flags.go
             && should_preview_resume_rpc(extra_args)
-            && let Ok(plan) = prepare_resume_plan(&db, &name, fork, extra_args, flags)
+            && let Ok(plan) = prepare_resume_plan_preview(&db, &name, fork, extra_args, flags)
         {
             print_resume_preview(&plan, &hcom_config, &name, fork);
             return Ok(0);
@@ -262,13 +275,17 @@ fn run_resume(
         return Ok(0);
     }
 
+    // The preview path (`hcom r` without `--go` inside an AI tool) only
+    // classifies and describes: the plan below must not release a stale
+    // orphan-only row. The release runs only on the executing path.
+    let previewing = ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args);
     let (resolved, plan) = if restore_earlier {
-        resolve_restore_earlier_plan(&db, &name, extra_args, flags)?
+        resolve_restore_earlier_plan(&db, &name, extra_args, flags, previewing)?
     } else {
-        resolve_name_to_plan(&db, &name, fork, extra_args, flags)?
+        resolve_name_to_plan(&db, &name, fork, extra_args, flags, previewing)?
     };
     let is_adoption = plan.launch.name.is_none();
-    if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
+    if previewing {
         print_resume_preview(&plan, &hcom_config, &resolved, fork);
         return Ok(0);
     }
@@ -309,7 +326,7 @@ pub fn run_local_resume_result(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<LaunchResult> {
-    let (resolved, plan) = resolve_name_to_plan(db, name, fork, extra_args, flags)?;
+    let (resolved, plan) = resolve_name_to_plan(db, name, fork, extra_args, flags, false)?;
     execute_prepared_resume_result(db, &resolved, fork, &plan)
 }
 
@@ -334,12 +351,16 @@ pub fn run_local_resume_result(
 /// bare name still resumes the name's newest snapshot.
 ///
 /// Returns `(resolved_name_for_display, prepared_plan)`.
+///
+/// `preview` is the AI-tool preview path (`hcom r` without `--go`): the plan
+/// only classifies and describes, and never releases a stale orphan-only row.
 fn resolve_name_to_plan(
     db: &HcomDb,
     name: &str,
     fork: bool,
     extra_args: &[String],
     flags: &GlobalFlags,
+    preview: bool,
 ) -> Result<(String, PreparedResume)> {
     let current = crate::identity::resolve_display_name_or_stopped(db, name)
         .unwrap_or_else(|| name.to_string());
@@ -369,6 +390,7 @@ fn resolve_name_to_plan(
                 fork,
                 extra_args,
                 flags,
+                preview,
             )?;
             return Ok((instance_name, plan));
         }
@@ -403,6 +425,7 @@ fn resolve_name_to_plan(
                 fork,
                 extra_args,
                 flags,
+                preview,
             )?;
             return Ok((instance_name, plan));
         }
@@ -410,10 +433,20 @@ fn resolve_name_to_plan(
         return Ok((session_id, plan));
     }
 
-    let plan = prepare_resume_plan(db, &current, fork, extra_args, flags)?;
+    let plan = prepare_resume_plan_from_source(
+        db,
+        ResumeSource::Instance { name: &current },
+        fork,
+        extra_args,
+        flags,
+        preview,
+    )?;
     Ok((current, plan))
 }
 
+/// Executing plan by name. Production resolution goes through
+/// [`resolve_name_to_plan`]; only unit tests call this directly.
+#[cfg(test)]
 pub(crate) fn prepare_resume_plan(
     db: &HcomDb,
     name: &str,
@@ -421,7 +454,34 @@ pub(crate) fn prepare_resume_plan(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<PreparedResume> {
-    prepare_resume_plan_from_source(db, ResumeSource::Instance { name }, fork, extra_args, flags)
+    prepare_resume_plan_from_source(
+        db,
+        ResumeSource::Instance { name },
+        fork,
+        extra_args,
+        flags,
+        false,
+    )
+}
+
+/// [`prepare_resume_plan`] for the AI-tool preview path (`hcom r` without
+/// `--go`): classifies a stale orphan-only row read-only and describes what
+/// `--go` will release, without releasing anything.
+fn prepare_resume_plan_preview(
+    db: &HcomDb,
+    name: &str,
+    fork: bool,
+    extra_args: &[String],
+    flags: &GlobalFlags,
+) -> Result<PreparedResume> {
+    prepare_resume_plan_from_source(
+        db,
+        ResumeSource::Instance { name },
+        fork,
+        extra_args,
+        flags,
+        true,
+    )
 }
 
 /// Spawn gates shared by name resume and exact-session resume: refuse when
@@ -430,11 +490,12 @@ pub(crate) fn prepare_resume_plan(
 /// live check that a name resume would hit.
 ///
 /// A non-inactive row with no live root whose only live carriers are
-/// orphans is not live: it is released here with no signal to anyone
-/// ([`crate::commands::stop::release_orphaned_row`]), and the resume goes on
-/// from the stopped snapshot that release writes. That is the same release
-/// the daemon sweep performs on its own, so it is safe even in the AI-tool
-/// preview path.
+/// orphans is not live: on the executing path it is released here with no
+/// signal to anyone ([`crate::commands::stop::release_orphaned_row`]), and
+/// the resume goes on from the stopped snapshot that release writes. That
+/// is the same release the daemon sweep performs on its own. The preview
+/// path never releases: it only classifies
+/// ([`preview_resumable`]) and describes what `--go` will release.
 fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
     if !fork
         && let Ok(Some(inst)) = db.get_instance_full(name)
@@ -453,7 +514,7 @@ fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
                 );
             }
             Some(Err(e)) => bail!("{e}"),
-            None => bail!("'{}' is still active — run hcom kill {} first", name, name),
+            None => bail!("{}", still_active_message(name)),
         }
     }
     // Process truth gates the spawn: even with the row stopped, a
@@ -467,12 +528,55 @@ fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
     Ok(())
 }
 
+/// The preview half of [`ensure_resumable`]: read-only. A non-inactive row
+/// with no live root whose only live carriers are orphans comes back as a
+/// pending release for the preview to describe; anything else live (or
+/// undeterminable) refuses exactly as the executing path would, but without
+/// releasing anything.
+fn preview_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<Option<PendingOrphanRelease>> {
+    let mut pending = None;
+    if !fork
+        && let Ok(Some(inst)) = db.get_instance_full(name)
+        && inst.status != ST_INACTIVE
+    {
+        let (row, binding_ids) = db
+            .get_instance_with_bindings(name)
+            .map_err(|e| anyhow::anyhow!("could not read instance {name}: {e}"))?;
+        match row {
+            Some(row) => match crate::proctruth::orphaned_row_carriers(db, &row, &binding_ids) {
+                Some(orphans) => {
+                    pending = Some(PendingOrphanRelease {
+                        name: name.to_string(),
+                        orphans,
+                    });
+                }
+                None => bail!("{}", still_active_message(name)),
+            },
+            None => bail!("{}", still_active_message(name)),
+        }
+    }
+    if !fork && let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name) {
+        bail!("{refusal}");
+    }
+    Ok(pending)
+}
+
+/// The refusal a live (or undeterminable) row gets on every resume path.
+fn still_active_message(name: &str) -> String {
+    format!("'{name}' is still active — run hcom kill {name} first")
+}
+
+/// `preview` is the AI-tool preview path (`hcom r` without `--go`): the plan
+/// only classifies and describes, and never releases a stale orphan-only row
+/// ([`preview_resumable`]). `false` is the executing path, which releases it
+/// ([`ensure_resumable`]).
 fn prepare_resume_plan_from_source(
     db: &HcomDb,
     source: ResumeSource<'_>,
     fork: bool,
     extra_args: &[String],
     flags: &GlobalFlags,
+    preview: bool,
 ) -> Result<PreparedResume> {
     let is_adoption = matches!(source, ResumeSource::Disk { .. });
     // Only a plain name resume can suggest `--restore-earlier`.
@@ -495,10 +599,21 @@ fn prepare_resume_plan_from_source(
         snapshot_current,
         snapshot_transcript_path,
         display_name,
+        pending_orphan_release,
     ) = match source {
         ResumeSource::Instance { name } => {
-            ensure_resumable(db, name, fork)?;
+            let pending = if preview {
+                preview_resumable(db, name, fork)?
+            } else {
+                ensure_resumable(db, name, fork)?;
+                None
+            };
             let (tool, sid, largs, tag, bg, leid, snap, purpose, current, tpath) = if fork {
+                load_instance_data(db, name)?
+            } else if pending.is_some() {
+                // Preview only: the row is still there (nothing was
+                // released), so plan from the live row — the same data the
+                // release would snapshot — instead of a stopped snapshot.
                 load_instance_data(db, name)?
             } else {
                 load_stopped_snapshot(db, name)?
@@ -515,10 +630,16 @@ fn prepare_resume_plan_from_source(
                 current,
                 tpath,
                 name.to_string(),
+                pending,
             )
         }
         ResumeSource::StoppedSession { name, session_id } => {
-            ensure_resumable(db, name, fork)?;
+            let pending = if preview {
+                preview_resumable(db, name, fork)?
+            } else {
+                ensure_resumable(db, name, fork)?;
+                None
+            };
             let (tool, sid, largs, tag, bg, leid, snap, purpose, current, tpath) =
                 load_stopped_snapshot_by_session_id(db, session_id)?;
             (
@@ -533,10 +654,16 @@ fn prepare_resume_plan_from_source(
                 current,
                 tpath,
                 name.to_string(),
+                pending,
             )
         }
         ResumeSource::EarlierSnapshot { name, loaded } => {
-            ensure_resumable(db, name, fork)?;
+            let pending = if preview {
+                preview_resumable(db, name, fork)?
+            } else {
+                ensure_resumable(db, name, fork)?;
+                None
+            };
             let (tool, sid, largs, tag, bg, leid, snap, purpose, current, tpath) = loaded;
             (
                 tool,
@@ -550,6 +677,7 @@ fn prepare_resume_plan_from_source(
                 current,
                 tpath,
                 name.to_string(),
+                pending,
             )
         }
         ResumeSource::Disk {
@@ -570,6 +698,7 @@ fn prepare_resume_plan_from_source(
                 String::new(),
                 String::new(),
                 display,
+                None,
             )
         }
     };
@@ -839,6 +968,7 @@ fn prepare_resume_plan_from_source(
         session_id,
         tracked_fork_identity,
         restored_snapshot: None,
+        pending_orphan_release,
     })
 }
 
@@ -881,6 +1011,7 @@ fn resolve_restore_earlier_plan(
     name: &str,
     extra_args: &[String],
     flags: &GlobalFlags,
+    preview: bool,
 ) -> Result<(String, PreparedResume)> {
     if is_session_id(name) {
         bail!(
@@ -936,6 +1067,7 @@ fn resolve_restore_earlier_plan(
                 false,
                 extra_args,
                 flags,
+                preview,
             )?;
             plan.restored_snapshot = Some(RestoredSnapshot {
                 source_event_id: event_id,
@@ -1349,6 +1481,16 @@ fn print_resume_preview(
         show_config_args: false,
         notes: &notes,
     });
+    if let Some(pending) = &plan.pending_orphan_release {
+        println!(
+            "On --go, '{}' will be released: no live process roots it, so its row is stale; resuming from its session.",
+            pending.name
+        );
+        println!(
+            "{}",
+            crate::proctruth::describe_unsignalled_orphans(&pending.name, &pending.orphans)
+        );
+    }
 }
 
 fn should_preview_resume_rpc(extra_args: &[String]) -> bool {
@@ -3084,6 +3226,7 @@ fn build_adopt_plan(
         fork,
         extra_args,
         flags,
+        false,
     )
 }
 
@@ -4397,9 +4540,15 @@ mod tests {
         // `hcom r <A>` must carry `--resume A` even though the name's newest
         // stopped snapshot belongs to the later session B.
         let db = reused_name_db();
-        let (resolved, plan) =
-            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
-                .unwrap();
+        let (resolved, plan) = resolve_name_to_plan(
+            &db,
+            EXACT_SESSION_A,
+            false,
+            &[],
+            &GlobalFlags::default(),
+            false,
+        )
+        .unwrap();
         assert_eq!(resolved, "luna");
         assert_eq!(plan.session_id, EXACT_SESSION_A);
         assert!(
@@ -4420,7 +4569,7 @@ mod tests {
         // Control: `hcom r <name>` keeps meaning the name's newest snapshot.
         let db = reused_name_db();
         let (resolved, plan) =
-            resolve_name_to_plan(&db, "luna", false, &[], &GlobalFlags::default()).unwrap();
+            resolve_name_to_plan(&db, "luna", false, &[], &GlobalFlags::default(), false).unwrap();
         assert_eq!(resolved, "luna");
         assert_eq!(plan.session_id, EXACT_SESSION_B);
         assert!(
@@ -4437,9 +4586,15 @@ mod tests {
         // (500), not A's stale 100 — restoring 100 would rewind the name's
         // delivery cursor and redeliver messages B already consumed.
         let db = reused_name_db_with_cursors(100, 500);
-        let (resolved, plan) =
-            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
-                .unwrap();
+        let (resolved, plan) = resolve_name_to_plan(
+            &db,
+            EXACT_SESSION_A,
+            false,
+            &[],
+            &GlobalFlags::default(),
+            false,
+        )
+        .unwrap();
         assert_eq!(resolved, "luna");
         assert_eq!(plan.session_id, EXACT_SESSION_A);
         assert_eq!(
@@ -4459,9 +4614,15 @@ mod tests {
         // Grey zone: A's cursor is higher than the name's newest (the newer
         // snapshot predates the cursor field, say). The max keeps A's cursor.
         let db = reused_name_db_with_cursors(700, 500);
-        let (_resolved, plan) =
-            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
-                .unwrap();
+        let (_resolved, plan) = resolve_name_to_plan(
+            &db,
+            EXACT_SESSION_A,
+            false,
+            &[],
+            &GlobalFlags::default(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             plan.last_event_id, 700,
             "a cursor above the name's newest must be kept"
@@ -4476,9 +4637,15 @@ mod tests {
         let mut data = serde_json::Map::new();
         data.insert("last_event_id".into(), json!(500));
         crate::instances::update_instance_position(&db, "luna", &data);
-        let (_resolved, plan) =
-            resolve_name_to_plan(&db, EXACT_SESSION_A, false, &[], &GlobalFlags::default())
-                .unwrap();
+        let (_resolved, plan) = resolve_name_to_plan(
+            &db,
+            EXACT_SESSION_A,
+            false,
+            &[],
+            &GlobalFlags::default(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             plan.last_event_id, 500,
             "the instance row's cursor counts toward the name's newest"
@@ -4497,6 +4664,7 @@ mod tests {
             false,
             &[],
             &GlobalFlags::default(),
+            false,
         )
         .err()
         .expect("expected adoption lookup to fail for unknown UUID")
@@ -4966,6 +5134,7 @@ mod tests {
                 false,
                 &[],
                 &GlobalFlags::default(),
+                false,
             )
             .err()
             .expect("exact-session resume with no session file must fail")
@@ -5271,7 +5440,8 @@ mod tests {
             let before = stopped_events(&db, "lave").len();
 
             let (resolved, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             assert_eq!(resolved, "lave");
             assert_eq!(plan.launch.name.as_deref(), Some("lave"));
             assert!(
@@ -5323,10 +5493,11 @@ mod tests {
                 }
                 let before = stopped_events(&db, "lave").len();
 
-                let err = resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default())
-                    .err()
-                    .expect("restoring a held session must fail")
-                    .to_string();
+                let err =
+                    resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                        .err()
+                        .expect("restoring a held session must fail")
+                        .to_string();
                 assert!(
                     err.contains(&format!("earlier session {OMP_EARLIER_SID} of 'lave'"))
                         && err.contains("is live as 'rune'; nothing restored"),
@@ -5356,10 +5527,11 @@ mod tests {
             assert_eq!(err, format!("session file not found: {OMP_MISSING_SID}"));
 
             let before = stopped_events(&db, "lave").len();
-            let err = resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default())
-                .err()
-                .expect("no earlier session with a file must fail")
-                .to_string();
+            let err =
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .err()
+                    .expect("no earlier session with a file must fail")
+                    .to_string();
             assert_eq!(
                 err,
                 "--restore-earlier: no earlier session of 'lave' has a session file; \
@@ -5376,11 +5548,16 @@ mod tests {
         with_omp_home(|home| {
             let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
             let before = stopped_events(&db, "lave").len();
-            let err =
-                resolve_restore_earlier_plan(&db, OMP_EARLIER_SID, &[], &GlobalFlags::default())
-                    .err()
-                    .expect("a session id is already exact")
-                    .to_string();
+            let err = resolve_restore_earlier_plan(
+                &db,
+                OMP_EARLIER_SID,
+                &[],
+                &GlobalFlags::default(),
+                false,
+            )
+            .err()
+            .expect("a session id is already exact")
+            .to_string();
             assert!(
                 err.starts_with("--restore-earlier takes a seat name, not a session id"),
                 "unexpected error: {err}"
@@ -5400,7 +5577,8 @@ mod tests {
         with_omp_home(|home| {
             let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             append_restored_snapshot(&db, "lave", &plan).unwrap();
 
             let corrective = stopped_events(&db, "lave").pop().unwrap();
@@ -5423,7 +5601,8 @@ mod tests {
         with_omp_home(|home| {
             let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             let mut data = serde_json::Map::new();
             data.insert("session_id".into(), json!(OMP_EARLIER_SID));
             data.insert("tool".into(), json!("omp"));
@@ -5461,9 +5640,11 @@ mod tests {
             insert_omp_stopped_event(&db, "kiwi", OMP_EARLIER_SID, &a_dir, OMP_EARLIER_CURSOR);
             insert_omp_stopped_event(&db, "kiwi", OMP_MISSING_SID, "/tmp", OMP_DEAD_CURSOR);
             let (_, kiwi_plan) =
-                resolve_restore_earlier_plan(&db, "kiwi", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "kiwi", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             let (_, lave_plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
 
             append_restored_snapshot(&db, "lave", &lave_plan).unwrap();
             let row = db.get_instance_full("lave").unwrap().unwrap();
@@ -5499,7 +5680,8 @@ mod tests {
         with_omp_home(|home| {
             let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             append_restored_snapshot(&db, "lave", &plan).unwrap();
             let reserved = db.get_instance_full("lave").unwrap().expect("reservation");
 
@@ -5559,7 +5741,8 @@ mod tests {
         with_omp_home(|home| {
             let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             let mut data = serde_json::Map::new();
             data.insert("session_id".into(), json!(OMP_OTHER_SID));
             data.insert("tool".into(), json!("omp"));
@@ -5589,7 +5772,8 @@ mod tests {
         with_omp_home(|home| {
             let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             let created_at = crate::shared::time::now_epoch_f64();
             let mut data = serde_json::Map::new();
             data.insert("session_id".into(), json!(OMP_OTHER_SID));
@@ -5634,7 +5818,8 @@ mod tests {
         with_omp_home(|home| {
             let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             let old = crate::shared::time::now_epoch_f64() - 1000.0;
             let mut data = serde_json::Map::new();
             data.insert("session_id".into(), json!(OMP_OTHER_SID));
@@ -5702,7 +5887,8 @@ mod tests {
             insert_omp_stopped_event(&db, "lave", OMP_MISSING_SID, "/tmp", OMP_DEAD_CURSOR);
             insert_omp_stopped_event(&db, "lave", OMP_MISSING_SID, "/tmp", OMP_DEAD_CURSOR);
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             let before = stopped_events(&db, "lave").len();
 
             let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
@@ -5756,7 +5942,8 @@ mod tests {
         with_omp_home(|home| {
             let (db, _, _) = poisoned_seat_db(home, true, OMP_MISSING_SID);
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             write_omp_session_file(&format!("2026-01-02T00-00-00Z_{OMP_OTHER_SID}.jsonl"));
             insert_omp_stopped_event(&db, "lave", OMP_OTHER_SID, "/tmp", OMP_DEAD_CURSOR + 1);
             let before = stopped_events(&db, "lave").len();
@@ -5799,7 +5986,8 @@ mod tests {
             );
 
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             assert!(
                 plan.launch
                     .args
@@ -5858,7 +6046,8 @@ mod tests {
                 )
             );
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             assert!(
                 plan.launch
                     .args
@@ -5908,7 +6097,8 @@ mod tests {
                 )
             );
             let (_, plan) =
-                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default()).unwrap();
+                resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
+                    .unwrap();
             assert_eq!(plan.launch.cwd.as_deref(), Some(a_dir.as_str()));
         });
     }
