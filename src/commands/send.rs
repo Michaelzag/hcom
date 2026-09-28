@@ -4,6 +4,7 @@ use std::io::{IsTerminal, Read as IoRead};
 
 use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
+use crate::fleet_names::FleetCtx;
 use crate::identity;
 use crate::instances;
 use crate::messages::{
@@ -244,20 +245,23 @@ struct ResolvedDelivery {
     is_thread_resolved: bool,
 }
 
+/// Every row a send may deliver to or resolve a bare name against, carrying
+/// the `origin_device_id` the fleet suffix-only flag needs (a mirror row's
+/// `:SHORT` suffix is not always its device's canonical short id).
 fn deliverable_instances(db: &HcomDb) -> Result<Vec<InstanceInfo>, String> {
     let rows = db
         .conn()
-        .prepare(
-            "SELECT name, tag FROM instances
-             WHERE status != 'stopped'
-               AND status_context != 'launch_failed'
-               AND NOT (status = 'inactive' AND status_context LIKE 'exit:%')",
-        )
+        .prepare(&format!(
+            "SELECT name, tag, origin_device_id FROM instances
+             WHERE {}",
+            crate::fleet_names::LIVE_ROW_PREDICATE
+        ))
         .map_err(|e| format!("DB error: {e}"))?
         .query_map([], |row| {
             Ok(InstanceInfo {
                 name: row.get::<_, String>(0)?,
                 tag: row.get::<_, Option<String>>(1)?,
+                origin: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
             })
         })
         .map_err(|e| format!("DB error: {e}"))?
@@ -276,10 +280,13 @@ fn resolve_delivery(
     // Deliverable agents: exclude session-stopped (exit:*) and launch_failed placeholders.
     // Adhoc instances use inactive:tool:* between commands — still @mentionable.
     let rows = deliverable_instances(db)?;
+    // Fleet bare-name context, loaded once per send (infallible: every
+    // failure path degrades to the empty fallback).
+    let fleet = FleetCtx::load();
 
     // Compute scope and routing. Thread-only sends keep their original message
     // semantics; membership only affects the delivery target set.
-    let scope_result = compute_scope(message, &rows, explicit_targets)?;
+    let scope_result = compute_scope(message, &rows, explicit_targets, &fleet)?;
     let thread_delivery_members =
         if let Some(thread) = envelope.and_then(|env| env.thread.as_deref()) {
             if scope_result.scope == MessageScope::Broadcast {
@@ -308,7 +315,12 @@ fn resolve_delivery(
         thread_delivery_members.clone()
     };
 
-    let scope_data = build_scope_data(identity, effective_scope, &effective_mentions);
+    let scope_data = build_scope_data(
+        identity,
+        effective_scope,
+        &effective_mentions,
+        !is_thread_resolved,
+    );
     let delivered_to = rows
         .iter()
         .filter(|inst| {
@@ -326,16 +338,28 @@ fn resolve_delivery(
     })
 }
 
+/// The event data the local `delivered_to` filter is computed from.
+/// `resolved` is false for the thread-override path, whose members come from
+/// a stored membership list rather than from this send's resolution: the
+/// key is omitted there, so that path keeps the legacy base-name match
+/// instead of being silently over-constrained to unresolved names.
 fn build_scope_data(
     identity: &SenderIdentity,
     scope: MessageScope,
     mentions: &[String],
+    resolved: bool,
 ) -> serde_json::Value {
     let mut scope_data = serde_json::json!({
         "scope": scope.as_str(),
     });
     if !mentions.is_empty() {
         scope_data["mentions"] = serde_json::json!(mentions);
+    }
+    // Device-exact delivery: mentions are already resolved to canonical
+    // exact instance names, so record them for the local delivered_to filter
+    // (same value the event writer stores). Broadcast omits the key.
+    if resolved && scope == MessageScope::Mentions && !mentions.is_empty() {
+        scope_data["exact_targets"] = serde_json::json!(mentions);
     }
     if let Some(gid) = identity.group_id() {
         scope_data["group_id"] = serde_json::json!(gid);
@@ -400,9 +424,20 @@ pub fn send_message(
         "delivered_to": delivery.delivered_to.clone(),
     });
 
-    // Add scope extra data (mentions)
+    // Add scope extra data (mentions + device-exact targets). Mentions scope
+    // resolved here carries the canonical names in `exact_targets`, so a
+    // receiver on another host with a same-named instance does not take it;
+    // broadcast omits the key. The thread-override path omits it too: those
+    // members come from a stored membership list (a thread seeded by a
+    // pre-fleet peer can hold base names), so they keep legacy base matching.
     if !delivery.effective_mentions.is_empty() {
         data["mentions"] = serde_json::json!(delivery.effective_mentions);
+    }
+    if !delivery.is_thread_resolved
+        && delivery.effective_scope == MessageScope::Mentions
+        && !delivery.effective_mentions.is_empty()
+    {
+        data["exact_targets"] = serde_json::json!(delivery.effective_mentions);
     }
 
     if let Some(env) = envelope {

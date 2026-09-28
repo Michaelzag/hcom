@@ -14,6 +14,7 @@ mod context;
 pub mod core;
 mod db;
 mod delivery;
+pub mod fleet_names;
 pub mod hooks;
 pub mod identity;
 mod instance_binding;

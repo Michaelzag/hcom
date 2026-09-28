@@ -25,6 +25,12 @@ impl HcomDb {
     /// Skips own messages. Checks scope: "broadcast" delivers to all,
     /// "mentions" checks the mentions array with cross-device base-name matching.
     ///
+    /// The mentions rule itself is `messages::mentions_delivers_to`, which
+    /// `messages::should_deliver_message` also calls: device-exact delivery
+    /// when the event carries a non-empty `exact_targets` array (mentions
+    /// resolved at send time), else the legacy base-name match for an
+    /// old-format event from a peer without exact targets.
+    ///
     /// `receiver` may be local (`luna`) or relay-namespaced (`luna:ABCD`).
     /// Mentions compare on base name so the same event JSON routes correctly
     /// on both local and relayed peers without rewriting stored scope.
@@ -39,19 +45,7 @@ impl HcomDb {
             .unwrap_or("broadcast");
         match scope {
             "broadcast" => true,
-            "mentions" => {
-                let receiver_base = receiver.split(':').next().unwrap_or(receiver);
-                json.get("mentions")
-                    .and_then(|m| m.as_array())
-                    .map(|arr| {
-                        arr.iter().any(|v| {
-                            v.as_str()
-                                .map(|m| receiver_base == m.split(':').next().unwrap_or(m))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-            }
+            "mentions" => crate::messages::mentions_delivers_to(json, receiver),
             _ => false,
         }
     }

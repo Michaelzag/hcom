@@ -33,6 +33,14 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         bail!("Too many agents requested (max {}).", max_count);
     }
 
+    // `--as NAME`: the moving-a-seat form. A ':' would read as a device suffix
+    // (x:DEV), which names another device's seat, not a fresh one here.
+    if let Some(name) = hcom_flags.as_name.as_deref()
+        && name.contains(':')
+    {
+        bail!("--as value '{name}' must not contain ':' (that form addresses a remote device)");
+    }
+
     let tag = hcom_flags.tag;
     let terminal = hcom_flags.terminal;
     let headless = hcom_flags.headless;
@@ -72,6 +80,9 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     if let Some(ref device) = remote_device {
         if hcom_flags.run_here == Some(true) {
             bail!("Remote launch does not support --run-here");
+        }
+        if hcom_flags.as_name.is_some() {
+            bail!("Remote launch does not support --as (the target device names its own seats)");
         }
         let remote_cwd = dir_override.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -203,7 +214,9 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             launcher: Some(launcher_name.clone()),
             run_here: hcom_flags.run_here,
             batch_id: hcom_flags.batch_id,
-            name: None, // --name is caller identity, not instance name
+            // `--as NAME` claims the explicit name; `--name` (router global) is
+            // caller identity and never the instance name.
+            name: hcom_flags.as_name.clone(),
             skip_validation: false,
             terminal,
             answer_omp_reroot_prompt: false,
@@ -450,6 +463,9 @@ pub(crate) struct HcomLaunchFlags {
     pub run_here: Option<bool>,
     pub batch_id: Option<String>,
     pub dir: Option<String>,
+    /// Explicit instance name for a fresh launch (`--as NAME`), the moving-a-seat
+    /// form. Distinct from the router-level `--name`, which is caller identity.
+    pub as_name: Option<String>,
 }
 
 /// Parse launch argv: extract count, tool name, hcom flags, and tool-specific args.
@@ -617,6 +633,11 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             i += 1;
             continue;
         }
+        if args[i].starts_with("--as=") {
+            flags.as_name = Some(args[i][5..].to_string());
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
             "--tag" if i + 1 < args.len() => {
                 flags.tag = Some(args[i + 1].clone());
@@ -667,6 +688,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
                 i += 1;
             }
             "--name" if i + 1 < args.len() => {
+                i += 2;
+            }
+            "--as" if i + 1 < args.len() => {
+                flags.as_name = Some(args[i + 1].clone());
                 i += 2;
             }
             "--go" => {
@@ -882,6 +907,7 @@ fn format_inline_launch_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|i| i.to_string()).collect()
@@ -915,6 +941,70 @@ mod tests {
         assert_eq!(tool, "claude");
         assert_eq!(flags.tag, Some("test".to_string()));
         assert_eq!(args, s(&["--model", "haiku"]));
+    }
+
+    #[test]
+    fn test_parse_launch_argv_carries_as_name() {
+        // Every tool shares this parse path, so `hcom omp --as X` and
+        // `hcom claude --as X` both land the name in the launch flags.
+        for tool in [
+            "omp", "claude", "codex", "gemini", "opencode", "kilo", "pi", "agy",
+        ] {
+            let (_, parsed, flags, args) = parse_launch_argv(&s(&[tool, "--as", "X"])).unwrap();
+            assert_eq!(parsed, tool);
+            assert_eq!(flags.as_name.as_deref(), Some("X"), "tool {tool}");
+            assert!(args.is_empty(), "tool {tool}");
+        }
+    }
+
+    #[test]
+    fn test_parse_launch_argv_as_equals_form() {
+        let (_, tool, flags, args) =
+            parse_launch_argv(&s(&["omp", "--as=X", "--model", "flash"])).unwrap();
+        assert_eq!(tool, "omp");
+        assert_eq!(flags.as_name.as_deref(), Some("X"));
+        assert_eq!(args, s(&["--model", "flash"]));
+    }
+
+    #[test]
+    fn test_parse_launch_argv_leaves_name_absent_by_default() {
+        let (_, _, flags, _) = parse_launch_argv(&s(&["omp"])).unwrap();
+        assert!(flags.as_name.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_as_name_with_colon_is_refused() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let err = run(
+            &s(&["omp", "--as", "X:ABCD"]),
+            &crate::router::GlobalFlags {
+                name: None,
+                go: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must not contain ':'"), "{err}");
+    }
+
+    #[test]
+    fn test_as_name_is_refused_on_remote_launch() {
+        // The remote path never builds LaunchParams, so an explicit name
+        // there must be refused rather than silently dropped.
+        let argv = s(&["omp", "--device", "BOXE", "--dir", ".", "--as", "X"]);
+        let err = run(
+            &argv,
+            &crate::router::GlobalFlags {
+                name: None,
+                go: true,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Remote launch does not support --as"),
+            "{err}"
+        );
     }
 
     #[test]

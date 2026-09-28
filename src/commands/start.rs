@@ -484,6 +484,16 @@ fn start_rebind(
         anyhow::bail!("{refusal}");
     }
 
+    // Cross-host guard, beside the other `--as` guards: the rebind target must
+    // not be a bare name that is live as a mirror row on another device
+    // (suffix-only devices included). A target that already carries a `:SHORT`
+    // suffix names its own device and is exempt. Best effort — only rows relay
+    // sync delivered to this device are visible.
+    if let Some(refusal) = instance_names::remote_name_refusal(db, &target_name)? {
+        eprintln!("Error: {refusal}");
+        return Ok(1);
+    }
+
     // The recreated row gets an anchor pid only from the target's own
     // history, verified against the live process table. Both reads happen
     // before the deletions below rewrite the rows and bindings they consult.
@@ -1223,6 +1233,7 @@ mod tests {
     use rusqlite::params;
     use serde_json::json;
     use serial_test::serial;
+
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -1237,6 +1248,43 @@ mod tests {
             env.insert((*k).to_string(), (*v).to_string());
         }
         HcomContext::from_env(&env, PathBuf::from(cwd))
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_rebind_refuses_a_name_live_on_another_device() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, status, status_context, \
+                 created_at, tool) VALUES ('luna:ABCD', 'device-aaaa', 'listening', 'ready', 1.0, 'omp')",
+                [],
+            )
+            .unwrap();
+
+        let ctx = make_ctx(&[], "/tmp/project");
+        assert_eq!(start_rebind(&db, "luna", &ctx, None, None).unwrap(), 1);
+        // Nothing was written on this host: the guard refuses before the rebind.
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_rebind_refuses_a_name_live_on_a_suffix_only_device() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, status, status_context, \
+                 created_at, tool) VALUES ('luna:GIDU', 'device-solo', 'listening', 'ready', 1.0, 'omp')",
+                [],
+            )
+            .unwrap();
+
+        let ctx = make_ctx(&[], "/tmp/project");
+        assert_eq!(start_rebind(&db, "luna", &ctx, None, None).unwrap(), 1);
+        assert!(db.get_instance_full("luna").unwrap().is_none());
     }
 
     /// Claude context carrying exactly one session-id source, so an ambient

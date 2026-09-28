@@ -128,6 +128,9 @@ pub fn streamline_event(event: &Value, filters: &HashMap<String, Vec<String>>) -
         obj.remove("delivered_to");
         if !filters.contains_key("mention") {
             obj.remove("mentions");
+            // The exact recipient list is the device-exact form of the same
+            // field, and is as unreadable without `mentions`.
+            obj.remove("exact_targets");
         }
 
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");

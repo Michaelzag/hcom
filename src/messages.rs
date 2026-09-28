@@ -1,5 +1,7 @@
 //! Message operations — routing, scope computation, and delivery formatting.
 
+use crate::fleet_names::{BareCandidate, BareOutcome, FleetCtx, resolve_bare_name};
+use crate::relay::control::split_device_suffix;
 use crate::shared::{MAX_MESSAGE_SIZE, SENDER, extract_mentions};
 use regex::Regex;
 use serde_json::Value;
@@ -89,7 +91,8 @@ pub struct RelayMetadata {
 #[derive(Debug, Clone)]
 pub struct ScopeResult {
     pub scope: MessageScope,
-    /// For Mentions scope: list of base names targeted.
+    /// For Mentions scope: resolved exact instance names targeted
+    /// (a bare base resolves to its single live candidate, e.g. `x:DEVB`).
     pub mentions: Vec<String>,
 }
 
@@ -103,11 +106,17 @@ pub struct ReadReceipt {
     pub total_recipients: usize,
 }
 
-/// Instance info for scope computation (name + optional tag).
+/// Instance info for scope computation (name + optional tag + origin device).
 #[derive(Debug, Clone)]
 pub struct InstanceInfo {
     pub name: String,
     pub tag: Option<String>,
+    /// `origin_device_id` of the row: `Some` for a relay mirror row, `None`
+    /// for a local one. The fleet resolver's suffix-only flag reads it, so a
+    /// listed device is recognized even when the row's `:SHORT` suffix is
+    /// not that device's canonical short id (a probed slot, or relay's
+    /// 4-char import fallback).
+    pub origin: Option<String>,
 }
 
 impl InstanceInfo {
@@ -212,13 +221,57 @@ fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String 
 /// Match a target against instance names.
 ///
 /// Resolution order:
-/// 1. Exact base name
-/// 2. Exact full display name ({tag}-{name})
-/// 3. Exact tag group when the target ends in `-`
-/// 4. Unique remote prefix when the target contains `:`
+/// 1. A bare input uses the fleet resolver over every live matching seat:
+///    local base or full tagged display name, and remote base names. One
+///    candidate resolves; multiple candidates refuse and name all exact
+///    forms (including a local tagged seat); suffix-only devices count.
+/// 2. An explicit device-qualified name bypasses the fleet resolver.
+/// 3. Legacy exact, tag-group and unique remote-prefix matching when the
+///    fleet has no candidates for the bare input.
 ///
 /// Special case: bigboss:SUFFIX resolves to bigboss (virtual identity, device-agnostic).
-fn match_target(target: &str, instances: &[InstanceInfo]) -> Result<Vec<String>, String> {
+fn match_target(
+    target: &str,
+    instances: &[InstanceInfo],
+    fleet: &FleetCtx,
+) -> Result<Vec<String>, String> {
+    if !target.contains(':') {
+        let mut candidates: Vec<BareCandidate> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for inst in instances {
+            if inst.origin.is_none()
+                && (inst.name.eq_ignore_ascii_case(target)
+                    || inst.full_name().eq_ignore_ascii_case(target))
+            {
+                if seen.insert(inst.name.as_str()) {
+                    candidates.push(BareCandidate {
+                        exact: inst.name.clone(),
+                        suffix_only: !fleet.own_uuid.is_empty()
+                            && fleet.so.device_is_listed(&fleet.own_uuid),
+                        display_match: !inst.name.eq_ignore_ascii_case(target),
+                    });
+                }
+            } else if let Some((base, suffix)) = split_device_suffix(&inst.name) {
+                // Remote mirror row x:DEV whose base matches the bare input.
+                if base.eq_ignore_ascii_case(target) && seen.insert(inst.name.as_str()) {
+                    candidates.push(BareCandidate {
+                        exact: inst.name.clone(),
+                        suffix_only: fleet.so.mirror_is_suffix_only(
+                            inst.origin.as_deref().unwrap_or_default(),
+                            suffix,
+                        ),
+                        display_match: false,
+                    });
+                }
+            }
+        }
+        match resolve_bare_name(target, &candidates) {
+            BareOutcome::Single(exact) => return Ok(vec![exact]),
+            BareOutcome::Refuse(msg) => return Err(msg),
+            // No live candidate: fall through to the legacy branches below.
+            BareOutcome::NoCandidate => {}
+        }
+    }
     let exact_base: Vec<String> = instances
         .iter()
         .filter(|inst| inst.name.eq_ignore_ascii_case(target))
@@ -300,6 +353,8 @@ fn target_instances_with_sender(enabled_instances: &[InstanceInfo]) -> Vec<Insta
         instances.push(InstanceInfo {
             name: SENDER.to_string(),
             tag: None,
+            // The virtual identity has no row: it is never a mirror.
+            origin: None,
         });
     }
     instances
@@ -308,13 +363,14 @@ fn target_instances_with_sender(enabled_instances: &[InstanceInfo]) -> Vec<Insta
 pub(crate) fn resolve_targets(
     targets: &[String],
     enabled_instances: &[InstanceInfo],
+    fleet: &FleetCtx,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let target_instances = target_instances_with_sender(enabled_instances);
     let mut matched = Vec::new();
     let mut unmatched = Vec::new();
 
     for target in targets {
-        let target_matches = match_target(target, &target_instances)?;
+        let target_matches = match_target(target, &target_instances, fleet)?;
         if target_matches.is_empty() {
             unmatched.push(target.clone());
         } else {
@@ -338,6 +394,7 @@ pub fn compute_scope(
     message: &str,
     enabled_instances: &[InstanceInfo],
     explicit_targets: Option<&[String]>,
+    fleet: &FleetCtx,
 ) -> Result<ScopeResult, String> {
     let target_instances = target_instances_with_sender(enabled_instances);
     let full_names: Vec<String> = target_instances
@@ -348,7 +405,8 @@ pub fn compute_scope(
     // If explicit targets specified (via -- separator), use them instead of parsing @mentions
     if let Some(targets) = explicit_targets {
         if !targets.is_empty() {
-            let (matched_base_names, unmatched) = resolve_targets(targets, enabled_instances)?;
+            let (matched_base_names, unmatched) =
+                resolve_targets(targets, enabled_instances, fleet)?;
 
             if !unmatched.is_empty() {
                 return Err(build_unmatched_error(&unmatched, &full_names));
@@ -385,7 +443,8 @@ pub fn compute_scope(
 
         let mentions = extract_mentions(message);
         if !mentions.is_empty() {
-            let (matched_base_names, unmatched) = resolve_targets(&mentions, enabled_instances)?;
+            let (matched_base_names, unmatched) =
+                resolve_targets(&mentions, enabled_instances, fleet)?;
 
             // STRICT: fail on unmatched mentions
             if !unmatched.is_empty() {
@@ -442,9 +501,51 @@ fn dedup_preserving_order(items: &[String]) -> Vec<String> {
     result
 }
 
+/// The mentions-scope delivery decision for one receiver, shared verbatim
+/// with `db::events`'s `should_deliver_to` (the same predicate over a stored
+/// row — they must be edited together).
+///
+/// Device-exact delivery: when the event carries a non-empty `exact_targets`
+/// array (mentions resolved to canonical exact instance names at send time),
+/// delivery is a pure exact-string match against the receiver name. When the
+/// key is absent or empty (old-format event from a peer without exact
+/// targets), delivery falls back to the legacy base-name match.
+pub fn mentions_delivers_to(event_data: &Value, receiver_name: &str) -> bool {
+    if let Some(exacts) = event_data.get("exact_targets").and_then(|v| v.as_array()) {
+        let exact_strs: Vec<&str> = exacts.iter().filter_map(|v| v.as_str()).collect();
+        if !exact_strs.is_empty() {
+            return exact_strs.contains(&receiver_name);
+        }
+    }
+    let mentions: Vec<&str> = event_data
+        .get("mentions")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if !mentions.is_empty() && event_data.get("exact_targets").is_none() {
+        // Only an OLD peer or a sender that forgot to stamp the field lands
+        // here; log it so the two stay distinguishable after the fact.
+        crate::log::log_debug(
+            "messages",
+            "mentions_delivery_without_exact_targets",
+            &format!(
+                "legacy base-name match for mentions [{}]",
+                mentions.join(", ")
+            ),
+        );
+    }
+
+    // Strip device suffix for cross-device matching
+    let receiver_base = receiver_name.split(':').next().unwrap_or(receiver_name);
+    mentions
+        .iter()
+        .any(|m| receiver_base == m.split(':').next().unwrap_or(m))
+}
+
 /// Check if message should be delivered based on scope.
 ///
-/// Returns true if receiver should get the message.
+/// Returns true if receiver should get the message. The mentions-scope rule
+/// itself lives in [`mentions_delivers_to`].
 pub fn should_deliver_message(
     event_data: &Value,
     receiver_name: &str,
@@ -463,19 +564,7 @@ pub fn should_deliver_message(
 
     match scope {
         "broadcast" => Ok(true),
-        "mentions" => {
-            let mentions = event_data
-                .get("mentions")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            // Strip device suffix for cross-device matching
-            let receiver_base = receiver_name.split(':').next().unwrap_or(receiver_name);
-            Ok(mentions
-                .iter()
-                .any(|m| receiver_base == m.split(':').next().unwrap_or(m)))
-        }
+        "mentions" => Ok(mentions_delivers_to(event_data, receiver_name)),
         _ => Ok(false),
     }
 }
@@ -926,6 +1015,7 @@ pub fn build_message_preview(formatted: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet_names::SuffixOnly;
 
     // ---- validate_message ----
 
@@ -996,23 +1086,69 @@ mod tests {
         names.iter().map(|(name, tag)| info(name, *tag)).collect()
     }
 
+    /// Empty fleet context: no suffix-only devices, fixed test own-uuid.
+    /// Bare-name behavior tests build on this; suffix-only cases use
+    /// `fleet_with` below.
+    fn fleet() -> FleetCtx {
+        fleet_with(SuffixOnly::default(), "test-uuid-0000")
+    }
+
+    fn fleet_with(so: SuffixOnly, own_uuid: &str) -> FleetCtx {
+        FleetCtx {
+            so,
+            own_uuid: own_uuid.to_string(),
+        }
+    }
+
+    /// A mirror row of `device_uuid` whose `:SHORT` suffix is NOT that
+    /// device's canonical short id (a probed slot, or relay's 4-char import
+    /// fallback), so only the ORIGIN leg of the suffix-only flag can
+    /// classify it.
+    fn probed_mirror(base: &str, device_uuid: &str) -> InstanceInfo {
+        InstanceInfo {
+            name: format!("{base}:ZZZZ"),
+            tag: None,
+            origin: Some(device_uuid.to_string()),
+        }
+    }
+
     #[test]
     fn test_match_target_exact() {
         let instances = make_instances(&[("luna", None), ("nova", None)]);
-        assert_eq!(match_target("luna", &instances).unwrap(), vec!["luna"]);
+        assert_eq!(
+            match_target("luna", &instances, &fleet()).unwrap(),
+            vec!["luna"]
+        );
     }
 
     #[test]
     fn test_match_target_tagged() {
         let instances = make_instances(&[("luna", Some("api")), ("nova", None)]);
-        assert_eq!(match_target("api-luna", &instances).unwrap(), vec!["luna"]);
+        assert_eq!(
+            match_target("api-luna", &instances, &fleet()).unwrap(),
+            vec!["luna"]
+        );
+    }
+
+    #[test]
+    fn test_compute_scope_tagged_local_and_remote_same_display_refuse_both() {
+        let mut remote = info("grp-x:DEVB", None);
+        remote.origin = Some("device-b".into());
+        let instances = vec![info("x", Some("grp")), remote];
+        let err = compute_scope("hey @grp-x", &instances, None, &fleet()).unwrap_err();
+        assert!(err.contains("@x (local display @grp-x)"), "{err}");
+        assert!(err.contains("@grp-x:DEVB"), "{err}");
+        let exact = compute_scope("hey @grp-x:DEVB", &instances, None, &fleet()).unwrap();
+        assert_eq!(exact.mentions, vec!["grp-x:DEVB"]);
+        let local = compute_scope("hey @x", &instances, None, &fleet()).unwrap();
+        assert_eq!(local.mentions, vec!["x"]);
     }
 
     #[test]
     fn test_match_target_tag_prefix() {
         let instances =
             make_instances(&[("luna", Some("api")), ("nova", Some("api")), ("kira", None)]);
-        let result = match_target("api-", &instances).unwrap();
+        let result = match_target("api-", &instances, &fleet()).unwrap();
         assert!(result.contains(&"luna".to_string()));
         assert!(result.contains(&"nova".to_string()));
         assert!(!result.contains(&"kira".to_string()));
@@ -1021,7 +1157,10 @@ mod tests {
     #[test]
     fn test_match_target_exact_base_name_with_tag() {
         let instances = make_instances(&[("luna", Some("api"))]);
-        assert_eq!(match_target("luna", &instances).unwrap(), vec!["luna"]);
+        assert_eq!(
+            match_target("luna", &instances, &fleet()).unwrap(),
+            vec!["luna"]
+        );
     }
 
     #[test]
@@ -1032,20 +1171,24 @@ mod tests {
             ("giru2", None),
             ("giru_sub", None),
         ]);
-        let result = match_target("giru", &instances).unwrap();
+        let result = match_target("giru", &instances, &fleet()).unwrap();
         assert_eq!(result, vec!["giru"]);
     }
 
     #[test]
     fn test_match_target_rejects_partial_local_name() {
         let instances = make_instances(&[("luna", None), ("lunatic", None)]);
-        assert!(match_target("lun", &instances).unwrap().is_empty());
+        assert!(
+            match_target("lun", &instances, &fleet())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn test_match_target_group_requires_exact_tag() {
         let instances = make_instances(&[("luna", Some("api")), ("nova", Some("api-extra"))]);
-        let result = match_target("api-", &instances).unwrap();
+        let result = match_target("api-", &instances, &fleet()).unwrap();
         assert_eq!(result, vec!["luna"]);
     }
 
@@ -1053,7 +1196,7 @@ mod tests {
     fn test_match_target_bigboss_remote() {
         let instances = make_instances(&[("luna", None), ("bigboss", None)]);
         assert_eq!(
-            match_target("bigboss:BOXE", &instances).unwrap(),
+            match_target("bigboss:BOXE", &instances, &fleet()).unwrap(),
             vec!["bigboss"]
         );
     }
@@ -1062,7 +1205,7 @@ mod tests {
     fn test_match_target_remote_prefix() {
         let instances = make_instances(&[("luna:BOXE", None)]);
         assert_eq!(
-            match_target("luna:BO", &instances).unwrap(),
+            match_target("luna:BO", &instances, &fleet()).unwrap(),
             vec!["luna:BOXE"]
         );
     }
@@ -1070,14 +1213,18 @@ mod tests {
     #[test]
     fn test_match_target_ambiguous_remote_prefix_fails() {
         let instances = make_instances(&[("luna:BOXE", None), ("luna:BOLT", None)]);
-        let err = match_target("luna:BO", &instances).unwrap_err();
+        let err = match_target("luna:BO", &instances, &fleet()).unwrap_err();
         assert!(err.contains("Ambiguous remote @mention @luna:BO"));
     }
 
     #[test]
     fn test_match_target_no_match() {
         let instances = make_instances(&[("luna", None)]);
-        assert!(match_target("nonexistent", &instances).unwrap().is_empty());
+        assert!(
+            match_target("nonexistent", &instances, &fleet())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ---- compute_scope ----
@@ -1086,13 +1233,14 @@ mod tests {
         InstanceInfo {
             name: name.to_string(),
             tag: tag.map(|t| t.to_string()),
+            origin: None,
         }
     }
 
     #[test]
     fn test_compute_scope_broadcast() {
         let instances = vec![info("luna", None), info("nova", None)];
-        let result = compute_scope("hello everyone", &instances, None).unwrap();
+        let result = compute_scope("hello everyone", &instances, None, &fleet()).unwrap();
         assert_eq!(result.scope, MessageScope::Broadcast);
         assert!(result.mentions.is_empty());
     }
@@ -1100,7 +1248,7 @@ mod tests {
     #[test]
     fn test_compute_scope_mention_in_text() {
         let instances = vec![info("luna", None), info("nova", None)];
-        let result = compute_scope("hey @luna fix this", &instances, None).unwrap();
+        let result = compute_scope("hey @luna fix this", &instances, None, &fleet()).unwrap();
         assert_eq!(result.scope, MessageScope::Mentions);
         assert_eq!(result.mentions, vec!["luna"]);
     }
@@ -1108,7 +1256,7 @@ mod tests {
     #[test]
     fn test_compute_scope_exact_name_beats_tag_prefix_collision() {
         let instances = vec![info("giru", None), info("lasa", Some("giru-test"))];
-        let result = compute_scope("hey @giru", &instances, None).unwrap();
+        let result = compute_scope("hey @giru", &instances, None, &fleet()).unwrap();
         assert_eq!(result.mentions, vec!["giru"]);
     }
 
@@ -1116,7 +1264,7 @@ mod tests {
     fn test_compute_scope_explicit_targets() {
         let instances = vec![info("luna", None), info("nova", None)];
         let targets = vec!["luna".to_string()];
-        let result = compute_scope("fix this", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("fix this", &instances, Some(&targets), &fleet()).unwrap();
         assert_eq!(result.scope, MessageScope::Mentions);
         assert_eq!(result.mentions, vec!["luna"]);
     }
@@ -1125,7 +1273,7 @@ mod tests {
     fn test_compute_scope_explicit_empty_broadcast() {
         let instances = vec![info("luna", None)];
         let targets: Vec<String> = vec![];
-        let result = compute_scope("hello", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("hello", &instances, Some(&targets), &fleet()).unwrap();
         assert_eq!(result.scope, MessageScope::Broadcast);
     }
 
@@ -1133,41 +1281,109 @@ mod tests {
     fn test_compute_scope_unknown_target_fails() {
         let instances = vec![info("luna", None)];
         let targets = vec!["nonexistent".to_string()];
-        let result = compute_scope("hello", &instances, Some(&targets));
+        let result = compute_scope("hello", &instances, Some(&targets), &fleet());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("non-existent or stopped"));
     }
 
     #[test]
-    fn test_compute_scope_suggests_remote_match() {
-        // Bare `@zeli` shouldn't silently match remote `zeli:ZOME`, but the error
-        // should point users at the right form instead of just listing 30 names.
+    fn test_compute_scope_bare_resolves_single_live_candidate() {
+        // Contract change ordered by the ffc-ravoc design: a bare `@zeli` with
+        // exactly one live candidate (`zeli:ZOME`, no local `zeli`, no
+        // suffix-only collision) resolves to that exact suffixed form instead
+        // of erroring. This replaces the old local-only "Did you mean" test.
         let instances = vec![info("zeli:ZOME", None), info("luna", None)];
         let targets = vec!["zeli".to_string()];
-        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
-        assert!(err.contains("@zeli"), "got: {err}");
-        assert!(err.contains("Did you mean: @zeli:ZOME"), "got: {err}");
+        let result = compute_scope("hello", &instances, Some(&targets), &fleet()).unwrap();
+        assert_eq!(result.scope, MessageScope::Mentions);
+        assert_eq!(result.mentions, vec!["zeli:ZOME"]);
+    }
+
+    #[test]
+    fn test_compute_scope_bare_resolves_remote_mirror() {
+        // Bare `@x` with no local `x` and one live mirror `x:DEVB` resolves
+        // to the mirror's exact form.
+        let instances = vec![info("x:DEVB", None), info("luna", None)];
+        let targets = vec!["x".to_string()];
+        let result = compute_scope("hello", &instances, Some(&targets), &fleet()).unwrap();
+        assert_eq!(result.mentions, vec!["x:DEVB"]);
+    }
+
+    #[test]
+    fn test_compute_scope_bare_ambiguous_refuse_lists_both() {
+        // Bare `@x` with a live local `x` AND a live mirror `x:DEVB` is
+        // refused, naming every exact form (local as the bare name).
+        let instances = vec![info("x", None), info("x:DEVB", None)];
+        let targets = vec!["x".to_string()];
+        let err = compute_scope("hello", &instances, Some(&targets), &fleet()).unwrap_err();
+        assert!(err.contains("@x"), "got: {err}");
+        assert!(err.contains("@x:DEVB"), "got: {err}");
+    }
+
+    #[test]
+    fn test_compute_scope_bare_suffix_only_only_points_to_exact() {
+        // Bare `@x` live only on a suffix-only device is refused, pointing at
+        // the exact `x:GIDU` form.
+        let so = SuffixOnly::parse("GIDU");
+        let fleet = fleet_with(so, "test-uuid-0000");
+        let instances = vec![info("x:GIDU", None), info("luna", None)];
+        let targets = vec!["x".to_string()];
+        let err = compute_scope("hello", &instances, Some(&targets), &fleet).unwrap_err();
+        assert!(err.contains("@x:GIDU"), "got: {err}");
+    }
+
+    #[test]
+    fn test_compute_scope_bare_suffix_only_plus_other_lists_both() {
+        // Bare `@x` live on a suffix-only device plus one other device is
+        // refused, listing both exact forms (never silently picked).
+        let so = SuffixOnly::parse("GIDU");
+        let fleet = fleet_with(so, "test-uuid-0000");
+        let instances = vec![info("x", None), info("x:GIDU", None)];
+        let targets = vec!["x".to_string()];
+        let err = compute_scope("hello", &instances, Some(&targets), &fleet).unwrap_err();
+        assert!(err.contains("@x:GIDU"), "got: {err}");
+        // The local candidate is listed as the bare name.
+        assert!(err.contains("@x"), "got: {err}");
+    }
+
+    /// The send path must apply the resolver's own suffix-only policy, which
+    /// reads the mirror's ORIGIN device: a listed device whose row carries a
+    /// probed `:SHORT` slot (not its canonical short id) is still never a
+    /// bare-name target here, exactly as on every command path.
+    #[test]
+    fn test_compute_scope_bare_suffix_only_recognized_through_the_origin_device() {
+        const LISTED: &str = "f3a70268-8ffa-4f0c-9e37-62f78acfcc1e";
+        let so = SuffixOnly::parse(LISTED);
+        assert!(
+            !so.short_is_listed("ZZZZ"),
+            "the suffix leg must not be the one that matches"
+        );
+        let fleet = fleet_with(so, "test-uuid-0000");
+        let instances = vec![probed_mirror("x", LISTED), info("luna", None)];
+        let targets = vec!["x".to_string()];
+        let err = compute_scope("hello", &instances, Some(&targets), &fleet).unwrap_err();
+        assert!(err.contains("@x:ZZZZ"), "got: {err}");
     }
 
     #[test]
     fn test_compute_scope_no_suggestion_when_no_remote_match() {
         let instances = vec![info("luna", None), info("nova", None)];
         let targets = vec!["zeli".to_string()];
-        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        let err = compute_scope("hello", &instances, Some(&targets), &fleet()).unwrap_err();
         assert!(!err.contains("Did you mean"), "got: {err}");
     }
 
     #[test]
     fn test_compute_scope_unknown_mention_fails() {
         let instances = vec![info("luna", None)];
-        let result = compute_scope("hey @nonexistent fix this", &instances, None);
+        let result = compute_scope("hey @nonexistent fix this", &instances, None, &fleet());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_compute_scope_system_mention_fails() {
         let instances = vec![info("luna", None)];
-        let result = compute_scope("hey @[hcom-events]", &instances, None);
+        let result = compute_scope("hey @[hcom-events]", &instances, None, &fleet());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("System notifications"));
     }
@@ -1175,7 +1391,7 @@ mod tests {
     #[test]
     fn test_compute_scope_literal_mention_fails() {
         let instances = vec![info("luna", None)];
-        let result = compute_scope("use @mention to target", &instances, None);
+        let result = compute_scope("use @mention to target", &instances, None, &fleet());
         assert!(result.is_err());
         assert!(
             result
@@ -1188,7 +1404,7 @@ mod tests {
     fn test_compute_scope_tagged_instances() {
         let instances = vec![info("luna", Some("api")), info("nova", Some("api"))];
         let targets = vec!["api-".to_string()];
-        let result = compute_scope("hello", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("hello", &instances, Some(&targets), &fleet()).unwrap();
         assert_eq!(result.scope, MessageScope::Mentions);
         assert!(result.mentions.contains(&"luna".to_string()));
         assert!(result.mentions.contains(&"nova".to_string()));
@@ -1199,7 +1415,7 @@ mod tests {
         let instances = vec![info("luna", Some("api"))];
         // Both api-luna and luna resolve to the same instance
         let targets = vec!["api-luna".to_string(), "luna".to_string()];
-        let result = compute_scope("hello", &instances, Some(&targets)).unwrap();
+        let result = compute_scope("hello", &instances, Some(&targets), &fleet()).unwrap();
         assert_eq!(result.mentions.len(), 1);
         assert_eq!(result.mentions[0], "luna");
     }
@@ -1241,6 +1457,51 @@ mod tests {
     fn test_should_deliver_missing_scope() {
         let data = serde_json::json!({"from": "sender"});
         assert!(should_deliver_message(&data, "receiver", "sender").is_err());
+    }
+
+    #[test]
+    fn test_should_deliver_exact_targets_pure_match() {
+        // Non-empty exact_targets: pure exact-string match. A same-named
+        // local `x` must NOT take a message resolved to `x:DEVB`.
+        let data = serde_json::json!({
+            "scope": "mentions",
+            "mentions": ["x:DEVB"],
+            "exact_targets": ["x:DEVB"],
+        });
+        assert!(should_deliver_message(&data, "x:DEVB", "boss").unwrap());
+        assert!(!should_deliver_message(&data, "x", "boss").unwrap());
+        assert!(!should_deliver_message(&data, "x:OTHE", "boss").unwrap());
+    }
+
+    #[test]
+    fn test_should_deliver_exact_targets_self_skip_first() {
+        // from == receiver still skips even under exact matching.
+        let data = serde_json::json!({
+            "scope": "mentions",
+            "from": "x:DEVB",
+            "mentions": ["x:DEVB"],
+            "exact_targets": ["x:DEVB"],
+        });
+        assert!(!should_deliver_message(&data, "x:DEVB", "x:DEVB").unwrap());
+    }
+
+    #[test]
+    fn test_should_deliver_missing_exact_targets_legacy_base_match() {
+        // Absence of the key = old-format event → legacy base-name behavior:
+        // `x` takes a message mentioning `x:DEVB`.
+        let data = serde_json::json!({"scope": "mentions", "mentions": ["x:DEVB"]});
+        assert!(should_deliver_message(&data, "x", "boss").unwrap());
+    }
+
+    #[test]
+    fn test_should_deliver_empty_exact_targets_legacy_base_match() {
+        // An empty array is treated like a missing key (legacy base-name).
+        let data = serde_json::json!({
+            "scope": "mentions",
+            "mentions": ["x:DEVB"],
+            "exact_targets": [],
+        });
+        assert!(should_deliver_message(&data, "x", "boss").unwrap());
     }
 
     // ---- build_message_prefix ----

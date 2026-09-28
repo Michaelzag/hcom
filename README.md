@@ -391,7 +391,17 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
 | `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
+| `relay_suffix_only_devices` | Devices (UUIDs or short ids) never resolved by bare name; always use `name:SHORT` for them |
 | `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` | Default args passed to the tool |
+
+Bare seat names resolve consistently for messages, resume, kill, stop, terminal
+injection, and compact. A live local seat matches by base name **or** tagged
+display name; it does not take priority over a live remote match. When more
+than one seat matches, these actions refuse and show every exact addressable
+name. `hcom list <name>` shows all matches instead. An explicit `name:SHORT`
+addresses that device without bare-name resolution. Suffix-only devices still
+count toward collisions; a configured UUID identifies only that device, while
+an explicitly configured short id identifies devices carrying that short.
 
 ### Scope
 

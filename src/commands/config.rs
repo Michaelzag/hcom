@@ -189,6 +189,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "Relay worker is run by a service manager (systemd); hcom never spawns it",
         "boolean",
     ),
+    (
+        "HCOM_RELAY_SUFFIX_ONLY_DEVICES",
+        "Devices that must be addressed with a :SHORT suffix (comma-separated UUIDs or short ids; config file only)",
+        "string",
+    ),
 ];
 
 /// Instance-level config keys.
@@ -241,6 +246,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "relay_token" => Some("relay.token"),
         "relay_enabled" => Some("relay.enabled"),
         "relay_worker_managed" => Some("relay.worker_managed"),
+        "relay_suffix_only_devices" => Some("relay.suffix_only_devices"),
         "timeout" => Some("preferences.timeout"),
         "auto_approve" => Some("preferences.auto_approve"),
         "name_export" => Some("preferences.name_export"),
@@ -1748,6 +1754,24 @@ Set this when a systemd unit (e.g. `systemctl --user` hcom-relay) runs
 start/stop` refuse and point at the service manager, and relay off/reset only
 SIGTERM the worker so the manager restarts it. A managed worker idles instead
 of exiting while relay is disabled or the broker is unreachable.",
+        ),
+
+        "HCOM_RELAY_SUFFIX_ONLY_DEVICES" => Some(
+            "\
+HCOM_RELAY_SUFFIX_ONLY_DEVICES - Devices that must be addressed with a :SHORT suffix
+
+Default: (empty)
+Stored in [relay] in config.toml. Environment overrides are ignored for relay fields.
+
+Usage:
+  hcom config relay_suffix_only_devices \"f3a70268-8ffa-4f0c-9e37-62f78acfcc1e\"
+  hcom config relay_suffix_only_devices \"GIDU,HODA\"   # Clear with \"\"
+
+Effect:
+  A listed device is never a bare-name target and the name generator never
+  hands out a name live on one, but it still counts for collisions: with a
+  live seat elsewhere the name refuses listing both exact forms, and alone
+  it refuses pointing at the exact x:SHORT form.",
         ),
 
         _ => None,

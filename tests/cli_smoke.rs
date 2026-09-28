@@ -83,6 +83,69 @@ fn list_json_empty() {
 }
 
 #[test]
+fn named_list_shows_local_and_remote_candidates_including_tagged_display() {
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let uuid = "22222222-2222-4222-8222-222222222222";
+    let short = "ZAPE";
+    let now = chrono::Utc::now().timestamp();
+    db.execute(
+        "INSERT INTO instances (name, tag, status, status_context, status_time, created_at, tool)
+         VALUES ('x', 'grp', 'listening', 'ready', ?1, ?2, 'omp')",
+        rusqlite::params![now, now as f64],
+    )
+    .unwrap();
+    for name in [format!("x:{short}"), format!("grp-x:{short}")] {
+        db.execute(
+            "INSERT INTO instances (name, origin_device_id, status, status_context,
+                                    status_time, created_at, tool)
+             VALUES (?1, ?2, 'listening', 'ready', ?3, ?4, 'omp')",
+            rusqlite::params![name, uuid, now, now as f64],
+        )
+        .unwrap();
+    }
+    db.execute(
+        "INSERT INTO kv (key, value) VALUES (?1, ?2)",
+        rusqlite::params![format!("relay_sync_time_{uuid}"), now.to_string()],
+    )
+    .unwrap();
+
+    for (input, remote) in [
+        ("x", format!("x:{short}")),
+        ("grp-x", format!("grp-x:{short}")),
+    ] {
+        let (code, stdout, stderr) = h.run(["list", input, "--json"]);
+        assert_eq!(code, 0, "{input}: {stderr}");
+        let rows: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let rows = rows
+            .as_array()
+            .expect("ambiguous named list returns an array");
+        assert_eq!(rows.len(), 2, "{input}: {stdout}");
+        assert!(
+            rows.iter().any(|row| row["name"] == "x"),
+            "{input}: {stdout}"
+        );
+        assert!(
+            rows.iter().any(|row| row["name"] == remote),
+            "{input}: {stdout}"
+        );
+        if input == "grp-x" {
+            assert!(
+                rows.iter()
+                    .any(|row| row["name"] == "x" && row["display_name"] == "grp-x"),
+                "{stdout}"
+            );
+        }
+        let (code, stdout, stderr) = h.run(["list", &remote, "--json"]);
+        assert_eq!(code, 0, "{stderr}");
+        let row: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(row["name"], remote, "{stdout}");
+    }
+}
+
+#[test]
 fn events_empty_in_fresh_dir() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["events", "--last", "5"]);

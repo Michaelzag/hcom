@@ -1274,8 +1274,11 @@ fn kill_single(
     target: &str,
     initiator: &str,
 ) -> Result<i32> {
-    // Resolve display name
-    let name = identity::resolve_display_name(db, target).unwrap_or_else(|| target.to_string());
+    // Fleet-first: a bare name that is live on one other device resolves to
+    // that device's `x:DEV` form and falls into the remote branch below, an
+    // ambiguous name is refused, and a name live nowhere keeps today's local
+    // display-name lookup.
+    let name = identity::cli_target(db, target).map_err(anyhow::Error::msg)?;
 
     let inst = match db.get_instance_full(&name)? {
         Some(inst) => inst,
@@ -1349,6 +1352,8 @@ fn kill_single(
                     },
                 );
             }
+            // Fleet resolution already ran: no local row and no live row
+            // anywhere, so today's not-found error stands.
             bail!("Agent '{}' not found", target);
         }
     };
@@ -3981,5 +3986,117 @@ mod tests {
         );
         assert!(db.get_instance_full(&name).unwrap().is_some());
         assert!(seat.alive(seat.holder) && seat.alive(seat.carrier));
+    }
+
+    // ── fleet-wide bare-name resolution ─────────────────────────────────
+
+    const FLEET_DEV: &str = "11111111-1111-4111-8111-111111111111";
+    const FLEET_DEV_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// The `x:DEV` form a device's rows carry, from the canonical short-id
+    /// derivation.
+    fn remote_form(base: &str, device_uuid: &str) -> String {
+        format!("{base}:{}", crate::relay::device_short_id(device_uuid))
+    }
+
+    fn fleet_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    fn insert_mirror(db: &HcomDb, name: &str, device_uuid: &str) {
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool, origin_device_id)
+                 VALUES (?1, 'listening', 'ready', ?2, ?2, 'omp', ?3)",
+                rusqlite::params![name, now, device_uuid],
+            )
+            .unwrap();
+    }
+
+    /// A live LOCAL row in the given status/context (no origin device).
+    fn insert_local(db: &HcomDb, name: &str, status: &str, context: &str) {
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 'omp')",
+                rusqlite::params![name, status, context, now],
+            )
+            .unwrap();
+    }
+
+    /// A live local row is a fleet candidate, not a short-circuit: with a
+    /// live mirror of the same base name the kill refuses, naming both
+    /// forms, exactly as `hcom send @luna` does in the same database.
+    #[test]
+    #[serial_test::serial]
+    fn a_live_local_name_and_a_live_mirror_are_refused_with_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (dir, db) = fleet_db();
+        insert_local(&db, "luna", "listening", "ready");
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        let err = kill_single(&db, dir.path(), "luna", "tester").expect_err("refused");
+        let err = err.to_string();
+        assert!(err.contains("@luna,"), "{err}");
+        assert!(err.contains(&remote_form("luna", FLEET_DEV)), "{err}");
+    }
+
+    /// A stopped local row is never a candidate, so the name belongs to the
+    /// one device it is still live on.
+    #[test]
+    #[serial_test::serial]
+    fn a_stopped_local_name_with_a_live_remote_takes_the_kill_rpc_path() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (dir, db) = fleet_db();
+        insert_local(&db, "luna", "stopped", "exit");
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        let err = kill_single(&db, dir.path(), "luna", "tester").expect_err("remote kill");
+        let err = err.to_string();
+        assert!(err.contains("relay worker not running"), "{err}");
+        assert!(!err.contains("not found"), "{err}");
+    }
+
+    /// A bare name whose only live candidate is another device's row reaches
+    /// the KILL RPC, not the local not-found error. With no relay configured
+    /// the dispatch is the deterministic proof: the worker gate refuses it.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_one_remote_device_takes_the_kill_rpc_path() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        let err = kill_single(&db, dir.path(), "luna", "tester").expect_err("remote kill");
+        let err = err.to_string();
+        assert!(err.contains("relay worker not running"), "{err}");
+        assert!(!err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_two_remote_devices_is_refused_with_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV_B), FLEET_DEV_B);
+        let err = kill_single(&db, dir.path(), "luna", "tester").expect_err("refused");
+        let err = err.to_string();
+        assert!(err.contains(&remote_form("luna", FLEET_DEV)), "{err}");
+        assert!(err.contains(&remote_form("luna", FLEET_DEV_B)), "{err}");
+    }
+
+    /// A name live nowhere keeps today's not-found error verbatim.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_nowhere_is_still_not_found() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (dir, db) = fleet_db();
+        let err = kill_single(&db, dir.path(), "luna", "tester").expect_err("not found");
+        assert_eq!(err.to_string(), "Agent 'luna' not found");
     }
 }

@@ -29,6 +29,7 @@ use serde_json::json;
 
 use super::HcomDb;
 use crate::core::filters::{FILE_WRITE_CONTEXTS, build_sql_from_flags, is_uri_status_detail};
+use crate::fleet_names::FleetCtx;
 use crate::messages::{InstanceInfo, MessageScope, ScopeResult, compute_scope, resolve_targets};
 use crate::shared::constants::extract_mentions;
 
@@ -851,23 +852,32 @@ pub(crate) fn send_message_as(
     sender_kind: &str,
     message: &str,
 ) -> Result<Vec<String>> {
-    let mut stmt = db.conn.prepare_cached("SELECT name, tag FROM instances")?;
+    // The SAME live-row set `hcom send` resolves against, so a bare @x
+    // injected here lands on the same seat (a stopped or exited row is never
+    // a candidate).
+    let mut stmt = db.conn.prepare_cached(&format!(
+        "SELECT name, tag, origin_device_id FROM instances WHERE {}",
+        crate::fleet_names::LIVE_ROW_PREDICATE
+    ))?;
     let instances: Vec<InstanceInfo> = stmt
         .query_map([], |row| {
             Ok(InstanceInfo {
                 name: row.get::<_, String>(0)?,
                 tag: row.get::<_, Option<String>>(1)?,
+                origin: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
             })
         })?
         .filter_map(|r| r.ok())
         .collect();
 
     let parsed_mentions = extract_mentions(message);
+    // Fleet bare-name context (infallible: empty fallback on failure).
+    let fleet = FleetCtx::load();
     let scope_result = if parsed_mentions.is_empty() {
-        compute_scope(message, &instances, None).map_err(anyhow::Error::msg)?
+        compute_scope(message, &instances, None, &fleet).map_err(anyhow::Error::msg)?
     } else {
         let (mentions, _) =
-            resolve_targets(&parsed_mentions, &instances).map_err(anyhow::Error::msg)?;
+            resolve_targets(&parsed_mentions, &instances, &fleet).map_err(anyhow::Error::msg)?;
         ScopeResult {
             scope: MessageScope::Mentions,
             mentions,
@@ -899,6 +909,12 @@ pub(crate) fn send_message_as(
     });
     if !mention_list.is_empty() {
         event_data["mentions"] = serde_json::json!(mention_list);
+    }
+    // Device-exact delivery: mentions-scope events carry the resolved
+    // canonical names; broadcast omits the key. Absence of the key on read
+    // means an old-format event → legacy base-name matching.
+    if scope == "mentions" && !mention_list.is_empty() {
+        event_data["exact_targets"] = serde_json::json!(mention_list);
     }
 
     let routing_instance = match sender_kind {

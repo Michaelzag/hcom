@@ -21,7 +21,6 @@ pub struct TermArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
-use crate::identity::resolve_display_name;
 use crate::paths::hcom_dir;
 use crate::shared::CommandContext;
 
@@ -318,8 +317,20 @@ fn handle_screen(db: &HcomDb, argv: &[String]) -> i32 {
         .collect();
     let name = args.first().copied();
 
-    // Resolve display name if provided
-    let name = name.map(|n| resolve_display_name(db, n).unwrap_or_else(|| n.to_string()));
+    // Fleet-first (see `resolve_term_target`): a bare name live on one other
+    // device resolves to that device's `x:DEV` form (no local inject port,
+    // same as today); an ambiguous name is refused, an unknown name behaves
+    // as before.
+    let name = match name {
+        None => None,
+        Some(n) => match resolve_term_target(db, n) {
+            Ok(exact) => Some(exact),
+            Err(msg) => {
+                eprintln!("Error: {msg}");
+                return 1;
+            }
+        },
+    };
 
     if let Some(ref name) = name {
         let port = match get_inject_port(db, name) {
@@ -404,7 +415,13 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
             println!("Usage: hcom term inject <name> [text] [--enter]");
             return 1;
         }
-        let name = resolve_display_name(db, args[0]).unwrap_or_else(|| args[0].to_string());
+        let name = match resolve_term_target(db, args[0]) {
+            Ok(name) => name,
+            Err(msg) => {
+                eprintln!("Error: {msg}");
+                return 1;
+            }
+        };
         let text = if args.len() > 1 {
             args[1..].join(" ")
         } else {
@@ -437,7 +454,13 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
     // target. `hcom term --json luna:ABCD` must route through the RPC path
     // just like `hcom term luna:ABCD --json`.
     if let Some(name_arg) = argv.iter().find(|arg| !arg.starts_with('-')) {
-        let name = resolve_display_name(db, name_arg).unwrap_or_else(|| name_arg.clone());
+        let name = match resolve_term_target(db, name_arg) {
+            Ok(name) => name,
+            Err(msg) => {
+                eprintln!("Error: {msg}");
+                return 1;
+            }
+        };
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&name) {
             let raw_json = argv.iter().any(|a| a == "--json");
             let clean = argv.iter().any(|a| a == "--clean");
@@ -456,6 +479,14 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
 
     // Screen query
     handle_screen(db, argv)
+}
+
+/// The instance name `hcom term` acts on: fleet-first for a bare name, and
+/// on a name live nowhere today's local lookup. `Err` is the fleet refusal
+/// message; a name live nowhere comes back unchanged and behaves as it
+/// always has (no local PTY).
+fn resolve_term_target(db: &HcomDb, target: &str) -> Result<String, String> {
+    crate::identity::cli_target(db, target)
 }
 
 #[cfg(test)]
@@ -595,5 +626,93 @@ mod tests {
         assert!(rendered.contains("ready=true  prompt_empty=false  input_text=\"status\""));
         assert!(rendered.contains("  0: hello"));
         assert!(rendered.contains("  2: world"));
+    }
+
+    // ── fleet-wide bare-name resolution ─────────────────────────────────
+
+    const FLEET_DEV: &str = "11111111-1111-4111-8111-111111111111";
+    const FLEET_DEV_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// The `x:DEV` form a device's rows carry, from the canonical short-id
+    /// derivation.
+    fn remote_form(base: &str, device_uuid: &str) -> String {
+        format!("{base}:{}", crate::relay::device_short_id(device_uuid))
+    }
+
+    fn fleet_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    fn insert_mirror(db: &HcomDb, name: &str, device_uuid: &str) {
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool, origin_device_id)
+                 VALUES (?1, 'listening', 'ready', ?2, ?2, 'omp', ?3)",
+                rusqlite::params![name, now, device_uuid],
+            )
+            .unwrap();
+    }
+
+    /// `hcom term inject <bare> <text>` as the term tests build it.
+    fn inject_args(name: &str) -> TermArgs {
+        TermArgs {
+            args: vec!["inject".to_string(), name.to_string(), "hello".to_string()],
+        }
+    }
+
+    /// A bare name live on one other device resolves to that device's exact
+    /// `X:DEV` form, which is what sends the inject down the TERM_INJECT RPC
+    /// instead of looking for a local PTY.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_one_remote_device_resolves_to_its_suffixed_form() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        assert_eq!(resolve_term_target(&db, "luna").unwrap(), form);
+        // No relay is configured, so the RPC is refused by the worker gate.
+        assert_eq!(cmd_term(&db, &inject_args("luna"), None), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_two_remote_devices_is_refused_with_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV_B), FLEET_DEV_B);
+        let err = resolve_term_target(&db, "luna").expect_err("ambiguous");
+        assert!(err.contains(&remote_form("luna", FLEET_DEV)), "{err}");
+        assert!(err.contains(&remote_form("luna", FLEET_DEV_B)), "{err}");
+        assert_eq!(cmd_term(&db, &inject_args("luna"), None), 1);
+    }
+
+    /// A name live nowhere keeps today's local-inject behavior.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_nowhere_keeps_the_local_inject_path() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        assert_eq!(resolve_term_target(&db, "luna").unwrap(), "luna");
+        assert_eq!(cmd_term(&db, &inject_args("luna"), None), 1);
+    }
+
+    /// An already-suffixed name is never fleet-resolved, even when the bare
+    /// name would be ambiguous.
+    #[test]
+    #[serial_test::serial]
+    fn a_suffixed_name_is_never_fleet_resolved() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV_B), FLEET_DEV_B);
+        assert_eq!(resolve_term_target(&db, &form).unwrap(), form);
     }
 }

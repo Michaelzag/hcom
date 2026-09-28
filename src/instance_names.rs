@@ -248,6 +248,8 @@ pub(crate) fn allocate_name(
 
 pub(crate) fn collect_taken_names(db: &HcomDb) -> Result<(HashSet<String>, HashSet<String>)> {
     let instances = db.iter_instances_full()?;
+    // Every row's name, mirror names included: the similarity score is fed
+    // the set as-is, and only its length matters there.
     let alive_names: HashSet<String> = instances.iter().map(|r| r.name.clone()).collect();
     let mut taken_names = alive_names.clone();
 
@@ -265,6 +267,76 @@ pub(crate) fn collect_taken_names(db: &HcomDb) -> Result<(HashSet<String>, HashS
     taken_names.extend(stopped);
 
     Ok((alive_names, taken_names))
+}
+
+/// A row counts as live under hcom's existing liveness rule: not `stopped`,
+/// not a `launch_failed` placeholder, and not a session-exited `inactive`
+/// row. This is the same rule `fleet_names::LIVE_ROW_PREDICATE` carries as
+/// SQL (which `commands::send`'s `deliverable_instances` now runs), and
+/// `row_is_live_matches_the_sql_predicate` pins the two together; the
+/// stale-inactive demotions in `instance_lifecycle` never apply to a mirror
+/// row (they are gated on `origin_device_id IS NULL`), so the stored status
+/// is the whole rule for a remote row.
+fn row_is_live(row: &crate::db::InstanceRow) -> bool {
+    row.status != "stopped"
+        && row.status_context != "launch_failed"
+        && !(row.status == crate::shared::constants::ST_INACTIVE
+            && row.status_context.starts_with("exit:"))
+}
+
+/// Base names (lowercased) of every live remote mirror row, on ANY device —
+/// suffix-only devices included, since a suffix-only device is still a place
+/// the name is taken.
+pub(crate) fn collect_live_remote_bases(db: &HcomDb) -> Result<HashSet<String>> {
+    Ok(live_remote_rows(db)?
+        .iter()
+        .filter_map(|name| crate::relay::control::split_device_suffix(name))
+        .map(|(base, _)| base.to_ascii_lowercase())
+        .collect())
+}
+
+/// Live mirror rows (`origin_device_id` set) as their exact `x:SHORT` row
+/// names, sorted.
+fn live_remote_rows(db: &HcomDb) -> Result<Vec<String>> {
+    let mut names: Vec<String> = db
+        .iter_instances_full()?
+        .iter()
+        .filter(|row| row.origin_device_id.is_some() && row_is_live(row))
+        .map(|row| row.name.clone())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Cross-host name guard: refusal text when `name` is live as a mirror row on
+/// another device (suffix-only devices included), else `None`. Every refusal
+/// names the exact `x:SHORT` form(s) to use instead.
+///
+/// A name that already carries a `:SHORT` suffix names its own device and is
+/// never refused here. The guard is best effort, not a lease: it sees only
+/// the mirror rows relay sync has delivered to this device, so a peer that
+/// has not synced yet — or whose rows dropped out — is invisible to it.
+pub(crate) fn remote_name_refusal(db: &HcomDb, name: &str) -> Result<Option<String>> {
+    if name.contains(':') {
+        return Ok(None);
+    }
+    let wanted = name.to_ascii_lowercase();
+    let forms: Vec<String> = live_remote_rows(db)?
+        .into_iter()
+        .filter(|row_name| {
+            crate::relay::control::split_device_suffix(row_name)
+                .is_some_and(|(base, _)| base.to_ascii_lowercase() == wanted)
+        })
+        .collect();
+    if forms.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "'{}' is live on another device ({}); address it as {} or pick a different name",
+        name,
+        forms.join(", "),
+        forms.join(" / ")
+    )))
 }
 
 /// Total CVCV outputs: 15 consonants × 5 vowels × 15 × 5.
@@ -296,11 +368,27 @@ pub fn hash_to_name(input: &str, collision_attempt: u32) -> String {
 pub const PLACEHOLDER_STATUS: &str = "pending";
 pub const PLACEHOLDER_CONTEXT: &str = "new";
 
+/// Is `name` unavailable to the generator? Taken = a local instance row, a
+/// name that already stopped here, or a base name a live remote mirror row
+/// carries on ANY device (suffix-only devices included) — the cross-host
+/// guard, matched case-insensitively.
+pub(crate) fn generation_is_taken(
+    db: &HcomDb,
+    name: &str,
+    taken_names: &HashSet<String>,
+    remote_bases: &HashSet<String>,
+) -> bool {
+    taken_names.contains(name)
+        || remote_bases.contains(&name.to_ascii_lowercase())
+        || db.get_instance_full(name).ok().flatten().is_some()
+}
+
 pub(crate) fn allocate_unreserved_name(db: &HcomDb) -> Result<String> {
     let (alive_names, taken_names) = collect_taken_names(db)?;
+    let remote_bases = collect_live_remote_bases(db)?;
 
     allocate_name(
-        &|n| taken_names.contains(n) || db.get_instance_full(n).ok().flatten().is_some(),
+        &|n| generation_is_taken(db, n, &taken_names, &remote_bases),
         &alive_names,
         200,
         1200,
@@ -892,5 +980,125 @@ mod reservation_tests {
         // Default HcomConfig::timeout is 86400 (schema-equivalent default),
         // preserved for anyone who hasn't set HCOM_TIMEOUT.
         assert_eq!(wait_timeout, Some(86400));
+    }
+
+    /// Seed a live mirror row for `name` on `device` (relay pull's shape).
+    fn insert_mirror_row(db: &HcomDb, name: &str, device: &str, status: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, status, status_context, \
+                 created_at, tool) VALUES (?1, ?2, ?3, 'ready', 1.0, 'omp')",
+                rusqlite::params![name, device, status],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_alive_set_carries_the_mirror_row_itself_not_its_base() {
+        // The similarity set is fed every row name as-is (mirror names
+        // included); the fleet-wide claim on a remote BASE is the guard's,
+        // and `generation_is_taken` is what the generator consults for it.
+        let (_tmp, db) = setup_db();
+        insert_mirror_row(&db, "milo:ABCD", "device-aaaa", "listening");
+
+        let (alive, taken) = collect_taken_names(&db).unwrap();
+        assert!(alive.contains("milo:ABCD"), "{alive:?}");
+        assert!(!alive.contains("milo"), "{alive:?}");
+        assert!(!taken.contains("milo"), "{taken:?}");
+        let remote_bases = collect_live_remote_bases(&db).unwrap();
+        assert!(generation_is_taken(&db, "milo", &taken, &remote_bases));
+    }
+
+    #[test]
+    fn generator_skips_a_live_remote_base() {
+        let (_tmp, db) = setup_db();
+        insert_mirror_row(&db, "milo:ABCD", "device-aaaa", "listening");
+
+        let (alive, taken) = collect_taken_names(&db).unwrap();
+        let remote_bases = collect_live_remote_bases(&db).unwrap();
+        assert!(generation_is_taken(&db, "milo", &taken, &remote_bases));
+        // Case-insensitive: the mirror base is matched, not compared verbatim.
+        assert!(generation_is_taken(&db, "MILO", &taken, &remote_bases));
+        // A suffixed form is not itself a generator candidate.
+        assert!(!generation_is_taken(&db, "koto", &taken, &remote_bases));
+        assert!(alive.contains("milo:ABCD"));
+    }
+
+    #[test]
+    fn a_stopped_remote_mirror_row_frees_its_base() {
+        let (_tmp, db) = setup_db();
+        insert_mirror_row(&db, "milo:ABCD", "device-aaaa", "stopped");
+
+        let (_, taken) = collect_taken_names(&db).unwrap();
+        assert!(!taken.contains("milo"), "{taken:?}");
+        assert!(remote_name_refusal(&db, "milo").unwrap().is_none());
+    }
+
+    #[test]
+    fn remote_refusal_names_the_suffixed_forms() {
+        let (_tmp, db) = setup_db();
+        insert_mirror_row(&db, "milo:ABCD", "device-aaaa", "listening");
+        insert_mirror_row(&db, "milo:GIDU", "device-bbbb", "listening");
+
+        let refusal = remote_name_refusal(&db, "milo").unwrap().unwrap();
+        assert!(refusal.contains("milo:ABCD"), "{refusal}");
+        assert!(refusal.contains("milo:GIDU"), "{refusal}");
+        // A name that already names its device is never refused here.
+        assert!(remote_name_refusal(&db, "milo:ABCD").unwrap().is_none());
+        assert!(remote_name_refusal(&db, "koto").unwrap().is_none());
+    }
+
+    /// One seeded mirror row per liveness class: the guard's Rust rule
+    /// (`row_is_live`, via `live_remote_rows`) must select exactly the rows
+    /// `fleet_names::LIVE_ROW_PREDICATE` keeps, the SQL form
+    /// `commands::send` resolves bare names against.
+    #[test]
+    fn row_is_live_agrees_with_the_sql_predicate() {
+        let (_tmp, db) = setup_db();
+        for (name, status, context) in [
+            ("milo:AAAA", "listening", "ready"),
+            ("koto:AAAA", "stopped", "stop"),
+            ("lupa:AAAA", "pending", "launch_failed"),
+            ("nara:AAAA", "inactive", "exit:0"),
+            // Adhoc idles and stale demotions are stored but stay live: the
+            // demotion is computed on read for LOCAL rows only.
+            ("sena:AAAA", "inactive", "tool:bash"),
+            ("tomo:AAAA", "inactive", "stale:900"),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, origin_device_id, status, status_context, \
+                     created_at, tool) VALUES (?1, 'device-aaaa', ?2, ?3, 1.0, 'omp')",
+                    rusqlite::params![name, status, context],
+                )
+                .unwrap();
+        }
+
+        let sql_live: HashSet<String> = {
+            let mut stmt = db
+                .conn()
+                .prepare(&format!(
+                    "SELECT name FROM instances WHERE {}",
+                    crate::fleet_names::LIVE_ROW_PREDICATE
+                ))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            rows.into_iter().collect()
+        };
+        let guard_live: HashSet<String> = live_remote_rows(&db).unwrap().into_iter().collect();
+
+        assert_eq!(sql_live, guard_live, "the two liveness rules drifted");
+        assert_eq!(
+            sql_live,
+            HashSet::from([
+                "milo:AAAA".to_string(),
+                "sena:AAAA".to_string(),
+                "tomo:AAAA".to_string()
+            ])
+        );
     }
 }
