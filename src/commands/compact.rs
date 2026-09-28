@@ -660,7 +660,15 @@ fn execute_plugin(
 
 /// Run the whole command, returning its outcome instead of printing it.
 pub fn execute(db: &HcomDb, args: &CompactArgs) -> Result<Outcome, Fail> {
-    let name = &args.name;
+    // Fleet-first: a bare name live on exactly one other device resolves to
+    // that device's `x:DEV` form and hits the remote refusal below; a name
+    // live nowhere keeps today's "no such seat" error.
+    let name: String = match crate::identity::fleet_first(db, &args.name) {
+        crate::identity::CliResolve::Hit(exact) => exact,
+        crate::identity::CliResolve::Refused(msg) => return Err(Fail::Error(msg)),
+        crate::identity::CliResolve::Miss => args.name.clone(),
+    };
+    let name: &str = &name;
     let row = read_row(db, name)?;
 
     // Remote first, before any scanning: relay-mirrored seats have no local
@@ -1538,6 +1546,62 @@ mod tests {
             render_refusal("luna:BOXE", &[Reason::Remote], None),
             "refuse: compact luna:BOXE\n  - remote seat (relay compaction unsupported)"
         );
+    }
+
+    // ── fleet-wide bare-name resolution ─────────────────────────────────
+
+    const FLEET_DEV: &str = "11111111-1111-4111-8111-111111111111";
+    const FLEET_DEV_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// The `x:DEV` form a device's rows carry, from the canonical short-id
+    /// derivation.
+    fn remote_form(base: &str, device_uuid: &str) -> String {
+        format!("{base}:{}", crate::relay::device_short_id(device_uuid))
+    }
+
+    fn insert_mirror(db: &HcomDb, name: &str, device_uuid: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time,
+                                        created_at, origin_device_id)
+                 VALUES (?1, 'omp', 'listening', 'ready', ?2, 0, ?3)",
+                rusqlite::params![name, now_epoch_ms(), device_uuid],
+            )
+            .unwrap();
+    }
+
+    /// A bare name live on one other device resolves to that device and hits
+    /// the existing remote-compact refusal, exactly as `X:DEV` does.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_one_remote_device_is_refused_as_remote() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let s = seat("listening", COMPLETED_JOB, None);
+        insert_mirror(&s.db, &remote_form("navi", FLEET_DEV), FLEET_DEV);
+        let fail = execute(&s.db, &args("navi")).expect_err("remote");
+        assert_eq!(
+            fail,
+            Fail::Refused {
+                reasons: vec![Reason::Remote],
+                facts: None
+            }
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_two_remote_devices_is_refused_with_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let s = seat("listening", COMPLETED_JOB, None);
+        insert_mirror(&s.db, &remote_form("navi", FLEET_DEV), FLEET_DEV);
+        insert_mirror(&s.db, &remote_form("navi", FLEET_DEV_B), FLEET_DEV_B);
+        match execute(&s.db, &args("navi")).expect_err("refused") {
+            Fail::Error(msg) => {
+                assert!(msg.contains(&remote_form("navi", FLEET_DEV)), "{msg}");
+                assert!(msg.contains(&remote_form("navi", FLEET_DEV_B)), "{msg}");
+            }
+            other => panic!("expected an ambiguous-name refusal, got {other:?}"),
+        }
     }
 
     // --- 9. plugin path -------------------------------------------------------

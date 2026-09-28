@@ -633,8 +633,11 @@ fn import_remote_events(
                 );
             }
 
-            // Strip own device suffix from mentions and delivered_to
-            for field in &["mentions", "delivered_to"] {
+            // Strip own device suffix from mentions, delivered_to and
+            // exact_targets. Exact targets are resolved canonical names from
+            // the sender; stripping our own suffix here makes the pure exact
+            // match work against local receiver names on import.
+            for field in &["mentions", "delivered_to", "exact_targets"] {
                 if let Some(arr) = obj.get(*field).and_then(|v| v.as_array()).cloned() {
                     let fixed: Vec<Value> = arr
                         .iter()
@@ -1287,5 +1290,237 @@ mod tests {
             .unwrap()
             .expect("local row must survive");
         assert_eq!(local.status, "running");
+    }
+
+    /// Device-exact delivery through the REAL relay path (ffc-ravoc).
+    ///
+    /// Two live devices (separate HCOM_DIRs ⇒ separate DBs, device ids and
+    /// short ids), each with a live local `x`. The message event is written
+    /// through the REAL send path on db A, the push payload is built with the
+    /// REAL push builder, and it is fed through the REAL import
+    /// (`handle_state_message` → namespacing + own-suffix strip). Delivery is
+    /// asserted via `get_unread_messages`:
+    /// - `@x:B` reaches B's `x` but NOT A's `x` (device-exact);
+    /// - an old-format event (no `exact_targets` key, as an older peer would
+    ///   store/push) keeps today's base-name behavior on both sides.
+    ///
+    /// Why this test is not spuriously green: seeded rows/events skip the
+    /// own-suffix strip in `import_remote_events`, so a test that inserts
+    /// the event directly can pass while `@x:B` still misdelivers after a
+    /// real round trip. Here a strip revert leaves B's `exact_targets` as
+    /// `["x:SHORTB"]`, which no longer exactly matches local `x` (first
+    /// assertion fails); an exact-logic revert falls back to base-name
+    /// matching, so A's `x` also takes `@x:B` (second assertion fails).
+    #[test]
+    #[serial]
+    fn test_device_exact_message_delivery_through_relay_import() {
+        use crate::commands::send::send_message;
+        use crate::hooks::test_helpers::EnvGuard;
+        use crate::relay::push::build_push_payload;
+        use crate::relay::{read_device_uuid, state_topic};
+        use crate::shared::{SenderIdentity, SenderKind};
+
+        // Two isolated sides. The ambient HCOM_DIR/HOME is switched per side
+        // because FleetCtx::load (send path) and read_device_uuid resolve the
+        // device identity from the environment.
+        let _env = EnvGuard::new();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let home_a = dir_a.path().to_path_buf();
+        let home_b = dir_b.path().to_path_buf();
+        let hcom_a = home_a.join(".hcom");
+        let hcom_b = home_b.join(".hcom");
+        std::fs::create_dir_all(&hcom_a).unwrap();
+        std::fs::create_dir_all(&hcom_b).unwrap();
+        crate::paths::test_roots::register(&home_a);
+        crate::paths::test_roots::register(&home_b);
+        let use_side = |home: &std::path::Path, hcom: &std::path::Path| {
+            unsafe {
+                std::env::set_var("HOME", home);
+                std::env::set_var("HCOM_DIR", hcom);
+                std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
+                // Keep the omp /tmp redirect (`<build_root>/<seat>/tmp`) inside the tempdir.
+                std::env::set_var("HCOM_BUILD_ROOT", home.join("build"));
+            }
+            crate::config::Config::reset();
+            crate::config::Config::init();
+        };
+
+        use_side(&home_a, &hcom_a);
+        let db_a = HcomDb::open().unwrap();
+        let uuid_a = read_device_uuid().expect("device id for side A");
+        use_side(&home_b, &hcom_b);
+        let db_b = HcomDb::open().unwrap();
+        let uuid_b = read_device_uuid().expect("device id for side B");
+        assert_ne!(uuid_a, uuid_b);
+
+        let short_a = device_short_id_for_db(&db_a, &uuid_a);
+        let short_b = device_short_id_for_db(&db_b, &uuid_b);
+        assert_ne!(short_a, short_b, "test needs distinct device shorts");
+
+        // A live `x` on both devices.
+        db_a.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('x', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db_b.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('x', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let relay_id = "test-relay-exact";
+        let psk = fixture_psk();
+        // Deliver a sealed state payload from one side into the other's DB
+        // through the real inbound handler (state upsert + event import).
+        let deliver =
+            |db: &HcomDb, from_uuid: &str, own_uuid: &str, payload: &serde_json::Value| {
+                let topic = state_topic(relay_id, from_uuid);
+                let bytes = serde_json::to_vec(payload).unwrap();
+                let now = crate::shared::time::now_epoch_f64() as u64;
+                let envelope =
+                    crate::relay::crypto::seal(&psk, relay_id, &topic, &bytes, now).unwrap();
+                let mut guard = ReplayGuard::default();
+                handle_state_message(
+                    db,
+                    from_uuid,
+                    &envelope,
+                    own_uuid,
+                    &mut InboundContext {
+                        psk: &psk,
+                        relay_id,
+                        topic: &topic,
+                        replay_guard: &mut guard,
+                    },
+                )
+            };
+
+        // Mirror rows as the relay would hold them: each side learns the
+        // other's live `x` via a real state push.
+        let (state_b, _, _, _) = build_push_payload(&db_b, &uuid_b);
+        deliver(
+            &db_a,
+            &uuid_b,
+            &uuid_a,
+            &json!({"state": state_b, "events": []}),
+        );
+        let mirror_on_a = format!("x:{short_b}");
+        assert!(
+            db_a.get_instance_full(&mirror_on_a).unwrap().is_some(),
+            "A holds B's mirror {mirror_on_a}"
+        );
+        let (state_a, _, _, _) = build_push_payload(&db_a, &uuid_a);
+        deliver(
+            &db_b,
+            &uuid_a,
+            &uuid_b,
+            &json!({"state": state_a, "events": []}),
+        );
+        assert!(
+            db_b.get_instance_full(&format!("x:{short_a}"))
+                .unwrap()
+                .is_some(),
+            "B holds A's mirror"
+        );
+
+        // REAL send path on A: `@x:B` resolves to the exact mirror name.
+        use_side(&home_a, &hcom_a);
+        let sender = SenderIdentity {
+            kind: SenderKind::External,
+            name: "boss".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let delivered = send_message(
+            &db_a,
+            &sender,
+            "hello-b",
+            None,
+            Some(std::slice::from_ref(&mirror_on_a)),
+        )
+        .unwrap();
+        assert_eq!(
+            delivered,
+            vec![mirror_on_a.clone()],
+            "local delivery is device-exact: A's own x is not a recipient"
+        );
+        let stored: String = db_a
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'message' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_json: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(
+            stored_json
+                .get("exact_targets")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()),
+            Some(vec![mirror_on_a.as_str()]),
+            "send records the resolved canonical name"
+        );
+
+        // REAL push builder on A, REAL import on B.
+        let (push_state_a, push_events_a, _, _) = build_push_payload(&db_a, &uuid_a);
+        assert!(!push_events_a.is_empty());
+        deliver(
+            &db_b,
+            &uuid_a,
+            &uuid_b,
+            &json!({"state": push_state_a, "events": push_events_a}),
+        );
+
+        let unread_texts = |db: &HcomDb| -> Vec<String> {
+            db.get_unread_messages("x")
+                .iter()
+                .map(|m| m.text.clone())
+                .collect()
+        };
+        let b_unread = unread_texts(&db_b);
+        assert!(
+            b_unread.iter().any(|t| t == "hello-b"),
+            "@x:B reaches B's x; B unread: {b_unread:?}"
+        );
+        let a_unread = unread_texts(&db_a);
+        assert!(
+            !a_unread.iter().any(|t| t == "hello-b"),
+            "@x:B must NOT reach A's same-named x; A unread: {a_unread:?}"
+        );
+
+        // Old-format event: exactly what a peer without exact_targets would
+        // store and push (no `exact_targets` key anywhere).
+        use_side(&home_a, &hcom_a);
+        let old_data = serde_json::json!({
+            "from": "boss",
+            "sender_kind": "external",
+            "scope": "mentions",
+            "text": "hello-old",
+            "mentions": [mirror_on_a],
+            "delivered_to": [mirror_on_a],
+        });
+        assert!(old_data.get("exact_targets").is_none());
+        db_a.log_event("message", "ext_boss", &old_data).unwrap();
+        let (push_state_old, push_events_old, _, _) = build_push_payload(&db_a, &uuid_a);
+        deliver(
+            &db_b,
+            &uuid_a,
+            &uuid_b,
+            &json!({"state": push_state_old, "events": push_events_old}),
+        );
+        let b_unread_old = unread_texts(&db_b);
+        assert!(
+            b_unread_old.iter().any(|t| t == "hello-old"),
+            "old-format event keeps base-name delivery on B; B unread: {b_unread_old:?}"
+        );
+        let a_unread_old = unread_texts(&db_a);
+        assert!(
+            a_unread_old.iter().any(|t| t == "hello-old"),
+            "old-format event keeps today's base-name behavior on A; A unread: {a_unread_old:?}"
+        );
     }
 }

@@ -198,6 +198,114 @@ pub fn resolve_display_name_or_stopped(db: &HcomDb, input_name: &str) -> Option<
     None
 }
 
+/// Fleet-first resolution of a bare input for a CLI command.
+///
+/// * [`CliResolve::Hit`] — the one live candidate fleet-wide: the local
+///   row's bare name, or a live mirror's `x:DEV` form. The command proceeds
+///   under that name.
+/// * [`CliResolve::Refused`] — ambiguous, or live only on suffix-only
+///   devices; the message names the exact suffixed form(s) to use.
+/// * [`CliResolve::Miss`] — live nowhere: the caller's own local behavior
+///   stands (a stopped local row, a tag-name, an unknown name).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CliResolve {
+    Hit(String),
+    Refused(String),
+    Miss,
+}
+
+/// The one fleet entry every command's name lookup runs FIRST, so a bare
+/// name cannot mean one seat on the CLI and another on the send path.
+///
+/// Input that is empty or already device-qualified is `Miss`: every
+/// `:DEVICE` flow keeps its exact behavior. Otherwise the shared resolver
+/// decides over the live fleet (see [`crate::fleet_names`]).
+pub fn fleet_first(db: &HcomDb, input: &str) -> CliResolve {
+    if input.is_empty() || input.contains(':') {
+        return CliResolve::Miss;
+    }
+    let ctx = crate::fleet_names::FleetCtx::load();
+    let candidates = crate::fleet_names::live_candidates(db, input, &ctx);
+    match crate::fleet_names::resolve_bare_name(input, &candidates) {
+        crate::fleet_names::BareOutcome::Single(exact) => CliResolve::Hit(exact),
+        crate::fleet_names::BareOutcome::Refuse(msg) => CliResolve::Refused(msg),
+        crate::fleet_names::BareOutcome::NoCandidate => CliResolve::Miss,
+    }
+}
+
+/// The name a command should act on when its local lookup is the plain
+/// instance-name (or tag-name) one: fleet-first, and on a `Miss` today's
+/// local lookup verbatim. `Err` is the fleet refusal message.
+pub fn cli_target(db: &HcomDb, target: &str) -> Result<String, String> {
+    match fleet_first(db, target) {
+        CliResolve::Hit(name) => Ok(name),
+        CliResolve::Refused(msg) => Err(msg),
+        CliResolve::Miss => {
+            Ok(resolve_display_name(db, target).unwrap_or_else(|| target.to_string()))
+        }
+    }
+}
+
+/// SQL LIKE pattern for a literal prefix + `:`, with the wildcards in the
+/// prefix escaped. Base names may contain `_`, which LIKE would read as
+/// "any one character".
+fn like_device_prefix(name: &str) -> String {
+    let mut pattern = String::with_capacity(name.len() + 6);
+    for c in name.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push_str(":%");
+    pattern
+}
+
+/// The exact `X:DEV` forms on other devices where a bare name's history lives:
+/// live mirror rows with that base name, plus every `X:DEV` name that appears
+/// in the life history. Empty when the name has no history off-host.
+pub fn remote_history_forms(db: &HcomDb, name: &str) -> Vec<String> {
+    if name.is_empty() || name.contains(':') {
+        return Vec::new();
+    }
+    let pattern = like_device_prefix(name);
+    let mut forms: Vec<String> = Vec::new();
+    let mut rows = db.conn().prepare(
+        "SELECT name FROM instances
+         WHERE name LIKE ?1 ESCAPE '\\' AND origin_device_id IS NOT NULL AND origin_device_id != ''
+         UNION
+         SELECT DISTINCT instance FROM events
+         WHERE type = 'life' AND instance LIKE ?1 ESCAPE '\\'",
+    );
+    let Ok(rows) = rows.as_mut() else {
+        return Vec::new();
+    };
+    if let Ok(found) = rows.query_map([&pattern], |row| row.get::<_, String>(0)) {
+        for form in found.flatten() {
+            if !forms.contains(&form) {
+                forms.push(form);
+            }
+        }
+    }
+    forms.sort();
+    forms
+}
+
+/// Hint for a bare name with no local plan whose history lives on other
+/// devices: says where it is and how to reach it. `None` when the name has no
+/// off-host history (the caller reports its own not-found error instead).
+pub fn remote_history_hint(db: &HcomDb, name: &str) -> Option<String> {
+    let forms = remote_history_forms(db, name);
+    if forms.is_empty() {
+        return None;
+    }
+    let list = forms.join(", ");
+    Some(format!(
+        "'{name}' is not an identity on this host. {name}'s history is on {list} — 'hcom r {}' resumes it there, or launch fresh here with 'hcom omp --as {name}'.",
+        forms[0]
+    ))
+}
+
 /// Resolve `--name NAME` with strict instance lookup.
 ///
 /// Resolution order:
@@ -1032,5 +1140,170 @@ mod tests {
             resolve_display_name_or_stopped(&db, "luna").as_deref(),
             Some("luna")
         );
+    }
+
+    // ── fleet-wide bare-name resolution ─────────────────────────────────
+
+    const DEV_A: &str = "11111111-1111-4111-8111-111111111111";
+    const DEV_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// The `x:DEV` form a device's rows carry, from the canonical short-id
+    /// derivation (never a hand-written suffix).
+    fn remote_form(base: &str, device_uuid: &str) -> String {
+        format!("{base}:{}", crate::relay::device_short_id(device_uuid))
+    }
+
+    fn insert_mirror(db: &HcomDb, name: &str, device_uuid: &str, status: &str) {
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool, origin_device_id)
+                 VALUES (?1, ?2, 'ready', ?3, ?3, 'omp', ?4)",
+                rusqlite::params![name, status, now, device_uuid],
+            )
+            .unwrap();
+    }
+
+    /// A fresh empty DB. Every fleet test holds an isolated env for its whole
+    /// body: the resolver reads the device config on each call, so the guard
+    /// must outlive the assertion (and `#[serial]` keeps the env single-threaded).
+    fn fleet_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn one_live_remote_resolves_to_its_suffixed_form() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", DEV_A), DEV_A, "listening");
+        assert_eq!(
+            fleet_first(&db, "luna"),
+            CliResolve::Hit(remote_form("luna", DEV_A))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn two_live_remotes_refuse_and_name_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", DEV_A), DEV_A, "listening");
+        insert_mirror(&db, &remote_form("luna", DEV_B), DEV_B, "listening");
+        let err = refusal(&db, "luna");
+        assert!(err.contains(&remote_form("luna", DEV_A)), "{err}");
+        assert!(err.contains(&remote_form("luna", DEV_B)), "{err}");
+    }
+
+    /// A live local row is a candidate, not a short-circuit: a live mirror of
+    /// the same base name is the collision, and the CLI refuses exactly like
+    /// `hcom send @x` does in the same database.
+    #[test]
+    #[serial_test::serial]
+    fn a_live_local_row_and_a_live_mirror_refuse_and_name_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_instance(&db, "luna", Some("sess-1"), None);
+        insert_mirror(&db, &remote_form("luna", DEV_A), DEV_A, "listening");
+        let err = refusal(&db, "luna");
+        assert!(err.contains("@luna,"), "local shown as bare @luna: {err}");
+        assert!(err.contains(&remote_form("luna", DEV_A)), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_live_local_row_is_the_only_candidate_and_keeps_the_bare_name() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_instance(&db, "luna", Some("sess-1"), None);
+        assert_eq!(fleet_first(&db, "luna"), CliResolve::Hit("luna".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_stopped_local_name_is_not_a_fleet_candidate() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        db.log_life_event("luna", "stopped", "test", "exit", None, None)
+            .unwrap();
+        // Unchanged: the caller's local path still owns the stopped name.
+        assert_eq!(fleet_first(&db, "luna"), CliResolve::Miss);
+    }
+
+    /// A stopped local row is never a candidate, so a name live on another
+    /// device resolves to THAT device's exact form — the same answer
+    /// `hcom send @x` gives.
+    #[test]
+    #[serial_test::serial]
+    fn a_stopped_local_name_with_a_live_remote_resolves_to_the_remote_form() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        db.log_life_event("luna", "stopped", "test", "exit", None, None)
+            .unwrap();
+        insert_mirror(&db, &remote_form("luna", DEV_A), DEV_A, "listening");
+        assert_eq!(
+            fleet_first(&db, "luna"),
+            CliResolve::Hit(remote_form("luna", DEV_A))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_suffixed_name_is_never_fleet_resolved() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", DEV_A), DEV_A, "listening");
+        insert_mirror(&db, &remote_form("luna", DEV_B), DEV_B, "listening");
+        assert_eq!(
+            fleet_first(&db, &remote_form("luna", DEV_A)),
+            CliResolve::Miss
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_stopped_remote_row_is_not_a_candidate() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", DEV_A), DEV_A, "stopped");
+        assert_eq!(fleet_first(&db, "luna"), CliResolve::Miss);
+    }
+
+    /// The refusal text a `Refused` verdict carries, for the assertions above.
+    fn refusal(db: &HcomDb, name: &str) -> String {
+        match fleet_first(db, name) {
+            CliResolve::Refused(msg) => msg,
+            other => panic!("expected a refusal for {name}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_history_hint_names_the_device_and_the_fresh_launch() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        let form = remote_form("X", DEV_A);
+        db.log_life_event(&form, "stopped", "test", "exit", None, None)
+            .unwrap();
+        let hint = remote_history_hint(&db, "X").expect("off-host history");
+        assert!(hint.contains(&form), "{hint}");
+        assert!(hint.contains("--as X"), "{hint}");
+        assert!(hint.contains(&format!("hcom r {form}")), "{hint}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_name_with_no_off_host_history_has_no_hint() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        db.log_life_event("luna", "stopped", "test", "exit", None, None)
+            .unwrap();
+        assert!(remote_history_hint(&db, "luna").is_none());
+        // A different base name never matches the other's suffixed history.
+        assert!(remote_history_hint(&db, "other").is_none());
     }
 }

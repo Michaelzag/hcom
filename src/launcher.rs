@@ -1646,6 +1646,15 @@ pub(crate) fn resolve_explicit_name_conflict(
     if let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name) {
         anyhow::bail!("{refusal}");
     }
+
+    // Cross-host guard, right after process truth and before any local-row
+    // reasoning: a fresh host with no local row at all must still refuse a
+    // name that is live on another device. The guard covers mirror rows on
+    // ANY device, suffix-only devices included, and is best effort — it sees
+    // only what relay sync has delivered here.
+    if let Some(refusal) = instance_names::remote_name_refusal(db, name)? {
+        anyhow::bail!("{refusal}");
+    }
     let Some(row) = db.get_instance(name).ok().flatten() else {
         return Ok(());
     };
@@ -3868,6 +3877,66 @@ mod tests {
                 rusqlite::params![name, status, now],
             )
             .unwrap();
+    }
+
+    /// Seed a live mirror row for `name` on `device` (relay pull's shape).
+    fn insert_test_mirror(db: &crate::db::HcomDb, name: &str, device: &str, status: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, status, status_context, \
+                 created_at, tool) VALUES (?1, ?2, ?3, 'ready', 1.0, 'omp')",
+                rusqlite::params![name, device, status],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_refuses_a_name_live_on_a_normal_remote() {
+        // A fresh host with no local row must still refuse a name another
+        // device is running, and the refusal names the suffixed form.
+        let db = launcher_test_db();
+        insert_test_mirror(&db, "luna:ABCD", "device-aaaa", "listening");
+
+        let err = resolve_explicit_name_conflict(&db, "luna", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("luna:ABCD"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_refuses_a_name_live_only_on_a_suffix_only_device() {
+        // The guard counts mirror rows on ANY device, suffix-only devices
+        // included — it never asks the resolver whether the device is a
+        // bare-name target.
+        let db = launcher_test_db();
+        insert_test_mirror(&db, "luna:GIDU", "device-solo", "listening");
+
+        let err = resolve_explicit_name_conflict(&db, "luna", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("luna:GIDU"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_allows_a_stopped_local_snapshot() {
+        // A seat moving here: its stopped snapshot on this host is history,
+        // not a conflict. A `stopped` row is not deleted by the inactive arm,
+        // so seed the stopped state the way a stop leaves it — no row at all.
+        let db = launcher_test_db();
+        assert!(resolve_explicit_name_conflict(&db, "luna", None).is_ok());
+
+        // The inactive arm does consume an inactive row, so that form is
+        // allowed too and the row is cleared for a fresh launch.
+        insert_test_instance(&db, "zeno", "inactive");
+        assert!(resolve_explicit_name_conflict(&db, "zeno", None).is_ok());
+        assert!(db.get_instance("zeno").unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_allows_a_name_whose_remote_row_stopped() {
+        let db = launcher_test_db();
+        insert_test_mirror(&db, "luna:ABCD", "device-aaaa", "stopped");
+        assert!(resolve_explicit_name_conflict(&db, "luna", None).is_ok());
     }
 
     #[test]

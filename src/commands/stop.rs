@@ -6,7 +6,7 @@
 
 use crate::db::HcomDb;
 use crate::identity;
-use crate::identity::{get_full_name, resolve_display_name};
+use crate::identity::get_full_name;
 use crate::instances::{is_remote_instance, is_subagent_instance};
 use crate::log::log_info;
 use crate::shared::{CommandContext, SENDER, SenderKind, is_inside_ai_tool};
@@ -268,9 +268,18 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 eprintln!("Error: Cannot mix tag: with other targets: {t}");
                 return 1;
             }
-            let resolved = resolve_display_name(db, t);
-            let name = resolved.as_deref().unwrap_or(t);
-            match db.get_instance_with_bindings(name) {
+            // Fleet-first (see `identity::cli_target`): a bare name live on
+            // one other device is that device's `X:DEV` form and is skipped
+            // as a remote instance below; an ambiguous name is refused
+            // outright; a name live nowhere keeps today's local lookup.
+            let name = match resolve_stop_target(db, t) {
+                Ok(name) => name,
+                Err(msg) => {
+                    eprintln!("Error: {msg}");
+                    return 1;
+                }
+            };
+            match db.get_instance_with_bindings(&name) {
                 Ok((Some(data), binding_ids)) => instances_to_stop.push((data, binding_ids)),
                 _ => {
                     not_found.push(t.to_string());
@@ -356,8 +365,15 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
     let instance_name = if !targets.is_empty() {
         // Named target
         let target = targets[0];
-        let resolved = resolve_display_name(db, target);
-        resolved.unwrap_or_else(|| target.to_string())
+        // Fleet-first: a bare name live on one other device resolves to that
+        // device's `X:DEV` form and hits the remote-stop refusal below.
+        match resolve_stop_target(db, target) {
+            Ok(name) => name,
+            Err(msg) => {
+                eprintln!("Error: {msg}");
+                return 1;
+            }
+        }
     } else {
         // Self-stop: resolve identity
         let identity = if let Some(c) = ctx {
@@ -456,6 +472,15 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
     }
 
     0
+}
+
+/// The instance name `hcom stop` acts on: fleet-first for a bare name, and
+/// on a name live nowhere today's local lookup (the local row, else the
+/// input unchanged so it hits the not-found report). `Err` is the fleet
+/// refusal message (an ambiguous name, or one live only on suffix-only
+/// devices).
+fn resolve_stop_target(db: &HcomDb, target: &str) -> Result<String, String> {
+    crate::identity::cli_target(db, target)
 }
 
 /// Stop `inst`, bound to the incarnation this command read: `inst` and
@@ -791,5 +816,179 @@ mod tests {
         let note = crate::proctruth::describe_unsignalled_orphans(&name, &orphans);
         assert!(note.starts_with("Not signalled"), "{note}");
         assert!(note.contains(&format!("pid {}", orphan.carrier)), "{note}");
+    }
+
+    // ── fleet-wide bare-name resolution ─────────────────────────────────
+
+    const FLEET_DEV: &str = "11111111-1111-4111-8111-111111111111";
+    const FLEET_DEV_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// The `x:DEV` form a device's rows carry, from the canonical short-id
+    /// derivation.
+    fn remote_form(base: &str, device_uuid: &str) -> String {
+        format!("{base}:{}", crate::relay::device_short_id(device_uuid))
+    }
+
+    fn fleet_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    fn insert_mirror(db: &HcomDb, name: &str, device_uuid: &str) {
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool, origin_device_id)
+                 VALUES (?1, 'listening', 'ready', ?2, ?2, 'omp', ?3)",
+                rusqlite::params![name, now, device_uuid],
+            )
+            .unwrap();
+    }
+
+    /// Run `hcom --go stop <targets>`.
+    fn run_stop(db: &HcomDb, targets: &[&str]) -> i32 {
+        let args = StopArgs {
+            targets: targets.iter().map(|t| t.to_string()).collect(),
+        };
+        let go = CommandContext {
+            explicit_name: None,
+            identity: None,
+            go: true,
+        };
+        cmd_stop(db, &args, Some(&go))
+    }
+
+    /// A bare name live on one other device resolves to that device's exact
+    /// `X:DEV` form, which the command then refuses as a remote mirror.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_one_remote_device_resolves_to_its_suffixed_form() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        assert_eq!(resolve_stop_target(&db, "luna").unwrap(), form);
+        assert_eq!(run_stop(&db, &["luna"]), 1, "remote stop stays refused");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_two_remote_devices_is_refused_with_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV_B), FLEET_DEV_B);
+        let err = resolve_stop_target(&db, "luna").expect_err("ambiguous");
+        assert!(err.contains(&remote_form("luna", FLEET_DEV)), "{err}");
+        assert!(err.contains(&remote_form("luna", FLEET_DEV_B)), "{err}");
+    }
+
+    /// A refused ambiguous name stops nothing: the local seat in the same
+    /// command is left alone and the run fails.
+    #[test]
+    #[serial_test::serial]
+    fn an_ambiguous_bare_name_stops_nothing() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV_B), FLEET_DEV_B);
+        seed(&db, "navi", 1.0, "sess-navi", "proc-navi");
+        assert_eq!(run_stop(&db, &["luna", "navi"]), 1);
+        assert!(
+            db.get_instance_full("navi").unwrap().is_some(),
+            "a refused name must not take the rest of the command down with it silently"
+        );
+    }
+
+    /// A bare name live only on another device alongside a live local seat:
+    /// the remote one is skipped as a mirror, the local one is stopped. The
+    /// exit code is what tells the two apart from today's not-found error.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_remote_name_is_skipped_while_the_local_seat_stops() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        seed(&db, "navi", 1.0, "sess-navi", "proc-navi");
+        assert_eq!(run_stop(&db, &["luna", "navi"]), 0);
+        assert!(db.get_instance_full("navi").unwrap().is_none());
+        assert!(
+            db.get_instance_full(&remote_form("luna", FLEET_DEV))
+                .unwrap()
+                .is_some(),
+            "a mirror row is never stopped"
+        );
+    }
+
+    /// A stopped local name has no live candidate anywhere, so the fleet
+    /// resolver passes it through and today's not-found error stands.
+    #[test]
+    #[serial_test::serial]
+    fn a_stopped_local_name_keeps_todays_not_found() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        db.log_life_event("luna", "stopped", "test", "exit", None, None)
+            .unwrap();
+        assert_eq!(resolve_stop_target(&db, "luna").unwrap(), "luna");
+        assert_eq!(run_stop(&db, &["luna"]), 1);
+    }
+
+    /// An already-suffixed name never reaches the fleet resolver, even when
+    /// the bare name would be ambiguous.
+    #[test]
+    #[serial_test::serial]
+    fn a_suffixed_name_is_never_fleet_resolved() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV_B), FLEET_DEV_B);
+        assert_eq!(resolve_stop_target(&db, &form).unwrap(), form);
+        assert_eq!(run_stop(&db, &[&form]), 1, "remote stop stays refused");
+    }
+
+    /// A live local row is a fleet candidate, not a short-circuit: with a
+    /// live mirror of the same base name the stop refuses, naming both
+    /// forms, and stops nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_live_local_name_and_a_live_mirror_are_refused_with_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        seed(&db, "luna", 1.0, "sess-luna", "proc-luna");
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        let err = resolve_stop_target(&db, "luna").expect_err("ambiguous");
+        assert!(err.contains("@luna,"), "{err}");
+        assert!(err.contains(&form), "{err}");
+        assert_eq!(run_stop(&db, &["luna"]), 1);
+        assert!(
+            db.get_instance_full("luna").unwrap().is_some(),
+            "a refused name stops nothing"
+        );
+    }
+
+    /// A stopped local row is never a candidate, so the name belongs to the
+    /// one device it is still live on.
+    #[test]
+    #[serial_test::serial]
+    fn a_stopped_local_name_with_a_live_remote_resolves_to_the_remote_form() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool)
+                 VALUES ('luna', 'stopped', 'exit', 1.0, 1.0, 'omp')",
+                [],
+            )
+            .unwrap();
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        assert_eq!(resolve_stop_target(&db, "luna").unwrap(), form);
+        assert_eq!(run_stop(&db, &["luna"]), 1, "remote stop stays refused");
     }
 }

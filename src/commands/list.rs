@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::context::{self, SeatContext};
 use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
-use crate::identity::{get_full_name, resolve_display_name};
+use crate::identity::get_full_name;
 use crate::instance_lifecycle::{
     RECENTLY_STOPPED_WINDOW, cleanup_stale_placeholders, cleanup_stale_remote_instances,
     format_age, get_instance_status, is_in_wake_grace,
@@ -58,6 +58,20 @@ pub struct ListArgs {
     /// collected or stored without it)
     #[arg(long)]
     pub context: bool,
+}
+
+/// The name `hcom list --stopped <name>` reads history for: fleet-first for a
+/// bare name (the one live device's `X:DEV` form, whose stopped history is
+/// what is being looked up), and on a name live nowhere a local live or
+/// stopped name. `Err` is the fleet refusal message.
+fn resolve_list_stopped_target(db: &HcomDb, target: &str) -> Result<String, String> {
+    use crate::identity::CliResolve;
+    match crate::identity::fleet_first(db, target) {
+        CliResolve::Hit(name) => Ok(name),
+        CliResolve::Refused(msg) => Err(msg),
+        CliResolve::Miss => Ok(identity::resolve_display_name_or_stopped(db, target)
+            .unwrap_or_else(|| target.to_string())),
+    }
 }
 
 /// Get unread message count for a single instance.
@@ -108,8 +122,6 @@ fn seat_context_request(db: &HcomDb, data: &InstanceRow, now: i64) -> context::S
     }
 }
 
-/// Main entry point for `hcom list` command.
-///
 /// Returns exit code (0 = success, 1 = error).
 pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i32 {
     // Clean up stale launch placeholders (holding any whose launch is still
@@ -171,8 +183,15 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         let lookup_name = if is_self {
             current_name.clone().unwrap_or_default()
         } else {
-            let resolved = resolve_display_name(db, target);
-            resolved.unwrap_or_else(|| target.to_string())
+            // Fleet-first: a bare name live on one other device resolves to
+            // that device's `X:DEV` form and prints the mirror row's data.
+            match identity::cli_target(db, target) {
+                Ok(name) => name,
+                Err(msg) => {
+                    eprintln!("Error: {msg}");
+                    return 1;
+                }
+            }
         };
 
         if lookup_name.is_empty() {
@@ -921,8 +940,14 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
     let limit = if show_all { 10000 } else { last_n };
 
     let (query, param) = if let Some(name) = filter_name {
-        let name = crate::identity::resolve_display_name_or_stopped(db, name)
-            .unwrap_or_else(|| name.to_string());
+        // A stopped local snapshot resolves here and never reaches the fleet.
+        let name = match resolve_list_stopped_target(db, name) {
+            Ok(name) => name,
+            Err(msg) => {
+                eprintln!("Error: {msg}");
+                return 1;
+            }
+        };
         // Fix: fetch up to 10000 events for named instance (was LIMIT 1)
         (
             "SELECT instance, timestamp, data FROM events
@@ -1289,5 +1314,170 @@ mod tests {
             1,
             "a single-seat --context must query the plugin exactly once"
         );
+    }
+
+    // ── fleet-wide bare-name resolution ─────────────────────────────────
+
+    const FLEET_DEV: &str = "11111111-1111-4111-8111-111111111111";
+    const FLEET_DEV_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// The `x:DEV` form a device's rows carry, from the canonical short-id
+    /// derivation.
+    fn remote_form(base: &str, device_uuid: &str) -> String {
+        format!("{base}:{}", crate::relay::device_short_id(device_uuid))
+    }
+
+    fn fleet_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    /// A mirror row of a device that is still syncing, which is the only kind
+    /// `hcom list` keeps (its stale-device cleanup drops the rest).
+    fn insert_mirror(db: &HcomDb, name: &str, device_uuid: &str) {
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool, origin_device_id, session_id)
+                 VALUES (?1, 'listening', 'ready', ?2, ?2, 'omp', ?3, ?4)",
+                rusqlite::params![name, now, device_uuid, format!("sid-{name}")],
+            )
+            .unwrap();
+        db.kv_set(
+            &format!("relay_sync_time_{device_uuid}"),
+            Some(&crate::shared::time::now_epoch_f64().to_string()),
+        )
+        .unwrap();
+    }
+
+    /// A live LOCAL row (no `origin_device_id`): a fleet candidate in its
+    /// own right, shown under the bare name.
+    fn insert_local(db: &HcomDb, name: &str) {
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool, session_id)
+                 VALUES (?1, 'listening', 'ready', ?2, ?2, 'omp', ?3)",
+                rusqlite::params![name, now, format!("sid-{name}")],
+            )
+            .unwrap();
+    }
+
+    fn list_args(name: &str) -> ListArgs {
+        ListArgs {
+            name: Some(name.to_string()),
+            field: None,
+            stopped: false,
+            json: true,
+            verbose: false,
+            names: false,
+            sh: false,
+            format: None,
+            all: false,
+            last: None,
+            context: false,
+        }
+    }
+
+    /// A bare name live on one other device lists that device's mirror row
+    /// (exit 0), where today's lookup reports "Not found" (exit 1).
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_one_remote_device_lists_its_mirror_row() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        assert_eq!(identity::cli_target(&db, "luna").unwrap(), form);
+        assert_eq!(cmd_list(&db, &list_args("luna"), None), 0);
+    }
+
+    /// A live local row is a candidate, not a short-circuit: with a live
+    /// mirror of the same base name the command refuses, naming both forms.
+    #[test]
+    #[serial_test::serial]
+    fn a_live_local_name_and_a_live_mirror_are_refused_with_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_local(&db, "luna");
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        let err = identity::cli_target(&db, "luna").expect_err("ambiguous");
+        assert!(err.contains("@luna,"), "{err}");
+        assert!(err.contains(&form), "{err}");
+        assert_eq!(cmd_list(&db, &list_args("luna"), None), 1);
+    }
+
+    /// A stopped local row is never a candidate, so the name belongs to the
+    /// one device it is still live on.
+    #[test]
+    #[serial_test::serial]
+    fn a_stopped_local_name_with_a_live_remote_resolves_to_the_remote_form() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_local(&db, "luna");
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'stopped', status_context = 'exit' WHERE name = 'luna'",
+                [],
+            )
+            .unwrap();
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        assert_eq!(resolve_list_stopped_target(&db, "luna").unwrap(), form);
+        assert_eq!(cmd_list(&db, &list_args("luna"), None), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_two_remote_devices_is_refused_with_both_forms() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV_B), FLEET_DEV_B);
+        let err = identity::cli_target(&db, "luna").expect_err("ambiguous");
+        assert!(err.contains(&remote_form("luna", FLEET_DEV)), "{err}");
+        assert!(err.contains(&remote_form("luna", FLEET_DEV_B)), "{err}");
+        assert_eq!(cmd_list(&db, &list_args("luna"), None), 1);
+    }
+
+    /// A name live nowhere keeps today's not-found error.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_nowhere_is_still_not_found() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        assert_eq!(identity::cli_target(&db, "luna").unwrap(), "luna");
+        assert_eq!(cmd_list(&db, &list_args("luna"), None), 1);
+    }
+
+    /// A stopped local snapshot with nothing live elsewhere is the local
+    /// name's own history.
+    #[test]
+    #[serial_test::serial]
+    fn a_stopped_local_name_keeps_reading_its_own_history() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        db.log_life_event("luna", "stopped", "test", "exit", None, None)
+            .unwrap();
+        assert_eq!(resolve_list_stopped_target(&db, "luna").unwrap(), "luna");
+    }
+
+    /// `hcom list --stopped <name>` for a bare name that is live on one other
+    /// device reads THAT device's stopped events under its exact form.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_a_remote_reads_that_devices_stopped_history() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        db.log_life_event(&form, "stopped", "test", "exit", None, None)
+            .unwrap();
+        assert_eq!(resolve_list_stopped_target(&db, "luna").unwrap(), form);
     }
 }

@@ -391,6 +391,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
 | `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
+| `relay_suffix_only_devices` | Devices (UUIDs or short ids) never resolved by bare name; always use `name:SHORT` for them |
 | `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` | Default args passed to the tool |
 
 ### Scope

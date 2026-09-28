@@ -211,8 +211,26 @@ fn run_resume(
     flags: &GlobalFlags,
 ) -> Result<i32> {
     let db = HcomDb::open()?;
-    let name = crate::identity::resolve_display_name_or_stopped(&db, name)
-        .unwrap_or_else(|| name.to_string());
+    use crate::identity::CliResolve;
+    // A bare name is resolved FLEET-FIRST, so `hcom r x` can never act on a
+    // local `x` that another device also has live: the one live candidate
+    // wins, an ambiguous name is refused with both exact forms, and a name
+    // live nowhere keeps today's local path (a stopped local `x` still
+    // resumes). A `Single` is the `x:DEV` form of the one live candidate and
+    // falls into the RESUME RPC branch below.
+    //
+    // Brief item 4 asks `r` to REFUSE a name live elsewhere. This branch is
+    // the deliberate exception: the remote RPC resumes the name in place, so
+    // guard item 4's actual requirement — never spawn a local duplicate of a
+    // name live on another device — holds. `ensure_resumable` stays as the
+    // backstop for the exact-session / UUID paths, which skip this
+    // resolution; ambiguity and suffix-only names still refuse above.
+    let name = match crate::identity::fleet_first(&db, name) {
+        CliResolve::Hit(exact) => exact,
+        CliResolve::Refused(msg) => bail!("{msg}"),
+        CliResolve::Miss => crate::identity::resolve_display_name_or_stopped(&db, name)
+            .unwrap_or_else(|| name.to_string()),
+    };
     let hcom_config = load_hcom_config();
     let ctx = crate::shared::HcomContext::from_os();
 
@@ -433,14 +451,24 @@ fn resolve_name_to_plan(
         return Ok((session_id, plan));
     }
 
-    let plan = prepare_resume_plan_from_source(
+    let plan = match prepare_resume_plan_from_source(
         db,
         ResumeSource::Instance { name: &current },
         fork,
         extra_args,
         flags,
         preview,
-    )?;
+    ) {
+        Ok(plan) => plan,
+        // No local plan for a bare name: if its history lives on other devices,
+        // say where instead of the bare not-found error.
+        Err(err) => {
+            if let Some(hint) = crate::identity::remote_history_hint(db, &current) {
+                bail!("{hint}");
+            }
+            return Err(err);
+        }
+    };
     Ok((current, plan))
 }
 
@@ -6230,5 +6258,151 @@ mod tests {
         assert_eq!(db.process_binding_ids(&name).unwrap(), bindings);
         assert_eq!(orphan_fixtures::stopped_events(&db, &name).len(), 1);
         assert!(seat.alive(seat.holder) && seat.alive(seat.carrier));
+    }
+
+    // ── fleet-wide bare-name resolution ─────────────────────────────────
+
+    const FLEET_DEV: &str = "11111111-1111-4111-8111-111111111111";
+    const FLEET_DEV_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// The `X:DEV` form a device's rows and events carry, from the canonical
+    /// short-id derivation.
+    fn remote_form(base: &str, device_uuid: &str) -> String {
+        format!("{base}:{}", crate::relay::device_short_id(device_uuid))
+    }
+
+    fn insert_mirror(db: &HcomDb, name: &str, device_uuid: &str) {
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool, origin_device_id)
+                 VALUES (?1, 'listening', 'ready', ?2, ?2, 'omp', ?3)",
+                rusqlite::params![name, now, device_uuid],
+            )
+            .unwrap();
+    }
+
+    /// A bare name live on one other device resolves to that device and takes
+    /// the RESUME RPC path. With no relay configured the worker gate is the
+    /// deterministic proof that the remote branch ran.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_one_remote_device_takes_the_resume_rpc_path() {
+        let (_env, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        // `hcom r` opens $HCOM_DIR/hcom.db itself, so seed exactly that.
+        let db = HcomDb::open().unwrap();
+        let form = remote_form("luna", FLEET_DEV);
+        insert_mirror(&db, &form, FLEET_DEV);
+        drop(db);
+
+        let err =
+            do_resume("luna", false, &[], &GlobalFlags::default()).expect_err("remote resume");
+        let err = err.to_string();
+        assert!(err.contains("relay worker not running"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_live_on_two_remote_devices_is_refused_with_both_forms() {
+        let (_env, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        // `hcom r` opens $HCOM_DIR/hcom.db itself, so seed exactly that.
+        let db = HcomDb::open().unwrap();
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV_B), FLEET_DEV_B);
+        drop(db);
+
+        let err = do_resume("luna", false, &[], &GlobalFlags::default()).expect_err("refused");
+        let err = err.to_string();
+        assert!(err.contains(&remote_form("luna", FLEET_DEV)), "{err}");
+        assert!(err.contains(&remote_form("luna", FLEET_DEV_B)), "{err}");
+    }
+
+    /// No local plan and no live candidate anywhere, but the name's history
+    /// lives on another device: say where, and how to get it (or how to start
+    /// fresh here).
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_with_only_off_host_history_says_where_it_is() {
+        let (_env, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        // `hcom r` opens $HCOM_DIR/hcom.db itself, so seed exactly that.
+        let db = HcomDb::open().unwrap();
+        let form = remote_form("X", FLEET_DEV);
+        db.log_life_event(&form, "stopped", "test", "exit", None, None)
+            .unwrap();
+        drop(db);
+
+        let err = do_resume("X", false, &[], &GlobalFlags::default()).expect_err("no local plan");
+        let err = err.to_string();
+        assert!(err.contains(&form), "{err}");
+        assert!(err.contains("--as X"), "{err}");
+    }
+
+    /// A name with no history anywhere keeps today's error: the hint must not
+    /// appear for a name that was never an identity on any device.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_name_with_no_history_anywhere_keeps_todays_error() {
+        let (_env, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        // `hcom r` opens $HCOM_DIR/hcom.db itself, so seed exactly that.
+        let db = HcomDb::open().unwrap();
+        drop(db);
+
+        let err = do_resume("nobody", false, &[], &GlobalFlags::default()).expect_err("unknown");
+        let err = err.to_string();
+        assert!(!err.contains("--as"), "{err}");
+        assert!(!err.contains("history is on"), "{err}");
+    }
+
+    /// A live local row is a fleet candidate, not a short-circuit: with a
+    /// live mirror of the same base name the resume refuses, naming both
+    /// forms, exactly as `hcom send @luna` does in the same database.
+    #[test]
+    #[serial_test::serial]
+    fn a_live_local_name_and_a_live_mirror_are_refused_with_both_forms() {
+        let (_env, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        // `hcom r` opens $HCOM_DIR/hcom.db itself, so seed exactly that.
+        let db = HcomDb::open().unwrap();
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool)
+                 VALUES ('luna', 'listening', 'ready', ?1, ?1, 'omp')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        drop(db);
+
+        let err = do_resume("luna", false, &[], &GlobalFlags::default()).expect_err("refused");
+        let err = err.to_string();
+        assert!(err.contains("@luna,"), "{err}");
+        assert!(err.contains(&remote_form("luna", FLEET_DEV)), "{err}");
+    }
+
+    /// A stopped local row is never a candidate, so the name belongs to the
+    /// one device it is still live on — and resumes there.
+    #[test]
+    #[serial_test::serial]
+    fn a_stopped_local_name_with_a_live_remote_takes_the_resume_rpc_path() {
+        let (_env, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        // `hcom r` opens $HCOM_DIR/hcom.db itself, so seed exactly that.
+        let db = HcomDb::open().unwrap();
+        let now = chrono::Utc::now().timestamp_millis() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_time,
+                                        created_at, tool)
+                 VALUES ('luna', 'stopped', 'exit', ?1, ?1, 'omp')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        insert_mirror(&db, &remote_form("luna", FLEET_DEV), FLEET_DEV);
+        drop(db);
+
+        let err = do_resume("luna", false, &[], &GlobalFlags::default()).expect_err("remote");
+        let err = err.to_string();
+        assert!(err.contains("relay worker not running"), "{err}");
     }
 }

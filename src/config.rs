@@ -147,6 +147,7 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("relay_psk", "relay.psk"),
     ("relay_enabled", "relay.enabled"),
     ("relay_worker_managed", "relay.worker_managed"),
+    ("relay_suffix_only_devices", "relay.suffix_only_devices"),
     ("timeout", "preferences.timeout"),
     ("auto_approve", "preferences.auto_approve"),
     ("name_export", "preferences.name_export"),
@@ -202,6 +203,7 @@ const RELAY_FIELDS: &[&str] = &[
     "relay_psk",
     "relay_enabled",
     "relay_worker_managed",
+    "relay_suffix_only_devices",
 ];
 
 /// Characters that are dangerous in terminal preset values (injection risk).
@@ -306,6 +308,10 @@ pub struct HcomConfig {
     /// The relay worker is run by a service manager (systemd): hcom never
     /// spawns it, and stop paths only SIGTERM it so the manager restarts it.
     pub relay_worker_managed: bool,
+    /// Devices (comma-separated UUIDs or 4-char short ids) that must be
+    /// addressed with the `:SHORT` suffix: never bare-resolution targets,
+    /// but they count for collisions and the launch guard. File-only.
+    pub relay_suffix_only_devices: String,
     pub auto_approve: bool,
     pub auto_subscribe: String,
     pub name_export: String,
@@ -346,6 +352,7 @@ impl Default for HcomConfig {
             relay_psk: String::new(),
             relay_enabled: true,
             relay_worker_managed: false,
+            relay_suffix_only_devices: String::new(),
             auto_approve: true,
             auto_subscribe: "collision".to_string(),
             name_export: String::new(),
@@ -495,6 +502,28 @@ impl HcomConfig {
             }
         }
 
+        // Validate relay_suffix_only_devices (comma-separated device UUIDs or
+        // 4-char alphanumeric short ids; empty tokens are skipped)
+        if !self.relay_suffix_only_devices.is_empty() {
+            for token in self.relay_suffix_only_devices.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                let uuid_shaped = crate::fleet_names::is_uuid_shaped(token);
+                let short_shaped =
+                    token.len() == 4 && token.bytes().all(|b| b.is_ascii_alphanumeric());
+                if !uuid_shaped && !short_shaped {
+                    errors.insert(
+                        "relay_suffix_only_devices".into(),
+                        format!(
+                            "relay_suffix_only_devices entry '{token}' must be a device UUID or a 4-character short id"
+                        ),
+                    );
+                }
+            }
+        }
+
         errors
     }
 
@@ -534,6 +563,7 @@ impl HcomConfig {
             "relay_worker_managed" => {
                 Some(if self.relay_worker_managed { "1" } else { "0" }.into())
             }
+            "relay_suffix_only_devices" => Some(self.relay_suffix_only_devices.clone()),
             "auto_approve" => Some(if self.auto_approve { "1" } else { "0" }.into()),
             "auto_subscribe" => Some(self.auto_subscribe.clone()),
             "name_export" => Some(self.name_export.clone()),
@@ -589,6 +619,7 @@ impl HcomConfig {
             "relay_psk" => self.relay_psk = value.to_string(),
             "relay_enabled" => self.relay_enabled = !is_falsy(value),
             "relay_worker_managed" => self.relay_worker_managed = !is_falsy(value),
+            "relay_suffix_only_devices" => self.relay_suffix_only_devices = value.to_string(),
             "auto_approve" => self.auto_approve = !is_falsy(value),
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
             "name_export" => self.name_export = value.to_string(),
@@ -748,7 +779,13 @@ impl HcomConfig {
         }
 
         // Load relay string fields (file-only, already handled by get_var)
-        for relay_field in &["relay", "relay_id", "relay_token", "relay_psk"] {
+        for relay_field in &[
+            "relay",
+            "relay_id",
+            "relay_token",
+            "relay_psk",
+            "relay_suffix_only_devices",
+        ] {
             if let Some(val) = get_var(relay_field) {
                 let _ = config.set_field(relay_field, &val.as_string());
             }
@@ -1038,6 +1075,7 @@ token = ""
 psk = ""
 enabled = true
 worker_managed = false
+suffix_only_devices = ""
 
 [launch]
 tag = ""
