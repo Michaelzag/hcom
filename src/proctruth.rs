@@ -465,22 +465,31 @@ fn classify_carriers_proc(facts: &RootFacts, carriers: &[u32]) -> CarrierVerdict
     CarrierVerdict::Orphaned(orphans)
 }
 
-/// Some(orphans) (non-empty) iff the row has no live root and its only live carriers are orphans.
-pub(crate) fn orphaned_row_carriers(
+/// Read-only verdict for one row a signal-free release would reach: whether
+/// the row is proven orphan-only ([`CarrierVerdict::Orphaned`]), still live
+/// ([`CarrierVerdict::Rooted`]), or cannot be told ([`CarrierVerdict::Undetermined`]).
+/// The single classifier every signal-free decision shares.
+pub(crate) fn classify_row_carriers(
     db: &HcomDb,
     row: &crate::db::InstanceRow,
     binding_ids: &[String],
-) -> Option<Vec<OrphanCarrier>> {
+) -> CarrierVerdict {
     let owners = omp_owner_bindings(db, &row.name);
     let carriers: Vec<u32> = processes_for_instance(&row.name, binding_ids, &owners)
         .into_iter()
         .map(|m| m.pid)
         .filter(|&pid| !process_gone(pid))
         .collect();
-    if carriers.is_empty() {
-        return None;
-    }
-    match classify_carriers(&row.name, &RootFacts::of_row(row, owners), &carriers) {
+    classify_carriers(&row.name, &RootFacts::of_row(row, owners), &carriers)
+}
+
+/// Some(orphans) (non-empty) iff the row has no live root and its only live carriers are orphans.
+pub(crate) fn orphaned_row_carriers(
+    db: &HcomDb,
+    row: &crate::db::InstanceRow,
+    binding_ids: &[String],
+) -> Option<Vec<OrphanCarrier>> {
+    match classify_row_carriers(db, row, binding_ids) {
         CarrierVerdict::Orphaned(orphans) if !orphans.is_empty() => Some(orphans),
         _ => None,
     }

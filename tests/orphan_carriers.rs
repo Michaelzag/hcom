@@ -478,3 +478,419 @@ fn parent_stop_still_refuses_over_a_live_child_seat() {
         "the child seat's carrier was signalled"
     );
 }
+
+/// The henu shape with a claude tool row: resume plans never gate a claude
+/// row on a session file, so the preview path is exercisable without one.
+fn seed_dead_claude_row(db: &rusqlite::Connection, name: &str, session_id: &str, binding: &str) {
+    db.execute(
+        "INSERT INTO instances (name, tool, pid, session_id, status, status_context, status_time, created_at, last_event_id, launch_context)
+         VALUES (?1, 'claude', NULL, ?2, 'listening', 'start', 0, 0, 0, ?3)",
+        rusqlite::params![
+            name,
+            session_id,
+            format!("{{\"process_id\":\"{binding}\"}}")
+        ],
+    )
+    .expect("seed claude row");
+    db.execute(
+        "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+         VALUES (?1, ?2, ?3, 0)",
+        rusqlite::params![binding, session_id, name],
+    )
+    .expect("seed claude binding");
+}
+
+/// A child row nothing can prove dead or alive: no pid, no session, no
+/// bindings. Its carriers classify Undetermined (fail toward keep).
+fn seed_undetermined_child(db: &rusqlite::Connection, child: &str) {
+    db.execute(
+        "INSERT INTO instances (name, tool, pid, session_id, status, status_context, status_time, created_at, last_event_id)
+         VALUES (?1, 'claude', NULL, NULL, 'listening', 'start', 0, 0, 0)",
+        rusqlite::params![child],
+    )
+    .expect("seed undetermined child row");
+}
+
+/// Link an already-seeded child under an already-seeded parent by
+/// `parent_name` ([`seed_parent_of`] also inserts the parent row).
+fn link_native_child(db: &rusqlite::Connection, parent: &str, child: &str) {
+    db.execute(
+        "UPDATE instances SET parent_name = ?1 WHERE name = ?2",
+        rusqlite::params![parent, child],
+    )
+    .expect("link the child");
+}
+
+/// Fix A: `hcom r` without `--go` on an orphan-only parent is a preview. It
+/// classifies the stale row read-only, says `--go` will release it, and
+/// writes nothing: the row, its binding and its orphans are unchanged, and
+/// there is no new stopped event.
+#[test]
+fn resume_preview_of_orphan_only_parent_writes_nothing() {
+    become_subreaper();
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "initialize isolated DB: {stderr}");
+    let suffix = unique_suffix();
+    let parent = format!("prev-{suffix}");
+    let session = format!("sid-{parent}");
+    let binding = format!("omp-{}-d34d-{suffix}", dead_pid(&h));
+    let db = open_db(&h);
+    seed_dead_claude_row(&db, &parent, &session, &binding);
+    let carrier = adopt_carrier(&h, &parent);
+    let stopped_before = stopped_events(&db, &parent);
+
+    let out = h
+        .cmd()
+        .env("CLAUDECODE", "1")
+        .args(["r", parent.as_str(), "--terminal", "kitty"])
+        .output()
+        .expect("run the resume preview");
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        code, 0,
+        "preview must succeed: stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("will be released") && stdout.contains(&parent),
+        "preview must say the stale row will be released: {stdout}"
+    );
+    assert!(
+        stdout.contains(&carrier.pid.to_string()),
+        "preview must name the orphan it leaves running: {stdout}"
+    );
+    assert_eq!(rows_named(&db, &parent), 1, "preview released the row");
+    assert_eq!(
+        binding_owner(&db, &binding).as_deref(),
+        Some(parent.as_str()),
+        "preview released the binding"
+    );
+    assert_eq!(
+        stopped_events(&db, &parent),
+        stopped_before,
+        "preview wrote a stopped event"
+    );
+    assert!(
+        live(carrier.pid) && environ_carries(carrier.pid, &carrier.marker),
+        "preview signalled the orphan"
+    );
+}
+
+/// Fix A, executing half: the same parent resumed for real releases its
+/// stale row with no signal (the plan then fails on the missing omp session
+/// file, before any launch, which is what the exit code proves).
+#[test]
+fn resume_executes_the_release_of_an_orphan_only_parent() {
+    become_subreaper();
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "initialize isolated DB: {stderr}");
+    let suffix = unique_suffix();
+    let parent = format!("rexe-{suffix}");
+    let session = format!("sid-{parent}");
+    let binding = format!("omp-{}-e14c-{suffix}", dead_pid(&h));
+    let db = open_db(&h);
+    seed_dead_seat_row(&db, &parent, &session, &binding);
+    let carrier = adopt_carrier(&h, &parent);
+
+    let (code, stdout, stderr) = h.run(["r", parent.as_str()]);
+    assert_ne!(
+        code, 0,
+        "resume must fail past the release on the missing session file: stdout={stdout}; stderr={stderr}"
+    );
+    let output = format!("{stdout}{stderr}");
+    assert!(
+        output.contains(&format!("Released '{parent}'")),
+        "resume must report the release: {output}"
+    );
+    assert!(
+        output.contains(&carrier.pid.to_string()),
+        "resume must name the orphan it left running: {output}"
+    );
+    assert_eq!(rows_named(&db, &parent), 0, "executing resume kept the row");
+    assert_eq!(
+        binding_owner(&db, &binding),
+        None,
+        "executing resume kept the binding"
+    );
+    assert_eq!(stopped_events(&db, &parent), 1);
+    assert!(
+        live(carrier.pid) && environ_carries(carrier.pid, &carrier.marker),
+        "executing resume signalled the orphan"
+    );
+}
+
+/// Fix B: an orphan-only parent whose native child is a live seat refuses
+/// `hcom stop`: the child row and its binding stay intact and neither the
+/// seat's process nor its carrier is signalled.
+#[test]
+fn stop_refuses_orphan_only_parent_with_live_child() {
+    become_subreaper();
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "initialize isolated DB: {stderr}");
+    let suffix = unique_suffix();
+    let parent = format!("parl-{suffix}");
+    let child = format!("chil-{suffix}");
+    let parent_session = format!("sid-{parent}");
+    let session = format!("sid-{child}");
+    let parent_binding = format!("omp-{}-b1a4-{suffix}", dead_pid(&h));
+    let child_binding = format!("omp-{}-c41d-{suffix}", dead_pid(&h));
+    let db = open_db(&h);
+    seed_dead_seat_row(&db, &parent, &parent_session, &parent_binding);
+    seed_dead_seat_row(&db, &child, &session, &child_binding);
+    link_native_child(&db, &parent, &child);
+    let carrier = adopt_carrier(&h, &parent);
+    let mut seat = spawn_live_seat(&h, &child, &session);
+
+    let (code, stdout, stderr) = h.run(["stop", parent.as_str()]);
+    assert_ne!(
+        code, 0,
+        "stop must refuse: stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("refusing the signal-free release") && stderr.contains(&child),
+        "the refusal must name the live child: {stderr}"
+    );
+    assert_eq!(
+        rows_named(&db, &parent),
+        1,
+        "a refused stop released the parent"
+    );
+    assert_eq!(
+        rows_named(&db, &child),
+        1,
+        "a refused stop released the child"
+    );
+    assert_eq!(
+        binding_owner(&db, &parent_binding).as_deref(),
+        Some(parent.as_str())
+    );
+    assert_eq!(
+        binding_owner(&db, &child_binding).as_deref(),
+        Some(child.as_str())
+    );
+    assert_eq!(stopped_events(&db, &parent), 0);
+    assert_eq!(stopped_events(&db, &child), 0);
+    assert!(
+        live(carrier.pid) && environ_carries(carrier.pid, &carrier.marker),
+        "the refused stop signalled the parent's orphan"
+    );
+    assert!(
+        seat.owner.try_wait().expect("poll the seat").is_none(),
+        "the child seat's omp was signalled"
+    );
+    assert!(
+        live(seat.carrier) && environ_carries(seat.carrier, &seat.marker),
+        "the child seat's carrier was signalled"
+    );
+}
+
+/// Fix B: the same family under `hcom r` keeps today's "still active"
+/// refusal and changes nothing.
+#[test]
+fn resume_refuses_orphan_only_parent_with_live_child() {
+    become_subreaper();
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "initialize isolated DB: {stderr}");
+    let suffix = unique_suffix();
+    let parent = format!("parl-{suffix}");
+    let child = format!("chir-{suffix}");
+    let parent_session = format!("sid-{parent}");
+    let session = format!("sid-{child}");
+    let parent_binding = format!("omp-{}-b1a4-{suffix}", dead_pid(&h));
+    let child_binding = format!("omp-{}-c41d-{suffix}", dead_pid(&h));
+    let db = open_db(&h);
+    seed_dead_seat_row(&db, &parent, &parent_session, &parent_binding);
+    seed_dead_seat_row(&db, &child, &session, &child_binding);
+    link_native_child(&db, &parent, &child);
+    let carrier = adopt_carrier(&h, &parent);
+    let mut seat = spawn_live_seat(&h, &child, &session);
+
+    let (code, stdout, stderr) = h.run(["r", parent.as_str()]);
+    assert_ne!(
+        code, 0,
+        "resume must refuse: stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        format!("{stdout}{stderr}").contains(&format!("'{parent}' is still active")),
+        "the refusal is today's still-active one: stdout={stdout}; stderr={stderr}"
+    );
+    assert_eq!(
+        rows_named(&db, &parent),
+        1,
+        "a refused resume released the parent"
+    );
+    assert_eq!(
+        rows_named(&db, &child),
+        1,
+        "a refused resume released the child"
+    );
+    assert_eq!(stopped_events(&db, &parent), 0);
+    assert_eq!(stopped_events(&db, &child), 0);
+    assert!(
+        live(carrier.pid) && environ_carries(carrier.pid, &carrier.marker),
+        "the refused resume signalled the parent's orphan"
+    );
+    assert!(
+        seat.owner.try_wait().expect("poll the seat").is_none(),
+        "the child seat's omp was signalled"
+    );
+    assert!(
+        live(seat.carrier) && environ_carries(seat.carrier, &seat.marker),
+        "the child seat's carrier was signalled"
+    );
+}
+
+/// Fix B: a child nothing can prove dead (no pid, no session, no bindings)
+/// fails the whole signal-free release toward keep, on both `hcom stop` and
+/// `hcom r`.
+#[test]
+fn stop_and_resume_refuse_orphan_only_parent_with_undetermined_child() {
+    become_subreaper();
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "initialize isolated DB: {stderr}");
+    let suffix = unique_suffix();
+    let parent = format!("paru-{suffix}");
+    let child = format!("chiu-{suffix}");
+    let parent_session = format!("sid-{parent}");
+    let parent_binding = format!("omp-{}-b1a4-{suffix}", dead_pid(&h));
+    let db = open_db(&h);
+    seed_dead_seat_row(&db, &parent, &parent_session, &parent_binding);
+    seed_undetermined_child(&db, &child);
+    link_native_child(&db, &parent, &child);
+    let parent_carrier = adopt_carrier(&h, &parent);
+    let child_carrier = adopt_carrier(&h, &child);
+
+    let (code, stdout, stderr) = h.run(["stop", parent.as_str()]);
+    assert_ne!(
+        code, 0,
+        "stop must refuse: stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(&child) && stderr.contains("cannot be proven dead"),
+        "the refusal must name the undetermined child: {stderr}"
+    );
+
+    let (code, stdout, stderr) = h.run(["r", parent.as_str()]);
+    assert_ne!(
+        code, 0,
+        "resume must refuse: stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        format!("{stdout}{stderr}").contains(&format!("'{parent}' is still active")),
+        "the refusal is today's still-active one: stdout={stdout}; stderr={stderr}"
+    );
+
+    assert_eq!(
+        rows_named(&db, &parent),
+        1,
+        "a refused release dropped the parent"
+    );
+    assert_eq!(
+        rows_named(&db, &child),
+        1,
+        "a refused release dropped the child"
+    );
+    assert_eq!(
+        binding_owner(&db, &parent_binding).as_deref(),
+        Some(parent.as_str())
+    );
+    assert_eq!(stopped_events(&db, &parent), 0);
+    assert_eq!(stopped_events(&db, &child), 0);
+    assert!(
+        live(parent_carrier.pid) && environ_carries(parent_carrier.pid, &parent_carrier.marker),
+        "the refused release signalled the parent's orphan"
+    );
+    assert!(
+        live(child_carrier.pid) && environ_carries(child_carrier.pid, &child_carrier.marker),
+        "the refused release signalled the child's carrier"
+    );
+}
+
+/// Fix C (ffc-7osfm): a parent stop that releases an orphan-only child and
+/// then fails on a later live child still lists the released child's
+/// orphans and says they were not signalled.
+#[test]
+fn parent_stop_reports_released_orphan_when_a_later_child_fails() {
+    become_subreaper();
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["status", "--json"]);
+    assert_eq!(code, 0, "initialize isolated DB: {stderr}");
+    let suffix = unique_suffix();
+    let parent = format!("par7-{suffix}");
+    let released_child = format!("chi7-{suffix}");
+    let live_child = format!("chj7-{suffix}");
+    let released_session = format!("sid-{released_child}");
+    let live_session = format!("sid-{live_child}");
+    let released_binding = format!("omp-{}-d007-{suffix}", dead_pid(&h));
+    let live_binding = format!("omp-{}-1f1e-{suffix}", dead_pid(&h));
+    let db = open_db(&h);
+    seed_dead_seat_row(&db, &released_child, &released_session, &released_binding);
+    seed_dead_seat_row(&db, &live_child, &live_session, &live_binding);
+    seed_parent_of(&db, &parent, &live_child);
+    // The released child hangs off the session set (stopped first); the
+    // live child hangs off the native set (fails after).
+    db.execute(
+        "UPDATE instances SET parent_session_id = ?1 WHERE name = ?2",
+        rusqlite::params![format!("sid-{parent}"), released_child],
+    )
+    .expect("link the released child by session");
+    let orphan = adopt_carrier(&h, &released_child);
+    let mut seat = spawn_live_seat(&h, &live_child, &live_session);
+
+    let (code, stdout, stderr) = h.run(["stop", parent.as_str()]);
+    assert_ne!(
+        code, 0,
+        "stop must fail on the live child: stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("could not stop child {live_child}")),
+        "the error must name the live child: {stderr}"
+    );
+    assert!(
+        stdout.contains(&released_child)
+            && stdout.contains("Not signalled")
+            && stdout.contains(&orphan.pid.to_string()),
+        "the error path must still list the released child's orphan: {stdout}"
+    );
+    assert_eq!(
+        rows_named(&db, &released_child),
+        0,
+        "the released child survived"
+    );
+    assert_eq!(
+        binding_owner(&db, &released_binding),
+        None,
+        "the released child's binding survived"
+    );
+    assert_eq!(stopped_events(&db, &released_child), 1);
+    assert_eq!(
+        rows_named(&db, &parent),
+        1,
+        "a failed stop released the parent"
+    );
+    assert_eq!(
+        rows_named(&db, &live_child),
+        1,
+        "a failed stop released the live child"
+    );
+    assert_eq!(stopped_events(&db, &parent), 0);
+    assert_eq!(stopped_events(&db, &live_child), 0);
+    assert!(
+        live(orphan.pid) && environ_carries(orphan.pid, &orphan.marker),
+        "the failed stop signalled the released child's orphan"
+    );
+    assert!(
+        seat.owner.try_wait().expect("poll the seat").is_none(),
+        "the live child's omp was signalled"
+    );
+    assert!(
+        live(seat.carrier) && environ_carries(seat.carrier, &seat.marker),
+        "the live child's carrier was signalled"
+    );
+}

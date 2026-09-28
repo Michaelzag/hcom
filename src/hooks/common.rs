@@ -1472,7 +1472,7 @@ pub(crate) fn stop_placeholder_instance(
 /// corruption creates a parent_session_id cycle.
 const MAX_STOP_DEPTH: u32 = 10;
 
-fn child_instance_names(db: &HcomDb, column: &str, value: &str) -> Result<Vec<String>> {
+pub(crate) fn child_instance_names(db: &HcomDb, column: &str, value: &str) -> Result<Vec<String>> {
     let sql = match column {
         "parent_session_id" => "SELECT name FROM instances WHERE parent_session_id = ?",
         "parent_name" => "SELECT name FROM instances WHERE parent_name = ?",
@@ -1481,6 +1481,78 @@ fn child_instance_names(db: &HcomDb, column: &str, value: &str) -> Result<Vec<St
     let mut stmt = db.conn().prepare(sql)?;
     let rows = stmt.query_map(params![value], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The first descendant child row a signal-free (orphan-only) release of
+/// `name` must not take, as a refusal message, if any: native children via
+/// `parent_name` and session children via the row's `parent_session_id`, at
+/// any depth. A child the release cannot prove orphan-only (a live root, or
+/// no way to tell) blocks the whole release — fail toward keep — so the
+/// caller refuses before any child stop, reap, or release below. A child
+/// row that vanished mid-walk is skipped: the recursion below treats it as
+/// already stopped.
+pub(crate) fn signal_free_release_blocker(db: &HcomDb, name: &str) -> Option<String> {
+    use crate::proctruth::CarrierVerdict;
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = vec![name.to_string()];
+    while let Some(current) = queue.pop() {
+        let mut children = match child_instance_names(db, "parent_name", &current) {
+            Ok(names) => names,
+            Err(e) => {
+                return Some(format!(
+                    "refusing the signal-free release of '{name}': could not enumerate native children of '{current}': {e}; nothing was released or signalled"
+                ));
+            }
+        };
+        match db.get_instance_full(&current) {
+            Ok(Some(row)) => {
+                if let Some(session_id) = row.session_id.as_deref() {
+                    match child_instance_names(db, "parent_session_id", session_id) {
+                        Ok(names) => children.extend(names),
+                        Err(e) => {
+                            return Some(format!(
+                                "refusing the signal-free release of '{name}': could not enumerate session children of '{current}': {e}; nothing was released or signalled"
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                return Some(format!(
+                    "refusing the signal-free release of '{name}': could not read '{current}': {e}; nothing was released or signalled"
+                ));
+            }
+        }
+        for child in children {
+            if !seen.insert(child.clone()) {
+                continue;
+            }
+            let (row, binding_ids) = match db.get_instance_with_bindings(&child) {
+                Ok((Some(row), binding_ids)) => (row, binding_ids),
+                Ok((None, _)) => continue,
+                Err(e) => {
+                    return Some(format!(
+                        "refusing the signal-free release of '{name}': could not read child '{child}': {e}; nothing was released or signalled"
+                    ));
+                }
+            };
+            match crate::proctruth::classify_row_carriers(db, &row, &binding_ids) {
+                CarrierVerdict::Orphaned(_) => queue.push(child),
+                CarrierVerdict::Rooted { pid, via } => {
+                    return Some(format!(
+                        "refusing the signal-free release of '{name}': child '{child}' is still active (live root pid {pid} via {via}); nothing was released or signalled"
+                    ));
+                }
+                CarrierVerdict::Undetermined(why) => {
+                    return Some(format!(
+                        "refusing the signal-free release of '{name}': child '{child}' cannot be proven dead ({why}); nothing was released or signalled"
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Whether the headless row's recorded pid still leads this instance's tree:
@@ -1797,6 +1869,18 @@ fn stop_instance_inner_scoped(
 
         None => (None, Vec::new()),
     };
+
+    // A signal-free release (an orphan-only row here, or a converted
+    // orphan-only child below) takes every descendant it reaches through
+    // `orphan_only_release` — never the ordinary capture, reap, and
+    // refusal. Prove that upfront: a descendant with a live root, or one
+    // that cannot be proven dead, refuses the whole release before any
+    // child stop, signal, reap, or row delete below.
+    if (signal_free || orphans.is_some())
+        && let Some(blocker) = signal_free_release_blocker(db, instance_name)
+    {
+        return StopOutcome::RetryableError(blocker.into());
+    }
 
     // Kill headless processes (background=true)
     // Skipped when the reap gate is off (the kill paths): kill owns the
