@@ -685,6 +685,31 @@ impl HcomDb {
             .transpose()
     }
 
+    /// The newest `life.stopped` event whose snapshot carries `session_id`
+    /// (the one [`Self::find_stopped_snapshot_by_session_id`] restores from):
+    /// its instance and the whole event data, so a caller can read who the
+    /// stop recorded (`process_id`, `by`) beside the snapshot.
+    pub fn find_stopped_event_by_session_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, serde_json::Value)>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT instance, data FROM events
+                 WHERE type = 'life'
+                   AND json_extract(data, '$.action') = 'stopped'
+                   AND json_extract(data, '$.snapshot.session_id') = ?
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        found
+            .map(|(name, data)| Ok((name, serde_json::from_str(&data)?)))
+            .transpose()
+    }
+
     /// The `snapshot` of `name`'s newest `life.stopped` event whose snapshot
     /// is an object: the facts the instance's last stop recorded (its pid
     /// with that pid's incarnation, its session id), for a caller that has
