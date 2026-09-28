@@ -1263,7 +1263,21 @@ pub(crate) fn stop_instance_with_capture(
     reason: &str,
     capture: crate::proctruth::ReapCapture,
 ) -> StopOutcome {
-    stop_instance_inner(
+    stop_instance_with_capture_listing_orphans(db, instance_name, initiated_by, reason, capture).0
+}
+
+/// [`stop_instance_with_capture`], also returning every child row this stop
+/// released with no signal to anyone (no live root, only orphan carriers),
+/// each with the orphans it left running, for the caller to list.
+pub(crate) fn stop_instance_with_capture_listing_orphans(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+    capture: crate::proctruth::ReapCapture,
+) -> (StopOutcome, crate::proctruth::OrphanReleases) {
+    let mut post = PostCommit::default();
+    let outcome = stop_instance_inner_scoped(
         db,
         instance_name,
         initiated_by,
@@ -1271,9 +1285,12 @@ pub(crate) fn stop_instance_with_capture(
         false,
         0,
         true,
+        None,
+        &mut post,
         &[],
         Some(capture),
-    )
+    );
+    (outcome, post.orphan_releases)
 }
 
 /// External side effects of a stop: subscription notifications, listener
@@ -1287,6 +1304,9 @@ struct PostCommit {
     events: Vec<(i64, String, serde_json::Value)>,
     wake_ports: Vec<u16>,
     push: bool,
+    /// Child rows released with no signal (no live root, only orphan
+    /// carriers), each with the orphans left running. Reported, not fired.
+    orphan_releases: crate::proctruth::OrphanReleases,
 }
 
 impl PostCommit {
@@ -1675,11 +1695,13 @@ fn stop_instance_inner_scoped(
     let read_error = |e: &dyn std::fmt::Display| {
         StopOutcome::RetryableError(format!("could not read instance {instance_name}: {e}").into())
     };
-    let (row, pre_capture) = match pre_capture {
+    // `orphans`: set when this is a child row released with no signal to
+    // anyone (see below); reported once the release lands.
+    let (row, pre_capture, orphans) = match pre_capture {
         None if reap_gate => match db.get_instance_with_bindings(instance_name) {
             Ok((row, ids)) => {
                 let owners = crate::proctruth::omp_owner_bindings(db, instance_name);
-                let capture = match row.as_ref() {
+                let (capture, orphans) = match row.as_ref() {
                     Some(row) => {
                         match crate::proctruth::capture_reap_carriers(
                             db,
@@ -1689,7 +1711,31 @@ fn stop_instance_inner_scoped(
                             &owners,
                             exclude,
                         ) {
-                            Ok(capture) => Some(capture),
+                            // A child row with no live root whose only live
+                            // carriers are orphans is released with no signal
+                            // to anyone, exactly as a top-level stop's row is
+                            // (commands::stop): its carriers are no evidence,
+                            // and refusing it would fail the parent's whole
+                            // stop. A rooted or undetermined child keeps the
+                            // ordinary capture, reap, and refusal.
+                            Ok(capture) if depth > 0 => {
+                                match crate::proctruth::orphan_only_release(db, row, &ids, capture)
+                                {
+                                    Ok((capture, orphans)) => {
+                                        log::log_info(
+                                            "hooks",
+                                            "stop_instance.child_orphan_release",
+                                            &format!(
+                                                "instance={instance_name} orphans={:?}: no live root, releasing without signals",
+                                                orphans.iter().map(|o| o.pid).collect::<Vec<_>>()
+                                            ),
+                                        );
+                                        (Some(capture), Some(orphans))
+                                    }
+                                    Err(capture) => (Some(capture), None),
+                                }
+                            }
+                            Ok(capture) => (Some(capture), None),
                             // A foreign live owner refuses the whole stop:
                             // this is ahead of the headless group signal, the
                             // reap, and the release, so nothing is signalled
@@ -1699,14 +1745,14 @@ fn stop_instance_inner_scoped(
                             }
                         }
                     }
-                    None => None,
+                    None => (None, None),
                 };
-                (row, capture)
+                (row, capture, orphans)
             }
             Err(e) => return read_error(&e),
         },
         pre_capture => match db.get_instance_full(instance_name) {
-            Ok(row) => (row, pre_capture),
+            Ok(row) => (row, pre_capture, None),
             Err(e) => return read_error(&e),
         },
     };
@@ -1737,6 +1783,9 @@ fn stop_instance_inner_scoped(
     // snapshots its descendants, so the capture above holds the proven
     // carrier identities first: reparenting cannot erase that ownership
     // evidence. The reap's call-start epoch is the captured one.
+    let signal_free = pre_capture
+        .as_ref()
+        .is_some_and(crate::proctruth::ReapCapture::signal_free);
     let (capture, binding_ids) = match pre_capture {
         Some(capture) => {
             let ids = capture
@@ -1760,14 +1809,17 @@ fn stop_instance_inner_scoped(
         let pid_u32 = pid_val as u32;
         if is_headless {
             // Gated with the reap below: skipped on the kill paths, where the
-            // group signal could land on the caller's own tree (self path).
+            // group signal could land on the caller's own tree (self path),
+            // and on a signal-free release (a root-less row whose only
+            // carriers are orphans: the recorded group may still hold them,
+            // and they are never signalled).
             // A session releasing its own row (non-empty `exclude`) signals
             // only a group its tree is provably outside of, which only Linux
             // can prove; elsewhere that release skips the signal. Any stop
             // skips a group holding none of this instance's carriers (pid
             // reuse). The reap below still handles every carrier not in
             // `exclude`.
-            if reap_gate {
+            if reap_gate && !signal_free {
                 if !exclude.is_empty() && !caller_tree_outside_group(pid_u32, exclude) {
                     log::log_info(
                         "hooks",
@@ -2005,7 +2057,8 @@ fn stop_instance_inner_scoped(
     // without being signalled. The pty wrapper goes first within the reap.
     // Skipped when the reap gate is off (the kill paths): kill has already
     // reaped and verified the eligible carrier set before this teardown,
-    // and only after its own incarnation CAS.
+    // and only after its own incarnation CAS. A signal-free capture reaps
+    // nothing: its row has no live root and only orphan carriers.
     if let Some(capture) = capture
         && let Err(survivors) = crate::proctruth::reap_instance_tree_for_excluding_captured(
             db,
@@ -2167,6 +2220,10 @@ fn stop_instance_inner_scoped(
 
         // Trigger relay push (best-effort)
         crate::relay::spawn_background_push();
+    }
+    if let Some(orphans) = orphans {
+        post.orphan_releases
+            .push((instance_name.to_string(), orphans));
     }
     StopOutcome::Stopped
 }

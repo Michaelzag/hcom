@@ -1371,6 +1371,27 @@ fn kill_single(
         bail!("Cannot kill remote '{name}' - missing device suffix");
     }
 
+    // A root-less row held only by orphans is not a dead end: stop releases
+    // it without signalling them. Checked whatever the recorded pid: a dead
+    // one must not reach the kill, whose group signal could hit orphans that
+    // share the dead leader's process group.
+    let binding_ids = db.process_binding_ids(&name).unwrap_or_default();
+    if let Some(orphans) = crate::proctruth::orphaned_row_carriers(db, &inst, &binding_ids) {
+        let pids = orphans
+            .iter()
+            .map(|o| o.pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let n = orphans.len();
+        match inst.pid {
+            None => bail!(
+                "No tracked PID for '{name}', and no live process roots it: {n} orphaned process(es) carry only its identity ({pids}). Run 'hcom stop {name}' to release it; the orphans will not be signalled."
+            ),
+            Some(pid) => bail!(
+                "'{name}' has no live process: its recorded pid {pid} is gone, and no live process roots it: {n} orphaned process(es) carry only its identity ({pids}). Run 'hcom stop {name}' to release it; the orphans will not be signalled."
+            ),
+        }
+    }
     if inst.pid.is_none() {
         bail!(
             "No tracked PID for '{}' — use 'hcom stop {}' instead",
@@ -3902,5 +3923,63 @@ mod tests {
         assert!(db.get_instance_full(&name).unwrap().is_none());
         assert_eq!(stopped_events(&db, &name), 1, "stopped event written");
         let _ = _guard;
+    }
+
+    /// `hcom kill` on the henu shape (no pid, no live root, one orphan)
+    /// cannot signal anything, so it names the orphan and points at the
+    /// stop that releases the row. The row stays; the orphan is untouched.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial]
+    fn kill_names_the_orphans_of_a_root_less_row_and_points_at_stop() {
+        use crate::proctruth::orphan_fixtures;
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = orphan_fixtures::unique("kill-henu");
+        let session = format!("{name}-session");
+        orphan_fixtures::seed_seat_row(&db, &name, &session, dir.path());
+        let orphan = orphan_fixtures::spawn_orphan(&name);
+
+        let err = kill_single(&db, dir.path(), &name, "test")
+            .expect_err("a pid-less row cannot be killed")
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "No tracked PID for '{name}', and no live process roots it: 1 orphaned process(es) carry only its identity ({}). Run 'hcom stop {name}' to release it; the orphans will not be signalled.",
+                orphan.carrier
+            )
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert!(orphan.alive(orphan.carrier), "kill signalled the orphan");
+    }
+
+    /// A pid-less row with a live root (the valo shape: an `omp` holding its
+    /// session transcript, with a carrier child) keeps the old hint.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial]
+    fn kill_keeps_the_stop_hint_for_a_pid_less_row_with_a_live_root() {
+        use crate::proctruth::orphan_fixtures;
+        let _guard = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = orphan_fixtures::unique("kill-valo");
+        let session = format!("{name}-session");
+        orphan_fixtures::seed_seat_row(&db, &name, &session, dir.path());
+        let seat = orphan_fixtures::spawn_session_seat(dir.path(), &session, &name, "omp");
+
+        let err = kill_single(&db, dir.path(), &name, "test")
+            .expect_err("a pid-less row cannot be killed")
+            .to_string();
+        assert_eq!(
+            err,
+            format!("No tracked PID for '{name}' — use 'hcom stop {name}' instead")
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert!(seat.alive(seat.holder) && seat.alive(seat.carrier));
     }
 }

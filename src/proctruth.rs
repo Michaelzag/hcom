@@ -35,6 +35,12 @@
 //!   by its own processes).
 //! - [`sweep_vanished_instances`]: daemon-side periodic check that notices
 //!   rows whose harness is gone without a `stopped` event.
+//! - [`classify_carriers`]: whether a row's live identity carriers are
+//!   evidence of its life at all. A carrier counts only while a live root of
+//!   the row (its pid, its anchor, its minted omp owner, or a holder of its
+//!   session transcript) is in its ancestry; one reparented away from every
+//!   root after the seat died is an orphan, never signalled and never
+//!   evidence. The sweep, stop, resume and kill all read this one verdict.
 //!
 //! Unix only: `/proc` enumeration is compiled out on other platforms, where
 //! every query reports empty (verified-no-holders) and reap is a no-op.
@@ -205,6 +211,308 @@ fn proven_omp_owner(owner: &OmpOwnerBinding, btime: f64) -> bool {
             .is_some_and(|start| start <= owner.registered_at + START_EPOCH_SLACK_SECS)
 }
 
+/// A live identity carrier of a row that no live root of that row reaches.
+#[derive(Debug, Clone, PartialEq)]
+// Only the /proc ancestry walk finds an orphan.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+pub(crate) struct OrphanCarrier {
+    pub(crate) pid: u32,
+    pub(crate) comm: String,
+    pub(crate) ppid: Option<u32>,
+}
+
+/// Rows a stop released with no signal to anyone, by name, each with the
+/// orphans it left running.
+pub(crate) type OrphanReleases = Vec<(String, Vec<OrphanCarrier>)>;
+
+/// What a row's live carriers prove about it ([`classify_carriers`]).
+#[derive(Debug, Clone, PartialEq)]
+// Off Linux and Android every verdict is `Undetermined`.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+pub(crate) enum CarrierVerdict {
+    /// The row has a live root (`via`: "row-pid" | "anchor" | "minted-omp" | "session-fd"). Its carriers hold it.
+    Rooted { pid: u32, via: &'static str },
+    /// The row has NO live root and every carrier is an orphan (may be empty). Carriers are not evidence.
+    Orphaned(Vec<OrphanCarrier>),
+    /// Cannot tell (`why`): fail toward keep — callers behave exactly as before this change.
+    Undetermined(&'static str),
+}
+
+/// What a row offers to prove a live root.
+// Only the Linux/Android classifier reads the facts.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+pub(crate) struct RootFacts {
+    /// The row's pid (> 0), or a stopped snapshot's pid lacking identity fields.
+    pid: Option<u32>,
+    /// A stopped snapshot's pid with its `pid_start_time` and `boot_id` (see
+    /// [`record_anchor_identity`]).
+    anchor: Option<(u32, u64, String)>,
+    /// The row's minted omp owners ([`omp_owner_bindings`]).
+    owners: Vec<OmpOwnerBinding>,
+    /// Non-empty, and only for an omp row: the transcript-holder root proves
+    /// the row only for a harness known to keep its `<session_id>.jsonl` open
+    /// for its whole life, which today is omp alone. For any other tool a
+    /// bare session id proves nothing, so it is not recorded here.
+    session_id: Option<String>,
+}
+
+impl RootFacts {
+    pub(crate) fn of_row(row: &crate::db::InstanceRow, owners: Vec<OmpOwnerBinding>) -> Self {
+        Self {
+            pid: row
+                .pid
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| *pid > 0),
+            anchor: None,
+            owners,
+            session_id: (row.tool == "omp")
+                .then(|| row.session_id.clone())
+                .flatten()
+                .filter(|sid| !sid.is_empty()),
+        }
+    }
+
+    /// `snapshot` = the `snapshot` object of a life.stopped event.
+    pub(crate) fn of_stopped_snapshot(snapshot: &serde_json::Value) -> Self {
+        let pid = snapshot
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|pid| *pid > 0);
+        let identity = snapshot
+            .get("pid_start_time")
+            .and_then(serde_json::Value::as_u64)
+            .zip(snapshot.get("boot_id").and_then(serde_json::Value::as_str));
+        let (pid, anchor) = match (pid, identity) {
+            (Some(pid), Some((start, boot_id))) => (None, Some((pid, start, boot_id.to_string()))),
+            (pid, _) => (pid, None),
+        };
+        Self {
+            pid,
+            anchor,
+            owners: Vec::new(),
+            session_id: (snapshot.get("tool").and_then(serde_json::Value::as_str) == Some("omp"))
+                .then(|| {
+                    snapshot
+                        .get("session_id")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .flatten()
+                .filter(|sid| !sid.is_empty())
+                .map(str::to_string),
+        }
+    }
+
+    /// Whether the row offers anything a live root could be proven from.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn provable(&self) -> bool {
+        self.pid.is_some()
+            || self.anchor.is_some()
+            || !self.owners.is_empty()
+            || self.session_id.is_some()
+    }
+}
+
+/// Whether a row's live identity `carriers` are evidence that the row lives.
+///
+/// A carrier holds the row only while one of the row's LIVE ROOTS is the
+/// carrier itself or one of its ppid ancestors. The roots are, cheapest
+/// first: the row's pid alive; a stopped snapshot's anchor pid alive with its
+/// recorded start time and boot id; a minted omp owner proven by
+/// [`proven_omp_owner`] (pid reuse, comm and start time checked); and, for an
+/// omp row only, a process holding the row's session transcript
+/// (`<session_id>.jsonl`) open — omp keeps it open for its whole life; no
+/// other harness is known to, so another tool's session id is no root fact.
+/// Any of the first three roots the row outright. Otherwise each live carrier
+/// is walked up its ppid chain: an ancestor holding the transcript roots the
+/// row, and a walk reaching pid 1 (a reparent to the user's subreaper,
+/// systemd --user, whose own chain ends at 1, walks on to 1) makes the
+/// carrier an ORPHAN. A carrier under a different seat's root never meets
+/// this row's root, so it is an orphan here by construction. Last, any
+/// process on the host holding the transcript roots the row: a live seat
+/// stays held even when its only carriers are unrelated daemons. That scan
+/// skips processes whose fd table is unreadable (another user's, or
+/// non-dumpable); hcom seats all run as the caller's user, so a seat's own
+/// transcript holder is always readable.
+///
+/// Fails toward keep: a row with nothing to prove a root from (a non-omp row
+/// with no pid, anchor or minted owner included), a carrier whose ancestry
+/// or an ancestor's fd table cannot be read, and every target without /proc
+/// are `Undetermined`, which every caller treats exactly as a holding
+/// carrier. Logs the verdict once per call.
+pub(crate) fn classify_carriers(name: &str, facts: &RootFacts, carriers: &[u32]) -> CarrierVerdict {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let verdict = classify_carriers_proc(facts, carriers);
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let verdict = {
+        let _ = (facts, carriers);
+        CarrierVerdict::Undetermined("no-proc")
+    };
+    let detail = match &verdict {
+        CarrierVerdict::Rooted { pid, via } => format!("verdict=rooted root_pid={pid} via={via}"),
+        CarrierVerdict::Orphaned(orphans) => format!(
+            "verdict=orphaned orphans={:?}",
+            orphans.iter().map(|o| o.pid).collect::<Vec<_>>()
+        ),
+        CarrierVerdict::Undetermined(why) => format!("verdict=undetermined why={why}"),
+    };
+    crate::log::log_info(
+        "proctruth",
+        "carrier_verdict",
+        &format!("instance={name} {detail}"),
+    );
+    verdict
+}
+
+/// The /proc half of [`classify_carriers`], unlogged.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn classify_carriers_proc(facts: &RootFacts, carriers: &[u32]) -> CarrierVerdict {
+    if !facts.provable() {
+        return CarrierVerdict::Undetermined("no-root-facts");
+    }
+    if let Some(pid) = facts.pid
+        && !process_gone(pid)
+    {
+        return CarrierVerdict::Rooted {
+            pid,
+            via: "row-pid",
+        };
+    }
+    if let Some((pid, start, boot_id)) = &facts.anchor
+        && !process_gone(*pid)
+        && crate::sys::process::procfs_start_identity(*pid)
+            .is_some_and(|(live_start, live_boot)| live_start == *start && live_boot == *boot_id)
+    {
+        return CarrierVerdict::Rooted {
+            pid: *pid,
+            via: "anchor",
+        };
+    }
+    let btime = system_btime();
+    if let Some(owner) = facts
+        .owners
+        .iter()
+        .find(|owner| proven_omp_owner(owner, btime))
+    {
+        return CarrierVerdict::Rooted {
+            pid: owner.pid,
+            via: "minted-omp",
+        };
+    }
+    let transcript = facts
+        .session_id
+        .as_deref()
+        .map(|sid| format!("{sid}.jsonl"));
+    let mut orphans = Vec::new();
+    let mut undetermined: Option<&'static str> = None;
+    for &carrier in carriers {
+        if process_gone(carrier) {
+            continue;
+        }
+        // Why this carrier cannot be classified, if it cannot: a chain that
+        // still meets a root proves the row regardless. A chain that stops
+        // short of init was cut by an unreadable or vanished link.
+        let chain = ancestor_or_self_pids(carrier);
+        let mut why = (chain.last() != Some(&1)).then_some("ancestry-unreadable");
+        if let Some(transcript) = &transcript {
+            for &node in chain.iter().filter(|&&pid| pid != 1) {
+                match holds_session_transcript(node, transcript) {
+                    Some(true) => {
+                        return CarrierVerdict::Rooted {
+                            pid: node,
+                            via: "session-fd",
+                        };
+                    }
+                    Some(false) => {}
+                    None => {
+                        why.get_or_insert("fd-unreadable");
+                    }
+                }
+            }
+        }
+        match why {
+            // A carrier that exited meanwhile is no carrier at all.
+            Some(_) if process_gone(carrier) => continue,
+            Some(why) => {
+                undetermined.get_or_insert(why);
+            }
+            None => orphans.push(OrphanCarrier {
+                pid: carrier,
+                comm: std::fs::read_to_string(format!("/proc/{carrier}/comm"))
+                    .map(|comm| comm.trim().to_string())
+                    .unwrap_or_default(),
+                ppid: chain.get(1).copied(),
+            }),
+        }
+    }
+    if let Some(why) = undetermined {
+        return CarrierVerdict::Undetermined(why);
+    }
+    // Last root: any process on the host holding the transcript. Processes
+    // whose fd table cannot be read are skipped (see [`classify_carriers`]).
+    if let Some(transcript) = &transcript
+        && let Some(pid) = std::fs::read_dir("/proc").ok().and_then(|dir| {
+            dir.flatten()
+                .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+                .find(|&pid| holds_session_transcript(pid, transcript) == Some(true))
+        })
+    {
+        return CarrierVerdict::Rooted {
+            pid,
+            via: "session-fd",
+        };
+    }
+    CarrierVerdict::Orphaned(orphans)
+}
+
+/// Some(orphans) (non-empty) iff the row has no live root and its only live carriers are orphans.
+pub(crate) fn orphaned_row_carriers(
+    db: &HcomDb,
+    row: &crate::db::InstanceRow,
+    binding_ids: &[String],
+) -> Option<Vec<OrphanCarrier>> {
+    let owners = omp_owner_bindings(db, &row.name);
+    let carriers: Vec<u32> = processes_for_instance(&row.name, binding_ids, &owners)
+        .into_iter()
+        .map(|m| m.pid)
+        .filter(|&pid| !process_gone(pid))
+        .collect();
+    if carriers.is_empty() {
+        return None;
+    }
+    match classify_carriers(&row.name, &RootFacts::of_row(row, owners), &carriers) {
+        CarrierVerdict::Orphaned(orphans) if !orphans.is_empty() => Some(orphans),
+        _ => None,
+    }
+}
+
+/// The orphans a signal-free release left running, for stop's and resume's
+/// output: which processes, and why nothing was sent to them.
+pub(crate) fn describe_unsignalled_orphans(name: &str, orphans: &[OrphanCarrier]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = format!(
+        "Not signalled: {} orphaned process(es) still carry {name}'s identity, but no live {name} process is in their ancestry:",
+        orphans.len()
+    );
+    for orphan in orphans {
+        let comm = if orphan.comm.is_empty() {
+            "?"
+        } else {
+            orphan.comm.as_str()
+        };
+        let ppid = orphan
+            .ppid
+            .map_or_else(|| "?".to_string(), |ppid| ppid.to_string());
+        let _ = write!(out, "\n  pid {} ({comm}), ppid {ppid}", orphan.pid);
+    }
+    let _ = write!(
+        out,
+        "\nThey were reparented after the seat died and may be shared by other seats (e.g. the per-user sccache server); stop them yourself if they are {name}'s."
+    );
+    out
+}
+
 /// Decode the two identity facts from a raw /proc environ block: whether it
 /// carries exactly `want` (`HCOM_INSTANCE_NAME=<name>`) as one NUL-delimited
 /// entry, and its `HCOM_PROCESS_ID` value (empty when absent). Only these two
@@ -367,11 +675,19 @@ pub(crate) struct ReapCapture {
     /// `None` when no row existed at capture time, or when the capture is
     /// reap-only and deliberately binds no incarnation.
     incarnation: Option<CapturedIncarnation>,
+    /// Set only by [`orphan_only_release`]: the stop threading this capture
+    /// releases the row and signals nobody (no headless group signal, no
+    /// reap).
+    signal_free: bool,
 }
 
 impl ReapCapture {
     pub(crate) fn incarnation(&self) -> Option<&CapturedIncarnation> {
         self.incarnation.as_ref()
+    }
+
+    pub(crate) fn signal_free(&self) -> bool {
+        self.signal_free
     }
 }
 
@@ -440,12 +756,16 @@ fn capture_reap_carriers_unbound(
             scope,
             carriers,
             incarnation: None,
+            signal_free: false,
         })
     }
     #[cfg(not(unix))]
     {
         let _ = (db, name, row_pid, binding_ids, owners, exclude);
-        Ok(ReapCapture { incarnation: None })
+        Ok(ReapCapture {
+            incarnation: None,
+            signal_free: false,
+        })
     }
 }
 
@@ -615,6 +935,42 @@ pub(crate) fn capture_reap_carriers(
         binding_ids: binding_ids.to_vec(),
     });
     Ok(capture)
+}
+
+/// Stop's UnprovenOwnership path, recovered: `Ok` when this stop may release
+/// the row with no signal to anyone — the capture admitted no in-scope
+/// carrier, the row has no live root, and every live carrier is an orphan.
+/// The capture comes back signal-free with those orphans; this is the only
+/// way a capture becomes signal-free. `Err` hands the capture back unchanged
+/// for the ordinary stop. The F2 guard already ran in the capture and is
+/// unchanged.
+// `Err` is the caller's own capture handed back by move, not an error value
+// to propagate; boxing it would only add an allocation per stop.
+#[allow(clippy::result_large_err)]
+pub(crate) fn orphan_only_release(
+    db: &HcomDb,
+    row: &crate::db::InstanceRow,
+    binding_ids: &[String],
+    mut capture: ReapCapture,
+) -> Result<(ReapCapture, Vec<OrphanCarrier>), ReapCapture> {
+    #[cfg(unix)]
+    {
+        if !capture.carriers.is_empty() {
+            return Err(capture);
+        }
+        match orphaned_row_carriers(db, row, binding_ids) {
+            Some(orphans) => {
+                capture.signal_free = true;
+                Ok((capture, orphans))
+            }
+            None => Err(capture),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (db, row, binding_ids, &mut capture);
+        Err(capture)
+    }
 }
 
 #[cfg(unix)]
@@ -1684,6 +2040,11 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
     exclude: &[u32],
     capture: ReapCapture,
 ) -> Result<(), ReapError> {
+    // A signal-free capture never signals: its row has no live root and only
+    // orphan carriers, which are not this stop's to touch.
+    if capture.signal_free {
+        return Ok(());
+    }
     #[cfg(not(unix))]
     {
         let _ = (db, name, binding_ids, exclude, capture);
@@ -1715,6 +2076,11 @@ pub(crate) fn reap_instance_tree_for_excluding_captured(
                 .partial_cmp(&b.start_epoch)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        // The first capture is bound; its signal round is next. A test that
+        // must place a late carrier outside the first snapshot (and inside
+        // the KILL round's capture to come) spawns it right here.
+        #[cfg(test)]
+        fire_round_seam(RoundPoint::FirstCaptured);
         for m in &matches {
             // Pid-reuse guard: only signal a snapshot pid that still holds
             // the instance; a recycled pid belongs to someone else now.
@@ -1907,16 +2273,21 @@ fn carrier_in_reap_scope(
     true
 }
 
-/// Test-only round seam: a per-thread hook fired at the two boundaries the
-/// round-ordering contract pins in the KILL round — right after its carrier
-/// capture ([`RoundPoint::Captured`]) and right after its classification of
-/// that captured set ([`RoundPoint::Classified`]). A test arms it from its
-/// own reaper thread to land a concurrent registration or spawn at one exact
-/// instruction boundary of the round instead of racing the clock. Unarmed,
-/// firing is a no-op; never compiled outside `cfg(test)`.
+/// Test-only round seam: a per-thread hook fired at the boundaries the
+/// round-ordering contract pins — the first (TERM) round's capture boundary
+/// ([`RoundPoint::FirstCaptured`]) and the two KILL-round boundaries, right
+/// after its carrier capture ([`RoundPoint::Captured`]) and right after its
+/// classification of that captured set ([`RoundPoint::Classified`]). A test
+/// arms it from its own reaper thread to land a concurrent registration or
+/// spawn at one exact instruction boundary of the round instead of racing
+/// the clock. Unarmed, firing is a no-op; never compiled outside `cfg(test)`.
 #[cfg(all(test, unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoundPoint {
+    /// The first round's (TERM) capture is bound; its signals are next. A
+    /// test spawns a late carrier here: never a first-snapshot pid, and in
+    /// the KILL round's capture to come.
+    FirstCaptured,
     /// The KILL round has captured its carrier set; its registry read is next.
     Captured,
     /// The KILL round has classified the captured set; the pre-signal
@@ -2136,7 +2507,10 @@ fn caller_identity_tree(
 /// exactly like a live hcom-launched holder. The caller's own identity tree
 /// ([`caller_identity_tree`]) is removed from the carrier set first: a
 /// session re-registering its own name is never blocked by its own
-/// processes. What remains is classified:
+/// processes. The remaining carriers of a root-less instance never block: when
+/// [`classify_carriers`] finds them all orphans of the row (or, with no row,
+/// of the name's newest stopped snapshot), the spawn proceeds. Rooted or
+/// undeterminable carriers are classified:
 ///
 /// - Newest binding's own process_id still carried by a live process → live
 ///   holder, refuse.
@@ -2176,6 +2550,31 @@ pub fn check_spawn_allowed(db: &HcomDb, name: &str) -> Result<(), SpawnRefusal> 
     // spawn; with the tree gone the gate is open.
     if remainder.is_empty() {
         return Ok(());
+    }
+    let facts = match db.get_instance_full(name) {
+        Ok(Some(row)) => Some(RootFacts::of_row(&row, omp_owner_bindings(db, name))),
+        Ok(None) => db
+            .newest_stopped_snapshot(name)
+            .ok()
+            .flatten()
+            .map(|snapshot| RootFacts::of_stopped_snapshot(&snapshot)),
+        Err(_) => None,
+    };
+    if let Some(facts) = facts {
+        let pids: Vec<u32> = remainder.iter().map(|h| h.pid).collect();
+        if let CarrierVerdict::Orphaned(orphans) = classify_carriers(name, &facts, &pids)
+            && !orphans.is_empty()
+        {
+            crate::log::log_info(
+                "proctruth",
+                "spawn_gate.orphan_carriers",
+                &format!(
+                    "instance={name} pids={:?}: not evidence, spawn allowed",
+                    orphans.iter().map(|o| o.pid).collect::<Vec<_>>()
+                ),
+            );
+            return Ok(());
+        }
     }
     let newest = db.newest_process_binding(name).unwrap_or(None);
     classify_holders(name, &remainder, newest)
@@ -2276,7 +2675,10 @@ thread_local! {
 /// - any attributable pid alive (recorded snapshot pid, or the shell pid
 ///   parsed from a shell-shaped binding) → HELD.
 /// - any live carrier by name (`HCOM_INSTANCE_NAME`) or by binding process id
-///   (`HCOM_PROCESS_ID`) → HELD.
+///   (`HCOM_PROCESS_ID`) that [`classify_carriers`] finds rooted, or cannot
+///   classify → HELD. A row with no live root whose only carriers are
+///   orphans (reparented away after the seat died) is NOT held by them:
+///   they are no evidence, and nothing is ever signalled.
 /// - an unparseable binding process id contributes no pid evidence and never
 ///   counts toward death → HELD unless other evidence proves death.
 /// - a registered notify endpoint (kind other than `inject`) that still accepts
@@ -2375,24 +2777,57 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
             );
             continue;
         }
-        // Every attributable pid is dead. Still held while any live carrier
-        // holds the instance by name or by binding process id. Zombies don't
-        // count: a SIGKILLed carrier keeps its environ until its parent
-        // reaps it, but it is gone for lifecycle purposes — same rule as
-        // reap verification (live_carriers_for).
+        // Every attributable pid is dead. Still held while a live carrier
+        // that a live root of the row reaches holds the instance by name or
+        // by binding process id. Zombies don't count: a SIGKILLed carrier
+        // keeps its environ until its parent reaps it, but it is gone for
+        // lifecycle purposes — same rule as reap verification
+        // (live_carriers_for).
         // No binding owners: every minted owner pid is in `evidence_pids`,
         // all of which are gone by here.
-        if processes_for_instance(&inst.name, binding_ids, &[])
+        let carriers: Vec<u32> = processes_for_instance(&inst.name, binding_ids, &[])
             .into_iter()
-            .any(|m| !is_zombie(m.pid))
-        {
-            crate::log::log(
-                "DEBUG",
-                "daemon",
-                "sweep.held",
-                &format!("name={} reason=live-carrier", inst.name),
-            );
-            continue;
+            .map(|m| m.pid)
+            .filter(|&pid| !is_zombie(pid))
+            .collect();
+        if !carriers.is_empty() {
+            let facts = RootFacts::of_row(inst, omp_owner_bindings(db, &inst.name));
+            match classify_carriers(&inst.name, &facts, &carriers) {
+                CarrierVerdict::Rooted { pid, via } => {
+                    crate::log::log(
+                        "DEBUG",
+                        "daemon",
+                        "sweep.held",
+                        &format!(
+                            "name={} reason=live-carrier via={via} root_pid={pid}",
+                            inst.name
+                        ),
+                    );
+                    continue;
+                }
+                CarrierVerdict::Undetermined(why) => {
+                    crate::log::log(
+                        "DEBUG",
+                        "daemon",
+                        "sweep.held",
+                        &format!("name={} reason=live-carrier why={why}", inst.name),
+                    );
+                    continue;
+                }
+                // Orphans of a root-less row are no evidence: fall through
+                // to the endpoint check and the release, signalling nobody.
+                CarrierVerdict::Orphaned(orphans) => {
+                    crate::log::log_info(
+                        "daemon",
+                        "sweep.orphan_carriers",
+                        &format!(
+                            "name={} pids={:?}: not evidence",
+                            inst.name,
+                            orphans.iter().map(|o| o.pid).collect::<Vec<_>>()
+                        ),
+                    );
+                }
+            }
         }
         // /proc sees nothing for a seat with no HCOM-marked carrier, but its
         // own notify endpoint is served by the seat process: a listener proven
@@ -2584,7 +3019,7 @@ fn endpoint_owner(db: &HcomDb, name: &str, session_id: Option<&str>, port: u16) 
         let transcript = format!("{session_id}.jsonl");
         if let Some(&pid) = holders
             .iter()
-            .find(|&&pid| holds_session_transcript(pid, &transcript))
+            .find(|&&pid| holds_session_transcript(pid, &transcript) == Some(true))
         {
             return EndpointOwner::Owned {
                 pid,
@@ -2593,7 +3028,7 @@ fn endpoint_owner(db: &HcomDb, name: &str, session_id: Option<&str>, port: u16) 
         }
         if let Some((pid, _child)) = direct_children(&holders)
             .into_iter()
-            .find(|&(_, child)| holds_session_transcript(child, &transcript))
+            .find(|&(_, child)| holds_session_transcript(child, &transcript) == Some(true))
         {
             return EndpointOwner::Owned {
                 pid,
@@ -2767,22 +3202,21 @@ fn direct_children(parents: &[u32]) -> Vec<(u32, u32)> {
 /// Whether `pid` has a file open whose path ends in `transcript`
 /// (`<session_id>.jsonl`) right after a path separator or a non-alphanumeric
 /// prefix (`<ts>_<session_id>.jsonl`), so a longer id never matches a shorter
-/// one. A transcript deleted while open still counts.
-#[cfg(target_os = "linux")]
-fn holds_session_transcript(pid: u32, transcript: &str) -> bool {
+/// one. A transcript deleted while open still counts. None when
+/// `/proc/<pid>/fd` cannot be read (another user's process, or exited).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn holds_session_transcript(pid: u32, transcript: &str) -> Option<bool> {
     use std::os::unix::ffi::OsStrExt;
 
-    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return false;
-    };
-    fds.flatten().any(|fd| {
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    Some(fds.flatten().any(|fd| {
         std::fs::read_link(fd.path()).is_ok_and(|link| {
             let path = link.as_os_str().as_bytes();
             let path = path.strip_suffix(b" (deleted)").unwrap_or(path);
             path.strip_suffix(transcript.as_bytes())
                 .is_some_and(|head| head.last().is_none_or(|b| !b.is_ascii_alphanumeric()))
         })
-    })
+    }))
 }
 
 /// An omp or hcom process: `/proc/<pid>/comm`, or the basename of argv[0],
@@ -2798,6 +3232,399 @@ fn is_omp_or_hcom_process(pid: u32) -> bool {
             let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or_default();
             NAMES.iter().any(|name| name.as_bytes() == base)
         })
+}
+
+/// Row and process fixtures for the orphan-carrier tests here and in
+/// `commands::{stop, resume, kill}`. Every process tree starts OUTSIDE the
+/// test binary's own tree: a stop's capture roots its caller
+/// (`std::process::id()`), so a carrier under the test process would sit in
+/// that stop's signal scope, which no real orphan ever does.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod orphan_fixtures {
+    use super::{SWEEP_FRESH_GRACE_SECS, parent_pid, process_gone};
+    use crate::db::HcomDb;
+    use std::ffi::OsStr;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// A fixture name no other test or live seat shares: it embeds the
+    /// test-runner pid and a per-process counter.
+    pub(crate) fn unique(tag: &str) -> String {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "hcom-orphan-{}-{tag}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn dead_pid() -> u32 {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap true");
+        pid
+    }
+
+    /// The henu row: an omp seat, `listening`, no pid, `session_id` set, and one minted
+    /// omp binding (also its launch_context process id) whose pid is dead,
+    /// last seen outside the sweep's fresh grace. Returns the binding id.
+    pub(crate) fn seed_seat_row(
+        db: &HcomDb,
+        name: &str,
+        session_id: &str,
+        directory: &Path,
+    ) -> String {
+        let binding = format!("omp-{}-a470463d-{:08x}", dead_pid(), std::process::id());
+        let now = crate::shared::time::now_epoch_f64();
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), serde_json::json!(session_id));
+        data.insert("tool".into(), serde_json::json!("omp"));
+        data.insert("status".into(), serde_json::json!("listening"));
+        data.insert("created_at".into(), serde_json::json!(now));
+        data.insert(
+            "directory".into(),
+            serde_json::json!(directory.to_string_lossy()),
+        );
+        data.insert("launch_args".into(), serde_json::json!("[]"));
+        data.insert(
+            "launch_context".into(),
+            serde_json::json!(serde_json::json!({ "process_id": binding }).to_string()),
+        );
+        data.insert(
+            "last_seen".into(),
+            serde_json::json!(now as i64 - SWEEP_FRESH_GRACE_SECS - 60),
+        );
+        db.save_instance_named(name, &data).expect("seed seat row");
+        db.set_process_binding(&binding, session_id, name)
+            .expect("seed seat binding");
+        binding
+    }
+
+    fn environ_has(pid: u32, entry: &str) -> bool {
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .ok()
+            .is_some_and(|env| env.split(|b| *b == 0).any(|var| var == entry.as_bytes()))
+    }
+
+    /// Processes a fixture started, all carrying `marker` in their environ.
+    /// Drop SIGKILLs them in order, each only while it still carries the
+    /// marker (so a failing assertion can never kill an unrelated process),
+    /// then waits until their reaper has reaped every one.
+    struct Tree {
+        marker: String,
+        pids: Vec<u32>,
+        dir: tempfile::TempDir,
+    }
+
+    impl Tree {
+        fn new(name: &str) -> Self {
+            Self {
+                marker: format!("ORPHAN_FIXTURE={name}"),
+                pids: Vec::new(),
+                dir: tempfile::tempdir().expect("fixture dir"),
+            }
+        }
+
+        fn alive(&self, pid: u32) -> bool {
+            !process_gone(pid) && environ_has(pid, &self.marker)
+        }
+
+        /// Start `script` under `program -c`, detached: the process is
+        /// reparented away from this test before it execs, and with
+        /// `subreaper` it is the child subreaper of everything it spawns.
+        fn spawn_detached(
+            &self,
+            program: &Path,
+            script: &str,
+            envs: &[(&str, &OsStr)],
+            subreaper: bool,
+        ) {
+            let mut command = Command::new(program);
+            command
+                .arg("-c")
+                .arg(script)
+                .env_remove("HCOM_INSTANCE_NAME")
+                .env_remove("HCOM_PROCESS_ID")
+                .env(
+                    "ORPHAN_FIXTURE",
+                    self.marker.trim_start_matches("ORPHAN_FIXTURE="),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            for (key, value) in envs {
+                command.env(key, value);
+            }
+            // SAFETY: runs in the forked child before exec and only makes
+            // raw syscalls. A raw clone(SIGCHLD) forks without libc's atfork
+            // handlers, which are unsafe after forking a multithreaded
+            // process. The intermediate exits at once; the grandchild, whose
+            // exec the parent's spawn waits for, sets the subreaper bit
+            // (which survives exec) and execs.
+            unsafe {
+                command.pre_exec(move || {
+                    let zero: libc::c_long = 0;
+                    let (on, off): (libc::c_ulong, libc::c_ulong) = (1, 0);
+                    match libc::syscall(
+                        libc::SYS_clone,
+                        libc::SIGCHLD as libc::c_long,
+                        zero,
+                        zero,
+                        zero,
+                        zero,
+                    ) {
+                        -1 => Err(std::io::Error::last_os_error()),
+                        0 => {
+                            if subreaper
+                                && libc::prctl(libc::PR_SET_CHILD_SUBREAPER, on, off, off, off)
+                                    == -1
+                            {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        }
+                        _ => libc::_exit(0),
+                    }
+                });
+            }
+            let status = command
+                .spawn()
+                .expect("spawn detached fixture")
+                .wait()
+                .expect("reap the detaching parent");
+            assert!(status.success(), "detaching parent failed: {status}");
+        }
+
+        /// Read a pid the fixture wrote into `file`, and track it for Drop.
+        fn read_pid(&mut self, file: &str) -> u32 {
+            let path = self.dir.path().join(file);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    && self.alive(pid)
+                {
+                    self.pids.push(pid);
+                    return pid;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture never reported a live pid in {file}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn path(&self, file: &str) -> PathBuf {
+            self.dir.path().join(file)
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            for &pid in &self.pids {
+                if self.alive(pid) {
+                    // SAFETY: plain kill(2) on a pid that still carries this
+                    // fixture's unique marker.
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                }
+            }
+            // Detached: their reaper (the subreaper above this test, or
+            // init) reaps them. /proc/<pid> stays until that reap.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline
+                && self
+                    .pids
+                    .iter()
+                    .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// The ppid chain above `pid`, youngest first, up to init.
+    fn ancestry(pid: u32) -> Vec<u32> {
+        let mut chain = Vec::new();
+        let mut node = pid;
+        for _ in 0..1024 {
+            let Some(parent) = parent_pid(node) else {
+                break;
+            };
+            chain.push(parent);
+            if parent == 1 {
+                break;
+            }
+            node = parent;
+        }
+        chain
+    }
+
+    /// A carrier of `name` whose seat died: `HCOM_INSTANCE_NAME=<name>`,
+    /// reparented to a subreaper stand-in (the user's systemd --user). Its
+    /// ppid chain holds no root of the row and never passes this test.
+    pub(crate) struct Orphan {
+        pub(crate) standin: u32,
+        pub(crate) carrier: u32,
+        tree: Tree,
+    }
+
+    pub(crate) fn spawn_orphan(name: &str) -> Orphan {
+        let mut tree = Tree::new(name);
+        let standin_file = tree.path("standin.pid");
+        let carrier_file = tree.path("carrier.pid");
+        tree.spawn_detached(
+            Path::new("/bin/sh"),
+            "echo $$ > \"$STANDIN_PID\"; \
+             (HCOM_INSTANCE_NAME=\"$INSTANCE\" sleep 300 & echo $! > \"$CARRIER_PID\"); \
+             exec sleep 300",
+            &[
+                ("STANDIN_PID", standin_file.as_os_str()),
+                ("CARRIER_PID", carrier_file.as_os_str()),
+                ("INSTANCE", OsStr::new(name)),
+            ],
+            true,
+        );
+        // Carrier first: Drop kills in push order, so the stand-in, which
+        // reaps nothing, dies after its zombie child and hands it on.
+        let carrier = tree.read_pid("carrier.pid");
+        let standin = tree.read_pid("standin.pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while parent_pid(carrier) != Some(standin) {
+            assert!(
+                Instant::now() < deadline,
+                "carrier {carrier} never reparented to stand-in {standin}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The carrier's identity lands at exec; a forked-but-not-yet-exec'd
+        // carrier still shows the subshell's environ. Wait for the exec so
+        // the assert cannot race a slow spawn.
+        let identity = format!("HCOM_INSTANCE_NAME={name}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !environ_has(carrier, &identity) {
+            assert!(
+                Instant::now() < deadline,
+                "carrier {carrier} never took the identity {identity}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!environ_has(standin, &identity));
+        let chain = ancestry(carrier);
+        assert_eq!(chain.first(), Some(&standin), "{chain:?}");
+        assert_eq!(chain.last(), Some(&1), "{chain:?}");
+        assert!(
+            !chain.contains(&std::process::id()),
+            "the orphan's ancestry must not pass this test: {chain:?}"
+        );
+        Orphan {
+            standin,
+            carrier,
+            tree,
+        }
+    }
+
+    impl Orphan {
+        /// Still running as this fixture's process (never signalled).
+        pub(crate) fn alive(&self, pid: u32) -> bool {
+            self.tree.alive(pid)
+        }
+    }
+
+    /// A live seat root: a process named `comm` holding
+    /// `<dir>/<session_id>.jsonl` open, with a child carrying
+    /// `HCOM_INSTANCE_NAME=<carried>` that does not hold the fd itself.
+    pub(crate) struct SessionSeat {
+        pub(crate) holder: u32,
+        pub(crate) carrier: u32,
+        tree: Tree,
+    }
+
+    pub(crate) fn spawn_session_seat(
+        dir: &Path,
+        session_id: &str,
+        carried: &str,
+        comm: &str,
+    ) -> SessionSeat {
+        let mut tree = Tree::new(&format!("{carried}-{session_id}"));
+        let program = tree.path(comm);
+        std::os::unix::fs::symlink("/bin/sh", &program).expect("link the holder's comm");
+        let holder_file = tree.path("holder.pid");
+        let carrier_file = tree.path("carrier.pid");
+        let transcript = dir.join(format!("{session_id}.jsonl"));
+        tree.spawn_detached(
+            &program,
+            "echo $$ > \"$HOLDER_PID\"; exec 3>>\"$TRANSCRIPT\"; \
+             HCOM_INSTANCE_NAME=\"$INSTANCE\" sleep 300 3>&- & echo $! > \"$CARRIER_PID\"; wait",
+            &[
+                ("HOLDER_PID", holder_file.as_os_str()),
+                ("CARRIER_PID", carrier_file.as_os_str()),
+                ("TRANSCRIPT", transcript.as_os_str()),
+                ("INSTANCE", OsStr::new(carried)),
+            ],
+            false,
+        );
+        let carrier = tree.read_pid("carrier.pid");
+        let holder = tree.read_pid("holder.pid");
+        assert_eq!(parent_pid(carrier), Some(holder));
+        assert_eq!(comm_of(holder), comm);
+        let file = format!("{session_id}.jsonl");
+        // The carrier drops the inherited transcript fd at its exec
+        // (`3>&-`); a forked-but-not-yet-exec'd carrier still holds it.
+        // Wait for the exec so the asserts cannot race a slow spawn.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while super::holds_session_transcript(carrier, &file) != Some(false) {
+            assert!(
+                Instant::now() < deadline,
+                "carrier {carrier} never dropped its transcript fd"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(super::holds_session_transcript(holder, &file), Some(true));
+        assert_eq!(super::holds_session_transcript(carrier, &file), Some(false));
+        assert!(
+            !ancestry(carrier).contains(&std::process::id()),
+            "the seat must not descend from this test"
+        );
+        SessionSeat {
+            holder,
+            carrier,
+            tree,
+        }
+    }
+
+    impl SessionSeat {
+        pub(crate) fn alive(&self, pid: u32) -> bool {
+            self.tree.alive(pid)
+        }
+    }
+
+    /// `/proc/<pid>/comm`, trimmed.
+    pub(crate) fn comm_of(pid: u32) -> String {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    /// The `life` events of `name` whose action is `stopped`, parsed.
+    pub(crate) fn stopped_events(db: &HcomDb, name: &str) -> Vec<serde_json::Value> {
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT data FROM events WHERE type = 'life' AND instance = ?1 \
+                 AND json_extract(data, '$.action') = 'stopped' ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([name], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|data| serde_json::from_str(&data.unwrap()).unwrap())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -3511,6 +4338,7 @@ mod tests {
             },
             carriers: Vec::new(),
             incarnation: None,
+            signal_free: false,
         };
         assert!(
             reap_instance_tree_for_excluding_captured(
@@ -4000,9 +4828,11 @@ mod tests {
     fn sweep_leaves_name_held_row_alone() {
         let db = test_db();
         // Dead recorded pid, but a live process still carries the name
-        // (binding-less): the harness is around in some form; not vanished.
+        // (binding-less) under a live root of the row (this process holds
+        // its transcript): the harness is around in some form; not vanished.
         let name = unique_name("held");
         insert_row(&db, &name, "active", Some(dead_pid()));
+        let _root = root_row_in_test_process(&db, &name);
         let mut sleeper = spawn_named_sleeper(&name, "proc-held");
         wait_for_enumerated(&name, &[], sleeper.id());
         let swept = sweep_vanished_instances(&db);
@@ -4055,6 +4885,26 @@ mod tests {
         )
         .unwrap();
         (dir, file)
+    }
+
+    /// Root `name` in this test process: make the row an omp row with its
+    /// own session (only an omp session is a root fact) and hold that
+    /// session's transcript open here, so a carrier the test spawns has a
+    /// live root of the row (session-fd) in its ancestry while the returned
+    /// handles live.
+    #[cfg(unix)]
+    fn root_row_in_test_process(
+        db: &crate::db::HcomDb,
+        name: &str,
+    ) -> (tempfile::TempDir, std::fs::File) {
+        let session_id = format!("sess-root-{name}");
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'omp', session_id = ?1 WHERE name = ?2",
+                rusqlite::params![session_id, name],
+            )
+            .unwrap();
+        open_transcript(&session_id)
     }
 
     /// The valo 16:03 row: every /proc signal says gone, but the process
@@ -4314,9 +5164,11 @@ mod tests {
     fn sweep_holds_inactive_row_with_live_carrier() {
         let db = test_db();
         // Dead recorded pid, but a live process still carries the name and
-        // the bound process id: the harness is around; not vanished.
+        // the bound process id under a live root of the row (this process
+        // holds its transcript): the harness is around; not vanished.
         let name = unique_name("inactcarrier");
         insert_row(&db, &name, "inactive", Some(dead_pid()));
+        let _root = root_row_in_test_process(&db, &name);
         let binding = format!("proc-inactcarrier-{}", rand_suffix());
         db.set_process_binding(&binding, "sess", &name).unwrap();
         age_row(&db, &name);
@@ -4419,10 +5271,12 @@ mod tests {
     fn sweep_leaves_post_binding_different_id_carrier() {
         let db = test_db();
         // Dead recorded pid, but a live carrier with a different non-empty
-        // process_id started AFTER the binding (subagent shape): a holder,
-        // not a vanished harness.
+        // process_id started AFTER the binding (subagent shape) under a live
+        // root of the row (this process holds its transcript): a holder, not
+        // a vanished harness.
         let name = unique_name("subholder");
         insert_row(&db, &name, "active", Some(dead_pid()));
+        let _root = root_row_in_test_process(&db, &name);
         db.set_process_binding("proc-new", "sess", &name).unwrap();
         let mut sleeper = spawn_named_sleeper(&name, &format!("proc-old-{}", rand_suffix()));
         wait_for_enumerated(&name, &[], sleeper.id());
@@ -4909,24 +5763,32 @@ mod tests {
         unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
 
         let late_binding = format!("proc-fresh-{}", rand_suffix());
-        let (hook, hit, release) = rendezvous_at(RoundPoint::Classified);
+        let (mut spawn_hook, spawned, spawn_release) = rendezvous_at(RoundPoint::FirstCaptured);
+        let (mut hook, hit, release) = rendezvous_at(RoundPoint::Classified);
         let (start_tx, start_rx) = std::sync::mpsc::channel();
         let reap_name = name.clone();
         let reap_bindings = binding_ids.clone();
         let reaper = std::thread::spawn(move || {
             let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
-            arm_round_seam(hook);
+            arm_round_seam(move |p| {
+                spawn_hook(p);
+                hook(p);
+            });
             start_tx.send(()).ok();
             reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
         });
         start_rx.recv().unwrap();
-        // Late carrier with a not-yet-registered id, spawned after the reap
-        // began: it is classified (a late carrier), never a first-snapshot
-        // pid.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Late carrier with a not-yet-registered id, spawned at the
+        // first-capture boundary instead of racing the clock: it is
+        // classified (a late carrier), never a first-snapshot pid, and it is
+        // in the KILL round's capture to come.
+        spawned
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("reap reaches its first-capture boundary");
         let mut late = spawn_named_sleeper(&name, &late_binding);
         let late_pid = late.id();
         wait_for_enumerated(&name, &[], late_pid);
+        spawn_release.send(()).ok();
         // The registration lands between classification and the signal
         // round: the pre-signal re-read must spare the carrier.
         hit.recv_timeout(std::time::Duration::from_secs(30))
@@ -5279,10 +6141,12 @@ mod tests {
     #[cfg(unix)]
     fn sweep_keeps_uuid_binding_pid_only_carrier() {
         // UUID binding, dead recorded pid, one live process carrying ONLY
-        // the binding process id (no name in env): held, not vanished.
+        // the binding process id (no name in env) under a live root of the
+        // row (this process holds its transcript): held, not vanished.
         let db = test_db();
         let name = unique_name("pidonly");
         insert_row(&db, &name, "active", Some(dead_pid()));
+        let _root = root_row_in_test_process(&db, &name);
         let binding = format!("proc-pidonly-{}", rand_suffix());
         db.set_process_binding(&binding, "sess", &name).unwrap();
         let mut sleeper = spawn_pid_only_sleeper(&binding);
@@ -5636,5 +6500,233 @@ mod tests {
         sharing.wait().ok();
         stripped.kill().ok();
         stripped.wait().ok();
+    }
+
+    // -- Orphan identity carriers (ffc-0jnwn) -------------------------------
+
+    /// A row's facts plus a carrier set, classified the way every caller does.
+    #[cfg(target_os = "linux")]
+    fn classify_row(db: &crate::db::HcomDb, name: &str, carriers: &[u32]) -> CarrierVerdict {
+        let row = db
+            .get_instance_full(name)
+            .unwrap()
+            .expect("row to classify");
+        classify_carriers(
+            name,
+            &RootFacts::of_row(&row, omp_owner_bindings(db, name)),
+            carriers,
+        )
+    }
+
+    /// `hcom stop` on a row that is not orphan-only: the signal-free
+    /// release declines it (nothing done), and the stop goes the existing
+    /// way.
+    #[cfg(target_os = "linux")]
+    fn stop_when_not_orphan_only(
+        db: &crate::db::HcomDb,
+        name: &str,
+    ) -> crate::hooks::common::StopOutcome {
+        assert!(
+            crate::commands::stop::release_orphaned_row(db, name, "test", "orphaned").is_none(),
+            "a row with a live root or no root facts is never released signal-free"
+        );
+        crate::hooks::common::stop_instance(db, name, "test", "stopped")
+    }
+
+    /// Make `name` an omp seat of `session_id`: only an omp row's session
+    /// is a root proof.
+    #[cfg(target_os = "linux")]
+    fn set_omp_session(db: &crate::db::HcomDb, name: &str, session_id: &str) {
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'omp', session_id = ?1 WHERE name = ?2",
+                rusqlite::params![session_id, name],
+            )
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_unproven_ownership(outcome: &crate::hooks::common::StopOutcome) {
+        assert!(
+            matches!(
+                outcome,
+                crate::hooks::common::StopOutcome::RetryableError(e)
+                    if e.to_string().contains("cannot prove process ownership")
+            ),
+            "stop must refuse exactly as before: {outcome:?}"
+        );
+    }
+
+    /// A carrier whose parent holds the row's session transcript is held
+    /// by that live root: the holder, not the carrier, is named as root.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sweep_holds_a_row_whose_carrier_descends_from_its_session_holder() {
+        let db = test_db();
+        let work = tempfile::tempdir().unwrap();
+        let name = orphan_fixtures::unique("rooted");
+        let session = format!("{name}-session");
+        insert_row(&db, &name, "active", Some(dead_pid()));
+        set_omp_session(&db, &name, &session);
+        age_row(&db, &name);
+        let seat = orphan_fixtures::spawn_session_seat(work.path(), &session, &name, "seat-root");
+
+        assert_eq!(
+            classify_row(&db, &name, &[seat.carrier]),
+            CarrierVerdict::Rooted {
+                pid: seat.holder,
+                via: "session-fd"
+            }
+        );
+        let swept = sweep_vanished_instances(&db);
+        assert!(!swept.contains(&name), "rooted carrier released: {swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert!(orphan_fixtures::stopped_events(&db, &name).is_empty());
+        assert!(seat.alive(seat.holder) && seat.alive(seat.carrier));
+    }
+
+    /// The henu shape: no live root, one carrier reparented to the user's
+    /// subreaper. The sweep releases the row as vanished and signals nobody.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sweep_releases_a_row_whose_only_carrier_is_an_orphan() {
+        let db = test_db();
+        let work = tempfile::tempdir().unwrap();
+        let name = orphan_fixtures::unique("henu");
+        let session = format!("{name}-session");
+        let binding = orphan_fixtures::seed_seat_row(&db, &name, &session, work.path());
+        let orphan = orphan_fixtures::spawn_orphan(&name);
+
+        assert_eq!(
+            classify_row(&db, &name, &[orphan.carrier]),
+            CarrierVerdict::Orphaned(vec![OrphanCarrier {
+                pid: orphan.carrier,
+                comm: orphan_fixtures::comm_of(orphan.carrier),
+                ppid: Some(orphan.standin),
+            }])
+        );
+        let swept = sweep_vanished_instances(&db);
+        assert!(swept.contains(&name), "orphan-held row kept: {swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert!(db.process_binding_ids(&name).unwrap().is_empty());
+        let stopped = orphan_fixtures::stopped_events(&db, &name);
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert_eq!(stopped[0]["by"], "daemon");
+        assert_eq!(stopped[0]["reason"], "vanished");
+        assert_eq!(stopped[0]["process_id"], binding.as_str());
+        assert!(
+            orphan.alive(orphan.carrier),
+            "the sweep signalled the orphan"
+        );
+        assert!(orphan.alive(orphan.standin));
+    }
+
+    /// Regression of 0.7.38 (the valo 16:03 shape): no pid, a dead minted
+    /// binding, and a live `omp` holding the session transcript with a
+    /// carrier child. The sweep keeps the row and the stop refuses exactly
+    /// as before; nothing is released or signalled.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial]
+    fn valo_shape_stays_held_by_sweep_and_stop() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let work = tempfile::tempdir().unwrap();
+        let name = orphan_fixtures::unique("valo");
+        let session = format!("{name}-session");
+        let binding = orphan_fixtures::seed_seat_row(&db, &name, &session, work.path());
+        let seat = orphan_fixtures::spawn_session_seat(work.path(), &session, &name, "omp");
+
+        assert_eq!(
+            classify_row(&db, &name, &[seat.carrier]),
+            CarrierVerdict::Rooted {
+                pid: seat.holder,
+                via: "session-fd"
+            }
+        );
+        let swept = sweep_vanished_instances(&db);
+        assert!(!swept.contains(&name), "live seat swept: {swept:?}");
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+
+        assert_unproven_ownership(&stop_when_not_orphan_only(&db, &name));
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_eq!(db.process_binding_ids(&name).unwrap(), vec![binding]);
+        assert!(orphan_fixtures::stopped_events(&db, &name).is_empty());
+        assert!(
+            seat.alive(seat.holder) && seat.alive(seat.carrier),
+            "a refused stop signalled the live seat"
+        );
+    }
+
+    /// A row with nothing to prove a root from (no pid, no session, no
+    /// bindings): even an orphan-shaped carrier still holds it. Every
+    /// caller behaves exactly as before the classifier.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial]
+    fn undeterminable_row_carrier_still_holds() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let name = orphan_fixtures::unique("nofacts");
+        insert_row(&db, &name, "active", None);
+        age_row(&db, &name);
+        let carrier = orphan_fixtures::spawn_orphan(&name);
+
+        assert_eq!(
+            classify_row(&db, &name, &[carrier.carrier]),
+            CarrierVerdict::Undetermined("no-root-facts")
+        );
+        let swept = sweep_vanished_instances(&db);
+        assert!(!swept.contains(&name), "fact-less row swept: {swept:?}");
+
+        assert_unproven_ownership(&stop_when_not_orphan_only(&db, &name));
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert!(orphan_fixtures::stopped_events(&db, &name).is_empty());
+
+        let refusal =
+            check_spawn_allowed(&db, &name).expect_err("the carrier still blocks a spawn");
+        assert_eq!(refusal.kind, HolderKind::LiveHolder);
+        assert!(refusal.pids.contains(&carrier.carrier), "{refusal}");
+        assert!(carrier.alive(carrier.carrier), "the carrier was signalled");
+    }
+
+    /// A carrier of R living under ANOTHER seat's root (the holder of
+    /// session T, not R's S) never meets R's root: it is an orphan for R,
+    /// and R is released while seat B stays untouched.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn carrier_under_another_seats_root_is_not_evidence() {
+        let db = test_db();
+        let work = tempfile::tempdir().unwrap();
+        let name = orphan_fixtures::unique("foreign-root");
+        insert_row(&db, &name, "active", Some(dead_pid()));
+        set_omp_session(&db, &name, &format!("{name}-session-s"));
+        age_row(&db, &name);
+        let seat_b = orphan_fixtures::spawn_session_seat(
+            work.path(),
+            &format!("{name}-session-t"),
+            &name,
+            "seat-b",
+        );
+
+        assert_eq!(
+            classify_row(&db, &name, &[seat_b.carrier]),
+            CarrierVerdict::Orphaned(vec![OrphanCarrier {
+                pid: seat_b.carrier,
+                comm: orphan_fixtures::comm_of(seat_b.carrier),
+                ppid: Some(seat_b.holder),
+            }])
+        );
+        let swept = sweep_vanished_instances(&db);
+        assert!(
+            swept.contains(&name),
+            "foreign-rooted carrier held R: {swept:?}"
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert_eq!(orphan_fixtures::stopped_events(&db, &name).len(), 1);
+        assert!(
+            seat_b.alive(seat_b.holder) && seat_b.alive(seat_b.carrier),
+            "seat B was signalled"
+        );
     }
 }

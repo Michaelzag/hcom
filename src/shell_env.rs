@@ -467,11 +467,28 @@ mod tests {
             &shell,
             &cmd,
             "process-group-test",
-            Duration::from_millis(500),
+            // The `-lic` shell runs its rc files before the command; a tight
+            // budget can kill it before `printf` ever runs on a loaded host,
+            // and the pid file is then never written. The shell sleeps 30s,
+            // so this still exercises the timeout path.
+            Duration::from_secs(10),
         );
 
         assert!(output.is_none());
-        let pids = fs::read_to_string(pid_file).unwrap();
+        // The kill lands between the shell's spawn and its first command on
+        // a slow host; give the write a beat to appear before reading it.
+        let mut pids = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pids.is_empty() {
+            pids = fs::read_to_string(&pid_file).unwrap_or_default();
+            assert!(
+                !pids.is_empty() || std::time::Instant::now() < deadline,
+                "the shell never wrote its pid before the timeout killed it"
+            );
+            if pids.is_empty() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         let shell_pid = pids.trim().parse::<i32>().unwrap();
 
         assert!(wait_for_process_exit(shell_pid));
