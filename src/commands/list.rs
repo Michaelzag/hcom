@@ -544,6 +544,14 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             println!("    {}", context::format_columns(seat));
         }
 
+        // Sender-visible queue depth (ffc-98d2g): messages not yet consumed by
+        // the seat — with omp's ack-on-consume the unread count IS the queue
+        // depth. A seat without mid-run delivery additionally reports the same
+        // phrase as its status detail ("mail queued: N") until its run ends.
+        if unread > 0 {
+            println!("    mail queued: {unread}");
+        }
+
         if verbose_output {
             let session_id = data.session_id.as_deref().unwrap_or("(none)");
             let directory_display = if data.directory.is_empty() {

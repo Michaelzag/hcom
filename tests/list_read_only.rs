@@ -200,6 +200,54 @@ fn list_leaves_dead_inactive_row_in_place() {
     );
 }
 
+/// Sender surface for queued mail (ffc-98d2g): after `hcom send`, the sender
+/// looks at `hcom list` and must see mail that is queued — not yet consumed by
+/// the seat — as `mail queued: N`. The seat's plugin reports the same phrase as
+/// its status detail until the message has entered the seat's context.
+#[test]
+#[cfg(unix)]
+fn list_shows_mail_queued_for_unread_messages() {
+    let h = Hcom::new();
+    let (code, _, stderr) = h.run(["list"]);
+    assert_eq!(code, 0, "schema-init `hcom list` failed: {stderr}");
+
+    let name = format!("queued-mail-{}", std::process::id());
+    seed_stale_instance(&h, &name, "active", None);
+
+    let (code, stdout, stderr) = h.run(["list"]);
+    assert_eq!(
+        code, 0,
+        "`hcom list` failed:\n-- stdout --\n{stdout}\n-- stderr --\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("mail queued:"),
+        "no queue line without unread mail:\n{stdout}"
+    );
+
+    // One unconsumed message above the seat's read cursor.
+    fixture_db(&h)
+        .execute(
+            "INSERT INTO events (type, timestamp, instance, data)
+             VALUES ('message', ?1, ?2, ?3)",
+            rusqlite::params![
+                now_epoch_f64().to_string(),
+                name,
+                r#"{"from":"lola","message":"hold the door"}"#,
+            ],
+        )
+        .expect("seed unread message event");
+
+    let (code, stdout, stderr) = h.run(["list"]);
+    assert_eq!(
+        code, 0,
+        "`hcom list` failed:\n-- stdout --\n{stdout}\n-- stderr --\n{stderr}"
+    );
+    assert!(
+        stdout.contains("mail queued: 1"),
+        "sender must see queued mail in `hcom list`:\n{stdout}"
+    );
+}
+
 /// Seed a LOCAL launch placeholder: session_id NULL, status `pending`,
 /// context `new` — exactly `is_launching_placeholder`'s check — created ten
 /// minutes ago, so it is stale for the placeholder threshold while its
