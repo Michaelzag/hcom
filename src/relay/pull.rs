@@ -1991,6 +1991,54 @@ mod tests {
             )
             .unwrap();
 
+        // Acceptance: after x moves from A to B, a sender on A reaches x
+        // with bare @x, and x's bare-name reply returns to that sender on A.
+        seed(&db_a, "sender-a", None);
+        exchange(&db_b, uuids[1], &db_a, uuids[0]);
+        exchange(&db_a, uuids[0], &db_b, uuids[1]);
+        use_side(0);
+        let sender_on_a = sender("sender-a", SenderKind::Instance);
+        assert_eq!(identity::cli_target(&db_a, "x").unwrap(), x_b);
+        assert_eq!(
+            send_message(&db_a, &sender_on_a, "@x from-A-after-move", None, None).unwrap(),
+            vec![x_b.clone()],
+            "A's bare @x must address x launched fresh on B"
+        );
+        exchange(&db_a, uuids[0], &db_b, uuids[1]);
+        assert!(
+            unread(&db_b, "x", "@x from-A-after-move"),
+            "A's bare @x must reach x on B"
+        );
+        assert!(
+            !unread(&db_a, "sender-a", "@x from-A-after-move"),
+            "A's bare @x must not reach another seat on A"
+        );
+        seed(&db_c, "x", None);
+        exchange(&db_a, uuids[0], &db_c, uuids[2]);
+        assert!(
+            !unread(&db_c, "x", "@x from-A-after-move"),
+            "A's bare @x must not reach another x on C"
+        );
+        db_c.delete_instance("x").unwrap();
+
+        use_side(1);
+        let moved_sender = sender("x", SenderKind::Instance);
+        let sender_a_on_b = format!("sender-a:{short_a}");
+        assert_eq!(
+            identity::cli_target(&db_b, "sender-a").unwrap(),
+            sender_a_on_b
+        );
+        assert_eq!(
+            send_message(&db_b, &moved_sender, "@sender-a reply-to-A", None, None).unwrap(),
+            vec![sender_a_on_b],
+            "B's bare @sender-a must address its sender on A"
+        );
+        exchange(&db_b, uuids[1], &db_a, uuids[0]);
+        assert!(
+            unread(&db_a, "sender-a", "@sender-a reply-to-A"),
+            "B's bare-name reply must reach its sender on A"
+        );
+
         // A third device addresses moved B by bare name, and B replies by
         // the sender's bare name after both sides import real relay states.
         seed(&db_c, "sender", None);
@@ -2007,7 +2055,6 @@ mod tests {
         assert!(unread(&db_b, "x", "@x from-third"));
 
         use_side(1);
-        let moved_sender = sender("x", SenderKind::Instance);
         let sender_on_b = format!("sender:{short_c}");
         assert_eq!(
             send_message(&db_b, &moved_sender, "@sender reply", None, None).unwrap(),
