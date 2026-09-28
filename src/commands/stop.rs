@@ -91,12 +91,15 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         let mut failed_names = Vec::new();
         let mut skipped_names = Vec::new();
         let mut bg_logs = Vec::new();
+        let mut orphan_notes = Vec::new();
 
         for (inst, binding_ids) in &instances {
             let display = get_full_name(inst);
             // The release reaps the whole tree first; a failure means live
             // processes remain, so the name must not be reported as stopped.
-            match stop_read_instance(db, inst, binding_ids, &launcher, "stop_all") {
+            let (outcome, released) =
+                stop_read_instance(db, inst, binding_ids, &launcher, "stop_all");
+            match outcome {
                 outcome if outcome.is_re_registered() => {
                     eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
                     skipped_names.push(display.clone());
@@ -104,6 +107,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 crate::hooks::common::StopOutcome::Stopped
                 | crate::hooks::common::StopOutcome::AlreadyStopped => {
                     stopped_names.push(display.clone());
+                    orphan_notes.extend(released.iter().map(|(name, orphans)| {
+                        crate::proctruth::describe_unsignalled_orphans(name, orphans)
+                    }));
                 }
                 crate::hooks::common::StopOutcome::RetryableError(e) => {
                     eprintln!("Error stopping {display}: {e}");
@@ -121,6 +127,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         } else {
             if !stopped_names.is_empty() {
                 println!("Stopped: {}", stopped_names.join(", "));
+            }
+            for note in &orphan_notes {
+                println!("{note}");
             }
             if !failed_names.is_empty() {
                 eprintln!("Failed to stop: {}", failed_names.join(", "));
@@ -193,10 +202,13 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         let mut failed_names = Vec::new();
         let mut skipped_names = Vec::new();
         let mut bg_logs = Vec::new();
+        let mut orphan_notes = Vec::new();
 
         for (inst, binding_ids) in &tag_matches {
             let display = get_full_name(inst);
-            match stop_read_instance(db, inst, binding_ids, &launcher, "tag_stop") {
+            let (outcome, released) =
+                stop_read_instance(db, inst, binding_ids, &launcher, "tag_stop");
+            match outcome {
                 outcome if outcome.is_re_registered() => {
                     eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
                     skipped_names.push(display.clone());
@@ -204,6 +216,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 crate::hooks::common::StopOutcome::Stopped
                 | crate::hooks::common::StopOutcome::AlreadyStopped => {
                     stopped_names.push(display.clone());
+                    orphan_notes.extend(released.iter().map(|(name, orphans)| {
+                        crate::proctruth::describe_unsignalled_orphans(name, orphans)
+                    }));
                 }
                 crate::hooks::common::StopOutcome::RetryableError(e) => {
                     eprintln!("Error stopping {display}: {e}");
@@ -217,6 +232,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
         if !stopped_names.is_empty() {
             println!("Stopped tag:{tag}: {}", stopped_names.join(", "));
+        }
+        for note in &orphan_notes {
+            println!("{note}");
         }
         if !failed_names.is_empty() {
             eprintln!("Failed to stop tag:{tag}: {}", failed_names.join(", "));
@@ -271,6 +289,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         let mut failed_names = Vec::new();
         let mut skipped_names = Vec::new();
         let mut bg_logs = Vec::new();
+        let mut orphan_notes = Vec::new();
 
         for (inst, binding_ids) in &instances_to_stop {
             if is_remote_instance(inst) {
@@ -278,7 +297,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 continue;
             }
             let display = get_full_name(inst);
-            match stop_read_instance(db, inst, binding_ids, &launcher, "multi_stop") {
+            let (outcome, released) =
+                stop_read_instance(db, inst, binding_ids, &launcher, "multi_stop");
+            match outcome {
                 outcome if outcome.is_re_registered() => {
                     eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
                     skipped_names.push(display.clone());
@@ -286,6 +307,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 crate::hooks::common::StopOutcome::Stopped
                 | crate::hooks::common::StopOutcome::AlreadyStopped => {
                     stopped_names.push(display.clone());
+                    orphan_notes.extend(released.iter().map(|(name, orphans)| {
+                        crate::proctruth::describe_unsignalled_orphans(name, orphans)
+                    }));
                 }
                 crate::hooks::common::StopOutcome::RetryableError(e) => {
                     eprintln!("Error stopping {display}: {e}");
@@ -299,6 +323,9 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
         if !stopped_names.is_empty() {
             println!("Stopped: {}", stopped_names.join(", "));
+        }
+        for note in &orphan_notes {
+            println!("{note}");
         }
         if !failed_names.is_empty() {
             eprintln!("Failed to stop: {}", failed_names.join(", "));
@@ -383,7 +410,8 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
     // The release reaps the whole tree first; on failure the name stays
     // live and must not be reported as stopped.
-    match stop_read_instance(db, &position, &binding_ids, &launcher, reason) {
+    let (outcome, released) = stop_read_instance(db, &position, &binding_ids, &launcher, reason);
+    match outcome {
         outcome if outcome.is_re_registered() => {
             eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
             return 1;
@@ -401,6 +429,12 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
     } else {
         println!("Stopped hcom for {display}.");
     }
+    for (name, orphans) in &released {
+        println!(
+            "{}",
+            crate::proctruth::describe_unsignalled_orphans(name, orphans)
+        );
+    }
 
     if position.background != 0 && !position.background_log_file.is_empty() {
         println!("\nHeadless log: {}", position.background_log_file);
@@ -413,32 +447,139 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 /// `binding_ids` are one snapshot, and the release refuses anything that
 /// registered under the name since (a `start --as` replacement or a rebind),
 /// which is reported skipped and never stopped.
+///
+/// A row with no live root whose only live carriers are orphans is released
+/// with no signal to anyone ([`crate::proctruth::orphan_only_release`]), and
+/// so is any such child row the stop reaches. Every row released that way
+/// comes back with its orphans for the caller to list, this row first.
 fn stop_read_instance(
     db: &HcomDb,
     inst: &crate::db::InstanceRow,
     binding_ids: &[String],
     initiator: &str,
     reason: &str,
-) -> crate::hooks::common::StopOutcome {
+) -> (
+    crate::hooks::common::StopOutcome,
+    crate::proctruth::OrphanReleases,
+) {
+    match capture_for_stop(db, inst, binding_ids) {
+        Ok((capture, orphans)) => {
+            release_captured(db, &inst.name, initiator, reason, capture, orphans)
+        }
+        Err(e) => (
+            crate::hooks::common::StopOutcome::RetryableError(e.into()),
+            Vec::new(),
+        ),
+    }
+}
+
+/// Run the stop `capture` gates, then gather every row it released with no
+/// signal: `name` itself when `orphans` is non-empty, then its children.
+fn release_captured(
+    db: &HcomDb,
+    name: &str,
+    initiator: &str,
+    reason: &str,
+    capture: crate::proctruth::ReapCapture,
+    orphans: Vec<crate::proctruth::OrphanCarrier>,
+) -> (
+    crate::hooks::common::StopOutcome,
+    crate::proctruth::OrphanReleases,
+) {
+    let (outcome, children) = crate::hooks::common::stop_instance_with_capture_listing_orphans(
+        db, name, initiator, reason, capture,
+    );
+    let mut released = Vec::new();
+    if !orphans.is_empty() {
+        released.push((name.to_string(), orphans));
+    }
+    released.extend(children);
+    (outcome, released)
+}
+
+/// Release `name`'s row with no signal to anyone when it has no live root
+/// and its only live carriers are orphans — the release the daemon sweep
+/// performs on its own. None when there is no row or the row is not
+/// orphan-only (nothing was done, so a live row gets the caller's plain
+/// refusal); otherwise every row released that way (this one first, then
+/// any orphan-only children) with the orphans left running, or an error:
+/// the row could not be read, the capture refused (the F2 foreign-owner
+/// guard), or the release did not land.
+pub(crate) fn release_orphaned_row(
+    db: &HcomDb,
+    name: &str,
+    initiator: &str,
+    reason: &str,
+) -> Option<Result<crate::proctruth::OrphanReleases, String>> {
+    let (row, binding_ids) = match db.get_instance_with_bindings(name) {
+        Ok(read) => read,
+        Err(e) => return Some(Err(format!("could not read instance {name}: {e}"))),
+    };
+    let row = row?;
+    // Classify first, read-only: a row with a live root never reaches the
+    // capture, so its refusal stays the caller's plain one.
+    crate::proctruth::orphaned_row_carriers(db, &row, &binding_ids)?;
+    let (capture, orphans) = match capture_for_stop(db, &row, &binding_ids) {
+        Ok(captured) => captured,
+        Err(e) => return Some(Err(e)),
+    };
+    // The carriers changed since the classification: not orphan-only now.
+    if !capture.signal_free() {
+        return None;
+    }
+    match release_captured(db, name, initiator, reason, capture, orphans) {
+        (
+            crate::hooks::common::StopOutcome::Stopped
+            | crate::hooks::common::StopOutcome::AlreadyStopped,
+            released,
+        ) => Some(Ok(released)),
+        (crate::hooks::common::StopOutcome::RetryableError(e), _) => Some(Err(e.to_string())),
+    }
+}
+
+/// The capture a stop of `inst` threads, and the orphans it leaves running.
+/// The capture is the gate: a refusal (`Err`, the F2 foreign-owner guard)
+/// means the stop sends nothing and leaves the row and its bindings
+/// untouched; the caller's existing error channel prints the owner named in
+/// the message and exits 1. When the row has no live root and every live
+/// carrier is an orphan, the capture becomes a signal-free release and the
+/// orphans are returned; otherwise they are empty.
+fn capture_for_stop(
+    db: &HcomDb,
+    inst: &crate::db::InstanceRow,
+    binding_ids: &[String],
+) -> Result<
+    (
+        crate::proctruth::ReapCapture,
+        Vec<crate::proctruth::OrphanCarrier>,
+    ),
+    String,
+> {
     let owners = crate::proctruth::omp_owner_bindings(db, &inst.name);
-    // The capture is the gate: a refusal returns here, before the headless
-    // group signal, the reap, and the release, leaving the row and its
-    // bindings untouched. The caller's existing error channel prints the
-    // owner named in the message and exits 1.
-    let capture = match crate::proctruth::capture_reap_carriers(
+    let capture = crate::proctruth::capture_reap_carriers(
         db,
         &inst.name,
         Some(inst),
         binding_ids,
         &owners,
         &[],
-    ) {
-        Ok(capture) => capture,
-        Err(e) => {
-            return crate::hooks::common::StopOutcome::RetryableError(e.to_string().into());
+    )
+    .map_err(|e| e.to_string())?;
+    match crate::proctruth::orphan_only_release(db, inst, binding_ids, capture) {
+        Ok((capture, orphans)) => {
+            log_info(
+                "lifecycle",
+                "stop.orphan_release",
+                &format!(
+                    "name={} orphans={:?}: no live root, releasing without signals",
+                    inst.name,
+                    orphans.iter().map(|o| o.pid).collect::<Vec<_>>()
+                ),
+            );
+            Ok((capture, orphans))
         }
-    };
-    crate::hooks::common::stop_instance_with_capture(db, &inst.name, initiator, reason, capture)
+        Err(capture) => Ok((capture, Vec::new())),
+    }
 }
 
 /// Print a stop preview for any scope (all, tag, or named targets).
@@ -574,5 +715,49 @@ mod tests {
     #[serial]
     fn single_stop_spares_a_replacement_landing_after_its_read() {
         assert_stop_spares_a_replacement(&["stop-target"]);
+    }
+
+    /// The henu shape: no live root, one carrier reparented to the user's
+    /// subreaper. The stop releases the row with the same stopped record as
+    /// any stop, names the orphan it left running, and signals nobody.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial]
+    fn stop_releases_a_root_less_row_without_signalling_its_orphan() {
+        use crate::proctruth::orphan_fixtures;
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = orphan_fixtures::unique("stop");
+        let session = format!("{name}-session");
+        orphan_fixtures::seed_seat_row(&db, &name, &session, dir.path());
+        let orphan = orphan_fixtures::spawn_orphan(&name);
+
+        let (row, binding_ids) = db.get_instance_with_bindings(&name).unwrap();
+        let row = row.expect("seeded row");
+        let (outcome, released) = stop_read_instance(&db, &row, &binding_ids, "test", "stopped");
+
+        assert_eq!(outcome, crate::hooks::common::StopOutcome::Stopped);
+        let orphans = vec![crate::proctruth::OrphanCarrier {
+            pid: orphan.carrier,
+            comm: orphan_fixtures::comm_of(orphan.carrier),
+            ppid: Some(orphan.standin),
+        }];
+        assert_eq!(released, vec![(name.clone(), orphans.clone())]);
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert!(db.process_binding_ids(&name).unwrap().is_empty());
+        let stopped = orphan_fixtures::stopped_events(&db, &name);
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert_eq!(stopped[0]["by"], "test");
+        assert!(
+            orphan.alive(orphan.carrier),
+            "the stop signalled the orphan"
+        );
+        assert!(orphan.alive(orphan.standin));
+
+        let note = crate::proctruth::describe_unsignalled_orphans(&name, &orphans);
+        assert!(note.starts_with("Not signalled"), "{note}");
+        assert!(note.contains(&format!("pid {}", orphan.carrier)), "{note}");
     }
 }

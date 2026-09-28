@@ -428,12 +428,33 @@ pub(crate) fn prepare_resume_plan(
 /// the hcom name is still live (or held), unless forking under a fresh name.
 /// Both paths gate on the same name so a UUID resume never slips past the
 /// live check that a name resume would hit.
+///
+/// A non-inactive row with no live root whose only live carriers are
+/// orphans is not live: it is released here with no signal to anyone
+/// ([`crate::commands::stop::release_orphaned_row`]), and the resume goes on
+/// from the stopped snapshot that release writes. That is the same release
+/// the daemon sweep performs on its own, so it is safe even in the AI-tool
+/// preview path.
 fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
     if !fork
         && let Ok(Some(inst)) = db.get_instance_full(name)
         && inst.status != ST_INACTIVE
     {
-        bail!("'{}' is still active — run hcom kill {} first", name, name);
+        match crate::commands::stop::release_orphaned_row(db, name, "resume", "orphaned") {
+            Some(Ok(released)) => {
+                for (released_name, orphans) in &released {
+                    eprintln!(
+                        "{}",
+                        crate::proctruth::describe_unsignalled_orphans(released_name, orphans)
+                    );
+                }
+                eprintln!(
+                    "Released '{name}': no live process roots it, so its row was stale; resuming."
+                );
+            }
+            Some(Err(e)) => bail!("{e}"),
+            None => bail!("'{}' is still active — run hcom kill {} first", name, name),
+        }
     }
     // Process truth gates the spawn: even with the row stopped, a
     // still-running prior subtree (orphan) or a live holder of the
@@ -4783,6 +4804,10 @@ mod tests {
                 rusqlite::params![start + 3600.0],
             )
             .unwrap();
+        // Rooted: the row's recorded pid is this live test process, the
+        // sleeper's parent, so the sleeper is a carrier of a live root and
+        // the binding-epoch rule decides (an unrooted one is no evidence).
+        db.update_instance_pid(&orphan_name, pid_tag).unwrap();
         let err = prepare_resume_plan(&db, &orphan_name, false, &[], &GlobalFlags::default())
             .err()
             .expect("orphan must refuse resume")
@@ -5658,6 +5683,17 @@ mod tests {
             let db_path = store.path().join("race.db");
             let db = HcomDb::open_raw(&db_path).unwrap();
             db.init_db().unwrap();
+            // The writer below holds BEGIN IMMEDIATE for a wall-clock window,
+            // and this connection queues behind it on the same write lock. The
+            // 5s default covers the lock itself, not a writer thread that
+            // waits minutes for CPU on a saturated host: a timeout surfaces
+            // as "database is locked" instead of the refusal under test.
+            // Whichever interleaving runs — serialized behind the writer, or
+            // the writer already committed — the append must see the
+            // registration and refuse it.
+            db.conn()
+                .execute_batch("PRAGMA busy_timeout=60000;")
+                .unwrap();
             write_omp_session_file(&format!("2026-01-01T00-00-00Z_{OMP_EARLIER_SID}.jsonl"));
             let a_dir = home.join("seat-dir");
             std::fs::create_dir_all(&a_dir).unwrap();
@@ -5926,5 +5962,83 @@ mod tests {
         ]);
         assert!(take_restore_earlier_flag(&mut args));
         assert_eq!(args, s(&["--tag", "x", "--tag=y"]));
+    }
+
+    /// The henu row a dead seat left: `listening`, no pid, its own session,
+    /// a dead minted binding, and an OLDER stopped snapshot of another
+    /// session under the same name. Returns the row's session id.
+    #[cfg(target_os = "linux")]
+    fn seed_dead_seat(db: &HcomDb, name: &str, directory: &std::path::Path) -> String {
+        insert_stopped_snapshot(db, name, EXACT_SESSION_A, 0);
+        let session = format!("{name}-session");
+        crate::proctruth::orphan_fixtures::seed_seat_row(db, name, &session, directory);
+        session
+    }
+
+    /// `hcom r` on the henu shape: the row has no live root and its only
+    /// carrier is an orphan, so the resume releases the row (no signal),
+    /// passes the spawn gate, and resumes the row's OWN session, not the
+    /// older snapshot's.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial]
+    fn resume_releases_a_root_less_row_held_only_by_orphans() {
+        use crate::proctruth::orphan_fixtures;
+        with_omp_home(|_| {
+            let db = test_db();
+            let work = tempfile::tempdir().unwrap();
+            let name = orphan_fixtures::unique("resume");
+            let session = seed_dead_seat(&db, &name, work.path());
+            // The seat's transcript is on disk; nothing holds it open.
+            write_omp_session_file(&format!("{session}.jsonl"));
+            let orphan = orphan_fixtures::spawn_orphan(&name);
+
+            let plan = prepare_resume_plan(&db, &name, false, &[], &GlobalFlags::default())
+                .unwrap_or_else(|e| panic!("an orphan-held row must resume: {e}"));
+
+            assert_eq!(plan.session_id, session);
+            assert!(db.get_instance_full(&name).unwrap().is_none());
+            let stopped = orphan_fixtures::stopped_events(&db, &name);
+            let released = stopped.last().expect("the release's stopped record");
+            assert_eq!(released["by"], "resume");
+            assert_eq!(released["reason"], "orphaned");
+            assert_eq!(released["snapshot"]["session_id"], session.as_str());
+            assert!(
+                orphan.alive(orphan.carrier),
+                "the resume signalled the orphan"
+            );
+            assert!(orphan.alive(orphan.standin));
+        });
+    }
+
+    /// The same row, but its carrier descends from a live holder of the
+    /// row's session transcript: the seat is live, and the resume refuses
+    /// with the existing message, leaving row, binding, and seat alone.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial]
+    fn resume_still_refuses_a_row_rooted_under_its_session_holder() {
+        use crate::proctruth::orphan_fixtures;
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        let work = tempfile::tempdir().unwrap();
+        let name = orphan_fixtures::unique("resume-live");
+        let session = seed_dead_seat(&db, &name, work.path());
+        let bindings = db.process_binding_ids(&name).unwrap();
+        let seat = orphan_fixtures::spawn_session_seat(work.path(), &session, &name, "omp");
+
+        let err = prepare_resume_plan(&db, &name, false, &[], &GlobalFlags::default())
+            .err()
+            .expect("a live seat must refuse resume")
+            .to_string();
+
+        assert!(
+            err.contains(&format!("'{name}' is still active")),
+            "unexpected error: {err}"
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_eq!(db.process_binding_ids(&name).unwrap(), bindings);
+        assert_eq!(orphan_fixtures::stopped_events(&db, &name).len(), 1);
+        assert!(seat.alive(seat.holder) && seat.alive(seat.carrier));
     }
 }

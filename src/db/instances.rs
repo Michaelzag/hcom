@@ -685,6 +685,29 @@ impl HcomDb {
             .transpose()
     }
 
+    /// The `snapshot` of `name`'s newest `life.stopped` event whose snapshot
+    /// is an object: the facts the instance's last stop recorded (its pid
+    /// with that pid's incarnation, its session id), for a caller that has
+    /// no row to read them from.
+    pub fn newest_stopped_snapshot(&self, name: &str) -> Result<Option<serde_json::Value>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT json_extract(data, '$.snapshot') FROM events
+                 WHERE type = 'life'
+                   AND instance = ?
+                   AND json_extract(data, '$.action') = 'stopped'
+                   AND json_type(data, '$.snapshot') = 'object'
+                 ORDER BY id DESC LIMIT 1",
+                params![name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        found
+            .map(|snapshot| Ok(serde_json::from_str(&snapshot)?))
+            .transpose()
+    }
+
     /// Convert a row from INSTANCE_COLUMNS SELECT to JSON.
     fn instance_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
         Ok(serde_json::json!({

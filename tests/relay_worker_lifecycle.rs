@@ -64,6 +64,29 @@ fn set_managed(h: &Hcom) {
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
 }
 
+/// Poll the worker's log until `needle` appears. The worker writes its
+/// pidfile before it loads config, so a test that flips worker config the
+/// moment the pidfile appears can race that startup load: started unmanaged
+/// with relay disabled, the worker exits 1 by design. Waiting for its idle
+/// line means that load is behind it and the managed flag is captured.
+// Its only caller is the linux-gated stop test below, so the gate matches it:
+// on Windows this would be dead code under clippy -D warnings.
+#[cfg(unix)]
+fn wait_for_worker_log(h: &Hcom, needle: &str) {
+    let log = h.hcom_dir.join(".tmp").join("logs").join("hcom.log");
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        if std::fs::read_to_string(&log).is_ok_and(|contents| contents.contains(needle)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "relay-worker never logged {needle}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Launch `relay-worker` from `cmd` and wait until its pidfile names it.
 fn start_worker(h: &Hcom, mut cmd: Command) -> Worker {
     cmd.arg("relay-worker")
@@ -241,9 +264,12 @@ fn replaced_binary_makes_worker_exit() {
     std::fs::copy(env!("CARGO_BIN_EXE_hcom"), &replacement).unwrap();
     std::fs::rename(&replacement, &running).unwrap();
 
+    // The exit is prompt (a 1s replacement-check tick), but the budget also
+    // covers IO-loaded hosts where the worker's shutdown-path SQLite close
+    // stalls; the assertion is the exit itself, not the deadline.
     let status = worker
-        .wait_exit(Duration::from_secs(3))
-        .expect("relay-worker did not exit within 3s of binary replacement");
+        .wait_exit(Duration::from_secs(10))
+        .expect("relay-worker did not exit within 10s of binary replacement");
     assert!(status.success(), "status={status}");
     assert!(!pid_file(&h).exists(), "pidfile left behind after exit");
 }
@@ -308,6 +334,11 @@ fn unmanaged_daemon_stop_stops_running_worker() {
     // Start managed so the worker idles without a broker, then hand it to hcom.
     set_managed(&h);
     let mut worker = start_worker(&h, h.cmd());
+    // The worker writes its pidfile before it loads config: flipping managed
+    // before that load starts it unmanaged, where "relay not configured"
+    // exits 1 by design and the stop below has nothing to stop. Wait until
+    // the worker captured managed=true and is idling.
+    wait_for_worker_log(&h, "relay_worker.idle");
     let (code, stdout, stderr) = h.run(["config", "relay_worker_managed", "false"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
 
