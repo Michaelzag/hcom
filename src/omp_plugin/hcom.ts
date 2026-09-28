@@ -168,8 +168,28 @@ function hcom(args: string[]): Promise<HcomResult> {
 	});
 }
 
-function formatMessagesForInjection(messages: any[], recipientName: string): string {
-	const parts = messages.map((m: any) => {
+// Per-delivery consume marker: the delivered message embeds this token and the
+// ack-on-consume matcher looks for the exact token on the message omp injects.
+// 128 random bits make a marker-looking string forged anywhere (tool result,
+// other message) unguessable, and the role/customType gate rejects those anyway.
+function newDeliveryMarker(): string {
+	return `[hcom-ack:${randomBytes(8).toString("hex")}]`;
+}
+
+type PendingMailMessage = {
+	event_id: number;
+	from: string;
+	message: string;
+	intent?: string;
+	thread?: string | null;
+};
+
+function formatMessagesForInjection(
+	messages: PendingMailMessage[],
+	recipientName: string,
+	ackMarker: string,
+): string {
+	const parts = messages.map((m) => {
 		const prefix = m.intent
 			? m.thread
 				? `[${m.intent}:${m.thread} #${m.event_id}]`
@@ -179,8 +199,54 @@ function formatMessagesForInjection(messages: any[], recipientName: string): str
 				: `[new message #${m.event_id}]`;
 		return `${prefix} ${m.from} -> ${recipientName}: ${m.message}`;
 	});
-	if (messages.length === 1) return `<hcom>${parts[0]}</hcom>`;
-	return `<hcom>[${messages.length} new messages] | ${parts.join(" | ")}</hcom>`;
+	if (messages.length === 1) return `<hcom>${parts[0]} ${ackMarker}</hcom>`;
+	return `<hcom>[${messages.length} new messages] | ${parts.join(" | ")} ${ackMarker}</hcom>`;
+}
+
+// The custom message type the busy-seat aside delivery rides. It is the
+// harness-authored mid-run notice channel (the same shape omp itself uses for
+// its own asides, e.g. ttsr-injection), never a tool result: tool results carry
+// untrusted bytes, so mail there could not be told apart from a forged <hcom>
+// block (ffc-98d2g ruling: mail's authority depends on an unspoofable channel).
+const HCOM_MAIL_CUSTOM_TYPE = "hcom-mail";
+
+// `deliverAs: "aside"` exists on the extension API from omp 18.1.6 (the release
+// whose CHANGELOG advertises "non-interrupting extension messages through
+// deliverAs: \"aside\" for pi.sendMessage and pi.sendUserMessage"). On older omp
+// (SDK 17.0.6) an unknown deliverAs falls through to prompt() with steer-on-
+// stream behavior, so the busy lane may only use aside when the running runtime
+// is >= 18.1.6; anything else takes the followUp fallback below.
+export function asideSupportedForVersion(raw: string | null | undefined): boolean {
+	const match = /^(?:omp\/)?v?(\d+)\.(\d+)\.(\d+)/.exec((raw ?? "").trim());
+	if (!match) return false;
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	const patch = Number(match[3]);
+	if (major !== 18) return major > 18;
+	if (minor !== 1) return minor > 1;
+	return patch >= 6;
+}
+
+// Two documented version surfaces, best first: `omp --version` (cli.ts prints
+// `omp/<VERSION>` — the same value every install reports) via pi.exec, then the
+// SDK's VERSION export (re-exported from @oh-my-pi/pi-utils, host-resolved to
+// the running runtime by omp's extension loader). An unparseable answer from
+// either falls through; when neither answers, report unsupported and take the
+// fallback — the safe direction: the fallback never risks the old steer-on-stream
+// path and still delivers and acks correctly, just at the run's end.
+
+function messageContentText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (Array.isArray(content)) {
+		return content
+			.map((part: unknown) =>
+				part && typeof part === "object" && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string"
+					? part.text
+					: "",
+			)
+			.join("");
+	}
+	return "";
 }
 
 function isBodylessWake(text: string): boolean {
@@ -637,6 +703,17 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	// also be acknowledged.
 	const compactGate = createCompactGate();
 	let pendingAckId: number | null = null;
+	// Ack-on-consume state for the one outstanding delivery. pendingAckId is the
+	// delivery gate AND the ack target (the batch's max event id); the cursor
+	// must not advance until the consumed flag is set by a marker-matched
+	// consume event — hcom "delivered" means in the session, never in omp's queue.
+	let pendingAckMarker: string | null = null;
+	let pendingAckRole: "user" | "custom" | null = null;
+	let pendingAckConsumed = false;
+	// The bodyless-wake transform rewrote input into our delivery text; the
+	// submitted turn proves that text entered the session (see before_agent_start).
+	let transformAckArmed = false;
+	let asideSupportPromise: Promise<boolean> | null = null;
 	let ackInFlight: Promise<boolean> | null = null;
 	let bindingGeneration = 0;
 	let deliveryInFlight = false;
@@ -660,6 +737,44 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	function isBoundSession(candidateSessionId?: string | null): boolean {
 		return !candidateSessionId || !sessionId || candidateSessionId === sessionId;
+	}
+
+	// Detect `deliverAs: "aside"` support on the RUNNING host; see
+	// asideSupportedForVersion for the 18.1.6 gate. Cached per instance.
+	function asideSupported(): Promise<boolean> {
+		asideSupportPromise ??= (async () => {
+			try {
+				const result = await pi.exec("omp", ["--version"]);
+				if (/^(?:omp\/)?v?\d/.test(result.stdout.trim())) return asideSupportedForVersion(result.stdout);
+			} catch {}
+			// Dynamic on purpose: this must resolve to the RUNNING host's module
+			// at probe time (omp's extension loader rewrites the bare specifier
+			// to the in-process host), and a static import would kill the whole
+			// extension at load on a host that cannot resolve it — the fallback
+			// must survive.
+			try {
+				const sdk = (await import("@oh-my-pi/pi-coding-agent")) as { VERSION?: unknown };
+				if (typeof sdk.VERSION === "string" && asideSupportedForVersion(sdk.VERSION)) return true;
+			} catch {}
+			return false;
+		})();
+		return asideSupportPromise;
+	}
+
+	// Consume proof for THIS plugin's outstanding delivery: the harness-authored
+	// message omp injected, matched on role/customType first — a marker-looking
+	// string in a tool result or any other message must never ack or count as
+	// mail — then on the exact per-delivery marker embedded in the text.
+	function isOwnConsumedMessage(message: unknown): boolean {
+		if (pendingAckId === null || pendingAckConsumed || !pendingAckMarker || !pendingAckRole) return false;
+		if (!message || typeof message !== "object" || !("role" in message)) return false;
+		const candidate: { role: unknown; customType?: unknown; content?: unknown } = message;
+		if (pendingAckRole === "custom") {
+			if (candidate.role !== "custom" || candidate.customType !== HCOM_MAIL_CUSTOM_TYPE) return false;
+		} else if (candidate.role !== "user") {
+			return false;
+		}
+		return messageContentText(candidate.content).includes(pendingAckMarker);
 	}
 
 	// One reply line for hcom's `list --context` query (`{"q":"context"}\n`).
@@ -938,38 +1053,73 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		try {
 			const pending = await fetchPending();
 			if (!pending) return false;
-			const formatted = formatMessagesForInjection(pending.messages, instanceName);
+			const marker = newDeliveryMarker();
+			const formatted = formatMessagesForInjection(pending.messages, instanceName, marker);
+			// Gate the next delivery AND record what consumption must later ack.
+			// The durable ack does NOT run here: hcom records "delivered" only
+			// when the message has entered the session's context (ffc-98d2g).
 			pendingAckId = pending.maxId;
+			pendingAckMarker = marker;
+			pendingAckConsumed = false;
+			transformAckArmed = false;
 			try {
 				const isIdle = ctx.isIdle();
+				let mode: "idle" | "aside" | "fallback";
 				if (isIdle) {
+					// Idle seats are unchanged: sendUserMessage starts a turn and
+					// the message enters the context at that turn.
+					mode = "idle";
+					pendingAckRole = "user";
 					await pi.sendUserMessage(formatted);
+				} else if (await asideSupported()) {
+					// Busy lane, omp >= 18.1.6: deliverAs "aside" rides the
+					// harness-authored mid-run notice channel — a separate custom
+					// message injected at the next agent step boundary without
+					// interrupting the in-flight tool batch (extensions/types.ts
+					// sendMessage docs; the same channel omp itself uses for its
+					// own mid-run asides). It is NEVER appended into a tool
+					// result: tool results carry untrusted bytes, so mail there
+					// could not be told apart from a forged <hcom> block (the
+					// ffc-98d2g ruling bans the tool-result rewrite outright).
+					// customType hcom-mail plus the per-delivery marker give the
+					// ack-on-consume matcher an unspoofable identity.
+					mode = "aside";
+					pendingAckRole = "custom";
+					await pi.sendMessage(
+						{ customType: HCOM_MAIL_CUSTOM_TYPE, content: formatted, display: true },
+						{ deliverAs: "aside" },
+					);
 				} else {
-					// Busy lane: `followUp`. The omp aside channel ("injected at
-					// the next step boundary without interrupting") is internal
-					// only — IRC records, advisor nits, job completions. The
-					// extension API (SendUserMessageHandler in SDK 17.0.6) accepts
-					// just `steer` | `followUp`, so `aside` never typechecked, and
-					// worse, at runtime the session falls an unknown deliverAs
-					// through to prompt() with steer-on-stream behavior — the old
-					// code steered while claiming not to. `steer` is wrong here:
-					// interrupts and can abort the rest of the tool batch.
-					// `followUp` waits for the run to end (one probe measured
-					// 44 s plus a turn boundary) but delivers visibly and never
-					// interrupts. Revisit if the SDK exposes aside to extensions.
+					// FALLBACK (omp without aside, e.g. the SDK 17.0.6): an
+					// unknown deliverAs there falls through to prompt() with
+					// steer-on-stream behavior — unsafe — so wait as a followUp
+					// (delivers visibly at the run's end, never interrupts) and
+					// say so meanwhile: "mail queued: N" in the status detail
+					// both to the seat and, via `hcom list`, to the sender.
+					mode = "fallback";
+					pendingAckRole = "user";
 					await pi.sendUserMessage(formatted, { deliverAs: "followUp" });
 				}
 				const sender = String(pending.messages[0]?.from ?? "");
-				await reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver");
+				const queuedDetail = mode === "fallback" ? `mail queued: ${pending.messages.length}` : "";
+				await reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver", queuedDetail);
 				log("INFO", "plugin.delivery_pending", instanceName, {
 					count: pending.messages.length,
 					pending_ack: pending.maxId,
-					idle: isIdle,
+					mode,
 				});
-				await ackPending(isIdle ? "sendUserMessage" : "followUp");
+				// No ack here: the ack lands when a consume event (message_start,
+				// or the inline-transform submission) proves the message entered
+				// the session.
 				return true;
 			} catch (error) {
-				if (pendingAckId === pending.maxId) pendingAckId = null;
+				if (pendingAckId === pending.maxId) {
+					pendingAckId = null;
+					pendingAckMarker = null;
+					pendingAckRole = null;
+					pendingAckConsumed = false;
+					transformAckArmed = false;
+				}
 				log("ERROR", "plugin.delivery_send_failed", instanceName, { error: String(error) });
 				return false;
 			}
@@ -1004,6 +1154,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		if (probeReason) return false;
 		if (ackInFlight) return ackInFlight;
 		if (!instanceName || pendingAckId === null) return false;
+		// Ack only what has been consumed: the durable cursor must never advance
+		// past a message that has not entered the session. Callers like
+		// reconcile retry blindly; this gate is what makes that safe.
+		if (!pendingAckConsumed) return false;
 		const ackInstance = instanceName;
 		const ackId = pendingAckId;
 		const generation = bindingGeneration;
@@ -1022,6 +1176,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			// succeeded. A reset/rebind invalidates this attempt's local state.
 			if (bindingGeneration === generation && instanceName === ackInstance && pendingAckId === ackId) {
 				pendingAckId = null;
+				pendingAckMarker = null;
+				pendingAckRole = null;
+				pendingAckConsumed = false;
+				transformAckArmed = false;
 				log("INFO", "plugin.deferred_ack", ackInstance, { acked_to: ackId, source });
 				drainPendingDelivery("post_ack_wake");
 			}
@@ -1103,6 +1261,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		bootstrapText = null;
 		bindingPromise = null;
 		pendingAckId = null;
+		pendingAckMarker = null;
+		pendingAckRole = null;
+		pendingAckConsumed = false;
+		transformAckArmed = false;
 		ackInFlight = null;
 		deliveryInFlight = false;
 		deliveryPending = false;
@@ -1227,14 +1389,27 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		await bindIdentity(ctx);
 		if (!instanceName) return {};
 		if (event.source === "extension") {
-			await ackPending("extension");
+			// Acks happen only on consume (message_start or the transform
+			// submission below): an extension-sourced input is not proof that OUR
+			// delivery entered the session, so it must never advance the cursor.
 			return {};
 		}
-		if (isBodylessWake(event.text) && pendingAckId === null) {
+		if (isBodylessWake(event.text)) {
+			// A bare wake is only a wake, never mail: drop it rather than echo a
+			// bodyless <hcom> to the model. When a delivery is already
+			// outstanding it owns the mail, so no second fetch (no duplicates).
+			if (pendingAckId !== null) return { handled: true };
 			const pending = await fetchPending();
 			if (pending) {
+				// Inline transform: omp applies the rewrite INLINE and submits it
+				// (input-controller.ts), so the mail rides this turn's input.
+				const marker = newDeliveryMarker();
 				pendingAckId = pending.maxId;
-				return { text: formatMessagesForInjection(pending.messages, instanceName) };
+				pendingAckMarker = marker;
+				pendingAckRole = "user";
+				pendingAckConsumed = false;
+				transformAckArmed = true;
+				return { text: formatMessagesForInjection(pending.messages, instanceName, marker) };
 			}
 			return { handled: true };
 		}
@@ -1246,15 +1421,19 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		currentCtx = ctx;
 		await bindIdentity(ctx);
 		if (!instanceName) return undefined;
-		// Ack the bodyless-wake transform here. The input handler sets pendingAckId
-		// and returns { text } for a bare <hcom>; omp applies that transform INLINE
-		// and submits it (input-controller.ts) — it never re-emits an input event
-		// with source "extension", so the input handler's extension-ack branch is
-		// dead for the transform path. before_agent_start fires for the submitted
-		// turn, so ack here; otherwise pendingAckId stays set and deliverPending
-		// early-returns forever, permanently jamming delivery. (For the
-		// sendUserMessage path deliverPending already acked, so this no-ops.)
-		if (pendingAckId !== null) await ackPending("before_agent_start");
+		// Consume proof for the bodyless-wake transform: the input handler
+		// rewrote the wake into our delivery text and omp applied that transform
+		// INLINE and submitted it (it never re-emits an input event with source
+		// "extension"). This handler firing for the submitted turn means that
+		// text — the mail — has entered the session, so it may be acked. Scoped
+		// to the armed transform: any other turn starting while a delivery waits
+		// must not ack it. (message_start carries the same marker and acks
+		// idempotently when it emits.)
+		if (pendingAckId !== null && transformAckArmed) {
+			transformAckArmed = false;
+			pendingAckConsumed = true;
+			await ackPending("before_agent_start");
+		}
 		if (!bootstrapText) return undefined;
 		const sid = ctx.sessionManager.getSessionId();
 		if (bootstrapInjectedForSession === sid) return undefined;
@@ -1302,6 +1481,28 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	pi.on("turn_end", async (_event, ctx) => {
 		currentCtx = ctx;
 		await deliverPending(ctx);
+	});
+
+	// Ack-on-consume: message_start fires exactly when the message enters the
+	// model-bound context (agent-loop emitInputMessages pushes it into
+	// currentContext.messages and emits at the step boundary), and message_end
+	// is subscribed as a fallback for hosts that emit only the end event for
+	// input messages. Only OUR delivery's own message — matched on role/
+	// customType plus its unique marker — acks; a marker-looking string in a
+	// tool result or any other message never matches and never acks.
+	pi.on("message_start", async (event, ctx) => {
+		currentCtx = ctx;
+		if (isOwnConsumedMessage(event.message)) {
+			pendingAckConsumed = true;
+			await ackPending("message_start");
+		}
+	});
+	pi.on("message_end", async (event, ctx) => {
+		currentCtx = ctx;
+		if (isOwnConsumedMessage(event.message)) {
+			pendingAckConsumed = true;
+			await ackPending("message_end");
+		}
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
