@@ -126,6 +126,26 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
         None => return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string()),
     };
 
+    // A late omp-start from the process whose own stop is recorded (its plugin
+    // rebinding while it exits, or a seat stopped from outside) must not
+    // restore the stopped row. A no-op success: a start hook never fails.
+    if let Some(stopped) =
+        instance_binding::stopped_restore_for_own_process(db, &session_id, &process_id)
+    {
+        log_info(
+            "hooks",
+            "omp-start.own_stop_restore_skipped",
+            &format!(
+                "instance={stopped} session_id={session_id} process_id={process_id} \
+                 reason=this process's own stop is recorded; restore left to a new process"
+            ),
+        );
+        return (
+            0,
+            serde_json::json!({"ok": true, "restored": false, "stopped": stopped}).to_string(),
+        );
+    }
+
     let instance_name = match instance_binding::bind_session_to_process(
         db,
         &session_id,

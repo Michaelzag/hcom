@@ -768,6 +768,76 @@ thread_local! {
     static RESTORE_STOPPED_COMMIT_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
 }
 
+/// Whether `process_id` presents the process incarnation the `life.stopped`
+/// event `stop` recorded: the stop's own `process_id`, or an OMP-minted id
+/// whose pid is the snapshot's anchor pid, alive with the snapshot's start
+/// time on the same boot. A launcher-launched seat records its launcher id
+/// on the stop, while its plugin re-mints `omp-<pid>-...` once that id's
+/// binding is gone, so the anchor arm is what recognizes it. Never the bare
+/// pid: a reused pid has a later start time.
+fn stop_recorded_process(
+    stop: &serde_json::Value,
+    process_id: &str,
+    live_identity: &dyn Fn(u32) -> Option<(u64, String)>,
+) -> bool {
+    if stop.get("process_id").and_then(serde_json::Value::as_str) == Some(process_id) {
+        return true;
+    }
+    let Some(pid) = crate::proctruth::omp_minted_pid(process_id) else {
+        return false;
+    };
+    let snapshot = &stop["snapshot"];
+    let (Some(anchor), Some(start_time), Some(boot_id)) = (
+        snapshot.get("pid").and_then(serde_json::Value::as_u64),
+        snapshot
+            .get("pid_start_time")
+            .and_then(serde_json::Value::as_u64),
+        snapshot.get("boot_id").and_then(serde_json::Value::as_str),
+    ) else {
+        return false;
+    };
+    anchor == u64::from(pid)
+        && live_identity(pid)
+            .is_some_and(|(live_start, live_boot)| live_start == start_time && live_boot == boot_id)
+}
+
+/// The omp-start hook's resurrection guard (ffc-vpqoz): the stopped name bind
+/// Path 2 would recreate for `session_id` when `process_id` is the very
+/// process whose stop that was. omp emits `session_shutdown` before it aborts
+/// the agent, so an exiting seat's plugin re-runs omp-start from the aborted
+/// turn's events after its own release; a process stopped from outside was
+/// stopped on purpose. Either way the recorded stop wins. A different process
+/// (a resume, a new launch) restores as before, and so does the same process
+/// returning from a session switch, which moved it rather than stopped it.
+/// Only the automatic hook consults this: an explicit `hcom start` rejoins.
+pub fn stopped_restore_for_own_process(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: &str,
+) -> Option<String> {
+    // A bound session takes Path 1, which never recreates a stopped row.
+    if !matches!(db.get_session_binding(session_id), Ok(None)) {
+        return None;
+    }
+    let (name, stop) = db
+        .find_stopped_event_by_session_id(session_id)
+        .ok()
+        .flatten()?;
+    if stop.get("by").and_then(serde_json::Value::as_str) == Some("session_switch") {
+        return None;
+    }
+    // A row that still exists is not a resurrection.
+    if !matches!(db.get_instance_full(&name), Ok(None)) {
+        return None;
+    }
+    stop_recorded_process(
+        &stop,
+        process_id,
+        &crate::sys::process::procfs_start_identity,
+    )
+    .then_some(name)
+}
+
 /// Bind session_id to canonical instance for process_id.
 /// Handles 4 paths: canonical exists (with placeholder merge/switch), placeholder bind,
 /// and two no-op paths.
@@ -1893,6 +1963,43 @@ mod tests {
             switching.wait().unwrap();
         }
 
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_own_stop_guard_spares_a_session_switch_back() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let snapshot = |sid: &str| serde_json::json!({"session_id": sid, "tool": "omp", "directory": "/tmp/proof-dir"});
+        // The process moved off xrow's session (omp /resume): a switch
+        // release, not a stop, so switching back still restores xrow.
+        db.log_life_event(
+            "xrow",
+            "stopped",
+            "session_switch",
+            "exit:session_switch",
+            Some(snapshot("sid-x")),
+            Some("pid-live"),
+        )
+        .unwrap();
+        assert_eq!(
+            stopped_restore_for_own_process(&db, "sid-x", "pid-live"),
+            None
+        );
+        // A stop of the same process, whoever recorded it, is not undone.
+        db.log_life_event(
+            "yrow",
+            "stopped",
+            "cli",
+            "external",
+            Some(snapshot("sid-y")),
+            Some("pid-live"),
+        )
+        .unwrap();
+        assert_eq!(
+            stopped_restore_for_own_process(&db, "sid-y", "pid-live").as_deref(),
+            Some("yrow")
+        );
         cleanup(path);
     }
 
