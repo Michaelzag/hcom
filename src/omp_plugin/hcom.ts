@@ -233,8 +233,7 @@ export function asideSupportedForVersion(raw: string | null | undefined): boolea
 // the running runtime by omp's extension loader). An unparseable answer from
 // either falls through; when neither answers, report unsupported and take the
 // fallback — the safe direction: the fallback never risks the old steer-on-stream
-// path and still delivers and acks correctly, just at the run's end. Cached per
-// extension instance (never at module scope) so the probe runs once per host.
+// path and still delivers and acks correctly, just at the run's end.
 
 function messageContentText(content: unknown): string {
 	if (typeof content === "string") return content;
