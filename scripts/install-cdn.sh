@@ -227,6 +227,14 @@ trap 'cleanup; release_lock' EXIT
 cp "$TMP/hcom-$TARGET_TRIPLE/hcom" "$STAGED" || die "could not stage the new binary"
 chmod 0755 "$STAGED" || die "could not make the new binary executable"
 
+# The swap is the one part of this script that must not be interrupted. A
+# handler that fired between "old binary moved aside" and "staged binary moved
+# into place" would delete the staged file and exit with NO executable at all, so
+# both signals are ignored for the duration rather than trapped. `mv` within one
+# directory is a rename, so the window is two syscalls wide; the deferred signal
+# is delivered after the swap completes, at which point stopping is correct.
+trap '' INT TERM
+
 # The old bytes move aside before the new ones take its place, so a failure
 # half way through leaves a restorable executable rather than none. The new
 # bytes were staged in the same directory first because rename across a
@@ -242,6 +250,12 @@ else
     mv "$STAGED" "$BIN" || die "could not install $BIN"
 fi
 STAGED=""
+
+# The swap is done and the install is either complete or restored. Re-arm the
+# handler so a signal arriving after this point still stops the script cleanly
+# instead of being silently discarded.
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 release_lock
 
 printf 'hcom %s installed to %s\n' "${VERSION#v}" "$BIN"
