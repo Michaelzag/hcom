@@ -1,6 +1,6 @@
 [package]
 name = "hcom"
-version = "0.7.48"
+version = "0.7.50"
 edition = "2024"
 authors = ["hcom"]
 description = "Connect Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, and Copilot so agents can message, watch, and spawn each other across terminals"
@@ -12,6 +12,13 @@ rust-version = "1.88"
 [[bin]]
 name = "hcom"
 path = "src/main.rs"
+
+[features]
+# Test seam only, deliberately off by default: a release binary built without
+# `--features update-test-manifest` never reads HCOM_UPDATE_MANIFEST_URL and
+# always checks the production latest.json. Remove once the release rehearsal
+# tag is no longer needed.
+update-test-manifest = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
