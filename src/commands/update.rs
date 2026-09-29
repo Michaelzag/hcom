@@ -20,6 +20,12 @@ pub struct UpdateArgs {
     /// Spawned by hcom itself; hidden because it is not a user interface.
     #[arg(long, hide = true)]
     pub refresh_cache: bool,
+
+    /// Install a published release that is OLDER than the running build.
+    /// Needed to step back to a known-good version on purpose; without it a
+    /// rolled-back or re-pointed channel is refused rather than obeyed.
+    #[arg(long)]
+    pub allow_downgrade: bool,
 }
 
 fn print_dev_root_notice(db: &HcomDb) {
@@ -56,14 +62,35 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, _ctx: Option<&CommandContext>
     };
     let info = crate::update::update_info(&manifest);
 
-    if !info.available {
+    // The channel pointer is mutable by whoever holds the publish key, so a
+    // manifest naming an OLDER release than the one running is refused by
+    // default: obeying it would revert the host on every host at once. Stepping
+    // back on purpose is a separate, explicit act.
+    let relation = crate::update::compare_versions(&info.current, &info.latest);
+    if relation == crate::update::VersionRelation::Downgrade && !args.allow_downgrade {
+        eprintln!(
+            "Refusing to downgrade: the release manifest names v{}, but this hcom is v{}.",
+            info.latest, info.current
+        );
+        eprintln!("Pass --allow-downgrade if that is what you meant.");
+        return 1;
+    }
+
+    if !info.available && !args.allow_downgrade {
         println!("hcom v{} is up to date", info.current);
         // Clear stale "update available" cache if it existed
         let _ = crate::paths::atomic_write(&crate::update::flag_path(), "");
         return 0;
     }
 
-    println!("Update available: v{} → v{}", info.current, info.latest);
+    if relation == crate::update::VersionRelation::Downgrade {
+        println!(
+            "Downgrading: v{} → v{} (--allow-downgrade)",
+            info.current, info.latest
+        );
+    } else {
+        println!("Update available: v{} → v{}", info.current, info.latest);
+    }
 
     if args.check {
         println!("Run `{}` to apply.", crate::update::UPDATE_COMMAND);
@@ -81,6 +108,14 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, _ctx: Option<&CommandContext>
         }
         Ok(ApplyOutcome::NoArtifact { platform, version }) => {
             eprintln!("hcom v{version} has no prebuilt archive for {platform}.");
+            if cfg!(target_env = "musl") && platform == "x86_64-linux" {
+                // The published archive is glibc-linked, so this host is
+                // excluded by what it can run, not by what was published.
+                eprintln!(
+                    "This hcom is linked against musl; the published archive needs glibc, \
+                     so installing it would leave an executable that cannot start."
+                );
+            }
             eprintln!();
             eprintln!("{}", crate::update::source_guidance(Some(&version)));
             1
@@ -103,6 +138,10 @@ mod tests {
         let args = UpdateArgs::try_parse_from(["update"]).unwrap();
         assert!(!args.check);
         assert!(!args.refresh_cache);
+        assert!(
+            !args.allow_downgrade,
+            "a downgrade must never be the default"
+        );
     }
 
     #[test]
@@ -110,6 +149,17 @@ mod tests {
         let args = UpdateArgs::try_parse_from(["update", "--check"]).unwrap();
         assert!(args.check);
         assert!(!args.refresh_cache);
+    }
+
+    #[test]
+    fn update_args_allow_downgrade_flag() {
+        let args = UpdateArgs::try_parse_from(["update", "--allow-downgrade"]).unwrap();
+        assert!(args.allow_downgrade);
+        assert!(!args.check);
+        // It composes with --check, so a caller can see what a downgrade would
+        // do before doing it.
+        let both = UpdateArgs::try_parse_from(["update", "--check", "--allow-downgrade"]).unwrap();
+        assert!(both.allow_downgrade && both.check);
     }
 
     #[test]

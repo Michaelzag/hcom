@@ -112,7 +112,14 @@ fn manifest_url() -> anyhow::Result<Cow<'static, str>> {
 /// cannot install for them. Never queried to decide which version is latest.
 pub(crate) const RELEASE_REPO: &str = "Michaelzag/hcom";
 
-/// One release archive: where to fetch it and what its bytes must hash to.
+/// One release archive: where the publisher says it lives, and what its bytes
+/// must hash to.
+///
+/// `url` is never fetched. It is read only to check that it names the one place
+/// a release archive for this version can live — see [`release_archive_url`].
+/// The publisher holds PutObject on the mutable channel pointers, so a manifest
+/// is a document someone with that key can rewrite; obeying a URL in it would
+/// make every host that reads it fetch wherever the rewriter chose.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Artifact {
     pub url: String,
@@ -208,7 +215,20 @@ fn is_sha256_hex(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// The one URL a release archive for `version` and `target` can live at, built
+/// from the fixed CDN base rather than read out of the manifest.
+pub(crate) fn release_archive_url(version: &str, target: &str) -> String {
+    format!("{CDN_BASE_URL}{version}/hcom-{target}.tar.gz")
+}
+
 /// Parse and validate a manifest body.
+///
+/// Every field this client acts on is checked, including the `url` each artifact
+/// declares. A manifest is a published but *mutable* document — the publisher's
+/// key can overwrite the channel pointers without any immutability refusal — so
+/// the checks are about refusing a re-pointed manifest, not about parsing
+/// trust. The digest is taken from the manifest because the manifest is the only
+/// place the digest is published; the destination is derived here.
 pub(crate) fn parse_manifest(body: &[u8]) -> anyhow::Result<Manifest> {
     let manifest: Manifest =
         serde_json::from_slice(body).context("release manifest is not valid JSON")?;
@@ -219,9 +239,23 @@ pub(crate) fn parse_manifest(body: &[u8]) -> anyhow::Result<Manifest> {
             manifest.version
         );
     }
+    // Artifact names are the ones this client can act on. Anything carrying a
+    // character outside printable ASCII, or a path separator, is refused rather
+    // than normalized: a target triple is a fixed identifier, so a manifest
+    // needing a lenient parse of one is not a manifest this client understands.
     for (target, artifact) in &manifest.artifacts {
-        if artifact.url.is_empty() {
-            bail!("release manifest has an empty url for {target}");
+        if !is_plain_ascii_identifier(target) {
+            bail!(
+                "release manifest names an artifact for {target:?}, which is not a plain target name"
+            );
+        }
+        let expected = release_archive_url(&manifest.version, target);
+        if artifact.url != expected {
+            bail!(
+                "release manifest points {target} at {:?}, but a release archive for {} must be at {expected:?}",
+                artifact.url,
+                manifest.version
+            );
         }
         if !is_sha256_hex(&artifact.sha256) {
             bail!("release manifest has a malformed sha256 for {target}");
@@ -229,6 +263,17 @@ pub(crate) fn parse_manifest(body: &[u8]) -> anyhow::Result<Manifest> {
     }
 
     Ok(manifest)
+}
+
+/// A target triple: printable ASCII, no separators, nothing that could name a
+/// different path when it is formatted into a URL.
+fn is_plain_ascii_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && !s.starts_with('.')
+        && s != ".."
 }
 
 pub(crate) fn fetch_manifest(fetcher: &dyn Fetcher) -> anyhow::Result<Manifest> {
@@ -294,14 +339,62 @@ fn is_newer(current: &str, latest: &str) -> bool {
     }
 }
 
+/// How the manifest's version compares with the running build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VersionRelation {
+    /// The published release is newer and is worth installing.
+    Upgrade,
+    /// The published release is exactly what is running.
+    Same,
+    /// The published release is OLDER than the running build. The channel
+    /// pointer is mutable by the publisher, so this is the shape a re-pointed or
+    /// rolled-back `latest.json` takes, and installing it would silently revert
+    /// the host to older code.
+    Downgrade,
+}
+
+pub(crate) fn compare_versions(current: &str, latest: &str) -> VersionRelation {
+    match (parse_version(current), parse_version(latest)) {
+        (Some(c), Some(l)) if l > c => VersionRelation::Upgrade,
+        (Some(c), Some(l)) if l == c => VersionRelation::Same,
+        (Some(_), Some(_)) => VersionRelation::Downgrade,
+        // An unparseable version on either side is not evidence of anything, so
+        // it is not treated as a downgrade attempt; update_info separately
+        // refuses to act on it because is_newer is false.
+        _ => VersionRelation::Same,
+    }
+}
+
+/// Whether this build links the GNU C library, i.e. whether the published
+/// `x86_64-unknown-linux-gnu` archive is a working replacement for the running
+/// executable.
+///
+/// A musl-linked hcom launches fine on a musl host and would keep launching fine
+/// if it were left alone, but the archive hcom publishes is glibc-linked: it
+/// needs the GNU dynamic loader, which a musl-only host does not have. Installing
+/// it there replaces a working binary with one that cannot start, so the musl
+/// hosts are told how to build the tag from source instead. A musl *glibc*
+/// (`x86_64-unknown-linux-musl` with a glibc target) is out of scope: hcom does
+/// not ship such a build today, so there is no working binary to protect and
+/// nothing to decide.
+#[cfg(target_env = "musl")]
+fn is_gnu_libc() -> bool {
+    false
+}
+
+#[cfg(not(target_env = "musl"))]
+fn is_gnu_libc() -> bool {
+    true
+}
+
 /// Target triples hcom publishes release archives for.
 ///
-/// Linux x86_64 only: every other host — aarch64 Linux included — is told how
-/// to build the release tag instead of being pointed at an archive that does
-/// not exist.
+/// Linux x86_64 only: every other host — aarch64 Linux included, and x86_64
+/// musl — is told how to build the release tag instead of being pointed at an
+/// archive that does not run there.
 fn supported_target(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
-        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("linux", "x86_64") if is_gnu_libc() => Some("x86_64-unknown-linux-gnu"),
         _ => None,
     }
 }
@@ -336,10 +429,11 @@ pub(crate) fn apply_manifest_to(
         });
     };
 
+    let archive_url = release_archive_url(&manifest.version, target);
     let archive = fetcher
-        .get(&artifact.url)
-        .with_context(|| format!("could not download {}", artifact.url))?;
-    verify_sha256(&archive, &artifact.sha256, &artifact.url)?;
+        .get(&archive_url)
+        .with_context(|| format!("could not download {archive_url}"))?;
+    verify_sha256(&archive, &artifact.sha256, &archive_url)?;
 
     let scratch = tempfile::tempdir().context("could not create a temporary directory")?;
     let binary = extract_binary(&archive, target, scratch.path())?;
@@ -413,8 +507,15 @@ fn extract_binary(archive: &[u8], target: &str, dest: &Path) -> anyhow::Result<P
     }
 
     let binary = dest.join(&member);
-    if !binary.is_file() {
-        bail!("release archive did not unpack {member}");
+    // symlink_metadata does not follow links: is_file() is true for a symlink to
+    // a regular file, and a member that is a link would have its target's bytes
+    // copied over the live executable. The archive's URL is now derived rather
+    // than read from the manifest, so this is defence in depth for a
+    // second-order path rather than the primary defence.
+    match fs::symlink_metadata(&binary) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => bail!("release archive member {member} is not a regular file"),
+        Err(e) => bail!("release archive did not unpack {member}: {e}"),
     }
     Ok(binary)
 }
@@ -717,6 +818,171 @@ mod tests {
     }
 
     #[test]
+    fn manifest_whose_url_points_elsewhere_is_refused_not_obeyed() {
+        // The publish key can overwrite the mutable channel pointers, so a
+        // manifest is a document someone can rewrite. The url it names is
+        // checked against the one place a release archive for this version can
+        // live; a mismatch aborts instead of becoming the fetch target.
+        let good = r#"{"version":"v1.2.3","artifacts":{"x86_64-unknown-linux-gnu":{
+            "url":"https://cdn.ffc-w.com/hcom/releases/v1.2.3/hcom-x86_64-unknown-linux-gnu.tar.gz",
+            "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#;
+        parse_manifest(good.as_bytes()).expect("the canonical url is accepted");
+
+        for hostile in [
+            // another host entirely
+            r#"{"version":"v1.2.3","artifacts":{"x86_64-unknown-linux-gnu":{
+                "url":"https://evil.example/hcom.tar.gz",
+                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+            // plain http downgrade of the scheme
+            r#"{"version":"v1.2.3","artifacts":{"x86_64-unknown-linux-gnu":{
+                "url":"http://cdn.ffc-w.com/hcom/releases/v1.2.3/hcom-x86_64-unknown-linux-gnu.tar.gz",
+                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+            // a path traversal out of the release prefix
+            r#"{"version":"v1.2.3","artifacts":{"x86_64-unknown-linux-gnu":{
+                "url":"https://cdn.ffc-w.com/hcom/releases/v1.2.3/../../../etc/passwd",
+                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+            // a well-formed url for a DIFFERENT version than the one declared
+            r#"{"version":"v1.2.3","artifacts":{"x86_64-unknown-linux-gnu":{
+                "url":"https://cdn.ffc-w.com/hcom/releases/v9.9.9/hcom-x86_64-unknown-linux-gnu.tar.gz",
+                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+            // a lookalike host
+            r#"{"version":"v1.2.3","artifacts":{"x86_64-unknown-linux-gnu":{
+                "url":"https://cdn.ffc-w.com.evil.test/hcom/releases/v1.2.3/hcom-x86_64-unknown-linux-gnu.tar.gz",
+                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+        ] {
+            let err = parse_manifest(hostile.as_bytes()).unwrap_err().to_string();
+            assert!(
+                err.contains("must be at"),
+                "a re-pointed url must be refused by name, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_with_an_odd_artifact_name_is_refused() {
+        // A target triple is a fixed identifier. One carrying a separator or a
+        // non-ASCII character is not parsed leniently, because formatting it
+        // into a URL would name a different path.
+        for target in [
+            "a/b",
+            "..",
+            ".hidden",
+            "x86_64 unknown-linux-gnu",
+            "ünïcode",
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "version": "v1.2.3",
+                "artifacts": {
+                    target: {
+                        "url": format!("{CDN_BASE_URL}v1.2.3/hcom-x86_64-unknown-linux-gnu.tar.gz"),
+                        "sha256": "a".repeat(64),
+                    }
+                }
+            }))
+            .unwrap();
+            let err = parse_manifest(&body).unwrap_err().to_string();
+            assert!(
+                err.contains("not a plain target name"),
+                "artifact name {target:?} must be refused, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_relation_separates_upgrade_same_and_downgrade() {
+        assert_eq!(
+            compare_versions("0.7.49", "0.7.50"),
+            VersionRelation::Upgrade
+        );
+        assert_eq!(compare_versions("0.7.50", "0.7.50"), VersionRelation::Same);
+        assert_eq!(
+            compare_versions("0.7.50", "0.7.49"),
+            VersionRelation::Downgrade
+        );
+        // A big jump back is still a downgrade, not an upgrade.
+        assert_eq!(
+            compare_versions("1.0.0", "0.1.0"),
+            VersionRelation::Downgrade
+        );
+        // Unparseable on either side is not a downgrade verdict; update_info
+        // separately refuses to act on it.
+        assert_eq!(compare_versions("0.7.50", "garbage"), VersionRelation::Same);
+    }
+
+    /// A tarball whose single member is a symlink, not a regular file.
+    #[cfg(unix)]
+    fn symlinked_release_tarball(target: &str, link_to: &str) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let member_dir = dir.path().join(format!("hcom-{target}"));
+        fs::create_dir_all(&member_dir).unwrap();
+        std::os::unix::fs::symlink(link_to, member_dir.join("hcom")).unwrap();
+
+        let tarball = dir.path().join("release.tar.gz");
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(dir.path())
+            .arg(format!("hcom-{target}"))
+            .status()
+            .expect("tar is required to build and unpack release archives");
+        assert!(status.success(), "failed to build test tarball");
+        fs::read(&tarball).unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_release_member_is_refused_not_installed() {
+        // -f / is_file() is true for a symlink to a regular file, so the target's
+        // bytes would be copied over the live executable. The archive's URL is
+        // derived rather than read from the manifest, which makes this
+        // defence in depth, but the extraction step is the last place to catch
+        // it and it costs one metadata call.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hcom");
+        fs::write(&exe, b"old executable bytes").unwrap();
+        let secret = dir.path().join("secret");
+        fs::write(&secret, b"not the release binary").unwrap();
+
+        let archive = symlinked_release_tarball(TARGET, secret.to_str().unwrap());
+        let manifest = manifest("v1.2.3", TARGET, &hex_sha256(&archive));
+        let fetcher = MockFetcher::new().with(archive_url("v1.2.3", TARGET), archive);
+
+        let err = apply_manifest_to(&manifest, &exe, "linux", "x86_64", &fetcher)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not a regular file"),
+            "a symlinked member must be refused by name, got: {err}"
+        );
+        assert_eq!(
+            fs::read(&exe).unwrap(),
+            b"old executable bytes",
+            "the live executable must be untouched"
+        );
+    }
+
+    #[test]
+    fn the_download_goes_to_the_derived_url_not_the_manifests() {
+        // The manifest's url is checked, then ignored. This pins the property
+        // that matters: the only URL requested is the one this client derived.
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hcom");
+        fs::write(&exe, b"old executable bytes").unwrap();
+
+        let archive = release_tarball(TARGET, b"new executable bytes");
+        let sha = hex_sha256(&archive);
+        // A manifest whose url is the canonical one, so it is accepted.
+        let manifest = manifest("v1.2.3", TARGET, &sha);
+        let expected = release_archive_url("v1.2.3", TARGET);
+        let fetcher = MockFetcher::new().with(expected.clone(), archive);
+        // Anything else is absent from the mock, so a request for it errors.
+
+        apply_manifest_to(&manifest, &exe, "linux", "x86_64", &fetcher).unwrap();
+        assert_eq!(fetcher.requested(), vec![expected]);
+    }
+
+    #[test]
     fn manifest_rejects_malformed_sha256() {
         let body = manifest_json("v1.2.3", TARGET, "not-a-hash");
         let err = parse_manifest(&body).unwrap_err().to_string();
@@ -806,6 +1072,49 @@ mod tests {
         assert_eq!(supported_target("macos", "x86_64"), None);
         assert_eq!(supported_target("windows", "x86_64"), None);
         assert_eq!(supported_target("linux", "riscv64"), None);
+
+        // The one host that shares the release target's arch and os but cannot
+        // run its archive. This assertion is written to hold whichever libc
+        // this test binary is linked against: on a glibc build the host is
+        // supported, on a musl build it is refused, and a mistake that made the
+        // answer unconditional fails on one of the two.
+        assert_eq!(
+            supported_target("linux", "x86_64"),
+            if cfg!(target_env = "musl") {
+                None
+            } else {
+                Some(TARGET)
+            },
+            "x86_64 support must follow the libc this build actually links"
+        );
+    }
+
+    #[test]
+    fn a_musl_build_will_not_replace_itself_with_a_glibc_archive() {
+        // The archive is glibc-linked. On a musl host that lacks the GNU loader
+        // installing it leaves a binary that cannot start, so the swap must not
+        // happen and nothing may be downloaded.
+        if !cfg!(target_env = "musl") {
+            return; // nothing to protect on a glibc test binary
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hcom");
+        fs::write(&exe, b"old musl executable bytes").unwrap();
+
+        let sha = "f".repeat(64);
+        let manifest = manifest("v1.2.3", TARGET, &sha);
+        let fetcher = MockFetcher::new();
+
+        let outcome = apply_manifest_to(&manifest, &exe, "linux", "x86_64", &fetcher).unwrap();
+        assert!(
+            matches!(outcome, ApplyOutcome::NoArtifact { .. }),
+            "a musl build must not install a glibc archive"
+        );
+        assert_eq!(fs::read(&exe).unwrap(), b"old musl executable bytes");
+        assert!(
+            fetcher.requested().is_empty(),
+            "the archive must not even be downloaded"
+        );
     }
 
     #[test]
@@ -829,11 +1138,14 @@ mod tests {
         assert_eq!(fs::read(&backup).unwrap(), b"old executable bytes");
 
         // The staging file must not survive, and nothing else may be left over.
+        // The install lock is the one expected resident: it is deliberately
+        // never deleted, because removing a path another process may hold locked
+        // lets the next install lock a fresh inode and stop excluding anybody.
         let leftovers: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name != "hcom" && name != "hcom.bak")
+            .filter(|name| name != "hcom" && name != "hcom.bak" && name != ".hcom.update.lock")
             .collect();
         assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
     }
@@ -938,7 +1250,10 @@ mod tests {
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .filter(|n| n.contains(".new-"))
                 .collect();
-            assert!(strays.is_empty(), "round {round}: staging files left: {strays:?}");
+            assert!(
+                strays.is_empty(),
+                "round {round}: staging files left: {strays:?}"
+            );
         }
     }
 

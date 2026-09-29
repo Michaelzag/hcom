@@ -16,19 +16,24 @@
 # latest.json. Keep the default the literal `latest` here and never commit a
 # concrete version in its place.
 #
-# Environment overrides, for testing against a fixture instead of the live CDN:
-#   HCOM_BASE_URL             release prefix
-#                             (default https://cdn.ffc-w.com/hcom/releases/)
-#   HCOM_RELEASE_TAG          release to install; `latest` reads latest.json,
-#                             anything else reads <tag>/manifest.json
-#                             (default `latest`)
-#   HCOM_INSTALL_MANIFEST_URL manifest URL to read directly, highest precedence
+# The CDN base is a CONSTANT below, not an environment variable. The manifest's
+# own "url" field is checked against the URL this script derives and never
+# fetched from, so a rewritten channel pointer cannot repoint a download at
+# another host: it can only make this script refuse.
+#
+# The one environment variable this accepts is HCOM_RELEASE_TAG, which selects
+# which release to install (an exact vX.Y.Z, or `latest` to read latest.json).
+# It names a release, never a host, so it cannot redirect the download.
+#
+# Testing note: the fixture harness in tests/ substitutes a fake CDN by
+# overriding `curl` on PATH, not by setting a variable here. That is deliberate
+# - a test seam in the published copy would be a way to repoint every host that
+# runs it.
 
 set -eu
 
 HCOM_RELEASE_TAG="${HCOM_RELEASE_TAG:-latest}"
-HCOM_INSTALL_MANIFEST_URL="${HCOM_INSTALL_MANIFEST_URL:-}"
-HCOM_BASE_URL="${HCOM_BASE_URL:-https://cdn.ffc-w.com/hcom/releases/}"
+CDN_BASE_URL="https://cdn.ffc-w.com/hcom/releases/"
 TARGET_TRIPLE="x86_64-unknown-linux-gnu"
 
 TMP=""
@@ -65,18 +70,14 @@ hash_file() {
     fi
 }
 
-if [ -n "$HCOM_INSTALL_MANIFEST_URL" ]; then
-    printf '%s' "$HCOM_INSTALL_MANIFEST_URL" | grep -Eq '^(https?|file)://' ||
-        die "HCOM_INSTALL_MANIFEST_URL must be an http://, https:// or file:// URL"
-    MANIFEST_URL=$HCOM_INSTALL_MANIFEST_URL
+BASE="${CDN_BASE_URL%/}"
+BASE="$BASE/"
+if [ "$HCOM_RELEASE_TAG" = "latest" ]; then
+    MANIFEST_URL="${BASE}latest.json"
 else
-    BASE="${HCOM_BASE_URL%/}"
-    BASE="$BASE/"
-    if [ "$HCOM_RELEASE_TAG" = "latest" ]; then
-        MANIFEST_URL="${BASE}latest.json"
-    else
-        MANIFEST_URL="${BASE}${HCOM_RELEASE_TAG}/manifest.json"
-    fi
+    printf '%s' "$HCOM_RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' ||
+        die "HCOM_RELEASE_TAG must be 'latest' or a stable vX.Y.Z tag (got '$HCOM_RELEASE_TAG')"
+    MANIFEST_URL="${BASE}${HCOM_RELEASE_TAG}/manifest.json"
 fi
 
 printf 'hcom-installer: reading release manifest %s\n' "$MANIFEST_URL"
@@ -88,16 +89,26 @@ MANIFEST_BODY=$(curl -fsSL --max-time 60 "$MANIFEST_URL") ||
 # The version is a stable vX.Y.Z tag - exactly what src/update.rs accepts.
 FLAT=$(printf '%s' "$MANIFEST_BODY" | tr '\n' ' ')
 VERSION=$(printf '%s' "$FLAT" | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p')
-ARTIFACT_URL=$(printf '%s' "$FLAT" | sed -n "s/.*\"$TARGET_TRIPLE\"[^{]*{[^}]*\"url\" *: *\"\([^\"]*\)\".*/\1/p")
+# The manifest's own "url" is read only to CHECK it, never to fetch from: every
+# download below is built from the fixed CDN base, the validated version and
+# the known file name. A manifest that names any other URL is rejected instead
+# of obeyed, so whoever can rewrite a channel pointer still cannot repoint a
+# download at a host of their choosing.
+DECLARED_URL=$(printf '%s' "$FLAT" | sed -n "s/.*\"$TARGET_TRIPLE\"[^{]*{[^}]*\"url\" *: *\"\([^\"]*\)\".*/\1/p")
 MANIFEST_SHA256=$(printf '%s' "$FLAT" | sed -n "s/.*\"$TARGET_TRIPLE\"[^{]*{[^}]*\"sha256\" *: *\"\([^\"]*\)\".*/\1/p")
 
 printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' ||
     die "release manifest names version '$VERSION', which is not a stable vX.Y.Z release"
-[ -n "$ARTIFACT_URL" ] ||
+[ -n "$DECLARED_URL" ] ||
     die "release manifest has no artifact for $TARGET_TRIPLE"
 printf '%s' "$MANIFEST_SHA256" | grep -Eq '^[0-9a-fA-F]{64}$' ||
     die "release manifest has a malformed sha256 for $TARGET_TRIPLE"
 MANIFEST_SHA256=$(printf '%s' "$MANIFEST_SHA256" | tr '[:upper:]' '[:lower:]')
+
+TARBALL_NAME="hcom-$TARGET_TRIPLE.tar.gz"
+ARTIFACT_URL="${BASE}${VERSION}/${TARBALL_NAME}"
+[ "$DECLARED_URL" = "$ARTIFACT_URL" ] ||
+    die "release manifest points $TARGET_TRIPLE at '$DECLARED_URL', but a release archive for $VERSION must be at '$ARTIFACT_URL' - not installing"
 
 # Every other host is told how to build the release tag instead of being
 # pointed at an archive that does not exist (Linux x86_64 is the only prebuilt).
@@ -142,6 +153,11 @@ printf 'hcom-installer: sha256 verified (%s)\n' "$ACTUAL_SHA256"
 
 tar -xzf "$TARBALL" -C "$TMP" "hcom-$TARGET_TRIPLE/hcom" ||
     die "release archive does not contain hcom-$TARGET_TRIPLE/hcom"
+# -f alone is true for a symlink to a regular file, and the download URL is now
+# built by us rather than read from the manifest, so a symlinked member would be
+# defence in depth against a second-order path: refuse it explicitly.
+[ -L "$TMP/hcom-$TARGET_TRIPLE/hcom" ] &&
+    die "release archive member hcom-$TARGET_TRIPLE/hcom is a symlink, not a regular file"
 [ -f "$TMP/hcom-$TARGET_TRIPLE/hcom" ] ||
     die "release archive did not unpack hcom-$TARGET_TRIPLE/hcom"
 
