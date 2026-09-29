@@ -231,8 +231,7 @@ chmod 0755 "$STAGED" || die "could not make the new binary executable"
 # handler that fired between "old binary moved aside" and "staged binary moved
 # into place" would delete the staged file and exit with NO executable at all, so
 # both signals are ignored for the duration rather than trapped. `mv` within one
-# directory is a rename, so the window is two syscalls wide; the deferred signal
-# is delivered after the swap completes, at which point stopping is correct.
+# directory is a rename, so the window is two syscalls wide.
 trap '' INT TERM
 
 # The old bytes move aside before the new ones take its place, so a failure
@@ -251,23 +250,23 @@ else
 fi
 STAGED=""
 
-# The swap is done and the install is either complete or restored, so a signal
-# can safely stop the script from here. It was ignored across the swap, and an
-# ignored signal is DISCARDED rather than queued - so a cancellation that arrived
-# mid-swap would otherwise be silently lost and the install would report success
-# after the user asked it to stop. Re-arm the handler, then honour anything that
-# arrived while it was off: the install is already done, so the honest outcome is
-# to report it and exit nonzero rather than claim the signal was heeded.
-INTERRUPTED=0
-trap 'INTERRUPTED=1' INT
-trap 'INTERRUPTED=TERM' TERM
+# The swap is complete, so the install directory is consistent again and a
+# signal can safely stop the script. Restore the exiting handler - not a
+# flag-setting one: a handler that merely records the signal would let the
+# success output below run and return zero, which is exactly what the swap's
+# protection is supposed to prevent, and the install is already done, so there
+# is nothing left to do but report and exit.
+#
+# A signal that arrived DURING the swap is not recovered. `trap ''` discards
+# what it ignores rather than queueing it, and dash confirms it does not
+# re-deliver on restore. That is the accepted cost of not letting a handler run
+# between the two renames: the window is two syscalls wide and its alternative is
+# an install directory with no executable in it. The swap always completes; only
+# the intent to cancel it is lost.
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 
 release_lock
-
-if [ "$INTERRUPTED" != 0 ]; then
-    printf 'hcom-installer: interrupted during the swap; the install completed anyway\n' >&2
-    exit 130
-fi
 
 printf 'hcom %s installed to %s\n' "${VERSION#v}" "$BIN"
 if [ -e "$BAK" ]; then
