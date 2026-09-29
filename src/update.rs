@@ -425,6 +425,14 @@ fn extract_binary(archive: &[u8], target: &str, dest: &Path) -> anyhow::Result<P
 /// filesystem boundary fails and a temporary directory usually is one. The
 /// original is moved aside before the new file takes its place, so a failure
 /// half way through leaves a restorable executable rather than none.
+///
+/// The staging and the swap happen under an exclusive lock beside the
+/// executable. Two updates that overlap used to interleave here and could delete
+/// each other's backup: one moved the live binary aside, the other's
+/// `remove_file` on that same backup succeeded, and the first then restored it
+/// into place — a single surviving backup, now the *new* binary, for two callers
+/// that both reported success. The lock makes the read-swap-write of the pair
+/// (`exe`, `<exe>.bak`) a single critical section instead.
 fn install_binary(new_binary: &Path, exe: &Path) -> anyhow::Result<PathBuf> {
     let dir = exe
         .parent()
@@ -437,6 +445,20 @@ fn install_binary(new_binary: &Path, exe: &Path) -> anyhow::Result<PathBuf> {
 
     let staged = dir.join(format!(".{name}.new-{}", std::process::id()));
     let backup = dir.join(format!("{name}.bak"));
+    let lock_path = dir.join(format!(".{name}.update.lock"));
+
+    // The lock lives beside the executable, not under HCOM_DIR: two hcom
+    // instances (a seat's own HCOM_DIR, the system one) can share an install
+    // directory while being mutually invisible, and they must still exclude each
+    // other here. Released when `_lock` drops, including on the error path.
+    let lock = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("could not open {}", lock_path.display()))?;
+    crate::sys::fs::lock_exclusive(&lock)
+        .with_context(|| format!("could not lock {}", lock_path.display()))?;
 
     let result = (|| -> io::Result<()> {
         fs::copy(new_binary, &staged)?;
@@ -455,6 +477,7 @@ fn install_binary(new_binary: &Path, exe: &Path) -> anyhow::Result<PathBuf> {
 
     // A staged file left behind would shadow the real executable on some PATHs.
     let _ = fs::remove_file(&staged);
+    drop(lock);
     result.with_context(|| format!("could not replace {}", exe.display()))?;
 
     Ok(backup)
@@ -710,18 +733,22 @@ mod tests {
 
     #[test]
     fn the_checked_in_builder_manifest_is_canonical_and_parses() {
+        // A Windows checkout can rewrite this LF file as CRLF, and the bytes the
+        // publisher emits are the LF ones. Normalize the checkout, not the
+        // expectation.
+        let checked_in = BUILDER_MANIFEST.replace("\r\n", "\n");
         // serde_json's Map is sorted by default and its pretty printer uses two
         // spaces, so this is the builder's canonical_json byte for byte. Drift
         // in the publisher's serialization fails here instead of leaving a
         // fixture that describes a format nothing publishes any more.
-        let value: serde_json::Value = serde_json::from_str(BUILDER_MANIFEST).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&checked_in).unwrap();
         assert_eq!(
             format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
-            BUILDER_MANIFEST,
+            checked_in,
             "the checked-in fixture is not canonical JSON"
         );
 
-        let parsed = parse_manifest(BUILDER_MANIFEST.as_bytes())
+        let parsed = parse_manifest(checked_in.as_bytes())
             .expect("the published manifest shape must be one this client accepts");
         assert_eq!(parsed.version, "v99.0.0");
 
@@ -855,6 +882,64 @@ mod tests {
         assert!(err.contains("manifest expects"), "unexpected error: {err}");
         assert_eq!(fs::read(&exe).unwrap(), b"old executable bytes");
         assert!(!dir.path().join("hcom.bak").exists());
+    }
+
+    #[test]
+    fn two_installs_into_one_directory_never_lose_the_only_backup() {
+        // Two updates racing on one install directory used to interleave inside
+        // install_binary: A moves the live binary to hcom.bak, B deletes that
+        // same file, and A then restores it into place. Both report success, and
+        // the surviving "previous binary" is B's new bytes — so hcom.bak is a
+        // copy of what is installed and the original is gone. The install holds
+        // an exclusive lock, so the pair (exe, hcom.bak) is only ever written by
+        // one caller at a time.
+        //
+        // This is a race, so it is stressed across rounds rather than asserted
+        // once: a single round can pass even on the unlocked code. What must hold
+        // on every round is the invariant, not the ordering.
+        for round in 0..25 {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir.path().join("hcom");
+            let incoming_a = dir.path().join("incoming-a");
+            let incoming_b = dir.path().join("incoming-b");
+            fs::write(&exe, b"original bytes").unwrap();
+            fs::write(&incoming_a, b"update A bytes").unwrap();
+            fs::write(&incoming_b, b"update B bytes").unwrap();
+
+            let spawn = |source: PathBuf| {
+                let exe = exe.clone();
+                std::thread::spawn(move || install_binary(&source, &exe))
+            };
+            let a = spawn(incoming_a);
+            let b = spawn(incoming_b);
+            a.join().unwrap().unwrap();
+            b.join().unwrap().unwrap();
+
+            let live = fs::read(&exe).unwrap();
+            let kept = fs::read(dir.path().join("hcom.bak")).unwrap();
+            assert_ne!(
+                kept, live,
+                "round {round}: the backup is a copy of the live binary, so an \
+                 interleaved install destroyed the only restorable copy"
+            );
+            for bytes in [&live, &kept] {
+                assert!(
+                    matches!(
+                        bytes.as_slice(),
+                        b"original bytes" | b"update A bytes" | b"update B bytes"
+                    ),
+                    "round {round}: an install produced bytes nobody handed it: {bytes:?}"
+                );
+            }
+            // No staging file is left behind: a stray one shadows the real
+            // executable on some PATHs.
+            let strays: Vec<String> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".new-"))
+                .collect();
+            assert!(strays.is_empty(), "round {round}: staging files left: {strays:?}");
+        }
     }
 
     #[test]
