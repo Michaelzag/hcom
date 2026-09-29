@@ -284,13 +284,20 @@ pub(crate) fn fetch_manifest(fetcher: &dyn Fetcher) -> anyhow::Result<Manifest> 
     parse_manifest(&body)
 }
 
-/// Structured update information: current version, latest published version,
-/// and whether the latter is worth installing.
+/// Structured update information: the running version, the published one, and
+/// how the two compare.
+///
+/// The comparison is a three-way relation rather than an "is there an update"
+/// flag because the caller must act differently in all three cases: install a
+/// newer release, do nothing for an equal one, and refuse an older one unless
+/// the operator asked for it. A boolean cannot express the third, and
+/// collapsing "equal" into "not available" is what made an `--allow-downgrade`
+/// reinstall the version already running.
 #[derive(Clone, Debug)]
 pub(crate) struct UpdateInfo {
     pub current: String,
     pub latest: String,
-    pub available: bool,
+    pub relation: VersionRelation,
 }
 
 /// The command that applies an available update. Reported verbatim by
@@ -323,12 +330,12 @@ pub(crate) fn source_guidance(version: Option<&str>) -> String {
 pub(crate) fn update_info(manifest: &Manifest) -> UpdateInfo {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let latest = manifest.version.trim_start_matches('v').to_string();
-    let available = is_newer(&current, &latest);
+    let relation = compare_versions(&current, &latest);
 
     UpdateInfo {
         current,
         latest,
-        available,
+        relation,
     }
 }
 
@@ -963,6 +970,11 @@ mod tests {
     }
 
     #[test]
+    // A musl build refuses the glibc archive by design, so this test's
+    // premise - that a real install happens on linux/x86_64 - does not
+    // hold there. The refusal itself is covered by
+    // a_musl_build_will_not_replace_itself_with_a_glibc_archive.
+    #[cfg_attr(target_env = "musl", ignore = "glibc-only install test")]
     fn the_download_goes_to_the_derived_url_not_the_manifests() {
         // The manifest's url is checked, then ignored. This pins the property
         // that matters: the only URL requested is the one this client derived.
@@ -980,6 +992,26 @@ mod tests {
 
         apply_manifest_to(&manifest, &exe, "linux", "x86_64", &fetcher).unwrap();
         assert_eq!(fetcher.requested(), vec![expected]);
+    }
+
+    #[test]
+    fn an_equal_version_is_never_an_install() {
+        // `--allow-downgrade` permits stepping BACK. It is not a reinstall
+        // switch: reinstalling the running version would overwrite hcom.bak -
+        // the only copy of the previous release - with the version already
+        // running, destroying the rollback path for nothing.
+        let current = env!("CARGO_PKG_VERSION");
+        let same = manifest(&format!("v{current}"), TARGET, &"a".repeat(64));
+        assert_eq!(
+            compare_versions(current, current),
+            VersionRelation::Same,
+            "the running version against itself is Same, never Downgrade"
+        );
+        // And the same manifest is not something update_info calls available,
+        // so the up-to-date path is the one that runs.
+        let info = update_info(&same);
+        assert_eq!(info.relation, VersionRelation::Same);
+        assert_eq!(info.latest, info.current);
     }
 
     #[test]
@@ -1031,8 +1063,9 @@ mod tests {
         );
 
         let info = update_info(&parsed);
-        assert!(
-            info.available,
+        assert_eq!(
+            info.relation,
+            VersionRelation::Upgrade,
             "the golden fixture must name a release newer than this build"
         );
     }
@@ -1066,18 +1099,16 @@ mod tests {
     fn supported_targets_are_linux_x86_64_only() {
         // aarch64 Linux is deliberately not a release target: it gets source
         // instructions rather than a binary that was never published.
-        assert_eq!(supported_target("linux", "x86_64"), Some(TARGET));
         assert_eq!(supported_target("linux", "aarch64"), None);
         assert_eq!(supported_target("macos", "aarch64"), None);
         assert_eq!(supported_target("macos", "x86_64"), None);
         assert_eq!(supported_target("windows", "x86_64"), None);
         assert_eq!(supported_target("linux", "riscv64"), None);
 
-        // The one host that shares the release target's arch and os but cannot
-        // run its archive. This assertion is written to hold whichever libc
-        // this test binary is linked against: on a glibc build the host is
-        // supported, on a musl build it is refused, and a mistake that made the
-        // answer unconditional fails on one of the two.
+        // The one host that shares the release target's arch and os but may
+        // still not be able to run its archive. Written to hold whichever libc
+        // this test binary is linked against, so a musl-targeted run exercises
+        // the refusal instead of failing on an unconditional Some.
         assert_eq!(
             supported_target("linux", "x86_64"),
             if cfg!(target_env = "musl") {
@@ -1118,6 +1149,11 @@ mod tests {
     }
 
     #[test]
+    // A musl build refuses the glibc archive by design, so this test's
+    // premise - that a real install happens on linux/x86_64 - does not
+    // hold there. The refusal itself is covered by
+    // a_musl_build_will_not_replace_itself_with_a_glibc_archive.
+    #[cfg_attr(target_env = "musl", ignore = "glibc-only install test")]
     fn apply_installs_verified_binary_and_keeps_exact_old_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("hcom");
@@ -1151,6 +1187,11 @@ mod tests {
     }
 
     #[test]
+    // A musl build refuses the glibc archive by design, so this test's
+    // premise - that a real install happens on linux/x86_64 - does not
+    // hold there. The refusal itself is covered by
+    // a_musl_build_will_not_replace_itself_with_a_glibc_archive.
+    #[cfg_attr(target_env = "musl", ignore = "glibc-only install test")]
     fn apply_downloads_only_the_archive_from_the_manifest_it_was_given() {
         // The version hcom announces and the version it installs must come from
         // one read of one document: applying must not go back to the network
@@ -1276,12 +1317,16 @@ mod tests {
     #[test]
     fn update_info_compares_a_manifest_against_this_build() {
         let ahead = update_info(&manifest("v99.0.0", TARGET, &"a".repeat(64)));
-        assert!(ahead.available);
+        assert_eq!(ahead.relation, VersionRelation::Upgrade);
         assert_eq!(ahead.latest, "99.0.0");
         assert_eq!(ahead.current, env!("CARGO_PKG_VERSION"));
 
         let behind = update_info(&manifest("v0.0.1", TARGET, &"a".repeat(64)));
-        assert!(!behind.available, "an older release is not an update");
+        assert_eq!(
+            behind.relation,
+            VersionRelation::Downgrade,
+            "an older release is a downgrade, not an update"
+        );
     }
 
     #[test]

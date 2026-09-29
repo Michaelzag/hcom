@@ -123,6 +123,22 @@ if [ "$OS" != "Linux" ] || [ "$ARCH" != "x86_64" ]; then
     exit 1
 fi
 
+# The published archive is glibc-linked. A musl-only host can run a musl hcom
+# perfectly well, and would keep doing so if left alone - but installing the
+# gnu archive there leaves an executable that cannot start without the GNU
+# dynamic loader. So this is a refusal, not an install, on a host that matches
+# the target triple and still cannot use the archive for it.
+MUSL_LD="/lib/ld-musl-$(uname -m).so.1"
+if [ -f "$MUSL_LD" ]; then
+    printf 'hcom-installer: this host is musl-linked; the published archive needs glibc\n' >&2
+    printf 'Installing it would leave an executable that cannot start, so nothing is changed.\n' >&2
+    printf 'Install it from source instead:\n' >&2
+    printf '  git clone --branch %s https://github.com/Michaelzag/hcom.git\n' "$VERSION" >&2
+    printf '  cd hcom && cargo build --release --locked\n\n' >&2
+    printf 'Release archives and the release manifest live at https://cdn.ffc-w.com/hcom/releases/\n' >&2
+    exit 1
+fi
+
 SIDECAR=$(curl -fsSL --max-time 60 "${ARTIFACT_URL}.sha256") ||
     die "could not download ${ARTIFACT_URL}.sha256"
 # sha256sum -c format: `<64 hex>  <filename>` on the first line.
@@ -166,12 +182,34 @@ BIN_DIR="$HOME/.local/bin"
 BIN="$BIN_DIR/hcom"
 BAK="$BIN.bak"
 STAGED="$BIN_DIR/.hcom-installer-new.$$"
+# The SAME lock the Rust updater takes, on the same path, so this script and
+# `hcom update` exclude each other as well as themselves. Without it two
+# overlapping installs interleave in the swap below: one moves the live binary
+# aside, the other deletes that same file, and the first restores it - leaving
+# one backup, now the *new* bytes, for two callers that both reported success.
+LOCK="$BIN_DIR/.hcom.update.lock"
+LOCKED=0
+
+release_lock() { [ "$LOCKED" -eq 0 ] || exec 9>&-; }
 
 mkdir -p "$BIN_DIR" || die "could not create $BIN_DIR"
+
+# The lock file is never deleted: removing a path another process may hold
+# locked lets the next installer lock a fresh inode and stop excluding anybody.
+# It is opened by path, so it is a real file and not something to follow.
+if ! command -v flock >/dev/null 2>&1; then
+    printf 'hcom-installer: required command not found: flock\n' >&2
+    exit 1
+fi
+exec 9>>"$LOCK" || die "could not open $LOCK"
+flock -w 120 9 || die "another install held $LOCK for more than 120s - not installing"
+LOCKED=1
+trap 'cleanup; release_lock' EXIT INT TERM
+
 cp "$TMP/hcom-$TARGET_TRIPLE/hcom" "$STAGED" || die "could not stage the new binary"
 chmod 0755 "$STAGED" || die "could not make the new binary executable"
 
-# The old bytes move aside before the new ones take their place, so a failure
+# The old bytes move aside before the new ones take its place, so a failure
 # half way through leaves a restorable executable rather than none. The new
 # bytes were staged in the same directory first because rename across a
 # filesystem boundary fails and a temporary directory usually is one.
@@ -186,6 +224,7 @@ else
     mv "$STAGED" "$BIN" || die "could not install $BIN"
 fi
 STAGED=""
+release_lock
 
 printf 'hcom %s installed to %s\n' "${VERSION#v}" "$BIN"
 if [ -e "$BAK" ]; then

@@ -61,13 +61,24 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, _ctx: Option<&CommandContext>
         }
     };
     let info = crate::update::update_info(&manifest);
+    use crate::update::VersionRelation::{Downgrade, Same, Upgrade};
+    let relation = info.relation;
+
+    // An EQUAL version is not an install. `--allow-downgrade` exists to permit
+    // stepping back to an older release; it is not a reinstall switch, and
+    // treating it as one would overwrite `hcom.bak` — the only copy of the
+    // previous release — with the very version already running.
+    if relation == Same {
+        println!("hcom v{} is up to date", info.current);
+        let _ = crate::paths::atomic_write(&crate::update::flag_path(), "");
+        return 0;
+    }
 
     // The channel pointer is mutable by whoever holds the publish key, so a
     // manifest naming an OLDER release than the one running is refused by
     // default: obeying it would revert the host on every host at once. Stepping
     // back on purpose is a separate, explicit act.
-    let relation = crate::update::compare_versions(&info.current, &info.latest);
-    if relation == crate::update::VersionRelation::Downgrade && !args.allow_downgrade {
+    if relation == Downgrade && !args.allow_downgrade {
         eprintln!(
             "Refusing to downgrade: the release manifest names v{}, but this hcom is v{}.",
             info.latest, info.current
@@ -76,24 +87,24 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, _ctx: Option<&CommandContext>
         return 1;
     }
 
-    if !info.available && !args.allow_downgrade {
-        println!("hcom v{} is up to date", info.current);
-        // Clear stale "update available" cache if it existed
-        let _ = crate::paths::atomic_write(&crate::update::flag_path(), "");
-        return 0;
-    }
-
-    if relation == crate::update::VersionRelation::Downgrade {
+    if relation == Downgrade {
         println!(
             "Downgrading: v{} → v{} (--allow-downgrade)",
             info.current, info.latest
         );
     } else {
+        debug_assert_eq!(relation, Upgrade);
         println!("Update available: v{} → v{}", info.current, info.latest);
     }
 
     if args.check {
-        println!("Run `{}` to apply.", crate::update::UPDATE_COMMAND);
+        // The command to run has to carry the flag too, or it names a command
+        // this very invocation just refused.
+        if relation == Downgrade {
+            println!("Run `hcom update --allow-downgrade` to apply.");
+        } else {
+            println!("Run `{}` to apply.", crate::update::UPDATE_COMMAND);
+        }
         return 0;
     }
 
