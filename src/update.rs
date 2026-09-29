@@ -939,6 +939,14 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    // A musl build refuses the glibc archive by design, so this test's
+    // premise - that the request reaches the download on linux/x86_64 - does
+    // not hold there. The refusal itself is covered by
+    // a_musl_build_will_not_replace_itself_with_a_glibc_archive.
+    #[cfg_attr(
+        target_env = "musl",
+        ignore = "glibc-only: refused before the download"
+    )]
     fn a_symlinked_release_member_is_refused_not_installed() {
         // -f / is_file() is true for a symlink to a regular file, so the target's
         // bytes would be copied over the live executable. The archive's URL is
@@ -1219,6 +1227,14 @@ mod tests {
     }
 
     #[test]
+    // A musl build refuses the glibc archive by design, so this test's
+    // premise - that the request reaches the download on linux/x86_64 - does
+    // not hold there. The refusal itself is covered by
+    // a_musl_build_will_not_replace_itself_with_a_glibc_archive.
+    #[cfg_attr(
+        target_env = "musl",
+        ignore = "glibc-only: refused before the download"
+    )]
     fn apply_refuses_archive_that_does_not_match_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("hcom");
@@ -1353,6 +1369,14 @@ mod tests {
     }
 
     #[test]
+    // A musl build refuses the glibc archive by design, so this test's
+    // premise - that the request reaches the download on linux/x86_64 - does
+    // not hold there. The refusal itself is covered by
+    // a_musl_build_will_not_replace_itself_with_a_glibc_archive.
+    #[cfg_attr(
+        target_env = "musl",
+        ignore = "glibc-only: refused before the download"
+    )]
     fn apply_reports_no_artifact_when_target_is_missing_from_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("hcom");

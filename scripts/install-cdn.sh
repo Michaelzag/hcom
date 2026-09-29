@@ -123,15 +123,17 @@ if [ "$OS" != "Linux" ] || [ "$ARCH" != "x86_64" ]; then
     exit 1
 fi
 
-# The published archive is glibc-linked. A musl-only host can run a musl hcom
-# perfectly well, and would keep doing so if left alone - but installing the
-# gnu archive there leaves an executable that cannot start without the GNU
-# dynamic loader. So this is a refusal, not an install, on a host that matches
-# the target triple and still cannot use the archive for it.
-MUSL_LD="/lib/ld-musl-$(uname -m).so.1"
-if [ -f "$MUSL_LD" ]; then
-    printf 'hcom-installer: this host is musl-linked; the published archive needs glibc\n' >&2
-    printf 'Installing it would leave an executable that cannot start, so nothing is changed.\n' >&2
+# The published archive is glibc-linked, so what matters is whether THIS host
+# can run a glibc binary - not whether it has musl. A glibc host with the musl
+# runtime also installed can use the archive perfectly well, so probing for the
+# musl loader would refuse a host that is fine. Probe for the glibc loader
+# instead: the refusal is for a host that has no GNU dynamic loader at all, which
+# is the case that would end up with an executable that cannot start.
+GLIBC_LD="/lib/ld-linux-$(uname -m | sed 's/x86_64/x86-64/').so.2"
+if [ ! -f "$GLIBC_LD" ] && [ ! -f /lib64/ld-linux-x86-64.so.2 ]; then
+    printf 'hcom-installer: no GNU dynamic loader found on this host; the published\n' >&2
+    printf 'archive is glibc-linked, so installing it would leave an executable that\n' >&2
+    printf 'cannot start. Nothing was changed.\n' >&2
     printf 'Install it from source instead:\n' >&2
     printf '  git clone --branch %s https://github.com/Michaelzag/hcom.git\n' "$VERSION" >&2
     printf '  cd hcom && cargo build --release --locked\n\n' >&2
@@ -204,7 +206,23 @@ fi
 exec 9>>"$LOCK" || die "could not open $LOCK"
 flock -w 120 9 || die "another install held $LOCK for more than 120s - not installing"
 LOCKED=1
-trap 'cleanup; release_lock' EXIT INT TERM
+
+# On a signal the handler MUST exit. A handler that only cleaned up and
+# returned would release the lock and then run the rest of the script - the
+# swap below - with no mutual exclusion, which is the exact race the lock
+# exists to prevent. Trapping the signal also means we choose the exit status
+# instead of whatever the interrupted command happened to return.
+on_signal() {
+    signal=$1
+    trap - INT TERM
+    printf 'hcom-installer: interrupted by SIG%s - nothing was installed\n' "$signal" >&2
+    cleanup
+    release_lock
+    exit 130
+}
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'cleanup; release_lock' EXIT
 
 cp "$TMP/hcom-$TARGET_TRIPLE/hcom" "$STAGED" || die "could not stage the new binary"
 chmod 0755 "$STAGED" || die "could not make the new binary executable"
