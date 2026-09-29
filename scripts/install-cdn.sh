@@ -251,12 +251,23 @@ else
 fi
 STAGED=""
 
-# The swap is done and the install is either complete or restored. Re-arm the
-# handler so a signal arriving after this point still stops the script cleanly
-# instead of being silently discarded.
-trap 'on_signal INT' INT
-trap 'on_signal TERM' TERM
+# The swap is done and the install is either complete or restored, so a signal
+# can safely stop the script from here. It was ignored across the swap, and an
+# ignored signal is DISCARDED rather than queued - so a cancellation that arrived
+# mid-swap would otherwise be silently lost and the install would report success
+# after the user asked it to stop. Re-arm the handler, then honour anything that
+# arrived while it was off: the install is already done, so the honest outcome is
+# to report it and exit nonzero rather than claim the signal was heeded.
+INTERRUPTED=0
+trap 'INTERRUPTED=1' INT
+trap 'INTERRUPTED=TERM' TERM
+
 release_lock
+
+if [ "$INTERRUPTED" != 0 ]; then
+    printf 'hcom-installer: interrupted during the swap; the install completed anyway\n' >&2
+    exit 130
+fi
 
 printf 'hcom %s installed to %s\n' "${VERSION#v}" "$BIN"
 if [ -e "$BAK" ]; then
