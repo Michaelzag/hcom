@@ -343,6 +343,20 @@ impl Hcom {
                 .unwrap_or_else(|e| panic!("create isolated directory {}: {e}", dir.display()));
         }
 
+        // Prime the update-check cache at its production path
+        // (`$HCOM_DIR/.tmp/flags/update_check`, see `flag_path()` in
+        // src/update.rs). `get_update_info()` spawns a background `curl` of the
+        // live release CDN when that flag is missing or older than the check
+        // interval, so a fresh HCOM_DIR would make every fixture CLI run leak
+        // a live network child. Creating it empty keeps the mtime fresh (no
+        // spawn) while reading back as "no update available", so test CLI
+        // output is unchanged.
+        let flags_dir = hcom_dir.join(".tmp").join("flags");
+        fs::create_dir_all(&flags_dir)
+            .unwrap_or_else(|e| panic!("create isolated directory {}: {e}", flags_dir.display()));
+        fs::File::create(flags_dir.join("update_check"))
+            .unwrap_or_else(|e| panic!("create update_check flag in {}: {e}", flags_dir.display()));
+
         let mut path_entries = Vec::new();
         if let Some(parent) = bin.parent() {
             // The scripted Codex shell call uses `hcom ...`; make the exact

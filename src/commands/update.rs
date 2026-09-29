@@ -1,11 +1,13 @@
 //! `hcom update` command — check and apply updates.
 //!
-//! Uses the shared `fetch_update_info()` function from update.rs to get current,
-//! latest, and availability in one call. Applies immediately when an update is
-//! available; `--check` reports availability without applying.
+//! The latest version comes from the CDN release manifest, and applying an
+//! update downloads, hash-checks and unpacks the release archive for this
+//! host. No downloaded installer is ever executed. Hosts with no prebuilt
+//! archive are told how to build the release tag from source instead.
 
 use crate::db::HcomDb;
 use crate::shared::CommandContext;
+use crate::update::{ApplyOutcome, CurlFetcher};
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "update", about = "Check for and apply updates")]
@@ -13,6 +15,11 @@ pub struct UpdateArgs {
     /// Only check — print update status without applying
     #[arg(long)]
     pub check: bool,
+
+    /// Refresh the cached update notice in the background and exit.
+    /// Spawned by hcom itself; hidden because it is not a user interface.
+    #[arg(long, hide = true)]
+    pub refresh_cache: bool,
 }
 
 fn print_dev_root_notice(db: &HcomDb) {
@@ -25,16 +32,29 @@ fn print_dev_root_notice(db: &HcomDb) {
 }
 
 pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, _ctx: Option<&CommandContext>) -> i32 {
+    if args.refresh_cache {
+        return if crate::update::refresh_update_cache().is_ok() {
+            0
+        } else {
+            1
+        };
+    }
+
     println!("Checking for updates...");
     print_dev_root_notice(_db);
 
-    let info = match crate::update::fetch_update_info() {
-        Ok(i) => i,
+    // One read of one manifest decides and installs. Fetching again to apply
+    // could announce one version and install another.
+    let manifest = match crate::update::fetch_manifest(&CurlFetcher) {
+        Ok(manifest) => manifest,
         Err(e) => {
-            eprintln!("Error: {e}");
+            eprintln!("Error: {e:#}");
+            eprintln!();
+            eprintln!("{}", crate::update::source_guidance(None));
             return 1;
         }
     };
+    let info = crate::update::update_info(&manifest);
 
     if !info.available {
         println!("hcom v{} is up to date", info.current);
@@ -46,58 +66,27 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, _ctx: Option<&CommandContext>
     println!("Update available: v{} → v{}", info.current, info.latest);
 
     if args.check {
-        println!("Run `hcom update` to apply.");
+        println!("Run `{}` to apply.", crate::update::UPDATE_COMMAND);
         return 0;
     }
 
-    let status = if cfg!(windows) {
-        if crate::update::is_powershell_installer_command(info.cmd) {
-            let program = crate::update::windows_installer_program();
-            let script = crate::update::windows_installer_script();
-            println!("Running: {program} -NoProfile -ExecutionPolicy Bypass -Command \"{script}\"");
-            std::process::Command::new(program)
-                .args([
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    script,
-                ])
-                .status()
-        } else if crate::update::is_shell_pipe_command(info.cmd) {
-            Err(std::io::Error::other(
-                "POSIX shell update command selected on Windows",
-            ))
-        } else {
-            println!("Running: {}", info.cmd);
-            match crate::update::split_program_args(info.cmd) {
-                Some((program, args)) => std::process::Command::new(program).args(args).status(),
-                None => Err(std::io::Error::other("empty update command")),
-            }
-        }
-    } else {
-        println!("Running: {}", info.cmd);
-        std::process::Command::new("sh")
-            .args(["-c", info.cmd])
-            .status()
-    };
-
-    match status {
-        Ok(s) if s.success() => {
+    match crate::update::apply_manifest(&manifest, &CurlFetcher) {
+        Ok(ApplyOutcome::Updated { version, backup }) => {
             // Clear the cached "update available" notice
             let _ = crate::paths::atomic_write(&crate::update::flag_path(), "");
-            println!("Done. Run 'hcom --version' to confirm.");
+            println!("Updated to v{version}.");
+            println!("Previous executable kept at {}", backup.display());
+            println!("Run 'hcom --version' to confirm.");
             0
         }
-        Ok(s) => {
-            eprintln!(
-                "Error: Update command failed (exit {})",
-                s.code().unwrap_or(-1)
-            );
+        Ok(ApplyOutcome::NoArtifact { platform, version }) => {
+            eprintln!("hcom v{version} has no prebuilt archive for {platform}.");
+            eprintln!();
+            eprintln!("{}", crate::update::source_guidance(Some(&version)));
             1
         }
         Err(e) => {
-            eprintln!("Error: Could not run update command: {e}");
+            eprintln!("Error: {e}");
             1
         }
     }
@@ -113,12 +102,23 @@ mod tests {
     fn update_args_default() {
         let args = UpdateArgs::try_parse_from(["update"]).unwrap();
         assert!(!args.check);
+        assert!(!args.refresh_cache);
     }
 
     #[test]
     fn update_args_check_flag() {
         let args = UpdateArgs::try_parse_from(["update", "--check"]).unwrap();
         assert!(args.check);
+        assert!(!args.refresh_cache);
+    }
+
+    #[test]
+    fn update_args_background_refresh_flag() {
+        // The background refresh hcom spawns on itself must parse, and must not
+        // be mistaken for an interactive run that swaps the binary.
+        let args = UpdateArgs::try_parse_from(["update", "--refresh-cache"]).unwrap();
+        assert!(args.refresh_cache);
+        assert!(!args.check);
     }
 
     #[test]
