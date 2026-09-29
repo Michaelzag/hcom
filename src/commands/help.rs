@@ -726,12 +726,16 @@ const UPDATE_HELP: &[HelpEntry] = &[
     ("", ""),
     (
         "",
-        "Detects install method and runs the right update command:",
+        "Linux x86_64: verify the artifact-CDN archive, then keep a .bak.",
     ),
-    ("", "  brew install    → brew upgrade hcom"),
-    ("", "  uv tool install → uv tool upgrade hcom"),
-    ("", "  pip install     → pip install -U hcom"),
-    ("", "  curl installer  → re-run hcom-installer.sh"),
+    (
+        "",
+        "macOS, Arm Linux, Windows: build from the release git tag.",
+    ),
+    (
+        "",
+        "If the CDN cannot be reached, prints the source-build steps.",
+    ),
 ];
 
 const HOOKS_HELP: &[HelpEntry] = &[

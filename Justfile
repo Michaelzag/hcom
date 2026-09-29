@@ -55,11 +55,6 @@ typecheck:
     bash ./scripts/typecheck.sh
 
 [group("checks")]
-[doc("Check the committed release workflow still matches dist-workspace.toml")]
-dist-check:
-    dist generate --check
-
-[group("checks")]
 [doc("cargo check on the MSRV from Cargo.toml (skips loudly if not installed)")]
 msrv:
     bash ./scripts/msrv.sh
@@ -129,7 +124,6 @@ ci *steps:
         fi
     }
 
-    step dist-check dist generate --check
     step typecheck  bash ./scripts/typecheck.sh
     step fmt        cargo fmt --all -- --check
     step clippy     cargo clippy --all-targets --locked -- -D warnings

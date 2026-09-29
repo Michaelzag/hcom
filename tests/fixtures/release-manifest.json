@@ -1,0 +1,9 @@
+{
+  "artifacts": {
+    "x86_64-unknown-linux-gnu": {
+      "sha256": "b59812f6ff311e4e39d5acc0a717240834df8cb5299843773ba22c7e8be8d90c",
+      "url": "https://cdn.ffc-w.com/hcom/releases/v99.0.0/hcom-x86_64-unknown-linux-gnu.tar.gz"
+    }
+  },
+  "version": "v99.0.0"
+}

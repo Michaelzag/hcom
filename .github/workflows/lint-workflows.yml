@@ -6,7 +6,7 @@ name: Lint workflows
 # exists to catch (`fromJSON(inputs.repeat) * 6 + 20` — expressions have no
 # arithmetic — produced a run with zero jobs, no log, and no annotation).
 # Workflow files are also the one thing this repo's CI cannot self-test:
-# everything else is covered by cargo test / clippy / dist-check, but a broken
+# everything else is covered by cargo test / clippy, but a broken
 # workflow means CI cannot run to report it.
 
 on:
@@ -38,10 +38,12 @@ jobs:
             https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
           echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  actionlint.tar.gz" | sha256sum -c -
           tar -xzf actionlint.tar.gz actionlint
-      # Pre-existing style findings in release.yml are ignored so this starts
-      # green and stays meaningful; the value here is parse/expression/context
-      # errors, which are not ignorable and are what actually take CI down.
-      # Drop an ignore once the underlying finding is fixed.
+      # These ignores are inherited, not earned: release.yml, which most of them
+      # were written for, is gone (releases are built on the host now). They
+      # match nothing today and are kept only so removing this workflow's
+      # history is not part of a storage change. The value here is
+      # parse/expression/context errors, which are not ignorable and are what
+      # actually take CI down.
       - name: Lint
         run: |
           ./actionlint \

@@ -257,13 +257,18 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     if json_mode {
         let log_summary = crate::log::get_log_summary(1.0);
         // Call get_update_info once to avoid inconsistent state (it has side effects)
-        let update_info = crate::update::get_update_info();
+        let latest_version = crate::update::get_update_info();
+        // A command a user can actually run, not prose: hcom installs the
+        // update itself. Null when there is nothing to install.
+        let update_cmd = latest_version
+            .as_ref()
+            .map(|_| crate::update::UPDATE_COMMAND);
         let mut result = json!({
             "version": {
                 "current": env!("CARGO_PKG_VERSION"),
-                "latest": update_info.as_ref().map(|(v, _)| v.clone()),
-                "update_available": update_info.is_some(),
-                "update_cmd": update_info.as_ref().map(|(_, c)| *c),
+                "latest": latest_version.clone(),
+                "update_available": latest_version.is_some(),
+                "update_cmd": update_cmd,
             },
             "hcom_dir": hcom_dir.to_string_lossy(),
             "hcom_dir_override": hcom_dir_override,
