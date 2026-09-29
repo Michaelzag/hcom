@@ -17,7 +17,15 @@ use anyhow::{Result, bail};
 use serde_json::json;
 use std::time::Instant;
 
+/// Fresh launches keep the short inline wait: nothing about a new agent's
+/// startup is expected to be slow, and this path runs on every single launch.
 pub(crate) const INLINE_SINGLE_LAUNCH_WAIT_SECS: u64 = 10;
+
+/// Resumes and forks get the longer window. Restoring a large session is
+/// legitimately slower than starting a fresh one (ffc-47uy6: luvo's resume was
+/// ready 54.8 s after launch on a box at loadavg ~165), and the wait is only a
+/// convenience for the caller — a timeout is reported as pending, not failed.
+pub(crate) const INLINE_RESUME_LAUNCH_WAIT_SECS: u64 = 30;
 
 /// Run the launch command. `argv` is the full argv[1..] including count/tool.
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
@@ -803,19 +811,150 @@ pub(crate) enum InlineLaunchReadiness {
     Ready,
     Failed,
     Blocked,
-    Launching,
+    /// The readiness window elapsed but the launched tool is still running:
+    /// the launch is slow, not broken (ffc-47uy6).
+    Pending,
+    /// The readiness window elapsed and no pid could be read for the launch,
+    /// so nothing is proven either way. Not pending — exit 0 must mean a
+    /// verified-alive tool, never an absent one.
+    Unverified,
 }
 
 /// Map an inline-readiness outcome to a process exit code, shared by launch
 /// and resume/fork so all three report readiness the same way. `None` means
 /// no readiness wait ran (not inside an AI tool, or multi-launch).
+///
+/// `Pending` is 0, deliberately distinct from `Failed`: a timed-out wait on a
+/// live process used to exit 2, which callers such as fleet read as a failed
+/// launch, turning a seat that came up 54.8 s later into a casualty. Exit 0
+/// is reserved for a VERIFIED-alive tool, so `Unverified` keeps a non-zero
+/// exit rather than joining `Pending`.
 pub(crate) fn readiness_exit_code(state: Option<InlineLaunchReadiness>, failed: usize) -> i32 {
     match state {
         Some(InlineLaunchReadiness::Failed) => 1,
-        Some(InlineLaunchReadiness::Launching) | Some(InlineLaunchReadiness::Blocked) => 2,
+        Some(InlineLaunchReadiness::Pending) => 0,
+        Some(InlineLaunchReadiness::Blocked | InlineLaunchReadiness::Unverified) => 2,
         _ if failed == 0 => 0,
         _ => 1,
     }
+}
+
+/// Liveness of the launched TOOL behind a launched instance.
+///
+/// The pid hcom records is a WRAPPER, never the tool: a new-window launch
+/// records the generated script's shell, which ends in `exec bash -l` and so
+/// deliberately outlives the tool; a background launch records the detached
+/// runner. A live wrapper therefore proves nothing about the tool — that is
+/// exactly how a launch whose tool died before its first hook came to be
+/// reported as pending. `Alive` is the tool: either the recorded pid IS the
+/// tool (run-here's `exec`, the PTY wrapper's child-pid write) or a live tool
+/// process hangs below it. `Gone` is a dead wrapper, or a live one with no
+/// tool left under it. `Unknown` means no pid could be read at all, which is
+/// no proof of anything and so is never reported as a verified-alive pending.
+enum LaunchLiveness {
+    /// A live tool process, the one the pending line should name.
+    Alive(u32),
+    Gone,
+    Unknown,
+}
+
+/// The recorded pid of `name`'s launched process, preferring the handle the
+/// launcher returned (background runner) over the anchored row pid, which a
+/// PTY wrapper may have claimed for itself.
+fn recorded_launch_pid(db: &HcomDb, result: &LaunchResult, name: &str) -> Option<u32> {
+    let from_handle = result
+        .handles
+        .iter()
+        .filter(|h| h.get("instance_name").and_then(|v| v.as_str()) == Some(name))
+        .filter_map(|h| h.get("pid"))
+        .find_map(|pid| pid.as_u64())
+        .and_then(|pid| u32::try_from(pid).ok());
+    if from_handle.is_some() {
+        return from_handle;
+    }
+    db.get_instance_full(name)
+        .ok()
+        .flatten()
+        .and_then(|row| row.pid)
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+/// Every name the launched tool answers to: the canonical CLI binary plus its
+/// aliases, so a launch through `agy` or `cursor-agent` is still recognized
+/// as that tool. The PTY surface (`claude-pty`) is the same binary as
+/// `claude`. Empty for a tool string hcom does not know.
+fn launched_tool_names(tool: &str) -> Vec<&'static str> {
+    let Ok(surface) = crate::launcher::LaunchTool::from_str(tool) else {
+        return Vec::new();
+    };
+    let spec = surface.spec();
+    let mut names: Vec<&'static str> = Vec::new();
+    for name in std::iter::once(spec.cli_binary).chain(spec.aliases.iter().copied()) {
+        // A spec whose alias repeats its own cli_binary contributes one name,
+        // not two: `antigravity` is `agy` both ways.
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Whether the tool behind `name` is still running, per
+/// [`recorded_launch_pid`] and [`crate::proctruth::live_tool_processes`].
+///
+/// A zombie counts as gone anywhere in the tree: it is dead, only unreaped.
+/// The tool-name rule applies only where it can actually be answered — see
+/// [`crate::proctruth::tool_names_are_provable`] — and only for a tool hcom
+/// recognizes. Anywhere else the recorded pid's own liveness stands, which is
+/// the weaker rule the pid-only check always was, and the one that can still
+/// see a launch that never got as far as a tool.
+fn launch_liveness(db: &HcomDb, result: &LaunchResult, name: &str) -> LaunchLiveness {
+    let Some(pid) = recorded_launch_pid(db, result, name) else {
+        return LaunchLiveness::Unknown;
+    };
+    if crate::proctruth::process_gone(pid) {
+        return LaunchLiveness::Gone;
+    }
+    if !crate::proctruth::tool_names_are_provable() {
+        return LaunchLiveness::Alive(pid);
+    }
+    let tool_names = launched_tool_names(&result.tool);
+    if tool_names.is_empty() {
+        return LaunchLiveness::Alive(pid);
+    }
+    match crate::proctruth::live_tool_processes(pid, &tool_names).first() {
+        Some(&tool_pid) => LaunchLiveness::Alive(tool_pid),
+        None => LaunchLiveness::Gone,
+    }
+}
+
+/// Names of the launched instances whose tool is gone, so a timed-out wait on
+/// a dead launch reports a failure instead of a pending one.
+fn dead_launch_names(db: &HcomDb, result: &LaunchResult) -> Vec<String> {
+    instance_names_from_launch_result(result)
+        .into_iter()
+        .filter(|name| matches!(launch_liveness(db, result, name), LaunchLiveness::Gone))
+        .collect()
+}
+
+/// The live tool pid of the first launched instance, for the pending message.
+fn first_live_launch_pid(db: &HcomDb, result: &LaunchResult) -> Option<u32> {
+    instance_names_from_launch_result(result)
+        .into_iter()
+        .find_map(|name| match launch_liveness(db, result, &name) {
+            LaunchLiveness::Alive(pid) => Some(pid),
+            LaunchLiveness::Gone | LaunchLiveness::Unknown => None,
+        })
+}
+
+/// The launched names whose liveness could not be established at all, for the
+/// unverified line. Not a "first": a timed-out multi-name launch can have
+/// several, and the line must name all of them.
+fn unverified_launch_names(db: &HcomDb, result: &LaunchResult) -> Vec<String> {
+    instance_names_from_launch_result(result)
+        .into_iter()
+        .filter(|name| matches!(launch_liveness(db, result, name), LaunchLiveness::Unknown))
+        .collect()
 }
 
 pub(crate) fn print_inline_launch_readiness(
@@ -828,18 +967,55 @@ pub(crate) fn print_inline_launch_readiness(
     let wait = launch_status::wait_for_launch(db, None, Some(&result.batch_id), timeout_secs);
     let elapsed_secs = start.elapsed().as_secs_f64();
 
+    // A wait that ran out says nothing about the launch itself: the only
+    // question left is whether the launched TOOL is still running. A live tool
+    // is pending; a tool that is gone is a failure; no recorded pid proves
+    // nothing at all and is reported as unverified, never as pending.
+    let timed_out = matches!(
+        wait.status,
+        LaunchStatus::Timeout | LaunchStatus::NoLaunches
+    );
+    let dead = if timed_out {
+        dead_launch_names(db, result)
+    } else {
+        Vec::new()
+    };
+    let unverified = if timed_out && dead.is_empty() {
+        unverified_launch_names(db, result)
+    } else {
+        Vec::new()
+    };
+
     let (state, details) = match wait.status {
         LaunchStatus::Ready => (InlineLaunchReadiness::Ready, Vec::new()),
         LaunchStatus::Error => (InlineLaunchReadiness::Failed, wait.failures),
         LaunchStatus::Blocked => (InlineLaunchReadiness::Blocked, wait.blockers),
+        LaunchStatus::Timeout | LaunchStatus::NoLaunches if !dead.is_empty() => (
+            InlineLaunchReadiness::Failed,
+            vec![format!("{}: tool exited before ready", dead.join(", "))],
+        ),
+        LaunchStatus::Timeout | LaunchStatus::NoLaunches if !unverified.is_empty() => {
+            (InlineLaunchReadiness::Unverified, unverified)
+        }
         LaunchStatus::Timeout | LaunchStatus::NoLaunches => {
-            (InlineLaunchReadiness::Launching, Vec::new())
+            (InlineLaunchReadiness::Pending, Vec::new())
         }
     };
 
     println!(
         "{}",
-        format_inline_launch_readiness(state, result, &wait.instances, elapsed_secs, &details)
+        format_inline_launch_readiness(
+            state,
+            result,
+            &wait.instances,
+            elapsed_secs,
+            &details,
+            if state == InlineLaunchReadiness::Pending {
+                first_live_launch_pid(db, result)
+            } else {
+                None
+            },
+        )
     );
     state
 }
@@ -856,12 +1032,14 @@ fn instance_names_from_launch_result(result: &LaunchResult) -> Vec<String> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_inline_launch_readiness(
     state: InlineLaunchReadiness,
     result: &LaunchResult,
     ready_instances: &[String],
     elapsed_secs: f64,
     failures: &[String],
+    live_pid: Option<u32>,
 ) -> String {
     let names = instance_names_from_launch_result(result);
     let target = if names.is_empty() {
@@ -897,10 +1075,33 @@ fn format_inline_launch_readiness(
             };
             format!("Launch blocked: {detail} (batch: {}).", result.batch_id)
         }
-        InlineLaunchReadiness::Launching => format!(
-            "Still launching after {elapsed}: {target} ({progress}, batch: {}). Check `hcom list -v` or `hcom events launch {} --timeout 30`.",
-            result.batch_id, result.batch_id
-        ),
+        // Greppable and exit-0: the launched TOOL is running, it just has not
+        // said `ready` inside the window, and it will on its own.
+        InlineLaunchReadiness::Pending => {
+            let alive = match live_pid {
+                Some(pid) => format!("tool process {pid} alive"),
+                None => "its tool process is still running".to_string(),
+            };
+            format!(
+                "Launch pending: still starting after {elapsed}, {alive}; it will report ready on its own ({target}, {progress}, batch: {}). Check `hcom list -v` or `hcom events launch {} --timeout 30`.",
+                result.batch_id, result.batch_id
+            )
+        }
+        // Non-zero on purpose: no pid was ever recorded, so nothing proves
+        // this launch survived. It is NOT a refusal — the command did run —
+        // but it cannot be reported as a verified-alive pending either.
+        InlineLaunchReadiness::Unverified => {
+            let unverified = if failures.is_empty() {
+                target.clone()
+            } else {
+                failures.join(", ")
+            };
+            format!(
+                "Launch unverified: no process recorded for {unverified} (batch: {}). \
+                 Check `hcom list -v` to see whether the seat came up.",
+                result.batch_id
+            )
+        }
     }
 }
 
@@ -1321,13 +1522,17 @@ mod tests {
             &["luna".to_string()],
             2.2,
             &[],
+            None,
         );
 
         assert_eq!(line, "Launch ready: luna (1/1 ready, 2.2s).");
     }
 
+    /// A live launch past its window reports `launch pending` and exits 0 —
+    /// the machine-greppable wording ffc-47uy6 replaced `Still launching`
+    /// (which paired with exit 2) with. The follow-up command survives.
     #[test]
-    fn test_format_inline_launch_readiness_launching_has_followup_command() {
+    fn test_format_inline_launch_readiness_pending_has_followup_command() {
         let result = LaunchResult {
             tool: "gemini".to_string(),
             batch_id: "batch-2".to_string(),
@@ -1340,15 +1545,112 @@ mod tests {
         };
 
         let line = format_inline_launch_readiness(
-            InlineLaunchReadiness::Launching,
+            InlineLaunchReadiness::Pending,
             &result,
             &[],
             10.0,
             &[],
+            Some(4242),
         );
 
-        assert!(line.contains("Still launching after 10.0s: mari (0/1 ready"));
+        assert!(line.contains("Launch pending: still starting after 10.0s"));
+        assert!(
+            line.contains("tool process 4242 alive"),
+            "the pending line names the live TOOL, not the wrapper: {line}"
+        );
+        assert!(
+            line.contains("it will report ready on its own (mari, 0/1 ready, batch: batch-2)"),
+            "the pending line must name the seat and its progress: {line}"
+        );
         assert!(line.contains("hcom events launch batch-2 --timeout 30"));
+        assert!(
+            !line.contains("launch refused"),
+            "a live launch is never reported as refused: {line}"
+        );
+    }
+
+    /// A launch with no recorded pid is unverified, not pending: exit 0 must
+    /// mean a verified-alive tool, and the wording must never say "refused".
+    #[test]
+    fn test_format_inline_launch_readiness_unverified_names_the_seat() {
+        let result = LaunchResult {
+            tool: "claude".to_string(),
+            batch_id: "batch-4".to_string(),
+            launched: 1,
+            failed: 0,
+            background: false,
+            log_files: Vec::new(),
+            handles: vec![serde_json::json!({"instance_name": "nola"})],
+            errors: Vec::new(),
+        };
+
+        let line = format_inline_launch_readiness(
+            InlineLaunchReadiness::Unverified,
+            &result,
+            &[],
+            10.0,
+            &["nola".to_string()],
+            None,
+        );
+
+        assert!(
+            line.contains("Launch unverified: no process recorded for nola"),
+            "the unverified line must say what is missing: {line}"
+        );
+        assert!(
+            !line.to_lowercase().contains("refused"),
+            "an unverified launch is not a refusal: {line}"
+        );
+    }
+
+    /// The exit-code contract callers depend on: a slow-but-live launch is not
+    /// a failure, a real failure still is, and an unprovable one never claims
+    /// success.
+    #[test]
+    fn test_readiness_exit_code_separates_pending_from_failed() {
+        assert_eq!(
+            readiness_exit_code(Some(InlineLaunchReadiness::Pending), 0),
+            0,
+            "a live launch past its window must not read as a failure"
+        );
+        assert_eq!(
+            readiness_exit_code(Some(InlineLaunchReadiness::Failed), 0),
+            1
+        );
+        assert_eq!(
+            readiness_exit_code(Some(InlineLaunchReadiness::Blocked), 0),
+            2
+        );
+        assert_eq!(
+            readiness_exit_code(Some(InlineLaunchReadiness::Unverified), 0),
+            2,
+            "no recorded pid proves nothing, so it must not exit 0"
+        );
+        assert_eq!(
+            readiness_exit_code(Some(InlineLaunchReadiness::Ready), 0),
+            0
+        );
+        assert_eq!(readiness_exit_code(None, 1), 1);
+    }
+
+    /// The launched tool's names come from its spec, so a launch through an
+    /// alias (`agy`, `cursor-agent`) is still recognized as that tool, and the
+    /// PTY surface resolves to claude's binary.
+    #[test]
+    fn test_launched_tool_names_cover_aliases() {
+        assert_eq!(launched_tool_names("claude"), vec!["claude"]);
+        assert_eq!(launched_tool_names("claude-pty"), vec!["claude"]);
+        assert_eq!(
+            launched_tool_names("antigravity"),
+            vec!["agy"],
+            "the spec's own alias repeats its cli_binary: one name, not two"
+        );
+        assert_eq!(launched_tool_names("cursor"), vec!["cursor-agent"]);
+        assert_eq!(launched_tool_names("omp"), vec!["omp", "omp-agent"]);
+        assert!(
+            launched_tool_names("not-a-tool").is_empty(),
+            "an unknown tool names nothing, so no descendant can be mistaken for it"
+        );
     }
 
     #[test]
@@ -1370,6 +1672,7 @@ mod tests {
             &[],
             0.5,
             &["nola: executable not found".to_string()],
+            None,
         );
 
         assert_eq!(

@@ -1289,6 +1289,111 @@ fn is_zombie(pid: u32) -> bool {
         .map(|(_, rest)| rest.trim_start().starts_with('Z'))
         .unwrap_or(false)
 }
+
+/// Every live descendant of `root`, in breadth-first order, `root` excluded.
+///
+/// A launch's recorded pid is a WRAPPER (the generated terminal script's shell,
+/// or the detached background runner), not the tool it started. The wrapper
+/// outlives the tool on purpose — a new-window script ends in `exec bash -l` —
+/// so wrapper liveness proves nothing about the tool. The tool is somewhere
+/// BELOW the wrapper, so this is the walk that finds it.
+///
+/// ONE `/proc` pass, then a breadth-first search over that snapshot. Rescanning
+/// per generation would not terminate: a shell that runs `sleep` in a loop is
+/// handed a brand-new child pid every cycle, so the frontier would never
+/// empty. A process that starts after the snapshot simply is not in it, which
+/// costs at most one generation of depth and can never loop.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn live_descendants(root: u32) -> Vec<u32> {
+    let snapshot = all_parents();
+    let mut out = Vec::new();
+    let mut frontier = vec![root];
+    let mut seen = std::collections::HashSet::from([root]);
+    while !frontier.is_empty() {
+        let next = std::mem::take(&mut frontier);
+        for (parent, child) in snapshot.iter() {
+            if next.contains(parent) && seen.insert(*child) {
+                out.push(*child);
+                frontier.push(*child);
+            }
+        }
+    }
+    out
+}
+
+/// `(parent, child)` for every process on the host, read once. An empty parent
+/// list cannot be passed to [`direct_children`] (it filters on membership), so
+/// the unfiltered form is spelled out here.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn all_parents() -> Vec<(u32, u32)> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| parent_pid(pid).map(|parent| (parent, pid)))
+        .collect()
+}
+
+/// The same walk off targets without procfs, where no parent links can be
+/// read: no descendant is provable, so the caller falls back to the recorded
+/// pid's own liveness (see [`tool_names_are_provable`]).
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn live_descendants(_root: u32) -> Vec<u32> {
+    Vec::new()
+}
+
+/// Whether this host can answer "is that process the launched tool?" at all.
+///
+/// Only Linux and Android expose both halves of the answer: the parent links
+/// [`live_descendants`] walks and the `comm`/`cmdline` [`process_is_tool`]
+/// reads. Everywhere else both are unreadable, and a name match would come
+/// back empty for a launch that is in fact running — so the caller must fall
+/// back to the recorded pid's own liveness rather than report every launch as
+/// gone.
+pub(crate) const fn tool_names_are_provable() -> bool {
+    cfg!(any(target_os = "linux", target_os = "android"))
+}
+
+/// Whether `pid` is running the launched TOOL, by the name the launcher
+/// started: `/proc/<pid>/comm` exactly, or the basename of argv[0].
+///
+/// Both are read because a node/npm-installed tool is a script: its `comm` is
+/// the truncated interpreter name while argv[0] carries the script path the
+/// launcher exec'd, and either one can be the only name available. A zombie
+/// counts as not running it — a dead tool is a dead launch.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn process_is_tool(pid: u32, tool_names: &[&str]) -> bool {
+    if tool_names.is_empty() || process_gone(pid) {
+        return false;
+    }
+    let comm_matches = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| tool_names.contains(&comm.trim_end_matches('\n')));
+    comm_matches
+        || std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+            let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
+            let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or_default();
+            tool_names.iter().any(|name| name.as_bytes() == base)
+        })
+}
+
+/// No `comm`, no `cmdline`, no answer.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn process_is_tool(_pid: u32, _tool_names: &[&str]) -> bool {
+    false
+}
+
+/// Every live process at or below `root` that is running one of `tool_names`,
+/// `root` included. The answer to "is the launched tool still up?" when
+/// `root` is the wrapper shell the launcher recorded. The walk visits each pid
+/// once (see [`live_descendants`]), so the result is duplicate-free and in
+/// breadth-first order — the root, if it is the tool, comes first.
+pub(crate) fn live_tool_processes(root: u32, tool_names: &[&str]) -> Vec<u32> {
+    std::iter::once(root)
+        .chain(live_descendants(root))
+        .filter(|pid| process_is_tool(*pid, tool_names))
+        .collect()
+}
 /// Field 4 (ppid) of `/proc/<pid>/stat` — the token after the closing `)` of
 /// comm, so a comm containing spaces or parens cannot shift the parse. None
 /// when the process is gone, unparseable, or has no parent (ppid 0).
@@ -6736,6 +6841,286 @@ mod tests {
         assert!(
             seat_b.alive(seat_b.holder) && seat_b.alive(seat_b.carrier),
             "seat B was signalled"
+        );
+    }
+
+    /// Spawn a fake tool that lives until killed, as `name`, and return the
+    /// path hcom's PATH lookup would have resolved.
+    ///
+    /// Deliberately no `exec`: an `exec sleep` would replace the tool's own
+    /// process image, leaving `comm` as `sleep` and argv[0] as `sleep` too —
+    /// the exact shape a real npm-installed tool has, and exactly the shape
+    /// that must NOT match the launched tool's name.
+    ///
+    /// Every spawn site gives this null stdio, so the `sleep` children it
+    /// starts can never hold a test-harness pipe: a leaked grandchild holding
+    /// an inherited pipe is what turns a finished test into a hang.
+    #[cfg(target_os = "linux")]
+    fn fake_tool(dir: &std::path::Path, name: &str) -> String {
+        let bin = dir.join(name);
+        std::fs::write(&bin, "#!/bin/bash\nwhile true; do sleep 1; done\n").unwrap();
+        crate::sys::fs::set_executable(&bin).unwrap();
+        bin.to_str().expect("utf-8 tool path").to_string()
+    }
+
+    /// A fake tool that exits after `secs`, so a test can watch a tool leave
+    /// without signalling anything the test did not start.
+    #[cfg(target_os = "linux")]
+    fn fake_tool_that_exits(dir: &std::path::Path, name: &str, secs: u32) -> String {
+        let bin = dir.join(name);
+        std::fs::write(&bin, format!("#!/bin/bash\nsleep {secs}\n")).unwrap();
+        crate::sys::fs::set_executable(&bin).unwrap();
+        bin.to_str().expect("utf-8 tool path").to_string()
+    }
+
+    /// A wrapper shell that starts `script &`, prints the tool's pid, and then
+    /// stays alive — the generated launch script's shape, whose trailing
+    /// `exec bash -l` is what keeps a dead tool's wrapper running.
+    /// `(wrapper, tool, wrapper_child)`; the caller owns the cleanup of both.
+    ///
+    /// The tool is backgrounded with all three streams on `/dev/null`, so it
+    /// and its own children never inherit the pid pipe. That is the difference
+    /// between a test that finishes and one that hangs: a leaked grandchild
+    /// holding the write end of a pipe the harness is reading blocks the read
+    /// for as long as it lives.
+    ///
+    /// The returned tool pid is one whose `exec` has already settled. `$!` is
+    /// the forked child, which still carries the wrapper's own `comm` for a few
+    /// milliseconds until it exec's the shebang interpreter — a window in which
+    /// every name check would answer about the wrong process.
+    #[cfg(target_os = "linux")]
+    fn wrapper_tree(script: &str) -> (u32, u32, std::process::Child) {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "{script} > /dev/null 2>&1 < /dev/null & echo $!; \
+                 while true; do sleep 1; done"
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        // Its own process group, so the fixture's whole tree — wrapper, tool,
+        // and the tool's own `sleep` children — is one signal. Killing only
+        // the wrapper orphans those sleeps, and an orphan holding a pipe is
+        // what turns a finished test into a hang.
+        command.process_group(0);
+        let mut child = command.spawn().expect("spawn wrapper tree");
+        // `ChildStdout` is a `Read`, not a `BufRead`, so take the digits one at
+        // a time until the newline the shell prints after `$!`.
+        let mut digits = String::new();
+        let mut byte = [0u8; 1];
+        let mut stdout = child.stdout.take().expect("wrapper stdout");
+        while stdout.read_exact(&mut byte).is_ok() && byte[0] != b'\n' {
+            digits.push(byte[0] as char);
+        }
+        let tool: u32 = digits.trim().parse().expect("tool pid from `echo $!`");
+        wait_exec_settled(tool, child.id());
+        (child.id(), tool, child)
+    }
+
+    /// Wait until `pid` is no longer the shell that forked it, i.e. its
+    /// shebang `exec` has completed and `comm` reflects the tool itself.
+    /// A pid that vanishes first is fine — a caller asserting on a dead tool
+    /// is exercising the gone path, not a name match.
+    #[cfg(target_os = "linux")]
+    fn wait_exec_settled(tool: u32, wrapper: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // A tool that already exited (`fake_tool_that_exits` with 0s) never
+            // exec's away from the wrapper's comm; its comm reads empty, which
+            // is not the wrapper's name, so the loop ends on its own.
+            let comm = orphan_fixtures::comm_of(tool);
+            if comm != orphan_fixtures::comm_of(wrapper) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tool {tool} never exec'd away from the wrapper's comm"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Wait for `pid` to reach a lifecycle-gone state (exited or zombie).
+    #[cfg(target_os = "linux")]
+    fn wait_gone(pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !process_gone(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} never went away"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Kills the whole fixture tree when it goes out of scope, INCLUDING on a
+    /// panicking assert. It holds the fixture's process-group leader, and the
+    /// signal goes to the GROUP, so the tool's own `sleep` children die with
+    /// it — killing the leader alone orphans them, and an orphan holding an
+    /// inherited pipe is exactly what hangs a suite.
+    ///
+    /// Every process it can reach was spawned by the test that built the
+    /// guard: the tree is started with `process_group(0)`, so the group holds
+    /// the wrapper, the tool, and nothing else. Nothing outside the test is
+    /// ever signalled.
+    #[cfg(target_os = "linux")]
+    struct FixtureTree(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for FixtureTree {
+        fn drop(&mut self) {
+            // SAFETY: a negative pid targets the process GROUP led by
+            // `self.0.id()`, which this test created with process_group(0).
+            unsafe {
+                libc::killpg(self.0.id() as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The liveness rule's central case: a live tool under a live wrapper is a
+    /// live launch (luvo), and the SAME wrapper outliving a dead tool is not
+    /// (fauna's new-window script ending in `exec bash -l`).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn live_tool_processes_separates_a_live_tool_from_a_surviving_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool_bin = fake_tool(dir.path(), "hcom-fake-tool");
+        let (wrapper, tool, keep) = wrapper_tree(&tool_bin);
+        let _tree = FixtureTree(keep);
+
+        assert_eq!(orphan_fixtures::comm_of(tool), "hcom-fake-tool");
+        assert!(
+            !process_is_tool(wrapper, &["hcom-fake-tool"]),
+            "the wrapper shell is not the tool"
+        );
+        assert_eq!(
+            live_tool_processes(wrapper, &["hcom-fake-tool"]),
+            vec![tool],
+            "the live tool under the wrapper is the live launch"
+        );
+
+        // Now the trap: the tool exits before its first hook, and the wrapper
+        // keeps running. That must read as gone, never as alive.
+        let _ = crate::sys::process::kill(tool);
+        wait_gone(tool);
+        assert!(
+            !process_gone(wrapper),
+            "the wrapper must still be alive; that is the whole trap"
+        );
+        assert!(
+            live_tool_processes(wrapper, &["hcom-fake-tool"]).is_empty(),
+            "a surviving wrapper shell is not a live tool"
+        );
+    }
+
+    /// The recorded pid can BE the tool (run-here's `exec`, the PTY wrapper's
+    /// child-pid write). With no descendants the root itself must match.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn live_tool_processes_finds_a_tool_that_is_the_recorded_pid_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(fake_tool(dir.path(), "hcom-fake-root"));
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let tool = command.spawn().expect("spawn the tool itself");
+        let pid = tool.id();
+        let _tree = FixtureTree(tool);
+
+        // The root is checked first and wins, so the answer is the recorded pid
+        // itself and not some descendant of it.
+        assert_eq!(
+            live_tool_processes(pid, &["hcom-fake-root"]),
+            vec![pid],
+            "the recorded pid is the tool itself"
+        );
+        assert!(
+            live_tool_processes(pid, &[]).is_empty(),
+            "no tool name, nothing proven"
+        );
+        assert!(
+            live_tool_processes(pid, &["hcom-fake-other"]).is_empty(),
+            "a name that is not running is not a match"
+        );
+    }
+
+    /// A lookalike name is not the launched tool, and a tool at depth is
+    /// still found: neither "only the direct child" nor "any name in the
+    /// tree" is the rule.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn live_tool_processes_matches_by_name_at_any_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool_bin = fake_tool(dir.path(), "hcom-fake-deep");
+        // wrapper -> intermediate shell -> tool. The intermediate shell forks
+        // the tool (no `exec`, or it would BECOME the tool and the tree would
+        // be depth 1) and stays alive under it; `$!` is the tool's pid because
+        // the intermediate shell is what forked it.
+        let mid = dir.path().join("mid.sh");
+        std::fs::write(
+            &mid,
+            format!("#!/bin/sh\n{tool_bin} &\nwhile true; do sleep 1; done\n"),
+        )
+        .unwrap();
+        crate::sys::fs::set_executable(&mid).unwrap();
+        let (wrapper, mid_pid, keep) = wrapper_tree(mid.to_str().unwrap());
+        let _tree = FixtureTree(keep);
+
+        // `$!` at the wrapper is the intermediate shell, so the tool is found
+        // one level further down — which is exactly the point of the test.
+        let descendants = live_descendants(wrapper);
+        let tool = descendants
+            .iter()
+            .copied()
+            .find(|pid| process_is_tool(*pid, &["hcom-fake-deep"]))
+            .unwrap_or_else(|| panic!("the deep tool was never found in {descendants:?}"));
+        assert_ne!(
+            tool, mid_pid,
+            "the tool must be below the intermediate shell, not be it"
+        );
+        assert_ne!(
+            tool, wrapper,
+            "the tool must be below the wrapper, not be it"
+        );
+        assert!(
+            live_tool_processes(wrapper, &["hcom-fake-other"]).is_empty(),
+            "a sibling name is not the launched tool"
+        );
+        assert_eq!(
+            live_tool_processes(wrapper, &["hcom-fake-deep"]),
+            vec![tool],
+            "a tool at depth is still the live launch"
+        );
+    }
+
+    /// A tool that exits on its own, with no signal from the test, still reads
+    /// as gone the moment it is gone. This is the shape a real dying launch
+    /// takes, and it must not depend on anyone noticing the exit.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_tool_that_exits_on_its_own_stops_counting_as_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wrapper, tool, keep) =
+            wrapper_tree(&fake_tool_that_exits(dir.path(), "hcom-fake-brief", 1));
+        let _tree = FixtureTree(keep);
+
+        assert_eq!(
+            live_tool_processes(wrapper, &["hcom-fake-brief"]),
+            vec![tool],
+            "the tool is alive before it exits"
+        );
+        wait_gone(tool);
+        assert!(
+            live_tool_processes(wrapper, &["hcom-fake-brief"]).is_empty(),
+            "a tool that exited is not a live tool, wrapper or not"
         );
     }
 }

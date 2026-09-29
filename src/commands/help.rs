@@ -910,10 +910,16 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
     // Footer
     lines.push(String::new());
     lines.push("Exit codes:".to_string());
-    lines.push("    0  Ready (or process spawned with no inline readiness wait)".to_string());
+    lines.push(
+        "    0  Ready, launch pending after the readiness wait with a live tool,\n\
+         \x20      or process spawned with no inline readiness wait"
+            .to_string(),
+    );
     lines.push("    1  Spawn error, or one or more instances reported launch_failed".to_string());
     lines.push(
-        "    2  Still launching after readiness wait, or blocked on user attention".to_string(),
+        "    2  Blocked on user attention, or launch unverified (no process was\n\
+         \x20      recorded, so the launch could not be confirmed alive)"
+            .to_string(),
     );
     lines.push(String::new());
     lines.push(format!("  Run \"{} --help\" for {} options.", t, t));
