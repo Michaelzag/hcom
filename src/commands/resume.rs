@@ -308,8 +308,11 @@ fn run_resume(
         return Ok(0);
     }
 
+    // Resumes get the longer window: restoring a large session is legitimately
+    // slower than a fresh launch, and the wait is only a convenience for the
+    // caller (ffc-47uy6).
     let inline_readiness_wait_secs = if ctx.is_inside_ai_tool() {
-        Some(crate::commands::launch::INLINE_SINGLE_LAUNCH_WAIT_SECS)
+        Some(crate::commands::launch::INLINE_RESUME_LAUNCH_WAIT_SECS)
     } else {
         None
     };
