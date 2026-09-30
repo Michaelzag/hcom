@@ -7157,16 +7157,18 @@ mod tests {
     /// argv[1]. A live one is a live launch; a different script under the
     /// same interpreter is not, and neither is the interpreter alone.
     ///
-    /// The "runtime" is a symlink named exactly `node` to `/bin/sh`, and the
-    /// tool fixture is an sh script named exactly the tool's name. The
-    /// fixture builds both itself and needs nothing installed, so this test
-    /// proves the rule on a host with no Node at all.
+    /// The "runtime" is a symlink named exactly `node` to `/bin/bash` — the
+    /// same bash `fake_tool`'s shebang already requires, so this adds no
+    /// dependency the surrounding fixtures do not already have. Deliberately
+    /// not `/bin/sh`, which is BusyBox on some hosts and dispatches on
+    /// argv[0], exiting "node: applet not found" instead of running the
+    /// script.
     #[test]
     #[cfg(all(target_os = "linux", not(target_os = "android")))]
     fn a_node_launched_tool_is_alive_even_though_node_owns_the_process_image() {
         let dir = tempfile::tempdir().unwrap();
         let node = dir.path().join("node");
-        std::os::unix::fs::symlink("/bin/sh", &node).expect("link the fake runtime");
+        std::os::unix::fs::symlink("/bin/bash", &node).expect("link the fake runtime");
         // Named exactly the tool, because the rule matches argv[1]'s BASENAME
         // against the tool name — as a `node .../claude` rewrite does.
         let script = fake_tool(dir.path(), "hcom-fake-node-tool");
