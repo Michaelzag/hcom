@@ -69,13 +69,19 @@ pub fn wake_all(db: &HcomDb) {
     wake_ports(&ports, WAKE_FANOUT_MS);
 }
 
-/// Snapshot wake-endpoint ports for an instance.
+/// Snapshot wake-endpoint ports for an instance, filtered to `kinds`.
 ///
-/// Used by the stop pattern in `hooks::common::finalize_instance_inner`,
-/// which must capture ports BEFORE `delete_notify_endpoints` removes the rows
-/// and wake them AFTER `delete_instance` so listeners see the row gone.
+/// Empty `kinds` means all wake kinds (same as [`snapshot_wake_ports`]).
+/// Call IN-TXN immediately BEFORE `delete_notify_endpoints` removes the rows
+/// and extend the caller's PostCommit with the result: the post-commit fire
+/// then still reaches listeners whose endpoint rows are already gone (S1).
+/// Status wakes are DELIVERY_LOOPS-only — pass [`WakeKind::DELIVERY_LOOPS`].
+pub fn snapshot_wake_ports_for(db: &HcomDb, instance: &str, kinds: &[WakeKind]) -> Vec<u16> {
+    lookup_ports(db, instance, kinds)
+}
+
 pub fn snapshot_wake_ports(db: &HcomDb, instance: &str) -> Vec<u16> {
-    lookup_ports(db, instance, &[])
+    snapshot_wake_ports_for(db, instance, &[])
 }
 
 /// Connect-and-close on each port to fire a wake. Best-effort; errors ignored.

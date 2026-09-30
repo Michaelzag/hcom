@@ -15,6 +15,8 @@ pub mod core;
 mod db;
 mod delivery;
 mod delivery_policy;
+#[cfg(test)]
+mod fanout_regression;
 pub mod fleet_names;
 pub mod hooks;
 pub mod identity;

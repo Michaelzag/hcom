@@ -575,10 +575,35 @@ fn send_message_resolved(
         SenderKind::Instance => identity.name.clone(),
     };
 
-    // Log event to DB
-    let event_id = db
-        .log_event("message", &routing_instance, &data)
-        .map_err(|e| format!("Failed to write message to database: {e}"))?;
+    // Log event to DB: ONLY the message-row insert runs in the write
+    // transaction (one short statement), retried on lock contention. The
+    // subscription fan-out below runs after commit: it wakes TCP listeners
+    // and writes more rows, so it must never hold the write lock.
+    // True worst case ≈ 35s: the 30s retry budget plus one final 5s
+    // busy_timeout — the last attempt may itself sleep the full SQLite
+    // busy_timeout inside the engine before surfacing SQLITE_BUSY.
+    let write_started = std::time::Instant::now();
+    let event_id = crate::db::retry_on_busy(
+        || {
+            db.with_immediate_transaction(|_tx| {
+                db.insert_event_row("message", &routing_instance, &data, None)
+            })
+        },
+        crate::db::DEFAULT_SEND_WRITE_BUDGET,
+    )
+    .map_err(|e| {
+        // Say `retried` only for lock contention: any other failure (torn
+        // WAL, full disk, logic bug) returns on its first attempt.
+        let elapsed = write_started.elapsed().as_secs_f64();
+        if crate::db::is_busy_error(&e) {
+            format!(
+                "Failed to write message to database (retried {elapsed:.1}s, message NOT sent): {e}"
+            )
+        } else {
+            format!("Failed to write message to database ({elapsed:.1}s, message NOT sent): {e}")
+        }
+    })?;
+    db.dispatch_logged_event(event_id, "message", &routing_instance, &data);
 
     // `--from` is unauthenticated, so an External sender reaching a policy
     // instance is the known bypass; leave a trail every time it happens.
@@ -1861,6 +1886,129 @@ mod tests {
         cleanup_test_db(path);
     }
 
+    /// Hold a write lock on the test DB from a second connection, mimicking
+    /// a concurrent hook/relay writer mid-transaction.
+    fn hold_write_lock(db_path: &PathBuf) -> rusqlite::Connection {
+        let guard = rusqlite::Connection::open(db_path).unwrap();
+        guard
+            .execute_batch("PRAGMA busy_timeout=0; BEGIN IMMEDIATE;")
+            .unwrap();
+        guard
+    }
+
+    #[test]
+    #[serial]
+    fn send_message_under_held_lock_fails_unmistakably() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let _guard = hold_write_lock(&path);
+        // Fail fast at the sqlite layer: the (short) test budget bounds the
+        // retry loop, not the 5s production busy_timeout.
+        db.conn().execute_batch("PRAGMA busy_timeout=0;").unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::External,
+            name: "bigboss".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let err =
+            send_message(&db, &sender, "hello", None, Some(&["nova".to_string()])).unwrap_err();
+        assert!(
+            err.contains("Failed to write message to database"),
+            "err={err}"
+        );
+        assert!(
+            err.contains("retried"),
+            "busy exhaustion must say retried: {err}"
+        );
+        assert!(err.contains("NOT sent"), "err={err}");
+
+        // Exhaustion means nothing was written: no partial row.
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        cleanup_test_db(path);
+    }
+
+    /// Success-after-contention (F7): a second connection holds BEGIN
+    /// IMMEDIATE for ~250ms while `send_message` runs with busy_timeout=0.
+    /// The retry loop must ride out the contention and write exactly one row.
+    /// Fails on trees without the retry (the send errors on first BUSY).
+    #[test]
+    #[serial]
+    fn send_message_succeeds_after_transient_contention() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        // Fail fast at the sqlite layer so each attempt surfaces SQLITE_BUSY
+        // at once; the (short) test budget bounds the retry loop.
+        db.conn().execute_batch("PRAGMA busy_timeout=0;").unwrap();
+
+        // A concurrent writer holds the lock briefly, then commits. The
+        // channel proves the lock is held before the send starts, so the
+        // send cannot slip in first and the holder cannot fail its BEGIN.
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let guard = rusqlite::Connection::open(&path).unwrap();
+                guard
+                    .execute_batch("PRAGMA busy_timeout=0; BEGIN IMMEDIATE;")
+                    .unwrap();
+                held_tx.send(()).ok();
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                guard.execute_batch("COMMIT;").unwrap();
+            }
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder took the write lock");
+
+        let sender = SenderIdentity {
+            kind: SenderKind::External,
+            name: "bigboss".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let delivered =
+            send_message(&db, &sender, "hello", None, Some(&["nova".to_string()])).unwrap();
+        holder.join().expect("holder committed");
+        assert!(
+            delivered.contains(&"nova".to_string()),
+            "delivered={delivered:?}"
+        );
+
+        // Exactly one row: the attempts that hit the lock wrote nothing.
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        cleanup_test_db(path);
+    }
+
     #[test]
     fn process_compat_at_with_space() {
         // "@luna hi" → full text as message, no targets
@@ -2220,7 +2368,7 @@ mod tests {
     }
 
     /// A second connection holding the write lock, and this one failing fast.
-    fn hold_write_lock(db: &HcomDb, path: &PathBuf) -> rusqlite::Connection {
+    fn lock_writes_fail_fast(db: &HcomDb, path: &PathBuf) -> rusqlite::Connection {
         db.conn().execute_batch("PRAGMA busy_timeout=0;").unwrap();
         let guard = rusqlite::Connection::open(path).unwrap();
         guard
@@ -2244,7 +2392,7 @@ mod tests {
         );
         let before = cursor(&db, "kimi");
 
-        let guard = hold_write_lock(&db, &path);
+        let guard = lock_writes_fail_fast(&db, &path);
         // The forward cannot commit: the delegate's later message is not
         // exposed either, so no ack can move the cursor past the refused one.
         assert!(unread_texts(&db, "kimi").is_empty());
@@ -2278,7 +2426,7 @@ mod tests {
             &["kimi"],
         );
 
-        let guard = hold_write_lock(&db, &path);
+        let guard = lock_writes_fail_fast(&db, &path);
         for _ in 0..4 {
             assert!(unread_texts(&db, "kimi").is_empty());
         }
@@ -2609,7 +2757,7 @@ mod tests {
         crate::instances::update_instance_position(&db, "kimi", &updates);
         // Reader A now meets the handled event with the database write-locked,
         // for more reads than the give-up budget.
-        let guard = hold_write_lock(&db, &path);
+        let guard = lock_writes_fail_fast(&db, &path);
         for _ in 0..crate::delivery_policy::MAX_FORWARD_ATTEMPTS + 1 {
             assert!(unread_texts(&db, "kimi").is_empty());
         }

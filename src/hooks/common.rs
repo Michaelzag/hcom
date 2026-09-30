@@ -1298,26 +1298,57 @@ pub(crate) fn stop_instance_with_capture_listing_orphans(
 /// they always have. On the kill path the whole teardown shares one
 /// transaction, so they queue here and [`Self::fire`] runs them right after
 /// that single commit — never before the writes are durable.
+///
+/// This is also the single deferral mechanism for every write-txn site that
+/// fans out to TCP listeners: ALL DB reads/writes of the fan-out run in-txn
+/// at the event's insertion point (see
+/// [`crate::db::subscriptions::process_logged_event_collected`]), while every
+/// TCP connect is collected here via [`Self::collect_wake`] and fired by
+/// [`Self::fire`] only after the transaction commits. A rolled-back
+/// transaction drops its PostCommit, so wakes for unwritten events never
+/// fire. Never construct one inside another txn-site closure that already
+/// owns one — thread a single `&mut PostCommit` instead (no nesting).
 #[derive(Default)]
-struct PostCommit {
+pub(crate) struct PostCommit {
     /// `(event_id, instance, event_data)` per `stopped` event written.
-    events: Vec<(i64, String, serde_json::Value)>,
-    wake_ports: Vec<u16>,
-    push: bool,
+    pub(crate) events: Vec<(i64, String, serde_json::Value)>,
+    /// TCP wake ports collected in-txn, fired post-commit.
+    pub(crate) wake_ports: Vec<u16>,
+    /// Relay push after fire.
+    pub(crate) push: bool,
     /// Child rows released with no signal (no live root, only orphan
     /// carriers), each with the orphans left running. Reported, not fired.
-    orphan_releases: crate::proctruth::OrphanReleases,
+    pub(crate) orphan_releases: crate::proctruth::OrphanReleases,
 }
 
 impl PostCommit {
-    fn fire(&self, db: &HcomDb) {
+    /// Resolve `instance`'s current wake endpoints of `kinds` NOW (in-txn
+    /// visible) and queue them for the post-commit fire. Call BEFORE
+    /// `delete_notify_endpoints` removes the rows so the fire still reaches
+    /// the (now removed) listener. Status wakes are DELIVERY_LOOPS-only.
+    pub(crate) fn collect_wake(
+        &mut self,
+        db: &HcomDb,
+        instance: &str,
+        kinds: &[crate::notify::WakeKind],
+    ) {
+        self.wake_ports
+            .extend(crate::notify::snapshot_wake_ports_for(db, instance, kinds));
+    }
+
+    /// Fire after the carrying transaction commits: deferred subscription
+    /// fan-out, then the collected TCP wakes (deduplicated), then relay push.
+    pub(crate) fn fire(&self, db: &HcomDb) {
         for (event_id, instance, event_data) in &self.events {
             crate::db::subscriptions::process_logged_event(
                 db, *event_id, "life", instance, event_data,
             );
         }
         if !self.wake_ports.is_empty() {
-            crate::notify::wake_ports(&self.wake_ports, crate::notify::WAKE_TARGETED_MS);
+            let mut ports = self.wake_ports.clone();
+            ports.sort_unstable();
+            ports.dedup();
+            crate::notify::wake_ports(&ports, crate::notify::WAKE_TARGETED_MS);
         }
         if self.push {
             crate::relay::spawn_background_push();
@@ -2467,7 +2498,10 @@ fn persist_yielded_session_exit(
 ) {
     use rusqlite::OptionalExtension;
 
-    let updated = db.with_immediate_transaction(|tx| {
+    // The status write joins the transaction below with its fan-out inline;
+    // only the TCP wakes are collected into `post` and fired after commit.
+    let updated: Result<(bool, PostCommit)> = db.with_immediate_transaction(|tx| {
+        let mut post = PostCommit::default();
         let current: Option<(f64, Option<String>)> = tx
             .query_row(
                 "SELECT created_at, session_id FROM instances WHERE name = ?",
@@ -2478,23 +2512,24 @@ fn persist_yielded_session_exit(
         if !current.is_some_and(|(created_at, session_id)| {
             created_at.to_bits() == incarnation.0.to_bits() && session_id == incarnation.1
         }) {
-            return Ok(false);
+            return Ok((false, post));
         }
-        lifecycle::set_status(
+        lifecycle::set_status_collected(
             db,
             instance_name,
             ST_INACTIVE,
             &format!("exit:{}", reason),
             Default::default(),
+            &mut post,
         );
         if let Some(updates) = updates {
             instances::update_instance_position(db, instance_name, updates);
         }
-        Ok(true)
+        Ok((true, post))
     });
     match updated {
-        Ok(true) => {}
-        Ok(false) => log::log_info(
+        Ok((true, post)) => post.fire(db),
+        Ok((false, _)) => log::log_info(
             "hooks",
             "sessionend.yield_incarnation_changed",
             &format!("instance={instance_name}; exit writes skipped"),
@@ -2586,9 +2621,11 @@ pub fn soft_finalize_session(
         "sessionend.soft",
         &format!("instance={} reason={}", instance_name, reason),
     );
-
-    let written = db.with_immediate_transaction(|tx| {
+    // The status write joins the transaction below with its fan-out inline;
+    // only the TCP wakes are collected into `post` and fired after commit.
+    let written: Result<(bool, PostCommit)> = db.with_immediate_transaction(|tx| {
         use rusqlite::OptionalExtension;
+        let mut post = PostCommit::default();
         let present = tx
             .query_row(
                 "SELECT 1 FROM instances WHERE name = ?",
@@ -2598,15 +2635,16 @@ pub fn soft_finalize_session(
             .optional()?
             .is_some();
         if !present || row_re_registered(tx, instance_name, &row, &bound)? {
-            return Ok(false);
+            return Ok((false, post));
         }
 
-        lifecycle::set_status(
+        lifecycle::set_status_collected(
             db,
             instance_name,
             ST_INACTIVE,
             &format!("exit:{}", reason),
             Default::default(),
+            &mut post,
         );
 
         if let Some(updates) = updates {
@@ -2616,9 +2654,8 @@ pub fn soft_finalize_session(
         // Re-read inside the gated transaction: the snapshot carries the
         // exit writes above, and it is still the incarnation just checked.
         let Some(instance_data) = db.get_instance_full(instance_name)? else {
-            return Ok(false);
+            return Ok((false, post));
         };
-
         let mut snapshot = serde_json::json!({
             "name": instance_name,
             "transcript_path": instance_data.transcript_path,
@@ -2660,6 +2697,10 @@ pub fn soft_finalize_session(
             }
         }
 
+        // Snapshot the DELIVERY_LOOPS ports BEFORE the delete below removes
+        // them, so the post-commit fire still reaches the (now removed)
+        // listener (S1/F4). Status wakes are DELIVERY_LOOPS-only.
+        post.collect_wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
         let _ = db.delete_notify_endpoints(instance_name);
         if !keep_process_binding {
             let _ = tx.execute(
@@ -2669,7 +2710,11 @@ pub fn soft_finalize_session(
         }
         let _ = db.cleanup_subscriptions(instance_name);
 
-        if let Err(e) = db.log_life_event(
+        // In-txn fan-out at the insertion point: the status event (above) and
+        // this life event commit in id order before any listener wakes (B1),
+        // and the request-watch waterline read sees the live row (F2). Only
+        // the TCP connects are deferred into `post`.
+        if let Err(e) = db.log_life_event_collected(
             instance_name,
             "stopped",
             "session",
@@ -2678,6 +2723,7 @@ pub fn soft_finalize_session(
             // Soft stops preserve the row for resume; no incarnation is
             // released, so no process_id is claimed.
             None,
+            &mut post,
         ) {
             log::log_warn(
                 "hooks",
@@ -2685,11 +2731,11 @@ pub fn soft_finalize_session(
                 &format!("log_life_event failed for {instance_name}: {e}"),
             );
         }
-        Ok(true)
+        Ok((true, post))
     });
     match written {
-        Ok(true) => {}
-        Ok(false) => log::log_info(
+        Ok((true, post)) => post.fire(db),
+        Ok((false, _)) => log::log_info(
             "hooks",
             "sessionend.soft.re_registered",
             &format!(
