@@ -301,9 +301,10 @@ impl HcomDb {
             }
         };
 
+        let policies = crate::delivery_policy::load(self);
         for data in rows.flatten() {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
-                && Self::should_deliver_to(&json, name)
+                && Self::should_deliver_to(&json, name, &policies)
             {
                 return true;
             }
@@ -332,9 +333,10 @@ impl HcomDb {
         let mut min_id = i64::MAX;
         let mut max_id = i64::MIN;
         let mut count = 0i64;
+        let policies = crate::delivery_policy::load(self);
         for (id, data) in rows.flatten() {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
-                && Self::should_deliver_to(&json, name)
+                && Self::should_deliver_to(&json, name, &policies)
             {
                 min_id = min_id.min(id);
                 max_id = max_id.max(id);

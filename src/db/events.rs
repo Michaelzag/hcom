@@ -34,7 +34,17 @@ impl HcomDb {
     /// `receiver` may be local (`luna`) or relay-namespaced (`luna:ABCD`).
     /// Mentions compare on base name so the same event JSON routes correctly
     /// on both local and relayed peers without rewriting stored scope.
-    pub(super) fn should_deliver_to(json: &serde_json::Value, receiver: &str) -> bool {
+    ///
+    /// `policies` is the operator delivery policy backstop
+    /// (`crate::delivery_policy`): a receiver with a `[delivery.*]` entry never
+    /// reads a broadcast or a targeted message its rule refuses. A refused
+    /// event is skipped exactly like one addressed to someone else, so the
+    /// read cursor passes it on the next ack.
+    pub(super) fn should_deliver_to(
+        json: &serde_json::Value,
+        receiver: &str,
+        policies: &crate::delivery_policy::Policies,
+    ) -> bool {
         let from = json.get("from").and_then(|v| v.as_str()).unwrap_or("");
         if from == receiver {
             return false;
@@ -43,11 +53,12 @@ impl HcomDb {
             .get("scope")
             .and_then(|s| s.as_str())
             .unwrap_or("broadcast");
-        match scope {
+        let in_scope = match scope {
             "broadcast" => true,
             "mentions" => crate::messages::mentions_delivers_to(json, receiver),
             _ => false,
-        }
+        };
+        in_scope && policies.admits_event(receiver, json)
     }
 
     /// Returns true iff there is at least one unread message that names this
@@ -74,6 +85,7 @@ impl HcomDb {
             Ok(r) => r,
             Err(_) => return false,
         };
+        let policies = crate::delivery_policy::load(self);
         for data in rows.flatten() {
             let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
                 continue;
@@ -85,7 +97,7 @@ impl HcomDb {
             if scope != "mentions" {
                 continue;
             }
-            if Self::should_deliver_to(&json, name) {
+            if Self::should_deliver_to(&json, name, &policies) {
                 return true;
             }
         }
@@ -140,11 +152,12 @@ impl HcomDb {
             }
         };
 
+        let policies = crate::delivery_policy::load(self);
         let mut messages = Vec::new();
         for (id, timestamp, data) in rows.flatten() {
             // Parse JSON data
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                if !Self::should_deliver_to(&json, name) {
+                if !Self::should_deliver_to(&json, name, &policies) {
                     continue;
                 }
 

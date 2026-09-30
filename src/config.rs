@@ -2746,4 +2746,28 @@ active = "default"
             & 0o777;
         assert_eq!(mode, 0o600);
     }
+
+    #[test]
+    #[serial]
+    fn test_save_toml_config_keeps_delivery_policy_table() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let policy = "[delivery.kimi]\ndelegate = \"mupe\"\nleads = [\"poli\", \"valo\"]\n";
+        std::fs::write(
+            paths::config_toml_path(),
+            format!("[terminal]\nactive = \"default\"\n\n{policy}"),
+        )
+        .unwrap();
+        let before = crate::delivery_policy::parse(policy);
+
+        let config = HcomConfig {
+            relay_psk: "rotated".to_string(),
+            ..Default::default()
+        };
+        save_toml_config(&config, None).unwrap();
+
+        let after = std::fs::read_to_string(paths::config_toml_path()).unwrap();
+        assert!(after.contains("rotated"), "{after}");
+        assert_eq!(crate::delivery_policy::parse(&after), before);
+        assert!(before.has_entry("kimi"));
+    }
 }

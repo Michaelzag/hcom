@@ -1357,7 +1357,9 @@ fn deliver_freeze_messages(
 
     let subagent_names: Vec<&str> = subagent_rows.iter().map(|(n, _)| n.as_str()).collect();
 
-    // Filter messages
+    // Filter messages (the delivery policy backstop applies here too: this
+    // path reads events directly instead of through get_unread_messages).
+    let policies = crate::delivery_policy::load(db);
     let mut subagent_msgs: Vec<Value> = Vec::new();
     let mut parent_msgs: Vec<Value> = Vec::new();
 
@@ -1390,7 +1392,7 @@ fn deliver_freeze_messages(
         } else if !subagent_names.is_empty()
             && subagent_names.iter().any(|name| {
                 match messages::should_deliver_message(event_data, name, sender_name) {
-                    Ok(v) => v,
+                    Ok(v) => v && policies.admits_event(name, event_data),
                     Err(e) => {
                         log::log_warn(
                             "hooks",
@@ -1407,8 +1409,10 @@ fn deliver_freeze_messages(
             }
         } else {
             match messages::should_deliver_message(event_data, instance_name, sender_name) {
-                Ok(true) => parent_msgs.push(msg),
-                Ok(false) => {}
+                Ok(true) if policies.admits_event(instance_name, event_data) => {
+                    parent_msgs.push(msg)
+                }
+                Ok(_) => {}
                 Err(e) => {
                     log::log_warn(
                         "hooks",
