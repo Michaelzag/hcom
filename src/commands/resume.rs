@@ -1144,7 +1144,7 @@ fn append_restored_snapshot(
         return Ok(None);
     };
     let session_id = &plan.session_id;
-    db.with_immediate_transaction(|tx| {
+    let life_event = db.with_immediate_transaction(|tx| {
         if newest_stopped_event_id(tx, name)? != restored.planned_newest_id {
             bail!(
                 "{RESTORE_EARLIER_FLAG}: the newest session of '{name}' changed since \
@@ -1180,14 +1180,19 @@ fn append_restored_snapshot(
         if let Some(fields) = snapshot.as_object_mut() {
             fields.insert("last_event_id".to_string(), json!(cursor));
         }
-        db.log_life_event(
-            name,
-            "stopped",
-            RESTORE_EARLIER_BY,
-            RESTORE_EARLIER_REASON,
-            Some(snapshot),
-            None,
-        )?;
+        // Insert-only: the subscription fan-out for this event wakes TCP
+        // listeners and writes more rows, so it fires after the commit below,
+        // never while the write lock is held. The row itself is still
+        // visible to every read in this transaction.
+        let life_event =
+            db.log_life_event_insert(
+                name,
+                "stopped",
+                RESTORE_EARLIER_BY,
+                RESTORE_EARLIER_REASON,
+                Some(snapshot),
+                None,
+            )?;
         let mut row = serde_json::Map::new();
         row.insert("session_id".into(), json!(session_id));
         row.insert("tool".into(), json!(plan.output.tool));
@@ -1203,8 +1208,10 @@ fn append_restored_snapshot(
             json!(crate::shared::time::now_epoch_f64()),
         );
         db.save_instance_named(name, &row)?;
-        Ok(())
+        Ok(life_event)
     })?;
+    let (event_id, event_data) = life_event;
+    db.dispatch_logged_event(event_id, "life", name, &event_data);
     Ok(Some(format!(
         "restored earlier session {session_id} of '{name}' (from event #{})",
         restored.source_event_id

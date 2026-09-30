@@ -1715,6 +1715,7 @@ pub(crate) fn register_launch_instance(
     tag: Option<&str>,
     working_dir: &str,
 ) -> Result<()> {
+    let mut created_event = None;
     db.with_immediate_transaction(|_tx| {
         if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
             refuse_held_session(db, instance_name, sid)?;
@@ -1734,12 +1735,17 @@ pub(crate) fn register_launch_instance(
             None,              // subagent_timeout
             None,              // hints
             Some(working_dir), // cwd_override: use launch params cwd, not current_dir()
+            &mut created_event,
         ) {
             bail!("Failed to register instance '{instance_name}'");
         }
         db.set_process_binding(process_id, "", instance_name)?;
         Ok(())
-    })
+    })?;
+    // The `life.created` fan-out wakes TCP listeners and writes more rows, so
+    // it runs here, after the registration above committed.
+    instance_binding::dispatch_created_event(db, instance_name, created_event);
+    Ok(())
 }
 
 /// Err naming the holder when anything but `name`'s own unclaimed row holds

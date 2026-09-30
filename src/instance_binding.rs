@@ -526,6 +526,7 @@ fn recreate_instance_from_placeholder(
     let Some(ph) = ph else {
         return;
     };
+    let mut created_event = None;
     initialize_instance_in_position_file(
         db,
         target_name,
@@ -541,7 +542,9 @@ fn recreate_instance_from_placeholder(
         None,
         ph.hints.as_deref(),
         Some(ph.directory.as_str()),
+        &mut created_event,
     );
+    dispatch_created_event(db, target_name, created_event);
 }
 
 /// Identity metadata a reclaim or restore carries over: what a `life.stopped`
@@ -717,6 +720,7 @@ fn recreate_instance_from_stopped_snapshot(
             .map(|()| parent),
         None => None,
     };
+    let mut created_event = None;
     if !initialize_instance_in_position_file(
         db,
         target_name,
@@ -734,9 +738,11 @@ fn recreate_instance_from_stopped_snapshot(
         identity.subagent_timeout,
         identity.hints.as_deref(),
         Some(identity.directory.as_str()).filter(|dir| !dir.is_empty()),
+        &mut created_event,
     ) {
         anyhow::bail!("restore_stopped: could not recreate the instance row for '{target_name}'");
     }
+    dispatch_created_event(db, target_name, created_event);
     let mut updates = serde_json::Map::new();
     updates.insert("last_event_id".into(), serde_json::json!(cursor));
     updates.insert(
@@ -1172,6 +1178,13 @@ pub fn recover_process_binding_for_instance(
 /// Initialize the DB row and default bindings for an instance identity.
 ///
 /// This is the shared setup path used by launch, resume, and orphan recovery.
+///
+/// The `life.created` event is INSERT-only here; its subscription fan-out
+/// (TCP wakes, follow-up writes) is handed back through
+/// `pending_created_event` instead of running inline, so a caller inside a
+/// write transaction can dispatch it with
+/// [`dispatch_created_event`] after the commit. A caller with no open
+/// transaction dispatches it immediately at the call site.
 #[allow(clippy::too_many_arguments)]
 pub fn initialize_instance_in_position_file(
     db: &HcomDb,
@@ -1188,6 +1201,7 @@ pub fn initialize_instance_in_position_file(
     subagent_timeout: Option<i64>,
     hints: Option<&str>,
     cwd_override: Option<&str>,
+    pending_created_event: &mut Option<(i64, serde_json::Value)>,
 ) -> bool {
     let cwd = cwd_override.map(|s| s.to_string()).unwrap_or_else(|| {
         std::env::current_dir()
@@ -1340,6 +1354,7 @@ pub fn initialize_instance_in_position_file(
                         parent_session_id,
                         parent_name,
                         tool.unwrap_or(""),
+                        pending_created_event,
                     );
                     true
                 }
@@ -1358,6 +1373,7 @@ fn log_created_and_auto_subscribe(
     parent_session_id: Option<&str>,
     parent_name: Option<&str>,
     tool: &str,
+    pending_created_event: &mut Option<(i64, serde_json::Value)>,
 ) {
     let launcher = std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
     let event_data = serde_json::json!({
@@ -1367,8 +1383,25 @@ fn log_created_and_auto_subscribe(
         "is_subagent": parent_session_id.is_some(),
         "parent_name": parent_name.unwrap_or(""),
     });
-    let _ = db.log_event("life", instance_name, &event_data);
+    *pending_created_event = db
+        .insert_event_row("life", instance_name, &event_data, None)
+        .ok()
+        .map(|event_id| (event_id, event_data));
     auto_subscribe_defaults(db, instance_name, tool);
+}
+
+/// Dispatch the `life.created` fan-out
+/// [`initialize_instance_in_position_file`] deferred. Call only once the
+/// transaction carrying the row write has committed — the fan-out wakes TCP
+/// listeners and writes more rows, so it must never run under a write lock.
+pub(crate) fn dispatch_created_event(
+    db: &HcomDb,
+    instance_name: &str,
+    pending_created_event: Option<(i64, serde_json::Value)>,
+) {
+    if let Some((event_id, event_data)) = pending_created_event {
+        db.dispatch_logged_event(event_id, "life", instance_name, &event_data);
+    }
 }
 
 /// Create orphaned PTY identity — called when process binding exists but session_id
@@ -1391,6 +1424,7 @@ pub fn create_orphaned_pty_identity(
         }
     };
 
+    let mut created_event = None;
     let success = initialize_instance_in_position_file(
         db,
         &name,
@@ -1406,7 +1440,9 @@ pub fn create_orphaned_pty_identity(
         None,
         None,
         None,
+        &mut created_event,
     );
+    dispatch_created_event(db, &name, created_event);
 
     if !success {
         return None;
@@ -3229,6 +3265,7 @@ mod tests {
             None,
             None,
             None,
+            &mut None,
         );
         assert!(ok);
         let ok_again = initialize_instance_in_position_file(
@@ -3246,6 +3283,7 @@ mod tests {
             None,
             None,
             None,
+            &mut None,
         );
         assert!(ok_again);
 
@@ -3304,6 +3342,7 @@ mod tests {
             None,
             None,
             None,
+            &mut None,
         );
         assert!(ok);
 
@@ -3334,6 +3373,7 @@ mod tests {
             None,
             None,
             None,
+            &mut None,
         );
         assert!(ok);
 

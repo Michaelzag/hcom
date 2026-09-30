@@ -3317,6 +3317,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &mut None,
             )
         );
         let close_row = db

@@ -539,6 +539,12 @@ fn start_rebind(
     // one was committed by a competing reclaim, so this rebind refuses with
     // nothing written — the caller keeps its row, cursor and bindings, and
     // no anchor pid or binding lands on a row this call did not create.
+    // Pending post-commit fan-out for the events this transaction inserts:
+    // both wake TCP listeners and write more rows, so neither may run under
+    // the write lock. The rows themselves are inserted here and stay visible
+    // to every read in the transaction.
+    let mut renamed_event: Option<(i64, serde_json::Value)> = None;
+    let mut created_event: Option<(i64, serde_json::Value)> = None;
     let committed = db.with_immediate_transaction(|_tx| {
         // A process bound to a live seat other than the one this call renames
         // away belongs to that seat. Taking it here would move a running
@@ -588,7 +594,11 @@ fn start_rebind(
                 "process_id": ctx.process_id,
                 "snapshot": snapshot,
             });
-            db.log_event("life", &current_name, &life)?;
+            // Insert-only: the rename stop's fan-out fires after the commit.
+            renamed_event = Some(
+                db.insert_event_row("life", &current_name, &life, None)
+                    .map(|event_id| (event_id, life.clone()))?,
+            );
         }
         if !current_name.is_empty() && current_name != target_name {
             db.delete_instance(&current_name)?;
@@ -633,6 +643,7 @@ fn start_rebind(
             None,  // subagent_timeout
             None,  // hints
             Some(&cwd_override),
+            &mut created_event,
         ) {
             bail!("could not create the instance row for '{target_name}'");
         }
@@ -682,6 +693,11 @@ fn start_rebind(
         };
         Ok(Some((restored_pid, created_refused_binding)))
     })?;
+    // The reclaim committed: only now do the two fan-outs run.
+    if let Some((event_id, event_data)) = renamed_event {
+        db.dispatch_logged_event(event_id, "life", &current_name, &event_data);
+    }
+    instance_binding::dispatch_created_event(db, &target_name, created_event);
     let Some((restored_pid, created_refused_binding)) = committed else {
         eprintln!(
             "Error: '{target_name}' was reclaimed by another session while this one ran; \
@@ -1133,6 +1149,7 @@ fn start_bare(
         return Ok(0);
     }
 
+    let mut created_event = None;
     instance_binding::initialize_instance_in_position_file(
         db,
         &name,
@@ -1148,7 +1165,9 @@ fn start_bare(
         None,  // subagent_timeout
         None,  // hints
         None,  // cwd_override
+        &mut created_event,
     );
+    instance_binding::dispatch_created_event(db, &name, created_event);
 
     if let Some(ref session_id) = claude_session_id {
         db.set_session_binding(session_id, &name)?;

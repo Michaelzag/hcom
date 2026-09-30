@@ -2475,7 +2475,6 @@ fn persist_yielded_session_exit(
         ST_INACTIVE,
         &format!("exit:{}", reason),
         Default::default(),
-        &format!("{}:{}", file!(), line!()),
     );
     let updated = db.with_immediate_transaction(|tx| {
         let current: Option<(f64, Option<String>)> = tx
@@ -2599,7 +2598,6 @@ pub fn soft_finalize_session(
         ST_INACTIVE,
         &format!("exit:{}", reason),
         Default::default(),
-        &format!("{}:{}", file!(), line!()),
     );
     let written: Result<(bool, Option<(i64, Value)>)> =
         db.with_immediate_transaction(|tx| {

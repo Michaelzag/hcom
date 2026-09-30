@@ -535,16 +535,19 @@ pub(crate) struct StagedStatus {
 
 /// Read the current row and compute a status change without performing it:
 /// the column updates, whether listeners need a wake, and the fully-built
-/// status event payload (if one is due). `writer` is the `file:line` of the
-/// code requesting the change, recorded on the event for diagnostics.
+/// status event payload (if one is due). The event records this call site's
+/// `file:line` as `writer` for diagnostics, so every path reaching it stays
+/// `#[track_caller]`.
+#[track_caller]
 pub(crate) fn stage_set_status(
     db: &HcomDb,
     instance_name: &str,
     status: &str,
     context: &str,
     upd: StatusUpdate<'_>,
-    writer: &str,
 ) -> StagedStatus {
+    let caller = std::panic::Location::caller();
+    let writer = format!("{}:{}", caller.file(), caller.line());
     let StatusUpdate {
         detail,
         msg_ts,
@@ -665,9 +668,7 @@ pub fn set_status(
     context: &str,
     upd: StatusUpdate<'_>,
 ) {
-    let writer = std::panic::Location::caller();
-    let writer = format!("{}:{}", writer.file(), writer.line());
-    let staged = stage_set_status(db, instance_name, status, context, upd, &writer);
+    let staged = stage_set_status(db, instance_name, status, context, upd);
     apply_staged_status(db, instance_name, &staged);
     fire_staged_status(db, instance_name, &staged);
 }
