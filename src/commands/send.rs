@@ -238,6 +238,7 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     format!("Sent to: {}", parts.join(", "))
 }
 
+#[derive(Clone)]
 struct ResolvedDelivery {
     original_scope: MessageScope,
     effective_scope: MessageScope,
@@ -489,9 +490,24 @@ fn send_message_resolved(
     validate_message(message)?;
 
     let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
+    persist_resolved(db, identity, message, envelope, delivery)
+}
+
+/// Store a resolved message and run its after-commit work. The resolution
+/// was read outside any write lock; the persist re-checks it (see
+/// `recheck_reroutes`) in the transaction that inserts the row.
+fn persist_resolved(
+    db: &HcomDb,
+    identity: &SenderIdentity,
+    message: &str,
+    envelope: Option<&MessageEnvelope>,
+    delivery: ResolvedDelivery,
+) -> Result<ResolvedDelivery, String> {
     let scope_str = delivery.effective_scope.as_str();
 
-    // Build event data
+    // Build event data. The routing fields (delivered_to, mentions,
+    // exact_targets, the reroute marker) are added inside the write
+    // transaction, from the delivery re-checked there.
     let mut data = serde_json::json!({
         "from": identity.name,
         "sender_kind": match identity.kind {
@@ -501,41 +517,7 @@ fn send_message_resolved(
         },
         "scope": scope_str,
         "text": message,
-        "delivered_to": delivery.delivered_to.clone(),
     });
-
-    // Add scope extra data (mentions + device-exact targets). Mentions scope
-    // resolved here carries the canonical names in `exact_targets`, so a
-    // receiver on another host with a same-named instance does not take it;
-    // broadcast omits the key. The thread-override path omits it too: those
-    // members come from a stored membership list (a thread seeded by a
-    // pre-fleet peer can hold base names), so they keep legacy base matching.
-    if !delivery.effective_mentions.is_empty() {
-        data["mentions"] = serde_json::json!(delivery.effective_mentions);
-    }
-    if !delivery.is_thread_resolved
-        && delivery.effective_scope == MessageScope::Mentions
-        && !delivery.effective_mentions.is_empty()
-    {
-        data["exact_targets"] = serde_json::json!(delivery.effective_mentions);
-    }
-    // The one-hop marker: receivers admit a delegate named here without
-    // evaluating the delegate's own policy. A holder kept because its
-    // delegate is not live names itself, so its read admits it too.
-    let delegate_copies: serde_json::Map<String, serde_json::Value> = delivery
-        .reroutes
-        .iter()
-        .map(|(recipient, delegate)| (recipient.clone(), serde_json::json!(delegate)))
-        .chain(
-            delivery
-                .kept_for_holder
-                .iter()
-                .map(|(recipient, _)| (recipient.clone(), serde_json::json!(recipient))),
-        )
-        .collect();
-    if !delegate_copies.is_empty() {
-        data[crate::delivery_policy::REROUTES_FIELD] = serde_json::Value::Object(delegate_copies);
-    }
 
     if let Some(env) = envelope {
         if let Some(intent) = &env.intent {
@@ -582,11 +564,27 @@ fn send_message_resolved(
     // True worst case ≈ 35s: the 30s retry budget plus one final 5s
     // busy_timeout — the last attempt may itself sleep the full SQLite
     // busy_timeout inside the engine before surfacing SQLITE_BUSY.
+    // Every delegate chosen above is re-checked against the rows this
+    // transaction sees: a delegate that stopped between resolution and this
+    // insert would get a message its restarted row never reads (it starts at
+    // the current cursor), with the holder not a target, so lost. A stop
+    // needs this same write lock, so no delegate can leave between the check
+    // and the insert. Each retry starts again from the resolution, so nothing
+    // decided under an earlier attempt's snapshot survives.
+    let fleet = crate::fleet_names::FleetCtx::load();
     let write_started = std::time::Instant::now();
-    let event_id = crate::db::retry_on_busy(
+    let (event_id, delivery, data) = crate::db::retry_on_busy(
         || {
-            db.with_immediate_transaction(|_tx| {
-                db.insert_event_row("message", &routing_instance, &data, None)
+            db.with_immediate_transaction(|tx| {
+                let mut delivery = delivery.clone();
+                if !delivery.reroutes.is_empty() {
+                    let rows = crate::messages::deliverable_instances(tx)?;
+                    recheck_reroutes(&mut delivery, &rows, &fleet);
+                }
+                let mut data = data.clone();
+                set_routing_fields(&mut data, &delivery);
+                let event_id = db.insert_event_row("message", &routing_instance, &data, None)?;
+                Ok((event_id, delivery, data))
             })
         },
         crate::db::DEFAULT_SEND_WRITE_BUDGET,
@@ -649,6 +647,85 @@ fn send_message_resolved(
     crate::relay::trigger_push();
 
     Ok(delivery)
+}
+
+/// The stored routing of a message: `delivered_to`, the mentions and
+/// device-exact targets receivers deliver from, and the one-hop reroute marker.
+fn set_routing_fields(data: &mut serde_json::Value, delivery: &ResolvedDelivery) {
+    data["delivered_to"] = serde_json::json!(delivery.delivered_to);
+    // Mentions scope resolved here carries the canonical names in
+    // `exact_targets`, so a receiver on another host with a same-named
+    // instance does not take it; broadcast omits the key. The thread-override
+    // path omits it too: those members come from a stored membership list (a
+    // thread seeded by a pre-fleet peer can hold base names), so they keep
+    // legacy base matching.
+    if !delivery.effective_mentions.is_empty() {
+        data["mentions"] = serde_json::json!(delivery.effective_mentions);
+    }
+    if !delivery.is_thread_resolved
+        && delivery.effective_scope == MessageScope::Mentions
+        && !delivery.effective_mentions.is_empty()
+    {
+        data["exact_targets"] = serde_json::json!(delivery.effective_mentions);
+    }
+    // The one-hop marker: receivers admit a delegate named here without
+    // evaluating the delegate's own policy. A holder kept because its
+    // delegate is not live names itself, so its read admits it too.
+    let delegate_copies: serde_json::Map<String, serde_json::Value> = delivery
+        .reroutes
+        .iter()
+        .map(|(recipient, delegate)| (recipient.clone(), serde_json::json!(delegate)))
+        .chain(
+            delivery
+                .kept_for_holder
+                .iter()
+                .map(|(recipient, _)| (recipient.clone(), serde_json::json!(recipient))),
+        )
+        .collect();
+    if !delegate_copies.is_empty() {
+        data[crate::delivery_policy::REROUTES_FIELD] = serde_json::Value::Object(delegate_copies);
+    }
+}
+
+/// Inside the send's write transaction: every delegate a refused recipient
+/// was rerouted to must still be a live row in `rows`. One that left is
+/// resolved again (an exact live name first; a bare name live only as a
+/// remote mirror maps to it); none live, the holder keeps the message and
+/// the sender gets the warning.
+fn recheck_reroutes(
+    delivery: &mut ResolvedDelivery,
+    rows: &[crate::messages::InstanceInfo],
+    fleet: &crate::fleet_names::FleetCtx,
+) {
+    let live = |name: &str| rows.iter().any(|row| row.name == name);
+    for (holder, delegate) in std::mem::take(&mut delivery.reroutes) {
+        if live(&delegate) {
+            delivery.reroutes.push((holder, delegate));
+            continue;
+        }
+        let target = match crate::delivery_policy::resolve_delegate(&delegate, rows, fleet) {
+            Ok(replacement) => {
+                delivery.reroutes.push((holder, replacement.clone()));
+                replacement
+            }
+            Err(why) => {
+                let why = why.describe(&delegate);
+                crate::log::log_warn(
+                    "delivery_policy",
+                    "delegate_unresolved",
+                    &format!("delegate {why} at insert; delivered to {holder}"),
+                );
+                delivery.kept_for_holder.push((holder.clone(), why));
+                holder
+            }
+        };
+        for names in [&mut delivery.effective_mentions, &mut delivery.delivered_to] {
+            names.retain(|name| name != &delegate);
+            if !names.contains(&target) {
+                names.push(target.clone());
+            }
+        }
+    }
 }
 
 /// Resolve reply_to to local event ID. Returns None if not found.
@@ -2564,6 +2641,41 @@ mod tests {
 
     #[test]
     #[serial]
+    fn delegate_stopping_between_resolution_and_insert_leaves_it_with_the_holder() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        let nova = sender(SenderKind::Instance, "nova");
+        let targets = vec!["kimi".to_string()];
+        // Resolved while mupe is live: rerouted to mupe.
+        let resolved = resolve_delivery(&db, &nova, "mid-send", None, Some(&targets)).unwrap();
+        assert_eq!(
+            resolved.reroutes,
+            vec![("kimi".to_string(), "mupe".to_string())]
+        );
+        // Another connection stops mupe before the send's insert.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM instances WHERE name = 'mupe'", [])
+            .unwrap();
+        let d = persist_resolved(&db, &nova, "mid-send", None, resolved).unwrap();
+        assert!(d.reroutes.is_empty());
+        assert_eq!(
+            reroute_notices(&d),
+            vec!["mupe is not live; delivered to kimi".to_string()]
+        );
+        assert_eq!(d.delivered_to, vec!["kimi".to_string()]);
+        let (_, stored) = last_message(&db);
+        assert_eq!(stored["mentions"], serde_json::json!(["kimi"]));
+        assert_eq!(stored["exact_targets"], serde_json::json!(["kimi"]));
+        assert_eq!(
+            stored[crate::delivery_policy::REROUTES_FIELD],
+            serde_json::json!({"kimi": "kimi"})
+        );
+        assert_eq!(unread_texts(&db, "kimi"), vec!["mid-send".to_string()]);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
     fn mistyped_delegate_leaves_the_message_with_the_holder() {
         let (db, path, _env) = policy_db("[delivery.conductor]\ndelegate = \"mpue\"\n");
         let d = send(
@@ -2729,6 +2841,51 @@ mod tests {
 
     #[test]
     #[serial]
+    fn a_forwarded_refusal_with_a_racing_failure_record_stays_forwarded() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        send(
+            &db,
+            &sender(SenderKind::Instance, "mupe"),
+            "first",
+            None,
+            None,
+            &["kimi"],
+        );
+        let first = last_event_id(&db);
+        let refused = inject(&db, &old_peer_inform("refused", 97));
+        // One reader forwards it (handled, no cursor move: "first" precedes it).
+        assert_eq!(unread_texts(&db, "kimi"), vec!["first".to_string()]);
+        assert_eq!(forward_count(&db), 1);
+        // A second reader's give-up raced it and left a failure record too.
+        db.kv_set(
+            &format!(
+                "{}kimi:dev-lots:97:{SENT_AT}",
+                crate::delivery_policy::KV_FORWARD_FAILED_PREFIX
+            ),
+            Some(
+                &serde_json::json!({"holder": "kimi", "delegate": "mupe", "message": "#97:LOTS", "reason": "database is locked (after 5 attempt(s))"})
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+        let mut updates = serde_json::Map::new();
+        updates.insert("last_event_id".into(), serde_json::json!(first));
+        crate::instances::update_instance_position(&db, "kimi", &updates);
+        // Handled wins: the cursor-advancing read skips it, the count and the
+        // status agree, and mupe keeps the only copy.
+        assert_eq!(
+            crate::commands::list::get_unread_count(&db, "kimi", cursor(&db, "kimi")),
+            0
+        );
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert!(cursor(&db, "kimi") >= refused);
+        assert!(crate::delivery_policy::forward_failures(&db).is_empty());
+        assert_eq!(forward_count(&db), 1);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
     fn a_reader_locked_out_of_a_handled_forward_never_gives_it_to_the_holder() {
         let (db, path, _env) = policy_db(KIMI_POLICY);
         send(
@@ -2832,9 +2989,10 @@ mod tests {
                         let conn = HcomDb::open_at(&path).unwrap();
                         barrier.wait();
                         // A transient answer (the lock outlasted busy_timeout)
-                        // is retried, as the plugin does; only final answers
-                        // count.
-                        loop {
+                        // is retried, as the plugin does (bounded, so a leaked
+                        // lock fails the test instead of hanging it); only
+                        // final answers count.
+                        for _ in 0..10 {
                             match crate::delivery_policy::register_role(
                                 &conn,
                                 "kimi",
@@ -2842,9 +3000,10 @@ mod tests {
                                 role,
                             ) {
                                 Err(e) if e.transient => continue,
-                                other => break other,
+                                other => return other,
                             }
                         }
+                        panic!("register_role still transient after 10 tries");
                     })
                 })
                 .collect();

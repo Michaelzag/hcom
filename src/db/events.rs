@@ -603,25 +603,23 @@ impl HcomDb {
         // The handled marker is final: once any reader forwarded this
         // refusal, nothing here may re-decide it (a later give-up or an
         // unresolved delegate would hand the holder a message the delegate
-        // already has). Read first, before the failure record.
+        // already has). Read first; a failure record counts only without it.
+        // Handled with a cursor to move: the transaction does just the CAS.
         let handled = |db: &Self| db.kv_get(&keys.handled).ok().flatten().is_some();
-        if advance_from.is_none() && handled(self) {
+        let already_handled = handled(self);
+        if already_handled && advance_from.is_none() {
             return ForwardOutcome::Forwarded {
                 cursor_advanced: false,
             };
         }
-        if self.kv_get(&keys.failed).ok().flatten().is_some() {
-            return ForwardOutcome::DeliverToHolder;
-        }
-        if let Some(reason) = forward_given_up(self, &keys.holder_origin) {
-            if handled(self) {
-                return ForwardOutcome::Forwarded {
-                    cursor_advanced: false,
-                };
+        if !already_handled {
+            if self.kv_get(&keys.failed).ok().flatten().is_some() {
+                return ForwardOutcome::DeliverToHolder;
             }
-            // Given up while the database was too locked to record it.
-            let _ = self.kv_set(&keys.failed, Some(&failure(&reason)));
-            return ForwardOutcome::DeliverToHolder;
+            if let Some(reason) = forward_given_up(self, &keys.holder_origin) {
+                // Given up while the database was too locked to record it.
+                return self.give_to_holder_unless_handled(&keys, &failure(&reason));
+            }
         }
         if forward_backing_off(self, &keys.holder_origin) {
             return ForwardOutcome::Retry;
@@ -853,16 +851,42 @@ impl HcomDb {
                 }
                 let reason = format!("{e} (after {attempts} attempt(s))");
                 mark_forward_given_up(self, &keys.holder_origin, &reason);
-                let _ = self.kv_set(&keys.failed, Some(&failure(&reason)));
-                crate::log::log_warn(
-                    "delivery_policy",
-                    "forward_failed",
-                    &format!(
-                        "could not forward event {event_id} from {holder} to {delegate}: {reason}; delivering it to {holder} instead"
-                    ),
-                );
-                ForwardOutcome::DeliverToHolder
+                let outcome = self.give_to_holder_unless_handled(&keys, &failure(&reason));
+                if outcome == ForwardOutcome::DeliverToHolder {
+                    crate::log::log_warn(
+                        "delivery_policy",
+                        "forward_failed",
+                        &format!(
+                            "could not forward event {event_id} from {holder} to {delegate}: {reason}; delivering it to {holder} instead"
+                        ),
+                    );
+                }
+                outcome
             }
+        }
+    }
+
+    /// Give up a forward to the holder, unless another reader has forwarded
+    /// it: `failed` is written only while `handled` is absent, in one
+    /// statement, so no reader can commit `handled` between a check and the
+    /// write. When even that write is locked out, a plain read of `handled`
+    /// (allowed under a held write lock in WAL) decides.
+    fn give_to_holder_unless_handled(&self, keys: &ForwardKeys, failure: &str) -> ForwardOutcome {
+        let recorded = self.conn.execute(
+            "INSERT OR REPLACE INTO kv (key, value)
+             SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM kv WHERE key = ?3)",
+            params![keys.failed, failure, keys.handled],
+        );
+        let handled = match recorded {
+            Ok(n) => n == 0,
+            Err(_) => self.kv_get(&keys.handled).ok().flatten().is_some(),
+        };
+        if handled {
+            ForwardOutcome::Forwarded {
+                cursor_advanced: false,
+            }
+        } else {
+            ForwardOutcome::DeliverToHolder
         }
     }
 
@@ -878,11 +902,11 @@ impl HcomDb {
         fleet: &crate::fleet_names::FleetCtx,
     ) -> bool {
         let keys = ForwardKeys::new(holder, event);
-        if self.kv_get(&keys.failed).ok().flatten().is_some() {
-            return true;
-        }
         if self.kv_get(&keys.handled).ok().flatten().is_some() {
             return false;
+        }
+        if self.kv_get(&keys.failed).ok().flatten().is_some() {
+            return true;
         }
         crate::delivery_policy::resolve_delegate(delegate, rows, fleet).is_err()
     }

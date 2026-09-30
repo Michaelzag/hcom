@@ -1296,6 +1296,8 @@ mod tests {
     fn single_seat_context_probes_the_plugin_once() {
         use std::io::{Read as _, Write as _};
         use std::sync::atomic::{AtomicUsize, Ordering};
+        // cmd_list reads the delivery policy through the global Config.
+        let _env = crate::hooks::test_helpers::isolated_test_env();
 
         let dir = tempfile::tempdir().unwrap();
         let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();

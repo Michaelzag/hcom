@@ -885,11 +885,17 @@ pub struct ForwardFailure {
     pub reason: String,
 }
 
-/// Forwards that failed for good and went to the holder instead.
+/// Forwards that failed for good and went to the holder instead. A record
+/// whose refusal was also forwarded (a give-up racing another reader's
+/// forward) is not a failure: the handled marker is final.
 pub fn forward_failures(db: &HcomDb) -> Vec<ForwardFailure> {
     db.kv_prefix(KV_FORWARD_FAILED_PREFIX)
         .unwrap_or_default()
         .into_iter()
+        .filter(|(key, _)| {
+            let handled = key.replacen(KV_FORWARD_FAILED_PREFIX, KV_FORWARD_HANDLED_PREFIX, 1);
+            !matches!(db.kv_get(&handled), Ok(Some(_)))
+        })
         .filter_map(|(_, value)| serde_json::from_str(&value).ok())
         .collect()
 }
