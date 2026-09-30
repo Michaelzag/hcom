@@ -218,6 +218,10 @@ const INSTANCE_KEYS: &[(&str, &str)] = &[
 
 /// Maps HCOM_ field name (lowercase, no prefix) to nested TOML dotted path.
 fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
+    // relay_psk is set through `hcom relay`, not `hcom config`.
+    if field_name == "relay_psk" {
+        return None;
+    }
     match field_name {
         "terminal" => Some("terminal.active"),
         "title_mode" => Some("terminal.title_mode"),
@@ -2367,6 +2371,20 @@ fn update_auto_approve_permissions(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_mapped_field_is_set_where_the_loader_reads_it() {
+        for (field, path) in crate::config::TOML_KEY_MAP {
+            if *field == "relay_psk" {
+                continue;
+            }
+            assert_eq!(
+                toml_path_for_key(field),
+                Some(*path),
+                "`hcom config {field}` must write {path}"
+            );
+        }
+    }
 
     #[test]
     fn test_normalize_key() {

@@ -305,6 +305,9 @@ impl<'a> MqttRelay<'a> {
     /// silent for minutes while every peer's sync time kept advancing.
     const DRAIN_BUDGET: Duration = Duration::from_millis(200);
 
+    /// How often the worker advances catch-up backfill for skipped event ranges.
+    const BACKFILL_INTERVAL: Duration = Duration::from_secs(2);
+
     /// Build the MQTT relay client for one MQTT session.
     ///
     /// Returns (MqttRelay, Connection). The Connection must be polled in a
@@ -435,6 +438,7 @@ impl<'a> MqttRelay<'a> {
     ) -> RunEnd {
         let mut backoff = Backoff::new();
         let mut last_push = Instant::now();
+        let mut last_backfill = Instant::now();
         let mut pending_push_at: Option<Instant> = None;
         let mut epoch = DisconnectEpoch::new();
         // Track last time we received ANY event (success or error) from the
@@ -461,8 +465,23 @@ impl<'a> MqttRelay<'a> {
                 if hb_db.is_none() {
                     hb_db = HcomDb::open().ok();
                 }
-                if let Some(ref db) = hb_db {
-                    super::write_worker_heartbeat(db);
+                let heartbeat_ok = if let Some(ref mut db) = hb_db {
+                    // A reset or schema recovery can atomically replace hcom.db while the
+                    // long-lived relay worker still owns this connection.  Without this
+                    // check heartbeat writes continue against the unlinked database and
+                    // the live worker is reported stale forever.
+                    db.reconnect_if_stale();
+                    super::write_worker_heartbeat(db)
+                } else {
+                    false
+                };
+                if !heartbeat_ok {
+                    log::log_warn(
+                        "relay",
+                        "relay.heartbeat_write_failed",
+                        "heartbeat write failed; reopening the database on the next tick",
+                    );
+                    hb_db = None;
                 }
                 last_heartbeat = Some(Instant::now());
             }
@@ -508,6 +527,13 @@ impl<'a> MqttRelay<'a> {
             // stuck or dead but hasn't closed the channel. End the session so
             // the worker reconnects, and say so in the status detail instead
             // of leaving a stale error frozen there.
+
+            // Catch-up backfill runs here, never in the inbound handler: its
+            // answers arrive through that handler.
+            if epoch.connected && last_backfill.elapsed() >= Self::BACKFILL_INTERVAL {
+                self.do_backfill_cycle();
+                last_backfill = Instant::now();
+            }
             if last_event_from_conn.elapsed() > Self::LIVENESS_TIMEOUT {
                 let silent = last_event_from_conn.elapsed();
                 log::log_warn(
@@ -650,6 +676,18 @@ impl<'a> MqttRelay<'a> {
                     false
                 }
                 Packet::Publish(publish) => {
+                    // A broker-delivered publish is positive proof that this MQTT session
+                    // is live.  Reassert the state here as well as on ConnAck so a
+                    // transient/local state loss cannot leave periodic outbound sync
+                    // disabled while inbound sync continues normally.
+                    if !epoch.connected {
+                        log::log_info(
+                            "relay",
+                            "relay.inbound_reconnected",
+                            "inbound MQTT traffic re-established connected state",
+                        );
+                        epoch.connected = true;
+                    }
                     let topic = String::from_utf8_lossy(&publish.topic).to_string();
                     let payload = publish.payload.to_vec();
                     self.handle_incoming_message(&topic, &payload)
@@ -809,6 +847,54 @@ impl<'a> MqttRelay<'a> {
         }
     }
 
+    /// Advance catch-up backfill for skipped event ranges (see relay::backfill).
+    fn do_backfill_cycle(&self) {
+        let db = match HcomDb::open() {
+            Ok(db) => db,
+            Err(e) => {
+                log::log_error("relay", "relay.db_err", &format!("{}", e));
+                return;
+            }
+        };
+        if super::backfill::devices_with_gaps(&db).is_empty() {
+            return;
+        }
+        let config = HcomConfig::load(None).unwrap_or_default();
+        let own_short_id = super::device_short_id_for_db(&db, &self.device_uuid);
+        let now = crate::shared::time::now_epoch_f64();
+        let summary =
+            super::backfill::tick(&db, &own_short_id, now, &mut |short, request_id, params| {
+                let Some((topic, payload)) = super::control::build_rpc_control_payload(
+                    &db,
+                    &config,
+                    super::control::rpc_action::EVENTS,
+                    short,
+                    request_id,
+                    params,
+                ) else {
+                    return false;
+                };
+                // try_publish never blocks the worker loop on a full request queue.
+                self.client
+                    .try_publish(topic, QoS::AtLeastOnce, false, payload)
+                    .is_ok()
+            });
+        if summary.requests_sent > 0 || summary.events_imported > 0 || summary.gaps_abandoned > 0 {
+            log::log_with_fields(
+                "INFO",
+                "relay",
+                "relay.backfill_tick",
+                "",
+                &[
+                    ("requests", &summary.requests_sent.to_string()),
+                    ("imported", &summary.events_imported.to_string()),
+                    ("closed", &summary.gaps_closed.to_string()),
+                    ("abandoned", &summary.gaps_abandoned.to_string()),
+                ],
+            );
+        }
+    }
+
     /// Graceful shutdown: publish an authenticated retained tombstone, wait for
     /// PUBACK, then disconnect.
     fn shutdown_graceful(
@@ -954,7 +1040,6 @@ impl EphemeralClient {
 /// The returned EphemeralClient tracks PUBACK so callers can wait for delivery confirmation.
 pub fn create_ephemeral_client(config: &HcomConfig) -> Option<EphemeralClient> {
     let (host, port, use_tls) = super::get_broker_from_config(config)?;
-
     let client_id = format!("hcom-ephemeral-{}", std::process::id());
     let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
     mqttoptions.set_keep_alive(Duration::from_secs(10));
