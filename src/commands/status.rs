@@ -326,9 +326,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                             "invalid": s.invalid,
                         })))
                         .collect::<serde_json::Map<_, _>>(),
-                    "forward_failures": crate::delivery_policy::forward_failures(db)
-                        .into_iter()
-                        .collect::<std::collections::BTreeMap<_, _>>(),
+                    "forward_failures": crate::delivery_policy::forward_failures(db),
                 }),
                 Err(e) => json!({"error": e}),
             },

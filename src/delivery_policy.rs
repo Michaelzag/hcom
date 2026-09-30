@@ -78,12 +78,16 @@ const KV_ROLE_PREFIX: &str = "delivery_role:";
 pub const REROUTES_FIELD: &str = "delivery_reroutes";
 /// Forward copy field naming the local id of the event it forwards.
 pub const FORWARD_OF_FIELD: &str = "delivery_forward_of";
-/// kv claim, one per delegate and message origin (the primary key is the
-/// exactly-once).
+/// kv claim: the resolved delegate has its copy of one message
+/// (`<delegate>:<origin>`; the primary key is the exactly-once).
 pub const KV_FORWARDED_PREFIX: &str = "delivery_forwarded:";
-/// kv record of a forward that failed for good and went to the holder.
+/// kv marker: one holder's refusal of one message is handled, forwarded
+/// (`<holder>:<origin>`). Checked first, so a later read never re-decides it.
+pub const KV_FORWARD_HANDLED_PREFIX: &str = "delivery_forward_handled:";
+/// kv record (JSON `ForwardFailure`) of a forward that failed for good and
+/// went to the holder (`<holder>:<origin>`).
 pub const KV_FORWARD_FAILED_PREFIX: &str = "delivery_forward_failed:";
-/// kv count of failed forward attempts per delegate and message origin.
+/// kv count of failed forward attempts (`<holder>:<origin>`).
 pub const KV_FORWARD_ATTEMPTS_PREFIX: &str = "delivery_forward_attempts:";
 /// kv marker: a relayed External message to a holder was audited once.
 pub const KV_EXTERNAL_AUDITED_PREFIX: &str = "delivery_external_audited:";
@@ -152,9 +156,9 @@ pub struct Policies {
     entries: BTreeMap<String, Entry>,
     /// instance name -> its registration, live registrations only.
     holders: BTreeMap<String, Registration>,
-    /// config.toml did not parse: `load` gives every registered role an
-    /// entry, so none is silently unfiltered.
-    unparseable: bool,
+    /// config.toml did not parse or could not be read (why): `load` gives
+    /// every registered role an entry, so none is silently unfiltered.
+    config_broken: Option<&'static str>,
 }
 
 /// The facts about one message the rule reads.
@@ -364,12 +368,14 @@ pub fn parse(content: &str) -> Policies {
     Policies {
         entries,
         holders: BTreeMap::new(),
-        unparseable: false,
+        config_broken: None,
     }
 }
 
 /// Why every entry recovered from an unparseable config.toml is broken.
 const UNPARSEABLE: &str = "config.toml does not parse";
+/// Why every registered role is broken when config.toml cannot be read.
+const UNREADABLE: &str = "config.toml cannot be read";
 
 /// config.toml no longer parses: every delivery role still named in the
 /// text stays in force, degraded to its `delegate` when one is readable,
@@ -425,7 +431,7 @@ fn fail_closed_from_text(content: &str) -> Policies {
             .map(|(role, delegate)| (role, Entry::broken(UNPARSEABLE.to_string(), delegate)))
             .collect(),
         holders: BTreeMap::new(),
-        unparseable: true,
+        config_broken: Some(UNPARSEABLE),
     }
 }
 
@@ -535,15 +541,21 @@ fn string_list(table: &toml::Table, key: &str, default: &[&str]) -> Result<Vec<S
 /// that would switch the filter off for one read. Readers deliver nothing
 /// and leave the cursor where it is; a send fails.
 pub fn load(db: &HcomDb) -> Result<Policies, String> {
+    // Only a missing file means "no policy". Any other read failure is a
+    // broken config: fail closed like an unparseable one.
     let mut policies = match std::fs::read_to_string(crate::paths::config_toml_path()) {
         Ok(content) => parse(&content),
-        Err(_) => Policies::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Policies::default(),
+        Err(_) => Policies {
+            config_broken: Some(UNREADABLE),
+            ..Policies::default()
+        },
     };
-    if !policies.entries.is_empty() || policies.unparseable {
+    if !policies.entries.is_empty() || policies.config_broken.is_some() {
         policies.holders = live_role_holders(db)
             .map_err(|e| format!("delivery policy: cannot read role holders: {e}"))?;
     }
-    if policies.unparseable {
+    if let Some(reason) = policies.config_broken {
         // A registered role the broken text no longer names still gets an
         // entry: INVALID in status, and its holder receives everything
         // targeted (no delegate to send it to), never silently unfiltered.
@@ -551,26 +563,61 @@ pub fn load(db: &HcomDb) -> Result<Policies, String> {
             policies
                 .entries
                 .entry(reg.role.clone())
-                .or_insert_with(|| Entry::broken(UNPARSEABLE.to_string(), None));
+                .or_insert_with(|| Entry::broken(reason.to_string(), None));
         }
     }
     audit(db, &policies);
     Ok(policies)
 }
 
-/// The live row a configured `delegate` names, resolved exactly like a send
-/// target (a bare remote name maps to its mirror row). `None` when nothing
-/// live matches, or the name is ambiguous: the holder keeps the message.
+/// Why a configured delegate names no single live row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unresolved {
+    NotLive,
+    /// Several live rows match (the resolver's refusal).
+    Ambiguous(String),
+}
+
+impl Unresolved {
+    /// `mupe is not live` / `mupe is ambiguous (...)`, for notices and logs.
+    pub fn describe(&self, delegate: &str) -> String {
+        match self {
+            Unresolved::NotLive => format!("{delegate} is not live"),
+            Unresolved::Ambiguous(why) => format!("{delegate} is ambiguous ({why})"),
+        }
+    }
+}
+
+/// The live row a configured `delegate` names. A live row with exactly that
+/// name wins (so a local `mupe` is never made ambiguous by a relayed
+/// namesake); otherwise it resolves like a send target (a bare name live
+/// only as a remote mirror maps to that mirror row). The resolver's virtual
+/// sender identity has no row and never counts.
 pub(crate) fn resolve_delegate(
     delegate: &str,
     rows: &[crate::messages::InstanceInfo],
     fleet: &crate::fleet_names::FleetCtx,
-) -> Option<String> {
-    let (matched, _) =
-        crate::messages::resolve_targets(&[delegate.to_string()], rows, fleet).ok()?;
-    match matched.as_slice() {
-        [one] if rows.iter().any(|row| row.name == *one) => Some(one.clone()),
-        _ => None,
+) -> Result<String, Unresolved> {
+    if rows.iter().any(|row| row.name == delegate) {
+        return Ok(delegate.to_string());
+    }
+    let (matched, _) = crate::messages::resolve_targets(&[delegate.to_string()], rows, fleet)
+        .map_err(Unresolved::Ambiguous)?;
+    let real: Vec<&String> = matched
+        .iter()
+        .filter(|name| rows.iter().any(|row| row.name == **name))
+        .collect();
+    match real.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(Unresolved::NotLive),
+        several => Err(Unresolved::Ambiguous(format!(
+            "matches {}",
+            several
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
 }
 
@@ -819,18 +866,23 @@ pub fn role_status(db: &HcomDb) -> Result<Vec<RoleStatus>, String> {
         .collect())
 }
 
-/// Forwards that failed for good and went to the holder instead, as
-/// `(event id, reason)`.
-pub fn forward_failures(db: &HcomDb) -> Vec<(String, String)> {
+/// One forward that failed for good: the holder got the message instead.
+/// Stored as JSON in the kv value; the key is only a uniqueness token.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ForwardFailure {
+    pub holder: String,
+    pub delegate: String,
+    /// The sender's reference to its message (`#id` or `#id:DEVICE`).
+    pub message: String,
+    pub reason: String,
+}
+
+/// Forwards that failed for good and went to the holder instead.
+pub fn forward_failures(db: &HcomDb) -> Vec<ForwardFailure> {
     db.kv_prefix(KV_FORWARD_FAILED_PREFIX)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(key, reason)| {
-            Some((
-                key.strip_prefix(KV_FORWARD_FAILED_PREFIX)?.to_string(),
-                reason,
-            ))
-        })
+        .filter_map(|(_, value)| serde_json::from_str(&value).ok())
         .collect()
 }
 
@@ -861,9 +913,10 @@ pub fn role_status_lines(db: &HcomDb) -> Vec<String> {
             ));
         }
     }
-    for (event_id, reason) in forward_failures(db) {
+    for f in forward_failures(db) {
         lines.push(format!(
-            "delivery forward failed for event {event_id}: {reason} (delivered to the holder)"
+            "delivery forward failed for message {} to {}: {} ({} keeps it)",
+            f.message, f.delegate, f.reason, f.holder
         ));
     }
     lines
@@ -871,17 +924,31 @@ pub fn role_status_lines(db: &HcomDb) -> Vec<String> {
 
 /// Log one line when the effective policy differs from the last one logged.
 /// Compared against the hash persisted in kv (never a per-process memo, which
-/// would hide A -> B -> A changes made by other processes), so it is one line
-/// per change across processes for one kv read per load. A broken block with
-/// no readable delegate also sends each holder one notice per hash.
+/// would hide A -> B -> A changes made by other processes) and moved with a
+/// compare-and-set, so of several processes loading the same change only the
+/// one that moves the stored hash logs it. A broken block with no readable
+/// delegate also sends each holder one notice per hash.
 fn audit(db: &HcomDb, policies: &Policies) {
     let hash = policies.hash();
-    let previous = db.kv_get(KV_LOGGED_HASH).ok().flatten();
-    let previous = previous.as_deref().unwrap_or("none");
-    if previous == hash {
+    let stored = db.kv_get(KV_LOGGED_HASH).ok().flatten();
+    if stored.as_deref().unwrap_or("none") == hash {
         return;
     }
-    let _ = db.kv_set(KV_LOGGED_HASH, Some(&hash));
+    let moved = match &stored {
+        Some(prev) => db.conn().execute(
+            "UPDATE kv SET value = ?1 WHERE key = ?2 AND value = ?3",
+            rusqlite::params![hash, KV_LOGGED_HASH, prev],
+        ),
+        None => db.conn().execute(
+            "INSERT OR IGNORE INTO kv (key, value) VALUES (?2, ?1)",
+            rusqlite::params![hash, KV_LOGGED_HASH],
+        ),
+    }
+    .is_ok_and(|n| n == 1);
+    if !moved {
+        return;
+    }
+    let previous = stored.as_deref().unwrap_or("none");
     let holders: Vec<String> = policies
         .role_holders()
         .into_iter()

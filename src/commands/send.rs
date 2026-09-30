@@ -246,8 +246,8 @@ struct ResolvedDelivery {
     is_thread_resolved: bool,
     /// Recipients the delivery policy refused, as `(recipient, delegate)`.
     reroutes: Vec<(String, String)>,
-    /// Refused recipients kept because the delegate has no live row, as
-    /// `(recipient, delegate)`.
+    /// Refused recipients kept because the delegate names no single live
+    /// row, as `(recipient, why)` (`mupe is not live`).
     kept_for_holder: Vec<(String, String)>,
     /// Policy instances an External sender reached (the audited bypass).
     external_reached_policy: Vec<String>,
@@ -264,7 +264,7 @@ fn reroute_notices(delivery: &ResolvedDelivery) -> Vec<String> {
     let kept = delivery
         .kept_for_holder
         .iter()
-        .map(|(recipient, delegate)| format!("{delegate} is not live; delivered to {recipient}"));
+        .map(|(recipient, why)| format!("{why}; delivered to {recipient}"));
     rerouted.chain(kept).collect()
 }
 
@@ -334,24 +334,25 @@ fn resolve_delivery(
         for name in effective_mentions {
             let target = match policies.send_verdict(&name, &facts) {
                 SendVerdict::Deliver => name,
-                // The delegate resolves like any target (a bare remote name
-                // maps to its mirror row). None live: the holder keeps it
-                // (never dropped, and a delegate row started later begins at
-                // the current cursor, so parking it for the delegate would
-                // lose it).
+                // The delegate resolves like any target (an exact live name
+                // first; a bare remote name maps to its mirror row). No
+                // single live row: the holder keeps it (never dropped, and a
+                // delegate row started later begins at the current cursor,
+                // so parking it for the delegate would lose it).
                 SendVerdict::RerouteTo(delegate) => {
                     match crate::delivery_policy::resolve_delegate(&delegate, &rows, &fleet) {
-                        Some(canonical) => {
+                        Ok(canonical) => {
                             reroutes.push((name, canonical.clone()));
                             canonical
                         }
-                        None => {
+                        Err(why) => {
+                            let why = why.describe(&delegate);
                             crate::log::log_warn(
                                 "delivery_policy",
-                                "delegate_not_live",
-                                &format!("delegate {delegate} is not live; delivered to {name}"),
+                                "delegate_unresolved",
+                                &format!("delegate {why}; delivered to {name}"),
                             );
-                            kept_for_holder.push((name.clone(), delegate));
+                            kept_for_holder.push((name.clone(), why));
                             name
                         }
                     }
@@ -2284,15 +2285,26 @@ mod tests {
         // failure is recorded for `hcom status`.
         assert_eq!(unread_texts(&db, "kimi"), both);
         assert_eq!(forward_count(&db), 0);
-        let lines = crate::delivery_policy::role_status_lines(&db);
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.starts_with("delivery forward failed for event")
-                    && l.contains("dev-lots:82")),
-            "{lines:?}"
-        );
+        assert_failure_recorded(&db, "#82:LOTS", "(after 5 attempt(s))");
         cleanup_test_db(path);
+    }
+
+    /// kimi's one forward failure for `message` to mupe, and its status line.
+    fn assert_failure_recorded(db: &HcomDb, message: &str, reason_end: &str) {
+        let failures = crate::delivery_policy::forward_failures(db);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        let f = &failures[0];
+        assert_eq!(
+            (f.holder.as_str(), f.delegate.as_str(), f.message.as_str()),
+            ("kimi", "mupe", message)
+        );
+        assert!(f.reason.ends_with(reason_end), "{f:?}");
+        let line = format!(
+            "delivery forward failed for message {message} to mupe: {} (kimi keeps it)",
+            f.reason
+        );
+        let lines = crate::delivery_policy::role_status_lines(db);
+        assert!(lines.contains(&line), "{lines:?}");
     }
 
     #[test]
@@ -2540,6 +2552,75 @@ mod tests {
 
     #[test]
     #[serial]
+    fn local_delegate_with_a_live_remote_namesake_reroutes_to_the_local_one() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at, origin_device_id)
+                 VALUES ('mupe:BOXE', 'sess-remote', 1000.0, 'dev-boxe')",
+                [],
+            )
+            .unwrap();
+        let d = send(
+            &db,
+            &sender(SenderKind::Instance, "nova"),
+            "to the local mupe",
+            None,
+            None,
+            &["kimi"],
+        );
+        assert_eq!(d.reroutes, vec![("kimi".to_string(), "mupe".to_string())]);
+        assert!(reroute_notices(&d).iter().all(|n| !n.contains("not live")));
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn forwarded_then_delegate_stops_is_not_redelivered_to_the_holder() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        send(
+            &db,
+            &sender(SenderKind::Instance, "mupe"),
+            "first",
+            None,
+            None,
+            &["kimi"],
+        );
+        let first = last_event_id(&db);
+        let refused = inject(&db, &old_peer_inform("refused", 94));
+        // "first" is deliverable, so this read forwards "refused" without
+        // moving the cursor past it.
+        assert_eq!(unread_texts(&db, "kimi"), vec!["first".to_string()]);
+        assert_eq!(forward_count(&db), 1);
+        let mut updates = serde_json::Map::new();
+        updates.insert("last_event_id".into(), serde_json::json!(first));
+        crate::instances::update_instance_position(&db, "kimi", &updates);
+        // mupe stops; the next read meets the already-forwarded event first.
+        db.conn()
+            .execute("DELETE FROM instances WHERE name = 'mupe'", [])
+            .unwrap();
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert_eq!(forward_count(&db), 1);
+        assert!(crate::delivery_policy::forward_failures(&db).is_empty());
+        // Past it, and past the forward copy and notice it skips.
+        assert!(refused < last_event_id(&db));
+        assert_eq!(cursor(&db, "kimi"), last_event_id(&db));
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn list_counts_a_refused_message_the_holder_keeps() {
+        let (db, path, _env) = policy_db("[delivery.conductor]\ndelegate = \"mpue\"\n");
+        inject(&db, &old_peer_inform("kept", 95));
+        let count = crate::commands::list::get_unread_count(&db, "kimi", cursor(&db, "kimi"));
+        assert_eq!(count, 1);
+        assert_eq!(unread_texts(&db, "kimi"), vec!["kept".to_string()]);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
     fn racing_registrations_of_two_roles_admit_exactly_one() {
         let (db, path, _env) = policy_db(&format!(
             "{KIMI_POLICY}\n[delivery.deputy]\ndelegate = \"lola\"\n"
@@ -2606,6 +2687,9 @@ mod tests {
         both["mentions"] = serde_json::json!(["kimi", "valo"]);
         let id = inject(&db, &both);
         assert!(unread_texts(&db, "kimi").is_empty());
+        // valo reads after kimi's forward copy and notice exist: it forwards
+        // its own and skips through kimi's, up to what its read saw.
+        let seen_by_valo = last_event_id(&db);
         assert!(unread_texts(&db, "valo").is_empty());
         let delegates: Vec<serde_json::Value> = forward_rows(&db)
             .into_iter()
@@ -2615,8 +2699,10 @@ mod tests {
             delegates,
             vec![serde_json::json!(["mupe"]), serde_json::json!(["lola"])]
         );
-        // Both holders are past it (and past the forward copies they skip).
-        assert!(cursor(&db, "kimi") >= id && cursor(&db, "valo") >= id);
+        assert_eq!(
+            (cursor(&db, "kimi"), cursor(&db, "valo")),
+            (id, seen_by_valo)
+        );
         cleanup_test_db(path);
         // The env guard holds the process-wide env lock: release it before the next fixture.
         drop((db, _env));
@@ -2630,7 +2716,35 @@ mod tests {
         assert!(unread_texts(&db, "kimi").is_empty());
         assert!(unread_texts(&db, "valo").is_empty());
         assert_eq!(forward_count(&db), 1);
-        assert!(cursor(&db, "kimi") >= id && cursor(&db, "valo") >= id);
+        assert_eq!(
+            (cursor(&db, "kimi"), cursor(&db, "valo")),
+            (id, last_event_id(&db))
+        );
+        cleanup_test_db(path);
+        drop((db, _env));
+
+        // One delegate spelled two ways ("mupe", live only as a mirror, and
+        // "mupe:BOXE"): resolved to one row, so one copy.
+        let (db, path, _env) = policy_db(&format!(
+            "{KIMI_POLICY}\n[delivery.deputy]\ndelegate = \"mupe:BOXE\"\n"
+        ));
+        crate::delivery_policy::register_role(&db, "valo", "sess-valo", "deputy").unwrap();
+        db.conn()
+            .execute_batch(
+                "DELETE FROM instances WHERE name = 'mupe';
+                 INSERT INTO instances (name, session_id, created_at, origin_device_id)
+                 VALUES ('mupe:BOXE', 'sess-remote', 1000.0, 'dev-boxe');",
+            )
+            .unwrap();
+        inject(&db, &both);
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert!(unread_texts(&db, "valo").is_empty());
+        let delegates: Vec<serde_json::Value> = forward_rows(&db)
+            .into_iter()
+            .map(|(_, c)| c["mentions"].clone())
+            .collect();
+        assert_eq!(delegates, vec![serde_json::json!(["mupe:BOXE"])]);
+        assert_eq!(notice_count(&db), 1);
         cleanup_test_db(path);
     }
 
@@ -2723,12 +2837,7 @@ mod tests {
         crate::instances::update_instance_position(&db, "kimi", &updates);
         assert!(unread_texts(&db, "kimi").is_empty());
         assert_eq!(forward_count(&db), 0);
-        assert!(
-            crate::delivery_policy::role_status_lines(&db)
-                .iter()
-                .any(|l| l.starts_with("delivery forward failed for event")
-                    && l.contains("dev-lots:83"))
-        );
+        assert_failure_recorded(&db, "#83:LOTS", "(after 1 attempt(s))");
         cleanup_test_db(path);
     }
 

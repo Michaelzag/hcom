@@ -327,32 +327,64 @@ impl HcomDb {
         false
     }
 
-    /// Diagnostic-only: (min_id, max_id, count) of pending message events for
-    /// an instance, or None if nothing is pending. Not used on the delivery
-    /// hot path — for logging at `delivery.gate_pass`.
+    /// (min_id, max_id, count) of pending message events for an instance,
+    /// or None if nothing is pending: `hcom list`'s count, and logging at
+    /// `delivery.gate_pass`. Not used on the delivery hot path. A pure read:
+    /// for a role holder it counts what the holder will actually read,
+    /// including a refused message it keeps (a failed forward, or a delegate
+    /// with no single live row), without forwarding anything.
     pub fn pending_event_range(&self, name: &str) -> Option<(i64, i64, i64)> {
+        use crate::delivery_policy::ReadVerdict;
         let last_event_id = self.get_cursor(name);
 
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT id, data FROM events WHERE id > ? AND type = 'message' ORDER BY id",
+                "SELECT id, timestamp, data FROM events WHERE id > ? AND type = 'message' ORDER BY id",
             )
             .ok()?;
-        let rows = stmt
+        let rows: Vec<(i64, Option<String>, String)> = stmt
             .query_map(params![last_event_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
-            .ok()?;
+            .ok()?
+            .flatten()
+            .collect();
+        drop(stmt);
 
         let mut min_id = i64::MAX;
         let mut max_id = i64::MIN;
         let mut count = 0i64;
         let policies = crate::delivery_policy::load(self).ok()?;
-        for (id, data) in rows.flatten() {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
-                && Self::should_deliver_to(&json, name, &policies)
-            {
+        // Loaded once, only if a refused message needs its delegate resolved.
+        let mut live: Option<(
+            Vec<crate::messages::InstanceInfo>,
+            crate::fleet_names::FleetCtx,
+        )> = None;
+        for (id, timestamp, data) in rows {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
+                continue;
+            };
+            let reads = match Self::delivery_verdict(&json, name, &policies) {
+                ReadVerdict::Deliver => true,
+                ReadVerdict::Skip => false,
+                ReadVerdict::ForwardTo(delegate) => {
+                    if live.is_none() {
+                        live = Some((
+                            crate::messages::deliverable_instances(&self.conn).ok()?,
+                            crate::fleet_names::FleetCtx::load(),
+                        ));
+                    }
+                    let (rows, fleet) = live.as_ref()?;
+                    let event = super::RefusedEvent {
+                        id,
+                        timestamp: timestamp.as_deref().unwrap_or_default(),
+                        data: &json,
+                    };
+                    self.refused_reaches_holder(name, event, &delegate, rows, fleet)
+                }
+            };
+            if reads {
                 min_id = min_id.min(id);
                 max_id = max_id.max(id);
                 count += 1;

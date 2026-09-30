@@ -131,7 +131,8 @@ impl InstanceInfo {
 
 /// Every row a message may be delivered to or a bare name resolved against
 /// (the live-row predicate), carrying the `origin_device_id` the fleet
-/// suffix-only flag needs. Rows that fail to decode are skipped.
+/// suffix-only flag needs. A row that fails to read is an error, never a
+/// missing row: callers decide "not live" from this list.
 pub(crate) fn deliverable_instances(
     conn: &rusqlite::Connection,
 ) -> rusqlite::Result<Vec<InstanceInfo>> {
@@ -139,17 +140,14 @@ pub(crate) fn deliverable_instances(
         "SELECT name, tag, origin_device_id FROM instances WHERE {}",
         crate::fleet_names::LIVE_ROW_PREDICATE
     ))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(InstanceInfo {
-                name: row.get::<_, String>(0)?,
-                tag: row.get::<_, Option<String>>(1)?,
-                origin: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
+    stmt.query_map([], |row| {
+        Ok(InstanceInfo {
+            name: row.get::<_, String>(0)?,
+            tag: row.get::<_, Option<String>>(1)?,
+            origin: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
+        })
+    })?
+    .collect()
 }
 
 // validate_scope and validate_intent live in core::helpers — re-export for consumers.
