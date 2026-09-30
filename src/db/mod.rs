@@ -99,6 +99,53 @@ fn get_inode(path: &std::path::Path) -> u64 {
     crate::sys::fs::file_id(path)
 }
 
+/// How long `send_message` keeps retrying a contended message-row insert
+/// before giving up loudly. Short in tests so lock-contention tests fail
+/// fast instead of sleeping through the production budget.
+#[cfg(not(test))]
+pub(crate) const DEFAULT_SEND_WRITE_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(30);
+#[cfg(test)]
+pub(crate) const DEFAULT_SEND_WRITE_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// True when `e` is a SQLite lock-contention failure (`SQLITE_BUSY` /
+/// `SQLITE_LOCKED`), the only errors worth retrying: anything else (a torn
+/// WAL, a full disk, a logic bug) will fail the same way on every attempt.
+pub(crate) fn is_busy_error(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(err, _))
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// Run `op` until it succeeds, retrying lock-contention failures with
+/// exponential backoff (50ms, doubling, capped at 1s) until `budget` from
+/// the first attempt runs out. Non-busy errors return immediately; a busy
+/// error past the deadline returns as-is so the caller can report it.
+pub(crate) fn retry_on_busy<T>(
+    mut op: impl FnMut() -> Result<T>,
+    budget: std::time::Duration,
+) -> Result<T> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + budget;
+    let mut delay = Duration::from_millis(50);
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_busy_error(&e) && Instant::now() < deadline => {
+                std::thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+                delay = (delay * 2).min(Duration::from_secs(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Reject filesystem-backed unit-test databases that are not disposable state.
 /// This is a last-resort tripwire for code paths that bypass Config entirely.
 ///
@@ -134,6 +181,19 @@ fn assert_isolated_db_path(db_path: &std::path::Path) {
 pub(crate) type GapHook = std::cell::Cell<Option<fn(&HcomDb, &str)>>;
 
 impl HcomDb {
+    /// PRAGMA batch applied to every newly opened connection, in this order.
+    ///
+    /// busy_timeout first: converting a fresh db to WAL takes a brief
+    /// exclusive lock, so with a 0 timeout a concurrent first-open (or heavy
+    /// load) fails instantly with SQLITE_BUSY. Setting the timeout up front
+    /// makes the WAL conversion retry instead. The synchronous=FULL default
+    /// is deliberately left alone (crash durability over write latency).
+    pub(crate) fn apply_open_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
+        )
+    }
+
     /// Open a hardened connection: secure the directory and database files to
     /// owner-only modes (see `paths::ensure_private_db`), then open with the
     /// standard hcom PRAGMAs. The single write path for opening the DB.
@@ -143,13 +203,7 @@ impl HcomDb {
 
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
-        // busy_timeout first: converting a fresh db to WAL takes a brief
-        // exclusive lock, so with a 0 timeout a concurrent first-open (or heavy
-        // load) fails instantly with SQLITE_BUSY. Setting the timeout up front
-        // makes the WAL conversion retry instead.
-        conn.execute_batch(
-            "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
-        )?;
+        Self::apply_open_pragmas(&conn)?;
 
         Ok(conn)
     }
@@ -290,9 +344,7 @@ impl HcomDb {
         }
         match Connection::open(&self.db_path) {
             Ok(new_conn) => {
-                if let Err(e) = new_conn.execute_batch(
-                    "PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;",
-                ) {
+                if let Err(e) = Self::apply_open_pragmas(&new_conn) {
                     use crate::log::log_warn;
                     log_warn(
                         "native",
@@ -533,6 +585,13 @@ impl HcomDb {
             SchemaCompat::Ok | SchemaCompat::NeedsArchive(..) => {}
         }
 
+        // A concurrent first-opener may be initializing right now
+        // (tables present, version still 0). Wait for its stamp on the
+        // plain connection BEFORE taking the write lock: the version-0
+        // sleep loop must never run while holding BEGIN IMMEDIATE, where
+        // it would block every other writer for up to a second while
+        // sleeping. The in-txn compat check below re-reads without sleeping.
+        self.poll_concurrent_init();
         // Take the write lock BEFORE re-reading the version. A DEFERRED
         // transaction reads first and then fails its read->write upgrade with
         // SQLITE_BUSY, which busy_timeout never retries; IMMEDIATE makes a
@@ -547,7 +606,7 @@ impl HcomDb {
         let opened_version: i32 = tx
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
-        match self.check_schema_compat()? {
+        match self.check_schema_compat_no_wait()? {
             SchemaCompat::Ok => {
                 self.init_db()?;
                 if opened_version < 20 {
@@ -604,15 +663,7 @@ impl HcomDb {
                             // would delete it. Archive stays reserved for a
                             // migration that cannot run (Ok(false)) or that
                             // failed non-transiently.
-                            if matches!(
-                                e.downcast_ref::<rusqlite::Error>(),
-                                Some(rusqlite::Error::SqliteFailure(err, _))
-                                    if matches!(
-                                        err.code,
-                                        rusqlite::ErrorCode::DatabaseBusy
-                                            | rusqlite::ErrorCode::DatabaseLocked
-                                    )
-                            ) {
+                            if is_busy_error(&e) {
                                 drop(tx);
                                 return Err(e);
                             }
@@ -702,6 +753,65 @@ impl HcomDb {
 
     /// Internal: check schema compatibility without taking action.
     fn check_schema_compat(&self) -> Result<SchemaCompat> {
+        self.check_schema_compat_inner(true)
+    }
+
+    /// Same as [`Self::check_schema_compat`] but never sleeps: for use
+    /// while holding the `BEGIN IMMEDIATE` write lock in `ensure_schema`.
+    /// The caller must have run [`Self::poll_concurrent_init`] on the
+    /// plain connection first; the version is simply re-read here.
+    fn check_schema_compat_no_wait(&self) -> Result<SchemaCompat> {
+        self.check_schema_compat_inner(false)
+    }
+
+    /// Wait (up to ~1s) for a concurrent first-opener's version stamp.
+    /// Runs on the plain connection with no write lock held — never call
+    /// this from inside a transaction.
+    fn poll_concurrent_init(&self) {
+        let version: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if version != 0 {
+            return;
+        }
+        let has_own_table: bool = self
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .and_then(|mut s| {
+                Ok(s.query_map([], |row| row.get::<_, String>(0))?
+                    .filter_map(|r| r.ok())
+                    .any(|t| {
+                        matches!(
+                            t.as_str(),
+                            "events"
+                                | "instances"
+                                | "kv"
+                                | "notify_endpoints"
+                                | "session_bindings"
+                                | "claude_actor_capabilities"
+                        )
+                    }))
+            })
+            .unwrap_or(false);
+        // A fresh DB (or one with only foreign tables) has no initializer
+        // to wait for; only a partially-initialized store is worth the sleep.
+        if !has_own_table {
+            return;
+        }
+        for _ in 0..20 {
+            let v: i32 = self
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap_or(0);
+            if v != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn check_schema_compat_inner(&self, wait: bool) -> Result<SchemaCompat> {
         let version: i32 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -730,17 +840,27 @@ impl HcomDb {
         if version == 0 {
             // Race handling: another process may be initializing
             if !tables.is_empty() && required.iter().any(|t| tables.contains(*t)) {
+                // With `wait` (unlocked callers) poll for a concurrent
+                // initializer's stamp; under the write lock just re-read
+                // once — the caller already polled before taking the lock.
                 let mut resolved_version = 0i32;
-                for _ in 0..20 {
-                    let v2: i32 = self
+                if wait {
+                    for _ in 0..20 {
+                        let v2: i32 = self
+                            .conn
+                            .query_row("PRAGMA user_version", [], |row| row.get(0))
+                            .unwrap_or(0);
+                        if v2 != 0 {
+                            resolved_version = v2;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                } else {
+                    resolved_version = self
                         .conn
                         .query_row("PRAGMA user_version", [], |row| row.get(0))
                         .unwrap_or(0);
-                    if v2 != 0 {
-                        resolved_version = v2;
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 if resolved_version == SCHEMA_VERSION {
                     return Ok(SchemaCompat::Ok);
@@ -1481,6 +1601,74 @@ pub(super) mod tests {
         assert_eq!(version, SCHEMA_VERSION);
 
         cleanup_test_db(db_path);
+    }
+
+    fn lock_contention_error(raw_code: std::os::raw::c_int) -> anyhow::Error {
+        // Raw SQLITE_* code, not `ErrorCode as c_int`: rusqlite's ErrorCode
+        // discriminants are its own sequence, not the C result codes.
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(raw_code), None).into()
+    }
+
+    #[test]
+    fn is_busy_error_classifies_lock_contention() {
+        assert!(is_busy_error(&lock_contention_error(
+            rusqlite::ffi::SQLITE_BUSY
+        )));
+        assert!(is_busy_error(&lock_contention_error(
+            rusqlite::ffi::SQLITE_LOCKED
+        )));
+        let other_sqlite: anyhow::Error = rusqlite::Error::QueryReturnedNoRows.into();
+        assert!(!is_busy_error(&other_sqlite));
+        assert!(!is_busy_error(&anyhow::anyhow!("boom")));
+    }
+
+    #[test]
+    fn retry_on_busy_succeeds_after_transient_busy() {
+        let mut attempts = 0;
+        let out = retry_on_busy(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err::<&str, _>(lock_contention_error(rusqlite::ffi::SQLITE_LOCKED))
+                } else {
+                    Ok("sent")
+                }
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(out, "sent");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn retry_on_busy_exhausts_and_returns_the_busy_error() {
+        let mut attempts = 0;
+        let err = retry_on_busy(
+            || {
+                attempts += 1;
+                Err::<(), _>(lock_contention_error(rusqlite::ffi::SQLITE_BUSY))
+            },
+            std::time::Duration::from_millis(120),
+        )
+        .unwrap_err();
+        assert!(attempts >= 2, "attempts={attempts}");
+        assert!(is_busy_error(&err));
+    }
+
+    #[test]
+    fn retry_on_busy_propagates_non_busy_immediately() {
+        let mut attempts = 0;
+        let err = retry_on_busy(
+            || {
+                attempts += 1;
+                Err::<(), _>(anyhow::anyhow!("disk is gone"))
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(err.to_string().contains("disk is gone"));
     }
 
     #[test]

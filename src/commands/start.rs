@@ -17,6 +17,7 @@ use crate::bootstrap;
 use crate::claude_actor;
 use crate::config::HcomConfig;
 use crate::db::{HcomDb, InstanceRow};
+use crate::hooks::common::PostCommit;
 use crate::identity;
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
@@ -539,7 +540,14 @@ fn start_rebind(
     // one was committed by a competing reclaim, so this rebind refuses with
     // nothing written — the caller keeps its row, cursor and bindings, and
     // no anchor pid or binding lands on a row this call did not create.
-    let committed = db.with_immediate_transaction(|_tx| {
+    // Pending post-commit fan-out for the events this transaction inserts:
+    // both life fan-outs run inline with TCP wakes collected into one
+    // PostCommit, and `fire` below runs only after the commit. The rows
+    // themselves are inserted here and stay visible to every read in the
+    // transaction. A rollback (or reclaim refusal) drops `post`, discarding
+    // wakes for events that never became durable.
+    let (committed, post) = db.with_immediate_transaction(|_tx| {
+        let mut post = PostCommit::default();
         // A process bound to a live seat other than the one this call renames
         // away belongs to that seat. Taking it here would move a running
         // identity's process binding onto the reclaimed name, so the whole
@@ -568,7 +576,7 @@ fn start_rebind(
             && let Some(occupant) = occupant
             && Some(occupant.created_at.to_bits()) != planned_target
         {
-            return Ok(None);
+            return Ok((None, post));
         }
         if !kept_remote_row {
             db.delete_instance(&target_name)?;
@@ -577,7 +585,9 @@ fn start_rebind(
         db.delete_session_bindings_for_instance(&target_name)?;
 
         // A rename is recorded as the old name's stop, so it never
-        // disappears without a life event.
+        // disappears without a life event. In-txn fan-out at the insertion
+        // point, BEFORE the row delete below (F2): the request-watch
+        // waterline read sees the live row. Only TCP connects defer to `post`.
         if current_row.is_some() {
             let snapshot = db.get_instance_snapshot(&current_name)?;
             let life = json!({
@@ -588,7 +598,7 @@ fn start_rebind(
                 "process_id": ctx.process_id,
                 "snapshot": snapshot,
             });
-            db.log_event("life", &current_name, &life)?;
+            db.log_event_collected("life", &current_name, &life, &mut post)?;
         }
         if !current_name.is_empty() && current_name != target_name {
             db.delete_instance(&current_name)?;
@@ -618,7 +628,7 @@ fn start_rebind(
         }
         let binding_sid = session_id.clone().unwrap_or_default();
 
-        if !instance_binding::initialize_instance_in_position_file(
+        if !instance_binding::initialize_instance_in_position_file_collected(
             db,
             &target_name,
             session_id.as_deref(),
@@ -633,6 +643,7 @@ fn start_rebind(
             None,  // subagent_timeout
             None,  // hints
             Some(&cwd_override),
+            &mut post,
         ) {
             bail!("could not create the instance row for '{target_name}'");
         }
@@ -680,8 +691,10 @@ fn start_rebind(
         } else {
             false
         };
-        Ok(Some((restored_pid, created_refused_binding)))
+        Ok((Some((restored_pid, created_refused_binding)), post))
     })?;
+    // The reclaim committed: fire the collected wakes now.
+    post.fire(db);
     let Some((restored_pid, created_refused_binding)) = committed else {
         eprintln!(
             "Error: '{target_name}' was reclaimed by another session while this one ran; \

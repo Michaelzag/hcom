@@ -458,6 +458,44 @@ impl HcomDb {
         Ok(())
     }
 
+    /// [`log_life_event`] with the fan-out's TCP wakes collected into `post`
+    /// instead of connected: the event row and every follow-up write run
+    /// inline (joining the caller's write txn when there is one), so call
+    /// this at the insertion point inside a write txn and run
+    /// [`PostCommit::fire`](crate::hooks::common::PostCommit::fire) only
+    /// after that txn commits.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn log_life_event_collected(
+        &self,
+        instance: &str,
+        action: &str,
+        by: &str,
+        reason: &str,
+        snapshot: Option<serde_json::Value>,
+        process_id: Option<&str>,
+        post: &mut crate::hooks::common::PostCommit,
+    ) -> Result<()> {
+        let data = match snapshot {
+            Some(s) => serde_json::json!({
+                "action": action,
+                "by": by,
+                "reason": reason,
+                "process_id": process_id,
+                "snapshot": s
+            }),
+            None => serde_json::json!({
+                "action": action,
+                "by": by,
+                "reason": reason,
+                "process_id": process_id
+            }),
+        };
+
+        self.log_event_collected("life", instance, &data, post)?;
+
+        Ok(())
+    }
+
     /// Insert event and return its ID. Calls subscription check inline.
     pub fn log_event(
         &self,
@@ -468,8 +506,10 @@ impl HcomDb {
         self.log_event_with_ts(event_type, instance, data, None)
     }
 
-    /// Insert event with optional timestamp. Returns event ID.
-    pub fn log_event_with_ts(
+    /// Insert an event row with an optional timestamp. Pure INSERT: no
+    /// subscription fan-out, so this is safe to call while the caller holds
+    /// a write transaction on the same connection. Returns the event ID.
+    pub fn insert_event_row(
         &self,
         event_type: &str,
         instance: &str,
@@ -486,11 +526,54 @@ impl HcomDb {
             "INSERT INTO events (timestamp, type, instance, data) VALUES (?, ?, ?, ?)",
             params![ts, event_type, instance, data_str],
         )?;
-        let event_id = self.conn.last_insert_rowid();
+        Ok(self.conn.last_insert_rowid())
+    }
 
-        // Check event subscriptions inline.
+    /// Insert event and return its ID, with the fan-out's TCP wakes collected
+    /// into `post` instead of connected: the event row and every follow-up
+    /// write run inline (joining the caller's write txn when there is one),
+    /// so call this at the insertion point inside a write txn and run
+    /// [`PostCommit::fire`](crate::hooks::common::PostCommit::fire) only
+    /// after that txn commits.
+    pub(crate) fn log_event_collected(
+        &self,
+        event_type: &str,
+        instance: &str,
+        data: &serde_json::Value,
+        post: &mut crate::hooks::common::PostCommit,
+    ) -> Result<i64> {
+        let event_id = self.insert_event_row(event_type, instance, data, None)?;
+        subscriptions::process_logged_event_collected(
+            self, event_id, event_type, instance, data, post,
+        );
+        Ok(event_id)
+    }
+
+    /// Subscription fan-out for an already-durable event row: TCP wakes,
+    /// follow-up messages, kv cursor writes. Best-effort external effects —
+    /// call only AFTER the write transaction commits, never under one. (The
+    /// in-txn counterpart is [`Self::log_event_collected`], which defers only
+    /// the TCP connects into a PostCommit.)
+    pub(crate) fn dispatch_logged_event(
+        &self,
+        event_id: i64,
+        event_type: &str,
+        instance: &str,
+        data: &serde_json::Value,
+    ) {
         subscriptions::process_logged_event(self, event_id, event_type, instance, data);
+    }
 
+    /// Insert event with optional timestamp. Returns event ID.
+    pub fn log_event_with_ts(
+        &self,
+        event_type: &str,
+        instance: &str,
+        data: &serde_json::Value,
+        timestamp: Option<&str>,
+    ) -> Result<i64> {
+        let event_id = self.insert_event_row(event_type, instance, data, timestamp)?;
+        self.dispatch_logged_event(event_id, event_type, instance, data);
         Ok(event_id)
     }
 

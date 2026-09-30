@@ -7,6 +7,7 @@
 use anyhow::Context;
 
 use crate::db::{HcomDb, InstanceRow};
+use crate::hooks::common::PostCommit;
 use crate::instance_names::{PLACEHOLDER_CONTEXT, PLACEHOLDER_STATUS};
 use crate::instances::update_instance_position;
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
@@ -514,11 +515,17 @@ fn notify_session_switch_stop(db: &HcomDb, name: &str, event: Option<(i64, serde
 }
 
 /// Recreate a missing instance row from an active placeholder (resume after stop/kill).
+///
+/// The `life.created` event's fan-out runs inline with its TCP wakes
+/// collected into `post`: callers inside a write txn pass the txn's
+/// PostCommit (fired after commit); callers with no open txn pass a local
+/// one and fire it at the call site.
 fn recreate_instance_from_placeholder(
     db: &HcomDb,
     target_name: &str,
     session_id: &str,
     ph: Option<&InstanceRow>,
+    post: &mut PostCommit,
 ) {
     if db.get_instance_full(target_name).ok().flatten().is_some() {
         return;
@@ -526,7 +533,7 @@ fn recreate_instance_from_placeholder(
     let Some(ph) = ph else {
         return;
     };
-    initialize_instance_in_position_file(
+    initialize_instance_in_position_file_collected(
         db,
         target_name,
         Some(session_id),
@@ -541,6 +548,7 @@ fn recreate_instance_from_placeholder(
         None,
         ph.hints.as_deref(),
         Some(ph.directory.as_str()),
+        post,
     );
 }
 
@@ -698,6 +706,7 @@ fn recreate_instance_from_stopped_snapshot(
     target_name: &str,
     session_id: &str,
     snapshot: &serde_json::Value,
+    post: &mut PostCommit,
 ) -> anyhow::Result<()> {
     use rusqlite::OptionalExtension;
 
@@ -717,7 +726,7 @@ fn recreate_instance_from_stopped_snapshot(
             .map(|()| parent),
         None => None,
     };
-    if !initialize_instance_in_position_file(
+    if !initialize_instance_in_position_file_collected(
         db,
         target_name,
         Some(session_id),
@@ -734,6 +743,7 @@ fn recreate_instance_from_stopped_snapshot(
         identity.subagent_timeout,
         identity.hints.as_deref(),
         Some(identity.directory.as_str()).filter(|dir| !dir.is_empty()),
+        post,
     ) {
         anyhow::bail!("restore_stopped: could not recreate the instance row for '{target_name}'");
     }
@@ -915,12 +925,16 @@ fn bind_session_to_process_body(
             ),
         );
 
+        // No open txn here: fan-out runs inline, wakes fire at once.
+        let mut post = PostCommit::default();
         recreate_instance_from_placeholder(
             db,
             canonical_name,
             session_id,
             placeholder_data.as_ref(),
+            &mut post,
         );
+        post.fire(db);
 
         // Reset last_stop on resume
         let now = now_epoch_i64();
@@ -969,6 +983,7 @@ fn bind_session_to_process_body(
         update_instance_position(db, canonical_name, &resume_updates);
 
         if let Some(pid) = process_id {
+            let mut post = PostCommit::default();
             let released = db.with_immediate_transaction(|tx| {
                 db.set_process_binding(pid, session_id, canonical_name)
                     .with_context(|| {
@@ -978,6 +993,11 @@ fn bind_session_to_process_body(
                     && displaced != canonical_name
                     && !is_true_launch_placeholder(placeholder_data.as_ref())
                 {
+                    // The move below relocates the displaced row's endpoints
+                    // onto the new name in-txn: snapshot its DELIVERY_LOOPS
+                    // ports first so the post-commit fire still reaches the
+                    // moved listener (S1).
+                    post.collect_wake(db, displaced, crate::notify::WakeKind::DELIVERY_LOOPS);
                     return move_process_off_displaced_row(
                         db,
                         tx,
@@ -989,6 +1009,7 @@ fn bind_session_to_process_body(
                 }
                 Ok(None)
             })?;
+            post.fire(db);
             if let Some(displaced) = &placeholder_name {
                 notify_session_switch_stop(db, displaced, released);
             }
@@ -1012,13 +1033,19 @@ fn bind_session_to_process_body(
         // endpoints that follow the process, the displaced row's release and
         // the launch placeholder's retirement. Any failure rolls all of it
         // back, leaving the DB exactly as it was before this hook.
-        let released = db.with_immediate_transaction(|tx| {
+        let (released, post) = db.with_immediate_transaction(|tx| {
+            // The whole switch shares one PostCommit: the `life.created`
+            // fan-out runs inline with wakes collected, and `fire` below runs
+            // only after commit. A rollback drops `post`, discarding wakes
+            // for events that never became durable.
+            let mut post = PostCommit::default();
             if is_true_launch_placeholder(placeholder_data.as_ref()) {
                 recreate_instance_from_placeholder(
                     db,
                     &stopped_name,
                     session_id,
                     placeholder_data.as_ref(),
+                    &mut post,
                 );
             } else {
                 // A real old session is not the restored identity: take the
@@ -1029,6 +1056,7 @@ fn bind_session_to_process_body(
                     &stopped_name,
                     session_id,
                     &snapshot,
+                    &mut post,
                 )?;
             }
 
@@ -1050,6 +1078,11 @@ fn bind_session_to_process_body(
                     && displaced != &stopped_name
                     && !is_true_launch_placeholder(placeholder_data.as_ref())
                 {
+                    // The move below relocates the displaced row's endpoints
+                    // onto the new name in-txn: snapshot its DELIVERY_LOOPS
+                    // ports first so the post-commit fire still reaches the
+                    // moved listener (S1).
+                    post.collect_wake(db, displaced, crate::notify::WakeKind::DELIVERY_LOOPS);
                     released = move_process_off_displaced_row(
                         db,
                         tx,
@@ -1072,8 +1105,11 @@ fn bind_session_to_process_body(
             if let Some(hook) = RESTORE_STOPPED_COMMIT_GAP_HOOK.with(std::cell::Cell::take) {
                 hook(db, &stopped_name);
             }
-            Ok(released)
+            Ok((released, post))
         })?;
+        // Committed: fire the collected wakes. A rolled-back transaction never
+        // reaches here, and its event rows are gone with the rollback.
+        post.fire(db);
         if let Some(displaced) = &placeholder_name {
             notify_session_switch_stop(db, displaced, released);
         }
@@ -1172,6 +1208,9 @@ pub fn recover_process_binding_for_instance(
 /// Initialize the DB row and default bindings for an instance identity.
 ///
 /// This is the shared setup path used by launch, resume, and orphan recovery.
+///
+/// Plain entry point: the row write, the `life.created` event, and the whole
+/// fan-out run inline, and the collected TCP wakes fire before returning.
 #[allow(clippy::too_many_arguments)]
 pub fn initialize_instance_in_position_file(
     db: &HcomDb,
@@ -1188,6 +1227,51 @@ pub fn initialize_instance_in_position_file(
     subagent_timeout: Option<i64>,
     hints: Option<&str>,
     cwd_override: Option<&str>,
+) -> bool {
+    let mut post = PostCommit::default();
+    let ok = initialize_instance_in_position_file_collected(
+        db,
+        instance_name,
+        session_id,
+        parent_session_id,
+        parent_name,
+        agent_id,
+        transcript_path,
+        tool,
+        background,
+        tag,
+        wait_timeout,
+        subagent_timeout,
+        hints,
+        cwd_override,
+        &mut post,
+    );
+    post.fire(db);
+    ok
+}
+
+/// [`initialize_instance_in_position_file`] with the `life.created` fan-out's
+/// TCP wakes collected into `post` instead of connected: the row write, the
+/// event row, and every follow-up write run inline (joining the caller's
+/// write txn when there is one), so call this inside a write txn and run
+/// [`PostCommit::fire`] only after that txn commits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn initialize_instance_in_position_file_collected(
+    db: &HcomDb,
+    instance_name: &str,
+    session_id: Option<&str>,
+    parent_session_id: Option<&str>,
+    parent_name: Option<&str>,
+    agent_id: Option<&str>,
+    transcript_path: Option<&str>,
+    tool: Option<&str>,
+    background: bool,
+    tag: Option<&str>,
+    wait_timeout: Option<i64>,
+    subagent_timeout: Option<i64>,
+    hints: Option<&str>,
+    cwd_override: Option<&str>,
+    post: &mut PostCommit,
 ) -> bool {
     let cwd = cwd_override.map(|s| s.to_string()).unwrap_or_else(|| {
         std::env::current_dir()
@@ -1340,6 +1424,7 @@ pub fn initialize_instance_in_position_file(
                         parent_session_id,
                         parent_name,
                         tool.unwrap_or(""),
+                        post,
                     );
                     true
                 }
@@ -1351,6 +1436,10 @@ pub fn initialize_instance_in_position_file(
     }
 }
 
+/// Log the `life.created` event with its subscription fan-out inline, and
+/// auto-subscribe the new row. The fan-out's TCP wakes are collected into
+/// `post` (fired by the caller after commit); every DB write runs here, so a
+/// caller inside a write txn stays atomic and ordered exactly as before.
 fn log_created_and_auto_subscribe(
     db: &HcomDb,
     instance_name: &str,
@@ -1358,6 +1447,7 @@ fn log_created_and_auto_subscribe(
     parent_session_id: Option<&str>,
     parent_name: Option<&str>,
     tool: &str,
+    post: &mut PostCommit,
 ) {
     let launcher = std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
     let event_data = serde_json::json!({
@@ -1367,7 +1457,7 @@ fn log_created_and_auto_subscribe(
         "is_subagent": parent_session_id.is_some(),
         "parent_name": parent_name.unwrap_or(""),
     });
-    let _ = db.log_event("life", instance_name, &event_data);
+    let _ = db.log_event_collected("life", instance_name, &event_data, post);
     auto_subscribe_defaults(db, instance_name, tool);
 }
 

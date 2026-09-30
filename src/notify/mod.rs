@@ -14,7 +14,9 @@ pub mod server;
 pub mod wake;
 
 pub use server::NotifyServer;
-pub use wake::{WAKE_TARGETED_MS, snapshot_wake_ports, wake, wake_all, wake_ports};
+pub use wake::{
+    WAKE_TARGETED_MS, snapshot_wake_ports, snapshot_wake_ports_for, wake, wake_all, wake_ports,
+};
 
 /// Kinds of wake endpoint stored in the `notify_endpoints` table.
 ///

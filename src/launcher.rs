@@ -15,6 +15,7 @@ use serde_json::json;
 
 use crate::config::{self, HcomConfig};
 use crate::db::HcomDb;
+use crate::hooks::common::PostCommit;
 use crate::instance_binding;
 use crate::instance_names;
 use crate::instances;
@@ -1715,11 +1716,15 @@ pub(crate) fn register_launch_instance(
     tag: Option<&str>,
     working_dir: &str,
 ) -> Result<()> {
-    db.with_immediate_transaction(|_tx| {
+    // One PostCommit for the registration: the `life.created` fan-out runs
+    // inline with wakes collected, and `fire` runs only after commit. A
+    // rollback drops `post`, discarding wakes for the unwritten row.
+    let post = db.with_immediate_transaction(|_tx| {
+        let mut post = PostCommit::default();
         if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
             refuse_held_session(db, instance_name, sid)?;
         }
-        if !instance_binding::initialize_instance_in_position_file(
+        if !instance_binding::initialize_instance_in_position_file_collected(
             db,
             instance_name,
             session_id,
@@ -1734,12 +1739,16 @@ pub(crate) fn register_launch_instance(
             None,              // subagent_timeout
             None,              // hints
             Some(working_dir), // cwd_override: use launch params cwd, not current_dir()
+            &mut post,
         ) {
             bail!("Failed to register instance '{instance_name}'");
         }
         db.set_process_binding(process_id, "", instance_name)?;
-        Ok(())
-    })
+        Ok(post)
+    })?;
+    // The registration committed: fire the collected wakes now.
+    post.fire(db);
+    Ok(())
 }
 
 /// Err naming the holder when anything but `name`'s own unclaimed row holds

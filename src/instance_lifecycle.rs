@@ -524,6 +524,11 @@ pub fn get_status_description(status: &str, context: &str) -> String {
 }
 
 /// Set instance status with timestamp and log the status-change event.
+///
+/// Plain entry point: the row write, the status event, and the whole
+/// subscription fan-out run inline, and the collected TCP wakes fire before
+/// returning. Externally identical to before — only the wake connects move
+/// to the end of the call.
 #[track_caller]
 pub fn set_status(
     db: &HcomDb,
@@ -532,13 +537,67 @@ pub fn set_status(
     context: &str,
     upd: StatusUpdate<'_>,
 ) {
+    let mut post = crate::hooks::common::PostCommit::default();
+    set_status_inner(
+        db,
+        instance_name,
+        status,
+        context,
+        upd,
+        std::panic::Location::caller(),
+        &mut post,
+    );
+    post.fire(db);
+}
+
+/// [`set_status`] with the listener wake and the status event's fan-out wakes
+/// collected into `post` instead of connected: the row write, the event row,
+/// and every follow-up write run inline (joining the caller's write txn when
+/// there is one), so call this inside a write txn and run [`PostCommit::fire`]
+/// only after that txn commits. The event still records this call site's
+/// `file:line` as `writer`, so this stays `#[track_caller]` like `set_status`.
+///
+/// [`PostCommit::fire`]: crate::hooks::common::PostCommit::fire
+#[track_caller]
+pub(crate) fn set_status_collected(
+    db: &HcomDb,
+    instance_name: &str,
+    status: &str,
+    context: &str,
+    upd: StatusUpdate<'_>,
+    post: &mut crate::hooks::common::PostCommit,
+) {
+    set_status_inner(
+        db,
+        instance_name,
+        status,
+        context,
+        upd,
+        std::panic::Location::caller(),
+        post,
+    );
+}
+
+/// Fused status write shared by [`set_status`] and [`set_status_collected`]:
+/// the row write, the conditional DELIVERY_LOOPS wake (collected), and the
+/// status event log with its inline fan-out. `writer` is the
+/// `#[track_caller]` site both wrappers forward, so the event's `writer`
+/// field keeps naming the true caller.
+fn set_status_inner(
+    db: &HcomDb,
+    instance_name: &str,
+    status: &str,
+    context: &str,
+    upd: StatusUpdate<'_>,
+    writer: &'static std::panic::Location<'static>,
+    post: &mut crate::hooks::common::PostCommit,
+) {
     let StatusUpdate {
         detail,
         msg_ts,
         tool_name,
         tool_use_id,
     } = upd;
-    let writer = std::panic::Location::caller();
 
     let current_data = match db.get_instance_full(instance_name) {
         Ok(data) => data,
@@ -567,7 +626,7 @@ pub fn set_status(
     crate::instances::update_instance_position(db, instance_name, &updates);
 
     if status_changed {
-        crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+        post.collect_wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
 
     // The pi-family plugins (pi, and its fork omp) structurally double-write tool
@@ -617,7 +676,7 @@ pub fn set_status(
     if !tool_use_id.is_empty() {
         data["tool_use_id"] = serde_json::json!(tool_use_id);
     }
-    let _ = db.log_event("status", instance_name, &data);
+    let _ = db.log_event_collected("status", instance_name, &data, post);
 }
 
 // Test seam: runs between the cleanup's snapshot read and the stop it
