@@ -993,9 +993,10 @@ fn bind_session_to_process_body(
                     && displaced != canonical_name
                     && !is_true_launch_placeholder(placeholder_data.as_ref())
                 {
-                    // The release below deletes the displaced row's endpoints
-                    // in-txn: snapshot its DELIVERY_LOOPS ports first so the
-                    // post-commit fire still reaches the moved listener (S1).
+                    // The move below relocates the displaced row's endpoints
+                    // onto the new name in-txn: snapshot its DELIVERY_LOOPS
+                    // ports first so the post-commit fire still reaches the
+                    // moved listener (S1).
                     post.collect_wake(db, displaced, crate::notify::WakeKind::DELIVERY_LOOPS);
                     return move_process_off_displaced_row(
                         db,
@@ -1077,9 +1078,10 @@ fn bind_session_to_process_body(
                     && displaced != &stopped_name
                     && !is_true_launch_placeholder(placeholder_data.as_ref())
                 {
-                    // The release below deletes the displaced row's endpoints
-                    // in-txn: snapshot its DELIVERY_LOOPS ports first so the
-                    // post-commit fire still reaches the moved listener (S1).
+                    // The move below relocates the displaced row's endpoints
+                    // onto the new name in-txn: snapshot its DELIVERY_LOOPS
+                    // ports first so the post-commit fire still reaches the
+                    // moved listener (S1).
                     post.collect_wake(db, displaced, crate::notify::WakeKind::DELIVERY_LOOPS);
                     released = move_process_off_displaced_row(
                         db,

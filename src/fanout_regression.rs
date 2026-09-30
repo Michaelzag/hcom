@@ -116,9 +116,10 @@ fn blackhole_listener() -> (TcpListener, Vec<TcpStream>) {
     (listener, held)
 }
 
-fn data_version(db: &HcomDb) -> i64 {
-    db.conn()
-        .query_row("PRAGMA data_version", [], |row| row.get(0))
+/// `data_version` is per-connection: only a connection that reads its own
+/// baseline before the commit observes the change.
+fn data_version(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row("PRAGMA data_version", [], |row| row.get(0))
         .unwrap()
 }
 
@@ -363,18 +364,17 @@ fn fanout_f5_status_durable_under_post_commit_lock() {
         blackholes.push((listener, held));
     }
 
-    let v0 = data_version(&db);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let (grabbed_tx, grabbed_rx) = std::sync::mpsc::channel::<bool>();
     let spinner = std::thread::spawn({
         let path = db_path.clone();
         move || {
             let conn = rusqlite::Connection::open(&path).unwrap();
+            let v0 = data_version(&conn);
+            ready_tx.send(()).ok();
             let start = Instant::now();
             loop {
-                let v: i64 = conn
-                    .query_row("PRAGMA data_version", [], |row| row.get(0))
-                    .unwrap_or(v0);
-                if v != v0 {
+                if data_version(&conn) != v0 {
                     break;
                 }
                 if start.elapsed() > Duration::from_secs(15) {
@@ -385,13 +385,29 @@ fn fanout_f5_status_durable_under_post_commit_lock() {
             }
             // Hold the write lock past the 5s SQLite busy_timeout: any
             // post-commit write racing the commit fails instead of waiting.
-            conn.execute_batch("PRAGMA busy_timeout=0; BEGIN IMMEDIATE;")
-                .unwrap();
+            // data_version flips at the commit, but another writer can hold
+            // the write lock again the instant it is released, so poll for
+            // the grab rather than losing that race once: losing the grab is
+            // a harness flake, not the property under test.
+            let grab_deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match conn.execute_batch("PRAGMA busy_timeout=0; BEGIN IMMEDIATE;") {
+                    Ok(()) => break,
+                    Err(_) if Instant::now() < grab_deadline => std::thread::yield_now(),
+                    Err(e) => panic!("spinner never grabbed the write lock: {e}"),
+                }
+            }
             grabbed_tx.send(true).ok();
             std::thread::sleep(Duration::from_millis(5500));
             conn.execute_batch("COMMIT;").unwrap();
         }
     });
+
+    // The spinner's baseline is only meaningful if it is read before the
+    // commit below; wait for it to be armed.
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("spinner armed");
 
     soft_finalize_session(&db, "luna", "f5", None, false);
 

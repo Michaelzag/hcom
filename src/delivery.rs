@@ -2740,9 +2740,11 @@ pub(crate) fn cleanup_deleted_instance(
                 &format!("Failed to set inactive status: {}", e),
             );
         }
-        // Snapshot the DELIVERY_LOOPS ports BEFORE the delete below removes
-        // them, so the post-commit fire still reaches the (now removed)
-        // listener (S1/F4). Status wakes are DELIVERY_LOOPS-only.
+        // Snapshot the exiting instance's DELIVERY_LOOPS ports BEFORE the
+        // delete below removes them, so the post-commit fire still reaches
+        // the (now removed) listener (S1/F4). This is the PTY-exit path:
+        // unlike db.set_status, it wakes the exiting instance's own delivery
+        // loops.
         post.collect_wake(db, current_name, crate::notify::WakeKind::DELIVERY_LOOPS);
         if let Err(e) = db.delete_notify_endpoints(current_name) {
             log_warn(
