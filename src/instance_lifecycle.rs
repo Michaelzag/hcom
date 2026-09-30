@@ -639,11 +639,7 @@ pub(crate) fn stage_set_status(
 
 /// In-txn half of a staged status change: the row write only. Joins the
 /// caller's write transaction on the same connection; no wakes, no events.
-pub(crate) fn apply_staged_status(
-    db: &HcomDb,
-    instance_name: &str,
-    staged: &StagedStatus,
-) {
+pub(crate) fn apply_staged_status(db: &HcomDb, instance_name: &str, staged: &StagedStatus) {
     crate::instances::update_instance_position(db, instance_name, &staged.updates);
 }
 

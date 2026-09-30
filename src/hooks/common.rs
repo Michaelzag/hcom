@@ -2599,8 +2599,7 @@ pub fn soft_finalize_session(
         &format!("exit:{}", reason),
         Default::default(),
     );
-    let written: Result<(bool, Option<(i64, Value)>)> =
-        db.with_immediate_transaction(|tx| {
+    let written: Result<(bool, Option<(i64, Value)>)> = db.with_immediate_transaction(|tx| {
         use rusqlite::OptionalExtension;
         let present = tx
             .query_row(

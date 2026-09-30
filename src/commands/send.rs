@@ -1783,8 +1783,8 @@ mod tests {
             instance_data: None,
             session_id: None,
         };
-        let err = send_message(&db, &sender, "hello", None, Some(&["nova".to_string()]))
-            .unwrap_err();
+        let err =
+            send_message(&db, &sender, "hello", None, Some(&["nova".to_string()])).unwrap_err();
         assert!(
             err.contains("Failed to write message to database"),
             "err={err}"

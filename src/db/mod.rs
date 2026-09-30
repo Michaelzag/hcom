@@ -779,8 +779,7 @@ impl HcomDb {
             .conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
             .and_then(|mut s| {
-                Ok(s
-                    .query_map([], |row| row.get::<_, String>(0))?
+                Ok(s.query_map([], |row| row.get::<_, String>(0))?
                     .filter_map(|r| r.ok())
                     .any(|t| {
                         matches!(

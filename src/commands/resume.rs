@@ -1184,15 +1184,14 @@ fn append_restored_snapshot(
         // listeners and writes more rows, so it fires after the commit below,
         // never while the write lock is held. The row itself is still
         // visible to every read in this transaction.
-        let life_event =
-            db.log_life_event_insert(
-                name,
-                "stopped",
-                RESTORE_EARLIER_BY,
-                RESTORE_EARLIER_REASON,
-                Some(snapshot),
-                None,
-            )?;
+        let life_event = db.log_life_event_insert(
+            name,
+            "stopped",
+            RESTORE_EARLIER_BY,
+            RESTORE_EARLIER_REASON,
+            Some(snapshot),
+            None,
+        )?;
         let mut row = serde_json::Map::new();
         row.insert("session_id".into(), json!(session_id));
         row.insert("tool".into(), json!(plan.output.tool));
