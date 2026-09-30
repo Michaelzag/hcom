@@ -464,6 +464,7 @@ impl HcomDb {
     /// this at the insertion point inside a write txn and run
     /// [`PostCommit::fire`](crate::hooks::common::PostCommit::fire) only
     /// after that txn commits.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn log_life_event_collected(
         &self,
         instance: &str,
