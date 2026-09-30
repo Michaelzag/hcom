@@ -7151,31 +7151,48 @@ mod tests {
         );
     }
 
-    /// The interpreter-override launch shape: hcom execs `node <tool path>`
-    /// (the Termux rewrite, its Windows twin, or a plain npm install), so
-    /// argv[0] is the runtime and the TOOL's name is the basename of argv[1].
-    /// A live one is a live launch; a different script under the same
-    /// interpreter is not, and neither is the interpreter alone.
+    /// The interpreter-override launch shape: hcom execs `<runtime> <tool
+    /// path>` (the Termux rewrite, its Windows twin, or a plain npm install),
+    /// so argv[0] is the runtime and the TOOL's name is the basename of
+    /// argv[1]. A live one is a live launch; a different script under the
+    /// same interpreter is not, and neither is the interpreter alone.
+    ///
+    /// The "runtime" is a symlink named exactly `node` to `/bin/sh`, and the
+    /// tool fixture is an sh script named exactly the tool's name. The
+    /// fixture builds both itself and needs nothing installed, so this test
+    /// proves the rule on a host with no Node at all.
     #[test]
     #[cfg(all(target_os = "linux", not(target_os = "android")))]
     fn a_node_launched_tool_is_alive_even_though_node_owns_the_process_image() {
-        let node = crate::terminal::which_bin("node").expect("node on PATH for this test");
         let dir = tempfile::tempdir().unwrap();
-        // The wrapper runs `node <script>` the way the Termux launcher
-        // rewrite does, and the script keeps the interpreter alive the way a
-        // real node tool's own event loop does. The script's basename IS the
-        // launched tool's name, exactly as a `node .../claude` rewrite of a
-        // shebang tool carries the tool's name in argv[1].
-        let script = dir.path().join("hcom-fake-node-tool");
-        std::fs::write(&script, "setInterval(() => {}, 60000);\n").unwrap();
-        let (wrapper, tool, keep) = wrapper_tree(&format!("{} {}", node, script.display()));
+        let node = dir.path().join("node");
+        std::os::unix::fs::symlink("/bin/sh", &node).expect("link the fake runtime");
+        // Named exactly the tool, because the rule matches argv[1]'s BASENAME
+        // against the tool name — as a `node .../claude` rewrite does.
+        let script = fake_tool(dir.path(), "hcom-fake-node-tool");
+        let (wrapper, tool, keep) = wrapper_tree(&format!("{} {}", node.display(), script));
         let _tree = FixtureTree(keep);
 
-        // The wrapper shells out to `node <script>`, so the tool's argv is
-        // exactly the interpreter-override shape under test: argv[0] is the
-        // runtime, argv[1] the script. (comm can be anything — this node
-        // build sets its own title — which is precisely why the matcher
-        // must read argv and not trust comm alone.)
+        // The premise, read from the process itself: argv[0]'s basename is
+        // `node` and argv[1] is the tool. The matcher can only be right about
+        // this shape if the fixture really produced it.
+        let cmdline = std::fs::read(format!("/proc/{tool}/cmdline")).expect("tool cmdline");
+        let argv: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        assert_eq!(
+            argv.first()
+                .map(|arg| arg.rsplit('/').next().unwrap_or(arg)),
+            Some("node"),
+            "the fixture must present argv[0] as the runtime: {argv:?}"
+        );
+        assert_eq!(
+            argv.get(1).map(|arg| arg.rsplit('/').next().unwrap_or(arg)),
+            Some("hcom-fake-node-tool"),
+            "the tool's name must be argv[1]'s basename: {argv:?}"
+        );
+
         assert!(
             process_is_tool(tool, &["hcom-fake-node-tool"]),
             "a live `node <tool>` process is the live launched tool"
