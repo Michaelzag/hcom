@@ -1355,13 +1355,27 @@ pub(crate) const fn tool_names_are_provable() -> bool {
     cfg!(any(target_os = "linux", target_os = "android"))
 }
 
+/// Interpreters hcom itself launches a tool through, so a process whose
+/// argv[0] is one of these carries the TOOL's path in argv[1] instead.
+///
+/// The Termux launcher rewrite (terminal::resolve_termux_tool_launcher) and
+/// its Windows twin replace a node-shebang script with `node <script>`, and
+/// a plain `node script.js` install has the same shape. The list is exactly
+/// the runtimes those paths can exec, deliberately not "any argv position":
+/// a free-for-all match would read a tool's ARGUMENTS as its identity.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TOOL_INTERPRETERS: &[&str] = &["node", "bun", "deno", "python", "python3"];
+
 /// Whether `pid` is running the launched TOOL, by the name the launcher
 /// started: `/proc/<pid>/comm` exactly, or the basename of argv[0].
 ///
 /// Both are read because a node/npm-installed tool is a script: its `comm` is
 /// the truncated interpreter name while argv[0] carries the script path the
-/// launcher exec'd, and either one can be the only name available. A zombie
-/// counts as not running it — a dead tool is a dead launch.
+/// launcher exec'd, and either one can be the only name available. When
+/// argv[0] is one of [`TOOL_INTERPRETERS`] the tool path sits in argv[1]
+/// instead — the interpreter-override launch shape — so that basename is
+/// matched too. A zombie counts as not running it — a dead tool is a dead
+/// launch.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn process_is_tool(pid: u32, tool_names: &[&str]) -> bool {
     if tool_names.is_empty() || process_gone(pid) {
@@ -1371,9 +1385,22 @@ pub(crate) fn process_is_tool(pid: u32, tool_names: &[&str]) -> bool {
         .is_ok_and(|comm| tool_names.contains(&comm.trim_end_matches('\n')));
     comm_matches
         || std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
-            let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
+            let mut argv = cmdline.split(|b| *b == 0);
+            let argv0 = argv.next().unwrap_or_default();
             let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or_default();
-            tool_names.iter().any(|name| name.as_bytes() == base)
+            if tool_names.iter().any(|name| name.as_bytes() == base) {
+                return true;
+            }
+            // The interpreter-override shape: argv[0] names the runtime
+            // hcom exec'd through, argv[1] the tool. Anything else must not
+            // match — argv[1] of a plain invocation is a tool ARGUMENT.
+            TOOL_INTERPRETERS
+                .iter()
+                .any(|interp| interp.as_bytes() == base)
+                && argv.next().is_some_and(|argv1| {
+                    let arg_base = argv1.rsplit(|b| *b == b'/').next().unwrap_or_default();
+                    tool_names.iter().any(|name| name.as_bytes() == arg_base)
+                })
         })
 }
 
@@ -7121,6 +7148,76 @@ mod tests {
         assert!(
             live_tool_processes(wrapper, &["hcom-fake-brief"]).is_empty(),
             "a tool that exited is not a live tool, wrapper or not"
+        );
+    }
+
+    /// The interpreter-override launch shape: hcom execs `node <tool path>`
+    /// (the Termux rewrite, its Windows twin, or a plain npm install), so
+    /// argv[0] is the runtime and the TOOL's name is the basename of argv[1].
+    /// A live one is a live launch; a different script under the same
+    /// interpreter is not, and neither is the interpreter alone.
+    #[test]
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    fn a_node_launched_tool_is_alive_even_though_node_owns_the_process_image() {
+        let node = crate::terminal::which_bin("node").expect("node on PATH for this test");
+        let dir = tempfile::tempdir().unwrap();
+        // The wrapper runs `node <script>` the way the Termux launcher
+        // rewrite does, and the script keeps the interpreter alive the way a
+        // real node tool's own event loop does. The script's basename IS the
+        // launched tool's name, exactly as a `node .../claude` rewrite of a
+        // shebang tool carries the tool's name in argv[1].
+        let script = dir.path().join("hcom-fake-node-tool");
+        std::fs::write(&script, "setInterval(() => {}, 60000);\n").unwrap();
+        let (wrapper, tool, keep) = wrapper_tree(&format!("{} {}", node, script.display()));
+        let _tree = FixtureTree(keep);
+
+        // The wrapper shells out to `node <script>`, so the tool's argv is
+        // exactly the interpreter-override shape under test: argv[0] is the
+        // runtime, argv[1] the script. (comm can be anything — this node
+        // build sets its own title — which is precisely why the matcher
+        // must read argv and not trust comm alone.)
+        assert!(
+            process_is_tool(tool, &["hcom-fake-node-tool"]),
+            "a live `node <tool>` process is the live launched tool"
+        );
+        assert_eq!(
+            live_tool_processes(wrapper, &["hcom-fake-node-tool"]),
+            vec![tool],
+            "the interpreter-wrapped tool is found under the wrapper"
+        );
+        assert!(
+            live_tool_processes(wrapper, &["hcom-fake-other"]).is_empty(),
+            "a different script under the same interpreter is not the tool"
+        );
+    }
+
+    /// The negative half of the interpreter rule: argv[1] is only the tool
+    /// when argv[0] is one of the runtimes hcom actually launches through.
+    /// A bash wrapper carrying the tool's name as its first argument is a
+    /// plain invocation — argv[1] is an argument, not an identity.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_interpreter_presentation_alone_does_not_make_a_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        // A shell whose first argument is the tool's name: exactly the
+        // argv[1] position the rule reads, held by a process that is NOT
+        // the tool and must not be counted as one.
+        let sh = dir.path().join("hcom-fake-arg-carrier.sh");
+        std::fs::write(&sh, "#!/bin/bash\nwhile true; do sleep 1; done\n").unwrap();
+        crate::sys::fs::set_executable(&sh).unwrap();
+        let (wrapper, tool, keep) = wrapper_tree(&format!("{} hcom-fake-tool", sh.display()));
+        let _tree = FixtureTree(keep);
+
+        // `comm` is kernel-truncated to 15 chars, which is also why the
+        // argv path (not comm) is what carries the tool's name here.
+        assert_eq!(orphan_fixtures::comm_of(tool), "hcom-fake-arg-c");
+        assert!(
+            !process_is_tool(tool, &["hcom-fake-tool"]),
+            "a non-interpreter argv[0] must not read argv[1] as the tool name"
+        );
+        assert!(
+            live_tool_processes(wrapper, &["hcom-fake-tool"]).is_empty(),
+            "no process in the tree is the launched tool"
         );
     }
 }
