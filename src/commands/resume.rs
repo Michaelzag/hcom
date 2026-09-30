@@ -14,6 +14,7 @@ use crate::commands::launch::{
 use crate::commands::transcript::detect_agent_type;
 use crate::db::HcomDb;
 use crate::hooks::codex::derive_codex_transcript_path;
+use crate::hooks::common::PostCommit;
 use crate::hooks::gemini::derive_gemini_transcript_path;
 use crate::hooks::kimi::derive_kimi_transcript_path;
 use crate::launcher::{self, LaunchParams, LaunchResult};
@@ -1144,7 +1145,11 @@ fn append_restored_snapshot(
         return Ok(None);
     };
     let session_id = &plan.session_id;
-    let life_event = db.with_immediate_transaction(|tx| {
+    // One PostCommit for the restore: the `stopped` fan-out runs inline with
+    // wakes collected, and `fire` runs only after commit. A bail drops `post`,
+    // discarding wakes for the unwritten event.
+    let post = db.with_immediate_transaction(|tx| {
+        let mut post = PostCommit::default();
         if newest_stopped_event_id(tx, name)? != restored.planned_newest_id {
             bail!(
                 "{RESTORE_EARLIER_FLAG}: the newest session of '{name}' changed since \
@@ -1180,17 +1185,17 @@ fn append_restored_snapshot(
         if let Some(fields) = snapshot.as_object_mut() {
             fields.insert("last_event_id".to_string(), json!(cursor));
         }
-        // Insert-only: the subscription fan-out for this event wakes TCP
-        // listeners and writes more rows, so it fires after the commit below,
-        // never while the write lock is held. The row itself is still
-        // visible to every read in this transaction.
-        let life_event = db.log_life_event_insert(
+        // In-txn fan-out at the insertion point: the row itself is inserted
+        // below into the same txn, and only the TCP connects are deferred
+        // into `post`.
+        db.log_life_event_collected(
             name,
             "stopped",
             RESTORE_EARLIER_BY,
             RESTORE_EARLIER_REASON,
             Some(snapshot),
             None,
+            &mut post,
         )?;
         let mut row = serde_json::Map::new();
         row.insert("session_id".into(), json!(session_id));
@@ -1207,10 +1212,9 @@ fn append_restored_snapshot(
             json!(crate::shared::time::now_epoch_f64()),
         );
         db.save_instance_named(name, &row)?;
-        Ok(life_event)
+        Ok(post)
     })?;
-    let (event_id, event_data) = life_event;
-    db.dispatch_logged_event(event_id, "life", name, &event_data);
+    post.fire(db);
     Ok(Some(format!(
         "restored earlier session {session_id} of '{name}' (from event #{})",
         restored.source_event_id

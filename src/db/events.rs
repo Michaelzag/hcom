@@ -422,11 +422,13 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Build a life event payload and insert it, WITHOUT subscription
-    /// fan-out. Returns `(event_id, data)` so the caller can dispatch after
-    /// its write transaction commits (fan-out wakes TCP listeners and
-    /// writes more rows — it must never run while a write txn is open).
-    pub(crate) fn log_life_event_insert(
+    /// Log a life event (started/stopped) to the events table.
+    ///
+    /// `process_id` keys the event to one process incarnation of the
+    /// instance: a `stopped` only releases the row when it equals the row's
+    /// current binding (see `finalize_instance_stop`). `None` records null
+    /// (writer outside any harness, e.g. legacy paths).
+    pub fn log_life_event(
         &self,
         instance: &str,
         action: &str,
@@ -434,7 +436,7 @@ impl HcomDb {
         reason: &str,
         snapshot: Option<serde_json::Value>,
         process_id: Option<&str>,
-    ) -> Result<(i64, serde_json::Value)> {
+    ) -> Result<()> {
         let data = match snapshot {
             Some(s) => serde_json::json!({
                 "action": action,
@@ -451,17 +453,18 @@ impl HcomDb {
             }),
         };
 
-        let event_id = self.insert_event_row("life", instance, &data, None)?;
-        Ok((event_id, data))
+        self.log_event_with_ts("life", instance, &data, None)?;
+
+        Ok(())
     }
 
-    /// Log a life event (started/stopped) to the events table.
-    ///
-    /// `process_id` keys the event to one process incarnation of the
-    /// instance: a `stopped` only releases the row when it equals the row's
-    /// current binding (see `finalize_instance_stop`). `None` records null
-    /// (writer outside any harness, e.g. legacy paths).
-    pub fn log_life_event(
+    /// [`log_life_event`] with the fan-out's TCP wakes collected into `post`
+    /// instead of connected: the event row and every follow-up write run
+    /// inline (joining the caller's write txn when there is one), so call
+    /// this at the insertion point inside a write txn and run
+    /// [`PostCommit::fire`](crate::hooks::common::PostCommit::fire) only
+    /// after that txn commits.
+    pub(crate) fn log_life_event_collected(
         &self,
         instance: &str,
         action: &str,
@@ -469,10 +472,26 @@ impl HcomDb {
         reason: &str,
         snapshot: Option<serde_json::Value>,
         process_id: Option<&str>,
+        post: &mut crate::hooks::common::PostCommit,
     ) -> Result<()> {
-        let (event_id, data) =
-            self.log_life_event_insert(instance, action, by, reason, snapshot, process_id)?;
-        self.dispatch_logged_event(event_id, "life", instance, &data);
+        let data = match snapshot {
+            Some(s) => serde_json::json!({
+                "action": action,
+                "by": by,
+                "reason": reason,
+                "process_id": process_id,
+                "snapshot": s
+            }),
+            None => serde_json::json!({
+                "action": action,
+                "by": by,
+                "reason": reason,
+                "process_id": process_id
+            }),
+        };
+
+        self.log_event_collected("life", instance, &data, post)?;
+
         Ok(())
     }
 
@@ -509,9 +528,31 @@ impl HcomDb {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Insert event and return its ID, with the fan-out's TCP wakes collected
+    /// into `post` instead of connected: the event row and every follow-up
+    /// write run inline (joining the caller's write txn when there is one),
+    /// so call this at the insertion point inside a write txn and run
+    /// [`PostCommit::fire`](crate::hooks::common::PostCommit::fire) only
+    /// after that txn commits.
+    pub(crate) fn log_event_collected(
+        &self,
+        event_type: &str,
+        instance: &str,
+        data: &serde_json::Value,
+        post: &mut crate::hooks::common::PostCommit,
+    ) -> Result<i64> {
+        let event_id = self.insert_event_row(event_type, instance, data, None)?;
+        subscriptions::process_logged_event_collected(
+            self, event_id, event_type, instance, data, post,
+        );
+        Ok(event_id)
+    }
+
     /// Subscription fan-out for an already-durable event row: TCP wakes,
     /// follow-up messages, kv cursor writes. Best-effort external effects —
-    /// call only AFTER the write transaction commits, never under one.
+    /// call only AFTER the write transaction commits, never under one. (The
+    /// in-txn counterpart is [`Self::log_event_collected`], which defers only
+    /// the TCP connects into a PostCommit.)
     pub(crate) fn dispatch_logged_event(
         &self,
         event_id: i64,

@@ -482,6 +482,10 @@ pub fn send_message(
     // transaction (one short statement), retried on lock contention. The
     // subscription fan-out below runs after commit: it wakes TCP listeners
     // and writes more rows, so it must never hold the write lock.
+    // True worst case ≈ 35s: the 30s retry budget plus one final 5s
+    // busy_timeout — the last attempt may itself sleep the full SQLite
+    // busy_timeout inside the engine before surfacing SQLITE_BUSY.
+    let write_started = std::time::Instant::now();
     let _event_id = crate::db::retry_on_busy(
         || {
             db.with_immediate_transaction(|_tx| {
@@ -491,10 +495,16 @@ pub fn send_message(
         crate::db::DEFAULT_SEND_WRITE_BUDGET,
     )
     .map_err(|e| {
-        format!(
-            "Failed to write message to database (retried {:.0}s, message NOT sent): {e}",
-            crate::db::DEFAULT_SEND_WRITE_BUDGET.as_secs_f64()
-        )
+        // Say `retried` only for lock contention: any other failure (torn
+        // WAL, full disk, logic bug) returns on its first attempt.
+        let elapsed = write_started.elapsed().as_secs_f64();
+        if crate::db::is_busy_error(&e) {
+            format!(
+                "Failed to write message to database (retried {elapsed:.1}s, message NOT sent): {e}"
+            )
+        } else {
+            format!("Failed to write message to database ({elapsed:.1}s, message NOT sent): {e}")
+        }
     })?;
     db.dispatch_logged_event(_event_id, "message", &routing_instance, &data);
 
@@ -1789,6 +1799,10 @@ mod tests {
             err.contains("Failed to write message to database"),
             "err={err}"
         );
+        assert!(
+            err.contains("retried"),
+            "busy exhaustion must say retried: {err}"
+        );
         assert!(err.contains("NOT sent"), "err={err}");
 
         // Exhaustion means nothing was written: no partial row.
@@ -1805,25 +1819,68 @@ mod tests {
         cleanup_test_db(path);
     }
 
+    /// Success-after-contention (F7): a second connection holds BEGIN
+    /// IMMEDIATE for ~250ms while `send_message` runs with busy_timeout=0.
+    /// The retry loop must ride out the contention and write exactly one row.
+    /// Fails on trees without the retry (the send errors on first BUSY).
     #[test]
     #[serial]
-    fn cmd_send_returns_1_when_database_locked() {
+    fn send_message_succeeds_after_transient_contention() {
         let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
-                "INSERT INTO instances (name, created_at) VALUES ('nova', 1000.0)",
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
                 [],
             )
             .unwrap();
-        let _guard = hold_write_lock(&path);
+        // Fail fast at the sqlite layer so each attempt surfaces SQLITE_BUSY
+        // at once; the (short) test budget bounds the retry loop.
         db.conn().execute_batch("PRAGMA busy_timeout=0;").unwrap();
 
-        let mut args =
-            SendArgs::try_parse_from(["send", "--from", "bigboss", "@nova", "--", "hello"])
-                .unwrap();
-        // The router sets this from raw argv; clap parsing alone leaves it false.
-        args.had_separator = true;
-        assert_eq!(cmd_send(&db, &args, None), 1);
+        // A concurrent writer holds the lock briefly, then commits. The
+        // channel proves the lock is held before the send starts, so the
+        // send cannot slip in first and the holder cannot fail its BEGIN.
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let guard = rusqlite::Connection::open(&path).unwrap();
+                guard
+                    .execute_batch("PRAGMA busy_timeout=0; BEGIN IMMEDIATE;")
+                    .unwrap();
+                held_tx.send(()).ok();
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                guard.execute_batch("COMMIT;").unwrap();
+            }
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder took the write lock");
+
+        let sender = SenderIdentity {
+            kind: SenderKind::External,
+            name: "bigboss".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let delivered =
+            send_message(&db, &sender, "hello", None, Some(&["nova".to_string()])).unwrap();
+        holder.join().expect("holder committed");
+        assert!(
+            delivered.contains(&"nova".to_string()),
+            "delivered={delivered:?}"
+        );
+
+        // Exactly one row: the attempts that hit the lock wrote nothing.
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
 
         cleanup_test_db(path);
     }

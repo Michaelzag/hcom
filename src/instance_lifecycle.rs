@@ -523,31 +523,75 @@ pub fn get_status_description(status: &str, context: &str) -> String {
     }
 }
 
-/// A staged status change: the row write plus everything that must happen
-/// only after it is durable. Built by [`stage_set_status`] with no writes,
-/// no wakes, and no event logging; applied in-txn by
-/// [`apply_staged_status`], fired post-commit by [`fire_staged_status`].
-pub(crate) struct StagedStatus {
-    updates: serde_json::Map<String, serde_json::Value>,
-    status_changed: bool,
-    event: Option<serde_json::Value>,
-}
-
-/// Read the current row and compute a status change without performing it:
-/// the column updates, whether listeners need a wake, and the fully-built
-/// status event payload (if one is due). The event records this call site's
-/// `file:line` as `writer` for diagnostics, so every path reaching it stays
-/// `#[track_caller]`.
+/// Set instance status with timestamp and log the status-change event.
+///
+/// Plain entry point: the row write, the status event, and the whole
+/// subscription fan-out run inline, and the collected TCP wakes fire before
+/// returning. Externally identical to before — only the wake connects move
+/// to the end of the call.
 #[track_caller]
-pub(crate) fn stage_set_status(
+pub fn set_status(
     db: &HcomDb,
     instance_name: &str,
     status: &str,
     context: &str,
     upd: StatusUpdate<'_>,
-) -> StagedStatus {
-    let caller = std::panic::Location::caller();
-    let writer = format!("{}:{}", caller.file(), caller.line());
+) {
+    let mut post = crate::hooks::common::PostCommit::default();
+    set_status_inner(
+        db,
+        instance_name,
+        status,
+        context,
+        upd,
+        std::panic::Location::caller(),
+        &mut post,
+    );
+    post.fire(db);
+}
+
+/// [`set_status`] with the listener wake and the status event's fan-out wakes
+/// collected into `post` instead of connected: the row write, the event row,
+/// and every follow-up write run inline (joining the caller's write txn when
+/// there is one), so call this inside a write txn and run [`PostCommit::fire`]
+/// only after that txn commits. The event still records this call site's
+/// `file:line` as `writer`, so this stays `#[track_caller]` like `set_status`.
+///
+/// [`PostCommit::fire`]: crate::hooks::common::PostCommit::fire
+#[track_caller]
+pub(crate) fn set_status_collected(
+    db: &HcomDb,
+    instance_name: &str,
+    status: &str,
+    context: &str,
+    upd: StatusUpdate<'_>,
+    post: &mut crate::hooks::common::PostCommit,
+) {
+    set_status_inner(
+        db,
+        instance_name,
+        status,
+        context,
+        upd,
+        std::panic::Location::caller(),
+        post,
+    );
+}
+
+/// Fused status write shared by [`set_status`] and [`set_status_collected`]:
+/// the row write, the conditional DELIVERY_LOOPS wake (collected), and the
+/// status event log with its inline fan-out. `writer` is the
+/// `#[track_caller]` site both wrappers forward, so the event's `writer`
+/// field keeps naming the true caller.
+fn set_status_inner(
+    db: &HcomDb,
+    instance_name: &str,
+    status: &str,
+    context: &str,
+    upd: StatusUpdate<'_>,
+    writer: &'static std::panic::Location<'static>,
+    post: &mut crate::hooks::common::PostCommit,
+) {
     let StatusUpdate {
         detail,
         msg_ts,
@@ -579,6 +623,12 @@ pub(crate) fn stage_set_status(
         d.status != status || d.status_context != context || d.status_detail != detail
     });
 
+    crate::instances::update_instance_position(db, instance_name, &updates);
+
+    if status_changed {
+        post.collect_wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+    }
+
     // The pi-family plugins (pi, and its fork omp) structurally double-write tool
     // status: the extension's tool_call handler calls reportStatus (omp/pi-status)
     // AND the Rust beforetool hook calls update_tool_status, both with the same
@@ -589,11 +639,7 @@ pub(crate) fn stage_set_status(
         Some("pi") | Some("omp")
     );
     if is_pi_family && !status_event_changed && msg_ts.is_empty() {
-        return StagedStatus {
-            updates,
-            status_changed,
-            event: None,
-        };
+        return;
     }
 
     let position = current_data.as_ref().map(|d| d.last_event_id).unwrap_or(0);
@@ -617,7 +663,7 @@ pub(crate) fn stage_set_status(
     data["new_status"] = serde_json::json!(status);
     data["new_context"] = serde_json::json!(context);
     data["new_detail"] = serde_json::json!(detail);
-    data["writer"] = serde_json::json!(writer);
+    data["writer"] = serde_json::json!(format!("{}:{}", writer.file(), writer.line()));
     if let Some(session_id) = current_data.as_ref().and_then(|d| d.session_id.as_deref()) {
         data["session"] = serde_json::json!(session_id);
     }
@@ -630,43 +676,7 @@ pub(crate) fn stage_set_status(
     if !tool_use_id.is_empty() {
         data["tool_use_id"] = serde_json::json!(tool_use_id);
     }
-    StagedStatus {
-        updates,
-        status_changed,
-        event: Some(data),
-    }
-}
-
-/// In-txn half of a staged status change: the row write only. Joins the
-/// caller's write transaction on the same connection; no wakes, no events.
-pub(crate) fn apply_staged_status(db: &HcomDb, instance_name: &str, staged: &StagedStatus) {
-    crate::instances::update_instance_position(db, instance_name, &staged.updates);
-}
-
-/// Post-commit half of a staged status change: the conditional listener
-/// wake plus the status event log (which dispatches inline). Call only
-/// after the transaction carrying the row write commits — never under one.
-pub(crate) fn fire_staged_status(db: &HcomDb, instance_name: &str, staged: &StagedStatus) {
-    if staged.status_changed {
-        crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
-    }
-    if let Some(event) = &staged.event {
-        let _ = db.log_event("status", instance_name, event);
-    }
-}
-
-/// Set instance status with timestamp and log the status-change event.
-#[track_caller]
-pub fn set_status(
-    db: &HcomDb,
-    instance_name: &str,
-    status: &str,
-    context: &str,
-    upd: StatusUpdate<'_>,
-) {
-    let staged = stage_set_status(db, instance_name, status, context, upd);
-    apply_staged_status(db, instance_name, &staged);
-    fire_staged_status(db, instance_name, &staged);
+    let _ = db.log_event_collected("status", instance_name, &data, post);
 }
 
 // Test seam: runs between the cleanup's snapshot read and the stop it

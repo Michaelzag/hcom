@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::db::HcomDb;
+use crate::hooks::common::PostCommit;
 use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
 use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING};
@@ -2715,9 +2716,13 @@ pub(crate) fn cleanup_deleted_instance(
         Some(process_id)
     };
     let released = db.with_immediate_transaction(|tx| {
+        // One PostCommit for the whole exit: the `stopped` fan-out runs inline
+        // with wakes collected, and `fire` below runs only after commit. A
+        // rollback drops `post`, discarding wakes for unwritten events.
+        let mut post = PostCommit::default();
         if !exit_incarnation_holds(tx, current_name, &incarnation)? {
             release_own_binding(tx, current_name, process_id, &own_binding)?;
-            return Ok((false, None));
+            return Ok((false, post));
         }
         let snapshot = db.get_instance_snapshot(current_name)?.map(|mut snapshot| {
             if let Some(object) = snapshot.as_object_mut() {
@@ -2735,6 +2740,10 @@ pub(crate) fn cleanup_deleted_instance(
                 &format!("Failed to set inactive status: {}", e),
             );
         }
+        // Snapshot the DELIVERY_LOOPS ports BEFORE the delete below removes
+        // them, so the post-commit fire still reaches the (now removed)
+        // listener (S1/F4). Status wakes are DELIVERY_LOOPS-only.
+        post.collect_wake(db, current_name, crate::notify::WakeKind::DELIVERY_LOOPS);
         if let Err(e) = db.delete_notify_endpoints(current_name) {
             log_warn(
                 "native",
@@ -2745,33 +2754,31 @@ pub(crate) fn cleanup_deleted_instance(
         if let Err(e) = db.cleanup_subscriptions(current_name) {
             log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
         }
-        // Insert-only: the subscription fan-out fires after commit below,
-        // never while the write lock is held. The event is recorded even on
-        // the re-registered path (as today), so it dispatches on both
+        // In-txn fan-out at the insertion point, BEFORE the row delete below
+        // (F2): the request-watch waterline read sees the live row. Only the
+        // TCP connects are deferred into `post`. The event is recorded even
+        // on the re-registered path (as always), so it fires on both
         // committed outcomes.
-        let life_event = match db.log_life_event_insert(
+        if let Err(e) = db.log_life_event_collected(
             current_name,
             "stopped",
             "pty",
             exit_reason,
             snapshot,
             event_process_id,
+            &mut post,
         ) {
-            Ok((event_id, event_data)) => Some((event_id, event_data)),
-            Err(e) => {
-                log_warn(
-                    "native",
-                    "delivery.life_event_fail",
-                    &format!("Failed to log life event: {}", e),
-                );
-                None
-            }
-        };
+            log_warn(
+                "native",
+                "delivery.life_event_fail",
+                &format!("Failed to log life event: {}", e),
+            );
+        }
         // Re-checked after the writes above: anything they set off (a launch
         // publishing its pid, a replacement row or rebind) keeps the row.
         if !exit_incarnation_holds(tx, current_name, &incarnation)? {
             release_own_binding(tx, current_name, process_id, &own_binding)?;
-            return Ok((false, life_event));
+            return Ok((false, post));
         }
         let deleted = tx.execute(
             "DELETE FROM instances WHERE name = ?1 AND created_at = ?2 AND pid IS ?3 \
@@ -2790,18 +2797,12 @@ pub(crate) fn cleanup_deleted_instance(
                 rusqlite::params![process_id, current_name],
             )?;
         }
-        Ok((deleted == 1, life_event))
+        Ok((deleted == 1, post))
     });
     match released {
-        Ok((true, life_event)) => {
-            if let Some((event_id, event_data)) = life_event {
-                db.dispatch_logged_event(event_id, "life", current_name, &event_data);
-            }
-        }
-        Ok((false, life_event)) => {
-            if let Some((event_id, event_data)) = life_event {
-                db.dispatch_logged_event(event_id, "life", current_name, &event_data);
-            }
+        Ok((true, post)) => post.fire(db),
+        Ok((false, post)) => {
+            post.fire(db);
             log_info(
                 "native",
                 "delivery.cleanup_re_registered",

@@ -30,6 +30,7 @@ use serde_json::json;
 use super::HcomDb;
 use crate::core::filters::{FILE_WRITE_CONTEXTS, build_sql_from_flags, is_uri_status_detail};
 use crate::fleet_names::FleetCtx;
+use crate::hooks::common::PostCommit;
 use crate::messages::{InstanceInfo, MessageScope, ScopeResult, compute_scope, resolve_targets};
 use crate::shared::constants::extract_mentions;
 
@@ -246,7 +247,7 @@ fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str) {
 /// Fire Antigravity request watches whose idle grace elapsed while no matching
 /// event arrived. The conditional delete is the claim: concurrent sweepers can
 /// observe the same row, but only one can remove it and emit the one-shot notice.
-fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
+fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64, post: &mut PostCommit) {
     for (key, sub, filters) in load_reqwatch_subs(db) {
         if filters.get("target_tool").and_then(|v| v.as_str()) != Some("antigravity")
             || !super::reqwatch_policy::idle_grace_expired(&sub, now)
@@ -316,7 +317,7 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
             &serde_json::json!({"status": "listening"}),
             Some(&filters),
         );
-        let _ = send_sub_notification(db, caller, &notification);
+        let _ = send_sub_notification(db, caller, &notification, post);
     }
 }
 
@@ -472,12 +473,35 @@ pub(crate) fn add_thread_memberships(
 
 /// Check subscriptions and send matching notifications.
 /// Called inline from log_event(). Errors logged, never propagated.
+///
+/// Plain entry point: runs the whole fan-out with DB reads/writes inline and
+/// fires the collected TCP wakes before returning. Externally identical to
+/// before — only the wake connects move to the end of the call.
 pub(crate) fn process_logged_event(
     db: &HcomDb,
     event_id: i64,
     event_type: &str,
     instance: &str,
     data: &serde_json::Value,
+) {
+    let mut post = PostCommit::default();
+    process_logged_event_collected(db, event_id, event_type, instance, data, &mut post);
+    post.fire(db);
+}
+
+/// [`process_logged_event`] with every TCP wake collected into `post` instead
+/// of connected: ALL DB reads/writes run inline on the caller's connection
+/// (joining the caller's write txn when there is one), so call this at the
+/// event's insertion point inside a write txn and run [`PostCommit::fire`]
+/// only after that txn commits. A rollback drops `post`, discarding wakes
+/// for events that never became durable.
+pub(crate) fn process_logged_event_collected(
+    db: &HcomDb,
+    event_id: i64,
+    event_type: &str,
+    instance: &str,
+    data: &serde_json::Value,
+    post: &mut PostCommit,
 ) {
     // Recursion guard: skip events that could cause notification loops.
     if instance.starts_with("sys_") {
@@ -626,14 +650,25 @@ pub(crate) fn process_logged_event(
                 .unwrap_or("");
             let sub_caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
             if request_id > 0 && !target.is_empty() {
-                let waterline: i64 = db
-                    .conn
-                    .query_row(
-                        "SELECT last_event_id FROM instances WHERE name = ?",
-                        params![target],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
+                // The row may already be gone: stop/delete commits the row
+                // removal together with the event, and fan-out can run after
+                // (kill path) or just before (in-txn, row still present) the
+                // delete. When the row is absent, fall back to the event's
+                // own snapshot cursor so a live requester is still notified
+                // (F2). Stop snapshots always carry last_event_id.
+                let waterline: i64 = match db.conn.query_row(
+                    "SELECT last_event_id FROM instances WHERE name = ?",
+                    params![target],
+                    |row| row.get::<_, i64>(0),
+                ) {
+                    Ok(cursor) => cursor,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => data
+                        .get("snapshot")
+                        .and_then(|snapshot| snapshot.get("last_event_id"))
+                        .and_then(|cursor| cursor.as_i64())
+                        .unwrap_or(0),
+                    Err(_) => 0,
+                };
                 if waterline < request_id {
                     let mut sub_mut = sub.clone();
                     sub_mut["last_id"] = serde_json::json!(event_id);
@@ -706,14 +741,14 @@ pub(crate) fn process_logged_event(
             data,
             filters_opt,
         );
-        let _ = send_sub_notification(db, caller, &notification);
+        let _ = send_sub_notification(db, caller, &notification, post);
 
         if let Some(on_hit_text) = sub.get("on_hit_text").and_then(|v| v.as_str()) {
             let caller_kind = sub
                 .get("caller_kind")
                 .and_then(|v| v.as_str())
                 .unwrap_or("external");
-            if let Err(e) = send_message_as(db, caller, caller_kind, on_hit_text) {
+            if let Err(e) = send_message_as_collected(db, caller, caller_kind, on_hit_text, post) {
                 crate::log::log_error("db", "check_event_subscriptions.on_hit", &format!("{e}"));
             }
         }
@@ -752,7 +787,7 @@ pub(crate) fn process_logged_event(
 
     // A grace expiry is not itself an event. Sweep after handling the current
     // event so replies, active/blocked transitions, and stop events win first.
-    sweep_expired_reqwatch_graces(db, crate::shared::time::now_epoch_f64());
+    sweep_expired_reqwatch_graces(db, crate::shared::time::now_epoch_f64(), post);
 }
 
 /// Load all reqwatch subscriptions as (key, parsed_sub, filters) tuples.
@@ -842,7 +877,22 @@ pub(crate) fn send_system_message(
     sender_name: &str,
     message: &str,
 ) -> Result<Vec<String>> {
-    send_message_as(db, sender_name, "system", message)
+    let mut post = PostCommit::default();
+    let delivered = send_system_message_collected(db, sender_name, message, &mut post)?;
+    post.fire(db);
+    Ok(delivered)
+}
+
+/// [`send_system_message`] with wakes collected into `post`: the message row
+/// and every follow-up write run inline (joining the caller's write txn when
+/// there is one).
+pub(crate) fn send_system_message_collected(
+    db: &HcomDb,
+    sender_name: &str,
+    message: &str,
+    post: &mut PostCommit,
+) -> Result<Vec<String>> {
+    send_message_as_collected(db, sender_name, "system", message, post)
 }
 
 /// Send a message from a specific sender kind.
@@ -851,6 +901,22 @@ pub(crate) fn send_message_as(
     sender_name: &str,
     sender_kind: &str,
     message: &str,
+) -> Result<Vec<String>> {
+    let mut post = PostCommit::default();
+    let delivered = send_message_as_collected(db, sender_name, sender_kind, message, &mut post)?;
+    post.fire(db);
+    Ok(delivered)
+}
+
+/// [`send_message_as`] with the message event's fan-out wakes collected into
+/// `post` instead of connected: every DB read/write runs inline (joining the
+/// caller's write txn when there is one).
+pub(crate) fn send_message_as_collected(
+    db: &HcomDb,
+    sender_name: &str,
+    sender_kind: &str,
+    message: &str,
+    post: &mut PostCommit,
 ) -> Result<Vec<String>> {
     // The SAME live-row set `hcom send` resolves against, so a bare @x
     // injected here lands on the same seat (a stopped or exited row is never
@@ -922,7 +988,7 @@ pub(crate) fn send_message_as(
         "external" => format!("ext_{}", sender_name),
         _ => format!("sys_{}", sender_name),
     };
-    db.log_event("message", &routing_instance, &event_data)?;
+    db.log_event_collected("message", &routing_instance, &event_data, post)?;
 
     Ok(delivered_to)
 }
@@ -1095,7 +1161,7 @@ fn find_collision_partner(
         .ok()
 }
 
-fn send_sub_notification(db: &HcomDb, caller: &str, message: &str) -> bool {
+fn send_sub_notification(db: &HcomDb, caller: &str, message: &str, post: &mut PostCommit) -> bool {
     let row: Option<(String, Option<String>)> = db
         .conn
         .query_row(
@@ -1115,15 +1181,16 @@ fn send_sub_notification(db: &HcomDb, caller: &str, message: &str) -> bool {
     };
 
     let text = format!("@{} {}", full_name, message);
-    let Ok(delivered_to) = send_system_message(db, "[hcom-events]", &text) else {
+    let Ok(delivered_to) = send_system_message_collected(db, "[hcom-events]", &text, post) else {
         return false;
     };
     // send_system_message only logs the [hcom-events] row; unlike `hcom send`
     // it does not ping notify endpoints, so the notification can sit unread
-    // until an unrelated wake. Wake only the matching caller here: this path
-    // runs inline from log_event, so avoid a broader wake_all fan-out.
+    // until an unrelated wake. Wake only the matching caller here (collected
+    // into the PostCommit — this path runs at the event's insertion point,
+    // possibly under a write txn), never a broader wake_all fan-out.
     if delivered_to.iter().any(|recipient| recipient == caller) {
-        crate::notify::wake(db, caller, &[]);
+        post.collect_wake(db, caller, &[]);
     }
     true
 }
@@ -1410,8 +1477,10 @@ mod tests {
         sub["idle_grace_until"] = serde_json::json!(1.0);
         kv_store_sub(&db, &sub_key, &sub);
 
-        sweep_expired_reqwatch_graces(&db, 2.0);
-        sweep_expired_reqwatch_graces(&db, 3.0);
+        let mut post = PostCommit::default();
+        sweep_expired_reqwatch_graces(&db, 2.0, &mut post);
+        sweep_expired_reqwatch_graces(&db, 3.0, &mut post);
+        post.fire(&db);
 
         assert_eq!(
             count_reqwatch_without_reply_notifications(&db, "gora"),
@@ -1454,7 +1523,9 @@ mod tests {
         )
         .unwrap();
 
-        sweep_expired_reqwatch_graces(&db, f64::MAX);
+        let mut post = PostCommit::default();
+        sweep_expired_reqwatch_graces(&db, f64::MAX, &mut post);
+        post.fire(&db);
         assert!(db.kv_get(&sub_key).unwrap().is_none());
         assert_eq!(
             count_reqwatch_without_reply_notifications(&db, "gora"),
@@ -2062,11 +2133,14 @@ mod tests {
         db.upsert_notify_endpoint("rune", "plugin", rune_probe.local_addr().unwrap().port())
             .unwrap();
 
+        let mut post = PostCommit::default();
         assert!(send_sub_notification(
             &db,
             "tofu",
-            "[sub:test] #42 dani status | blocked | approval"
+            "[sub:test] #42 dani status | blocked | approval",
+            &mut post,
         ));
+        post.fire(&db);
 
         assert!(
             await_connect(&tofu_probe, Duration::from_millis(500)),
