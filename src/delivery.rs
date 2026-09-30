@@ -3709,6 +3709,7 @@ mod tests {
 
     #[test]
     fn wake_inject_includes_prompt_safe_metadata_only() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("hcom.db");
         let db = HcomDb::open_at(&db_path).unwrap();
@@ -3746,6 +3747,7 @@ mod tests {
 
     #[test]
     fn wake_inject_falls_back_to_minimal_trigger_when_preview_would_wrap() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("hcom.db");
         let db = HcomDb::open_at(&db_path).unwrap();

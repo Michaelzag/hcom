@@ -277,14 +277,16 @@ fn start_handler_registering_plugin_notify_wakes_pty_delivery_loop() {
 #[test]
 #[serial_test::serial]
 fn omp_role_registers_delivery_role_for_the_bound_session() {
-    let _env = isolated_omp_env();
+    // The policy exists before the env points at the dir (see
+    // `isolated_test_env_with_config`).
+    let _env = crate::hooks::test_helpers::isolated_test_env_with_config(Some(
+        "[delivery.conductor]\ndelegate = \"mupe\"\n",
+    ));
+    unsafe {
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+    }
     let (db, path) = setup_test_db();
     let temp = tempfile::TempDir::new().unwrap();
-    std::fs::write(
-        crate::paths::config_toml_path(),
-        "[delivery.conductor]\ndelegate = \"mupe\"\n",
-    )
-    .unwrap();
     save_test_instance(&db, "luna", ST_ACTIVE);
     db.set_process_binding("pid-omp", "", "luna").unwrap();
     let env = std::collections::HashMap::from([

@@ -1812,6 +1812,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_instance_name_some_when_set() {
+        let _guard = EnvGuard::new();
         Config::reset();
         with_env("HCOM_INSTANCE_NAME", "test-instance", || {
             Config::init();
@@ -1823,6 +1824,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_instance_name_none_when_unset() {
+        let _guard = EnvGuard::new();
         Config::reset();
         without_env(&["HCOM_INSTANCE_NAME"], || {
             Config::init();
@@ -1834,6 +1836,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_process_id_some_when_set() {
+        let _guard = EnvGuard::new();
         Config::reset();
         with_env("HCOM_PROCESS_ID", "pid-123", || {
             Config::init();
@@ -1845,6 +1848,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_process_id_none_when_unset() {
+        let _guard = EnvGuard::new();
         Config::reset();
         without_env(&["HCOM_PROCESS_ID"], || {
             Config::init();
@@ -1856,6 +1860,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_reset_allows_reinit() {
+        let _guard = EnvGuard::new();
         Config::reset();
         with_env("HCOM_INSTANCE_NAME", "first", || {
             Config::init();
@@ -2750,13 +2755,11 @@ active = "default"
     #[test]
     #[serial]
     fn test_save_toml_config_keeps_delivery_policy_table() {
-        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         let policy = "[delivery.conductor]\ndelegate = \"mupe\"\nleads = [\"poli\", \"valo\"]\n";
-        std::fs::write(
-            paths::config_toml_path(),
-            format!("[terminal]\nactive = \"default\"\n\n{policy}"),
-        )
-        .unwrap();
+        let (_dir, _hcom_dir, _home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env_with_config(Some(&format!(
+                "[terminal]\nactive = \"default\"\n\n{policy}"
+            )));
         let before = crate::delivery_policy::parse(policy);
         assert_eq!(before.role_holders().len(), 1);
 

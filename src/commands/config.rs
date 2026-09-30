@@ -2567,6 +2567,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_terminal_help_text_lists_cmux_as_managed() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         crate::config::Config::reset();
         crate::config::Config::init();
         let help = terminal_help_text(false);

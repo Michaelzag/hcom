@@ -1683,7 +1683,7 @@ mod tests {
 
     #[test]
     fn test_build_remote_launch_output_prefers_remote_background() {
-        crate::config::Config::init();
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = HcomDb::open_raw(&db_path).unwrap();
@@ -1716,7 +1716,7 @@ mod tests {
 
     #[test]
     fn test_build_remote_launch_output_uses_remote_launch_result_background() {
-        crate::config::Config::init();
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = HcomDb::open_raw(&db_path).unwrap();
@@ -1762,7 +1762,7 @@ mod tests {
 
     #[test]
     fn test_resolve_launcher_name_prefers_explicit_name() {
-        crate::config::Config::init();
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = HcomDb::open_raw(&db_path).unwrap();
@@ -1778,7 +1778,7 @@ mod tests {
 
     #[test]
     fn test_resolve_launcher_name_falls_back_to_process_binding() {
-        crate::config::Config::init();
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = HcomDb::open_raw(&db_path).unwrap();

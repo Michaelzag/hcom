@@ -4150,6 +4150,7 @@ mod tests {
 
     #[test]
     fn test_posttooluse_delivery_write_failure_keeps_message_unread() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (_dir, db) = make_delivery_test_db();
         let (output, ack) = get_posttooluse_messages(&db, "nova").unwrap();
         let stdout = serde_json::to_string(&output).unwrap();

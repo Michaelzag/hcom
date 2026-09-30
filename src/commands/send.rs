@@ -1585,12 +1585,18 @@ mod tests {
     }
 
     fn setup_test_db() -> (HcomDb, PathBuf, TestEnv) {
+        setup_test_db_with_config(None)
+    }
+
+    /// `config` becomes config.toml before the env points at it (see
+    /// `isolated_test_env_with_config`).
+    fn setup_test_db_with_config(config: Option<&str>) -> (HcomDb, PathBuf, TestEnv) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
         // send_message() reaches the process-global relay notification path,
         // so its ambient HCOM_DIR must live as long as the test DB.
-        let env = crate::hooks::test_helpers::isolated_test_env();
+        let env = crate::hooks::test_helpers::isolated_test_env_with_config(config);
         let temp_dir = std::env::temp_dir();
         let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let db_path = temp_dir.join(format!(
@@ -1894,8 +1900,7 @@ mod tests {
 
     /// Five live rows (session `sess-<name>`) and `config` as config.toml.
     fn rows_db(config: &str) -> (HcomDb, PathBuf, TestEnv) {
-        let (db, path, env) = setup_test_db();
-        std::fs::write(env.1.join("config.toml"), config).unwrap();
+        let (db, path, env) = setup_test_db_with_config(Some(config));
         db.conn()
             .execute(
                 "INSERT INTO instances (name, session_id, created_at) VALUES
@@ -2576,6 +2581,47 @@ mod tests {
 
     #[test]
     #[serial]
+    fn a_reader_locked_out_of_a_handled_forward_never_gives_it_to_the_holder() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        send(
+            &db,
+            &sender(SenderKind::Instance, "mupe"),
+            "first",
+            None,
+            None,
+            &["kimi"],
+        );
+        let first = last_event_id(&db);
+        inject(&db, &old_peer_inform("refused", 96));
+        // Reader B forwards it: handled, but no cursor move ("first" precedes it).
+        let reader_b = HcomDb::open_at(&path).unwrap();
+        assert_eq!(
+            reader_b
+                .get_unread_messages("kimi")
+                .into_iter()
+                .map(|m| m.text)
+                .collect::<Vec<_>>(),
+            vec!["first".to_string()]
+        );
+        assert_eq!(forward_count(&db), 1);
+        let mut updates = serde_json::Map::new();
+        updates.insert("last_event_id".into(), serde_json::json!(first));
+        crate::instances::update_instance_position(&db, "kimi", &updates);
+        // Reader A now meets the handled event with the database write-locked,
+        // for more reads than the give-up budget.
+        let guard = hold_write_lock(&db, &path);
+        for _ in 0..crate::delivery_policy::MAX_FORWARD_ATTEMPTS + 1 {
+            assert!(unread_texts(&db, "kimi").is_empty());
+        }
+        drop(guard);
+        assert!(crate::delivery_policy::forward_failures(&db).is_empty());
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert_eq!(forward_count(&db), 1);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
     fn forwarded_then_delegate_stops_is_not_redelivered_to_the_holder() {
         let (db, path, _env) = policy_db(KIMI_POLICY);
         send(
@@ -2637,7 +2683,20 @@ mod tests {
                     std::thread::spawn(move || {
                         let conn = HcomDb::open_at(&path).unwrap();
                         barrier.wait();
-                        crate::delivery_policy::register_role(&conn, "kimi", "sess-kimi", role)
+                        // A transient answer (the lock outlasted busy_timeout)
+                        // is retried, as the plugin does; only final answers
+                        // count.
+                        loop {
+                            match crate::delivery_policy::register_role(
+                                &conn,
+                                "kimi",
+                                "sess-kimi",
+                                role,
+                            ) {
+                                Err(e) if e.transient => continue,
+                                other => break other,
+                            }
+                        }
                     })
                 })
                 .collect();
@@ -2929,6 +2988,37 @@ mod tests {
             "{log}"
         );
         assert!(log.contains("\"role_registration_refused\""), "{log}");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_row_whose_created_at_json_cannot_round_trip_still_holds_its_role() {
+        // A real fractional timestamp a serde f64 round trip lands one ULP
+        // off (the same fixture db::mod's created_at_bits migration guards).
+        const CREATED_AT: f64 = 1_790_000_000.000_002_1;
+        assert_eq!(CREATED_AT.to_bits(), 4_745_294_612_153_761_801);
+        let (db, path, _env) = rows_db(KIMI_POLICY);
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = ?1 WHERE name = 'kimi'",
+                [CREATED_AT],
+            )
+            .unwrap();
+        crate::delivery_policy::register_role(&db, "kimi", "sess-kimi", "conductor").unwrap();
+        assert_eq!(
+            crate::delivery_policy::role_status_lines(&db),
+            vec!["conductor role: kimi".to_string()]
+        );
+        let d = send(
+            &db,
+            &sender(SenderKind::Instance, "nova"),
+            "filtered",
+            None,
+            None,
+            &["kimi"],
+        );
+        assert_eq!(d.reroutes, vec![("kimi".to_string(), "mupe".to_string())]);
         cleanup_test_db(path);
     }
 

@@ -173,11 +173,24 @@ pub mod test_helpers {
     /// Create an isolated test env: tempdir with .hcom dir, env vars set.
     /// Returns (tempdir, hcom_dir, test_home, guard).
     pub fn isolated_test_env() -> (tempfile::TempDir, PathBuf, PathBuf, EnvGuard) {
+        isolated_test_env_with_config(None)
+    }
+
+    /// `isolated_test_env` with `config` as config.toml, written before the
+    /// global Config points at the dir. Written after, a test that runs
+    /// without the env lock and reads Config (`load_config_snapshot`) can
+    /// find no config.toml in between and write the defaults over it.
+    pub fn isolated_test_env_with_config(
+        config: Option<&str>,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, EnvGuard) {
         let guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let test_home = dir.path().to_path_buf();
         let hcom_dir = test_home.join(".hcom");
         std::fs::create_dir_all(&hcom_dir).unwrap();
+        if let Some(config) = config {
+            std::fs::write(hcom_dir.join("config.toml"), config).unwrap();
+        }
         // Claim this tempdir as a disposable root so Config trusts it (temp-tree
         // geography alone is not enough — see paths::test_roots).
         crate::paths::test_roots::register(&test_home);

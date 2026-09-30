@@ -964,7 +964,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_persist_relay_config_clears_stale_token_when_password_omitted() {
-        let _ = isolated_test_env();
+        let _env = isolated_test_env();
         let psk_b64 = relay::encode_psk(&fake_psk());
         let contents = render_relay_config_content(
             "[relay]\nurl = \"mqtt://old:1883\"\nid = \"old-id\"\ntoken = \"stale-secret\"\npsk = \"old-psk\"\nenabled = true\n",

@@ -79,6 +79,8 @@ impl ForwardKeys {
 enum Committed {
     /// The holder's registered row changed under this read: nothing written.
     HolderChanged,
+    /// Another reader already gave this refusal to the holder: no claim.
+    AlreadyFailed,
     /// No single live row matches the delegate: the failure is recorded, no
     /// claim (the reason).
     DelegateUnresolved(String),
@@ -598,18 +600,28 @@ impl HcomDb {
             })
             .unwrap_or_default()
         };
+        // The handled marker is final: once any reader forwarded this
+        // refusal, nothing here may re-decide it (a later give-up or an
+        // unresolved delegate would hand the holder a message the delegate
+        // already has). Read first, before the failure record.
+        let handled = |db: &Self| db.kv_get(&keys.handled).ok().flatten().is_some();
+        if advance_from.is_none() && handled(self) {
+            return ForwardOutcome::Forwarded {
+                cursor_advanced: false,
+            };
+        }
         if self.kv_get(&keys.failed).ok().flatten().is_some() {
             return ForwardOutcome::DeliverToHolder;
         }
         if let Some(reason) = forward_given_up(self, &keys.holder_origin) {
+            if handled(self) {
+                return ForwardOutcome::Forwarded {
+                    cursor_advanced: false,
+                };
+            }
             // Given up while the database was too locked to record it.
             let _ = self.kv_set(&keys.failed, Some(&failure(&reason)));
             return ForwardOutcome::DeliverToHolder;
-        }
-        if advance_from.is_none() && self.kv_get(&keys.handled).ok().flatten().is_some() {
-            return ForwardOutcome::Forwarded {
-                cursor_advanced: false,
-            };
         }
         if forward_backing_off(self, &keys.holder_origin) {
             return ForwardOutcome::Retry;
@@ -701,6 +713,19 @@ impl HcomDb {
             let mut inserted = Vec::new();
             let mut target = None;
             if !handled {
+                // Another reader already gave this refusal to the holder:
+                // that stays the decision (no claim, no copy).
+                let failed = tx
+                    .query_row(
+                        "SELECT 1 FROM kv WHERE key = ?1",
+                        params![keys.failed],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if failed {
+                    return Ok(Committed::AlreadyFailed);
+                }
                 // Resolved inside the transaction, against the rows it sees.
                 let rows = crate::messages::deliverable_instances(&tx)?;
                 let resolved =
@@ -762,6 +787,7 @@ impl HcomDb {
 
         match committed {
             Ok(Committed::HolderChanged) => ForwardOutcome::Retry,
+            Ok(Committed::AlreadyFailed) => ForwardOutcome::DeliverToHolder,
             Ok(Committed::DelegateUnresolved(reason)) => {
                 forward_retries().remove(&(self.path().to_path_buf(), keys.holder_origin));
                 crate::log::log_warn(
@@ -796,6 +822,13 @@ impl HcomDb {
                 }
                 ForwardOutcome::Forwarded { cursor_advanced }
             }
+            // Another reader forwarded it meanwhile (a plain read works under
+            // a held write lock in WAL): it is handled, never counted as a
+            // failed attempt or given up to the holder. Only the cursor move
+            // is missed; the next read skips it.
+            Err(_) if handled(self) => ForwardOutcome::Forwarded {
+                cursor_advanced: false,
+            },
             Err(e) => {
                 let transient = matches!(
                     &e,
@@ -1276,6 +1309,7 @@ mod tests {
     // backlog (broadcasts match every recipient when the cursor falls back to 0).
     #[test]
     fn test_get_unread_messages_empty_for_missing_instance() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         db.log_event(
@@ -1371,6 +1405,7 @@ mod tests {
     /// broadcast and the "no message in → no keep-alive" gate is broken.
     #[test]
     fn test_has_direct_unread_ignores_broadcasts() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
         db.conn
             .execute(

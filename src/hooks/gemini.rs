@@ -3063,6 +3063,7 @@ mod tests {
 
     #[test]
     fn test_antigravity_aftertool_does_not_ack_pending_delivery() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         use std::collections::HashMap;
         use std::path::PathBuf;
 

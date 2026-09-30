@@ -2108,6 +2108,10 @@ mod tests {
         for (side, hcom) in hcoms.iter().enumerate() {
             std::fs::create_dir_all(hcom.join(".tmp")).unwrap();
             std::fs::write(hcom.join(".tmp/device_id"), uuids[side]).unwrap();
+            // A config.toml exists before Config ever points here, so no test
+            // running without the env lock can write the defaults over the
+            // policy written below (it only writes them when the file is missing).
+            std::fs::write(hcom.join("config.toml"), "").unwrap();
             crate::paths::test_roots::register(&homes[side]);
         }
         use_side(0);
@@ -2197,15 +2201,19 @@ mod tests {
         let kimi = texts(&db_a, "kimi");
         let rows: Vec<String> = db_a
             .conn()
-            .prepare("SELECT name || '/' || status FROM instances")
+            .prepare(
+                "SELECT name || '/' || status || '/' || status_context || '/' || ifnull(session_id,'-') \
+                 || '/' || created_at FROM instances",
+            )
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
+        let roles = db_a.kv_prefix("delivery_role:").unwrap_or_default();
         assert!(
             kimi.is_empty(),
-            "{kimi:?} rows={rows:?} status={:?}",
+            "{kimi:?} rows={rows:?} roles={roles:?} status={:?}",
             crate::delivery_policy::role_status_lines(&db_a)
         );
 

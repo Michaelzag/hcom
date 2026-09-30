@@ -623,12 +623,20 @@ pub(crate) fn resolve_delegate(
 
 /// One registration, stored in kv under `delivery_role:<name>`. It counts
 /// only while the exact row it was written for (name + session id +
-/// created_at) is still there and live.
+/// created_at) is still there and live. `created_at` is kept as its exact
+/// f64 bit pattern: a serde f64 round trip can land one ULP off a real
+/// timestamp (see `db::raw_created_at_bits`), and then the row never matches.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct RoleRecord {
     role: String,
     session_id: String,
-    created_at: f64,
+    created_at_bits: u64,
+}
+
+impl RoleRecord {
+    fn created_at(&self) -> f64 {
+        f64::from_bits(self.created_at_bits)
+    }
 }
 
 /// The exact row the record was written for is still there and live.
@@ -640,7 +648,7 @@ fn record_is_live(db: &HcomDb, name: &str, record: &RoleRecord) -> Result<bool, 
                 "SELECT 1 FROM instances WHERE name = ? AND session_id = ? AND created_at = ? AND {}",
                 crate::fleet_names::LIVE_ROW_PREDICATE
             ),
-            rusqlite::params![name, record.session_id, record.created_at],
+            rusqlite::params![name, record.session_id, record.created_at()],
             |_| Ok(()),
         )
         .optional()
@@ -674,9 +682,9 @@ fn live_role_holders(db: &HcomDb) -> Result<BTreeMap<String, Registration>, Stri
             holders.insert(
                 name.to_string(),
                 Registration {
+                    created_at: record.created_at(),
                     role: record.role,
                     session_id: record.session_id,
-                    created_at: record.created_at,
                 },
             );
         }
@@ -801,7 +809,7 @@ fn register_role_inner(
     let record = RoleRecord {
         role: role.to_string(),
         session_id: session_id.to_string(),
-        created_at,
+        created_at_bits: created_at.to_bits(),
     };
     let value = serde_json::to_string(&record).map_err(RoleError::transient)?;
     tx.execute(

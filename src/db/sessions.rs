@@ -853,6 +853,7 @@ mod tests {
     // recipient) as unread and replay a stale message into a freshly-resumed session.
     #[test]
     fn test_has_pending_false_for_missing_instance() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         // A broadcast in history (delivers to all recipients).
