@@ -383,7 +383,7 @@ fn config_set_at_path(path: &Path, key: &str, value: &str) -> Result<(), String>
     // unknown-key fallback below would overwrite the whole table.
     if field_name == "delivery" || field_name.starts_with("delivery.") {
         return Err(
-            "delivery policy has no CLI setter: edit [delivery.<name>] in config.toml".to_string(),
+            "delivery policy has no CLI setter: edit [delivery.<role>] in config.toml".to_string(),
         );
     }
     validate_config_args(&field_name, value)?;
@@ -2548,11 +2548,11 @@ mod tests {
     fn test_config_set_keeps_and_refuses_delivery_policy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let policy = "[delivery.kimi]\ndelegate = \"mupe\"\nleads = [\"poli\"]\n";
+        let policy = "[delivery.conductor]\ndelegate = \"mupe\"\nleads = [\"poli\"]\n";
         std::fs::write(&path, policy).unwrap();
 
         config_set_at_path(&path, "HCOM_PI_ARGS", "--model safe-model").unwrap();
-        for key in ["delivery", "HCOM_DELIVERY", "delivery.kimi.delegate"] {
+        for key in ["delivery", "HCOM_DELIVERY", "delivery.conductor.delegate"] {
             assert!(config_set_at_path(&path, key, "x").is_err(), "{key}");
         }
 

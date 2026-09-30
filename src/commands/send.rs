@@ -373,7 +373,7 @@ fn resolve_delivery(
     let external_reached_policy = if facts.external {
         effective_mentions
             .iter()
-            .filter(|name| policies.has_entry(name))
+            .filter(|name| policies.governs(name))
             .cloned()
             .collect()
     } else {
@@ -404,7 +404,7 @@ fn resolve_delivery(
         is_thread_resolved,
         reroutes,
         external_reached_policy,
-        sender_has_policy: policies.has_entry(&identity.name),
+        sender_has_policy: policies.governs(&identity.name),
     })
 }
 
@@ -1885,23 +1885,162 @@ mod tests {
         assert_eq!(msg.as_deref(), Some("hello"));
     }
 
-    // ── Delivery policy ([delivery.kimi], crate::delivery_policy) ──
+    // ── Delivery policy ([delivery.conductor] held by kimi, crate::delivery_policy) ──
 
     const KIMI_POLICY: &str =
-        "[delivery.kimi]\ndelegate = \"mupe\"\nleads = [\"poli\", \"valo\"]\n";
+        "[delivery.conductor]\ndelegate = \"mupe\"\nleads = [\"poli\", \"valo\"]\n";
 
-    fn policy_db(config: &str) -> (HcomDb, PathBuf, TestEnv) {
+    /// Five live rows (session `sess-<name>`) and `config` as config.toml.
+    fn rows_db(config: &str) -> (HcomDb, PathBuf, TestEnv) {
         let (db, path, env) = setup_test_db();
         std::fs::write(env.1.join("config.toml"), config).unwrap();
         db.conn()
             .execute(
-                "INSERT INTO instances (name, created_at) VALUES
-                 ('kimi', 1000.0), ('mupe', 1000.0), ('valo', 1000.0),
-                 ('nova', 1000.0), ('lola', 1000.0)",
+                "INSERT INTO instances (name, session_id, created_at) VALUES
+                 ('kimi', 'sess-kimi', 1000.0), ('mupe', 'sess-mupe', 1000.0),
+                 ('valo', 'sess-valo', 1000.0), ('nova', 'sess-nova', 1000.0),
+                 ('lola', 'sess-lola', 1000.0)",
                 [],
             )
             .unwrap();
         (db, path, env)
+    }
+
+    /// `rows_db` with kimi registered as `conductor`, the way the plugin's
+    /// `hcom omp-role` does it.
+    fn policy_db(config: &str) -> (HcomDb, PathBuf, TestEnv) {
+        let (db, path, env) = rows_db(config);
+        crate::delivery_policy::register_role(&db, "kimi", "sess-kimi", "conductor").unwrap();
+        (db, path, env)
+    }
+
+    fn log_text(env: &TestEnv) -> String {
+        std::fs::read_to_string(env.1.join(".tmp/logs/hcom.log")).unwrap_or_default()
+    }
+
+    #[test]
+    #[serial]
+    fn conductor_role_unheld_turns_filter_off_and_warns() {
+        let (db, path, env) = rows_db(KIMI_POLICY);
+        assert_eq!(
+            crate::delivery_policy::role_status_lines(&db),
+            vec!["conductor role: NONE".to_string()]
+        );
+        crate::delivery_policy::warn_unheld_roles(&db);
+        assert!(
+            log_text(&env).contains("\"role_unheld\""),
+            "{}",
+            log_text(&env)
+        );
+
+        // Nobody holds the role, so nobody is filtered: the visible warning
+        // above is the only signal a registration was missed.
+        let d = send(
+            &db,
+            &sender(SenderKind::Instance, "nova"),
+            "hi",
+            None,
+            None,
+            &["kimi"],
+        );
+        assert_delivered_to_kimi(&db, &d, "hi");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn two_conductor_role_holders_both_filtered_and_warned() {
+        let (db, path, env) = policy_db(KIMI_POLICY);
+        crate::delivery_policy::register_role(&db, "lola", "sess-lola", "conductor").unwrap();
+        assert_eq!(
+            crate::delivery_policy::role_status_lines(&db),
+            vec!["conductor role: kimi, lola".to_string()]
+        );
+        let d = send(
+            &db,
+            &sender(SenderKind::Instance, "nova"),
+            "cc",
+            None,
+            None,
+            &["kimi", "lola"],
+        );
+        assert_eq!(
+            d.reroutes,
+            vec![
+                ("kimi".to_string(), Some("mupe".to_string())),
+                ("lola".to_string(), Some("mupe".to_string())),
+            ]
+        );
+        assert_eq!(d.effective_mentions, vec!["mupe".to_string()]);
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert!(unread_texts(&db, "lola").is_empty());
+        assert!(log_text(&env).contains("\"role_multiple_holders\""));
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn conductor_role_registration_is_add_only() {
+        let (db, path, env) = policy_db(KIMI_POLICY);
+        let err =
+            crate::delivery_policy::register_role(&db, "kimi", "sess-kimi", "deputy").unwrap_err();
+        assert!(
+            err.message.contains("add-only") && !err.transient,
+            "{err:?}"
+        );
+        // Same role again is a no-op success; a session the row is not bound
+        // to cannot register it.
+        crate::delivery_policy::register_role(&db, "kimi", "sess-kimi", "conductor").unwrap();
+        assert!(
+            crate::delivery_policy::register_role(&db, "nova", "sess-kimi", "conductor").is_err()
+        );
+        assert_eq!(
+            crate::delivery_policy::role_status_lines(&db),
+            vec!["conductor role: kimi".to_string()]
+        );
+        let log = log_text(&env);
+        assert!(
+            log.lines()
+                .any(|l| l.contains("\"role_registered\"")
+                    && l.contains("\"session_id\":\"sess-kimi\"")),
+            "{log}"
+        );
+        assert!(log.contains("\"role_registration_refused\""), "{log}");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn conductor_role_dies_with_its_row_and_resume_must_reregister() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        let nova = sender(SenderKind::Instance, "nova");
+        let recreate = |session: &str, created_at: f64| {
+            db.conn()
+                .execute("DELETE FROM instances WHERE name = 'kimi'", [])
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, session_id, created_at) VALUES ('kimi', ?, ?)",
+                    rusqlite::params![session, created_at],
+                )
+                .unwrap();
+        };
+
+        // `hcom r kimi`: same name, same omp session, but a new row.
+        recreate("sess-kimi", 2000.0);
+        let d = send(&db, &nova, "after resume", None, None, &["kimi"]);
+        assert_delivered_to_kimi(&db, &d, "after resume");
+        // The resumed session's plugin registers again at bind.
+        crate::delivery_policy::register_role(&db, "kimi", "sess-kimi", "conductor").unwrap();
+        let d = send(&db, &nova, "after re-register", None, None, &["kimi"]);
+        assert_rerouted_to_mupe(&db, &d, "after re-register");
+
+        // A later seat reusing the name (fresh launch, new session) is not
+        // the conductor.
+        recreate("sess-new-seat", 3000.0);
+        let d = send(&db, &nova, "new seat", None, None, &["kimi"]);
+        assert_delivered_to_kimi(&db, &d, "new seat");
+        cleanup_test_db(path);
     }
 
     fn sender(kind: SenderKind, name: &str) -> SenderIdentity {
@@ -2118,6 +2257,27 @@ mod tests {
         cleanup_test_db(path);
     }
 
+    /// The block that ships to the conductor's host (omp-config
+    /// delivery-conductor-proposal.md): a third wake word, CONFLICT.
+    #[test]
+    #[serial]
+    fn deployment_config_conflict_prefix_wakes_kimi_only_in_uppercase() {
+        use crate::messages::MessageIntent::Request;
+        let (db, path, _env) = policy_db(
+            "[delivery.conductor]\n\
+             delegate = \"mupe\"\n\
+             leads = [\"poli\", \"valo\", \"henu\", \"todo\", \"zeno\"]\n\
+             wake_intents = [\"request\"]\n\
+             wake_prefixes = [\"BLOCKED\", \"DECISION\", \"CONFLICT\"]\n",
+        );
+        let valo = sender(SenderKind::Instance, "valo");
+        let d = send(&db, &valo, "CONFLICT: x", Some(Request), None, &["kimi"]);
+        assert_delivered_to_kimi(&db, &d, "CONFLICT: x");
+        let d = send(&db, &valo, "Conflict: x", Some(Request), None, &["kimi"]);
+        assert_rerouted_to_mupe(&db, &d, "Conflict: x");
+        cleanup_test_db(path);
+    }
+
     #[test]
     #[serial]
     fn lead_without_wake_word_or_request_and_nonlead_rerouted() {
@@ -2230,7 +2390,7 @@ mod tests {
     #[serial]
     fn invalid_policy_fails_closed_to_external_targeted_only() {
         use crate::messages::MessageIntent::Request;
-        let (db, path, _env) = policy_db("[delivery.kimi]\nleads = [\"valo\"]\n");
+        let (db, path, _env) = policy_db("[delivery.conductor]\nleads = [\"valo\"]\n");
         let valo = sender(SenderKind::Instance, "valo");
 
         let d = send(&db, &valo, "BLOCKED: x", Some(Request), None, &["kimi"]);
@@ -2289,8 +2449,9 @@ mod tests {
     #[serial]
     fn policy_marked_delegate_reroute_stops_after_one_hop() {
         let (db, path, _env) = policy_db(&format!(
-            "{KIMI_POLICY}\n[delivery.mupe]\ndelegate = \"lola\"\n"
+            "{KIMI_POLICY}\n[delivery.deputy]\ndelegate = \"lola\"\n"
         ));
+        crate::delivery_policy::register_role(&db, "mupe", "sess-mupe", "deputy").unwrap();
         let nova = sender(SenderKind::Instance, "nova");
 
         let d = send(&db, &nova, "hop", None, None, &["kimi"]);

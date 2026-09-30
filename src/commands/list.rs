@@ -454,6 +454,10 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
     } else {
         println!("Your name: (not participating)");
     }
+    // `[delivery.<role>]` filter state: NONE means the filter is off.
+    for line in crate::delivery_policy::role_status_lines(db) {
+        println!("{line}");
+    }
     println!();
 
     // Check if multiple tool types exist

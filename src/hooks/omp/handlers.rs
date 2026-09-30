@@ -257,6 +257,9 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
     if let Some(port) = notify_port {
         upsert_plugin_notify_endpoint(db, &instance_name, port);
     }
+    // A configured role nobody holds means its filter is off: say so at
+    // every bind (crate::delivery_policy).
+    crate::delivery_policy::warn_unheld_roles(db);
     log_info(
         "hooks",
         "omp-start.bind",
@@ -270,6 +273,35 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
         "bootstrap": bootstrap_for(ctx, db, &instance_name),
     });
     (0, response.to_string())
+}
+
+/// `omp-role --name <n> --session-id <sid> --role <r>`: add-only delivery
+/// role registration (crate::delivery_policy::register_role). The plugin
+/// sends it once per binding when the omp session carries conductor-guard's
+/// `conductor-role` marker. It is a separate hook rather than an `omp-start`
+/// flag because the marker can land after the session_start bind, and an
+/// older binary answers an unknown hook with an error instead of failing the
+/// bind.
+pub(crate) fn handle_role(db: &HcomDb, argv: &[String]) -> (i32, String) {
+    let (Some(name), Some(session_id), Some(role)) = (
+        parse_flag(argv, "--name"),
+        parse_flag(argv, "--session-id"),
+        parse_flag(argv, "--role"),
+    ) else {
+        return (
+            0,
+            r#"{"error":"Missing --name, --session-id or --role"}"#.to_string(),
+        );
+    };
+    // `transient` tells the plugin to retry (locked DB); any other error is
+    // final and the plugin stops asking for this binding.
+    match crate::delivery_policy::register_role(db, &name, &session_id, &role) {
+        Ok(()) => (0, serde_json::json!({"ok": true, "role": role}).to_string()),
+        Err(error) => (
+            0,
+            serde_json::json!({"error": error.message, "transient": error.transient}).to_string(),
+        ),
+    }
 }
 
 pub(crate) fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
@@ -459,6 +491,7 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
             "omp-read" => handle_read(&db, &handler_argv),
             "omp-beforetool" => handle_beforetool(&db, &handler_argv),
             "omp-stop" => handle_stop(&db, &handler_argv),
+            "omp-role" => handle_role(&db, &handler_argv),
             _ => (
                 0,
                 serde_json::json!({"error": format!("Unknown Omp hook: {}", hook_name_owned)})

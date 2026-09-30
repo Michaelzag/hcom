@@ -313,7 +313,14 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                     "pid": relay.pidfile_pid,
                 },
             },
-            "delivery": {},
+            "delivery": {
+                // Configured `[delivery.<role>]` roles and their live
+                // holders; an empty list means the role's filter is off.
+                "roles": crate::delivery_policy::role_status(db)
+                    .into_iter()
+                    .map(|(role, holders)| (role, json!(holders)))
+                    .collect::<serde_json::Map<_, _>>()
+            },
             "logs": {
                 "error_count": log_summary.get("error_count").and_then(|v| v.as_i64()).unwrap_or(0),
                 "warn_count": log_summary.get("warn_count").and_then(|v| v.as_i64()).unwrap_or(0),
@@ -419,6 +426,9 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     for (name, detail) in &launch_failures {
         let first_line = detail.lines().next().unwrap_or(detail);
         println!("failure:   {name}: {first_line}");
+    }
+    for line in crate::delivery_policy::role_status_lines(db) {
+        println!("delivery:  {line}");
     }
 
     // Relay summary + worker process line both branch on the canonical
