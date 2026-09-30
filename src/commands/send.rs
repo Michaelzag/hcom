@@ -244,9 +244,8 @@ struct ResolvedDelivery {
     effective_mentions: Vec<String>,
     delivered_to: Vec<String>,
     is_thread_resolved: bool,
-    /// Recipients the delivery policy refused: `(recipient, delegate)`, with
-    /// no delegate when the recipient's entry is invalid (fail closed).
-    reroutes: Vec<(String, Option<String>)>,
+    /// Recipients the delivery policy refused, as `(recipient, delegate)`.
+    reroutes: Vec<(String, String)>,
     /// Policy instances an External sender reached (the audited bypass).
     external_reached_policy: Vec<String>,
     /// The sender has a `[delivery.*]` entry: its requests create no watches.
@@ -254,13 +253,10 @@ struct ResolvedDelivery {
 }
 
 /// One `hcom send` output line per refused recipient.
-fn reroute_notices(reroutes: &[(String, Option<String>)]) -> Vec<String> {
+fn reroute_notices(reroutes: &[(String, String)]) -> Vec<String> {
     reroutes
         .iter()
-        .map(|(recipient, delegate)| match delegate {
-            Some(delegate) => format!("{recipient} takes no cc; delivered to {delegate}"),
-            None => format!("{recipient} takes no cc; not delivered (invalid delivery policy)"),
-        })
+        .map(|(recipient, delegate)| format!("{recipient} takes no cc; delivered to {delegate}"))
         .collect()
 }
 
@@ -337,7 +333,7 @@ fn resolve_delivery(
     // Operator delivery policy (crate::delivery_policy): a refused recipient
     // is replaced by its delegate in the stored mentions/exact_targets, which
     // is what receivers deliver from. One hop: a delegate is never evaluated.
-    let policies = crate::delivery_policy::load(db);
+    let policies = crate::delivery_policy::load(db)?;
     let facts = MessageFacts {
         from: &identity.name,
         external: matches!(identity.kind, SenderKind::External),
@@ -352,19 +348,13 @@ fn resolve_delivery(
         let mut kept: Vec<String> = Vec::with_capacity(effective_mentions.len());
         for name in effective_mentions {
             let target = match policies.send_verdict(&name, &facts) {
-                SendVerdict::Deliver => Some(name),
+                SendVerdict::Deliver => name,
                 SendVerdict::RerouteTo(delegate) => {
-                    reroutes.push((name, Some(delegate.clone())));
-                    Some(delegate)
-                }
-                SendVerdict::Drop => {
-                    reroutes.push((name, None));
-                    None
+                    reroutes.push((name, delegate.clone()));
+                    delegate
                 }
             };
-            if let Some(target) = target
-                && !kept.contains(&target)
-            {
+            if !kept.contains(&target) {
                 kept.push(target);
             }
         }
@@ -379,7 +369,7 @@ fn resolve_delivery(
     } else {
         Vec::new()
     };
-    let is_delegate_copy = |name: &str| reroutes.iter().any(|(_, d)| d.as_deref() == Some(name));
+    let is_delegate_copy = |name: &str| reroutes.iter().any(|(_, d)| d == name);
 
     let scope_data = build_scope_data(
         identity,
@@ -527,9 +517,7 @@ fn send_message_resolved(
     let delegate_copies: serde_json::Map<String, serde_json::Value> = delivery
         .reroutes
         .iter()
-        .filter_map(|(recipient, delegate)| {
-            Some((recipient.clone(), serde_json::json!(delegate.as_ref()?)))
-        })
+        .map(|(recipient, delegate)| (recipient.clone(), serde_json::json!(delegate)))
         .collect();
     if !delegate_copies.is_empty() {
         data[crate::delivery_policy::REROUTES_FIELD] = serde_json::Value::Object(delegate_copies);
@@ -1920,6 +1908,365 @@ mod tests {
 
     #[test]
     #[serial]
+    fn unreadable_role_holders_fail_closed_not_open() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        send(
+            &db,
+            &sender(SenderKind::Instance, "nova"),
+            "before",
+            None,
+            None,
+            &[],
+        );
+        // The registrations live in kv; make every read of it fail at step
+        // time (abs() of i64::MIN raises "integer overflow").
+        db.conn()
+            .execute_batch(
+                "ALTER TABLE kv RENAME TO kv_gone;
+                 CREATE VIEW kv AS SELECT key, value FROM kv_gone
+                 WHERE abs(-9223372036854775807 - 1) > 0;",
+            )
+            .unwrap();
+        assert!(
+            db.conn()
+                .query_row("SELECT count(*) FROM kv", [], |r| r.get::<_, i64>(0))
+                .is_err()
+        );
+
+        // Readers deliver nothing (the broadcast stays unread for later)
+        // instead of treating kimi as unfiltered; a send refuses.
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert!(!db.has_pending("kimi"));
+        let err = send_message(
+            &db,
+            &sender(SenderKind::Instance, "nova"),
+            "hi",
+            None,
+            Some(&["kimi".to_string()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot read role holders"), "{err}");
+        assert!(
+            crate::delivery_policy::role_status_lines(&db)[0]
+                .starts_with("delivery roles: unknown"),
+        );
+        cleanup_test_db(path);
+    }
+
+    // ── Backstop forward (zori #238929: nothing to the conductor is dropped) ──
+
+    /// A targeted inform to kimi as a 0.7.48 peer on LOTS writes it: no
+    /// send-side reroute, namespaced sender, relay origin 77.
+    fn old_peer_inform(text: &str, relay_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "from": "nova:LOTS",
+            "sender_kind": "instance",
+            "scope": "mentions",
+            "mentions": ["kimi"],
+            "delivered_to": ["kimi"],
+            "intent": "inform",
+            "text": text,
+            "_relay": {"device": "dev-lots", "short": "LOTS", "id": relay_id},
+        })
+    }
+
+    fn inject(db: &HcomDb, data: &serde_json::Value) -> i64 {
+        db.log_event("message", "nova:LOTS", data).unwrap()
+    }
+
+    fn forward_rows(db: &HcomDb) -> Vec<(String, serde_json::Value)> {
+        db.conn()
+            .prepare(
+                "SELECT instance, data FROM events
+                 WHERE json_extract(data, '$.delivery_forward_of') IS NOT NULL ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| {
+                let (instance, data) = r.unwrap();
+                (instance, serde_json::from_str(&data).unwrap())
+            })
+            .collect()
+    }
+
+    fn forward_count(db: &HcomDb) -> usize {
+        forward_rows(db).len()
+    }
+
+    fn notice_rows(db: &HcomDb) -> Vec<(String, serde_json::Value)> {
+        db.conn()
+            .prepare(
+                "SELECT instance, data FROM events
+                 WHERE json_extract(data, '$.delivery_notice_for') IS NOT NULL ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| {
+                let (instance, data) = r.unwrap();
+                (instance, serde_json::from_str(&data).unwrap())
+            })
+            .collect()
+    }
+
+    fn notice_count(db: &HcomDb) -> usize {
+        notice_rows(db).len()
+    }
+
+    fn cursor(db: &HcomDb, name: &str) -> i64 {
+        db.get_cursor(name)
+    }
+
+    #[test]
+    #[serial]
+    fn backstop_forwards_relayed_old_format_inform_once_with_sender_notice() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        let id = inject(&db, &old_peer_inform("old peer hi", 77));
+
+        // The holder's read returns nothing, moves its cursor past the event,
+        // and a second read adds nothing.
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert_eq!(cursor(&db, "kimi"), id);
+        assert!(unread_texts(&db, "kimi").is_empty());
+
+        let forwards = forward_rows(&db);
+        assert_eq!(forwards.len(), 1, "{forwards:?}");
+        let (instance, copy) = &forwards[0];
+        assert!(
+            !instance.contains(':'),
+            "relayable instance column: {instance}"
+        );
+        assert_eq!(copy["from"], "[hcom-delivery]");
+        assert_eq!(copy["delivery_forward_of"], id);
+        assert_eq!(copy["delivery_forward_of_from"], "nova:LOTS");
+        assert_eq!(copy["delivery_forward_of_origin"], "dev-lots:77");
+        assert_eq!(copy["intent"], "inform");
+        assert_eq!(copy["mentions"], serde_json::json!(["mupe"]));
+        assert_eq!(
+            unread_texts(&db, "mupe"),
+            vec!["[nova:LOTS → kimi, forwarded] old peer hi".to_string()]
+        );
+
+        // The sender on LOTS learns where it went; the row relays out.
+        let notices = notice_rows(&db);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let (instance, notice) = &notices[0];
+        assert!(
+            !instance.contains(':'),
+            "relayable instance column: {instance}"
+        );
+        assert_eq!(notice["mentions"], serde_json::json!(["nova:LOTS"]));
+        assert_eq!(notice["exact_targets"], serde_json::json!(["nova:LOTS"]));
+        assert_eq!(
+            notice["text"],
+            "kimi takes no cc; delivered to mupe (your message #77:LOTS)"
+        );
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn backstop_forward_is_once_across_readers_and_relay_reimport() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        let data = old_peer_inform("once", 78);
+        inject(&db, &data);
+        // A second process on the same database reads the holder too.
+        let other = HcomDb::open_at(&path).unwrap();
+        assert!(other.get_unread_messages("kimi").is_empty());
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert_eq!(forward_count(&db), 1);
+        assert_eq!(notice_count(&db), 1);
+
+        // A relay id-regression reset re-imports the row under a new rowid.
+        db.conn()
+            .execute(
+                "DELETE FROM events WHERE json_extract(data, '$._relay.id') = 78
+                 AND json_extract(data, '$.delivery_forward_of') IS NULL",
+                [],
+            )
+            .unwrap();
+        inject(&db, &data);
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert!(other.get_unread_messages("kimi").is_empty());
+        assert_eq!(forward_count(&db), 1);
+        assert_eq!(notice_count(&db), 1);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn idle_holder_gate_forwards_without_reporting_pending() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        inject(&db, &old_peer_inform("while idle", 79));
+        // The pty loop's gate: nothing to inject into kimi, and mupe already
+        // has it after this one check.
+        assert!(!db.has_pending("kimi"));
+        assert_eq!(forward_count(&db), 1);
+        assert!(
+            unread_texts(&db, "mupe")
+                .iter()
+                .any(|t| t.ends_with("while idle"))
+        );
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn broadcast_to_holder_is_never_forwarded() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        inject(
+            &db,
+            &serde_json::json!({
+                "from": "nova:LOTS", "sender_kind": "instance", "scope": "broadcast", "text": "all",
+            }),
+        );
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert!(!db.has_pending("kimi"));
+        assert_eq!(forward_count(&db), 0);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn forward_copy_is_not_refiltered_by_a_policy_marked_delegate() {
+        let (db, path, _env) = policy_db(&format!(
+            "{KIMI_POLICY}\n[delivery.deputy]\ndelegate = \"lola\"\n"
+        ));
+        crate::delivery_policy::register_role(&db, "mupe", "sess-mupe", "deputy").unwrap();
+        inject(&db, &old_peer_inform("hop once", 80));
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert_eq!(
+            unread_texts(&db, "mupe"),
+            vec!["[nova:LOTS → kimi, forwarded] hop once".to_string()]
+        );
+        assert!(unread_texts(&db, "lola").is_empty());
+        assert_eq!(forward_count(&db), 1);
+        cleanup_test_db(path);
+    }
+
+    /// A second connection holding the write lock, and this one failing fast.
+    fn hold_write_lock(db: &HcomDb, path: &PathBuf) -> rusqlite::Connection {
+        db.conn().execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        let guard = rusqlite::Connection::open(path).unwrap();
+        guard
+            .execute_batch("PRAGMA busy_timeout=0; BEGIN IMMEDIATE;")
+            .unwrap();
+        guard
+    }
+
+    #[test]
+    #[serial]
+    fn locked_forward_exposes_nothing_past_it_then_forwards_once() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        let refused = inject(&db, &old_peer_inform("refused", 81));
+        send(
+            &db,
+            &sender(SenderKind::Instance, "mupe"),
+            "later",
+            None,
+            None,
+            &["kimi"],
+        );
+        let before = cursor(&db, "kimi");
+
+        let guard = hold_write_lock(&db, &path);
+        // The forward cannot commit: the delegate's later message is not
+        // exposed either, so no ack can move the cursor past the refused one.
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert!(!db.has_pending("kimi"));
+        assert_eq!(cursor(&db, "kimi"), before);
+        assert_eq!(forward_count(&db), 0);
+        drop(guard);
+
+        assert_eq!(unread_texts(&db, "kimi"), vec!["later".to_string()]);
+        assert_eq!(cursor(&db, "kimi"), refused);
+        assert_eq!(forward_count(&db), 1);
+        assert!(
+            unread_texts(&db, "mupe")
+                .iter()
+                .any(|t| t.ends_with("refused"))
+        );
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn forward_that_stays_locked_gives_up_to_the_holder_after_five_tries() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        inject(&db, &old_peer_inform("stuck", 82));
+        send(
+            &db,
+            &sender(SenderKind::Instance, "mupe"),
+            "later",
+            None,
+            None,
+            &["kimi"],
+        );
+
+        let guard = hold_write_lock(&db, &path);
+        for _ in 0..4 {
+            assert!(unread_texts(&db, "kimi").is_empty());
+        }
+        // Fifth failure: the holder gets it rather than a wedged inbox.
+        let both = vec!["stuck".to_string(), "later".to_string()];
+        assert_eq!(unread_texts(&db, "kimi"), both);
+        drop(guard);
+        // Unlocked, it stays given up (no late forward, no duplicate) and the
+        // failure is recorded for `hcom status`.
+        assert_eq!(unread_texts(&db, "kimi"), both);
+        assert_eq!(forward_count(&db), 0);
+        let lines = crate::delivery_policy::role_status_lines(&db);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("delivery forward failed for event dev-lots:82")),
+            "{lines:?}"
+        );
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn forward_that_always_fails_reaches_the_holder_once_and_blocks_nothing() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER poison_forward BEFORE INSERT ON events
+                 WHEN NEW.data LIKE '%delivery_forward_of%'
+                 BEGIN SELECT RAISE(ABORT, 'poisoned'); END;",
+            )
+            .unwrap();
+        inject(&db, &old_peer_inform("poison", 83));
+        send(
+            &db,
+            &sender(SenderKind::Instance, "mupe"),
+            "later",
+            None,
+            None,
+            &["kimi"],
+        );
+
+        let unread = db.get_unread_messages("kimi");
+        let texts: Vec<&str> = unread.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["poison", "later"]);
+        // Acked like any delivery: the holder never sees it again.
+        let last = unread.last().and_then(|m| m.event_id).unwrap();
+        let mut updates = serde_json::Map::new();
+        updates.insert("last_event_id".into(), serde_json::json!(last));
+        crate::instances::update_instance_position(&db, "kimi", &updates);
+        assert!(unread_texts(&db, "kimi").is_empty());
+        assert_eq!(forward_count(&db), 0);
+        assert!(
+            crate::delivery_policy::role_status_lines(&db)
+                .iter()
+                .any(|l| l.contains("delivery forward failed for event dev-lots:83"))
+        );
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
     fn conductor_role_unheld_turns_filter_off_and_warns() {
         let (db, path, env) = rows_db(KIMI_POLICY);
         assert_eq!(
@@ -1967,8 +2314,8 @@ mod tests {
         assert_eq!(
             d.reroutes,
             vec![
-                ("kimi".to_string(), Some("mupe".to_string())),
-                ("lola".to_string(), Some("mupe".to_string())),
+                ("kimi".to_string(), "mupe".to_string()),
+                ("lola".to_string(), "mupe".to_string()),
             ]
         );
         assert_eq!(d.effective_mentions, vec!["mupe".to_string()]);
@@ -2118,7 +2465,7 @@ mod tests {
     fn assert_rerouted_to_mupe(db: &HcomDb, delivery: &ResolvedDelivery, text: &str) {
         assert_eq!(
             delivery.reroutes,
-            vec![("kimi".to_string(), Some("mupe".to_string()))],
+            vec![("kimi".to_string(), "mupe".to_string())],
             "{text}"
         );
         assert_eq!(
@@ -2338,7 +2685,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn system_launcher_and_reqwatch_ping_to_kimi_not_delivered() {
+    fn system_launcher_and_reqwatch_ping_to_kimi_forwarded_to_mupe_once() {
         let (db, path, _env) = policy_db(KIMI_POLICY);
         // Written straight to the events table, bypassing `hcom send`.
         db.notify_batch_failure("kimi", "batch-1", "zazu", "pty died")
@@ -2350,6 +2697,22 @@ mod tests {
         )
         .unwrap();
         assert!(unread_texts(&db, "kimi").is_empty());
+        assert!(
+            unread_texts(&db, "kimi").is_empty(),
+            "a second read adds nothing"
+        );
+
+        // Both reach mupe once, and no sender notice goes to a system sender.
+        let mupe = unread_texts(&db, "mupe");
+        for needle in ["Launch failed: zazu", "reqwatch: nova went idle"] {
+            assert_eq!(
+                mupe.iter().filter(|t| t.contains(needle)).count(),
+                1,
+                "{needle}: {mupe:?}"
+            );
+        }
+        assert_eq!(forward_count(&db), 2);
+        assert_eq!(notice_count(&db), 0);
 
         // Through `hcom send`, a System sender is rerouted like any instance.
         let launcher = sender(SenderKind::System, "hcom-launcher");
@@ -2388,44 +2751,55 @@ mod tests {
 
     #[test]
     #[serial]
-    fn invalid_policy_fails_closed_to_external_targeted_only() {
+    fn broken_policy_with_readable_delegate_forwards_to_it() {
         use crate::messages::MessageIntent::Request;
-        let (db, path, _env) = policy_db("[delivery.conductor]\nleads = [\"valo\"]\n");
+        // `lead` is a typo: the block is broken, its delegate still readable.
+        let (db, path, _env) = policy_db(
+            "[delivery.conductor]\ndelegate = \"mupe\"\nleads = [\"valo\"]\nlead = [\"x\"]\n",
+        );
+        // The broken block keeps no leads: even a lead's wake word goes to mupe.
         let valo = sender(SenderKind::Instance, "valo");
-
         let d = send(&db, &valo, "BLOCKED: x", Some(Request), None, &["kimi"]);
-        assert_eq!(d.reroutes, vec![("kimi".to_string(), None)]);
-        assert_eq!(
-            reroute_notices(&d.reroutes),
-            vec!["kimi takes no cc; not delivered (invalid delivery policy)".to_string()]
+        assert_rerouted_to_mupe(&db, &d, "BLOCKED: x");
+        let lines = crate::delivery_policy::role_status_lines(&db);
+        assert!(
+            lines.iter().any(
+                |l| l.starts_with("delivery policy INVALID: [delivery.conductor]")
+                    && l.contains("delegate mupe only")
+            ),
+            "{lines:?}"
         );
-        assert!(d.delivered_to.is_empty());
-        send(
-            &db,
-            &sender(SenderKind::Instance, "mupe"),
-            "hi",
-            None,
-            None,
-            &["kimi"],
-        );
-        send(
-            &db,
-            &sender(SenderKind::External, "bigboss"),
-            "everyone",
-            None,
-            None,
-            &[],
-        );
-        send(
-            &db,
-            &sender(SenderKind::External, "bigboss"),
-            "you",
-            None,
-            None,
-            &["kimi"],
-        );
+        cleanup_test_db(path);
+    }
 
-        assert_eq!(unread_texts(&db, "kimi"), vec!["you".to_string()]);
+    #[test]
+    #[serial]
+    fn broken_policy_without_delegate_delivers_to_holder_loudly() {
+        let (db, path, _env) = policy_db("[delivery.conductor]\nleads = [\"valo\"]\n");
+        let nova = sender(SenderKind::Instance, "nova");
+        let d = send(&db, &nova, "cc", None, None, &["kimi"]);
+        assert_delivered_to_kimi(&db, &d, "cc");
+        send(&db, &nova, "everyone", None, None, &[]);
+        crate::delivery_policy::role_status_lines(&db);
+
+        let unread = unread_texts(&db, "kimi");
+        assert_eq!(
+            unread
+                .iter()
+                .filter(|t| t.contains("delivery policy INVALID for role conductor"))
+                .count(),
+            1,
+            "{unread:?}"
+        );
+        assert!(!unread.contains(&"everyone".to_string()));
+        let lines = crate::delivery_policy::role_status_lines(&db);
+        assert!(
+            lines.iter().any(
+                |l| l.starts_with("delivery policy INVALID: [delivery.conductor]")
+                    && l.contains("no delegate")
+            ),
+            "{lines:?}"
+        );
         cleanup_test_db(path);
     }
 
@@ -2461,10 +2835,7 @@ mod tests {
 
         // mupe's own policy still applies to traffic addressed to mupe.
         let d = send(&db, &nova, "direct to mupe", None, None, &["mupe"]);
-        assert_eq!(
-            d.reroutes,
-            vec![("mupe".to_string(), Some("lola".to_string()))]
-        );
+        assert_eq!(d.reroutes, vec![("mupe".to_string(), "lola".to_string())]);
         assert_eq!(unread_texts(&db, "mupe"), vec!["hop".to_string()]);
         cleanup_test_db(path);
     }
@@ -2487,10 +2858,7 @@ mod tests {
         )
         .unwrap();
         assert!(d.is_thread_resolved);
-        assert_eq!(
-            d.reroutes,
-            vec![("kimi".to_string(), Some("mupe".to_string()))]
-        );
+        assert_eq!(d.reroutes, vec![("kimi".to_string(), "mupe".to_string())]);
         assert!(unread_texts(&db, "kimi").is_empty());
         assert!(unread_texts(&db, "mupe").contains(&"thread update".to_string()));
         assert!(unread_texts(&db, "lola").contains(&"thread update".to_string()));

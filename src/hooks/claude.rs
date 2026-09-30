@@ -1337,7 +1337,7 @@ fn deliver_freeze_messages(
         return (freeze_event_id, None);
     }
 
-    let last_id = events
+    let mut last_id = events
         .iter()
         .filter_map(|e| e.get("id").and_then(|v| v.as_i64()))
         .max()
@@ -1358,8 +1358,11 @@ fn deliver_freeze_messages(
     let subagent_names: Vec<&str> = subagent_rows.iter().map(|(n, _)| n.as_str()).collect();
 
     // Filter messages (the delivery policy backstop applies here too: this
-    // path reads events directly instead of through get_unread_messages).
-    let policies = crate::delivery_policy::load(db);
+    // path reads events directly instead of through get_unread_messages). An
+    // unreadable policy delivers nothing and keeps the cursor.
+    let Ok(policies) = crate::delivery_policy::load(db) else {
+        return (freeze_event_id, None);
+    };
     let mut subagent_msgs: Vec<Value> = Vec::new();
     let mut parent_msgs: Vec<Value> = Vec::new();
 
@@ -1392,7 +1395,10 @@ fn deliver_freeze_messages(
         } else if !subagent_names.is_empty()
             && subagent_names.iter().any(|name| {
                 match messages::should_deliver_message(event_data, name, sender_name) {
-                    Ok(v) => v && policies.admits_event(name, event_data),
+                    Ok(v) => {
+                        v && policies.read_verdict(name, event_data)
+                            == crate::delivery_policy::ReadVerdict::Deliver
+                    }
                     Err(e) => {
                         log::log_warn(
                             "hooks",
@@ -1408,11 +1414,27 @@ fn deliver_freeze_messages(
                 subagent_msgs.push(msg);
             }
         } else {
+            use crate::db::ForwardOutcome;
+            use crate::delivery_policy::ReadVerdict;
             match messages::should_deliver_message(event_data, instance_name, sender_name) {
-                Ok(true) if policies.admits_event(instance_name, event_data) => {
-                    parent_msgs.push(msg)
-                }
-                Ok(_) => {}
+                Ok(true) => match policies.read_verdict(instance_name, event_data) {
+                    ReadVerdict::Deliver => parent_msgs.push(msg),
+                    ReadVerdict::Skip => {}
+                    ReadVerdict::ForwardTo(delegate) => {
+                        let id = event.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                        match db.forward_refused(instance_name, id, event_data, &delegate, None) {
+                            ForwardOutcome::Forwarded { .. } => {}
+                            ForwardOutcome::DeliverToHolder => parent_msgs.push(msg),
+                            // Not forwarded yet: stop below it so the cursor
+                            // cannot pass it; the next read retries.
+                            ForwardOutcome::Retry => {
+                                last_id = id - 1;
+                                break;
+                            }
+                        }
+                    }
+                },
+                Ok(false) => {}
                 Err(e) => {
                     log::log_warn(
                         "hooks",

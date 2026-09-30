@@ -313,13 +313,24 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                     "pid": relay.pidfile_pid,
                 },
             },
-            "delivery": {
-                // Configured `[delivery.<role>]` roles and their live
-                // holders; an empty list means the role's filter is off.
-                "roles": crate::delivery_policy::role_status(db)
-                    .into_iter()
-                    .map(|(role, holders)| (role, json!(holders)))
-                    .collect::<serde_json::Map<_, _>>()
+            "delivery": match crate::delivery_policy::role_status(db) {
+                // Configured `[delivery.<role>]` roles: live holders (empty =
+                // the role's filter is off), where refusals go, and why a
+                // broken block is broken; plus forwards that failed for good.
+                Ok(roles) => json!({
+                    "roles": roles
+                        .into_iter()
+                        .map(|s| (s.role, json!({
+                            "holders": s.holders,
+                            "delegate": s.delegate,
+                            "invalid": s.invalid,
+                        })))
+                        .collect::<serde_json::Map<_, _>>(),
+                    "forward_failures": crate::delivery_policy::forward_failures(db)
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                }),
+                Err(e) => json!({"error": e}),
             },
             "logs": {
                 "error_count": log_summary.get("error_count").and_then(|v| v.as_i64()).unwrap_or(0),

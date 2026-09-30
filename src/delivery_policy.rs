@@ -27,18 +27,24 @@
 //! its text (after leading whitespace) opens with a `wake_prefixes` word as a
 //! whole case-sensitive word, or (c) its sender is `SenderKind::External` (the
 //! human). System senders (launcher events, hcom notices, reqwatch pings) are
-//! not exempt. Broadcasts of any sender kind never reach it. `hcom send`
-//! rewrites a refused recipient to the delegate (one hop: the rerouted copy is
-//! never re-evaluated, even when the delegate holds a role of its own), and
-//! every read path re-applies the rule as a backstop for traffic that never
-//! went through `hcom send` (system notices, remote hosts without this
-//! config, events written before the role was registered).
+//! not exempt. Broadcasts of any sender kind never reach it. Nothing refused
+//! is dropped (zori's ruling): `hcom send` rewrites a refused recipient to
+//! the delegate, and the holder's consuming read (`HcomDb::scan_unread`)
+//! forwards every refused targeted message that did not go through `hcom
+//! send` (system notices, older or unconfigured peers, events written before
+//! the role was registered) to the delegate once, with a notice to an
+//! instance sender (`HcomDb::forward_refused`). Rerouted and forwarded copies
+//! carry `delivery_reroutes`, so they are never re-evaluated, even when the
+//! delegate holds a role of its own (one hop).
 //!
-//! Fail closed: an entry that is present but invalid (not a table, no or
-//! empty `delegate`, wrong types, unknown keys), or a config.toml that no
-//! longer parses while it still names `[delivery.<role>]`, leaves the role's
-//! holders receiving only targeted messages from External senders, and logs
-//! a warning each time the effective policy changes.
+//! A broken block (not a table, wrong types, unknown keys, or a config.toml
+//! that no longer parses while it still names `[delivery.<role>]`) keeps its
+//! readable `delegate` and nothing else: no leads, default wake words. With
+//! no readable delegate there is nowhere to forward, so the holder receives
+//! every targeted message, `hcom status` / `hcom list` say `delivery policy
+//! INVALID`, and the holder gets one notice per policy hash. A database
+//! error while reading the role holders is never read as "no holders":
+//! readers deliver nothing that round and a send fails.
 //!
 //! Missed registration is the failure that would turn the filter silently
 //! off, so a configured role with no live holder is logged as a warning at
@@ -68,8 +74,20 @@ const KNOWN_KEYS: &[&str] = &["delegate", "leads", "wake_intents", "wake_prefixe
 const KV_LOGGED_HASH: &str = "delivery_policy:logged_hash";
 /// kv prefix of one role registration per instance name.
 const KV_ROLE_PREFIX: &str = "delivery_role:";
-/// Event field recording `{refused recipient: delegate}` for a rerouted send.
+/// Event field recording `{refused recipient: delegate}` for a rerouted send
+/// or a forward copy: the delegate named there is never re-evaluated.
 pub const REROUTES_FIELD: &str = "delivery_reroutes";
+/// Forward copy field naming the local id of the event it forwards.
+pub const FORWARD_OF_FIELD: &str = "delivery_forward_of";
+/// kv claim, one per forwarded event id (the primary key is the exactly-once).
+pub const KV_FORWARDED_PREFIX: &str = "delivery_forwarded:";
+/// kv record of a forward that failed for good and went to the holder.
+pub const KV_FORWARD_FAILED_PREFIX: &str = "delivery_forward_failed:";
+/// kv count of failed forward attempts per event id.
+pub const KV_FORWARD_ATTEMPTS_PREFIX: &str = "delivery_forward_attempts:";
+/// Locked-database retries before a forward is given up and the holder
+/// gets the message instead.
+pub const MAX_FORWARD_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
@@ -79,11 +97,41 @@ pub struct Policy {
     pub wake_prefixes: Vec<String>,
 }
 
+/// One `[delivery.<role>]` entry. `policy` is the rule that applies:
+/// the whole block, or, for a broken block whose `delegate` is still
+/// readable, that delegate alone (no leads, default wake words). A broken
+/// block with no readable delegate has no rule: its holder receives every
+/// targeted message (nothing is dropped) and status shows it INVALID.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Entry {
-    Valid(Policy),
-    /// Present but unusable; the reason goes in the warning.
-    Invalid(String),
+pub struct Entry {
+    pub policy: Option<Policy>,
+    /// Why the block is broken; `None` for a valid block.
+    pub invalid: Option<String>,
+}
+
+impl Entry {
+    fn valid(policy: Policy) -> Self {
+        Self {
+            policy: Some(policy),
+            invalid: None,
+        }
+    }
+
+    /// A broken block, degraded to its readable delegate when there is one.
+    fn broken(reason: String, delegate: Option<String>) -> Self {
+        Self {
+            policy: delegate.map(|delegate| Policy {
+                delegate,
+                leads: Vec::new(),
+                wake_intents: DEFAULT_WAKE_INTENTS.iter().map(|s| s.to_string()).collect(),
+                wake_prefixes: DEFAULT_WAKE_PREFIXES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            }),
+            invalid: Some(reason),
+        }
+    }
 }
 
 /// The `[delivery.*]` entries in effect (keyed by role) and the live
@@ -126,8 +174,17 @@ impl<'a> MessageFacts<'a> {
 pub enum SendVerdict {
     Deliver,
     RerouteTo(String),
-    /// Invalid entry: there is no delegate to reroute to.
-    Drop,
+}
+
+/// What a reader does with one stored message event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadVerdict {
+    Deliver,
+    /// Not for this reader (a broadcast to a role holder).
+    Skip,
+    /// A targeted message the holder refuses: it goes to the delegate as a
+    /// forward copy, never dropped.
+    ForwardTo(String),
 }
 
 impl Policies {
@@ -144,10 +201,11 @@ impl Policies {
     /// Send-side decision for a recipient of a targeted message.
     pub fn send_verdict(&self, recipient: &str, msg: &MessageFacts<'_>) -> SendVerdict {
         match self.entry_for(recipient) {
-            None => SendVerdict::Deliver,
-            Some(entry) if entry_admits(entry, msg) => SendVerdict::Deliver,
-            Some(Entry::Valid(policy)) => SendVerdict::RerouteTo(policy.delegate.clone()),
-            Some(Entry::Invalid(_)) => SendVerdict::Drop,
+            Some(entry) if !entry_admits(entry, msg) => match &entry.policy {
+                Some(policy) => SendVerdict::RerouteTo(policy.delegate.clone()),
+                None => SendVerdict::Deliver,
+            },
+            _ => SendVerdict::Deliver,
         }
     }
 
@@ -157,18 +215,26 @@ impl Policies {
             .is_none_or(|entry| entry_admits(entry, msg))
     }
 
-    /// Receive-side backstop: may `receiver` read this stored message event?
-    /// A receiver named as a reroute delegate on the event is admitted
-    /// without evaluating its own policy (one hop, never re-evaluated).
-    pub fn admits_event(&self, receiver: &str, data: &Value) -> bool {
-        if !self.governs(receiver) {
-            return true;
-        }
+    /// Receive-side backstop for one stored message event already in the
+    /// receiver's scope. A receiver named as a reroute delegate on the event
+    /// is admitted without evaluating its own policy (one hop, never
+    /// re-evaluated); forward copies carry that mark.
+    pub fn read_verdict(&self, receiver: &str, data: &Value) -> ReadVerdict {
+        let Some(entry) = self.entry_for(receiver) else {
+            return ReadVerdict::Deliver;
+        };
         let rerouted_here = data
             .get(REROUTES_FIELD)
             .and_then(|v| v.as_object())
             .is_some_and(|map| map.values().any(|to| to.as_str() == Some(receiver)));
-        rerouted_here || self.admits(receiver, &MessageFacts::from_event(data))
+        let facts = MessageFacts::from_event(data);
+        if rerouted_here || entry_admits(entry, &facts) {
+            return ReadVerdict::Deliver;
+        }
+        match (&entry.policy, facts.targeted) {
+            (Some(policy), true) => ReadVerdict::ForwardTo(policy.delegate.clone()),
+            _ => ReadVerdict::Skip,
+        }
     }
 
     /// Every configured role with its live holders (empty = NONE).
@@ -205,8 +271,9 @@ fn entry_admits(entry: &Entry, msg: &MessageFacts<'_>) -> bool {
     if msg.external {
         return true;
     }
-    let Entry::Valid(policy) = entry else {
-        return false;
+    // No readable delegate: nowhere to forward, so the holder keeps it.
+    let Some(policy) = &entry.policy else {
+        return true;
     };
     if msg.from == policy.delegate {
         return true;
@@ -261,21 +328,42 @@ pub fn parse(content: &str) -> Policies {
 }
 
 /// config.toml no longer parses: every `[delivery.<role>]` header still in
-/// the text fails closed rather than silently dropping its protection.
+/// the text stays in force, degraded to the `delegate = "..."` line under it
+/// when one is readable, rather than silently dropping its protection.
 fn fail_closed_from_headers(content: &str) -> Policies {
-    let entries = content
-        .lines()
-        .filter_map(|line| {
-            let inner = line.trim().strip_prefix("[delivery.")?;
-            let role = inner.split(']').next()?.trim().trim_matches(['"', '\'']);
-            (!role.is_empty()).then(|| {
-                (
-                    role.to_string(),
-                    Entry::Invalid("config.toml does not parse".to_string()),
-                )
-            })
-        })
-        .collect();
+    let mut entries = BTreeMap::new();
+    let mut current: Option<(String, Option<String>)> = None;
+    let mut finish = |current: &mut Option<(String, Option<String>)>| {
+        if let Some((role, delegate)) = current.take() {
+            entries.insert(
+                role,
+                Entry::broken("config.toml does not parse".to_string(), delegate),
+            );
+        }
+    };
+    for line in content.lines().map(str::trim) {
+        if line.starts_with('[') {
+            finish(&mut current);
+            if let Some(inner) = line.strip_prefix("[delivery.") {
+                let role = inner
+                    .split(']')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches(['"', '\'']);
+                if !role.is_empty() {
+                    current = Some((role.to_string(), None));
+                }
+            }
+        } else if let Some((_, delegate)) = current.as_mut()
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "delegate"
+        {
+            let value = value.trim().trim_matches(['"', '\'']).trim();
+            *delegate = (!value.is_empty()).then(|| value.to_string());
+        }
+    }
+    finish(&mut current);
     Policies {
         entries,
         holders: BTreeMap::new(),
@@ -284,42 +372,43 @@ fn fail_closed_from_headers(content: &str) -> Policies {
 
 fn parse_entry(value: &toml::Value) -> Entry {
     let Some(table) = value.as_table() else {
-        return Entry::Invalid("entry is not a table".to_string());
+        return Entry::broken("entry is not a table".to_string(), None);
     };
-    if let Some(unknown) = table.keys().find(|k| !KNOWN_KEYS.contains(&k.as_str())) {
-        return Entry::Invalid(format!("unknown key `{unknown}`"));
+    let delegate = table
+        .get("delegate")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
+    match parse_policy(table, delegate.clone()) {
+        Ok(policy) => Entry::valid(policy),
+        Err(reason) => Entry::broken(reason, delegate),
     }
-    let delegate = match table.get("delegate").and_then(|v| v.as_str()) {
-        Some(d) if !d.trim().is_empty() => d.trim().to_string(),
-        _ => return Entry::Invalid("`delegate` must be a non-empty string".to_string()),
-    };
-    let leads = match string_list(table, "leads", &[]) {
-        Ok(v) => v,
-        Err(e) => return Entry::Invalid(e),
-    };
-    let wake_intents = match string_list(table, "wake_intents", DEFAULT_WAKE_INTENTS) {
-        Ok(v) => v,
-        Err(e) => return Entry::Invalid(e),
-    };
+}
+
+fn parse_policy(table: &toml::Table, delegate: Option<String>) -> Result<Policy, String> {
+    if let Some(unknown) = table.keys().find(|k| !KNOWN_KEYS.contains(&k.as_str())) {
+        return Err(format!("unknown key `{unknown}`"));
+    }
+    let delegate = delegate.ok_or("`delegate` must be a non-empty string")?;
+    let leads = string_list(table, "leads", &[])?;
+    let wake_intents = string_list(table, "wake_intents", DEFAULT_WAKE_INTENTS)?;
     if let Some(bad) = wake_intents
         .iter()
         .find(|i| crate::core::helpers::validate_intent(i).is_err())
     {
-        return Entry::Invalid(format!("`wake_intents` has unknown intent `{bad}`"));
+        return Err(format!("`wake_intents` has unknown intent `{bad}`"));
     }
-    let wake_prefixes = match string_list(table, "wake_prefixes", DEFAULT_WAKE_PREFIXES) {
-        Ok(v) => v,
-        Err(e) => return Entry::Invalid(e),
-    };
+    let wake_prefixes = string_list(table, "wake_prefixes", DEFAULT_WAKE_PREFIXES)?;
     if let Some(bad) = wake_prefixes
         .iter()
         .find(|p| p.is_empty() || p.chars().any(|c| c.is_lowercase() || c.is_whitespace()))
     {
-        return Entry::Invalid(format!(
+        return Err(format!(
             "`wake_prefixes` entry `{bad}` must be a non-empty uppercase word"
         ));
     }
-    Entry::Valid(Policy {
+    Ok(Policy {
         delegate,
         leads,
         wake_intents,
@@ -344,16 +433,21 @@ fn string_list(table: &toml::Table, key: &str, default: &[&str]) -> Result<Vec<S
 /// every call (delivery time), so an operator edit or a new registration
 /// takes effect on the next read without a restart. No `[delivery.*]` entry
 /// means no DB query at all.
-pub fn load(db: &HcomDb) -> Policies {
+///
+/// A DB error while reading the holders is an error, never "no holders":
+/// that would switch the filter off for one read. Readers deliver nothing
+/// and leave the cursor where it is; a send fails.
+pub fn load(db: &HcomDb) -> Result<Policies, String> {
     let mut policies = match std::fs::read_to_string(crate::paths::config_toml_path()) {
         Ok(content) => parse(&content),
         Err(_) => Policies::default(),
     };
     if !policies.entries.is_empty() {
-        policies.holders = live_role_holders(db);
+        policies.holders = live_role_holders(db)
+            .map_err(|e| format!("delivery policy: cannot read role holders: {e}"))?;
     }
     audit(db, &policies);
-    policies
+    Ok(policies)
 }
 
 /// One registration, stored in kv under `delivery_role:<name>`. It counts
@@ -386,18 +480,30 @@ fn read_record(value: &str) -> Option<RoleRecord> {
     serde_json::from_str(value).ok()
 }
 
-fn live_role_holders(db: &HcomDb) -> BTreeMap<String, String> {
-    db.kv_prefix(KV_ROLE_PREFIX)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(key, value)| {
-            let name = key.strip_prefix(KV_ROLE_PREFIX)?.to_string();
-            let record = read_record(&value)?;
-            record_is_live(db, &name, &record)
-                .unwrap_or(false)
-                .then_some((name, record.role))
+/// Runs its own query rather than `kv_prefix`, which drops row errors: a
+/// failed step here must surface as an error, never as "no holders".
+fn live_role_holders(db: &HcomDb) -> Result<BTreeMap<String, String>, String> {
+    let rows = db
+        .conn()
+        .prepare_cached("SELECT key, value FROM kv WHERE key >= ?1 AND key < ?2")
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![KV_ROLE_PREFIX, "delivery_role;"], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
         })
-        .collect()
+        .map_err(|e| e.to_string())?;
+    let mut holders = BTreeMap::new();
+    for (key, value) in rows {
+        let (Some(name), Some(record)) = (key.strip_prefix(KV_ROLE_PREFIX), read_record(&value))
+        else {
+            continue;
+        };
+        if record_is_live(db, name, &record).map_err(|e| e.to_string())? {
+            holders.insert(name.to_string(), record.role);
+        }
+    }
+    Ok(holders)
 }
 
 /// Why a registration did not happen. `transient` (a locked or failing
@@ -521,7 +627,14 @@ fn register_role_inner(
 /// Warn for every configured role no live instance holds: the filter is off
 /// for it. Called at every omp bind.
 pub fn warn_unheld_roles(db: &HcomDb) {
-    for (role, holders) in load(db).role_holders() {
+    let policies = match load(db) {
+        Ok(policies) => policies,
+        Err(e) => {
+            crate::log::log_warn("delivery_policy", "load_failed", &e);
+            return;
+        }
+    };
+    for (role, holders) in policies.role_holders() {
         if holders.is_empty() {
             crate::log::log_warn(
                 "delivery_policy",
@@ -534,40 +647,91 @@ pub fn warn_unheld_roles(db: &HcomDb) {
     }
 }
 
-/// Every configured role with its live holders (empty = NONE), for
-/// `hcom status --json`.
-pub fn role_status(db: &HcomDb) -> Vec<(String, Vec<String>)> {
-    load(db)
+/// One configured role as `hcom status` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleStatus {
+    pub role: String,
+    /// Live holders; empty means the role's filter is off.
+    pub holders: Vec<String>,
+    /// Why the block is broken, if it is.
+    pub invalid: Option<String>,
+    /// Where refused messages go (`None` for a broken block with no
+    /// readable delegate: its holders get everything).
+    pub delegate: Option<String>,
+}
+
+/// Every configured role with its live holders, for `hcom status --json`.
+pub fn role_status(db: &HcomDb) -> Result<Vec<RoleStatus>, String> {
+    let policies = load(db)?;
+    Ok(policies
         .role_holders()
         .into_iter()
         .map(|(role, holders)| {
-            (
-                role.to_string(),
-                holders.into_iter().map(str::to_string).collect(),
-            )
+            let entry = &policies.entries[role];
+            RoleStatus {
+                role: role.to_string(),
+                holders: holders.into_iter().map(str::to_string).collect(),
+                invalid: entry.invalid.clone(),
+                delegate: entry.policy.as_ref().map(|p| p.delegate.clone()),
+            }
+        })
+        .collect())
+}
+
+/// Forwards that failed for good and went to the holder instead, as
+/// `(event id, reason)`.
+pub fn forward_failures(db: &HcomDb) -> Vec<(String, String)> {
+    db.kv_prefix(KV_FORWARD_FAILED_PREFIX)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(key, reason)| {
+            Some((
+                key.strip_prefix(KV_FORWARD_FAILED_PREFIX)?.to_string(),
+                reason,
+            ))
         })
         .collect()
 }
 
-/// `<role> role: <holders>|NONE`, one line per configured role, for
-/// `hcom status` / `hcom list`.
+/// `<role> role: <holders>|NONE` per configured role, plus a loud line for a
+/// broken block and for every forward that failed, for `hcom status` /
+/// `hcom list`.
 pub fn role_status_lines(db: &HcomDb) -> Vec<String> {
-    role_status(db)
-        .into_iter()
-        .map(|(role, holders)| {
-            let who = if holders.is_empty() {
-                "NONE".to_string()
-            } else {
-                holders.join(", ")
+    let roles = match role_status(db) {
+        Ok(roles) => roles,
+        Err(e) => return vec![format!("delivery roles: unknown ({e})")],
+    };
+    let mut lines = Vec::new();
+    for status in roles {
+        let who = if status.holders.is_empty() {
+            "NONE".to_string()
+        } else {
+            status.holders.join(", ")
+        };
+        lines.push(format!("{} role: {who}", status.role));
+        if let Some(reason) = &status.invalid {
+            let effect = match &status.delegate {
+                Some(delegate) => format!("delegate {delegate} only, no leads"),
+                None => "no delegate: the holder receives everything targeted".to_string(),
             };
-            format!("{role} role: {who}")
-        })
-        .collect()
+            lines.push(format!(
+                "delivery policy INVALID: [delivery.{}] {reason} ({effect})",
+                status.role
+            ));
+        }
+    }
+    for (event_id, reason) in forward_failures(db) {
+        lines.push(format!(
+            "delivery forward failed for event {event_id}: {reason} (delivered to the holder)"
+        ));
+    }
+    lines
 }
 
 /// Log one line when the effective policy differs from the last one logged
 /// (the hash is kept in kv, so it is one line per change across processes).
-/// A process-local memo keeps repeat loads to a hash compare.
+/// A process-local memo keeps repeat loads to a hash compare. A broken block
+/// with no readable delegate also sends each holder one notice per hash.
 fn audit(db: &HcomDb, policies: &Policies) {
     static SEEN: Mutex<Option<(std::path::PathBuf, String)>> = Mutex::new(None);
     let hash = policies.hash();
@@ -603,18 +767,43 @@ fn audit(db: &HcomDb, policies: &Policies) {
             ("roles", &holders.join(",")),
         ],
     );
-    for (role, entry) in &policies.entries {
-        if let Entry::Invalid(reason) = entry {
+    for (role, names) in policies.role_holders() {
+        let entry = &policies.entries[role];
+        if let Some(reason) = &entry.invalid {
+            let effect = match &entry.policy {
+                Some(policy) => format!("forwarding to its delegate {} only", policy.delegate),
+                None => {
+                    "no readable delegate, so every targeted message reaches the holder".to_string()
+                }
+            };
             crate::log::log_warn(
                 "delivery_policy",
                 "invalid_entry",
-                &format!(
-                    "[delivery.{role}] is invalid ({reason}); failing closed: role {role} receives only targeted messages from External senders"
-                ),
+                &format!("[delivery.{role}] is invalid ({reason}); {effect}"),
             );
+            if entry.policy.is_none() {
+                for holder in &names {
+                    // One notice per policy hash and holder, however many
+                    // processes see the change: the kv primary key claims it.
+                    let claimed = db
+                        .conn()
+                        .execute(
+                            "INSERT OR IGNORE INTO kv (key, value) VALUES (?1, '1')",
+                            [format!("delivery_invalid_notice:{hash}:{holder}")],
+                        )
+                        .is_ok_and(|n| n == 1);
+                    if claimed {
+                        let _ = crate::db::subscriptions::send_system_message(
+                            db,
+                            "[hcom-delivery]",
+                            &format!(
+                                "@{holder} delivery policy INVALID for role {role} ({reason}): no readable delegate, so every targeted message now reaches you. Fix [delivery.{role}] in ~/.hcom/config.toml."
+                            ),
+                        );
+                    }
+                }
+            }
         }
-    }
-    for (role, names) in policies.role_holders() {
         match names.len() {
             0 => crate::log::log_warn(
                 "delivery_policy",
@@ -668,7 +857,7 @@ leads = ["poli", "valo"]
         let policies = parse(CONDUCTOR);
         assert_eq!(
             policies.entries.get("conductor"),
-            Some(&Entry::Valid(Policy {
+            Some(&Entry::valid(Policy {
                 delegate: "mupe".into(),
                 leads: vec!["poli".into(), "valo".into()],
                 wake_intents: vec!["request".into()],
@@ -683,23 +872,47 @@ leads = ["poli", "valo"]
     }
 
     #[test]
-    fn parse_invalid_entries_fail_closed() {
-        for bad in [
-            "[delivery.conductor]\nleads = [\"poli\"]\n",
-            "[delivery.conductor]\ndelegate = \"  \"\n",
-            "[delivery.conductor]\ndelegate = 3\n",
-            "[delivery.conductor]\ndelegate = \"mupe\"\nleads = \"poli\"\n",
-            "[delivery.conductor]\ndelegate = \"mupe\"\nwake_intents = [\"shout\"]\n",
-            "[delivery.conductor]\ndelegate = \"mupe\"\nwake_prefixes = [\"blocked\"]\n",
-            "[delivery.conductor]\ndelegate = \"mupe\"\nlead = [\"poli\"]\n",
-            "[delivery]\nconductor = \"mupe\"\n",
-            // Whole file unparseable: the header alone still fails closed.
-            "[delivery.conductor]\ndelegate = \"mupe\"\n[terminal\n",
+    fn broken_entries_keep_a_readable_delegate_and_nothing_else() {
+        let delegate_only = |delegate: &str| {
+            Some(Policy {
+                delegate: delegate.into(),
+                leads: Vec::new(),
+                wake_intents: vec!["request".into()],
+                wake_prefixes: vec!["BLOCKED".into(), "DECISION".into()],
+            })
+        };
+        for (bad, policy) in [
+            ("[delivery.conductor]\nleads = [\"poli\"]\n", None),
+            ("[delivery.conductor]\ndelegate = \"  \"\n", None),
+            ("[delivery.conductor]\ndelegate = 3\n", None),
+            ("[delivery]\nconductor = \"mupe\"\n", None),
+            (
+                "[delivery.conductor]\ndelegate = \"mupe\"\nleads = \"poli\"\n",
+                delegate_only("mupe"),
+            ),
+            (
+                "[delivery.conductor]\ndelegate = \"mupe\"\nwake_intents = [\"shout\"]\n",
+                delegate_only("mupe"),
+            ),
+            (
+                "[delivery.conductor]\ndelegate = \"mupe\"\nwake_prefixes = [\"blocked\"]\n",
+                delegate_only("mupe"),
+            ),
+            (
+                "[delivery.conductor]\ndelegate = \"mupe\"\nlead = [\"poli\"]\n",
+                delegate_only("mupe"),
+            ),
+            // Whole file unparseable: the header and its delegate line stand.
+            (
+                "[delivery.conductor]\ndelegate = \"mupe\"\n[terminal\n",
+                delegate_only("mupe"),
+            ),
+            ("[delivery.conductor]\nleads = [\n[terminal\n", None),
         ] {
-            assert!(
-                matches!(parse(bad).entries.get("conductor"), Some(Entry::Invalid(_))),
-                "{bad}"
-            );
+            let entry = parse(bad).entries.remove("conductor");
+            let entry = entry.unwrap_or_else(|| panic!("no entry for {bad}"));
+            assert!(entry.invalid.is_some(), "{bad}");
+            assert_eq!(entry.policy, policy, "{bad}");
         }
     }
 
@@ -765,23 +978,20 @@ leads = ["poli", "valo"]
     }
 
     #[test]
-    fn invalid_entry_admits_only_external_targeted() {
+    fn broken_entry_without_delegate_delivers_targeted_to_the_holder() {
         let policies = held("[delivery.conductor]\nleads = [\"valo\"]\n");
-        assert_eq!(
-            policies.send_verdict("kimi", &facts("valo", Some("request"), "BLOCKED: x")),
-            SendVerdict::Drop
-        );
-        let external = MessageFacts {
-            external: true,
-            ..facts("bigboss", None, "hi")
-        };
-        assert_eq!(
-            policies.send_verdict("kimi", &external),
-            SendVerdict::Deliver
-        );
+        for msg in [
+            facts("nova", Some("inform"), "cc"),
+            MessageFacts {
+                external: true,
+                ..facts("bigboss", None, "hi")
+            },
+        ] {
+            assert_eq!(policies.send_verdict("kimi", &msg), SendVerdict::Deliver);
+        }
         let broadcast = MessageFacts {
             targeted: false,
-            ..external
+            ..facts("nova", None, "all")
         };
         assert!(!policies.admits("kimi", &broadcast));
     }

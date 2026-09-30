@@ -267,8 +267,24 @@ impl HcomDb {
     /// Check if there are pending (unread) messages for an instance.
     ///
     /// Lightweight check — parses only the JSON `data` column (skipping full
-    /// Message construction) and returns on the first matching row.
+    /// Message construction) and returns on the first matching row. For a
+    /// delivery-role holder this is also the gate the pty delivery loop polls
+    /// while the seat is idle, so it runs the forwarding scan: a refused
+    /// message reaches the delegate on this wake without ever reporting
+    /// "pending" (which would inject an empty wake into the holder).
     pub fn has_pending(&self, name: &str) -> bool {
+        let policies = match crate::delivery_policy::load(self) {
+            Ok(policies) => policies,
+            Err(e) => {
+                crate::log::log_error("db", "has_pending.delivery_policy", &e);
+                return false;
+            }
+        };
+        if policies.governs(name) {
+            return self
+                .scan_unread(name, true)
+                .is_some_and(|deliver| !deliver.is_empty());
+        }
         let last_event_id = match self.get_instance_status(name) {
             Ok(Some(status)) => status.last_event_id,
             // No instance row (e.g. a launch placeholder deleted after restore_stopped
@@ -301,7 +317,6 @@ impl HcomDb {
             }
         };
 
-        let policies = crate::delivery_policy::load(self);
         for data in rows.flatten() {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
                 && Self::should_deliver_to(&json, name, &policies)
@@ -333,7 +348,7 @@ impl HcomDb {
         let mut min_id = i64::MAX;
         let mut max_id = i64::MIN;
         let mut count = 0i64;
-        let policies = crate::delivery_policy::load(self);
+        let policies = crate::delivery_policy::load(self).ok()?;
         for (id, data) in rows.flatten() {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
                 && Self::should_deliver_to(&json, name, &policies)
