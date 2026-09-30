@@ -2,6 +2,7 @@
 
 use crate::config;
 use crate::db::HcomDb;
+use crate::relay::broker::BrokerProbe;
 use crate::relay::token::DecodedToken;
 use crate::relay::{self, DEFAULT_BROKERS};
 use crate::shared::CommandContext;
@@ -42,14 +43,6 @@ fn parse_broker_flags(argv: &[String]) -> (Option<String>, Option<String>, Vec<S
 /// Returns round-trip ms or None on failure.
 fn ping_broker(host: &str, port: u16, use_tls: bool) -> Option<u32> {
     crate::relay::broker::ping_broker(host, port, use_tls).map(|ms| ms as u32)
-}
-
-/// Test all default brokers in parallel. Returns (host, port, ping_ms|None) for each.
-fn test_brokers_parallel() -> Vec<(String, u16, Option<u32>)> {
-    relay::broker::test_brokers_parallel(DEFAULT_BROKERS)
-        .into_iter()
-        .map(|(h, p, ms)| (h, p, ms.map(|m| m as u32)))
-        .collect()
 }
 
 /// Encode relay_id + broker into a join token. Always passes the active PSK so
@@ -618,16 +611,18 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
     } else {
         // Public broker — test all in parallel
         println!("Testing brokers...");
-        let results = test_brokers_parallel();
+        let results = relay::broker::test_brokers_parallel(DEFAULT_BROKERS);
         let mut best = None;
-        for (host, port, ms) in &results {
-            if let Some(ms) = ms {
-                println!("  {host}:{port} — {ms}ms");
-                if best.is_none() {
-                    best = Some(format!("mqtts://{host}:{port}"));
+        for (host, port, probe) in &results {
+            match probe {
+                BrokerProbe::Reachable(ms) => {
+                    println!("  {host}:{port} — {ms}ms");
+                    if best.is_none() {
+                        best = Some(format!("mqtts://{host}:{port}"));
+                    }
                 }
-            } else {
-                println!("  {host}:{port} — failed");
+                BrokerProbe::Failed => println!("  {host}:{port} — failed"),
+                BrokerProbe::Skipped => println!("  {host}:{port} — skipped"),
             }
         }
         match best {
