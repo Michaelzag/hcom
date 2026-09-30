@@ -514,11 +514,18 @@ fn notify_session_switch_stop(db: &HcomDb, name: &str, event: Option<(i64, serde
 }
 
 /// Recreate a missing instance row from an active placeholder (resume after stop/kill).
+///
+/// The `life.created` event is handed back in `pending_created_event` rather
+/// than dispatched here: its fan-out (TCP wakes, follow-up writes) must never
+/// run under a write lock, so a caller inside a transaction dispatches it with
+/// [`dispatch_created_event`] after the commit and a caller with no open
+/// transaction dispatches it at the call site.
 fn recreate_instance_from_placeholder(
     db: &HcomDb,
     target_name: &str,
     session_id: &str,
     ph: Option<&InstanceRow>,
+    pending_created_event: &mut Option<(i64, serde_json::Value)>,
 ) {
     if db.get_instance_full(target_name).ok().flatten().is_some() {
         return;
@@ -526,7 +533,6 @@ fn recreate_instance_from_placeholder(
     let Some(ph) = ph else {
         return;
     };
-    let mut created_event = None;
     initialize_instance_in_position_file(
         db,
         target_name,
@@ -542,9 +548,8 @@ fn recreate_instance_from_placeholder(
         None,
         ph.hints.as_deref(),
         Some(ph.directory.as_str()),
-        &mut created_event,
+        pending_created_event,
     );
-    dispatch_created_event(db, target_name, created_event);
 }
 
 /// Identity metadata a reclaim or restore carries over: what a `life.stopped`
@@ -701,6 +706,7 @@ fn recreate_instance_from_stopped_snapshot(
     target_name: &str,
     session_id: &str,
     snapshot: &serde_json::Value,
+    pending_created_event: &mut Option<(i64, serde_json::Value)>,
 ) -> anyhow::Result<()> {
     use rusqlite::OptionalExtension;
 
@@ -720,7 +726,6 @@ fn recreate_instance_from_stopped_snapshot(
             .map(|()| parent),
         None => None,
     };
-    let mut created_event = None;
     if !initialize_instance_in_position_file(
         db,
         target_name,
@@ -738,11 +743,10 @@ fn recreate_instance_from_stopped_snapshot(
         identity.subagent_timeout,
         identity.hints.as_deref(),
         Some(identity.directory.as_str()).filter(|dir| !dir.is_empty()),
-        &mut created_event,
+        pending_created_event,
     ) {
         anyhow::bail!("restore_stopped: could not recreate the instance row for '{target_name}'");
     }
-    dispatch_created_event(db, target_name, created_event);
     let mut updates = serde_json::Map::new();
     updates.insert("last_event_id".into(), serde_json::json!(cursor));
     updates.insert(
@@ -921,12 +925,15 @@ fn bind_session_to_process_body(
             ),
         );
 
+        let mut created_event = None;
         recreate_instance_from_placeholder(
             db,
             canonical_name,
             session_id,
             placeholder_data.as_ref(),
+            &mut created_event,
         );
+        dispatch_created_event(db, canonical_name, created_event);
 
         // Reset last_stop on resume
         let now = now_epoch_i64();
@@ -1018,13 +1025,18 @@ fn bind_session_to_process_body(
         // endpoints that follow the process, the displaced row's release and
         // the launch placeholder's retirement. Any failure rolls all of it
         // back, leaving the DB exactly as it was before this hook.
-        let released = db.with_immediate_transaction(|tx| {
+        let (released, created_event) = db.with_immediate_transaction(|tx| {
+            // Held until the transaction commits: the `life.created` fan-out
+            // below opens its own writes, so running it under this write lock
+            // is what produced the SQLITE_BUSY that stalled the whole switch.
+            let mut created_event = None;
             if is_true_launch_placeholder(placeholder_data.as_ref()) {
                 recreate_instance_from_placeholder(
                     db,
                     &stopped_name,
                     session_id,
                     placeholder_data.as_ref(),
+                    &mut created_event,
                 );
             } else {
                 // A real old session is not the restored identity: take the
@@ -1035,6 +1047,7 @@ fn bind_session_to_process_body(
                     &stopped_name,
                     session_id,
                     &snapshot,
+                    &mut created_event,
                 )?;
             }
 
@@ -1078,8 +1091,12 @@ fn bind_session_to_process_body(
             if let Some(hook) = RESTORE_STOPPED_COMMIT_GAP_HOOK.with(std::cell::Cell::take) {
                 hook(db, &stopped_name);
             }
-            Ok(released)
+            Ok((released, created_event))
         })?;
+        // Committed: the `life.created` fan-out is safe to run now. A rolled
+        // back transaction never reaches here, and its event row is gone with
+        // the rollback, so dropping the pending event is correct.
+        dispatch_created_event(db, &stopped_name, created_event);
         if let Some(displaced) = &placeholder_name {
             notify_session_switch_stop(db, displaced, released);
         }
