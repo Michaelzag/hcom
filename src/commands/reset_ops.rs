@@ -22,6 +22,8 @@ pub(crate) fn archive_and_clear_db() -> Result<Option<String>, String> {
 
     let has_content = {
         let conn = rusqlite::Connection::open(&db_file).map_err(|e| e.to_string())?;
+        // Don't fail instantly when a live writer holds the lock; reads only.
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
         let event_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
             .unwrap_or(0);
@@ -37,6 +39,7 @@ pub(crate) fn archive_and_clear_db() -> Result<Option<String>, String> {
     }
 
     if let Ok(conn) = rusqlite::Connection::open(&db_file) {
+        let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
     }
 

@@ -2717,7 +2717,7 @@ pub(crate) fn cleanup_deleted_instance(
     let released = db.with_immediate_transaction(|tx| {
         if !exit_incarnation_holds(tx, current_name, &incarnation)? {
             release_own_binding(tx, current_name, process_id, &own_binding)?;
-            return Ok(false);
+            return Ok((false, None));
         }
         let snapshot = db.get_instance_snapshot(current_name)?.map(|mut snapshot| {
             if let Some(object) = snapshot.as_object_mut() {
@@ -2745,7 +2745,11 @@ pub(crate) fn cleanup_deleted_instance(
         if let Err(e) = db.cleanup_subscriptions(current_name) {
             log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
         }
-        if let Err(e) = db.log_life_event(
+        // Insert-only: the subscription fan-out fires after commit below,
+        // never while the write lock is held. The event is recorded even on
+        // the re-registered path (as today), so it dispatches on both
+        // committed outcomes.
+        let life_event = match db.log_life_event_insert(
             current_name,
             "stopped",
             "pty",
@@ -2753,17 +2757,21 @@ pub(crate) fn cleanup_deleted_instance(
             snapshot,
             event_process_id,
         ) {
-            log_warn(
-                "native",
-                "delivery.life_event_fail",
-                &format!("Failed to log life event: {}", e),
-            );
-        }
+            Ok((event_id, event_data)) => Some((event_id, event_data)),
+            Err(e) => {
+                log_warn(
+                    "native",
+                    "delivery.life_event_fail",
+                    &format!("Failed to log life event: {}", e),
+                );
+                None
+            }
+        };
         // Re-checked after the writes above: anything they set off (a launch
         // publishing its pid, a replacement row or rebind) keeps the row.
         if !exit_incarnation_holds(tx, current_name, &incarnation)? {
             release_own_binding(tx, current_name, process_id, &own_binding)?;
-            return Ok(false);
+            return Ok((false, life_event));
         }
         let deleted = tx.execute(
             "DELETE FROM instances WHERE name = ?1 AND created_at = ?2 AND pid IS ?3 \
@@ -2782,17 +2790,26 @@ pub(crate) fn cleanup_deleted_instance(
                 rusqlite::params![process_id, current_name],
             )?;
         }
-        Ok(deleted == 1)
+        Ok((deleted == 1, life_event))
     });
     match released {
-        Ok(true) => {}
-        Ok(false) => log_info(
-            "native",
-            "delivery.cleanup_re_registered",
-            &format!(
-                "{current_name} is another incarnation than this exit read; its row and bindings untouched"
-            ),
-        ),
+        Ok((true, life_event)) => {
+            if let Some((event_id, event_data)) = life_event {
+                db.dispatch_logged_event(event_id, "life", current_name, &event_data);
+            }
+        }
+        Ok((false, life_event)) => {
+            if let Some((event_id, event_data)) = life_event {
+                db.dispatch_logged_event(event_id, "life", current_name, &event_data);
+            }
+            log_info(
+                "native",
+                "delivery.cleanup_re_registered",
+                &format!(
+                    "{current_name} is another incarnation than this exit read; its row and bindings untouched"
+                ),
+            )
+        }
         Err(e) => eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}"),
     }
     ExitBinding::Settled

@@ -478,10 +478,25 @@ pub fn send_message(
         SenderKind::Instance => identity.name.clone(),
     };
 
-    // Log event to DB
-    let _event_id = db
-        .log_event("message", &routing_instance, &data)
-        .map_err(|e| format!("Failed to write message to database: {e}"))?;
+    // Log event to DB: ONLY the message-row insert runs in the write
+    // transaction (one short statement), retried on lock contention. The
+    // subscription fan-out below runs after commit: it wakes TCP listeners
+    // and writes more rows, so it must never hold the write lock.
+    let _event_id = crate::db::retry_on_busy(
+        || {
+            db.with_immediate_transaction(|_tx| {
+                db.insert_event_row("message", &routing_instance, &data, None)
+            })
+        },
+        crate::db::DEFAULT_SEND_WRITE_BUDGET,
+    )
+    .map_err(|e| {
+        format!(
+            "Failed to write message to database (retried {:.0}s, message NOT sent): {e}",
+            crate::db::DEFAULT_SEND_WRITE_BUDGET.as_secs_f64()
+        )
+    })?;
+    db.dispatch_logged_event(_event_id, "message", &routing_instance, &data);
 
     // Auto-create request-watch subscriptions for targeted requests
     if let Some(env) = envelope {
@@ -1733,6 +1748,82 @@ mod tests {
             !available_line.contains("dove"),
             "soft-stopped agent must not appear in Available: {err}"
         );
+
+        cleanup_test_db(path);
+    }
+
+    /// Hold a write lock on the test DB from a second connection, mimicking
+    /// a concurrent hook/relay writer mid-transaction.
+    fn hold_write_lock(db_path: &PathBuf) -> rusqlite::Connection {
+        let guard = rusqlite::Connection::open(db_path).unwrap();
+        guard
+            .execute_batch("PRAGMA busy_timeout=0; BEGIN IMMEDIATE;")
+            .unwrap();
+        guard
+    }
+
+    #[test]
+    #[serial]
+    fn send_message_under_held_lock_fails_unmistakably() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let _guard = hold_write_lock(&path);
+        // Fail fast at the sqlite layer: the (short) test budget bounds the
+        // retry loop, not the 5s production busy_timeout.
+        db.conn().execute_batch("PRAGMA busy_timeout=0;").unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::External,
+            name: "bigboss".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let err = send_message(&db, &sender, "hello", None, Some(&["nova".to_string()]))
+            .unwrap_err();
+        assert!(
+            err.contains("Failed to write message to database"),
+            "err={err}"
+        );
+        assert!(err.contains("NOT sent"), "err={err}");
+
+        // Exhaustion means nothing was written: no partial row.
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn cmd_send_returns_1_when_database_locked() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let _guard = hold_write_lock(&path);
+        db.conn().execute_batch("PRAGMA busy_timeout=0;").unwrap();
+
+        let mut args =
+            SendArgs::try_parse_from(["send", "--from", "bigboss", "@nova", "--", "hello"])
+                .unwrap();
+        // The router sets this from raw argv; clap parsing alone leaves it false.
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, None), 1);
 
         cleanup_test_db(path);
     }

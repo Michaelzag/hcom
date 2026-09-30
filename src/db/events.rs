@@ -422,13 +422,11 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Log a life event (started/stopped) to the events table.
-    ///
-    /// `process_id` keys the event to one process incarnation of the
-    /// instance: a `stopped` only releases the row when it equals the row's
-    /// current binding (see `finalize_instance_stop`). `None` records null
-    /// (writer outside any harness, e.g. legacy paths).
-    pub fn log_life_event(
+    /// Build a life event payload and insert it, WITHOUT subscription
+    /// fan-out. Returns `(event_id, data)` so the caller can dispatch after
+    /// its write transaction commits (fan-out wakes TCP listeners and
+    /// writes more rows — it must never run while a write txn is open).
+    pub(crate) fn log_life_event_insert(
         &self,
         instance: &str,
         action: &str,
@@ -436,7 +434,7 @@ impl HcomDb {
         reason: &str,
         snapshot: Option<serde_json::Value>,
         process_id: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<(i64, serde_json::Value)> {
         let data = match snapshot {
             Some(s) => serde_json::json!({
                 "action": action,
@@ -453,8 +451,28 @@ impl HcomDb {
             }),
         };
 
-        self.log_event_with_ts("life", instance, &data, None)?;
+        let event_id = self.insert_event_row("life", instance, &data, None)?;
+        Ok((event_id, data))
+    }
 
+    /// Log a life event (started/stopped) to the events table.
+    ///
+    /// `process_id` keys the event to one process incarnation of the
+    /// instance: a `stopped` only releases the row when it equals the row's
+    /// current binding (see `finalize_instance_stop`). `None` records null
+    /// (writer outside any harness, e.g. legacy paths).
+    pub fn log_life_event(
+        &self,
+        instance: &str,
+        action: &str,
+        by: &str,
+        reason: &str,
+        snapshot: Option<serde_json::Value>,
+        process_id: Option<&str>,
+    ) -> Result<()> {
+        let (event_id, data) =
+            self.log_life_event_insert(instance, action, by, reason, snapshot, process_id)?;
+        self.dispatch_logged_event(event_id, "life", instance, &data);
         Ok(())
     }
 
@@ -468,8 +486,10 @@ impl HcomDb {
         self.log_event_with_ts(event_type, instance, data, None)
     }
 
-    /// Insert event with optional timestamp. Returns event ID.
-    pub fn log_event_with_ts(
+    /// Insert an event row with an optional timestamp. Pure INSERT: no
+    /// subscription fan-out, so this is safe to call while the caller holds
+    /// a write transaction on the same connection. Returns the event ID.
+    pub fn insert_event_row(
         &self,
         event_type: &str,
         instance: &str,
@@ -486,11 +506,32 @@ impl HcomDb {
             "INSERT INTO events (timestamp, type, instance, data) VALUES (?, ?, ?, ?)",
             params![ts, event_type, instance, data_str],
         )?;
-        let event_id = self.conn.last_insert_rowid();
+        Ok(self.conn.last_insert_rowid())
+    }
 
-        // Check event subscriptions inline.
+    /// Subscription fan-out for an already-durable event row: TCP wakes,
+    /// follow-up messages, kv cursor writes. Best-effort external effects —
+    /// call only AFTER the write transaction commits, never under one.
+    pub(crate) fn dispatch_logged_event(
+        &self,
+        event_id: i64,
+        event_type: &str,
+        instance: &str,
+        data: &serde_json::Value,
+    ) {
         subscriptions::process_logged_event(self, event_id, event_type, instance, data);
+    }
 
+    /// Insert event with optional timestamp. Returns event ID.
+    pub fn log_event_with_ts(
+        &self,
+        event_type: &str,
+        instance: &str,
+        data: &serde_json::Value,
+        timestamp: Option<&str>,
+    ) -> Result<i64> {
+        let event_id = self.insert_event_row(event_type, instance, data, timestamp)?;
+        self.dispatch_logged_event(event_id, event_type, instance, data);
         Ok(event_id)
     }
 

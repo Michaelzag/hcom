@@ -2467,6 +2467,16 @@ fn persist_yielded_session_exit(
 ) {
     use rusqlite::OptionalExtension;
 
+    // Same split as the soft stop below: row write in-txn, wake + status
+    // event only after commit.
+    let staged = lifecycle::stage_set_status(
+        db,
+        instance_name,
+        ST_INACTIVE,
+        &format!("exit:{}", reason),
+        Default::default(),
+        &format!("{}:{}", file!(), line!()),
+    );
     let updated = db.with_immediate_transaction(|tx| {
         let current: Option<(f64, Option<String>)> = tx
             .query_row(
@@ -2480,20 +2490,14 @@ fn persist_yielded_session_exit(
         }) {
             return Ok(false);
         }
-        lifecycle::set_status(
-            db,
-            instance_name,
-            ST_INACTIVE,
-            &format!("exit:{}", reason),
-            Default::default(),
-        );
+        lifecycle::apply_staged_status(db, instance_name, &staged);
         if let Some(updates) = updates {
             instances::update_instance_position(db, instance_name, updates);
         }
         Ok(true)
     });
     match updated {
-        Ok(true) => {}
+        Ok(true) => lifecycle::fire_staged_status(db, instance_name, &staged),
         Ok(false) => log::log_info(
             "hooks",
             "sessionend.yield_incarnation_changed",
@@ -2586,8 +2590,19 @@ pub fn soft_finalize_session(
         "sessionend.soft",
         &format!("instance={} reason={}", instance_name, reason),
     );
-
-    let written = db.with_immediate_transaction(|tx| {
+    // Stage the status change with no side effects: the row write joins the
+    // transaction below, while the listener wake + status event fire only
+    // after commit (both fan out to TCP listeners and hold the write lock).
+    let staged = lifecycle::stage_set_status(
+        db,
+        instance_name,
+        ST_INACTIVE,
+        &format!("exit:{}", reason),
+        Default::default(),
+        &format!("{}:{}", file!(), line!()),
+    );
+    let written: Result<(bool, Option<(i64, Value)>)> =
+        db.with_immediate_transaction(|tx| {
         use rusqlite::OptionalExtension;
         let present = tx
             .query_row(
@@ -2598,16 +2613,10 @@ pub fn soft_finalize_session(
             .optional()?
             .is_some();
         if !present || row_re_registered(tx, instance_name, &row, &bound)? {
-            return Ok(false);
+            return Ok((false, None));
         }
 
-        lifecycle::set_status(
-            db,
-            instance_name,
-            ST_INACTIVE,
-            &format!("exit:{}", reason),
-            Default::default(),
-        );
+        lifecycle::apply_staged_status(db, instance_name, &staged);
 
         if let Some(updates) = updates {
             instances::update_instance_position(db, instance_name, updates);
@@ -2616,9 +2625,8 @@ pub fn soft_finalize_session(
         // Re-read inside the gated transaction: the snapshot carries the
         // exit writes above, and it is still the incarnation just checked.
         let Some(instance_data) = db.get_instance_full(instance_name)? else {
-            return Ok(false);
+            return Ok((false, None));
         };
-
         let mut snapshot = serde_json::json!({
             "name": instance_name,
             "transcript_path": instance_data.transcript_path,
@@ -2669,7 +2677,9 @@ pub fn soft_finalize_session(
         }
         let _ = db.cleanup_subscriptions(instance_name);
 
-        if let Err(e) = db.log_life_event(
+        // Insert-only: the subscription fan-out for this event fires after
+        // commit below, never while the write lock is held.
+        let life_event = match db.log_life_event_insert(
             instance_name,
             "stopped",
             "session",
@@ -2679,17 +2689,26 @@ pub fn soft_finalize_session(
             // released, so no process_id is claimed.
             None,
         ) {
-            log::log_warn(
-                "hooks",
-                "sessionend.soft.life_event_failed",
-                &format!("log_life_event failed for {instance_name}: {e}"),
-            );
-        }
-        Ok(true)
+            Ok((event_id, event_data)) => Some((event_id, event_data)),
+            Err(e) => {
+                log::log_warn(
+                    "hooks",
+                    "sessionend.soft.life_event_failed",
+                    &format!("log_life_event failed for {instance_name}: {e}"),
+                );
+                None
+            }
+        };
+        Ok((true, life_event))
     });
     match written {
-        Ok(true) => {}
-        Ok(false) => log::log_info(
+        Ok((true, life_event)) => {
+            lifecycle::fire_staged_status(db, instance_name, &staged);
+            if let Some((event_id, event_data)) = life_event {
+                db.dispatch_logged_event(event_id, "life", instance_name, &event_data);
+            }
+        }
+        Ok((false, _)) => log::log_info(
             "hooks",
             "sessionend.soft.re_registered",
             &format!(
