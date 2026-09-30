@@ -61,6 +61,17 @@ pub fn uri_status_detail_sql(column: &str) -> String {
     )
 }
 
+/// SQL: `inner` event is within 30s of `outer`. The ISO-timestamp range lets
+/// SQLite walk `idx_timestamp` (callers write `+inner.type` so the planner does
+/// not pick the far less selective `idx_type`); ABS keeps the exact window.
+pub fn collision_window_sql(outer: &str, inner: &str) -> String {
+    format!(
+        "{inner}.timestamp >= strftime('%Y-%m-%dT%H:%M:%S', {outer}.timestamp, '-30 seconds') \
+         AND {inner}.timestamp < strftime('%Y-%m-%dT%H:%M:%S', {outer}.timestamp, '+31 seconds') \
+         AND ABS(strftime('%s', {outer}.timestamp) - strftime('%s', {inner}.timestamp)) < 30"
+    )
+}
+
 /// All file operation contexts.
 pub const FILE_OP_CONTEXTS: &[&str] = &[
     "tool:Write",
@@ -435,14 +446,15 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
              AND NOT {uri}\n\
              AND EXISTS (\n\
              \x20   SELECT 1 FROM events_v e\n\
-             \x20   WHERE e.type = 'status' AND e.status_context IN {ctx}\n\
+             \x20   WHERE +e.type = 'status' AND e.status_context IN {ctx}\n\
              \x20   AND e.status_detail IS NOT NULL AND e.status_detail != ''\n\
              \x20   AND e.status_detail = events_v.status_detail\n\
              \x20   AND e.instance != events_v.instance\n\
-             \x20   AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 30\n\
+             \x20   AND {window}\n\
              ))",
             ctx = FILE_WRITE_CONTEXTS,
-            uri = uri_status_detail_sql("events_v.status_detail")
+            uri = uri_status_detail_sql("events_v.status_detail"),
+            window = collision_window_sql("events_v", "e"),
         );
         clauses.push(collision_sql);
     }
@@ -752,6 +764,7 @@ mod tests {
         let sql = build_sql_from_flags(&filters).unwrap();
         assert!(sql.contains("EXISTS"));
         assert!(sql.contains("ABS(strftime"));
+        assert!(sql.contains("+e.type = 'status'"));
     }
 
     fn sql_context_list_contains(list: &str, operation: &str) -> bool {
