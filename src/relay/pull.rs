@@ -647,6 +647,18 @@ fn import_remote_events(
                     obj.insert(field.to_string(), Value::Array(fixed));
                 }
             }
+            // The same for the delivery-policy reroute map's delegates: a
+            // delegate on this host must compare equal to its local name.
+            if let Some(reroutes) = obj
+                .get_mut(crate::delivery_policy::REROUTES_FIELD)
+                .and_then(|v| v.as_object_mut())
+            {
+                for delegate in reroutes.values_mut() {
+                    if let Some(name) = delegate.as_str() {
+                        *delegate = Value::String(strip_device_suffix(name, own_short_id));
+                    }
+                }
+            }
 
             // Store relay origin
             obj.insert(
@@ -2062,5 +2074,169 @@ mod tests {
         );
         exchange(&db_b, uuids[1], &db_c, uuids[2]);
         assert!(unread(&db_c, "sender", "@sender reply"));
+    }
+
+    /// fauna B4: a backstop forward to a delegate on another host keeps its
+    /// one-hop exemption through the real relay import, even when that
+    /// delegate holds a configured role of its own there (the import
+    /// namespaces `from` and strips this host's suffix from the targets).
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn backstop_forward_to_remote_policy_delegate_is_not_refused_after_import() {
+        use crate::hooks::test_helpers::EnvGuard;
+        use crate::relay::push::build_push_payload;
+        use crate::relay::state_topic;
+
+        let _env = EnvGuard::new();
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+        let homes: Vec<_> = dirs.iter().map(|dir| dir.path().to_path_buf()).collect();
+        let hcoms: Vec<_> = homes.iter().map(|home| home.join(".hcom")).collect();
+        let uuids = [
+            "33333333-3333-4333-8333-333333333333",
+            "44444444-4444-4444-8444-444444444444",
+        ];
+        let use_side = |side: usize| {
+            unsafe {
+                std::env::set_var("HOME", &homes[side]);
+                std::env::set_var("HCOM_DIR", &hcoms[side]);
+                std::env::set_var("HCOM_BUILD_ROOT", homes[side].join("build"));
+            }
+            crate::config::Config::reset();
+            crate::config::Config::init();
+        };
+        for (side, hcom) in hcoms.iter().enumerate() {
+            std::fs::create_dir_all(hcom.join(".tmp")).unwrap();
+            std::fs::write(hcom.join(".tmp/device_id"), uuids[side]).unwrap();
+            crate::paths::test_roots::register(&homes[side]);
+        }
+        use_side(0);
+        let db_a = HcomDb::open().unwrap();
+        use_side(1);
+        let db_b = HcomDb::open().unwrap();
+        let short_b = device_short_id_for_db(&db_b, uuids[1]);
+        let seed = |db: &HcomDb, name: &str| {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, session_id, status, status_context, status_time, created_at, tool)
+                     VALUES (?1, ?2, 'listening', 'ready', ?3, ?4, 'omp')",
+                    rusqlite::params![
+                        name,
+                        format!("sess-{name}"),
+                        crate::shared::time::now_epoch_i64(),
+                        crate::shared::time::now_epoch_f64()
+                    ],
+                )
+                .unwrap();
+        };
+        let relay_id = "delivery-b4";
+        let psk = fixture_psk();
+        let exchange = |from: &HcomDb, from_uuid: &str, to: &HcomDb, to_uuid: &str| {
+            let (state, events, _, _) = build_push_payload(from, from_uuid);
+            let topic = state_topic(relay_id, from_uuid);
+            let payload = json!({"state": state, "events": events});
+            let sealed = crate::relay::crypto::seal(
+                &psk,
+                relay_id,
+                &topic,
+                &serde_json::to_vec(&payload).unwrap(),
+                crate::shared::time::now_epoch_f64() as u64,
+            )
+            .unwrap();
+            let mut guard = ReplayGuard::default();
+            handle_state_message(
+                to,
+                from_uuid,
+                &sealed,
+                to_uuid,
+                &mut InboundContext {
+                    psk: &psk,
+                    relay_id,
+                    topic: &topic,
+                    replay_guard: &mut guard,
+                },
+            );
+        };
+        let texts = |db: &HcomDb, name: &str| -> Vec<String> {
+            db.get_unread_messages(name)
+                .into_iter()
+                .map(|m| m.text)
+                .collect()
+        };
+
+        // B: mupe holds `deputy`, whose delegate is lola.
+        use_side(1);
+        std::fs::write(
+            hcoms[1].join("config.toml"),
+            "[delivery.deputy]\ndelegate = \"lola\"\n",
+        )
+        .unwrap();
+        seed(&db_b, "mupe");
+        seed(&db_b, "lola");
+        crate::delivery_policy::register_role(&db_b, "mupe", "sess-mupe", "deputy").unwrap();
+        exchange(&db_b, uuids[1], &db_a, uuids[0]);
+
+        // A: kimi holds `conductor`, delegating to mupe on B.
+        use_side(0);
+        std::fs::write(
+            hcoms[0].join("config.toml"),
+            format!("[delivery.conductor]\ndelegate = \"mupe:{short_b}\"\n"),
+        )
+        .unwrap();
+        seed(&db_a, "kimi");
+        crate::delivery_policy::register_role(&db_a, "kimi", "sess-kimi", "conductor").unwrap();
+        db_a.log_event(
+            "message",
+            "nova",
+            &json!({
+                "from": "nova", "sender_kind": "instance", "scope": "mentions",
+                "mentions": ["kimi"], "text": "old peer to the conductor",
+            }),
+        )
+        .unwrap();
+        let kimi = texts(&db_a, "kimi");
+        let rows: Vec<String> = db_a
+            .conn()
+            .prepare("SELECT name || '/' || status FROM instances")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            kimi.is_empty(),
+            "{kimi:?} rows={rows:?} status={:?}",
+            crate::delivery_policy::role_status_lines(&db_a)
+        );
+
+        exchange(&db_a, uuids[0], &db_b, uuids[1]);
+        use_side(1);
+        let mupe = texts(&db_b, "mupe");
+        assert_eq!(
+            mupe.iter()
+                .filter(|t| t.ends_with("old peer to the conductor"))
+                .count(),
+            1,
+            "{mupe:?}"
+        );
+        // The import strips B's own suffix from the reroute map's delegate.
+        let reroutes: Vec<Value> = db_b
+            .conn()
+            .prepare(
+                "SELECT json_extract(data, '$.delivery_reroutes') FROM events
+                 WHERE json_extract(data, '$.delivery_forward_of') IS NOT NULL",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+            .collect();
+        assert_eq!(reroutes, vec![json!({"kimi": "mupe"})]);
+        assert!(
+            !texts(&db_b, "lola")
+                .iter()
+                .any(|t| t.contains("old peer to the conductor")),
+            "the imported copy must not be forwarded a second hop"
+        );
     }
 }

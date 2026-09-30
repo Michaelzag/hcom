@@ -74,8 +74,15 @@ fn resolve_list_stopped_target(db: &HcomDb, target: &str) -> Result<String, Stri
     }
 }
 
-/// Get unread message count for a single instance.
-fn get_unread_count(db: &HcomDb, name: &str, last_event_id: i64) -> i64 {
+/// Get unread message count for a single instance. For a delivery-role
+/// holder, only what it will actually read counts (the policy view: refused
+/// messages go to its delegate, not its inbox); a pure read, no forwarding.
+pub(super) fn get_unread_count(db: &HcomDb, name: &str, last_event_id: i64) -> i64 {
+    if crate::delivery_policy::load(db).is_ok_and(|p| p.governs(name)) {
+        return db
+            .pending_event_range(name)
+            .map_or(0, |(_, _, count)| count);
+    }
     db.conn()
         .query_row(
             "SELECT COUNT(*) FROM events WHERE id > ? AND type = 'message'

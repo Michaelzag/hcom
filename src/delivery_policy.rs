@@ -61,7 +61,6 @@
 //! write outside its ledger dir and any hcom subcommand beyond its allowlist.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 use serde_json::Value;
 
@@ -79,12 +78,15 @@ const KV_ROLE_PREFIX: &str = "delivery_role:";
 pub const REROUTES_FIELD: &str = "delivery_reroutes";
 /// Forward copy field naming the local id of the event it forwards.
 pub const FORWARD_OF_FIELD: &str = "delivery_forward_of";
-/// kv claim, one per forwarded event id (the primary key is the exactly-once).
+/// kv claim, one per delegate and message origin (the primary key is the
+/// exactly-once).
 pub const KV_FORWARDED_PREFIX: &str = "delivery_forwarded:";
 /// kv record of a forward that failed for good and went to the holder.
 pub const KV_FORWARD_FAILED_PREFIX: &str = "delivery_forward_failed:";
-/// kv count of failed forward attempts per event id.
+/// kv count of failed forward attempts per delegate and message origin.
 pub const KV_FORWARD_ATTEMPTS_PREFIX: &str = "delivery_forward_attempts:";
+/// kv marker: a relayed External message to a holder was audited once.
+pub const KV_EXTERNAL_AUDITED_PREFIX: &str = "delivery_external_audited:";
 /// Locked-database retries before a forward is given up and the holder
 /// gets the message instead.
 pub const MAX_FORWARD_ATTEMPTS: u32 = 5;
@@ -134,13 +136,25 @@ impl Entry {
     }
 }
 
+/// The row a role registration was written for. A holder counts only while
+/// this exact row is live, and a forward commits only if it still is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Registration {
+    pub role: String,
+    pub session_id: String,
+    pub created_at: f64,
+}
+
 /// The `[delivery.*]` entries in effect (keyed by role) and the live
 /// instances holding each role.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Policies {
     entries: BTreeMap<String, Entry>,
-    /// instance name -> role, live registrations only.
-    holders: BTreeMap<String, String>,
+    /// instance name -> its registration, live registrations only.
+    holders: BTreeMap<String, Registration>,
+    /// config.toml did not parse: `load` gives every registered role an
+    /// entry, so none is silently unfiltered.
+    unparseable: bool,
 }
 
 /// The facts about one message the rule reads.
@@ -190,7 +204,14 @@ pub enum ReadVerdict {
 impl Policies {
     /// The entry governing `instance`, if it holds a configured role.
     fn entry_for(&self, instance: &str) -> Option<&Entry> {
-        self.entries.get(self.holders.get(instance)?)
+        self.entries.get(&self.holders.get(instance)?.role)
+    }
+
+    /// The registration that makes `instance` a governed holder, if it is one.
+    pub fn registration(&self, instance: &str) -> Option<&Registration> {
+        self.holders
+            .get(instance)
+            .filter(|reg| self.entries.contains_key(&reg.role))
     }
 
     /// `instance` holds a role that has a `[delivery.*]` entry.
@@ -223,10 +244,22 @@ impl Policies {
         let Some(entry) = self.entry_for(receiver) else {
             return ReadVerdict::Deliver;
         };
-        let rerouted_here = data
-            .get(REROUTES_FIELD)
-            .and_then(|v| v.as_object())
-            .is_some_and(|map| map.values().any(|to| to.as_str() == Some(receiver)));
+        // One hop, keyed on the event's data marks, never on `from` (a relay
+        // import namespaces `from`): a forward copy is only ever addressed to
+        // its delegate, and a rerouted send names its delegate. Names compare
+        // by base name because import strips this host's suffix from the
+        // targets but not from the reroute map.
+        let base = |name: &str| name.split(':').next().unwrap_or(name).to_string();
+        let receiver_base = base(receiver);
+        let rerouted_here = data.get(FORWARD_OF_FIELD).is_some()
+            || data
+                .get(REROUTES_FIELD)
+                .and_then(|v| v.as_object())
+                .is_some_and(|map| {
+                    map.values()
+                        .filter_map(|to| to.as_str())
+                        .any(|to| to == receiver || base(to) == receiver_base)
+                });
         let facts = MessageFacts::from_event(data);
         if rerouted_here || entry_admits(entry, &facts) {
             return ReadVerdict::Deliver;
@@ -245,7 +278,7 @@ impl Policies {
                 let holders = self
                     .holders
                     .iter()
-                    .filter(|(_, r)| *r == role)
+                    .filter(|(_, reg)| reg.role == *role)
                     .map(|(name, _)| name.as_str())
                     .collect();
                 (role.as_str(), holders)
@@ -259,7 +292,14 @@ impl Policies {
         if self.entries.is_empty() {
             return "none".to_string();
         }
-        let digest = Sha256::digest(format!("{:?}{:?}", self.entries, self.holders).as_bytes());
+        // Name -> role only: a holder re-registering under a new session is
+        // not a policy change.
+        let holders: BTreeMap<&str, &str> = self
+            .holders
+            .iter()
+            .map(|(name, reg)| (name.as_str(), reg.role.as_str()))
+            .collect();
+        let digest = Sha256::digest(format!("{:?}{holders:?}", self.entries).as_bytes());
         digest[..6].iter().map(|b| format!("{b:02x}")).collect()
     }
 }
@@ -302,7 +342,7 @@ fn starts_with_wake_word(text: &str, prefixes: &[String]) -> bool {
 pub fn parse(content: &str) -> Policies {
     let table = match content.parse::<toml::Table>() {
         Ok(table) => table,
-        Err(_) => return fail_closed_from_headers(content),
+        Err(_) => return fail_closed_from_text(content),
     };
     let mut entries = BTreeMap::new();
     if let Some(delivery) = table.get("delivery") {
@@ -324,50 +364,107 @@ pub fn parse(content: &str) -> Policies {
     Policies {
         entries,
         holders: BTreeMap::new(),
+        unparseable: false,
     }
 }
 
-/// config.toml no longer parses: every `[delivery.<role>]` header still in
-/// the text stays in force, degraded to the `delegate = "..."` line under it
-/// when one is readable, rather than silently dropping its protection.
-fn fail_closed_from_headers(content: &str) -> Policies {
-    let mut entries = BTreeMap::new();
-    let mut current: Option<(String, Option<String>)> = None;
-    let mut finish = |current: &mut Option<(String, Option<String>)>| {
-        if let Some((role, delegate)) = current.take() {
-            entries.insert(
-                role,
-                Entry::broken("config.toml does not parse".to_string(), delegate),
-            );
-        }
-    };
+/// Why every entry recovered from an unparseable config.toml is broken.
+const UNPARSEABLE: &str = "config.toml does not parse";
+
+/// config.toml no longer parses: every delivery role still named in the
+/// text stays in force, degraded to its `delegate` when one is readable,
+/// rather than silently dropping its protection. Reads `[delivery.<role>]`
+/// headers (spaced or quoted), dotted keys (`delivery.<role>.delegate = ..`,
+/// or `<role>.delegate = ..` under `[delivery]`) and inline tables
+/// (`<role> = { delegate = .. }`). `load` adds a broken entry for every
+/// registered role the text no longer names.
+fn fail_closed_from_text(content: &str) -> Policies {
+    let mut roles: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut table: Vec<String> = Vec::new();
     for line in content.lines().map(str::trim) {
-        if line.starts_with('[') {
-            finish(&mut current);
-            if let Some(inner) = line.strip_prefix("[delivery.") {
-                let role = inner
-                    .split(']')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .trim_matches(['"', '\'']);
-                if !role.is_empty() {
-                    current = Some((role.to_string(), None));
+        if line.starts_with("[[") {
+            table.clear();
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            table = key_path(header.split(']').next().unwrap_or(""));
+            if let [delivery, role] = table.as_slice()
+                && delivery == "delivery"
+            {
+                roles.entry(role.clone()).or_default();
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let mut path = table.clone();
+        path.extend(key_path(key));
+        match path.as_slice() {
+            [delivery, role] if delivery == "delivery" => {
+                // An inline table: `<role> = { delegate = "mupe", ... }`.
+                let slot = roles.entry(role.clone()).or_default();
+                if let Some(delegate) = inline_delegate(value) {
+                    *slot = Some(delegate);
                 }
             }
-        } else if let Some((_, delegate)) = current.as_mut()
-            && let Some((key, value)) = line.split_once('=')
-            && key.trim() == "delegate"
-        {
-            let value = value.trim().trim_matches(['"', '\'']).trim();
-            *delegate = (!value.is_empty()).then(|| value.to_string());
+            [delivery, role, field] if delivery == "delivery" => {
+                let slot = roles.entry(role.clone()).or_default();
+                if field == "delegate"
+                    && let Some(delegate) = string_value(value)
+                {
+                    *slot = Some(delegate);
+                }
+            }
+            _ => {}
         }
     }
-    finish(&mut current);
     Policies {
-        entries,
+        entries: roles
+            .into_iter()
+            .map(|(role, delegate)| (role, Entry::broken(UNPARSEABLE.to_string(), delegate)))
+            .collect(),
         holders: BTreeMap::new(),
+        unparseable: true,
     }
+}
+
+/// `delivery . "conductor"` -> `["delivery", "conductor"]`.
+fn key_path(key: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut quote: Option<char> = None;
+    for c in key.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => part.push(c),
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '.') => parts.push(std::mem::take(&mut part)),
+            (None, c) if c.is_whitespace() => {}
+            (None, c) => part.push(c),
+        }
+    }
+    parts.push(part);
+    parts
+}
+
+/// The string at the start of a TOML value (`"mupe" # note` -> `mupe`).
+fn string_value(value: &str) -> Option<String> {
+    let value = value.trim_start();
+    let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let rest = &value[1..];
+    let end = rest.find(quote)?;
+    let s = rest[..end].trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// `delegate` inside an inline table value `{ delegate = "mupe", ... }`.
+fn inline_delegate(value: &str) -> Option<String> {
+    let inner = value.trim().strip_prefix('{')?;
+    inner.split(',').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key_path(key) == ["delegate"]).then(|| string_value(value))?
+    })
 }
 
 fn parse_entry(value: &toml::Value) -> Entry {
@@ -432,7 +529,7 @@ fn string_list(table: &toml::Table, key: &str, default: &[&str]) -> Result<Vec<S
 /// Load the policy from config.toml plus the live role holders. Read on
 /// every call (delivery time), so an operator edit or a new registration
 /// takes effect on the next read without a restart. No `[delivery.*]` entry
-/// means no DB query at all.
+/// means no DB query at all, unless config.toml does not parse.
 ///
 /// A DB error while reading the holders is an error, never "no holders":
 /// that would switch the filter off for one read. Readers deliver nothing
@@ -442,12 +539,39 @@ pub fn load(db: &HcomDb) -> Result<Policies, String> {
         Ok(content) => parse(&content),
         Err(_) => Policies::default(),
     };
-    if !policies.entries.is_empty() {
+    if !policies.entries.is_empty() || policies.unparseable {
         policies.holders = live_role_holders(db)
             .map_err(|e| format!("delivery policy: cannot read role holders: {e}"))?;
     }
+    if policies.unparseable {
+        // A registered role the broken text no longer names still gets an
+        // entry: INVALID in status, and its holder receives everything
+        // targeted (no delegate to send it to), never silently unfiltered.
+        for reg in policies.holders.values() {
+            policies
+                .entries
+                .entry(reg.role.clone())
+                .or_insert_with(|| Entry::broken(UNPARSEABLE.to_string(), None));
+        }
+    }
     audit(db, &policies);
     Ok(policies)
+}
+
+/// The live row a configured `delegate` names, resolved exactly like a send
+/// target (a bare remote name maps to its mirror row). `None` when nothing
+/// live matches, or the name is ambiguous: the holder keeps the message.
+pub(crate) fn resolve_delegate(
+    delegate: &str,
+    rows: &[crate::messages::InstanceInfo],
+    fleet: &crate::fleet_names::FleetCtx,
+) -> Option<String> {
+    let (matched, _) =
+        crate::messages::resolve_targets(&[delegate.to_string()], rows, fleet).ok()?;
+    match matched.as_slice() {
+        [one] if rows.iter().any(|row| row.name == *one) => Some(one.clone()),
+        _ => None,
+    }
 }
 
 /// One registration, stored in kv under `delivery_role:<name>`. It counts
@@ -482,7 +606,7 @@ fn read_record(value: &str) -> Option<RoleRecord> {
 
 /// Runs its own query rather than `kv_prefix`, which drops row errors: a
 /// failed step here must surface as an error, never as "no holders".
-fn live_role_holders(db: &HcomDb) -> Result<BTreeMap<String, String>, String> {
+fn live_role_holders(db: &HcomDb) -> Result<BTreeMap<String, Registration>, String> {
     let rows = db
         .conn()
         .prepare_cached("SELECT key, value FROM kv WHERE key >= ?1 AND key < ?2")
@@ -500,7 +624,14 @@ fn live_role_holders(db: &HcomDb) -> Result<BTreeMap<String, String>, String> {
             continue;
         };
         if record_is_live(db, name, &record).map_err(|e| e.to_string())? {
-            holders.insert(name.to_string(), record.role);
+            holders.insert(
+                name.to_string(),
+                Registration {
+                    role: record.role,
+                    session_id: record.session_id,
+                    created_at: record.created_at,
+                },
+            );
         }
     }
     Ok(holders)
@@ -587,6 +718,11 @@ fn register_role_inner(
             "invalid role `{role}`: use [a-z0-9_-]"
         )));
     }
+    // Check and write in one IMMEDIATE transaction: a racing registration of
+    // another role waits, then sees this one live and is refused.
+    let tx =
+        rusqlite::Transaction::new_unchecked(db.conn(), rusqlite::TransactionBehavior::Immediate)
+            .map_err(RoleError::transient)?;
     let created_at: f64 = db
         .conn()
         .query_row(
@@ -621,7 +757,12 @@ fn register_role_inner(
         created_at,
     };
     let value = serde_json::to_string(&record).map_err(RoleError::transient)?;
-    db.kv_set(&key, Some(&value)).map_err(RoleError::transient)
+    tx.execute(
+        "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+        rusqlite::params![key, value],
+    )
+    .map_err(RoleError::transient)?;
+    tx.commit().map_err(RoleError::transient)
 }
 
 /// Warn for every configured role no live instance holds: the filter is off
@@ -728,24 +869,13 @@ pub fn role_status_lines(db: &HcomDb) -> Vec<String> {
     lines
 }
 
-/// Log one line when the effective policy differs from the last one logged
-/// (the hash is kept in kv, so it is one line per change across processes).
-/// A process-local memo keeps repeat loads to a hash compare. A broken block
-/// with no readable delegate also sends each holder one notice per hash.
+/// Log one line when the effective policy differs from the last one logged.
+/// Compared against the hash persisted in kv (never a per-process memo, which
+/// would hide A -> B -> A changes made by other processes), so it is one line
+/// per change across processes for one kv read per load. A broken block with
+/// no readable delegate also sends each holder one notice per hash.
 fn audit(db: &HcomDb, policies: &Policies) {
-    static SEEN: Mutex<Option<(std::path::PathBuf, String)>> = Mutex::new(None);
     let hash = policies.hash();
-    let db_path = db.path().to_path_buf();
-    {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if seen
-            .as_ref()
-            .is_some_and(|(p, h)| *p == db_path && *h == hash)
-        {
-            return;
-        }
-        *seen = Some((db_path, hash.clone()));
-    }
     let previous = db.kv_get(KV_LOGGED_HASH).ok().flatten();
     let previous = previous.as_deref().unwrap_or("none");
     if previous == hash {
@@ -846,9 +976,14 @@ leads = ["poli", "valo"]
     /// `parse` plus kimi holding `conductor`.
     fn held(content: &str) -> Policies {
         let mut policies = parse(content);
-        policies
-            .holders
-            .insert("kimi".to_string(), "conductor".to_string());
+        policies.holders.insert(
+            "kimi".to_string(),
+            Registration {
+                role: "conductor".to_string(),
+                session_id: "sess-kimi".to_string(),
+                created_at: 1000.0,
+            },
+        );
         policies
     }
 
@@ -908,6 +1043,28 @@ leads = ["poli", "valo"]
                 delegate_only("mupe"),
             ),
             ("[delivery.conductor]\nleads = [\n[terminal\n", None),
+            // Unparseable, in the other shapes TOML allows.
+            (
+                "[ delivery . \"conductor\" ]\n\"delegate\" = 'mupe'  # note\n[terminal\n",
+                delegate_only("mupe"),
+            ),
+            (
+                "delivery.conductor.delegate = \"mupe\"\n[terminal\n",
+                delegate_only("mupe"),
+            ),
+            (
+                "[delivery]\nconductor.delegate = \"mupe\"\n[terminal\n",
+                delegate_only("mupe"),
+            ),
+            (
+                "[delivery]\nconductor = { leads = [\"poli\"], delegate = \"mupe\" }\n[terminal\n",
+                delegate_only("mupe"),
+            ),
+            (
+                "delivery.conductor = { delegate = \"mupe\" }\n[terminal\n",
+                delegate_only("mupe"),
+            ),
+            ("[delivery.conductor]\ndelegate = \"\"\n[terminal\n", None),
         ] {
             let entry = parse(bad).entries.remove("conductor");
             let entry = entry.unwrap_or_else(|| panic!("no entry for {bad}"));

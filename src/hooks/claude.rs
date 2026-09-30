@@ -1414,7 +1414,7 @@ fn deliver_freeze_messages(
                 subagent_msgs.push(msg);
             }
         } else {
-            use crate::db::ForwardOutcome;
+            use crate::db::{ForwardOutcome, RefusedEvent};
             use crate::delivery_policy::ReadVerdict;
             match messages::should_deliver_message(event_data, instance_name, sender_name) {
                 Ok(true) => match policies.read_verdict(instance_name, event_data) {
@@ -1422,7 +1422,22 @@ fn deliver_freeze_messages(
                     ReadVerdict::Skip => {}
                     ReadVerdict::ForwardTo(delegate) => {
                         let id = event.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-                        match db.forward_refused(instance_name, id, event_data, &delegate, None) {
+                        let outcome = match policies.registration(instance_name) {
+                            Some(reg) => db.forward_refused(
+                                instance_name,
+                                RefusedEvent {
+                                    id,
+                                    timestamp,
+                                    data: event_data,
+                                },
+                                &delegate,
+                                None,
+                                reg,
+                            ),
+                            // ForwardTo comes only for a governed holder.
+                            None => ForwardOutcome::Retry,
+                        };
+                        match outcome {
                             ForwardOutcome::Forwarded { .. } => {}
                             ForwardOutcome::DeliverToHolder => parent_msgs.push(msg),
                             // Not forwarded yet: stop below it so the cursor

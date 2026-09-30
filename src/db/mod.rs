@@ -31,8 +31,8 @@ pub(crate) mod reqwatch_policy;
 mod sessions;
 pub(crate) mod subscriptions;
 
-pub(crate) use events::ForwardOutcome;
 pub use events::Message;
+pub(crate) use events::{ForwardOutcome, RefusedEvent};
 pub use instances::InstanceRow;
 #[allow(unused_imports)]
 pub use instances::InstanceStatus;

@@ -462,9 +462,12 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
                 "hook.error",
                 &format!("hook={} op=db_open err={}", hook_name, e),
             );
+            // Transient: the plugin retries (e.g. `omp-role` after a busy
+            // or briefly unavailable database).
             return (
                 0,
-                serde_json::json!({"error": format!("DB open failed: {}", e)}).to_string(),
+                serde_json::json!({"error": format!("DB open failed: {}", e), "transient": true})
+                    .to_string(),
             );
         }
     };
