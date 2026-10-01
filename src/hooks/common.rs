@@ -1422,11 +1422,15 @@ pub(crate) fn skipped_stop_line(display: &str) -> String {
     format!("{display} skipped: {}", StopError::re_registered())
 }
 
+/// Stop a stale launch placeholder bound to `capture`: the incarnation the
+/// cleanup read (row plus binding epoch, one snapshot). A rebind after that
+/// read is another incarnation and is left intact.
 pub(crate) fn stop_placeholder_instance(
     db: &HcomDb,
     instance_name: &str,
     initiated_by: &str,
     reason: &str,
+    capture: crate::proctruth::ReapCapture,
 ) -> StopOutcome {
     stop_instance_inner(
         db,
@@ -1437,7 +1441,7 @@ pub(crate) fn stop_placeholder_instance(
         0,
         true,
         &[],
-        None,
+        Some(capture),
     )
 }
 
