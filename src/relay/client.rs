@@ -1182,7 +1182,12 @@ mod tests {
         const APPLY_DELAY: Duration = Duration::from_millis(30);
         const PUSH_INTERVAL: Duration = Duration::from_millis(300);
         const SAMPLE: Duration = Duration::from_millis(25);
-        const MAX_HEARTBEAT_GAP: Duration = Duration::from_millis(1500);
+        // The heartbeat writes on its own ~1s cadence, and the loop revisits
+        // the top at least once per DRAIN_BUDGET (200ms), so the floor is
+        // ~1.2s. Leave room for a push cycle and scheduler noise on a loaded
+        // runner: the unfixed loop wrote the heartbeat exactly once for the
+        // whole ~4.5s drain, which fails both this bound and the count above.
+        const MAX_HEARTBEAT_GAP: Duration = Duration::from_millis(2500);
         const RELAY_ID: &str = "relay-drain";
 
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
