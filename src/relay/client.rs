@@ -1192,6 +1192,12 @@ mod tests {
 
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
 
+        // Opened here, once, before any other thread exists: the first open of
+        // a fresh db converts it to WAL under a brief exclusive lock, and a
+        // concurrent first opener can lose that race with SQLITE_BUSY (see
+        // HcomDb::ensure_schema). The sampler below only reads.
+        let db = HcomDb::open().unwrap();
+
         // The Connection is never polled, so no socket is opened; holding it
         // keeps the request channel alive, which is what makes a push cycle
         // (and its `relay_last_push` write) succeed without a broker.
@@ -1260,12 +1266,11 @@ mod tests {
         });
 
         let done = Arc::new(AtomicBool::new(false));
-        let last_device = format!("device-peer-{:03}", EVENTS - 1);
+        let sampler_device = format!("device-peer-{:03}", EVENTS - 1);
         let sampler = {
-            let sampler_device = last_device.clone();
             let done = done.clone();
             thread::spawn(move || {
-                let db = HcomDb::open().unwrap();
+                let db = db;
                 let mut hb_changes: Vec<Instant> = Vec::new();
                 let mut last_hb: Option<String> = None;
                 let mut push_changes = 0usize;
@@ -1294,28 +1299,30 @@ mod tests {
                     }
                     thread::sleep(SAMPLE);
                 }
-                (hb_changes, push_changes, push_before_drain)
+
+                // Every queued event must really have been applied (30ms
+                // each), so this watched a deep, slow queue, not an idle loop.
+                let fully_applied = db
+                    .kv_get(&format!("relay_sync_time_{sampler_device}"))
+                    .ok()
+                    .flatten()
+                    .is_some();
+                (hb_changes, push_changes, push_before_drain, fully_applied)
             })
         };
 
         let end = relay.run_loop(&event_rx);
         done.store(true, Ordering::Relaxed);
         producer.join().unwrap();
-        let (hb_changes, push_changes, push_before_drain) = sampler.join().unwrap();
+        let (hb_changes, push_changes, push_before_drain, fully_applied) = sampler.join().unwrap();
 
         assert!(
             matches!(end, RunEnd::Ended(_)),
             "loop should end when the producer drops the event channel: {end:?}"
         );
 
-        // Every queued event was really applied (30ms each), so the sampler
-        // above watched a deep, slow queue — not an idle loop.
-        let db = HcomDb::open().unwrap();
         assert!(
-            db.kv_get(&format!("relay_sync_time_{last_device}"))
-                .ok()
-                .flatten()
-                .is_some(),
+            fully_applied,
             "the synthetic inbound stream must be fully applied"
         );
 
