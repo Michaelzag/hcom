@@ -254,6 +254,9 @@ struct ResolvedDelivery {
     external_reached_policy: Vec<String>,
     /// The sender has a `[delivery.*]` entry: its requests create no watches.
     sender_has_policy: bool,
+    /// The targets the sender addressed (mentions or thread members), before
+    /// any reroute: a delegate named here is a recipient in its own right.
+    addressed: Vec<String>,
 }
 
 /// One `hcom send` output line per refused recipient.
@@ -314,6 +317,7 @@ fn resolve_delivery(
     } else {
         thread_delivery_members.clone()
     };
+    let addressed = effective_mentions.clone();
 
     // Operator delivery policy (crate::delivery_policy): a refused recipient
     // is replaced by its delegate in the stored mentions/exact_targets, which
@@ -403,6 +407,7 @@ fn resolve_delivery(
         kept_for_holder,
         external_reached_policy,
         sender_has_policy: policies.governs(&identity.name),
+        addressed,
     })
 }
 
@@ -719,8 +724,13 @@ fn recheck_reroutes(
                 holder
             }
         };
+        // A delegate the sender also addressed by name keeps its own copy
+        // (as a plain `@mupe` send would); only the reroute's copy moves.
+        let addressed = delivery.addressed.contains(&delegate);
         for names in [&mut delivery.effective_mentions, &mut delivery.delivered_to] {
-            names.retain(|name| name != &delegate);
+            if !addressed {
+                names.retain(|name| name != &delegate);
+            }
             if !names.contains(&target) {
                 names.push(target.clone());
             }
@@ -2636,6 +2646,45 @@ mod tests {
         );
         assert_eq!(count("valo"), 1);
         assert_eq!(unread_texts(&db, "kimi"), vec!["for kimi".to_string()]);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_delegate_also_addressed_by_name_keeps_its_copy_when_it_stops_mid_send() {
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        let nova = sender(SenderKind::Instance, "nova");
+        let targets = vec!["kimi".to_string(), "mupe".to_string()];
+        // `@kimi @mupe`: kimi is rerouted to mupe, deduped with the explicit @mupe.
+        let resolved = resolve_delivery(&db, &nova, "both", None, Some(&targets)).unwrap();
+        assert_eq!(resolved.effective_mentions, vec!["mupe".to_string()]);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM instances WHERE name = 'mupe'", [])
+            .unwrap();
+        let d = persist_resolved(&db, &nova, "both", None, resolved).unwrap();
+        let sorted = |value: &serde_json::Value| {
+            let mut names: Vec<String> = serde_json::from_value(value.clone()).unwrap();
+            names.sort();
+            names
+        };
+        let both = vec!["kimi".to_string(), "mupe".to_string()];
+        let (_, stored) = last_message(&db);
+        // (a) mupe keeps the copy the sender addressed to it by name.
+        assert_eq!(sorted(&stored["mentions"]), both);
+        assert_eq!(sorted(&stored["delivered_to"]), both);
+        // (b) the reroute still falls back to the holder: kimi is a target,
+        // reads it, and the sender is told why.
+        assert_eq!(sorted(&stored["exact_targets"]), both);
+        assert_eq!(
+            stored[crate::delivery_policy::REROUTES_FIELD],
+            serde_json::json!({"kimi": "kimi"})
+        );
+        assert_eq!(
+            reroute_notices(&d),
+            vec!["mupe is not live; delivered to kimi".to_string()]
+        );
+        assert_eq!(unread_texts(&db, "kimi"), vec!["both".to_string()]);
         cleanup_test_db(path);
     }
 

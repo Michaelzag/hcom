@@ -1813,8 +1813,10 @@ mod tests {
     #[serial]
     fn test_instance_name_some_when_set() {
         let _guard = EnvGuard::new();
-        Config::reset();
+        // Reset after the var is set: a concurrent `Config::get()` from a test
+        // without the env lock then initializes from this env, not the old one.
         with_env("HCOM_INSTANCE_NAME", "test-instance", || {
+            Config::reset();
             Config::init();
             let config = Config::get();
             assert_eq!(config.instance_name, Some("test-instance".to_string()));
@@ -1825,8 +1827,8 @@ mod tests {
     #[serial]
     fn test_instance_name_none_when_unset() {
         let _guard = EnvGuard::new();
-        Config::reset();
         without_env(&["HCOM_INSTANCE_NAME"], || {
+            Config::reset();
             Config::init();
             let config = Config::get();
             assert_eq!(config.instance_name, None);
@@ -1837,8 +1839,8 @@ mod tests {
     #[serial]
     fn test_process_id_some_when_set() {
         let _guard = EnvGuard::new();
-        Config::reset();
         with_env("HCOM_PROCESS_ID", "pid-123", || {
+            Config::reset();
             Config::init();
             let config = Config::get();
             assert_eq!(config.process_id, Some("pid-123".to_string()));
@@ -1849,8 +1851,8 @@ mod tests {
     #[serial]
     fn test_process_id_none_when_unset() {
         let _guard = EnvGuard::new();
-        Config::reset();
         without_env(&["HCOM_PROCESS_ID"], || {
+            Config::reset();
             Config::init();
             let config = Config::get();
             assert_eq!(config.process_id, None);
@@ -1861,14 +1863,14 @@ mod tests {
     #[serial]
     fn test_reset_allows_reinit() {
         let _guard = EnvGuard::new();
-        Config::reset();
         with_env("HCOM_INSTANCE_NAME", "first", || {
+            Config::reset();
             Config::init();
             assert_eq!(Config::get().instance_name, Some("first".to_string()));
         });
 
-        Config::reset();
         with_env("HCOM_INSTANCE_NAME", "second", || {
+            Config::reset();
             Config::init();
             assert_eq!(Config::get().instance_name, Some("second".to_string()));
         });
