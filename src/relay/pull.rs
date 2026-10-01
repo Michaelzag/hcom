@@ -2247,4 +2247,79 @@ mod tests {
             "the imported copy must not be forwarded a second hop"
         );
     }
+
+    /// A steady stream of state messages from a peer whose short id never
+    /// changes must not rewrite `relay_uuid_short_<device>` (nor its
+    /// `relay_short_<short>` mirror). The unconditional `INSERT OR REPLACE`
+    /// took the WAL write lock on every inbound message — the wedge captured
+    /// in the relay worker on mbai — while the stored value was identical.
+    #[test]
+    #[serial]
+    fn repeated_state_messages_with_unchanged_short_id_write_no_kv() {
+        use crate::relay::{kv_write_count, reset_kv_write_counts};
+
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        let base_ts = crate::shared::time::now_epoch_f64() as u64;
+
+        deliver_state(
+            &db,
+            &mut guard,
+            &psk,
+            "device-d",
+            &state_payload("DDDD", &[]),
+            base_ts,
+        );
+        reset_kv_write_counts();
+
+        // Ten more snapshots from the same peer: same short id, rising ts.
+        for i in 1..=10u64 {
+            deliver_state(
+                &db,
+                &mut guard,
+                &psk,
+                "device-d",
+                &state_payload("DDDD", &[]),
+                base_ts + i,
+            );
+        }
+
+        assert_eq!(
+            kv_write_count("relay_uuid_short_device-d"),
+            0,
+            "an unchanged short id must not rewrite relay_uuid_short_device-d"
+        );
+        assert_eq!(
+            kv_write_count("relay_short_DDDD"),
+            0,
+            "an unchanged short id must not rewrite relay_short_DDDD"
+        );
+
+        // A genuinely new mapping is still persisted, exactly once each way.
+        reset_kv_write_counts();
+        deliver_state(
+            &db,
+            &mut guard,
+            &psk,
+            "device-e",
+            &state_payload("EEEE", &[]),
+            base_ts + 20,
+        );
+        assert_eq!(
+            safe_kv_get(&db, "relay_uuid_short_device-e").as_deref(),
+            Some("EEEE")
+        );
+        assert_eq!(
+            kv_write_count("relay_uuid_short_device-e"),
+            1,
+            "a new device's forward mapping is written exactly once"
+        );
+        assert_eq!(
+            kv_write_count("relay_short_EEEE"),
+            1,
+            "the reverse mapping is written exactly once"
+        );
+    }
 }

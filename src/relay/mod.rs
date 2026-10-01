@@ -217,6 +217,29 @@ fn relay_uuid_short_key(device_uuid: &str) -> String {
     format!("{RELAY_UUID_SHORT_PREFIX}{device_uuid}")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: per-key [`safe_kv_set`] call counter, thread-local because
+    /// `safe_kv_set` takes only `&HcomDb`. Every accepted state message from
+    /// every peer passes through the short-id mapping, so a test needs to see
+    /// which keys the hot path actually writes.
+    pub(crate) static KV_WRITE_COUNTS: std::cell::RefCell<
+        std::collections::HashMap<String, usize>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// How many times [`safe_kv_set`] was called for `key` on this thread.
+#[cfg(test)]
+pub(crate) fn kv_write_count(key: &str) -> usize {
+    KV_WRITE_COUNTS.with(|counts| counts.borrow().get(key).copied().unwrap_or(0))
+}
+
+/// Reset the [`safe_kv_set`] counters for this thread.
+#[cfg(test)]
+pub(crate) fn reset_kv_write_counts() {
+    KV_WRITE_COUNTS.with(|counts| counts.borrow_mut().clear());
+}
+
 /// Hash a device UUID to a 4-letter uppercase CVCV short ID.
 pub fn device_short_id(device_uuid: &str) -> String {
     instance_names::hash_to_name(device_uuid, 0).to_uppercase()
@@ -234,7 +257,9 @@ pub fn device_short_id_for_db(db: &HcomDb, device_uuid: &str) -> String {
         match safe_kv_get(db, &short_key) {
             Some(owner) if owner != device_uuid => {}
             _ => {
-                safe_kv_set(db, &short_key, Some(device_uuid));
+                if !kv_set_is_noop(db, &short_key, device_uuid) {
+                    safe_kv_set(db, &short_key, Some(device_uuid));
+                }
                 return short_id;
             }
         }
@@ -259,9 +284,28 @@ pub fn device_short_id_for_db(db: &HcomDb, device_uuid: &str) -> String {
     fallback
 }
 
+/// True when `kv_set` for this key would actually change the stored value.
+/// A read costs no WAL write lock; an `INSERT OR REPLACE` of an identical value
+/// still takes one, which is what the relay worker was observed blocked on.
+fn kv_set_is_noop(db: &HcomDb, key: &str, value: &str) -> bool {
+    matches!(safe_kv_get(db, key).as_deref(), Some(stored) if stored == value)
+}
+
+/// Persist a device's short id in both directions.
+///
+/// Reads before writing: this runs for every accepted state message from
+/// every peer (five peers republishing every 5s in the observed stall), and
+/// the mapping almost never changes. The unconditional writes took the WAL
+/// write lock on every message even when the value was already identical.
 pub(crate) fn remember_device_short_id(db: &HcomDb, device_uuid: &str, short_id: &str) {
-    safe_kv_set(db, &relay_uuid_short_key(device_uuid), Some(short_id));
-    safe_kv_set(db, &relay_short_key(short_id), Some(device_uuid));
+    let uuid_key = relay_uuid_short_key(device_uuid);
+    if !kv_set_is_noop(db, &uuid_key, short_id) {
+        safe_kv_set(db, &uuid_key, Some(short_id));
+    }
+    let short_key = relay_short_key(short_id);
+    if !kv_set_is_noop(db, &short_key, device_uuid) {
+        safe_kv_set(db, &short_key, Some(device_uuid));
+    }
 }
 
 /// Add device short ID suffix to a name (e.g., "luna" → "luna:XABC").
@@ -276,6 +320,10 @@ pub(crate) fn safe_kv_get(db: &HcomDb, key: &str) -> Option<String> {
 
 /// Safe KV set that won't crash on DB errors.
 pub(crate) fn safe_kv_set(db: &HcomDb, key: &str, value: Option<&str>) {
+    #[cfg(test)]
+    KV_WRITE_COUNTS.with(|counts| {
+        *counts.borrow_mut().entry(key.to_string()).or_insert(0) += 1;
+    });
     let _ = db.kv_set(key, value);
 }
 
