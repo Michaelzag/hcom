@@ -254,9 +254,11 @@ struct ResolvedDelivery {
     external_reached_policy: Vec<String>,
     /// The sender has a `[delivery.*]` entry: its requests create no watches.
     sender_has_policy: bool,
-    /// The targets the sender addressed (mentions or thread members), before
-    /// any reroute: a delegate named here is a recipient in its own right.
-    addressed: Vec<String>,
+    /// Recipients that keep their own copy (their own verdict delivered it
+    /// to them, or their delegate had no live row): a delegate named here is
+    /// a recipient in its own right. A name the sender addressed whose own
+    /// copy was rerouted is not, since its delegate already has that copy.
+    own_copies: Vec<String>,
 }
 
 /// One `hcom send` output line per refused recipient.
@@ -317,7 +319,7 @@ fn resolve_delivery(
     } else {
         thread_delivery_members.clone()
     };
-    let addressed = effective_mentions.clone();
+    let mut own_copies = Vec::new();
 
     // Operator delivery policy (crate::delivery_policy): a refused recipient
     // is replaced by its delegate in the stored mentions/exact_targets, which
@@ -338,7 +340,10 @@ fn resolve_delivery(
         let mut kept: Vec<String> = Vec::with_capacity(effective_mentions.len());
         for name in effective_mentions {
             let target = match policies.send_verdict(&name, &facts) {
-                SendVerdict::Deliver => name,
+                SendVerdict::Deliver => {
+                    own_copies.push(name.clone());
+                    name
+                }
                 // The delegate resolves like any target (an exact live name
                 // first; a bare remote name maps to its mirror row). No
                 // single live row: the holder keeps it (never dropped, and a
@@ -358,6 +363,7 @@ fn resolve_delivery(
                                 &format!("delegate {why}; delivered to {name}"),
                             );
                             kept_for_holder.push((name.clone(), why));
+                            own_copies.push(name.clone());
                             name
                         }
                     }
@@ -407,7 +413,7 @@ fn resolve_delivery(
         kept_for_holder,
         external_reached_policy,
         sender_has_policy: policies.governs(&identity.name),
-        addressed,
+        own_copies,
     })
 }
 
@@ -724,11 +730,13 @@ fn recheck_reroutes(
                 holder
             }
         };
-        // A delegate the sender also addressed by name keeps its own copy
-        // (as a plain `@mupe` send would); only the reroute's copy moves.
-        let addressed = delivery.addressed.contains(&delegate);
+        // A delegate that keeps its own copy of this message (addressed by
+        // name and delivered to it, as a plain `@mupe` send would) keeps it;
+        // only the reroute's copy moves. A delegate whose own copy was itself
+        // rerouted onward has nothing of its own here.
+        let own_copy = delivery.own_copies.contains(&delegate);
         for names in [&mut delivery.effective_mentions, &mut delivery.delivered_to] {
-            if !addressed {
+            if !own_copy {
                 names.retain(|name| name != &delegate);
             }
             if !names.contains(&target) {
@@ -2646,6 +2654,61 @@ mod tests {
         );
         assert_eq!(count("valo"), 1);
         assert_eq!(unread_texts(&db, "kimi"), vec!["for kimi".to_string()]);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_role_holding_delegate_addressed_by_name_is_not_forwarded_twice_after_resume() {
+        // mupe is kimi's delegate and holds a role of its own (deputy -> lola).
+        let (db, path, _env) = policy_db(&format!(
+            "{KIMI_POLICY}\n[delivery.deputy]\ndelegate = \"lola\"\n"
+        ));
+        crate::delivery_policy::register_role(&db, "mupe", "sess-mupe", "deputy").unwrap();
+        let nova = sender(SenderKind::Instance, "nova");
+        let targets = vec!["kimi".to_string(), "mupe".to_string()];
+        // `@kimi @mupe`: kimi -> mupe, and mupe's own copy -> lola.
+        let resolved = resolve_delivery(&db, &nova, "chained", None, Some(&targets)).unwrap();
+        assert_eq!(
+            resolved.reroutes,
+            vec![
+                ("kimi".to_string(), "mupe".to_string()),
+                ("mupe".to_string(), "lola".to_string())
+            ]
+        );
+        // mupe stops between resolution and insert.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM instances WHERE name = 'mupe'", [])
+            .unwrap();
+        let d = persist_resolved(&db, &nova, "chained", None, resolved).unwrap();
+        let (id, stored) = last_message(&db);
+        // `hcom r mupe`: a new row resumed from its old cursor, re-registered.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at, last_event_id)
+                 VALUES ('mupe', 'sess-mupe2', 2000.0, ?1)",
+                [id - 1],
+            )
+            .unwrap();
+        crate::delivery_policy::register_role(&db, "mupe", "sess-mupe2", "deputy").unwrap();
+        // mupe's own copy already went to lola at send time: the resumed mupe
+        // reads nothing and lola is never forwarded a second copy.
+        assert!(unread_texts(&db, "mupe").is_empty());
+        assert_eq!(forward_count(&db), 0);
+        assert_eq!(unread_texts(&db, "lola"), vec!["chained".to_string()]);
+        // kimi falls back to itself, and mupe is no longer a target.
+        assert_eq!(
+            reroute_notices(&d),
+            vec![
+                "mupe takes no cc; delivered to lola".to_string(),
+                "mupe is not live; delivered to kimi".to_string()
+            ]
+        );
+        let mut mentions: Vec<String> = serde_json::from_value(stored["mentions"].clone()).unwrap();
+        mentions.sort();
+        assert_eq!(mentions, vec!["kimi".to_string(), "lola".to_string()]);
+        assert_eq!(unread_texts(&db, "kimi"), vec!["chained".to_string()]);
         cleanup_test_db(path);
     }
 
