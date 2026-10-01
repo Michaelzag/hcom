@@ -254,14 +254,17 @@ pub fn device_short_id_for_db(db: &HcomDb, device_uuid: &str) -> String {
     let uuid_key = relay_uuid_short_key(device_uuid);
     if let Some(short_id) = safe_kv_get(db, &uuid_key) {
         let short_key = relay_short_key(&short_id);
-        match safe_kv_get(db, &short_key) {
-            Some(owner) if owner != device_uuid => {}
-            _ => {
-                if !kv_set_is_noop(db, &short_key, device_uuid) {
-                    safe_kv_set(db, &short_key, Some(device_uuid));
-                }
+        // The reverse mapping's owner is already in hand, so each arm acts on
+        // that value directly: no second read to decide whether to write.
+        match safe_kv_get(db, &short_key).as_deref() {
+            Some(owner) if owner == device_uuid => return short_id,
+            None => {
+                safe_kv_set(db, &short_key, Some(device_uuid));
                 return short_id;
             }
+            // Owned by a different UUID: this mapping is stale or colliding,
+            // fall through and probe for a free short id.
+            Some(_) => {}
         }
     }
 
@@ -285,8 +288,9 @@ pub fn device_short_id_for_db(db: &HcomDb, device_uuid: &str) -> String {
 }
 
 /// True when `kv_set` for this key would actually change the stored value.
-/// A read costs no WAL write lock; an `INSERT OR REPLACE` of an identical value
-/// still takes one, which is what the relay worker was observed blocked on.
+/// A read takes no WAL write lock, while an `INSERT OR REPLACE` takes one even
+/// when the value is byte-identical, so this removes per-message write-lock
+/// traffic on keys whose value rarely changes.
 fn kv_set_is_noop(db: &HcomDb, key: &str, value: &str) -> bool {
     matches!(safe_kv_get(db, key).as_deref(), Some(stored) if stored == value)
 }
@@ -294,9 +298,11 @@ fn kv_set_is_noop(db: &HcomDb, key: &str, value: &str) -> bool {
 /// Persist a device's short id in both directions.
 ///
 /// Reads before writing: this runs for every accepted state message from
-/// every peer (five peers republishing every 5s in the observed stall), and
-/// the mapping almost never changes. The unconditional writes took the WAL
-/// write lock on every message even when the value was already identical.
+/// every peer, and the mapping almost never changes. The old unconditional
+/// writes took the WAL write lock on every message even when the value was
+/// already identical. This removes that write-lock traffic; it does not
+/// remove the per-apply lock wait itself — the heartbeat and push starvation
+/// is fixed by the bounded drain in `client::MqttRelay::run_loop`.
 pub(crate) fn remember_device_short_id(db: &HcomDb, device_uuid: &str, short_id: &str) {
     let uuid_key = relay_uuid_short_key(device_uuid);
     if !kv_set_is_noop(db, &uuid_key, short_id) {

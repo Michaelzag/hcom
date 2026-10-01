@@ -1169,9 +1169,13 @@ mod tests {
     /// 2026-10-01T06:50Z stall — a 1024-event tick at the observed per-apply
     /// cost lasted minutes.
     ///
-    /// Asserts two consumer-visible facts while the queue is deep: the
-    /// heartbeat KV keeps advancing (at least every ~1.5s), and at least one
-    /// push happens before the last queued event has been applied.
+    /// Asserts three consumer-visible facts while the queue is deep: the
+    /// heartbeat KV keeps advancing (at least twice, with no observed gap
+    /// above MAX_HEARTBEAT_GAP), and pushes keep being attempted before the
+    /// last queued event has been applied. MAX_HEARTBEAT_GAP is what pins
+    /// DRAIN_BUDGET: measured here, a 2s budget leaves a 3.28s gap and an
+    /// unbounded drain leaves a single write for the whole ~4.5s drain,
+    /// while 200ms holds it near the ~1.2s floor.
     #[test]
     #[serial]
     fn slow_inbound_drain_still_heartbeats_and_pushes() {
@@ -1341,9 +1345,15 @@ mod tests {
             "heartbeat stalled for {worst_gap:?} under a slow inbound drain"
         );
 
+        // Pushes must keep being attempted while the queue is deep. Measured
+        // on this test: 200ms budget -> 12 pushes before the drain finished,
+        // 2s budget -> 12, unbounded -> 0. So this catches a drain that never
+        // returns to the top at all, but it does NOT distinguish 200ms from
+        // 2s — MAX_HEARTBEAT_GAP above is what pins DRAIN_BUDGET (measured
+        // 3.28s gap at a 2s budget, ~1.2s at 200ms).
         assert!(
-            push_before_drain >= 1,
-            "a push must be attempted while events are still queued \
+            push_before_drain >= 5,
+            "pushes must keep being attempted while events are still queued \
              (pushes={push_changes}, before_drain={push_before_drain})"
         );
     }
