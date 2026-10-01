@@ -1,8 +1,7 @@
 # hcom
 
-[![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
+[![CI](https://github.com/Michaelzag/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/Michaelzag/hcom/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Michaelzag/hcom/blob/main/LICENSE)
 
 > **Hook your coding agents together**
 
@@ -18,31 +17,49 @@ https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 
 ## Install
 
-```bash
-brew install aannoo/hcom/hcom
-```
-
-<details><summary>Other install options</summary>
-
-```bash
-# With Python
-uv tool install hcom  # or: pip install hcom
-```
+**Linux x86_64** is the only platform with published binaries. The installer
+reads the release manifest from the CDN, verifies the archive against the
+manifest and its published `.sha256` sidecar, and only then swaps the binary
+into `~/.local/bin/hcom` — the previous binary is kept at `hcom.bak`:
 
 ```bash
-# macOS, Linux, Android (Termux), and WSL
-curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
+curl -fsSL https://cdn.ffc-w.com/hcom/releases/install.sh | sh
 ```
 
-```powershell
-# Windows (native, Powershell)
-irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex
-```
+To install one specific release instead of the latest:
 
 ```bash
-# Update any existing install to latest hcom version
-hcom update
+curl -fsSL https://cdn.ffc-w.com/hcom/releases/install.sh -o hcom-install.sh
+HCOM_RELEASE_TAG=vX.Y.Z sh hcom-install.sh
 ```
+
+<details><summary>Other platforms, PyPI, updating</summary>
+
+**aarch64 Linux, macOS and Windows** have no published binaries — build the
+release tag locally (this is also how the Arm Macs in the fleet update):
+
+```bash
+git clone --branch vX.Y.Z https://github.com/Michaelzag/hcom.git
+cd hcom
+cargo build --release --locked
+# binary at target/release/hcom
+```
+
+Fleet hosts are rolled from the same CDN releases (`https://cdn.ffc-w.com/hcom/releases/`),
+not from GitHub: each host verifies the tarball's sha256 before swapping.
+
+**PyPI is not a channel for this fork**: the `hcom` package on PyPI belongs to
+the upstream project and is frozen at 0.7.26. Install from the CDN or build
+from the tag.
+
+**Updating** an existing install:
+
+```bash
+hcom update    # Linux x86_64: reads the CDN manifest, verifies, keeps hcom.bak
+```
+
+On every other host, update by checking out the new release tag and rebuilding
+as above.
 
 </details>
 
@@ -459,7 +476,7 @@ Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovere
 ```bash
 # Prerequisites: Rust 1.88+
 
-git clone https://github.com/aannoo/hcom.git
+git clone https://github.com/Michaelzag/hcom.git
 cd hcom
 cargo build
 cargo test
