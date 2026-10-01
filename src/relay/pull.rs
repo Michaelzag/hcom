@@ -13,7 +13,9 @@ use crate::log;
 
 use super::crypto;
 use super::replay::ReplayGuard;
-use super::{device_short_id_for_db, remember_device_short_id, safe_kv_get, safe_kv_set};
+use super::{
+    device_short_id_for_db, kv_set_is_noop, remember_device_short_id, safe_kv_get, safe_kv_set,
+};
 
 /// Crypto + replay context shared by all inbound message handlers.
 pub struct InboundContext<'a> {
@@ -287,11 +289,15 @@ pub fn handle_state_message(
     //               control disabled); capability check blocks every action.
     //   - "[...]" → explicit advertisement.
     // Missing KV key means "no state received yet" and is handled separately.
-    if let Some(caps) = state.get("capabilities").and_then(|v| v.as_array()) {
-        let serialized = serde_json::to_string(caps).unwrap_or_else(|_| "[]".to_string());
-        safe_kv_set(db, &format!("relay_caps_{}", device_id), Some(&serialized));
-    } else {
-        safe_kv_set(db, &format!("relay_caps_{}", device_id), Some("null"));
+    // Write-on-change: a peer's advertised capabilities are stable for the
+    // life of the peer, so this key only needs writing when it differs.
+    let caps_key = format!("relay_caps_{}", device_id);
+    let serialized_caps = match state.get("capabilities").and_then(|v| v.as_array()) {
+        Some(caps) => serde_json::to_string(caps).unwrap_or_else(|_| "[]".to_string()),
+        None => "null".to_string(),
+    };
+    if !kv_set_is_noop(db, &caps_key, &serialized_caps) {
+        safe_kv_set(db, &caps_key, Some(&serialized_caps));
     }
 
     // Check for device reset — clean old data before importing
@@ -489,7 +495,9 @@ pub fn handle_state_message(
         Some(&now.to_string()),
     );
 
-    // Update relay_device_count and relay_last_sync
+    // Update relay_device_count and relay_last_sync. The COUNT is a read; the
+    // count only changes when a peer joins or leaves, so the key is written
+    // only on a real change. relay_last_sync moves on every message by design.
     let device_count: i64 = db
         .conn()
         .query_row(
@@ -499,7 +507,10 @@ pub fn handle_state_message(
             |r| r.get(0),
         )
         .unwrap_or(0);
-    safe_kv_set(db, "relay_device_count", Some(&device_count.to_string()));
+    let device_count_str = device_count.to_string();
+    if !kv_set_is_noop(db, "relay_device_count", &device_count_str) {
+        safe_kv_set(db, "relay_device_count", Some(&device_count_str));
+    }
     safe_kv_set(db, "relay_last_sync", Some(&now.to_string()));
     record_state_ts_watermark(db, device_id, opened.ts_secs);
 
@@ -2246,5 +2257,137 @@ mod tests {
                 .any(|t| t.contains("old peer to the conductor")),
             "the imported copy must not be forwarded a second hop"
         );
+    }
+
+    /// A steady stream of state messages from a peer whose short id never
+    /// changes must not rewrite `relay_uuid_short_<device>` (nor its
+    /// `relay_short_<short>` mirror). The unconditional `INSERT OR REPLACE`
+    /// took the WAL write lock on every inbound message — the wedge captured
+    /// in the relay worker on mbai — while the stored value was identical.
+    #[test]
+    #[serial]
+    fn repeated_state_messages_with_unchanged_short_id_write_no_kv() {
+        use crate::relay::{kv_write_count, reset_kv_write_counts};
+
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        let base_ts = crate::shared::time::now_epoch_f64() as u64;
+
+        deliver_state(
+            &db,
+            &mut guard,
+            &psk,
+            "device-d",
+            &state_payload("DDDD", &[]),
+            base_ts,
+        );
+        reset_kv_write_counts();
+
+        // Ten more snapshots from the same peer: same short id, rising ts.
+        for i in 1..=10u64 {
+            deliver_state(
+                &db,
+                &mut guard,
+                &psk,
+                "device-d",
+                &state_payload("DDDD", &[]),
+                base_ts + i,
+            );
+        }
+
+        assert_eq!(
+            kv_write_count("relay_uuid_short_device-d"),
+            0,
+            "an unchanged short id must not rewrite relay_uuid_short_device-d"
+        );
+        assert_eq!(
+            kv_write_count("relay_short_DDDD"),
+            0,
+            "an unchanged short id must not rewrite relay_short_DDDD"
+        );
+
+        // A genuinely new mapping is still persisted, exactly once each way.
+        reset_kv_write_counts();
+        deliver_state(
+            &db,
+            &mut guard,
+            &psk,
+            "device-e",
+            &state_payload("EEEE", &[]),
+            base_ts + 20,
+        );
+        assert_eq!(
+            safe_kv_get(&db, "relay_uuid_short_device-e").as_deref(),
+            Some("EEEE")
+        );
+        assert_eq!(
+            kv_write_count("relay_uuid_short_device-e"),
+            1,
+            "a new device's forward mapping is written exactly once"
+        );
+        assert_eq!(
+            kv_write_count("relay_short_EEEE"),
+            1,
+            "the reverse mapping is written exactly once"
+        );
+    }
+
+    /// A steady stream of identical state messages must not rewrite
+    /// `relay_caps_<device>` or `relay_device_count` after the first one. Both
+    /// values are stable while a peer's advertised capabilities and the fleet
+    /// membership are unchanged, and an `INSERT OR REPLACE` of an identical
+    /// value still takes the WAL write lock.
+    #[test]
+    #[serial]
+    fn repeated_identical_state_messages_write_no_caps_or_device_count() {
+        use crate::relay::{kv_write_count, reset_kv_write_counts};
+
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        let base_ts = crate::shared::time::now_epoch_f64() as u64;
+
+        let mut payload = state_payload("CAPS", &["luna"]);
+        payload["state"]["capabilities"] = json!(["launch", "resume"]);
+
+        // The first message establishes both values, once each.
+        deliver_state(&db, &mut guard, &psk, "device-f", &payload, base_ts);
+        assert_eq!(
+            kv_write_count("relay_caps_device-f"),
+            1,
+            "the first snapshot writes the capabilities once"
+        );
+        assert_eq!(
+            kv_write_count("relay_device_count"),
+            1,
+            "the first snapshot writes the device count once"
+        );
+        reset_kv_write_counts();
+
+        // Ten more snapshots: same capabilities, same instances, rising ts.
+        for i in 1..=10u64 {
+            deliver_state(&db, &mut guard, &psk, "device-f", &payload, base_ts + i);
+        }
+
+        assert_eq!(
+            kv_write_count("relay_caps_device-f"),
+            0,
+            "unchanged capabilities must not rewrite relay_caps_device-f"
+        );
+        assert_eq!(
+            kv_write_count("relay_device_count"),
+            0,
+            "an unchanged device count must not rewrite relay_device_count"
+        );
+        // Guard against a vacuous pass: the stored values are the ones the
+        // first message wrote.
+        assert_eq!(
+            safe_kv_get(&db, "relay_caps_device-f").as_deref(),
+            Some(r#"["launch","resume"]"#)
+        );
+        assert_eq!(safe_kv_get(&db, "relay_device_count").as_deref(), Some("1"));
     }
 }

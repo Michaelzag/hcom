@@ -280,6 +280,11 @@ pub struct MqttRelay<'a> {
     cmd_rx: &'a mpsc::Receiver<RelayCommand>,
     /// Push interval (seconds between automatic push cycles).
     push_interval: Duration,
+    /// Artificial per-event apply latency. Set only by tests, so the drain
+    /// budget can be exercised without waiting for real multi-second
+    /// applies. Zero in every non-test build.
+    #[cfg(test)]
+    apply_delay: Duration,
 }
 
 impl<'a> MqttRelay<'a> {
@@ -292,6 +297,13 @@ impl<'a> MqttRelay<'a> {
     /// events flow. Also the "has not been connected" threshold past which
     /// `hcom relay` status must say so.
     const LIVENESS_TIMEOUT: Duration = Duration::from_secs(90);
+
+    /// Wall-clock budget for one inbound drain pass. The heartbeat write and
+    /// the push timers live at the top of the loop, so a tick that spends
+    /// longer than this inside `handle_event` starves them: measured applies
+    /// take 0.1–2.6s each, and a full 1024-event batch kept a live relay
+    /// silent for minutes while every peer's sync time kept advancing.
+    const DRAIN_BUDGET: Duration = Duration::from_millis(200);
 
     /// Build the MQTT relay client for one MQTT session.
     ///
@@ -354,6 +366,8 @@ impl<'a> MqttRelay<'a> {
             replay_guard: Mutex::new(ReplayGuard::default()),
             cmd_rx,
             push_interval: Duration::from_secs(5),
+            #[cfg(test)]
+            apply_delay: Duration::ZERO,
         };
 
         log::log_info(
@@ -409,6 +423,16 @@ impl<'a> MqttRelay<'a> {
             }
         });
 
+        self.run_loop(&event_rx)
+    }
+
+    /// The worker loop proper: heartbeat, commands, push timers and the
+    /// bounded inbound drain. Split out of [`Self::run`] so a test can drive
+    /// it with a synthetic inbound stream and no broker.
+    fn run_loop(
+        &self,
+        event_rx: &mpsc::Receiver<Result<Event, rumqttc::v5::ConnectionError>>,
+    ) -> RunEnd {
         let mut backoff = Backoff::new();
         let mut last_push = Instant::now();
         let mut pending_push_at: Option<Instant> = None;
@@ -447,7 +471,7 @@ impl<'a> MqttRelay<'a> {
             match self.cmd_rx.try_recv() {
                 Ok(RelayCommand::Shutdown) => {
                     log::log_info("relay", "relay.shutdown", "shutdown requested");
-                    self.shutdown_graceful(&event_rx);
+                    self.shutdown_graceful(event_rx);
                     return RunEnd::Shutdown;
                 }
                 Ok(RelayCommand::Push) => {
@@ -457,7 +481,7 @@ impl<'a> MqttRelay<'a> {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log::log_info("relay", "relay.shutdown", "command channel closed");
-                    self.shutdown_graceful(&event_rx);
+                    self.shutdown_graceful(event_rx);
                     return RunEnd::Shutdown;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -517,19 +541,24 @@ impl<'a> MqttRelay<'a> {
                 ));
             }
 
-            // Drain queued MQTT events (up to a cap), then poll once with
-            // timeout. This prevents stale error backlogs from burying a
-            // ConnAck behind hours of one-error-per-backoff processing,
-            // while capping per-tick work so cmd_rx and push timers stay
-            // responsive under sustained inbound traffic.
+            // Drain queued MQTT events (bounded by count AND by elapsed
+            // time), then poll once with timeout. This prevents stale error
+            // backlogs from burying a ConnAck behind hours of
+            // one-error-per-backoff processing, while capping per-tick work
+            // so the heartbeat, cmd_rx and push timers stay responsive under
+            // sustained inbound traffic. The count cap alone was not enough:
+            // 1024 applies at the observed 0.1–2.6s each is minutes inside a
+            // single tick, long enough for every reader to see the worker as
+            // stale.
             let mut drained = false;
             let mut channel_disconnected = false;
             let mut trigger_push = false;
             let mut drain_count: u32 = 0;
             const MAX_DRAIN_PER_TICK: u32 = 1024;
+            let drain_deadline = Instant::now() + Self::DRAIN_BUDGET;
 
             // Phase 1: drain queued events without blocking (bounded)
-            while drain_count < MAX_DRAIN_PER_TICK {
+            while drain_count < MAX_DRAIN_PER_TICK && Instant::now() < drain_deadline {
                 match event_rx.try_recv() {
                     Ok(Ok(event)) => {
                         drain_count += 1;
@@ -601,6 +630,10 @@ impl<'a> MqttRelay<'a> {
 
     /// Handle a single MQTT event.
     fn handle_event(&self, event: Event, epoch: &mut DisconnectEpoch) -> bool {
+        #[cfg(test)]
+        if !self.apply_delay.is_zero() {
+            thread::sleep(self.apply_delay);
+        }
         match event {
             Event::Incoming(incoming) => match incoming {
                 Packet::ConnAck(_connack) => {
@@ -1127,5 +1160,202 @@ mod tests {
             "{long}"
         );
         assert!(long.contains("not connected for 125s"), "{long}");
+    }
+
+    /// A steady inbound stream with slow applies must not starve the
+    /// heartbeat or the push timer: both live at the top of the worker loop,
+    /// so a drain that runs unbounded keeps every reader looking at a stale
+    /// worker while peers' sync times advance. This is the mbai
+    /// 2026-10-01T06:50Z stall — a 1024-event tick at the observed per-apply
+    /// cost lasted minutes.
+    ///
+    /// Asserts three consumer-visible facts while the queue is deep: the
+    /// heartbeat KV keeps advancing (at least twice, with no observed gap
+    /// above MAX_HEARTBEAT_GAP), and pushes keep being attempted before the
+    /// last queued event has been applied. MAX_HEARTBEAT_GAP is what pins
+    /// DRAIN_BUDGET: measured here, a 2s budget leaves a 3.28s gap and an
+    /// unbounded drain leaves a single write for the whole ~4.5s drain,
+    /// while 200ms holds it near the ~1.2s floor.
+    #[test]
+    #[serial]
+    fn slow_inbound_drain_still_heartbeats_and_pushes() {
+        use rumqttc::v5::mqttbytes::v5::{ConnAck, ConnectReturnCode, Publish};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const EVENTS: u64 = 150;
+        const APPLY_DELAY: Duration = Duration::from_millis(30);
+        const PUSH_INTERVAL: Duration = Duration::from_millis(300);
+        const SAMPLE: Duration = Duration::from_millis(25);
+        // The heartbeat writes on its own ~1s cadence, and the loop revisits
+        // the top at least once per DRAIN_BUDGET (200ms), so the floor is
+        // ~1.2s. Leave room for a push cycle and scheduler noise on a loaded
+        // runner: the unfixed loop wrote the heartbeat exactly once for the
+        // whole ~4.5s drain, which fails both this bound and the count above.
+        const MAX_HEARTBEAT_GAP: Duration = Duration::from_millis(2500);
+        const RELAY_ID: &str = "relay-drain";
+
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+
+        // Opened here, once, before any other thread exists: the first open of
+        // a fresh db converts it to WAL under a brief exclusive lock, and a
+        // concurrent first opener can lose that race with SQLITE_BUSY (see
+        // HcomDb::ensure_schema). The sampler below only reads.
+        let db = HcomDb::open().unwrap();
+
+        // The Connection is never polled, so no socket is opened; holding it
+        // keeps the request channel alive, which is what makes a push cycle
+        // (and its `relay_last_push` write) succeed without a broker.
+        let (client, _connection) =
+            Client::new(MqttOptions::new("hcom-drain-test", "127.0.0.1", 1883), 4096);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<RelayCommand>();
+        let relay = MqttRelay {
+            client,
+            relay_id: RELAY_ID.to_string(),
+            device_uuid: "device-own".to_string(),
+            psk: Mutex::new([0x42; 32]),
+            replay_guard: Mutex::new(ReplayGuard::default()),
+            cmd_rx: &cmd_rx,
+            push_interval: PUSH_INTERVAL,
+            apply_delay: APPLY_DELAY,
+        };
+
+        let (event_tx, event_rx) = mpsc::channel::<Result<Event, rumqttc::v5::ConnectionError>>();
+        // ConnAck first: the push timers only run in a connected epoch.
+        event_tx
+            .send(Ok(Event::Incoming(Packet::ConnAck(ConnAck {
+                session_present: false,
+                code: ConnectReturnCode::Success,
+                properties: None,
+            }))))
+            .unwrap();
+
+        let producer = thread::spawn(move || {
+            let psk = [0x42u8; 32];
+            let base_ts = crate::shared::time::now_epoch_f64() as u64;
+            for i in 0..EVENTS {
+                let device = format!("device-peer-{i:03}");
+                let topic = format!("{RELAY_ID}/{device}");
+                let payload = json!({
+                    "state": {
+                        "short_id": format!("P{i:03}"),
+                        "reset_ts": 0.0,
+                        "instances": {},
+                    },
+                    "events": []
+                });
+                let envelope = crate::relay::crypto::seal(
+                    &psk,
+                    RELAY_ID,
+                    &topic,
+                    &serde_json::to_vec(&payload).unwrap(),
+                    base_ts + i,
+                )
+                .unwrap();
+                let publish = Publish {
+                    qos: QoS::AtLeastOnce,
+                    retain: true,
+                    topic: bytes::Bytes::copy_from_slice(topic.as_bytes()),
+                    payload: bytes::Bytes::from(envelope),
+                    ..Default::default()
+                };
+                // All events are queued up front: the loop cannot outrun a
+                // 30ms-per-apply drain of the whole batch.
+                if event_tx
+                    .send(Ok(Event::Incoming(Packet::Publish(publish))))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let done = Arc::new(AtomicBool::new(false));
+        let sampler_device = format!("device-peer-{:03}", EVENTS - 1);
+        let sampler = {
+            let done = done.clone();
+            thread::spawn(move || {
+                let db = db;
+                let mut hb_changes: Vec<Instant> = Vec::new();
+                let mut last_hb: Option<String> = None;
+                let mut push_changes = 0usize;
+                let mut push_before_drain = 0usize;
+                let mut last_push: Option<String> = None;
+                while !done.load(Ordering::Relaxed) {
+                    let drained = db
+                        .kv_get(&format!("relay_sync_time_{sampler_device}"))
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if let Some(hb) = db.kv_get(super::super::HEARTBEAT_KEY).ok().flatten()
+                        && last_hb.as_deref() != Some(hb.as_str())
+                    {
+                        hb_changes.push(Instant::now());
+                        last_hb = Some(hb);
+                    }
+                    if let Some(p) = db.kv_get("relay_last_push").ok().flatten()
+                        && last_push.as_deref() != Some(p.as_str())
+                    {
+                        push_changes += 1;
+                        if !drained {
+                            push_before_drain += 1;
+                        }
+                        last_push = Some(p);
+                    }
+                    thread::sleep(SAMPLE);
+                }
+
+                // Every queued event must really have been applied (30ms
+                // each), so this watched a deep, slow queue, not an idle loop.
+                let fully_applied = db
+                    .kv_get(&format!("relay_sync_time_{sampler_device}"))
+                    .ok()
+                    .flatten()
+                    .is_some();
+                (hb_changes, push_changes, push_before_drain, fully_applied)
+            })
+        };
+
+        let end = relay.run_loop(&event_rx);
+        done.store(true, Ordering::Relaxed);
+        producer.join().unwrap();
+        let (hb_changes, push_changes, push_before_drain, fully_applied) = sampler.join().unwrap();
+
+        assert!(
+            matches!(end, RunEnd::Ended(_)),
+            "loop should end when the producer drops the event channel: {end:?}"
+        );
+
+        assert!(
+            fully_applied,
+            "the synthetic inbound stream must be fully applied"
+        );
+
+        assert!(
+            hb_changes.len() >= 2,
+            "heartbeat must keep advancing while the inbound queue drains, saw {} writes",
+            hb_changes.len()
+        );
+        let worst_gap = hb_changes
+            .windows(2)
+            .map(|w| w[1].duration_since(w[0]))
+            .max()
+            .unwrap_or_default();
+        assert!(
+            worst_gap <= MAX_HEARTBEAT_GAP,
+            "heartbeat stalled for {worst_gap:?} under a slow inbound drain"
+        );
+
+        // Pushes must keep being attempted while the queue is deep. This
+        // guards against pushes stopping altogether during a drain; it is NOT
+        // what pins DRAIN_BUDGET — measured, this assertion still passes at a
+        // 2s budget. MAX_HEARTBEAT_GAP above is the discriminator: a 2s
+        // budget measured a 3.28s heartbeat gap against this 2.5s bound
+        // (fails), while 200ms holds it near the ~1.2s floor of the 1s
+        // heartbeat cadence plus one drain tick (passes).
+        assert!(
+            push_before_drain >= 5,
+            "pushes must keep being attempted while events are still queued \
+             (pushes={push_changes}, before_drain={push_before_drain})"
+        );
     }
 }
