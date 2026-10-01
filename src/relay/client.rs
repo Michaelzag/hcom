@@ -1345,12 +1345,13 @@ mod tests {
             "heartbeat stalled for {worst_gap:?} under a slow inbound drain"
         );
 
-        // Pushes must keep being attempted while the queue is deep. Measured
-        // on this test: 200ms budget -> 12 pushes before the drain finished,
-        // 2s budget -> 12, unbounded -> 0. So this catches a drain that never
-        // returns to the top at all, but it does NOT distinguish 200ms from
-        // 2s — MAX_HEARTBEAT_GAP above is what pins DRAIN_BUDGET (measured
-        // 3.28s gap at a 2s budget, ~1.2s at 200ms).
+        // Pushes must keep being attempted while the queue is deep. This
+        // guards against pushes stopping altogether during a drain; it is NOT
+        // what pins DRAIN_BUDGET — measured, this assertion still passes at a
+        // 2s budget. MAX_HEARTBEAT_GAP above is the discriminator: a 2s
+        // budget measured a 3.28s heartbeat gap against this 2.5s bound
+        // (fails), while 200ms holds it near the ~1.2s floor of the 1s
+        // heartbeat cadence plus one drain tick (passes).
         assert!(
             push_before_drain >= 5,
             "pushes must keep being attempted while events are still queued \
