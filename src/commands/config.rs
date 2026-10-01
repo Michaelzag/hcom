@@ -379,6 +379,13 @@ fn config_set_at_path(path: &Path, key: &str, value: &str) -> Result<(), String>
 
     // Map HCOM_KEY to field name, then to nested TOML path
     let field_name = key.strip_prefix("HCOM_").unwrap_or(key).to_lowercase();
+    // `[delivery.*]` is operator-edited only (crate::delivery_policy); the
+    // unknown-key fallback below would overwrite the whole table.
+    if field_name == "delivery" || field_name.starts_with("delivery.") {
+        return Err(
+            "delivery policy has no CLI setter: edit [delivery.<role>] in config.toml".to_string(),
+        );
+    }
     validate_config_args(&field_name, value)?;
 
     if field_name == "codex_sandbox_mode" && !value.is_empty() {
@@ -2538,8 +2545,29 @@ mod tests {
     }
 
     #[test]
+    fn test_config_set_keeps_and_refuses_delivery_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let policy = "[delivery.conductor]\ndelegate = \"mupe\"\nleads = [\"poli\"]\n";
+        std::fs::write(&path, policy).unwrap();
+
+        config_set_at_path(&path, "HCOM_PI_ARGS", "--model safe-model").unwrap();
+        for key in ["delivery", "HCOM_DELIVERY", "delivery.conductor.delegate"] {
+            assert!(config_set_at_path(&path, key, "x").is_err(), "{key}");
+        }
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("safe-model"));
+        assert_eq!(
+            crate::delivery_policy::parse(&after),
+            crate::delivery_policy::parse(policy)
+        );
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn test_terminal_help_text_lists_cmux_as_managed() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         crate::config::Config::reset();
         crate::config::Config::init();
         let help = terminal_help_text(false);

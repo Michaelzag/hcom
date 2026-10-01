@@ -1812,8 +1812,11 @@ mod tests {
     #[test]
     #[serial]
     fn test_instance_name_some_when_set() {
-        Config::reset();
+        let _guard = EnvGuard::new();
+        // Reset after the var is set: a concurrent `Config::get()` from a test
+        // without the env lock then initializes from this env, not the old one.
         with_env("HCOM_INSTANCE_NAME", "test-instance", || {
+            Config::reset();
             Config::init();
             let config = Config::get();
             assert_eq!(config.instance_name, Some("test-instance".to_string()));
@@ -1823,8 +1826,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_instance_name_none_when_unset() {
-        Config::reset();
+        let _guard = EnvGuard::new();
         without_env(&["HCOM_INSTANCE_NAME"], || {
+            Config::reset();
             Config::init();
             let config = Config::get();
             assert_eq!(config.instance_name, None);
@@ -1834,8 +1838,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_process_id_some_when_set() {
-        Config::reset();
+        let _guard = EnvGuard::new();
         with_env("HCOM_PROCESS_ID", "pid-123", || {
+            Config::reset();
             Config::init();
             let config = Config::get();
             assert_eq!(config.process_id, Some("pid-123".to_string()));
@@ -1845,8 +1850,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_process_id_none_when_unset() {
-        Config::reset();
+        let _guard = EnvGuard::new();
         without_env(&["HCOM_PROCESS_ID"], || {
+            Config::reset();
             Config::init();
             let config = Config::get();
             assert_eq!(config.process_id, None);
@@ -1856,14 +1862,15 @@ mod tests {
     #[test]
     #[serial]
     fn test_reset_allows_reinit() {
-        Config::reset();
+        let _guard = EnvGuard::new();
         with_env("HCOM_INSTANCE_NAME", "first", || {
+            Config::reset();
             Config::init();
             assert_eq!(Config::get().instance_name, Some("first".to_string()));
         });
 
-        Config::reset();
         with_env("HCOM_INSTANCE_NAME", "second", || {
+            Config::reset();
             Config::init();
             assert_eq!(Config::get().instance_name, Some("second".to_string()));
         });
@@ -2745,5 +2752,27 @@ active = "default"
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_toml_config_keeps_delivery_policy_table() {
+        let policy = "[delivery.conductor]\ndelegate = \"mupe\"\nleads = [\"poli\", \"valo\"]\n";
+        let (_dir, _hcom_dir, _home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env_with_config(Some(&format!(
+                "[terminal]\nactive = \"default\"\n\n{policy}"
+            )));
+        let before = crate::delivery_policy::parse(policy);
+        assert_eq!(before.role_holders().len(), 1);
+
+        let config = HcomConfig {
+            relay_psk: "rotated".to_string(),
+            ..Default::default()
+        };
+        save_toml_config(&config, None).unwrap();
+
+        let after = std::fs::read_to_string(paths::config_toml_path()).unwrap();
+        assert!(after.contains("rotated"), "{after}");
+        assert_eq!(crate::delivery_policy::parse(&after), before);
     }
 }

@@ -74,8 +74,15 @@ fn resolve_list_stopped_target(db: &HcomDb, target: &str) -> Result<String, Stri
     }
 }
 
-/// Get unread message count for a single instance.
-fn get_unread_count(db: &HcomDb, name: &str, last_event_id: i64) -> i64 {
+/// Get unread message count for a single instance. For a delivery-role
+/// holder, only what it will actually read counts (the policy view: refused
+/// messages go to its delegate, not its inbox); a pure read, no forwarding.
+pub(super) fn get_unread_count(db: &HcomDb, name: &str, last_event_id: i64) -> i64 {
+    if crate::delivery_policy::load(db).is_ok_and(|p| p.governs(name)) {
+        return db
+            .pending_event_range(name)
+            .map_or(0, |(_, _, count)| count);
+    }
     db.conn()
         .query_row(
             "SELECT COUNT(*) FROM events WHERE id > ? AND type = 'message'
@@ -453,6 +460,10 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         println!("Your name: {display_name}");
     } else {
         println!("Your name: (not participating)");
+    }
+    // `[delivery.<role>]` filter state: NONE means the filter is off.
+    for line in crate::delivery_policy::role_status_lines(db) {
+        println!("{line}");
     }
     println!();
 
@@ -1285,6 +1296,8 @@ mod tests {
     fn single_seat_context_probes_the_plugin_once() {
         use std::io::{Read as _, Write as _};
         use std::sync::atomic::{AtomicUsize, Ordering};
+        // cmd_list reads the delivery policy through the global Config.
+        let _env = crate::hooks::test_helpers::isolated_test_env();
 
         let dir = tempfile::tempdir().unwrap();
         let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();

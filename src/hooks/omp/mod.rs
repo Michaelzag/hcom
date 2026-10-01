@@ -15,5 +15,5 @@ pub use plugin::{
 
 #[cfg(test)]
 pub(crate) use handlers::{
-    handle_start, handle_status, handle_stop, upsert_plugin_notify_endpoint,
+    handle_role, handle_start, handle_status, handle_stop, upsert_plugin_notify_endpoint,
 };

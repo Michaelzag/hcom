@@ -1,9 +1,202 @@
 //! Event append/read methods and message delivery queries.
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use super::{HcomDb, chrono_now_iso, subscriptions};
+use crate::delivery_policy::{
+    FORWARD_OF_FIELD, ForwardFailure, KV_EXTERNAL_AUDITED_PREFIX, KV_FORWARD_ATTEMPTS_PREFIX,
+    KV_FORWARD_FAILED_PREFIX, KV_FORWARD_HANDLED_PREFIX, KV_FORWARDED_PREFIX, MAX_FORWARD_ATTEMPTS,
+    REROUTES_FIELD, ReadVerdict, Registration,
+};
+
+/// What became of one refused event on this read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardOutcome {
+    /// The delegate has it (now, or from an earlier reader): the holder skips
+    /// it. `cursor_advanced`: this read also moved the holder's cursor past it.
+    Forwarded { cursor_advanced: bool },
+    /// Not yet (a locked database): expose nothing at or past it; the next
+    /// read retries.
+    Retry,
+    /// The forward failed for good: the holder gets it (logged, and shown by
+    /// `hcom status`) so it is never lost and never wedges the inbox.
+    DeliverToHolder,
+}
+
+/// One refused stored message event: its local id, its row timestamp (for a
+/// relayed row, the sender's own timestamp) and its data.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RefusedEvent<'a> {
+    pub id: i64,
+    pub timestamp: &'a str,
+    pub data: &'a serde_json::Value,
+}
+
+impl RefusedEvent<'_> {
+    /// `<device>:<relay id>:<sender timestamp>` for a relayed row: stable
+    /// across our own re-import (new rowid, same remote id and timestamp),
+    /// new when a reset peer reuses an old id. `None` for a local row.
+    fn relay_origin(&self) -> Option<String> {
+        let relay = self.data.get("_relay")?;
+        let device = relay.get("device")?.as_str()?;
+        let id = relay.get("id")?;
+        Some(format!(
+            "{device}:{}:{}",
+            id.to_string().trim_matches('"'),
+            self.timestamp
+        ))
+    }
+}
+
+/// The per-holder kv keys of one refused message: `<holder>:<origin>`, where
+/// origin is the relay origin for a relayed row and the local id otherwise
+/// (so a relay id-regression re-import is the same message).
+struct ForwardKeys {
+    origin: String,
+    /// Also the in-process retry map key.
+    holder_origin: String,
+    handled: String,
+    failed: String,
+    attempts: String,
+}
+
+impl ForwardKeys {
+    fn new(holder: &str, event: RefusedEvent<'_>) -> Self {
+        let origin = event.relay_origin().unwrap_or_else(|| event.id.to_string());
+        let holder_origin = format!("{holder}:{origin}");
+        Self {
+            handled: format!("{KV_FORWARD_HANDLED_PREFIX}{holder_origin}"),
+            failed: format!("{KV_FORWARD_FAILED_PREFIX}{holder_origin}"),
+            attempts: format!("{KV_FORWARD_ATTEMPTS_PREFIX}{holder_origin}"),
+            origin,
+            holder_origin,
+        }
+    }
+}
+
+/// What the forward transaction did.
+enum Committed {
+    /// The holder's registered row changed under this read: nothing written.
+    HolderChanged,
+    /// Another reader already gave this refusal to the holder: no claim.
+    AlreadyFailed,
+    /// No single live row matches the delegate: the failure is recorded, no
+    /// claim (the reason).
+    DelegateUnresolved(String),
+    Done {
+        /// The resolved delegate; `None` when an earlier read had handled it.
+        target: Option<String>,
+        inserted: Vec<(i64, serde_json::Value)>,
+        cursor_advanced: bool,
+    },
+}
+
+/// A `Message` from one stored message event.
+fn message_from_event(id: i64, timestamp: String, json: &serde_json::Value) -> Message {
+    let text_field = |key: &str| json.get(key).and_then(|v| v.as_str()).map(String::from);
+    Message {
+        from: text_field("from").unwrap_or_else(|| "unknown".to_string()),
+        text: text_field("text").unwrap_or_default(),
+        intent: text_field("intent"),
+        thread: text_field("thread"),
+        event_id: Some(id),
+        timestamp: Some(timestamp),
+        delivered_to: json
+            .get("delivered_to")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            }),
+        bundle_id: text_field("bundle_id"),
+        relay: json
+            .get("_relay")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
+}
+
+/// Retry state of one refused message's forward to one delegate, per
+/// process, keyed like the claim (`<delegate>:<origin>`).
+#[derive(Clone)]
+struct ForwardRetry {
+    attempts: u32,
+    next_try: std::time::Instant,
+    /// Given up (the reason), remembered here too in case the database was
+    /// too locked to record it: the holder keeps getting it, never a late
+    /// forward on top.
+    gave_up: Option<String>,
+}
+
+type ForwardRetries = std::collections::HashMap<(std::path::PathBuf, String), ForwardRetry>;
+
+static FORWARD_RETRIES: std::sync::LazyLock<std::sync::Mutex<ForwardRetries>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn forward_retries() -> std::sync::MutexGuard<'static, ForwardRetries> {
+    FORWARD_RETRIES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// First retry delay after a failed forward; doubles per attempt, capped at
+/// a minute, so a pending gate polling the holder never spins on it.
+#[cfg(not(test))]
+const FORWARD_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const FORWARD_BACKOFF_BASE: std::time::Duration = std::time::Duration::ZERO;
+
+/// The forward failed again: count it (in kv when the database takes the
+/// write, and in process memory when it is too locked to) and schedule the
+/// next try. Returns the attempt count.
+fn note_failed_attempt(db: &HcomDb, forward_key: &str) -> u32 {
+    let key = format!("{KV_FORWARD_ATTEMPTS_PREFIX}{forward_key}");
+    let stored: u32 = db
+        .kv_get(&key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut retries = forward_retries();
+    let entry = retries
+        .entry((db.path().to_path_buf(), forward_key.to_string()))
+        .or_insert(ForwardRetry {
+            attempts: 0,
+            next_try: std::time::Instant::now(),
+            gave_up: None,
+        });
+    entry.attempts = entry.attempts.max(stored) + 1;
+    let delay = FORWARD_BACKOFF_BASE
+        .saturating_mul(1 << (entry.attempts - 1).min(6))
+        .min(std::time::Duration::from_secs(60));
+    entry.next_try = std::time::Instant::now() + delay;
+    let attempts = entry.attempts;
+    drop(retries);
+    let _ = db.kv_set(&key, Some(&attempts.to_string()));
+    attempts
+}
+
+/// Still inside the backoff window of an earlier failed forward.
+fn forward_backing_off(db: &HcomDb, forward_key: &str) -> bool {
+    forward_retries()
+        .get(&(db.path().to_path_buf(), forward_key.to_string()))
+        .is_some_and(|retry| std::time::Instant::now() < retry.next_try)
+}
+
+/// This process gave the forward up earlier (reason).
+fn forward_given_up(db: &HcomDb, forward_key: &str) -> Option<String> {
+    forward_retries()
+        .get(&(db.path().to_path_buf(), forward_key.to_string()))
+        .and_then(|retry| retry.gave_up.clone())
+}
+
+fn mark_forward_given_up(db: &HcomDb, forward_key: &str, reason: &str) {
+    if let Some(retry) =
+        forward_retries().get_mut(&(db.path().to_path_buf(), forward_key.to_string()))
+    {
+        retry.gave_up = Some(reason.to_string());
+    }
+}
 
 /// Message from the events table
 #[derive(Debug, Clone)]
@@ -34,20 +227,44 @@ impl HcomDb {
     /// `receiver` may be local (`luna`) or relay-namespaced (`luna:ABCD`).
     /// Mentions compare on base name so the same event JSON routes correctly
     /// on both local and relayed peers without rewriting stored scope.
-    pub(super) fn should_deliver_to(json: &serde_json::Value, receiver: &str) -> bool {
+    ///
+    /// `policies` is the operator delivery policy backstop
+    /// (`crate::delivery_policy`); see `delivery_verdict`. This bool form is
+    /// for callers that only look (no forwarding): a refused event is not
+    /// theirs to deliver.
+    pub(super) fn should_deliver_to(
+        json: &serde_json::Value,
+        receiver: &str,
+        policies: &crate::delivery_policy::Policies,
+    ) -> bool {
+        Self::delivery_verdict(json, receiver, policies) == ReadVerdict::Deliver
+    }
+
+    /// The scope rule, then the delivery policy for a role holder: deliver,
+    /// skip (not addressed here, or a broadcast to a role holder), or forward
+    /// a targeted message the holder refuses to its delegate.
+    pub(super) fn delivery_verdict(
+        json: &serde_json::Value,
+        receiver: &str,
+        policies: &crate::delivery_policy::Policies,
+    ) -> ReadVerdict {
         let from = json.get("from").and_then(|v| v.as_str()).unwrap_or("");
         if from == receiver {
-            return false;
+            return ReadVerdict::Skip;
         }
         let scope = json
             .get("scope")
             .and_then(|s| s.as_str())
             .unwrap_or("broadcast");
-        match scope {
+        let in_scope = match scope {
             "broadcast" => true,
             "mentions" => crate::messages::mentions_delivers_to(json, receiver),
             _ => false,
+        };
+        if !in_scope {
+            return ReadVerdict::Skip;
         }
+        policies.read_verdict(receiver, json)
     }
 
     /// Returns true iff there is at least one unread message that names this
@@ -56,11 +273,16 @@ impl HcomDb {
     ///
     /// Used to gate dormant subagent activation: a SubagentStart-allocated
     /// row is in the broadcast recipient set, but we don't want a passing
-    /// broadcast to wake a subagent nobody actually addressed.
+    /// broadcast to wake a subagent nobody actually addressed. A cheap check:
+    /// it never forwards (role holders are top-level seats, whose reads go
+    /// through `scan_unread`).
     pub fn has_direct_unread(&self, name: &str) -> bool {
         let last_event_id = match self.get_instance_status(name) {
             Ok(Some(status)) => status.last_event_id,
             _ => 0,
+        };
+        let Ok(policies) = crate::delivery_policy::load(self) else {
+            return false;
         };
         let mut stmt = match self.conn.prepare_cached(
             "SELECT data FROM events
@@ -85,11 +307,218 @@ impl HcomDb {
             if scope != "mentions" {
                 continue;
             }
-            if Self::should_deliver_to(&json, name) {
+            if Self::should_deliver_to(&json, name, &policies) {
                 return true;
             }
         }
         false
+    }
+
+    /// The unread message events `name` may read, as `(id, timestamp, data)`,
+    /// in id order. This is the consuming read: for a role holder it forwards
+    /// every targeted message the holder refuses (`forward_refused`), and it
+    /// stops before a refused event whose forward has not committed yet, so no
+    /// ack can move the cursor past it (the next read retries). `first_only`
+    /// returns at the first deliverable event (the pending gate).
+    ///
+    /// `None` when the instance row or the policy cannot be read: deliver
+    /// nothing this round, keep the cursor.
+    pub(super) fn scan_unread(
+        &self,
+        name: &str,
+        first_only: bool,
+    ) -> Option<Vec<(i64, String, serde_json::Value)>> {
+        // A policy that cannot be read delivers nothing instead of switching
+        // the filter off.
+        let policies = match crate::delivery_policy::load(self) {
+            Ok(policies) => policies,
+            Err(e) => {
+                crate::log::log_error("db", "scan_unread.delivery_policy", &e);
+                return None;
+            }
+        };
+        // A governed holder's cursor is read from the exact row its
+        // registration names, so the cursor, the verdicts and the forward's
+        // re-check all describe one row. A rebind since `load` finds no row:
+        // nothing this round, the next read re-evaluates.
+        let registration = policies.registration(name);
+        let cursor_row = match registration {
+            Some(reg) => self
+                .conn
+                .query_row(
+                    "SELECT last_event_id FROM instances
+                     WHERE name = ?1 AND session_id = ?2 AND created_at = ?3",
+                    params![name, reg.session_id, reg.created_at],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(anyhow::Error::from),
+            // A missing/unreadable row means there is no recipient: no unread
+            // rather than cursor 0, which would treat the whole channel
+            // backlog (broadcasts match everyone) as unread.
+            None => self
+                .get_instance_status(name)
+                .map(|status| status.map(|s| s.last_event_id)),
+        };
+        let mut cursor = match cursor_row {
+            Ok(Some(cursor)) => cursor,
+            Ok(None) => return None,
+            Err(e) => {
+                crate::log::log_error("db", "scan_unread.cursor", &format!("{e}"));
+                return None;
+            }
+        };
+        // Collected before any forward writes, so no read statement is open
+        // while the forward transaction runs.
+        let rows: Vec<(i64, Option<String>, String)> = {
+            let mut stmt = match self.conn.prepare_cached(
+                "SELECT id, timestamp, data FROM events
+                 WHERE id > ? AND type = 'message'
+                 ORDER BY id",
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::log::log_error("db", "scan_unread.prepare", &format!("{e}"));
+                    return None;
+                }
+            };
+            let rows = stmt.query_map(params![cursor], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            });
+            match rows.and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>()) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    crate::log::log_error("db", "scan_unread.query", &format!("{e}"));
+                    return None;
+                }
+            }
+        };
+
+        let mut deliver = Vec::new();
+        // A governed holder's leading run of skipped rows (broadcasts it
+        // never reads): the cursor moves past them, so they are not rescanned
+        // or counted on every read.
+        let mut skip_to: Option<i64> = None;
+        let flush_skips = |cursor: &mut i64, skip_to: &mut Option<i64>| {
+            if let (Some(to), Some(reg)) = (skip_to.take(), registration)
+                && self.advance_holder_cursor(name, reg, *cursor, to)
+            {
+                *cursor = to;
+            }
+        };
+        for (id, timestamp, data) in rows {
+            let timestamp = timestamp.unwrap_or_default();
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
+                continue;
+            };
+            match Self::delivery_verdict(&json, name, &policies) {
+                ReadVerdict::Skip => {
+                    if registration.is_some() && deliver.is_empty() {
+                        skip_to = Some(id);
+                    }
+                    continue;
+                }
+                ReadVerdict::Deliver => {
+                    if registration.is_some() {
+                        self.audit_relayed_external(
+                            name,
+                            RefusedEvent {
+                                id,
+                                timestamp: &timestamp,
+                                data: &json,
+                            },
+                        );
+                    }
+                    deliver.push((id, timestamp, json))
+                }
+                ReadVerdict::ForwardTo(delegate) => {
+                    // With nothing deliverable before it, the forward also
+                    // moves the cursor past it in the same transaction.
+                    flush_skips(&mut cursor, &mut skip_to);
+                    let advance_from = deliver.is_empty().then_some(cursor);
+                    let outcome = match registration {
+                        Some(reg) => {
+                            let event = RefusedEvent {
+                                id,
+                                timestamp: &timestamp,
+                                data: &json,
+                            };
+                            self.forward_refused(name, event, &delegate, advance_from, reg)
+                        }
+                        // ForwardTo comes only for a governed holder.
+                        None => ForwardOutcome::Retry,
+                    };
+                    match outcome {
+                        ForwardOutcome::Forwarded { cursor_advanced } => {
+                            if cursor_advanced {
+                                cursor = id;
+                            }
+                            continue;
+                        }
+                        ForwardOutcome::Retry => break,
+                        ForwardOutcome::DeliverToHolder => deliver.push((id, timestamp, json)),
+                    }
+                }
+            }
+            if first_only && !deliver.is_empty() {
+                break;
+            }
+        }
+        flush_skips(&mut cursor, &mut skip_to);
+        Some(deliver)
+    }
+
+    /// Compare-and-set a governed holder's cursor from `from` to `to`, only
+    /// while its registered row is still the one that read them.
+    fn advance_holder_cursor(&self, name: &str, reg: &Registration, from: i64, to: i64) -> bool {
+        self.conn
+            .execute(
+                "UPDATE instances SET last_event_id = ?1
+                 WHERE name = ?2 AND last_event_id = ?3 AND session_id = ?4 AND created_at = ?5",
+                params![to, name, from, reg.session_id, reg.created_at],
+            )
+            .is_ok_and(|n| n == 1)
+    }
+
+    /// An External sender on another host reached a governed holder (the
+    /// unauthenticated `--from` bypass). That host cannot know the role
+    /// (roles never relay), so the holder's host writes the audit line, once
+    /// per message (a kv marker, `INSERT OR IGNORE`), however often it is
+    /// read. Local External sends are audited when they are sent.
+    fn audit_relayed_external(&self, holder: &str, event: RefusedEvent<'_>) {
+        if event.data.get("sender_kind").and_then(|v| v.as_str()) != Some("external") {
+            return;
+        }
+        let Some(origin) = event.relay_origin() else {
+            return;
+        };
+        let key = format!("{KV_EXTERNAL_AUDITED_PREFIX}{holder}:{origin}");
+        // Read first: this runs on every holder read (the pty gate too), and
+        // even an ignored INSERT takes the write lock.
+        if !matches!(self.kv_get(&key), Ok(None)) {
+            return;
+        }
+        let first = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO kv (key, value) VALUES (?1, ?2)",
+                params![key, event.id.to_string()],
+            )
+            .is_ok_and(|n| n == 1);
+        if first {
+            let from = event
+                .data
+                .get("from")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            crate::log::log_with_fields(
+                "INFO",
+                "delivery_policy",
+                "external_reached",
+                &format!("External sender '{from}' reached policy instance {holder}"),
+                &[("event_id", &event.id.to_string()), ("origin", &origin)],
+            );
+        }
     }
 
     /// Get unread messages for an instance
@@ -97,108 +526,389 @@ impl HcomDb {
     /// Returns messages where:
     /// - event.id > instance.last_event_id
     /// - event.type = 'message'
-    /// - instance is in scope (broadcast or direct)
+    /// - instance is in scope (broadcast or direct), through the delivery
+    ///   policy (`scan_unread`)
     pub fn get_unread_messages(&self, name: &str) -> Vec<Message> {
-        // Get last_event_id for this instance. A missing/unreadable row means there is
-        // no recipient — return no unread rather than falling back to cursor 0, which
-        // would treat the whole channel backlog (broadcasts match everyone) as unread.
-        let last_event_id = match self.get_instance_status(name) {
-            Ok(Some(status)) => status.last_event_id,
-            Ok(None) => return vec![],
-            Err(e) => {
-                crate::log::log_error(
-                    "db",
-                    "get_unread_messages.get_instance_status",
-                    &format!("{e}"),
-                );
-                return vec![];
-            }
-        };
+        self.scan_unread(name, false)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, timestamp, json)| message_from_event(id, timestamp, &json))
+            .collect()
+    }
 
-        let mut stmt = match self.conn.prepare_cached(
-            "SELECT id, timestamp, data FROM events
-             WHERE id > ? AND type = 'message'
-             ORDER BY id",
+    /// Forward one targeted message the role holder `holder` refuses to its
+    /// `delegate` (crate::delivery_policy): zori's ruling is that nothing sent
+    /// to the conductor is dropped silently.
+    ///
+    /// One IMMEDIATE transaction:
+    /// - re-checks that the holder's registered row (name, session id,
+    ///   created_at) is still there and live; a stop or rebind that landed
+    ///   meanwhile writes nothing and the next read re-evaluates;
+    /// - checks `delivery_forward_handled:<holder>:<origin>` FIRST: a refusal
+    ///   already forwarded is never re-decided (a delegate that has since
+    ///   stopped must not turn it into a duplicate for the holder);
+    /// - otherwise resolves the delegate against the rows it sees. No single
+    ///   live row: no claim, a failure record, and the holder keeps the
+    ///   message (a new delegate row starts at the current cursor, so
+    ///   parking it for the delegate would lose it);
+    /// - claims `delivery_forwarded:<resolved delegate>:<origin>` with
+    ///   `INSERT OR IGNORE` (the primary key makes one copy per delegate and
+    ///   message, however many holders or readers race, however each holder
+    ///   spells the delegate) and only if that inserted writes the forward
+    ///   copy and, for an instance sender, a notice to that sender;
+    /// - with `advance_from`, moves the holder's cursor from that value to
+    ///   this event (compare-and-set).
+    ///
+    /// Subscription dispatch, wakes and the relay push run after commit.
+    ///
+    /// Runs only on the host where the holder's role is registered (roles are
+    /// never relayed), so one host forwards; the copy relayed onward carries
+    /// the forward mark and is never refused or forwarded again.
+    ///
+    /// The kv rows are never pruned: a few small rows per forwarded message,
+    /// and forwards happen only for refused targeted messages that skipped
+    /// the send-time reroute (older peers, system notices). Pruning below the
+    /// holder's cursor would break the re-import dedupe, since a re-imported
+    /// relayed row gets a new id above the cursor.
+    pub(crate) fn forward_refused(
+        &self,
+        holder: &str,
+        event: RefusedEvent<'_>,
+        delegate: &str,
+        advance_from: Option<i64>,
+        registration: &Registration,
+    ) -> ForwardOutcome {
+        let (event_id, data) = (event.id, event.data);
+        let keys = ForwardKeys::new(holder, event);
+        let origin = keys.origin.as_str();
+        let relay = data.get("_relay");
+        // The sender's own reference to its message: the relayed id and
+        // device for a message from another host, else the local id.
+        let message_ref = match (
+            relay.and_then(|r| r.get("id")),
+            relay.and_then(|r| r.get("short")).and_then(|v| v.as_str()),
         ) {
-            Ok(s) => s,
-            Err(e) => {
-                crate::log::log_error("db", "get_unread_messages.prepare", &format!("{e}"));
-                return vec![];
-            }
+            (Some(id), Some(short)) => format!("#{}:{short}", id.to_string().trim_matches('"')),
+            _ => format!("#{event_id}"),
         };
-
-        let rows = match stmt.query_map(params![last_event_id], |row| {
-            let id: i64 = row.get(0)?;
-            let timestamp: String = row.get(1)?;
-            let data: String = row.get(2)?;
-            Ok((id, timestamp, data))
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                crate::log::log_error("db", "get_unread_messages.query", &format!("{e}"));
-                return vec![];
-            }
+        let failure = |reason: &str| {
+            serde_json::to_string(&ForwardFailure {
+                holder: holder.to_string(),
+                delegate: delegate.to_string(),
+                message: message_ref.clone(),
+                reason: reason.to_string(),
+            })
+            .unwrap_or_default()
         };
-
-        let mut messages = Vec::new();
-        for (id, timestamp, data) in rows.flatten() {
-            // Parse JSON data
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                if !Self::should_deliver_to(&json, name) {
-                    continue;
-                }
-
-                let from = json
-                    .get("from")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                let text = json
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let intent = json
-                    .get("intent")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let thread = json
-                    .get("thread")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let delivered_to = json
-                    .get("delivered_to")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    });
-                let bundle_id = json
-                    .get("bundle_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let relay = json
-                    .get("_relay")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-                messages.push(Message {
-                    from,
-                    text,
-                    intent,
-                    thread,
-                    event_id: Some(id),
-                    timestamp: Some(timestamp.clone()),
-                    delivered_to,
-                    bundle_id,
-                    relay,
-                });
+        // The handled marker is final: once any reader forwarded this
+        // refusal, nothing here may re-decide it (a later give-up or an
+        // unresolved delegate would hand the holder a message the delegate
+        // already has). Read first; a failure record counts only without it.
+        // Handled with a cursor to move: the transaction does just the CAS.
+        let handled = |db: &Self| db.kv_get(&keys.handled).ok().flatten().is_some();
+        let already_handled = handled(self);
+        if already_handled && advance_from.is_none() {
+            return ForwardOutcome::Forwarded {
+                cursor_advanced: false,
+            };
+        }
+        if !already_handled {
+            if self.kv_get(&keys.failed).ok().flatten().is_some() {
+                return ForwardOutcome::DeliverToHolder;
+            }
+            if let Some(reason) = forward_given_up(self, &keys.holder_origin) {
+                // Given up while the database was too locked to record it.
+                return self.give_to_holder_unless_handled(&keys, &failure(&reason));
             }
         }
+        if forward_backing_off(self, &keys.holder_origin) {
+            return ForwardOutcome::Retry;
+        }
+        // Bare-name context for resolving the delegate (config only, read
+        // outside the transaction).
+        let fleet = crate::fleet_names::FleetCtx::load();
 
-        messages
+        let text = |key: &str| data.get(key).and_then(|v| v.as_str());
+        let from = text("from").unwrap_or("");
+        // The copy's own sender is hcom, never the original sender: a peer's
+        // self-skip (`from == receiver`) must not hide it. The original
+        // sender travels as data and at the head of the text.
+        let make_copy = |target: &str| {
+            let mut copy = serde_json::json!({
+                "from": "[hcom-delivery]",
+                "sender_kind": "system",
+                "scope": "mentions",
+                "mentions": [target],
+                "exact_targets": [target],
+                "delivered_to": [target],
+                "text": format!("[{from} → {holder}, forwarded] {}", text("text").unwrap_or("")),
+                "delivery_forward_of_from": from,
+                "delivery_forward_of_sender_kind": data.get("sender_kind").cloned().unwrap_or(serde_json::Value::Null),
+                "delivery_forward_of_origin": origin,
+            });
+            copy[FORWARD_OF_FIELD] = serde_json::json!(event_id);
+            let mut reroute = serde_json::Map::new();
+            reroute.insert(holder.to_string(), serde_json::json!(target));
+            copy[REROUTES_FIELD] = serde_json::Value::Object(reroute);
+            for key in [
+                "intent",
+                "thread",
+                "bundle_id",
+                "reply_to",
+                "reply_to_local",
+            ] {
+                if let Some(value) = data.get(key) {
+                    copy[key] = value.clone();
+                }
+            }
+            copy
+        };
+        // `from` of a relayed message is already namespaced (`valo:GIDU`),
+        // so the notice relays back to that host.
+        let wants_notice = text("sender_kind") == Some("instance") && !from.is_empty();
+        let make_notice = |target: &str| {
+            serde_json::json!({
+                "from": "[hcom-delivery]",
+                "sender_kind": "system",
+                "scope": "mentions",
+                "mentions": [from],
+                "exact_targets": [from],
+                "delivered_to": [from],
+                "text": format!("{holder} takes no cc; delivered to {target} (your message {message_ref})"),
+                "delivery_notice_for": origin,
+            })
+        };
+        const INSTANCE: &str = "sys_[hcom-delivery]";
+
+        let committed = (|| -> rusqlite::Result<Committed> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &self.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let same_row = tx
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM instances
+                         WHERE name = ?1 AND session_id = ?2 AND created_at = ?3 AND {}",
+                        crate::fleet_names::LIVE_ROW_PREDICATE
+                    ),
+                    params![holder, registration.session_id, registration.created_at],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !same_row {
+                return Ok(Committed::HolderChanged);
+            }
+            let handled = tx
+                .query_row(
+                    "SELECT 1 FROM kv WHERE key = ?1",
+                    params![keys.handled],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let mut inserted = Vec::new();
+            let mut target = None;
+            if !handled {
+                // Another reader already gave this refusal to the holder:
+                // that stays the decision (no claim, no copy).
+                let failed = tx
+                    .query_row(
+                        "SELECT 1 FROM kv WHERE key = ?1",
+                        params![keys.failed],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if failed {
+                    return Ok(Committed::AlreadyFailed);
+                }
+                // Resolved inside the transaction, against the rows it sees.
+                let rows = crate::messages::deliverable_instances(&tx)?;
+                let resolved =
+                    match crate::delivery_policy::resolve_delegate(delegate, &rows, &fleet) {
+                        Ok(resolved) => resolved,
+                        Err(why) => {
+                            let reason = why.describe(&format!("delegate {delegate}"));
+                            tx.execute(
+                                "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+                                params![keys.failed, failure(&reason)],
+                            )?;
+                            tx.commit()?;
+                            return Ok(Committed::DelegateUnresolved(reason));
+                        }
+                    };
+                let claimed = tx.execute(
+                    "INSERT OR IGNORE INTO kv (key, value) VALUES (?1, ?2)",
+                    params![
+                        format!("{KV_FORWARDED_PREFIX}{resolved}:{origin}"),
+                        event_id.to_string()
+                    ],
+                )? == 1;
+                if claimed {
+                    let ts = chrono_now_iso();
+                    let copy = make_copy(&resolved);
+                    let notice = wants_notice.then(|| make_notice(&resolved));
+                    for event in std::iter::once(copy).chain(notice) {
+                        tx.execute(
+                            "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'message', ?, ?)",
+                            params![ts, INSTANCE, event.to_string()],
+                        )?;
+                        inserted.push((tx.last_insert_rowid(), event));
+                    }
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO kv (key, value) VALUES (?1, ?2)",
+                    params![keys.handled, resolved],
+                )?;
+                tx.execute("DELETE FROM kv WHERE key = ?1", params![keys.attempts])?;
+                target = Some(resolved);
+            }
+            let cursor_advanced = match advance_from {
+                Some(expected) => {
+                    tx.execute(
+                        "UPDATE instances SET last_event_id = ?1
+                         WHERE name = ?2 AND last_event_id = ?3",
+                        params![event_id, holder, expected],
+                    )? == 1
+                }
+                None => false,
+            };
+            tx.commit()?;
+            Ok(Committed::Done {
+                target,
+                inserted,
+                cursor_advanced,
+            })
+        })();
+
+        match committed {
+            Ok(Committed::HolderChanged) => ForwardOutcome::Retry,
+            Ok(Committed::AlreadyFailed) => ForwardOutcome::DeliverToHolder,
+            Ok(Committed::DelegateUnresolved(reason)) => {
+                forward_retries().remove(&(self.path().to_path_buf(), keys.holder_origin));
+                crate::log::log_warn(
+                    "delivery_policy",
+                    "delegate_unresolved",
+                    &format!("{reason}; {holder} keeps event {event_id}"),
+                );
+                ForwardOutcome::DeliverToHolder
+            }
+            Ok(Committed::Done {
+                target,
+                inserted,
+                cursor_advanced,
+            }) => {
+                forward_retries().remove(&(self.path().to_path_buf(), keys.holder_origin));
+                for (id, event) in &inserted {
+                    subscriptions::process_logged_event(self, *id, "message", INSTANCE, event);
+                }
+                if let Some(target) = target.filter(|_| !inserted.is_empty()) {
+                    crate::log::log_with_fields(
+                        "INFO",
+                        "delivery_policy",
+                        "forwarded",
+                        &format!("{holder} refused event {event_id}; forwarded to {target}"),
+                        &[("event_id", &event_id.to_string()), ("from", from)],
+                    );
+                    crate::notify::wake(self, &target, &[]);
+                    if wants_notice {
+                        crate::notify::wake(self, from, &[]);
+                    }
+                    crate::relay::trigger_push();
+                }
+                ForwardOutcome::Forwarded { cursor_advanced }
+            }
+            // Another reader forwarded it meanwhile (a plain read works under
+            // a held write lock in WAL): it is handled, never counted as a
+            // failed attempt or given up to the holder. Only the cursor move
+            // is missed; the next read skips it.
+            Err(_) if handled(self) => ForwardOutcome::Forwarded {
+                cursor_advanced: false,
+            },
+            Err(e) => {
+                let transient = matches!(
+                    &e,
+                    rusqlite::Error::SqliteFailure(err, _)
+                        if matches!(
+                            err.code,
+                            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                        )
+                );
+                let attempts = note_failed_attempt(self, &keys.holder_origin);
+                if transient && attempts < MAX_FORWARD_ATTEMPTS {
+                    if attempts == 1 {
+                        crate::log::log_warn(
+                            "delivery_policy",
+                            "forward_retry",
+                            &format!(
+                                "forward of event {event_id} from {holder} to {delegate} failed ({e}); retrying with backoff"
+                            ),
+                        );
+                    }
+                    return ForwardOutcome::Retry;
+                }
+                let reason = format!("{e} (after {attempts} attempt(s))");
+                mark_forward_given_up(self, &keys.holder_origin, &reason);
+                let outcome = self.give_to_holder_unless_handled(&keys, &failure(&reason));
+                if outcome == ForwardOutcome::DeliverToHolder {
+                    crate::log::log_warn(
+                        "delivery_policy",
+                        "forward_failed",
+                        &format!(
+                            "could not forward event {event_id} from {holder} to {delegate}: {reason}; delivering it to {holder} instead"
+                        ),
+                    );
+                }
+                outcome
+            }
+        }
+    }
+
+    /// Give up a forward to the holder, unless another reader has forwarded
+    /// it: `failed` is written only while `handled` is absent, in one
+    /// statement, so no reader can commit `handled` between a check and the
+    /// write. When even that write is locked out, a plain read of `handled`
+    /// (allowed under a held write lock in WAL) decides.
+    fn give_to_holder_unless_handled(&self, keys: &ForwardKeys, failure: &str) -> ForwardOutcome {
+        let recorded = self.conn.execute(
+            "INSERT OR REPLACE INTO kv (key, value)
+             SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM kv WHERE key = ?3)",
+            params![keys.failed, failure, keys.handled],
+        );
+        let handled = match recorded {
+            Ok(n) => n == 0,
+            Err(_) => self.kv_get(&keys.handled).ok().flatten().is_some(),
+        };
+        if handled {
+            ForwardOutcome::Forwarded {
+                cursor_advanced: false,
+            }
+        } else {
+            ForwardOutcome::DeliverToHolder
+        }
+    }
+
+    /// Whether the holder will itself receive a message it refuses (a
+    /// recorded failure, or a delegate with no single live row), without
+    /// writing anything: `hcom list`'s count of what the holder will read.
+    pub(crate) fn refused_reaches_holder(
+        &self,
+        holder: &str,
+        event: RefusedEvent<'_>,
+        delegate: &str,
+        rows: &[crate::messages::InstanceInfo],
+        fleet: &crate::fleet_names::FleetCtx,
+    ) -> bool {
+        let keys = ForwardKeys::new(holder, event);
+        if self.kv_get(&keys.handled).ok().flatten().is_some() {
+            return false;
+        }
+        if self.kv_get(&keys.failed).ok().flatten().is_some() {
+            return true;
+        }
+        crate::delivery_policy::resolve_delegate(delegate, rows, fleet).is_err()
     }
 
     /// Build the shared envelope every launch-lifecycle life event uses
@@ -706,6 +1416,7 @@ mod tests {
     // backlog (broadcasts match every recipient when the cursor falls back to 0).
     #[test]
     fn test_get_unread_messages_empty_for_missing_instance() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         db.log_event(
@@ -801,6 +1512,7 @@ mod tests {
     /// broadcast and the "no message in → no keep-alive" gate is broken.
     #[test]
     fn test_has_direct_unread_ignores_broadcasts() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
         db.conn
             .execute(

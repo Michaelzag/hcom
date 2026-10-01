@@ -275,6 +275,7 @@ const OMP_HOOKS: &[&str] = &[
     "omp-read",
     "omp-beforetool",
     "omp-stop",
+    "omp-role",
 ];
 
 const CURSOR_HOOKS: &[&str] = &[

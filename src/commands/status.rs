@@ -313,7 +313,23 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                     "pid": relay.pidfile_pid,
                 },
             },
-            "delivery": {},
+            "delivery": match crate::delivery_policy::role_status(db) {
+                // Configured `[delivery.<role>]` roles: live holders (empty =
+                // the role's filter is off), where refusals go, and why a
+                // broken block is broken; plus forwards that failed for good.
+                Ok(roles) => json!({
+                    "roles": roles
+                        .into_iter()
+                        .map(|s| (s.role, json!({
+                            "holders": s.holders,
+                            "delegate": s.delegate,
+                            "invalid": s.invalid,
+                        })))
+                        .collect::<serde_json::Map<_, _>>(),
+                    "forward_failures": crate::delivery_policy::forward_failures(db),
+                }),
+                Err(e) => json!({"error": e}),
+            },
             "logs": {
                 "error_count": log_summary.get("error_count").and_then(|v| v.as_i64()).unwrap_or(0),
                 "warn_count": log_summary.get("warn_count").and_then(|v| v.as_i64()).unwrap_or(0),
@@ -419,6 +435,9 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     for (name, detail) in &launch_failures {
         let first_line = detail.lines().next().unwrap_or(detail);
         println!("failure:   {name}: {first_line}");
+    }
+    for line in crate::delivery_policy::role_status_lines(db) {
+        println!("delivery:  {line}");
     }
 
     // Relay summary + worker process line both branch on the canonical

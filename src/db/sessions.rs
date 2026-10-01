@@ -267,8 +267,24 @@ impl HcomDb {
     /// Check if there are pending (unread) messages for an instance.
     ///
     /// Lightweight check — parses only the JSON `data` column (skipping full
-    /// Message construction) and returns on the first matching row.
+    /// Message construction) and returns on the first matching row. For a
+    /// delivery-role holder this is also the gate the pty delivery loop polls
+    /// while the seat is idle, so it runs the forwarding scan: a refused
+    /// message reaches the delegate on this wake without ever reporting
+    /// "pending" (which would inject an empty wake into the holder).
     pub fn has_pending(&self, name: &str) -> bool {
+        let policies = match crate::delivery_policy::load(self) {
+            Ok(policies) => policies,
+            Err(e) => {
+                crate::log::log_error("db", "has_pending.delivery_policy", &e);
+                return false;
+            }
+        };
+        if policies.governs(name) {
+            return self
+                .scan_unread(name, true)
+                .is_some_and(|deliver| !deliver.is_empty());
+        }
         let last_event_id = match self.get_instance_status(name) {
             Ok(Some(status)) => status.last_event_id,
             // No instance row (e.g. a launch placeholder deleted after restore_stopped
@@ -303,7 +319,7 @@ impl HcomDb {
 
         for data in rows.flatten() {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
-                && Self::should_deliver_to(&json, name)
+                && Self::should_deliver_to(&json, name, &policies)
             {
                 return true;
             }
@@ -311,31 +327,64 @@ impl HcomDb {
         false
     }
 
-    /// Diagnostic-only: (min_id, max_id, count) of pending message events for
-    /// an instance, or None if nothing is pending. Not used on the delivery
-    /// hot path — for logging at `delivery.gate_pass`.
+    /// (min_id, max_id, count) of pending message events for an instance,
+    /// or None if nothing is pending: `hcom list`'s count, and logging at
+    /// `delivery.gate_pass`. Not used on the delivery hot path. A pure read:
+    /// for a role holder it counts what the holder will actually read,
+    /// including a refused message it keeps (a failed forward, or a delegate
+    /// with no single live row), without forwarding anything.
     pub fn pending_event_range(&self, name: &str) -> Option<(i64, i64, i64)> {
+        use crate::delivery_policy::ReadVerdict;
         let last_event_id = self.get_cursor(name);
 
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT id, data FROM events WHERE id > ? AND type = 'message' ORDER BY id",
+                "SELECT id, timestamp, data FROM events WHERE id > ? AND type = 'message' ORDER BY id",
             )
             .ok()?;
-        let rows = stmt
+        let rows: Vec<(i64, Option<String>, String)> = stmt
             .query_map(params![last_event_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
-            .ok()?;
+            .ok()?
+            .flatten()
+            .collect();
+        drop(stmt);
 
         let mut min_id = i64::MAX;
         let mut max_id = i64::MIN;
         let mut count = 0i64;
-        for (id, data) in rows.flatten() {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
-                && Self::should_deliver_to(&json, name)
-            {
+        let policies = crate::delivery_policy::load(self).ok()?;
+        // Loaded once, only if a refused message needs its delegate resolved.
+        let mut live: Option<(
+            Vec<crate::messages::InstanceInfo>,
+            crate::fleet_names::FleetCtx,
+        )> = None;
+        for (id, timestamp, data) in rows {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
+                continue;
+            };
+            let reads = match Self::delivery_verdict(&json, name, &policies) {
+                ReadVerdict::Deliver => true,
+                ReadVerdict::Skip => false,
+                ReadVerdict::ForwardTo(delegate) => {
+                    if live.is_none() {
+                        live = Some((
+                            crate::messages::deliverable_instances(&self.conn).ok()?,
+                            crate::fleet_names::FleetCtx::load(),
+                        ));
+                    }
+                    let (rows, fleet) = live.as_ref()?;
+                    let event = super::RefusedEvent {
+                        id,
+                        timestamp: timestamp.as_deref().unwrap_or_default(),
+                        data: &json,
+                    };
+                    self.refused_reaches_holder(name, event, &delegate, rows, fleet)
+                }
+            };
+            if reads {
                 min_id = min_id.min(id);
                 max_id = max_id.max(id);
                 count += 1;
@@ -804,6 +853,7 @@ mod tests {
     // recipient) as unread and replay a stale message into a freshly-resumed session.
     #[test]
     fn test_has_pending_false_for_missing_instance() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         // A broadcast in history (delivers to all recipients).

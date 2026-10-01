@@ -32,6 +32,7 @@ mod sessions;
 pub(crate) mod subscriptions;
 
 pub use events::Message;
+pub(crate) use events::{ForwardOutcome, RefusedEvent};
 pub use instances::InstanceRow;
 #[allow(unused_imports)]
 pub use instances::InstanceStatus;

@@ -209,6 +209,10 @@ function formatMessagesForInjection(
 // untrusted bytes, so mail there could not be told apart from a forged <hcom>
 // block (ffc-98d2g ruling: mail's authority depends on an unspoofable channel).
 const HCOM_MAIL_CUSTOM_TYPE = "hcom-mail";
+// conductor-guard's session-log entry, stamped by `omp --conductor`: a session
+// whose own log carries it registers its bound row for hcom's add-only
+// `conductor` delivery role (`[delivery.conductor]` in config.toml).
+const CONDUCTOR_ROLE_MARKER = "conductor-role";
 
 // `deliverAs: "aside"` exists on the extension API from omp 18.1.6 (the release
 // whose CHANGELOG advertises "non-interrupting extension messages through
@@ -725,9 +729,15 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	let lastReportedStatusKey: string | null = null;
 	let lastPendingPollAt = 0;
 	let agentActive = false;
+	// omp-role for this binding: done after success or a final answer; a
+	// transient failure retries on later turns up to DELIVERY_ROLE_MAX_ATTEMPTS.
+	let deliveryRoleDone = false;
+	let deliveryRoleAttempts = 0;
+	let deliveryRoleInFlight = false;
 	let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
 	const PENDING_POLL_MS = 60_000;
+	const DELIVERY_ROLE_MAX_ATTEMPTS = 5;
 	const FALLBACK_PENDING_POLL_MS = 5_000;
 	const IDLE_DEBOUNCE_MS = 250;
 
@@ -1000,6 +1010,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 					notify_port: port,
 					bootstrap_len: bootstrapText?.length ?? 0,
 				});
+				await ensureDeliveryRole(ctx);
 			} catch (error) {
 				stopNotifyServer();
 				log("ERROR", "plugin.bind_error", null, { error: String(error) });
@@ -1008,6 +1019,59 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			}
 		})();
 		await bindingPromise;
+	}
+
+	// Register the bound row for the `conductor` delivery role once per binding
+	// when this session's own log carries the marker. Tried after every bind
+	// and again before each agent turn until settled: on a fresh `omp
+	// --conductor` the marker can be appended after our session_start bind. A
+	// separate `omp-role` hook rather than an `omp-start` flag, so an older hcom
+	// binary answers with an error and the seat's binding still stands.
+	// Success or a final answer (refused, unknown command) settles it with one
+	// log line; a transient failure (locked DB, timeout) retries next turn and
+	// gives up with one warning after DELIVERY_ROLE_MAX_ATTEMPTS.
+	async function ensureDeliveryRole(ctx: ExtensionContext): Promise<void> {
+		if (deliveryRoleDone || deliveryRoleInFlight || !instanceName || !sessionId) return;
+		let marked = false;
+		try {
+			marked = ctx.sessionManager
+				.getEntries()
+				.some((entry) => entry.type === "custom" && entry.customType === CONDUCTOR_ROLE_MARKER);
+		} catch {
+			return;
+		}
+		if (!marked) return;
+		const generation = bindingGeneration;
+		const name = instanceName;
+		deliveryRoleInFlight = true;
+		deliveryRoleAttempts++;
+		const result = await hcom(["omp-role", "--name", name, "--session-id", sessionId, "--role", "conductor"]);
+		if (generation !== bindingGeneration) return; // rebound meanwhile; the new binding asks again
+		deliveryRoleInFlight = false;
+		let json: { ok?: boolean; error?: string; transient?: boolean } = {};
+		try {
+			json = JSON.parse(result.stdout || "{}");
+		} catch {}
+		if (result.code === 0 && json.ok) {
+			deliveryRoleDone = true;
+			log("INFO", "plugin.delivery_role_registered", name, { role: "conductor" });
+			return;
+		}
+		// An older binary's router rejects the unknown command before any hook.
+		const unknownCommand = result.code !== 0 && result.stderr.includes("Unknown command");
+		const final = unknownCommand || (result.code === 0 && typeof json.error === "string" && json.transient !== true);
+		const error = json.error ?? result.stderr.slice(0, 300);
+		if (final || deliveryRoleAttempts >= DELIVERY_ROLE_MAX_ATTEMPTS) {
+			deliveryRoleDone = true;
+			log("WARN", final ? "plugin.delivery_role_refused" : "plugin.delivery_role_gave_up", name, {
+				role: "conductor",
+				attempts: deliveryRoleAttempts,
+				exit_code: result.code,
+				error,
+			});
+			return;
+		}
+		log("DEBUG", "plugin.delivery_role_retry", name, { attempts: deliveryRoleAttempts, exit_code: result.code, error });
 	}
 
 	async function fetchPending(): Promise<{ messages: any[]; maxId: number } | null> {
@@ -1270,6 +1334,9 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		deliveryPending = false;
 		deliveryRetryScheduled = false;
 		bootstrapInjectedForSession = null;
+		deliveryRoleDone = false;
+		deliveryRoleAttempts = 0;
+		deliveryRoleInFlight = false;
 		lastReportedStatusKey = null;
 		lastPendingPollAt = 0;
 		agentActive = false;
@@ -1421,6 +1488,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		currentCtx = ctx;
 		await bindIdentity(ctx);
 		if (!instanceName) return undefined;
+		await ensureDeliveryRole(ctx);
 		// Consume proof for the bodyless-wake transform: the input handler
 		// rewrote the wake into our delivery text and omp applied that transform
 		// INLINE and submitted it (it never re-emits an input event with source

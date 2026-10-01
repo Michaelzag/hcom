@@ -275,6 +275,70 @@ fn start_handler_registering_plugin_notify_wakes_pty_delivery_loop() {
 }
 
 #[test]
+#[serial_test::serial]
+fn omp_role_registers_delivery_role_for_the_bound_session() {
+    // The policy exists before the env points at the dir (see
+    // `isolated_test_env_with_config`).
+    let _env = crate::hooks::test_helpers::isolated_test_env_with_config(Some(
+        "[delivery.conductor]\ndelegate = \"mupe\"\n",
+    ));
+    unsafe {
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+    }
+    let (db, path) = setup_test_db();
+    let temp = tempfile::TempDir::new().unwrap();
+    save_test_instance(&db, "luna", ST_ACTIVE);
+    db.set_process_binding("pid-omp", "", "luna").unwrap();
+    let env = std::collections::HashMap::from([
+        ("HCOM_PROCESS_ID".to_string(), "pid-omp".to_string()),
+        ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+        ("HCOM_TOOL".to_string(), "omp".to_string()),
+    ]);
+    let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+    let (code, output) = handle_start(
+        &ctx,
+        &db,
+        &["--session-id".to_string(), "sid-omp".to_string()],
+    );
+    assert_eq!(code, 0);
+    let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(response["name"].as_str(), Some("luna"), "{output}");
+    let role = |session: &str| {
+        let argv: Vec<String> = [
+            "--name",
+            "luna",
+            "--session-id",
+            session,
+            "--role",
+            "conductor",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (code, output) = handle_role(&db, &argv);
+        assert_eq!(code, 0);
+        serde_json::from_str::<serde_json::Value>(&output).unwrap()
+    };
+
+    // Bound without the marker: no role, the filter is off, and bind says so.
+    assert_eq!(
+        crate::delivery_policy::role_status_lines(&db),
+        vec!["conductor role: NONE".to_string()]
+    );
+    let log = std::fs::read_to_string(crate::paths::log_path()).unwrap_or_default();
+    assert!(log.contains("\"role_unheld\""), "{log}");
+
+    // Another session cannot claim the row's role; the bound session can.
+    assert!(role("sid-other")["error"].is_string());
+    assert_eq!(role("sid-omp")["ok"], serde_json::json!(true));
+    assert_eq!(
+        crate::delivery_policy::role_status_lines(&db),
+        vec!["conductor role: luna".to_string()]
+    );
+    cleanup(path);
+}
+
+#[test]
 fn plugin_notify_registration_failure_does_not_wake_delivery_loop() {
     let (db, path) = setup_test_db();
     save_test_instance(&db, "luna", ST_ACTIVE);

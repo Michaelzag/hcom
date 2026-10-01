@@ -2042,6 +2042,7 @@ mod tests {
 
     #[test]
     fn test_send_system_message_broadcast() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         db.conn
@@ -2070,6 +2071,7 @@ mod tests {
 
     #[test]
     fn test_send_system_message_targeted() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         db.conn
@@ -2097,6 +2099,7 @@ mod tests {
 
     #[test]
     fn test_send_system_message_with_tag() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         db.conn
@@ -2118,6 +2121,7 @@ mod tests {
 
     #[test]
     fn test_send_sub_notification_wakes_target_instance() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         db.conn
@@ -2156,6 +2160,7 @@ mod tests {
 
     #[test]
     fn test_send_system_message_exact_name_avoids_tag_prefix_collision() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         db.conn
@@ -2220,6 +2225,7 @@ mod tests {
 
     #[test]
     fn test_on_hit_provenance_instance_caller() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         db.conn
@@ -2282,6 +2288,7 @@ mod tests {
 
     #[test]
     fn test_on_hit_external_caller_and_mention_routing() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
 
         db.conn
@@ -2360,6 +2367,7 @@ mod tests {
 
     #[test]
     fn test_on_hit_caller_kind_captured_at_creation() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         // Verify resolve_caller_kind via create_filter_subscription:
         // instance caller → caller_kind=instance
         // non-instance caller (e.g. bigboss from -b) → caller_kind=external
@@ -2409,6 +2417,7 @@ mod tests {
 
     #[test]
     fn test_on_hit_provenance_stable_after_caller_stops() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         // Sub created by an instance stays sender_kind=instance at fire time
         // even if that instance row has been deleted before the match.
         let (db, db_path) = setup_full_test_db();
@@ -2472,6 +2481,7 @@ mod tests {
 
     #[test]
     fn test_on_hit_unmatched_mention_delivers_to_nobody() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
         // Documents current behavior: an on-hit text mentioning a nonexistent
         // agent produces a mentions-scope event with empty delivered_to.
         // This mirrors how send_system_message behaves for typos — no error,
