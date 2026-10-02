@@ -654,6 +654,19 @@ fn start_rebind(
         }
         updates.insert("name_announced".into(), serde_json::json!(1));
         db.update_instance_fields(&target_name, &updates)?;
+        // Initialization leaves a new row as a launch placeholder (inactive/
+        // "new"), but the caller is a running agent executing this command,
+        // not a launch awaiting its first hook. Left as a placeholder, the list and
+        // status sweeps stamp it launch_failed 30s later and send stops
+        // resolving @name while the session is alive.
+        lifecycle::set_status_collected(
+            db,
+            &target_name,
+            ST_ACTIVE,
+            "tool:start",
+            Default::default(),
+            &mut post,
+        );
         let restored_pid = match &anchor {
             Ok(matched) if !kept_remote_row => db
                 .set_instance_pid_if_unset(&target_name, matched.pid)?
@@ -2248,6 +2261,65 @@ mod tests {
         assert_eq!(life["renamed_to"], target.as_str());
         assert_eq!(life["snapshot"]["session_id"], "sess-r");
         assert_eq!(life["snapshot"]["last_event_id"], 9);
+    }
+
+    /// A session hcom never launched reclaims a name it has no history for
+    /// (the `@alias` incident): no session, no anchor pid. The reclaimed row
+    /// is the running caller, so past the launch-placeholder timeout the list
+    /// render and the status sweep must not stamp it launch_failed, and
+    /// `@name` must still resolve as a send recipient.
+    #[test]
+    #[serial]
+    fn test_start_rebind_row_survives_launch_placeholder_sweeps() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("alias_{}", std::process::id());
+        let ctx = make_ctx(
+            &[("OMPCODE", "1"), ("HCOM_PROCESS_ID", "proc-alias")],
+            "/tmp/project",
+        );
+
+        assert_eq!(start_rebind(&db, &target, &ctx, None, None).unwrap(), 0);
+        let row = db
+            .get_instance_full(&target)
+            .unwrap()
+            .expect("reclaimed row");
+        assert!(
+            row.session_id.is_none(),
+            "no session was resolved or adopted"
+        );
+        assert!(row.pid.is_none(), "no anchor pid was restored");
+
+        // Age the row past the placeholder timeout, as 31s of wall time would.
+        let aged = crate::shared::time::now_epoch_i64()
+            - crate::instance_lifecycle::LAUNCH_PLACEHOLDER_TIMEOUT
+            - 1;
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = ?1, status_time = ?2 WHERE name = ?3",
+                params![aged as f64, aged, target],
+            )
+            .unwrap();
+
+        // The `hcom list` render path, then the `hcom status` sweep.
+        let row = db.get_instance_full(&target).unwrap().unwrap();
+        crate::instance_lifecycle::get_instance_status(&row, &db);
+        crate::commands::status::finalize_timed_out_launches(&db);
+
+        let row = db.get_instance_full(&target).unwrap().unwrap();
+        assert_ne!(
+            row.status_context, "launch_failed",
+            "a live reclaimed session must not be stamped launch_failed"
+        );
+        let rows = crate::messages::deliverable_instances(db.conn()).unwrap();
+        let scope = crate::messages::compute_scope(
+            &format!("@{target} ping"),
+            &rows,
+            None,
+            &crate::fleet_names::FleetCtx::load(),
+        )
+        .expect("@name resolves to the live reclaimed row");
+        assert_eq!(scope.mentions, vec![target]);
     }
 
     /// A competing reclaim commits the target row after this rebind planned
