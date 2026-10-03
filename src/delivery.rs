@@ -1814,6 +1814,7 @@ pub fn run_delivery_loop(
         // Gate block tracking for TUI status updates
         let mut block_since: Option<Instant> = None;
         let mut last_block_context: String = String::new();
+        let mut endpoints_name = String::new();
 
         // Status tracking for terminal title updates
         let mut current_status = ST_LISTENING.to_string();
@@ -1849,10 +1850,29 @@ pub fn run_delivery_loop(
                     // Recheck launch readiness promptly while the TUI is still
                     // painting its initial screen. Some tools can start the
                     // delivery loop just before their input prompt appears.
-                    let idle_wait = if matches!(
-                        launch_outcome,
-                        LaunchOutcome::Pending | LaunchOutcome::Blocked
-                    ) {
+                    // Session switches create a new identity before it has endpoints.
+                    if endpoints_name != current_name {
+                        match db.refresh_pty_endpoints(
+                            &current_name,
+                            notify.port(),
+                            state.inject_port,
+                        ) {
+                            Ok(()) => endpoints_name = current_name.clone(),
+                            Err(e) => log_warn(
+                                "native",
+                                "delivery.register_endpoints_fail",
+                                &format!("{e}"),
+                            ),
+                        }
+                    }
+                    // SessionEnd can wake us before SessionStart binds the new name.
+                    let unbound = !process_id.is_empty()
+                        && matches!(db.get_process_binding(&process_id), Ok(None));
+                    let idle_wait = if unbound
+                        || matches!(
+                            launch_outcome,
+                            LaunchOutcome::Pending | LaunchOutcome::Blocked
+                        ) {
                         RETRY_DELAY
                     } else {
                         IDLE_WAIT
