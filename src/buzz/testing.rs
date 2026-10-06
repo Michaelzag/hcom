@@ -18,6 +18,51 @@ use tungstenite::{Message, WebSocket};
 
 use super::nostr::{Event, now, sha256_hex, verify, verify_auth_tag};
 
+/// TEST owner key: scalar 3, never a real identity.
+pub const TEST_OWNER_ENV: &str =
+    "BUZZ_PRIVATE_KEY=0303030303030303030303030303030303030303030303030303030303030303\n";
+
+/// A connector config aimed at a fake relay, with TEST key files written into
+/// this test's isolated `Config::dir()`: the seed at mode 0600 and the owner
+/// env file.
+///
+/// Built in memory rather than round-tripped through the config file: the
+/// loader rightly refuses a plaintext relay URL, and the fake relay speaks
+/// plaintext HTTP on loopback. Config validation has its own tests.
+pub fn connector_config(
+    relay: &FakeRelay,
+    device: &str,
+    seed: &[u8; 32],
+    channel_id: &str,
+    slug: &str,
+) -> super::config::Config {
+    use super::config::{ChannelConfig, Config};
+    let dir = Config::dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let seed_path = dir.join("seed.bin");
+    std::fs::write(&seed_path, seed).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::fs::write(dir.join("owner.env"), TEST_OWNER_ENV).unwrap();
+    Config {
+        relay_url: relay.url.replace("http://", "ws://"),
+        http_url: relay.url.clone(),
+        device_label: device.to_string(),
+        seed_path: std::path::PathBuf::from("seed.bin"),
+        owner_env_path: std::path::PathBuf::from("owner.env"),
+        local_signers: vec!["qa".to_string()],
+        channels: vec![ChannelConfig {
+            id: channel_id.to_string(),
+            slug: Some(slug.to_string()),
+            home: false,
+        }],
+        people: vec![],
+    }
+}
+
 #[derive(Default)]
 pub struct Switches {
     pub rate_limited: AtomicBool,

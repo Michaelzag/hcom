@@ -50,6 +50,11 @@ const BUZZ_HELP: &[HelpEntry] = &[
     ("  --limit N", "How many events (default: 20)"),
     ("  --before <id>", "Continue before this Buzz event id"),
     ("buzz down", "Drain, stop the connector, stop hosted rows"),
+    (
+        "buzz cursor set <channel> --since <unix>",
+        "Seed a channel's backfill start (connector down)",
+    ),
+    ("  --force", "Allow moving an existing cursor backwards"),
     ("", ""),
     ("Addressing a Buzz human from hcom:", ""),
     (
@@ -62,16 +67,20 @@ const BUZZ_HELP: &[HelpEntry] = &[
     ("", ""),
     ("mbai-local (only for local_signers):", ""),
     (
-        "  buzz query --as <n> --filter <json>",
+        "  buzz identity --as-name <n>",
+        "The signer's name and pubkey; signs nothing",
+    ),
+    (
+        "  buzz query --as-name <n> --filter <json>",
         "Signed relay query",
     ),
-    ("  buzz members <channel> --as <n>", "Channel members"),
+    ("  buzz members <channel> --as-name <n>", "Channel members"),
     (
-        "  buzz prepare --as <n> --channel <c> --created-at <ts>",
+        "  buzz prepare --as-name <n> --channel <c> --created-at <ts>",
         "Sign a post, send nothing",
     ),
     (
-        "  buzz publish --as <n>",
+        "  buzz publish --as-name <n>",
         "Post the signed event on stdin, confirm by id",
     ),
 ];

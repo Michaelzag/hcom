@@ -177,8 +177,9 @@ pub struct ReadOnlyStore {
 }
 
 impl Store {
-    /// Open (creating when missing) the connector state DB.
-    pub fn open(path: &Path, epoch: String) -> Result<Self> {
+    /// Open (creating when missing) the connector state DB. The epoch is the
+    /// one this store recorded with `adopt_epoch`, empty for a new store.
+    pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
@@ -188,8 +189,20 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let store = Self { conn, epoch };
+        // serve and the mbai-local CLI share this file; wait out a writer.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let mut store = Self {
+            conn,
+            epoch: String::new(),
+        };
         store.migrate()?;
+        store.epoch = store
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'epoch'", [], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .unwrap_or_default();
         Ok(store)
     }
 
@@ -369,8 +382,22 @@ impl Store {
             .optional()?)
     }
 
-    /// Advance a channel's backfill cursor.
+    /// Advance a channel's backfill cursor. Never moves it back: events arrive
+    /// out of order (backfill pages, retries), and a cursor that follows the
+    /// last one handled would re-read or skip history on the next start.
     pub fn set_channel_cursor(&self, id: &str, created_at: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE channels
+             SET cursor_created_at = MAX(COALESCE(cursor_created_at, 0), ?2)
+             WHERE id = ?1",
+            params![id, created_at as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Put a channel's cursor exactly here, backwards included: the operator's
+    /// `hcom buzz cursor set --force`, never the connector itself.
+    pub fn force_channel_cursor(&self, id: &str, created_at: u64) -> Result<()> {
         self.conn.execute(
             "UPDATE channels SET cursor_created_at = ?2 WHERE id = ?1",
             params![id, created_at as i64],
@@ -920,11 +947,22 @@ impl Store {
         Ok(rows)
     }
 
-    /// Forget an agent's enrollment in every channel.
-    pub fn drop_enrollment(&self, agent_pubkey: &str) -> Result<()> {
+    /// Forget an agent's enrollment in one channel, once omp removed it there.
+    pub fn drop_enrollment(&self, agent_pubkey: &str, channel_id: &str) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM enrollment WHERE agent_pubkey = ?1",
-            params![agent_pubkey],
+            "DELETE FROM enrollment WHERE agent_pubkey = ?1 AND channel_id = ?2",
+            params![agent_pubkey, channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Move an enrollment's `updated_at`, so a test can age a missing agent
+    /// past the removal window without waiting an hour.
+    #[cfg(test)]
+    pub fn age_enrollment(&self, agent_pubkey: &str, updated_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE enrollment SET updated_at = ?2 WHERE agent_pubkey = ?1",
+            params![agent_pubkey, updated_at],
         )?;
         Ok(())
     }
@@ -1300,7 +1338,8 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("state.db"), "epoch-1".into()).unwrap();
+        let mut store = Store::open(&dir.path().join("state.db")).unwrap();
+        store.adopt_epoch("epoch-1".into()).unwrap();
         (dir, store)
     }
 
@@ -1322,7 +1361,7 @@ mod tests {
         assert_eq!(store.epoch(), "epoch-1");
         assert!(store.channels().unwrap().is_empty());
         drop(store);
-        let reopened = Store::open(&dir.path().join("state.db"), "epoch-1".into()).unwrap();
+        let reopened = Store::open(&dir.path().join("state.db")).unwrap();
         assert_eq!(reopened.epoch(), "epoch-1");
     }
 
@@ -1349,6 +1388,25 @@ mod tests {
                 .unwrap()
                 .parked_reason
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn the_cursor_only_moves_forward_unless_forced() {
+        let (_dir, store) = store();
+        store.upsert_channel("chan-1", "infra").unwrap();
+        store.set_channel_cursor("chan-1", 2000).unwrap();
+        // A backfill page or a retried event older than what was handled.
+        store.set_channel_cursor("chan-1", 1500).unwrap();
+        assert_eq!(
+            store.channel("chan-1").unwrap().unwrap().cursor_created_at,
+            Some(2000)
+        );
+        store.force_channel_cursor("chan-1", 1500).unwrap();
+        assert_eq!(
+            store.channel("chan-1").unwrap().unwrap().cursor_created_at,
+            Some(1500),
+            "only the operator's override moves it back"
         );
     }
 
@@ -1731,7 +1789,7 @@ mod tests {
         assert_eq!(rows[0].channel_id, "chan-1");
         assert_eq!(rows[0].state, "enrolled");
 
-        store.drop_enrollment(&agent_pubkey).unwrap();
+        store.drop_enrollment(&agent_pubkey, "chan-1").unwrap();
         assert_eq!(store.enrolled_count().unwrap(), 0);
     }
 

@@ -110,12 +110,7 @@ impl Connector {
             remote: false,
         };
 
-        let state_db = Config::state_db_path();
-        let store = if state_db.exists() {
-            Store::open(&state_db, epoch_from_path(&state_db))?
-        } else {
-            Store::open(&state_db, String::new())?
-        };
+        let store = Store::open(&Config::state_db_path())?;
 
         Ok(Self {
             http: HttpRelay {
@@ -181,12 +176,12 @@ impl Connector {
 
 impl AgentIdentity {
     /// NIP-OA delegation of this key, owned by omp with empty conditions.
-    fn auth_tag(&self, owner: &SecretKey) -> [String; 4] {
+    pub fn auth_tag(&self, owner: &SecretKey) -> [String; 4] {
         auth_tag(owner, &self.pubkey, "")
     }
 
     /// Kind 0: display name, the hcom marker in `about`, NIP-OA tag.
-    fn profile_event(&self, owner: &SecretKey) -> Event {
+    pub fn profile_event(&self, owner: &SecretKey) -> Event {
         sign(
             UnsignedEvent {
                 created_at: nostr::now(),
@@ -199,7 +194,7 @@ impl AgentIdentity {
     }
 
     /// omp's kind 30177 managed-agent policy: what the mention popup reads.
-    fn managed_agent_event(&self, owner: &SecretKey) -> Event {
+    pub fn managed_agent_event(&self, owner: &SecretKey) -> Event {
         sign(
             UnsignedEvent {
                 created_at: nostr::now(),
@@ -212,7 +207,7 @@ impl AgentIdentity {
     }
 
     /// omp's kind 9000 add with role `bot`.
-    fn add_member_event(&self, owner: &SecretKey, channel_id: &str) -> Event {
+    pub fn add_member_event(&self, owner: &SecretKey, channel_id: &str) -> Event {
         sign(
             UnsignedEvent {
                 created_at: nostr::now(),
@@ -222,29 +217,6 @@ impl AgentIdentity {
             },
             owner,
         )
-    }
-
-    /// omp's kind 9001 remove.
-    fn remove_member_event(&self, owner: &SecretKey, channel_id: &str) -> Event {
-        sign(
-            UnsignedEvent {
-                created_at: nostr::now(),
-                kind: 9001,
-                tags: route::remove_member_tags(channel_id, &self.pubkey),
-                content: String::new(),
-            },
-            owner,
-        )
-    }
-
-    /// The same kind 0 `publish` posts, exposed for the CLI's publish path.
-    pub fn publish_profile_event(&self, owner: &SecretKey) -> Result<Event> {
-        Ok(self.profile_event(owner))
-    }
-
-    /// The same kind 30177 `publish` posts.
-    pub fn publish_managed_agent_event(&self, owner: &SecretKey) -> Result<Event> {
-        Ok(self.managed_agent_event(owner))
     }
 
     /// The reader's own kind 0: marked as the connector, never as an agent.
@@ -298,15 +270,6 @@ pub fn hcom_epoch(db: &HcomDb) -> Result<String> {
         .map(|_| "present".to_string())
         .unwrap_or_else(|_| "absent".to_string());
     Ok(format!("{identity}:{reset_ts}"))
-}
-
-/// The epoch recorded in the store, for reopening it.
-fn epoch_from_path(path: &std::path::Path) -> String {
-    let db = match HcomDb::open_at(path) {
-        Ok(db) => db,
-        Err(_) => return String::new(),
-    };
-    hcom_epoch(&db).unwrap_or_default()
 }
 
 /// A token bucket over a sliding window, one per signing key.
@@ -1624,6 +1587,34 @@ impl MainLoop {
             .into_iter()
             .map(|name| self.connector.agent_identity(&name))
             .collect();
+        let now = crate::shared::time::now_epoch_i64();
+        let enrollments = self
+            .connector
+            .store
+            .lock()
+            .enrollments()
+            .unwrap_or_default();
+
+        // Track absence first: `missing` rows record when the agent's row went
+        // away, and one that came back is enrolled again with no new writes,
+        // because omp never removed it from the channel.
+        for row in &enrollments {
+            if row.agent_pubkey == self.connector.reader.pubkey {
+                continue;
+            }
+            let present = roster.iter().any(|id| id.pubkey == row.agent_pubkey);
+            let state = match (row.state.as_str(), present) {
+                ("enrolled", false) => "missing",
+                ("missing", true) => "enrolled",
+                _ => continue,
+            };
+            let _ = self.connector.store.lock().put_enrollment(
+                &row.agent_pubkey,
+                &row.channel_id,
+                state,
+            );
+        }
+
         let channels = self.connector.channel_rows();
         for identity in &roster {
             for channel in &channels {
@@ -1636,28 +1627,20 @@ impl MainLoop {
             self.ensure_enrolled(&reader, &channel.id);
         }
 
-        let now = crate::shared::time::now_epoch_i64();
-        let enrollments = self
-            .connector
-            .store
-            .lock()
-            .enrollments()
-            .unwrap_or_default();
         for row in enrollments {
-            if row.state != "enrolled" || row.agent_pubkey == self.connector.reader.pubkey {
-                continue;
-            }
-            if roster
-                .iter()
-                .any(|identity| identity.pubkey == row.agent_pubkey)
+            let present = roster.iter().any(|id| id.pubkey == row.agent_pubkey);
+            let missing_since = match row.state.as_str() {
+                "missing" => row.updated_at,
+                // Marked missing in this very pass.
+                "enrolled" => now,
+                _ => continue,
+            };
+            if present
+                || row.agent_pubkey == self.connector.reader.pubkey
+                || now.saturating_sub(missing_since) < ENROLL_STALE_SECS
             {
                 continue;
             }
-            if now.saturating_sub(row.updated_at) < ENROLL_STALE_SECS {
-                continue;
-            }
-            let identity = self.connector.agent_identity(&row.agent_pubkey);
-            let event = identity.remove_member_event(&self.connector.owner, &row.channel_id);
             let owner_pubkey = self.connector.owner_pubkey.clone();
             if let Err(wait) = self.take_http_token(&owner_pubkey) {
                 crate::log::log_warn(
@@ -1667,19 +1650,39 @@ impl MainLoop {
                 );
                 continue;
             }
-            if self
+            // Built from the stored pubkey: the agent's row, and so its name,
+            // is exactly what no longer exists.
+            let event = sign(
+                UnsignedEvent {
+                    created_at: nostr::now(),
+                    kind: 9001,
+                    tags: route::remove_member_tags(&row.channel_id, &row.agent_pubkey),
+                    content: String::new(),
+                },
+                &self.connector.owner,
+            );
+            match self
                 .connector
                 .http
                 .post_event(&event, &self.connector.owner, None)
-                .is_ok()
-                && let store = self.connector.store.lock()
             {
-                let _ = store.drop_enrollment(&row.agent_pubkey);
-                crate::log::log_info(
+                Ok(()) => {
+                    let _ = self
+                        .connector
+                        .store
+                        .lock()
+                        .drop_enrollment(&row.agent_pubkey, &row.channel_id);
+                    crate::log::log_info(
+                        "buzz",
+                        "serve.unenrolled",
+                        &format!("{} left {}", row.agent_pubkey, row.channel_id),
+                    );
+                }
+                Err(error) => crate::log::log_warn(
                     "buzz",
-                    "serve.unenrolled",
-                    &format!("{} left {}", identity.canonical, row.channel_id),
-                );
+                    "serve.unenroll_failed",
+                    &format!("{} {}: {error}", row.agent_pubkey, row.channel_id),
+                ),
             }
         }
     }
@@ -2378,45 +2381,8 @@ mod tests {
         nostr::derive_secret(&SEED, "luna@mbai")
     }
 
-    /// TEST key material only: a seed file at mode 0600 and an owner env file.
-    fn write_key_files(dir: &std::path::Path) {
-        let seed_path = dir.join("seed.bin");
-        std::fs::write(&seed_path, SEED).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        std::fs::write(
-            dir.join("owner.env"),
-            "BUZZ_PRIVATE_KEY=0303030303030303030303030303030303030303030303030303030303030303\n",
-        )
-        .unwrap();
-    }
-
-    /// The connector's config for the fake relay.
-    ///
-    /// Built in memory rather than round-tripped through the config file: the
-    /// loader rightly refuses a plaintext relay URL, and the fake relay speaks
-    /// plaintext HTTP on loopback. Config validation has its own tests; what
-    /// these tests care about is the loop, not the file.
     fn test_config(relay: &FakeRelay, device: &str) -> Config {
-        std::fs::create_dir_all(Config::dir()).unwrap();
-        write_key_files(&Config::dir());
-        Config {
-            relay_url: relay.url.replace("http://", "ws://"),
-            http_url: relay.url.clone(),
-            device_label: device.to_string(),
-            seed_path: std::path::PathBuf::from("seed.bin"),
-            owner_env_path: std::path::PathBuf::from("owner.env"),
-            local_signers: vec!["qa".to_string()],
-            channels: vec![config::ChannelConfig {
-                id: CHANNEL_ID.to_string(),
-                slug: Some("infra".to_string()),
-                home: false,
-            }],
-            people: vec![],
-        }
+        crate::buzz::testing::connector_config(relay, device, &SEED, CHANNEL_ID, "infra")
     }
 
     /// An isolated HCOM_DIR, the fake relay, and the real main loop over the
@@ -3623,6 +3589,58 @@ mod tests {
 
     #[test]
     #[serial]
+    fn an_agent_gone_for_an_hour_is_removed_by_its_own_pubkey() {
+        let mut harness = harness("mbai");
+        harness.add_agent("luna");
+        let luna = public_hex(&agent_key());
+        harness.main.plan_enrollment();
+        assert_eq!(
+            harness
+                .store()
+                .enrollment(&luna, CHANNEL_ID)
+                .unwrap()
+                .as_deref(),
+            Some("enrolled")
+        );
+
+        // The session ends. The hour runs from when the row went missing, not
+        // from when the agent was enrolled.
+        assert!(harness.main.db.delete_instance("luna").unwrap());
+        harness.main.plan_enrollment();
+        assert!(
+            !harness.relay.events().iter().any(|e| e.kind == 9001),
+            "not removed the moment the row disappears"
+        );
+        let now = crate::shared::time::now_epoch_i64();
+        harness
+            .store()
+            .age_enrollment(&luna, now - ENROLL_STALE_SECS - 1)
+            .unwrap();
+        harness.main.plan_enrollment();
+
+        let removal = harness
+            .relay
+            .events()
+            .into_iter()
+            .find(|e| e.kind == 9001)
+            .expect("omp removed the agent");
+        assert_eq!(
+            route::tag(&removal, "p"),
+            Some(luna.as_str()),
+            "luna's own key"
+        );
+        assert_eq!(route::tag(&removal, "h"), Some(CHANNEL_ID));
+        assert!(
+            harness
+                .store()
+                .enrollment(&luna, CHANNEL_ID)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[serial]
     fn the_reader_is_enrolled_and_never_becomes_a_person() {
         let mut harness = harness("mbai");
         harness.add_person("michael", None);
@@ -3961,6 +3979,30 @@ mod tests {
         assert!(rolling.take().is_err());
         std::thread::sleep(Duration::from_millis(30));
         assert!(rolling.take().is_ok(), "the window refilled");
+    }
+
+    #[test]
+    #[serial]
+    fn the_connector_state_is_never_opened_as_an_hcom_database() {
+        let harness = harness("mbai");
+        harness.store().adopt_epoch("epoch-x".into()).unwrap();
+        let config = harness.main.connector.config.clone();
+        // A second start reopens state.db: it must read the epoch it stored,
+        // not run hcom's schema and migrations against the connector's tables.
+        let again = Connector::load(config).unwrap();
+        assert_eq!(again.store.lock().epoch(), "epoch-x");
+        let conn = rusqlite::Connection::open(Config::state_db_path()).unwrap();
+        let hcom_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('instances', 'events', 'kv')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hcom_tables, 0,
+            "no hcom schema inside the connector's state"
+        );
     }
 
     #[test]

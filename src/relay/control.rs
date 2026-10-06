@@ -1142,7 +1142,9 @@ fn handle_remote_events(
 ///
 /// Reads the connector's cache read-only. A device that never ran a connector
 /// answers with an explicit error rather than an empty channel, so a caller can
-/// tell "no events" from "wrong device".
+/// tell "no events" from "wrong device". `channel` may be a slug, a `ch_` row
+/// name or a channel id: the caller's device knows only its mirror row, so the
+/// connector host does the resolving.
 fn handle_remote_buzz_read(
     _db: &HcomDb,
     params: &Value,
@@ -1152,10 +1154,18 @@ fn handle_remote_buzz_read(
     let path = crate::buzz::config::Config::state_db_path();
     let store = crate::buzz::store::Store::open_read_only(&path).map_err(|e| e.to_string())?;
 
-    let channel_id = params
-        .get("channel_id")
+    let wanted = params
+        .get("channel")
+        .or_else(|| params.get("channel_id"))
         .and_then(Value::as_str)
-        .ok_or_else(|| "buzz_read: channel_id is required".to_string())?;
+        .ok_or_else(|| "buzz_read: channel is required".to_string())?;
+    let slug = wanted.strip_prefix("ch_").unwrap_or(wanted);
+    let channel = store
+        .channels()
+        .map_err(|e| format!("buzz_read: {e}"))?
+        .into_iter()
+        .find(|row| row.id == wanted || row.slug == slug)
+        .ok_or_else(|| format!("buzz_read: '{wanted}' is not a bridged channel here"))?;
     let thread = params.get("thread").and_then(Value::as_str);
     let before = params.get("before").and_then(Value::as_str);
     let limit = usize_param(params, "limit", 20).clamp(1, 2000);
@@ -1163,10 +1173,9 @@ fn handle_remote_buzz_read(
         .clamp(1024, REMOTE_EVENTS_BYTE_CAP);
 
     let events = store
-        .list_events(Some(channel_id), thread, before, limit)
+        .list_events(Some(&channel.id), thread, before, limit)
         .map_err(|e| format!("buzz_read: {e}"))?;
-
-    let mut rendered: Vec<Value> = events
+    let rendered: Vec<Value> = events
         .iter()
         .map(|event| {
             json!({
@@ -1184,42 +1193,59 @@ fn handle_remote_buzz_read(
             })
         })
         .collect();
+    let mut out = cap_buzz_read(rendered, byte_cap);
+    out["channel"] = json!(channel.slug);
+    out["channel_id"] = json!(channel.id);
+    Ok(out)
+}
 
-    let build = |events: &Vec<Value>, truncated: bool, marker: Option<&str>| {
+/// Fit a `buzz_read` answer under `byte_cap`: drop the oldest-listed events
+/// first, and when a single event is wider than the cap on its own, cut its
+/// text on a character boundary and mark it. Every pass shrinks the answer,
+/// so this always ends.
+fn cap_buzz_read(mut events: Vec<Value>, byte_cap: usize) -> Value {
+    let build = |events: &Vec<Value>, truncated: bool, cut: bool| {
         let mut out = json!({"events": events, "count": events.len()});
         if truncated {
             out["truncated"] = json!(true);
         }
-        if let Some(marker) = marker {
-            out["content_truncated"] = json!(marker);
+        if cut {
+            out["content_truncated"] = json!(BUZZ_CONTENT_CUT_MARKER);
         }
         out
     };
+    let size = |out: &Value| serde_json::to_string(out).map(|s| s.len()).unwrap_or(0);
 
-    let mut truncated = false;
-    let mut marker = None;
-    let mut out = build(&rendered, truncated, marker);
-    let mut len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
-    while len > byte_cap && !rendered.is_empty() {
-        if rendered.len() == 1 && byte_cap >= REMOTE_EVENTS_BYTE_CAP {
-            // One event wider than the cap can never travel whole, so cut its
-            // content and say so, rather than answering "no events".
-            let cut = BUZZ_CONTENT_CUT_MARKER;
-            let text = rendered[0]["text"].as_str().unwrap_or_default().to_string();
-            let keep = text.len().saturating_sub(cut.len() + 32);
-            rendered[0]["text"] = json!(format!(
-                "{}{cut}",
-                text.chars().take(keep).collect::<String>()
-            ));
-            marker = Some(cut);
-        } else {
-            rendered.pop();
-        }
+    let (mut truncated, mut cut) = (false, false);
+    let mut out = build(&events, truncated, cut);
+    let mut len = size(&out);
+    while len > byte_cap && !events.is_empty() {
         truncated = true;
-        out = build(&rendered, truncated, marker);
-        len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
+        let text = events[0]["text"].as_str().unwrap_or_default().to_string();
+        let body = text.strip_suffix(BUZZ_CONTENT_CUT_MARKER).unwrap_or(&text);
+        if events.len() == 1 && byte_cap >= REMOTE_EVENTS_BYTE_CAP && !body.is_empty() {
+            // One event wider than the cap can never travel whole: cut it, by
+            // at least the JSON overshoot (each raw byte is >= 1 JSON byte).
+            let overshoot = len - byte_cap + BUZZ_CONTENT_CUT_MARKER.len();
+            let mut end = body.len().saturating_sub(overshoot);
+            while !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            events[0]["text"] = json!(format!("{}{BUZZ_CONTENT_CUT_MARKER}", &body[..end]));
+            cut = true;
+        } else {
+            events.pop();
+        }
+        out = build(&events, truncated, cut);
+        let next = size(&out);
+        if next >= len {
+            // No progress is impossible by construction; never spin on it.
+            events.pop();
+            out = build(&events, truncated, cut);
+        }
+        len = size(&out);
     }
-    Ok(out)
+    out
 }
 
 /// Marker appended to an event's content cut to fit the RPC byte cap.
@@ -1483,6 +1509,89 @@ mod tests {
             )
             .unwrap();
         serde_json::from_str(&payload).unwrap()
+    }
+
+    /// Cache events in this test's connector state, the way `serve` does.
+    fn cache_buzz_events(channel: &str, slug: &str, contents: &[String]) {
+        use crate::buzz::nostr::{SecretKey, UnsignedEvent, sign};
+        let key = SecretKey::from_bytes(&[5; 32]).unwrap();
+        let store =
+            crate::buzz::store::Store::open(&crate::buzz::config::Config::state_db_path()).unwrap();
+        store.upsert_channel(channel, slug).unwrap();
+        for (index, content) in contents.iter().enumerate() {
+            let event = sign(
+                UnsignedEvent {
+                    created_at: 1_700_000_000 + index as u64,
+                    kind: 9,
+                    tags: vec![vec!["h".into(), channel.into()]],
+                    content: content.clone(),
+                },
+                &key,
+            );
+            store
+                .cache_event(
+                    &crate::buzz::store::cached_from_event(&event, channel, None, None).unwrap(),
+                )
+                .unwrap();
+        }
+    }
+
+    /// Run the handler with a deadline: a capping loop that never shrinks its
+    /// input would otherwise hang the relay worker, and the test with it.
+    fn buzz_read_within(params: Value) -> Result<Value, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let db_path = crate::paths::db_path();
+        std::thread::spawn(move || {
+            let db = HcomDb::open_raw(&db_path).unwrap();
+            let _ = tx.send(handle_remote_buzz_read(
+                &db,
+                &params,
+                "test",
+                &HcomConfig::default(),
+            ));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("buzz_read must terminate")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn buzz_read_cuts_an_oversized_event_on_a_byte_boundary_and_terminates() {
+        let (_dir, _hcom, _home, _guard) = isolated_test_env();
+        // Control characters cost 6 JSON bytes each; `€` is 3 bytes but one
+        // char. A cut counted in chars against a byte budget never shrinks it.
+        let hostile: String = "\u{1}€".repeat(20_000);
+        cache_buzz_events("chan-1", "infra", &[hostile]);
+
+        let out = buzz_read_within(json!({"channel": "infra", "limit": 1})).unwrap();
+        let len = serde_json::to_string(&out).unwrap().len();
+        assert!(len <= REMOTE_EVENTS_BYTE_CAP, "{len} bytes over the cap");
+        assert_eq!(out["count"], 1, "the event still travels, cut");
+        assert!(
+            out["events"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with(BUZZ_CONTENT_CUT_MARKER)
+        );
+        assert_eq!(out["content_truncated"], BUZZ_CONTENT_CUT_MARKER);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn buzz_read_drops_events_to_fit_the_cap_and_says_so() {
+        let (_dir, _hcom, _home, _guard) = isolated_test_env();
+        let big = "x".repeat(30_000);
+        cache_buzz_events("chan-1", "infra", &vec![big; 5]);
+
+        let out = buzz_read_within(json!({"channel_id": "chan-1", "limit": 5})).unwrap();
+        let len = serde_json::to_string(&out).unwrap().len();
+        assert!(len <= REMOTE_EVENTS_BYTE_CAP);
+        assert_eq!(out["count"], 3, "three 30 KB events fit under 96 KiB");
+        assert_eq!(out["truncated"], true);
+        assert!(
+            out.get("content_truncated").is_none(),
+            "whole events, uncut"
+        );
     }
 
     #[test]
@@ -1926,6 +2035,7 @@ mod tests {
                 "sub_create",
                 "sub_list",
                 "sub_unsub",
+                "buzz_read",
             ]
         );
     }

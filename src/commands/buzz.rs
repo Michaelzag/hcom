@@ -14,7 +14,7 @@ use crate::buzz::config::Config;
 use crate::buzz::nostr::{self, Event, UnsignedEvent, sign};
 use crate::buzz::relay::PublishError;
 use crate::buzz::route;
-use crate::buzz::serve::{Connector, ServeLock};
+use crate::buzz::serve::{AgentIdentity, Connector, ServeLock};
 use crate::buzz::store::{self, Store};
 use crate::db::HcomDb;
 use crate::relay::control::{RPC_DEFAULT_TIMEOUT, dispatch_remote, rpc_action};
@@ -48,6 +48,10 @@ pub enum BuzzSubcmd {
     Prepare(PrepareArgs),
     /// Post a signed event from stdin, enrolling first (mbai only)
     Publish(PublishArgs),
+    /// A local signer's Buzz identity: name and pubkey, no signing (mbai only)
+    Identity(IdentityArgs),
+    /// Inspect or seed a channel's Buzz cursor while the connector is down
+    Cursor(CursorArgs),
 }
 
 #[derive(clap::Parser, Debug)]
@@ -119,6 +123,38 @@ pub struct PublishArgs {
     pub json: bool,
 }
 
+#[derive(clap::Parser, Debug)]
+pub struct IdentityArgs {
+    #[arg(long)]
+    pub as_name: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Parser, Debug)]
+pub struct CursorArgs {
+    #[command(subcommand)]
+    pub cmd: CursorSubcmd,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum CursorSubcmd {
+    /// Seed where a channel's backfill starts, before the connector's first run
+    Set(CursorSetArgs),
+}
+
+#[derive(clap::Parser, Debug)]
+pub struct CursorSetArgs {
+    /// Channel slug or `ch_<slug>`
+    pub channel: String,
+    /// Unix seconds: the newest Buzz event already handled elsewhere
+    #[arg(long)]
+    pub since: u64,
+    /// Allow moving an existing cursor backwards (replays history)
+    #[arg(long)]
+    pub force: bool,
+}
+
 /// Entry point from the router.
 pub fn cmd_buzz(db: &HcomDb, args: &BuzzArgs, _ctx: Option<&crate::shared::CommandContext>) -> i32 {
     match &args.cmd {
@@ -136,6 +172,21 @@ pub fn cmd_buzz(db: &HcomDb, args: &BuzzArgs, _ctx: Option<&crate::shared::Comma
         BuzzSubcmd::Members(sub) => cmd_members(sub),
         BuzzSubcmd::Prepare(sub) => cmd_prepare(sub),
         BuzzSubcmd::Publish(sub) => cmd_publish(sub),
+        BuzzSubcmd::Identity(sub) => report(run_identity(sub)),
+        BuzzSubcmd::Cursor(sub) => match &sub.cmd {
+            CursorSubcmd::Set(set) => report(run_cursor_set(set)),
+        },
+    }
+}
+
+/// Exit code for a subcommand: errors are printed, never panicked.
+fn report(result: Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            1
+        }
     }
 }
 
@@ -295,20 +346,13 @@ fn hosted_channel_rows(db: &HcomDb) -> Vec<String> {
 
 /// `hcom buzz read <channel>`: the local cache, or the connector host's over RPC.
 fn cmd_read(db: &HcomDb, args: &ReadArgs) -> i32 {
-    let (channel_id, channel_slug) = match resolve_channel(&args.channel) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            eprintln!("Error: {error}");
-            return 1;
-        }
-    };
-
     let local = Config::state_db_path();
     // Answer from this device's cache; otherwise ask the connector host over
-    // the `buzz_read` RPC, addressed by the `ch_*` row's origin short id.
-    let events = if local.exists() {
-        match Store::open_read_only(&local).and_then(|store| {
-            Ok(store
+    // the `buzz_read` RPC, addressed by the `ch_*` mirror row's short id.
+    let answer = if local.exists() {
+        resolve_channel(&args.channel).and_then(|(channel_id, slug)| {
+            let store = Store::open_read_only(&local)?;
+            let events: Vec<Value> = store
                 .list_events(
                     Some(&channel_id),
                     args.thread.as_deref(),
@@ -317,89 +361,99 @@ fn cmd_read(db: &HcomDb, args: &ReadArgs) -> i32 {
                 )?
                 .iter()
                 .map(event_json)
-                .collect())
-        }) {
-            Ok(events) => events,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                return 1;
-            }
-        }
+                .collect();
+            Ok(json!({"channel": slug, "channel_id": channel_id, "events": events}))
+        })
     } else {
-        match remote_read(db, &channel_id, args) {
-            Ok(events) => events,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                return 1;
-            }
+        remote_read(db, args)
+    };
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return 1;
         }
     };
 
     if args.json {
-        println!(
-            "{}",
-            json!({"channel": channel_slug, "channel_id": channel_id, "events": events})
-        );
+        println!("{answer}");
         return 0;
     }
+    let slug = answer["channel"].as_str().unwrap_or(&args.channel);
+    let events = answer["events"].as_array().cloned().unwrap_or_default();
     if events.is_empty() {
-        println!("no cached Buzz events for {channel_slug}");
+        println!("no cached Buzz events for {slug}");
         return 0;
     }
-    println!("{channel_slug}: {} event(s)", events.len());
+    println!("{slug}: {} event(s)", events.len());
     for event in &events {
         let id = event["id"].as_str().unwrap_or_default();
-        let author = event["author_name"]
-            .as_str()
-            .unwrap_or_else(|| event["author"].as_str().unwrap_or_default());
+        let author = event["author"].as_str().unwrap_or_default();
         let text = event["text"].as_str().unwrap_or_default();
         let created = event["created_at"].as_u64().unwrap_or_default();
         let reply = event["root_id"].as_str().unwrap_or("-");
         println!("[{created}] {author} (thread {reply}): {text}\n  {id}");
     }
+    if answer["truncated"] == json!(true) {
+        println!(
+            "(more: continue with --before {})",
+            events
+                .last()
+                .and_then(|e| e["id"].as_str())
+                .unwrap_or_default()
+        );
+    }
     0
 }
 
 /// Ask the connector host for its cache, over the `buzz_read` RPC.
-fn remote_read(db: &HcomDb, channel_id: &str, args: &ReadArgs) -> Result<Vec<Value>> {
-    let device = origin_device_of(db, channel_id)?;
+fn remote_read(db: &HcomDb, args: &ReadArgs) -> Result<Value> {
+    let (row, short) = mirror_channel_row(db, &args.channel)?;
+    let slug = args.channel.strip_prefix("ch_").unwrap_or(&args.channel);
     let params = json!({
-        "channel_id": channel_id,
+        "channel": slug,
         "thread": args.thread,
         "limit": args.limit,
         "before": args.before,
     });
-    let result = dispatch_remote(
+    dispatch_remote(
         db,
-        &device,
-        Some(&format!("ch_{channel_id}")),
+        &short,
+        Some(&row),
         rpc_action::BUZZ_READ,
         &params,
         RPC_DEFAULT_TIMEOUT,
     )
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
-    Ok(result["events"].as_array().cloned().unwrap_or_default())
+    .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
-/// The short id of the device that publishes this channel's `ch_*` row.
-fn origin_device_of(db: &HcomDb, channel_id: &str) -> Result<String> {
-    let row: Option<String> = db
-        .conn()
-        .query_row(
-            "SELECT origin_device_id FROM instances
-             WHERE name = ?1 AND tool = ?2 AND COALESCE(origin_device_id, '') != ''",
-            rusqlite::params![format!("ch_{channel_id}"), crate::hosted::HOSTED_TOOL_BUZZ],
-            |row| row.get(0),
-        )
-        .ok();
-    let Some(device) = row else {
-        bail!(
-            "no connector host publishes this channel here — is the connector running on this device?"
-        );
-    };
-    Ok(crate::relay::control::split_device_suffix(&device)
-        .map(|(_, short)| short.to_string())
-        .unwrap_or(device))
+/// The mirror of a bridged channel's row on this device: `ch_<slug>:SHORT`,
+/// and the short id of the connector host that publishes it. A device without
+/// connector state knows a channel only through this row.
+fn mirror_channel_row(db: &HcomDb, channel: &str) -> Result<(String, String)> {
+    let slug = channel.strip_prefix("ch_").unwrap_or(channel);
+    let wanted = format!("ch_{slug}");
+    let mut stmt = db.conn().prepare(
+        "SELECT name FROM instances
+         WHERE tool = ?1 AND COALESCE(origin_device_id, '') != ''
+         ORDER BY name",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map(rusqlite::params![crate::hosted::HOSTED_TOOL_BUZZ], |row| {
+            row.get(0)
+        })?
+        .filter_map(std::result::Result::ok)
+        .collect();
+    rows.into_iter()
+        .find_map(|name| {
+            let (base, short) = crate::relay::control::split_device_suffix(&name)?;
+            (base == wanted).then(|| (name.clone(), short.to_string()))
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no device here mirrors {wanted}: is this device in the connector's relay group?"
+            )
+        })
 }
 
 /// Resolve a channel argument to `(channel_id, slug)`.
@@ -590,25 +644,12 @@ fn cmd_members(args: &MembersArgs) -> i32 {
 
 fn run_members(args: &MembersArgs) -> Result<()> {
     let connector = load_local_signer(&args.as_name)?;
-
     let (channel_id, slug) = resolve_channel(&args.channel)?;
     let identity = connector.agent_identity(&args.as_name);
-    let auth = connector.reader_auth_tag_for(&identity.pubkey);
-    // A 39002 roster is relay-signed, so query by kind rather than by channel
-    // tag: the discovery events carry `d`, not `h`.
-    let filter =
-        json!({ "kinds": [route::KIND_ROSTER], "authors": [connector.owner_pubkey.clone()] });
-    let events = connector.http.query(&filter, &identity.key, Some(&auth))?;
-    let roster = events
+    let roster: Vec<Value> = channel_members(&connector, &identity, &channel_id)?
         .into_iter()
-        .find(|event| route::tag(event, "d") == Some(channel_id.as_str()))
-        .map(|event| {
-            route::roster_members(&event)
-                .into_iter()
-                .map(|(pubkey, role)| json!({"pubkey": pubkey, "role": role}))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        .map(|(pubkey, role)| json!({"pubkey": pubkey, "role": role}))
+        .collect();
     if args.json {
         println!(
             "{}",
@@ -624,6 +665,83 @@ fn run_members(args: &MembersArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A channel's members from its 39002 roster. Rosters are signed by the
+/// relay, not omp, so they are found by `d` = channel id, and the relay may
+/// return several revisions: the newest wins.
+fn channel_members(
+    connector: &Connector,
+    identity: &AgentIdentity,
+    channel_id: &str,
+) -> Result<Vec<(String, String)>> {
+    let auth = connector.reader_auth_tag_for(&identity.pubkey);
+    let filter = json!({ "kinds": [route::KIND_ROSTER], "#d": [channel_id] });
+    let events = connector.http.query(&filter, &identity.key, Some(&auth))?;
+    Ok(events
+        .into_iter()
+        .filter(|event| route::tag(event, "d") == Some(channel_id))
+        .max_by_key(|event| event.created_at)
+        .map(|event| route::roster_members(&event))
+        .unwrap_or_default())
+}
+
+/// `hcom buzz identity --as-name <n>`: who a local signer is on Buzz, without
+/// signing anything.
+fn run_identity(args: &IdentityArgs) -> Result<()> {
+    let connector = load_local_signer(&args.as_name)?;
+    let identity = identity_json(&connector, &args.as_name);
+    if args.json {
+        println!("{identity}");
+    } else {
+        println!(
+            "{} {}",
+            identity["name"].as_str().unwrap_or_default(),
+            identity["pubkey"].as_str().unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn identity_json(connector: &Connector, name: &str) -> Value {
+    json!({"name": name, "pubkey": connector.agent_identity(name).pubkey})
+}
+
+/// `hcom buzz cursor set <slug> --since <unix>`: seed where a channel's
+/// backfill starts. Only while the connector is down, so nothing races it.
+fn run_cursor_set(args: &CursorSetArgs) -> Result<()> {
+    if ServeLock::holder_pid(&Config::lock_path())
+        .is_some_and(crate::buzz::config::lock_holder_alive)
+    {
+        bail!("hcom buzz serve is running; stop it (hcom buzz down) before moving a cursor");
+    }
+    let config = Config::load()?;
+    let channel = config.channel_by_slug(&args.channel).ok_or_else(|| {
+        anyhow::anyhow!("'{}' is not a bridged channel in the config", args.channel)
+    })?;
+    let slug = channel.slug.clone().unwrap_or_else(|| channel.id.clone());
+    let store = Store::open(&Config::state_db_path())?;
+    set_cursor(&store, &channel.id, &slug, args.since, args.force)?;
+    println!("{slug}: cursor at {}", args.since);
+    Ok(())
+}
+
+/// Seed one channel's cursor. Moving it back would replay history into hcom,
+/// so that takes `force`.
+fn set_cursor(store: &Store, channel_id: &str, slug: &str, since: u64, force: bool) -> Result<()> {
+    store.upsert_channel(channel_id, slug)?;
+    let current = store
+        .channel(channel_id)?
+        .and_then(|row| row.cursor_created_at);
+    if let Some(current) = current
+        && since < current
+        && !force
+    {
+        bail!(
+            "{slug}'s cursor is already at {current}; moving it back to {since} replays history (use --force)"
+        );
+    }
+    store.force_channel_cursor(channel_id, since)
 }
 
 fn cmd_prepare(args: &PrepareArgs) -> i32 {
@@ -674,42 +792,40 @@ fn cmd_publish(args: &PublishArgs) -> i32 {
 
 fn run_publish(args: &PublishArgs) -> Result<()> {
     let connector = load_local_signer(&args.as_name)?;
-
     let raw = read_stdin()?;
     let event: Event = serde_json::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("stdin is not a signed event: {e}"))?;
-    if !nostr::verify(&event) {
+    publish_signed(&connector, &args.as_name, &event)?;
+    if args.json {
+        println!("{}", json!({"published": true, "id": event.id}));
+    } else {
+        println!("published {}", event.id);
+    }
+    Ok(())
+}
+
+/// Post a signed event as `name`, enrolling first if needed, and confirm by
+/// id. Idempotent: a re-publish of the same event is a confirmation.
+fn publish_signed(connector: &Connector, name: &str, event: &Event) -> Result<()> {
+    if !nostr::verify(event) {
         bail!("stdin event fails signature verification");
     }
-    let identity = connector.agent_identity(&args.as_name);
+    let identity = connector.agent_identity(name);
     if event.pubkey != identity.pubkey {
         bail!(
-            "stdin event is signed by {}, not by the '{}' identity",
-            event.pubkey,
-            args.as_name
+            "stdin event is signed by {}, not by the '{name}' identity",
+            event.pubkey
         );
     }
-    let Some(channel_id) = route::tag(&event, "h") else {
+    let Some(channel_id) = route::tag(event, "h") else {
         bail!("stdin event carries no h tag");
     };
+    ensure_publish_enrolled(connector, &identity, channel_id)?;
+
     let auth = connector.reader_auth_tag_for(&identity.pubkey);
-
-    // Enroll if needed: kind 0 + 30177 as the signer, 9000 as omp.
-    if !publish_enroll(&connector, &identity, channel_id)? {
-        bail!(
-            "could not enroll {args_name} in {channel_id}",
-            args_name = args.as_name
-        );
-    }
-
-    match connector
-        .http
-        .post_event(&event, &identity.key, Some(&auth))
-    {
+    match connector.http.post_event(event, &identity.key, Some(&auth)) {
         Ok(()) => {}
-        Err(PublishError::Rejected(message)) if message.starts_with("duplicate:") => {
-            // Idempotent by event id: a re-publish is a confirmation.
-        }
+        Err(PublishError::Rejected(message)) if message.starts_with("duplicate:") => {}
         Err(error) => return Err(anyhow::anyhow!("{error}")),
     }
 
@@ -723,46 +839,51 @@ fn run_publish(args: &PublishArgs) -> Result<()> {
     if !confirmed {
         bail!("relay did not return {} after accepting it", event.id);
     }
-    if args.json {
-        println!("{}", json!({"published": true, "id": event.id}));
-    } else {
-        println!("published {}", event.id);
-    }
     Ok(())
 }
 
-/// The kind 0 / 30177 / 9000 sequence `publish` needs before a post lands.
-fn publish_enroll(
+/// Enroll a local signer in a channel unless the shared state already says
+/// it is: the agent's kind 0 under its own key, omp's 30177 and 9000 under
+/// omp's key (the relay requires author == signer). Recorded in `state.db`
+/// the same way `serve` records its own enrollments.
+fn ensure_publish_enrolled(
     connector: &Connector,
-    identity: &crate::buzz::serve::AgentIdentity,
+    identity: &AgentIdentity,
     channel_id: &str,
-) -> Result<bool> {
-    let auth = connector.reader_auth_tag_for(&identity.pubkey);
-    let tag = auth.clone();
-    for event in [
-        identity
-            .publish_profile_event(&connector.owner)
-            .context("cannot build the profile event")?,
-        identity
-            .publish_managed_agent_event(&connector.owner)
-            .context("cannot build the managed-agent event")?,
-    ] {
-        connector
-            .http
-            .post_event(&event, &identity.key, Some(&tag))?;
+) -> Result<()> {
+    if connector
+        .store
+        .lock()
+        .enrollment(&identity.pubkey, channel_id)?
+        .as_deref()
+        == Some("enrolled")
+    {
+        return Ok(());
     }
-    // Membership is omp's act, signed with omp's key and no delegation.
-    let member = sign(
-        UnsignedEvent {
-            created_at: nostr::now(),
-            kind: 9000,
-            tags: route::add_member_tags(channel_id, &identity.pubkey),
-            content: String::new(),
-        },
-        &connector.owner,
-    );
-    connector.http.post_event(&member, &connector.owner, None)?;
-    Ok(true)
+    let tag = connector.reader_auth_tag_for(&identity.pubkey);
+    connector.http.post_event(
+        &identity.profile_event(&connector.owner),
+        &identity.key,
+        Some(&tag),
+    )?;
+    for event in [
+        identity.managed_agent_event(&connector.owner),
+        identity.add_member_event(&connector.owner, channel_id),
+    ] {
+        connector.http.post_event(&event, &connector.owner, None)?;
+    }
+    let store = connector.store.lock();
+    store.put_enrollment(&identity.pubkey, channel_id, "enrolled")?;
+    store.put_author(&store::Author {
+        pubkey: identity.pubkey.clone(),
+        kind: store::AuthorKind::Agent,
+        hcom_name: Some(identity.row.clone()),
+        device_label: identity
+            .canonical
+            .rsplit_once('@')
+            .map(|(_, device)| device.to_string()),
+    })?;
+    Ok(())
 }
 
 fn read_stdin() -> Result<String> {
@@ -772,4 +893,178 @@ fn read_stdin() -> Result<String> {
         .read_to_string(&mut buffer)
         .context("cannot read stdin")?;
     Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buzz::nostr::{SecretKey, derive_secret, public_hex};
+    use crate::buzz::testing::{FakeRelay, connector_config};
+    use serial_test::serial;
+
+    const SEED: [u8; 32] = [11; 32];
+    const CHANNEL: &str = "33333333-4444-5555-6666-777777888899";
+
+    /// An isolated HCOM_DIR and a connector aimed at a fake relay. The guard
+    /// and dir must outlive the test.
+    fn setup() -> (
+        (
+            tempfile::TempDir,
+            std::path::PathBuf,
+            std::path::PathBuf,
+            crate::hooks::test_helpers::EnvGuard,
+        ),
+        FakeRelay,
+        Connector,
+    ) {
+        let env = crate::hooks::test_helpers::isolated_test_env();
+        let relay = FakeRelay::http();
+        let connector =
+            Connector::load(connector_config(&relay, "mbai", &SEED, CHANNEL, "infra")).unwrap();
+        (env, relay, connector)
+    }
+
+    fn roster(relay_key: &SecretKey, created_at: u64, channel: &str, member: &str) -> Event {
+        sign(
+            UnsignedEvent {
+                created_at,
+                kind: route::KIND_ROSTER,
+                tags: vec![
+                    vec!["d".into(), channel.into()],
+                    vec!["p".into(), member.into(), String::new(), "member".into()],
+                ],
+                content: String::new(),
+            },
+            relay_key,
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn identity_names_the_signer_and_signs_nothing() {
+        let (_env, relay, connector) = setup();
+        let before = relay.http_requests();
+        let identity = identity_json(&connector, "qa");
+        assert_eq!(identity["name"], "qa");
+        assert_eq!(
+            identity["pubkey"],
+            public_hex(&derive_secret(&SEED, "qa@mbai")),
+            "the same key the connector derives for qa"
+        );
+        assert_eq!(relay.http_requests(), before, "no relay traffic");
+    }
+
+    #[test]
+    #[serial]
+    fn members_come_from_the_newest_relay_signed_roster() {
+        let (_env, relay, connector) = setup();
+        // Relay-signed, as deployed: never omp's key.
+        let relay_key = derive_secret(&SEED, "relay@test");
+        let old = "a".repeat(64);
+        let new = "b".repeat(64);
+        relay.seed(roster(&relay_key, 1_000, CHANNEL, &old));
+        relay.seed(roster(&relay_key, 2_000, CHANNEL, &new));
+        relay.seed(roster(&relay_key, 3_000, "other-channel", &"c".repeat(64)));
+
+        let identity = connector.agent_identity("qa");
+        assert_eq!(
+            channel_members(&connector, &identity, CHANNEL).unwrap(),
+            vec![(new, "member".to_string())]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn publish_enrolls_once_with_omps_own_signature_on_the_policy() {
+        let (_env, relay, connector) = setup();
+        let identity = connector.agent_identity("qa");
+        let post = |text: &str| {
+            sign(
+                UnsignedEvent {
+                    created_at: nostr::now(),
+                    kind: route::KIND_MESSAGE,
+                    tags: vec![vec!["h".into(), CHANNEL.into()]],
+                    content: text.into(),
+                },
+                &identity.key,
+            )
+        };
+        publish_signed(&connector, "qa", &post("first")).unwrap();
+        let owner = public_hex(&connector.owner);
+        let policy: Vec<Event> = relay
+            .events()
+            .into_iter()
+            .filter(|e| e.kind == 30177)
+            .collect();
+        assert_eq!(policy.len(), 1);
+        assert_eq!(
+            policy[0].pubkey, owner,
+            "omp signs the managed-agent policy"
+        );
+
+        // The relay dedupes identical enrollment events, so stored events
+        // can't show a repeat; the request count can. A cached enrollment
+        // costs exactly the post and its confirming lookup.
+        let before = relay.http_requests();
+        publish_signed(&connector, "qa", &post("second")).unwrap();
+        assert_eq!(
+            relay.http_requests() - before,
+            2,
+            "the second publish reuses the enrollment"
+        );
+        assert_eq!(
+            relay
+                .events()
+                .iter()
+                .filter(|e| e.kind == route::KIND_MESSAGE)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_seeded_cursor_never_moves_back_without_force() {
+        let (_env, _relay, connector) = setup();
+        let store = connector.store.lock();
+        set_cursor(&store, CHANNEL, "infra", 5_000, false).unwrap();
+        assert!(
+            set_cursor(&store, CHANNEL, "infra", 6_000, false).is_ok(),
+            "forward is fine"
+        );
+        let refused = set_cursor(&store, CHANNEL, "infra", 4_000, false).unwrap_err();
+        assert!(refused.to_string().contains("--force"), "{refused}");
+        assert_eq!(
+            store.channel(CHANNEL).unwrap().unwrap().cursor_created_at,
+            Some(6_000)
+        );
+        set_cursor(&store, CHANNEL, "infra", 4_000, true).unwrap();
+        assert_eq!(
+            store.channel(CHANNEL).unwrap().unwrap().cursor_created_at,
+            Some(4_000)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_device_without_connector_state_reads_through_the_mirror_row() {
+        let (_env, _relay, _connector) = setup();
+        let db = HcomDb::open().unwrap();
+        let now = crate::shared::time::now_epoch_i64();
+        let mirror = json!({
+            "name": "ch_infra:BOXE", "tool": crate::hosted::HOSTED_TOOL_BUZZ,
+            "status": "listening", "status_time": now, "status_context": "buzz:online",
+            "last_stop": now, "tcp_mode": 1, "last_event_id": 0,
+            "origin_device_id": "9f2c-boxe-device-uuid", "directory": "",
+            "transcript_path": "", "background": 0, "name_announced": 0,
+            "created_at": crate::shared::time::now_epoch_f64(),
+        });
+        db.save_instance_named("ch_infra:BOXE", mirror.as_object().unwrap())
+            .unwrap();
+
+        let expected = ("ch_infra:BOXE".to_string(), "BOXE".to_string());
+        assert_eq!(mirror_channel_row(&db, "infra").unwrap(), expected);
+        assert_eq!(mirror_channel_row(&db, "ch_infra").unwrap(), expected);
+        assert!(mirror_channel_row(&db, "warehouse").is_err());
+    }
 }
