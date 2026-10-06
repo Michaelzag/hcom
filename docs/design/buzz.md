@@ -102,7 +102,7 @@ that shaped the design:
 | Routing (Buzz event → hcom message, hcom message → Buzz post) | `src/buzz/route.rs` | Pure decision functions over typed inputs; the heart of the tests. |
 | Service loop | `src/buzz/serve.rs` | Composition root: config, keys, sessions, workers. |
 | CLI | `src/commands/buzz.rs`: `serve`, `status`, `read`, `down`, plus mbai-local `query`, `prepare`, `publish` for the Q&A layer | One command family. |
-| Core hcom changes | `instance_binding.rs`, `proctruth.rs`, `commands/stop.rs`, `commands/send.rs`, `relay/control.rs` | Hosted participants and one read RPC. Listed below. |
+| Core hcom changes | `hosted.rs` (new), `proctruth.rs`, `commands/stop.rs`, `relay/control.rs` | Hosted participants and one read RPC. Listed below. |
 
 A separate binary or service was rejected: the connector has to own hcom rows,
 read their unread messages, send as them and advance their cursors. Doing that
@@ -150,8 +150,10 @@ never in a child's environment.
 `hcom reset` archives `hcom.db` and restarts event ids at 1. Every hcom event id
 the connector remembers is stored with an epoch: the `hcom.db` inode plus kv
 `relay_local_reset_ts`, the same rule the bridge uses (`hcom.py:475-500`). On an
-epoch change the connector drops id-keyed state, re-registers its rows and
-keeps everything keyed by pubkey or Buzz event id.
+epoch change the connector drops its id-keyed lookups and re-registers its rows.
+Unposted outbox rows are kept and sent until acknowledged: each holds a complete
+signed event and needs no hcom id to go out. Everything keyed by pubkey or Buzz
+event id carries over.
 
 ### Who is who in hcom
 
@@ -185,9 +187,10 @@ Inactive status alone deletes nothing, and the send predicate
 2. **Reaper and `stop all` exemption**: `proctruth::sweep_vanished_instances`
    and `hcom stop all` skip `tool = "buzz"` rows. Today the sweep would hold
    them for lack of PID evidence, but that's an accident, not a contract. An
-   explicit `hcom stop michael` still stops that row; the connector re-registers
-   it within one loop and logs that loudly. `hcom reset` is handled by the
-   epoch rule.
+   explicit `hcom stop michael` still stops that row; if `michael` is still in
+   the connector's active roster, the connector re-registers it within one loop
+   and logs that loudly. Rows the connector itself retired (people who left,
+   `down`) are never re-registered. `hcom reset` is handled by the epoch rule.
 3. **Liveness from the connector's heartbeat**: one localhost notify endpoint
    (kind `listen`, one port shared by every hosted row; `wake_all` already
    dedupes by port) and one `UPDATE … SET last_stop` over all hosted rows per
@@ -196,10 +199,7 @@ Inactive status alone deletes nothing, and the send predicate
    liveness is visible from mbai only. On graceful stop the connector writes
    `inactive` / `buzz:offline`. All of these are deliverable, so messages sent
    while the connector is down queue on the row's cursor and drain on restart.
-4. **`send_message` returns the new event id** alongside the recipient list
-   (`commands/send.rs`), so the connector can record what it sent without
-   searching for it.
-5. **One relay RPC handler, `buzz_read`** (one entry in `REMOTE_RPC_HANDLERS`).
+4. **One relay RPC handler, `buzz_read`** (one entry in `REMOTE_RPC_HANDLERS`).
    Every upgraded device advertises it, so callers don't pick the target by
    capability: they send it to the origin short id of the `ch_*` mirror rows,
    which only the connector host publishes. A device without connector state
@@ -248,8 +248,9 @@ For each event E from author H, signature verified first:
 - **Unresolvable target** (agent session ended, or its device's mirror expired):
   that target is parked per event and retried with backoff for 15 min. The
   channel cursor moves on regardless, so one sleeping laptop can't stall a
-  channel. If it still can't be delivered, omp replies in the Buzz thread:
-  "luna isn't running — not delivered".
+  channel. If it still can't be delivered, the connector says so in Buzz:
+  "luna isn't running — not delivered", as omp in a channel thread and as the
+  agent's own key in a DM (omp isn't a DM participant).
 - Delivery is at least once. The Buzz event id is recorded as delivered right
   after the send; a crash between the two can repeat that one message, and
   nothing is dropped.
@@ -257,11 +258,19 @@ For each event E from author H, signature verified first:
 ### hcom → Buzz (outbound)
 
 On every wake (and a 5 s tick as a backstop) the connector reads each hosted
-row's unread messages. It forwards message M only when the row is in M's
-`exact_targets`. `mentions` isn't enough: it also carries thread-member
-fan-out. Broadcasts, thread fan-out and messages sent by hosted rows are
-acknowledged and dropped. 0.7.52 senders write `exact_targets` too, so this
-holds in the mixed period.
+row's unread messages. It forwards message M when either:
+
+- the row is in M's `exact_targets` (explicitly addressed), or
+- M's thread is a `buzz_<channel>_<root12>` thread. Those threads only exist
+  because a Buzz conversation created them, so thread fan-out there is a reply
+  in that Buzz thread. This is what makes `hcom send --reply-to <id> -- answer`
+  work without an explicit `@michael`: hcom inherits the thread and resolves
+  the recipients from its members, leaving `exact_targets` empty.
+
+Everything else (broadcasts, fan-out in ordinary hcom threads, messages sent by
+hosted rows) is acknowledged and dropped. `mentions` alone is never the test,
+because it also carries ordinary thread fan-out. 0.7.52 senders write the same
+fields, so this holds in the mixed period.
 
 Sender: M's `from` (`luna` local or `luna:BOXE` remote) gives the agent key.
 External (`ext_`) and system (`sys_`) senders are not posted; they're logged
@@ -269,16 +278,14 @@ and dropped.
 
 Destinations, first rule that matches:
 
-1. M's thread is `buzz_<channel>_<root12>` → reply in that Buzz thread (NIP-10
-   `e` tags), p-tagging every addressed person and the parent author. Agents
-   get that thread automatically when they answer with `--reply-to`.
+1. M's thread is `buzz_<channel>_<root12>` → one reply in that Buzz thread
+   (NIP-10 `e` tags), p-tagging every addressed person and the parent author.
 2. M targets `ch_<x>` rows → one top-level post per channel, p-tagging the
    addressed people.
-3. M targets only people, and one of them addressed this agent in a Buzz
-   thread in the last 30 min → reply in that thread. This keeps a conversation
-   together when an agent answers with plain `hcom send @michael`.
-4. Otherwise → a DM from the agent to those people (41010, idempotent on the
-   participant set, at most 8 others). **Operator decision D1.**
+3. Otherwise (people only) → a DM from the agent to those people (41010,
+   idempotent on the participant set, at most 8 others). **Operator decision
+   D1.** Agents keep a conversation in its Buzz thread by answering with
+   `--reply-to`; the hcom agent-messaging skill says so.
 
 Before the first post into a channel the agent is enrolled: kind 0 (agent key),
 kind 30177 `{"name", "respond_to": "anyone", "parallelism": 1}` with `d` = agent
@@ -296,19 +303,23 @@ duplicate (`duplicate:`), not a second post. A 401 is a bug, not a retry case
 `created_at` nears the 900 s admission window is looked up by id and re-signed
 only if the relay never stored it.
 
-DM read path: every enrolled agent keeps one WS session for as long as it's
-enrolled. It subscribes to `{kinds:[44100], #p:[self]}` (a live, p-gated
-global sub the relay allows for self), which announces every DM it's added to,
-including DMs a human opens, plus one `#h` sub per known DM. No idle close, so a
-reply three days later still arrives. There's no per-IP connection cap at
-relay-v0.2.1; a few dozen sessions from mbai are fine.
+DM read path: an agent's WS session lives exactly as long as its hcom row is
+deliverable. On open it backfills `{kinds:[44100], #p:[self]}` (membership
+notices, stored globally and readable by their target) and each known DM `#h`
+from a per-agent cursor minus 960 s, then holds those subs live. Only 44100s
+whose channel is a DM (39000 marked `hidden`) get a `#h` sub; the rest are the
+agent's own channel enrollments, already covered by the reader. Nothing is
+missed while the session is closed, and messages for an agent whose row is gone
+take the unresolvable-target path. The session count tracks live agents, a few
+dozen; reconnects after a relay outage are staggered with jitter.
 
 ### Popup enrollment
 
 Agents become pickable before they ever post: every deliverable hcom agent row
 (local or remote; not hosted rows, `sys_`/`_` names or subagents) is enrolled
-into every bridged stream/forum channel. Removal of agents whose sessions ended
-is deferred: until it lands, `hcom buzz prune` does it by hand.
+into every bridged stream/forum channel. When an agent's row has been gone for
+an hour, omp removes it from those channels (kind 9001), the same trigger that
+closes its session, so the popup lists agents that can answer.
 
 ### Say and read from every device
 
@@ -334,8 +345,8 @@ is deferred: until it lands, `hcom buzz prune` does it by hand.
 - Nothing returns an error out of `serve` once it's up. Only config and key load
   failures at startup exit nonzero. A 40 s buzz-pg switchover is backoff plus
   backfill; that's a required test.
-- One connector: a lock file on mbai, and `serve` refuses to start if another
-  relay device is publishing `tool = "buzz"` rows.
+- One connector: a lock file on mbai. mbai is the only host configured to run
+  it.
 - systemd user unit on mbai (`hcom-buzz.service`, `Restart=always`) as the
   backstop for panics.
 
@@ -352,15 +363,20 @@ members, prepare_question, publish_question, publish_question_enrolled). The
 thin layer replaces its implementation, Python crypto + `buzz` CLI + raw HTTP,
 with calls to mbai-local `hcom buzz` subcommands that do the signing in-process:
 
-- `hcom buzz query --as qa --json` and `members`: signed `/query` reads as
-  `qa@mbai`.
-- `hcom buzz prepare --as qa --channel ch_warehouse --p <operator> --json`:
-  returns the signed kind 9 without sending it, so `qa` stores the exact
-  question and its root id in its reservation, as today.
-- `hcom buzz publish --as qa --json` with that event on stdin: enrolls if
-  needed, posts that exact event, confirms by id. Idempotent. An abandoned or
-  withdrawn question is simply never published, so the publication-truth rules
-  in `qa_workflow.py:663-727` hold unchanged.
+- `hcom buzz query --json` and `hcom buzz members <channel> --json`: signed
+  `/query` reads as `qa@mbai`.
+- `hcom buzz prepare --channel ch_warehouse --p <operator> --created-at <ts>
+  --json`: returns the signed kind 9 without sending it, using the
+  reservation's own `created_at`, so `qa` stores the exact question and its
+  root id, as today.
+- `hcom buzz publish --json` with that event on stdin: enrolls if needed, posts
+  that exact event, confirms by id. Idempotent. An abandoned or withdrawn
+  question is never published, so the publication-truth rules in
+  `qa_workflow.py:663-727` hold unchanged.
+
+These sign only as identities listed in the connector config's
+`local_signers` (just `qa`), so no other process on mbai can sign as an
+arbitrary agent.
 
 Everything else stays as it is: answers are still ingested by `qa`'s own
 signed-ancestry scan of `#warehouse`, so verbatim content, signatures, edits,
@@ -425,16 +441,16 @@ those empty.
    installed but disabled.
 7. Q&A transport swap in `zagcom`, then `#warehouse` cutover the same way.
 
-Rollback: `hcom buzz down` marks every hosted row `stopped`, so senders get a
-clear refusal instead of queueing into nothing, and stops the service; then
-start `zagcom-bridge`. Identities are shared, so nothing in Buzz changes.
-Unposted outbox entries are listed by `hcom buzz status` before `down`
-proceeds.
+Rollback: `hcom buzz down` first waits for the outbox to drain (bounded, and it
+prints anything still unposted with its destination), then stops the service,
+then marks every hosted row `stopped`, so senders get a clear refusal instead
+of queueing into nothing. Then start `zagcom-bridge`. Identities are shared, so
+nothing in Buzz changes.
 
 ## Decisions for the operator
 
-- **D1. Where `hcom send @michael` lands with no thread and no recent Buzz
-  conversation.** Recommend a DM from that agent: private, a phone
+- **D1. Where `hcom send @michael` lands with no Buzz thread.** Recommend a DM
+  from that agent: private, a phone
   notification, and the reply routes back to that agent. Alternative: a post in
   a default bridged channel with an `@michael` mention; less code, public to the
   channel.
