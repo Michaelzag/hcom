@@ -336,7 +336,7 @@ Today a lowercase colon target only prefix-matches row names and fails as
 unmatched, so this takes no existing meaning away.
 
 **No `@` needed.** In PowerShell a bare `@michael` is splatting: it's swallowed
-before hcom sees it (tested on KILA, pwsh 7.5: `@michael`, `@michael:infra` and
+before hcom sees it (tested on KILA, pwsh 7.6.6: `@michael`, `@michael:infra` and
 `@ch_infra` arrive as no argument; `@michael.infra` is a parse error). So
 `hcom send` accepts targets without `@` whenever the message is separated with
 `--` (or comes from `--stdin`/`--file`/`--base64`): every positional before the
@@ -353,9 +353,18 @@ hcom send michael --reply-to 4521 -- text
 ```
 
 These are single plain tokens (letters, digits, `_`, `:`, `-`) with no `/ \ #
-$` or backtick, and pass unchanged as bare arguments in bash and zsh (run
-locally) and in pwsh 7.5 and cmd.exe (run on KILA). [`--` passthrough on
-KILA's pwsh is being re-run; result goes in this table before merge.]
+$` or backtick. Argv as received, checked with a node argv probe:
+
+| Command | bash 5.3 / zsh 5.9 (mbai) | pwsh 7.6.6 (KILA) | cmd.exe (KILA) |
+|---|---|---|---|
+| `… michael:infra -- hello world` | `michael:infra -- hello world` | `["michael:infra","--","hello","world"]` | same as pwsh |
+| `… michael ch_infra -- it is done` | unchanged | `["michael","ch_infra","--","it","is","done"]` | same as pwsh |
+| `… michael:infra --thread buzz_infra_0123abcd4567 -- ok` | unchanged | `["michael:infra","--thread","buzz_infra_0123abcd4567","--","ok"]` | same as pwsh |
+| `… @michael` / `@michael:infra` / `@ch_infra` | unchanged | `[]` (swallowed) | unchanged |
+| `… @michael.infra` | unchanged | ParserError | unchanged |
+
+pwsh ran with `$PSNativeCommandArgumentPassing = Windows`; `--` reaches the
+program in both Windows shells.
 
 **A swallowed `@target` is not reliably caught today.** In pwsh,
 `hcom send @michael -- text` arrives as `hcom send -- text`, which is a
@@ -447,7 +456,7 @@ both.
 |---|---|
 | 0.7.52 device, `hcom send @michael` / `@ch_infra` | Resolves to the `…:XXXX` mirror and is relayed to mbai; delivered. |
 | 0.7.52 device lists rows | Hosted rows show as `michael:XXXX` with tool `buzz`; relay pull and the TUI keep unknown tool strings verbatim. |
-| 0.7.52 device broadcasts or posts to a thread | Not in `exact_targets`, so nothing reaches Buzz. |
+| 0.7.52 device broadcasts or posts to an ordinary hcom thread | Not in `exact_targets` and not a `buzz_*` thread, so nothing reaches Buzz. |
 | 0.7.52 agent replies with `--reply-to` | Its CLI copies the `buzz_*` thread name, so the reply lands in the Buzz thread. |
 | Receipts | The TUI read check is the recipient row's cursor, local to mbai; no hcom version relays remote read waterlines. |
 | 0.7.52 CLI, `hcom buzz read`, `michael:infra`, no-`@` targets | Need the new binary on the sending device. On 0.7.52, `michael:infra` fails as an unmatched target and a no-`@` target fails with "Targets require @"; both are loud. `hcom update` swaps the binary, so even not-yet-restarted sessions get the new forms on their next CLI call. |
