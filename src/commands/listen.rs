@@ -781,59 +781,53 @@ mod tests {
         }
     }
 
-    fn backdate_status(db: &HcomDb, secs: i64) {
-        db.conn()
-            .execute(
-                "UPDATE instances SET status_time = ? WHERE name = 'luna'",
-                [crate::shared::time::now_epoch_i64() - secs],
-            )
-            .unwrap();
+    fn row_named(db: &HcomDb, name: &str) -> crate::db::InstanceRow {
+        db.get_instance_full(name).unwrap().unwrap()
     }
 
-    fn cleanup_keeps_luna(db: &HcomDb) -> bool {
-        crate::instance_lifecycle::cleanup_stale_instances(db, 3600, 3600);
-        db.get_instance_full("luna").unwrap().is_some()
-    }
-
-    /// #118: a quiet poll is not an exit. An adhoc identity that polls with
-    /// `listen` must outlive the 60s exit-cleanup tier in both listen modes,
-    /// while observed exits and the ordinary inactive tier still reap it.
+    /// #118, fork form: a quiet poll is not an observed exit. After an adhoc
+    /// listener's quiet timeout elapses in either listen mode, the row must read
+    /// `inactive / listen timeout` — never `exit:timeout` — so a later
+    /// `hcom send @name` from another session is accepted instead of refused
+    /// ("<name> is not live"). Fails on origin/main, which records exit:timeout.
+    /// Each mode gets its own identity: the proof send of one iteration would
+    /// otherwise be the received message of the next.
     #[test]
     #[serial]
-    fn adhoc_quiet_listen_is_not_an_exit() {
+    fn adhoc_quiet_listen_stays_sendable() {
         let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
-                "INSERT INTO instances (name, created_at, tool) VALUES ('luna', 1000.0, 'adhoc')",
+                "INSERT INTO instances (name, created_at, tool) VALUES ('luna', 1000.0, 'adhoc'), ('mira', 1000.0, 'adhoc'), ('nova', 1000.0, 'adhoc')",
                 [],
             )
             .unwrap();
+        let sender = crate::shared::SenderIdentity {
+            kind: crate::shared::SenderKind::Instance,
+            name: "nova".into(),
+            instance_data: None,
+            session_id: None,
+        };
 
-        for args in [
-            listen_args(&["1"]),
-            listen_args(&["--timeout", "1", "--from", "nobody"]),
+        for (name, args) in [
+            ("luna", listen_args(&["1"])),
+            ("mira", listen_args(&["--timeout", "1", "--from", "nobody"])),
         ] {
-            assert_eq!(cmd_listen(&db, &args, Some(&ctx("luna"))), 0);
-            assert_eq!(row(&db).status, ST_INACTIVE);
-            assert_eq!(row(&db).status_context, "listen timeout");
-            backdate_status(&db, 120);
-            assert!(cleanup_keeps_luna(&db), "{args:?} reaped after 120s");
+            assert_eq!(cmd_listen(&db, &args, Some(&ctx(name))), 0);
+            assert_eq!(row_named(&db, name).status, ST_INACTIVE);
+            assert_eq!(row_named(&db, name).status_context, "listen timeout");
+            let delivered = crate::commands::send::send_message(
+                &db,
+                &sender,
+                &format!("@{name} are you there"),
+                None,
+                Some(&[name.to_string()]),
+            );
+            assert!(
+                matches!(&delivered, Ok(to) if to.contains(&name.to_string())),
+                "{args:?}: send @{name} after a quiet timeout must deliver, got {delivered:?}"
+            );
         }
-
-        // Ordinary inactive tier still applies (adhoc rows carry no PID).
-        backdate_status(&db, 3700);
-        assert!(!cleanup_keeps_luna(&db));
-
-        // An observed exit is still reaped on the short tier.
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, created_at, tool, status, status_context) \
-                 VALUES ('luna', 1000.0, 'adhoc', 'inactive', 'exit:closed')",
-                [],
-            )
-            .unwrap();
-        backdate_status(&db, 120);
-        assert!(!cleanup_keeps_luna(&db));
 
         cleanup_test_db(path);
     }

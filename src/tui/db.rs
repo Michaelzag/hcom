@@ -39,6 +39,18 @@ fn db_file_id(_path: &std::path::Path) -> Option<DbFileId> {
     None
 }
 
+/// True when both file identities are known and differ. Off Unix DbFileId
+/// carries no identity (comparison would be `() != ()`, which clippy denies
+/// as unit_cmp), and a replace-while-open cannot happen there anyway.
+#[cfg(unix)]
+fn db_file_replaced(opened: Option<DbFileId>, current: Option<DbFileId>) -> bool {
+    matches!((opened, current), (Some(a), Some(b)) if a != b)
+}
+
+#[cfg(not(unix))]
+fn db_file_replaced(_opened: Option<DbFileId>, _current: Option<DbFileId>) -> bool {
+    false
+}
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -131,7 +143,7 @@ impl DbDataSource {
                     after_open();
                 }
                 let after_open = db_file_id(&self.db_path);
-                if before_open != after_open {
+                if db_file_replaced(before_open, after_open) {
                     continue;
                 }
 
@@ -160,10 +172,7 @@ impl DbDataSource {
     /// file before bootstrapping the new one, and opening it during that window
     /// would create an empty database from the read-only TUI process.
     fn reconnect_if_database_replaced(&mut self) -> bool {
-        let replaced = matches!(
-            (self.db_file_id, db_file_id(&self.db_path)),
-            (Some(opened), Some(current)) if opened != current
-        );
+        let replaced = db_file_replaced(self.db_file_id, db_file_id(&self.db_path));
         if !replaced {
             return false;
         }

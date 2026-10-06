@@ -55,6 +55,28 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Re-register a PTY's `pty` + `inject` endpoints only while its instance
+    /// row exists, so a delivery loop waking on its own stop can't recreate them.
+    /// Ported from upstream 4b5a36c for the session-switch endpoint refresh (26c5c44).
+    pub fn refresh_pty_endpoints(
+        &self,
+        name: &str,
+        notify_port: u16,
+        inject_port: u16,
+    ) -> Result<()> {
+        let now = now_epoch_f64();
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO notify_endpoints (instance, kind, port, updated_at)
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM instances WHERE name = ?1)
+             ON CONFLICT(instance, kind) DO UPDATE SET
+                 port = excluded.port,
+                 updated_at = excluded.updated_at",
+        )?;
+        stmt.execute(params![name, "pty", notify_port as i64, now])?;
+        stmt.execute(params![name, "inject", inject_port as i64, now])?;
+        Ok(())
+    }
+
     /// Delete a specific notify endpoint by instance and kind.
     pub fn delete_notify_endpoint(&self, name: &str, kind: &str) -> Result<()> {
         self.conn.execute(
