@@ -97,6 +97,9 @@ impl FakeRelay {
             while !server_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // Windows accepted sockets inherit the listener's
+                        // nonblocking mode; the handlers need blocking reads.
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(1)))
                             .unwrap();
