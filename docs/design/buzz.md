@@ -97,7 +97,7 @@ that shaped the design:
 | Routing (Buzz event → hcom message, hcom message → Buzz post) | `src/buzz/route.rs` | Pure decision functions over typed inputs; the heart of the tests. |
 | Service loop | `src/buzz/serve.rs` | Composition root: config, keys, sessions, workers. |
 | CLI | `src/commands/buzz.rs`: `serve`, `status`, `read`, `down`, plus mbai-local `query`, `prepare`, `publish` for the Q&A layer | One command family. |
-| Core hcom changes | `hosted.rs` (new), `proctruth.rs`, `commands/stop.rs`, `relay/control.rs` | Hosted participants and one read RPC. Listed below. |
+| Core hcom changes | `hosted.rs` (new), `proctruth.rs`, `commands/stop.rs`, `commands/send.rs` + `messages.rs` (addressing), `relay/control.rs` | Hosted participants, the addressing forms, one read RPC. |
 
 A separate binary or service was rejected: the connector has to own hcom rows,
 read their unread messages, send as them and advance their cursors. Doing that
@@ -311,12 +311,63 @@ into every bridged stream/forum channel. When an agent's row has been gone for
 an hour, omp removes it from those channels (kind 9001), the same trigger that
 closes its session, so the popup lists agents that can answer.
 
+### Addressing
+
+Buzz targets live inside hcom's existing target grammar (`src/messages.rs`
+`match_target`, `src/commands/send.rs` positional handling), shaped like the
+`name:DEVICE` form agents already use (`nina:MABE`): a person, optionally at a
+place.
+
+| Address | Means | Buzz result |
+|---|---|---|
+| `michael` | the person | top-level post in Michael's home channel (`#michael`), @mentioning him |
+| `michael:infra` | the person, in a channel | top-level post in `#infra`, @mentioning him |
+| `ch_infra` | the channel | top-level post in `#infra`, no mention |
+| any of the above + `--reply-to <id>` of a Buzz-originated message | that conversation | reply in that Buzz thread |
+
+How it resolves, on the sender's device, before anything goes on the wire:
+`michael:infra` is a colon target whose suffix is not a device id (not four
+uppercase letters or digits matching a known device) and whose base is a
+`tool = "buzz"` person row; it expands to the two ordinary targets `michael`
+and `ch_infra` (`michael:MBAI` and `ch_infra:MBAI` on other devices). Nothing
+new travels in the event, so the connector's rule 2 handles it as a channel post
+addressed to Michael. A device id wins over a channel slug if both could match.
+Today a lowercase colon target only prefix-matches row names and fails as
+unmatched, so this takes no existing meaning away.
+
+**No `@` needed.** In PowerShell a bare `@michael` is splatting: it's swallowed
+before hcom sees it (tested on KILA, pwsh 7.5: `@michael`, `@michael:infra` and
+`@ch_infra` arrive as no argument; `@michael.infra` is a parse error). So
+`hcom send` accepts targets without `@` whenever the message is separated with
+`--` (or comes from `--stdin`/`--file`/`--base64`): every positional before the
+message is a target, so there's no ambiguity. Today that form errors with
+"Targets require @" (`send.rs:1048-1066`). The no-`--` compatibility form
+(`hcom send hello` = message text) is unchanged. This applies to all targets,
+not just Buzz ones, and all docs and agent instructions use the no-`@` form:
+
+```
+hcom send michael -- text
+hcom send michael:infra -- text
+hcom send ch_infra -- text
+hcom send michael --reply-to 4521 -- text
+```
+
+These are single plain tokens (letters, digits, `_`, `:`, `-`) with no `/ \ #
+$` or backtick, and pass unchanged as bare arguments in bash and zsh (run
+locally) and in pwsh 7.5 and cmd.exe (run on KILA). [`--` passthrough on
+KILA's pwsh is being re-run; result goes in this table before merge.]
+
+**A swallowed `@target` is not reliably caught today.** In pwsh,
+`hcom send @michael -- text` arrives as `hcom send -- text`, which is a
+broadcast. The broadcast preview only blocks it when the sender is inside an AI
+tool, without `--go`, and the broadcast would reach more than three rows
+(`send.rs:1162-1169`). Decision D6 below.
+
 ### Say and read from every device
 
-- **Say** is plain hcom: `hcom send @ch_infra -- text` posts in `#infra`;
-  `hcom send @michael -- text` reaches Michael by the rules above;
-  `--reply-to <id>` on an inbound Buzz message replies in its thread. All of it
-  works from 0.7.52 today: it's a message to a remote row.
+- **Say** is plain hcom with the addresses above. All of it works from 0.7.52
+  in the `@` form, since it's a message to a remote row; `michael:infra` and the
+  no-`@` form need the new CLI on the sending device.
 - **Read**: `hcom buzz read <channel> [--thread <root>] [--limit N] [--json]`
   answers from the connector's cache on mbai, and from any other device via the
   `buzz_read` RPC to the `ch_*` rows' origin device. Responses are capped at
@@ -399,7 +450,7 @@ both.
 | 0.7.52 device broadcasts or posts to a thread | Not in `exact_targets`, so nothing reaches Buzz. |
 | 0.7.52 agent replies with `--reply-to` | Its CLI copies the `buzz_*` thread name, so the reply lands in the Buzz thread. |
 | Receipts | The TUI read check is the recipient row's cursor, local to mbai; no hcom version relays remote read waterlines. |
-| 0.7.52 CLI, `hcom buzz read` | Command doesn't exist until that device's binary is updated. `hcom update` swaps the binary, so even not-yet-restarted sessions get it on their next CLI call. |
+| 0.7.52 CLI, `hcom buzz read`, `michael:infra`, no-`@` targets | Need the new binary on the sending device. On 0.7.52, `michael:infra` fails as an unmatched target and a no-`@` target fails with "Targets require @"; both are loud. `hcom update` swaps the binary, so even not-yet-restarted sessions get the new forms on their next CLI call. |
 | 0.7.52 daemon sweep on mbai while the connector is down | Hosted rows have no process binding, so the old sweep holds them (`no-pid-evidence`); the new one skips them explicitly. |
 | mbai relay silent > 90 s | Peers drop all mbai mirrors (existing behaviour); sends to `@michael` from a peer fail loudly until mbai is back. |
 | Connector host (mbai) | Runs the new binary and a restarted relay worker (the RPC handler runs there). Part of cutover. |
@@ -456,3 +507,10 @@ nothing in Buzz changes.
 - **D5. Q&A.** Recommend the thin layer: keep zagcom's Q&A logic, swap its
   transport for `hcom buzz` subcommands, make `qa` an hcom participant.
   `#warehouse` stays on the interim bridge until that's proven.
+- **D6. Target-less sends after `--`.** A swallowed pwsh `@target` silently
+  becomes a broadcast unless the narrow preview gate fires. Recommend: a send
+  that uses `--` (or `--stdin`/`--file`/`--base64`) with zero targets is
+  refused unless `--go` is given, everywhere, not only inside AI tools with
+  more than three recipients. That makes an accidental broadcast impossible to
+  send by mistake from any shell; deliberate broadcasts add `--go`.
+  Alternative: leave broadcast as is and rely on the no-`@` docs.
