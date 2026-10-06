@@ -1103,7 +1103,13 @@ impl MainLoop {
             }
             route::Outbound::Post(destinations) => {
                 for destination in destinations {
-                    self.queue_post(&identity, hcom_id, &destination, &message.text);
+                    self.queue_post(
+                        &message.from,
+                        &identity,
+                        hcom_id,
+                        &destination,
+                        &message.text,
+                    );
                 }
             }
         }
@@ -1111,8 +1117,14 @@ impl MainLoop {
 
     /// Sign one post and queue it. Signing first means the Buzz id is known
     /// before the send, which is what makes the outbox idempotent.
+    ///
+    /// `signer_row` is the sender's full hcom row name (`luna`, or `luna:BOXE`
+    /// for a mirror). The publisher re-derives the key from it for NIP-98, so
+    /// it must carry the device: the bare name derives this device's key, and
+    /// the relay refuses a header that doesn't match the event's author.
     fn queue_post(
         &self,
+        signer_row: &str,
         identity: &AgentIdentity,
         hcom_id: i64,
         destination: &route::Destination,
@@ -1130,7 +1142,7 @@ impl MainLoop {
         let row = OutboxRow {
             hcom_id,
             destination: destination.channel_id.clone(),
-            signer_name: identity.name.clone(),
+            signer_name: signer_row.to_string(),
             signed_json: serde_json::to_string(&event).unwrap_or_default(),
             buzz_id: event.id.clone(),
             state: "pending".into(),
@@ -1492,14 +1504,21 @@ impl MainLoop {
             // own; without this a mention of an agent whose session has ended
             // names nobody and is skipped instead of parked.
             if !is_reader {
+                let device = identity
+                    .canonical
+                    .rsplit_once('@')
+                    .map(|(_, device)| device.to_string());
+                // A mirror is addressed as `luna:BOXE` on this device; the bare
+                // name would park a mention for a local row that never exists.
+                let row = match (&device, identity.remote) {
+                    (Some(device), true) => format!("{}:{}", identity.name, device.to_uppercase()),
+                    _ => identity.name.clone(),
+                };
                 let _ = store.put_author(&Author {
                     pubkey: identity.pubkey.clone(),
                     kind: AuthorKind::Agent,
-                    hcom_name: Some(identity.name.clone()),
-                    device_label: identity
-                        .canonical
-                        .rsplit_once('@')
-                        .map(|(_, device)| device.to_string()),
+                    hcom_name: Some(row),
+                    device_label: device,
                 });
             }
         }
@@ -2527,6 +2546,39 @@ mod tests {
             vec![("sent".to_string(), 1)]
         );
         assert!(harness.unread("michael").is_empty(), "the cursor advanced");
+    }
+
+    #[test]
+    #[serial]
+    fn a_send_from_another_device_posts_as_that_devices_identity() {
+        // Requirement 3: `luna` on BOXE talks to Michael through the hcom relay.
+        // The post is signed as luna@boxe, and the NIP-98 header must be too:
+        // the relay refuses a header whose signer is not the event's author.
+        let mut harness = harness("mbai");
+        harness.use_home_channel("michael", "michael");
+        harness.add_person("michael", Some("michael"));
+        harness.send("luna:BOXE", "from the laptop", &["michael"], None);
+        harness.step_until(|h| {
+            h.store()
+                .outbox_counts()
+                .unwrap()
+                .iter()
+                .any(|(state, _)| state == "sent" || state == "failed")
+        });
+
+        let remote = public_hex(&nostr::derive_secret(&SEED, "luna@boxe"));
+        let posts: Vec<Event> = harness
+            .relay
+            .events()
+            .into_iter()
+            .filter(|e| e.kind == route::KIND_MESSAGE && e.pubkey == remote)
+            .collect();
+        assert_eq!(posts.len(), 1, "{:?}", harness.store().outbox_counts());
+        assert_eq!(posts[0].content, "from the laptop");
+        assert_eq!(
+            harness.store().outbox_counts().unwrap(),
+            vec![("sent".to_string(), 1)]
+        );
     }
 
     #[test]
