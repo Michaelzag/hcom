@@ -427,6 +427,10 @@ pub struct HcomMessage {
     pub thread: Option<String>,
     /// Resolved exact targets (may be empty for a broadcast).
     pub exact_targets: Vec<String>,
+    /// Rows hcom actually delivered to. A `--reply-to` answer in a Buzz thread
+    /// inherits its recipients from the thread, leaving `exact_targets` empty,
+    /// so this is where the person being answered shows up.
+    pub delivered_to: Vec<String>,
 }
 
 /// Everything outbound routing needs.
@@ -498,15 +502,29 @@ pub fn route_outbound(message: &HcomMessage, ctx: &OutboundContext<'_>) -> Outbo
         })
         .collect();
 
-    // Rule 1: a Buzz-originated thread is a reply in that thread.
+    // Rule 1: a Buzz-originated thread is a reply in that thread, p-tagging
+    // every person it reached: the addressed ones and the thread's humans hcom
+    // fanned it out to (the parent author included).
     if let Some(thread) = &message.thread
         && is_buzz_thread(thread)
         && let Some((channel_id, root_id)) = ctx.threads.get(thread)
     {
+        let reached = |p: &&PersonRow| {
+            message
+                .exact_targets
+                .iter()
+                .chain(&message.delivered_to)
+                .any(|t| t.eq_ignore_ascii_case(&p.name))
+        };
         return Outbound::Post(vec![Destination {
             channel_id: channel_id.clone(),
             root_id: Some(root_id.clone()),
-            mentions: addressed.iter().map(|p| p.pubkey.clone()).collect(),
+            mentions: ctx
+                .people
+                .iter()
+                .filter(reached)
+                .map(|p| p.pubkey.clone())
+                .collect(),
         }]);
     }
 
@@ -1325,6 +1343,7 @@ mod tests {
             text: "hello".into(),
             thread: thread.map(str::to_string),
             exact_targets: targets.iter().map(|t| t.to_string()).collect(),
+            delivered_to: Vec::new(),
         }
     }
 
@@ -1351,6 +1370,31 @@ mod tests {
                 mentions: vec!["m".repeat(64)],
             }]),
             "a buzz thread reply goes to the thread's channel, not the home channel"
+        );
+    }
+
+    #[test]
+    fn a_thread_answer_tags_the_person_it_reached_without_addressing() {
+        // `--reply-to` inherits the thread: no exact target, but hcom delivered
+        // it to the human who wrote in the thread, and Buzz must notify them.
+        let michael = person(&"m".repeat(64), "michael", Some("michael"));
+        let sean = person(&"s".repeat(64), "seanfitz", Some("seanfitz"));
+        let people = [michael, sean];
+        let channels = [channel("chan-1", "infra")];
+        let threads = BTreeMap::from([(
+            "buzz_infra_abc123".to_string(),
+            ("chan-1".to_string(), "root-id".to_string()),
+        )]);
+        let mut answer = message("luna", &[], Some("buzz_infra_abc123"));
+        answer.delivered_to = vec!["michael".into(), "luna".into()];
+        assert_eq!(
+            route_outbound(&answer, &outctx(&people, &channels, &threads)),
+            Outbound::Post(vec![Destination {
+                channel_id: "chan-1".into(),
+                root_id: Some("root-id".into()),
+                mentions: vec!["m".repeat(64)],
+            }]),
+            "only the person the answer reached is tagged"
         );
     }
 

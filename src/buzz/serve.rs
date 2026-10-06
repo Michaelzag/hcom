@@ -425,6 +425,22 @@ pub fn serve(config: Config) -> Result<i32> {
 
     crate::sys::signal::register_term(&connector.shutdown);
 
+    // The reader must be a member of every bridged channel *before* it opens a
+    // subscription: a live single-`#h` REQ from a non-member is refused with
+    // CLOSED "not a channel member", and no amount of reconnecting fixes that.
+    // Enrollment is HTTP and omp is the channel admin, so this is one write per
+    // channel, done before the reader thread exists.
+    let mut buckets: HashMap<String, TokenBucket> = HashMap::new();
+    for channel in connector.channel_rows() {
+        {
+            // The row is the durable cursor holder; without it the backfill
+            // always restarts from zero and `status` reports no channels.
+            let store = connector.store.lock();
+            let _ = store.upsert_channel(&channel.id, &channel.slug);
+        }
+        enroll_reader(&connector, &channel.id, &mut buckets);
+    }
+
     let (tx, rx) = mpsc::channel::<InboundItem>();
     let handles = ReaderHandles {
         relay_url: connector.config.relay_url.clone(),
@@ -448,7 +464,7 @@ pub fn serve(config: Config) -> Result<i32> {
         inbound: rx,
         last_enroll: Instant::now(),
         last_stale_check: Instant::now(),
-        buckets: HashMap::new(),
+        buckets,
     };
     let code = main.run();
 
@@ -466,6 +482,66 @@ struct ReaderHandles {
     channels: Vec<ChannelRow>,
     store: Arc<Mutex<Store>>,
     shutdown: Arc<AtomicBool>,
+}
+
+/// Enroll the connector's reader in one channel, before any subscription.
+///
+/// The reader's own kind 0 (marked as the connector, never as an hcom agent)
+/// plus omp's kind 9000 add with role `bot`. Both are HTTP writes from the main
+/// thread, before the reader thread exists, because a subscription from a
+/// non-member is refused outright and reconnecting cannot fix it.
+fn enroll_reader(
+    connector: &Connector,
+    channel_id: &str,
+    buckets: &mut HashMap<String, TokenBucket>,
+) {
+    let reader = &connector.reader;
+    let profile = reader.reader_profile_event(&connector.owner);
+    let member = sign(
+        UnsignedEvent {
+            created_at: nostr::now(),
+            kind: 9000,
+            tags: route::add_member_tags(channel_id, &reader.pubkey),
+            content: String::new(),
+        },
+        &connector.owner,
+    );
+    let tag = serde_json::to_string(&reader.auth_tag(&connector.owner)).unwrap_or_default();
+
+    for (event, signer, delegation) in [
+        (profile, &reader.key, Some(tag.as_str())),
+        (member, &connector.owner, None),
+    ] {
+        if let Err(wait) = buckets
+            .entry(event.pubkey.clone())
+            .or_insert_with(|| TokenBucket::new(HTTP_PER_MINUTE, Duration::from_secs(60)))
+            .take()
+        {
+            crate::log::log_warn(
+                "buzz",
+                "serve.reader_enroll_throttled",
+                &format!("{channel_id}: waiting {}s", wait.as_secs().max(1)),
+            );
+            return;
+        }
+        if let Err(error) = connector.http.post_event(&event, signer, delegation) {
+            crate::log::log_warn(
+                "buzz",
+                "serve.reader_enroll_failed",
+                &format!("{channel_id}: kind {}: {error}", event.kind),
+            );
+            return;
+        }
+    }
+    let _ = connector
+        .store
+        .lock()
+        .put_enrollment(&reader.pubkey, channel_id, "enrolled");
+    crate::log::log_info(
+        "buzz",
+        "serve.reader_enrolled",
+        &format!("reader is a member of {channel_id}"),
+    );
 }
 
 /// Register or refresh every hosted row: active people plus one row per
@@ -986,6 +1062,7 @@ impl MainLoop {
             text: message.text.clone(),
             thread: message.thread.clone(),
             exact_targets: exact_targets_of(&self.db, hcom_id),
+            delivered_to: message.delivered_to.clone().unwrap_or_default(),
         };
 
         let inputs = match self.route_inputs() {
