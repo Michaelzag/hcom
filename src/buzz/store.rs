@@ -159,7 +159,7 @@ pub struct SavedRoster {
 ///
 /// States: `pending` and `retry` (owed to the relay, the stored event resent
 /// as is), `posted` (acknowledged), `logged` (its hcom delivery status
-/// written) and `failed` (the relay will never take it).
+/// written), `deleted` (a prepared id was deleted) and `failed` (refused).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {
     /// The hcom DB epoch the row was prepared under. `prepare_outbox` stamps
@@ -294,6 +294,7 @@ impl Store {
                 slug TEXT NOT NULL,
                 position_created_at INTEGER,
                 position_id TEXT,
+                caught_up_since REAL,
                 parked_reason TEXT);
              CREATE TABLE IF NOT EXISTS people (
                 pubkey TEXT PRIMARY KEY,
@@ -316,6 +317,7 @@ impl Store {
                 kind INTEGER NOT NULL,
                 author TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
+                stored_at REAL NOT NULL,
                 root_id TEXT,
                 parent_id TEXT,
                 json TEXT NOT NULL,
@@ -341,6 +343,8 @@ impl Store {
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_at INTEGER NOT NULL DEFAULT 0,
                 first_at INTEGER NOT NULL,
+                source_created_at INTEGER NOT NULL,
+                revision_of TEXT,
                 sender TEXT NOT NULL,
                 thread TEXT NOT NULL,
                 root_id TEXT NOT NULL,
@@ -475,13 +479,37 @@ impl Store {
         events: &[Event],
         advance_until: Option<u64>,
     ) -> Result<usize> {
+        self.store_fetch(channel_id, events, advance_until, None)
+    }
+
+    /// Commit a completed catch-up's events, position and start time together.
+    /// Only revisions already stored before that walk can be settled when their
+    /// originals are absent. Live fetches never move this marker.
+    pub fn store_caught_up(
+        &self,
+        channel_id: &str,
+        events: &[Event],
+        advance_until: u64,
+        started_at: f64,
+    ) -> Result<usize> {
+        self.store_fetch(channel_id, events, Some(advance_until), Some(started_at))
+    }
+
+    fn store_fetch(
+        &self,
+        channel_id: &str,
+        events: &[Event],
+        advance_until: Option<u64>,
+        caught_up_since: Option<f64>,
+    ) -> Result<usize> {
         let tx = self.write_txn()?;
         let mut inserted = 0;
+        let stored_at = crate::shared::time::now_epoch_f64();
         {
             let mut insert = tx.prepare_cached(
                 "INSERT OR IGNORE INTO inbox
-                    (buzz_id, channel_id, kind, author, created_at, root_id, parent_id, json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    (buzz_id, channel_id, kind, author, created_at, root_id, parent_id, json, stored_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for event in events {
                 let (root_id, parent_id) = crate::buzz::route::thread_refs(event);
@@ -494,6 +522,7 @@ impl Store {
                     root_id,
                     parent_id,
                     serde_json::to_string(event).context("event serializes")?,
+                    stored_at,
                 ])?;
             }
         }
@@ -517,8 +546,27 @@ impl Store {
                 params![channel_id, newest.created_at as i64, newest.id],
             )?;
         }
+        if let Some(started_at) = caught_up_since {
+            tx.execute(
+                "UPDATE channels SET caught_up_since = ?2
+                 WHERE id = ?1 AND (caught_up_since IS NULL OR caught_up_since < ?2)",
+                params![channel_id, started_at],
+            )?;
+        }
         tx.commit()?;
         Ok(inserted)
+    }
+
+    /// Has this channel completed a walk begun after this item was stored?
+    /// The arrival time, not the signed event's created_at, fences the lookup.
+    pub fn caught_up_after(&self, channel_id: &str, buzz_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM channels c JOIN inbox i ON i.channel_id = c.id
+                WHERE c.id = ?1 AND i.buzz_id = ?2 AND c.caught_up_since > i.stored_at)",
+            params![channel_id, buzz_id],
+            |row| row.get(0),
+        )?)
     }
 
     /// The operator's `hcom buzz cursor set`: put a channel's position at
@@ -816,20 +864,28 @@ impl Store {
     /// after it replays the obligations.
     pub fn route_item(
         &self,
-        buzz_id: &str,
+        source: &Event,
         targets: &[String],
         owed: &OwedDelivery,
         now: i64,
     ) -> Result<()> {
         let tx = self.write_txn()?;
+        let revision_of = matches!(
+            source.kind,
+            crate::buzz::route::KIND_EDIT
+                | crate::buzz::route::KIND_DELETE
+                | crate::buzz::route::KIND_CHANNEL_DELETE
+        )
+        .then(|| crate::buzz::route::tag(source, "e"))
+        .flatten();
         for target in targets {
             tx.execute(
                 "INSERT OR IGNORE INTO obligations
                     (buzz_id, target, state, attempts, next_at, first_at,
-                     sender, thread, root_id, channel_id, text)
-                 VALUES (?1, ?2, 'pending', 0, 0, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     sender, thread, root_id, channel_id, text, source_created_at, revision_of)
+                 VALUES (?1, ?2, 'pending', 0, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
-                    buzz_id,
+                    source.id,
                     target,
                     now,
                     owed.sender,
@@ -837,6 +893,8 @@ impl Store {
                     owed.root_id,
                     owed.channel_id,
                     owed.text,
+                    source.created_at as i64,
+                    revision_of,
                 ],
             )?;
         }
@@ -848,7 +906,7 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE inbox SET state = 'routed', last_error = NULL WHERE buzz_id = ?1",
-            params![buzz_id],
+            params![source.id],
         )?;
         tx.commit()?;
         Ok(())
@@ -972,15 +1030,21 @@ impl Store {
 
     // ── obligations ──────────────────────────────────────────────────────
 
-    /// Obligations whose next step is due: deliveries to retry and notices to
-    /// post, oldest first.
+    /// Obligations whose next step is due, in source (created_at, id) order.
+    /// A revision waits for its original's obligation on this target to become
+    /// terminal, even when the revision is backdated or shares its second.
     pub fn due_obligations(&self, now: i64) -> Result<Vec<Obligation>> {
         let mut stmt = self.conn.prepare(
             "SELECT buzz_id, target, state, attempts, next_at, first_at,
                     sender, thread, root_id, channel_id, text, notice_json
              FROM obligations
              WHERE state IN ('pending', 'notice') AND next_at <= ?1
-             ORDER BY first_at, buzz_id, target",
+               AND NOT EXISTS (
+                   SELECT 1 FROM obligations original
+                   WHERE original.buzz_id = obligations.revision_of
+                     AND original.target = obligations.target
+                     AND original.state IN ('pending', 'notice'))
+             ORDER BY source_created_at, buzz_id, target",
         )?;
         let rows = stmt
             .query_map(params![now], |row| {
@@ -1285,13 +1349,39 @@ impl Store {
         Ok(ids)
     }
 
-    /// The relay acknowledged the post (or holds one of its prepared ids).
-    pub fn mark_outbox_posted(&self, row: &OutboxRow) -> Result<()> {
+    /// The relay acknowledged the post (or holds a prepared id). A by-id
+    /// recovery records the event actually found in the same durable ack.
+    pub fn mark_outbox_posted(&self, row: &OutboxRow, found: Option<&Event>) -> Result<()> {
+        let signed_json = found.map(serde_json::to_string).transpose()?;
         self.conn.execute(
-            "UPDATE outbox SET state = 'posted', attempts = attempts + 1, last_error = NULL
+            "UPDATE outbox SET state = 'posted', attempts = attempts + 1, last_error = NULL,
+                buzz_id = COALESCE(?4, buzz_id), signed_json = COALESCE(?5, signed_json)
              WHERE epoch = ?1 AND hcom_id = ?2 AND destination = ?3
                AND state IN ('pending', 'retry')",
-            params![row.epoch, row.hcom_id, row.destination],
+            params![
+                row.epoch,
+                row.hcom_id,
+                row.destination,
+                found.map(|event| event.id.as_str()),
+                signed_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A stored deletion references a prepared id: this row must never publish
+    /// again, and it must not log a posted status for the absent event.
+    pub fn mark_outbox_deleted(&self, row: &OutboxRow, tombstone_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbox SET state = 'deleted', attempts = attempts + 1, last_error = ?4
+             WHERE epoch = ?1 AND hcom_id = ?2 AND destination = ?3
+               AND state IN ('pending', 'retry')",
+            params![
+                row.epoch,
+                row.hcom_id,
+                row.destination,
+                format!("deleted by {tombstone_id}"),
+            ],
         )?;
         Ok(())
     }
@@ -1574,7 +1664,7 @@ fn enrolled_count_on(conn: &Connection) -> Result<i64> {
 fn unsent_outbox_on(conn: &Connection) -> Result<Vec<OutboxRow>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {OUTBOX_COLUMNS} FROM outbox
-         WHERE state NOT IN ('posted', 'logged')
+         WHERE state NOT IN ('posted', 'logged', 'deleted')
          ORDER BY created_at, hcom_id"
     ))?;
     let rows = stmt
@@ -1986,7 +2076,7 @@ mod tests {
             .store_fetched("chan-1", std::slice::from_ref(&item), None)
             .unwrap();
         store
-            .route_item(&item.id, &["luna".into(), "nina".into()], &owed(), 50)
+            .route_item(&item, &["luna".into(), "nina".into()], &owed(), 50)
             .unwrap();
         assert_eq!(
             store.inbox_state(&item.id).unwrap().as_deref(),
@@ -2048,7 +2138,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .route_item(&item.id, &["luna".into(), "nina".into()], &owed(), 50)
+                .route_item(&item, &["luna".into(), "nina".into()], &owed(), 50)
                 .is_err()
         );
         assert!(
@@ -2069,7 +2159,7 @@ mod tests {
             .store_fetched("chan-1", std::slice::from_ref(&item), None)
             .unwrap();
         store
-            .route_item(&item.id, &["luna".into()], &owed(), 0)
+            .route_item(&item, &["luna".into()], &owed(), 0)
             .unwrap();
         assert_eq!(store.due_obligations(100).unwrap().len(), 1);
 
@@ -2214,7 +2304,7 @@ mod tests {
         assert_eq!(store.due_outbox("chan-1", 100).unwrap().len(), 1);
         assert_eq!(store.due_outbox("chan-1", 1000).unwrap().len(), 2);
 
-        store.mark_outbox_posted(&first).unwrap();
+        store.mark_outbox_posted(&first, None).unwrap();
         store
             .fail_outbox(&stored_row(&store, 2, "chan-1"), "rejected: nope")
             .unwrap();
@@ -2275,7 +2365,7 @@ mod tests {
             "keyed under the epoch it was prepared in"
         );
 
-        store.mark_outbox_posted(&due[0]).unwrap();
+        store.mark_outbox_posted(&due[0], None).unwrap();
         assert!(store.unsent_outbox().unwrap().is_empty());
         assert_eq!(store.epoch(), "epoch-2");
     }
@@ -2296,7 +2386,7 @@ mod tests {
         let due = store.due_outbox("chan-1", 100).unwrap();
         assert_eq!(due.len(), 2);
         let old = due.iter().find(|row| row.buzz_id == "buzz-1").unwrap();
-        store.mark_outbox_posted(old).unwrap();
+        store.mark_outbox_posted(old, None).unwrap();
         let due = store.due_outbox("chan-1", 100).unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].buzz_id, "buzz-1-fresh");

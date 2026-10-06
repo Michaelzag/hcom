@@ -236,18 +236,25 @@ For each event E from author H, signature verified first:
   `buzz_<channel>_<root12>`. No `reply_to`: hcom event ids are per device and the
   relay doesn't translate them, so the thread name is the correlation that
   survives the hop.
-- **Edits (40003)** and **deletions (5, 9005)** of an event that was delivered →
+- **Edits (40003)** and **deletions (5, 9005)** of an event that was routed →
   a new message to the same targets in the same thread, prefixed `(edited) ` or
-  `(deleted)`. The original message is never rewritten. The Q&A layer doesn't
-  depend on these; it reads signed events itself.
-- **Unresolvable target** (agent session ended, or its device's mirror expired):
-  that target is parked per event and retried with backoff for 15 min. The
-  channel cursor moves on regardless, so one sleeping laptop can't stall a
-  channel. If it still can't be delivered, the connector says so in Buzz:
-  "luna isn't running — not delivered", as omp in that thread.
-- Delivery is at least once. The Buzz event id is recorded as delivered right
-  after the send; a crash between the two can repeat that one message, and
-  nothing is dropped.
+  `(deleted)`. The original message is never rewritten. A revision whose
+  original is pending waits for it to be routed. If the original is absent from
+  the inbox, the revision stays pending until its channel completes a catch-up
+  begun after the revision was stored; only then can an absent original settle
+  the revision without delivery. The Q&A layer reads signed events itself.
+- **Per-target obligations** commit together with the item's routed state,
+  before any send. Due obligations drain in source `(created_at, id)` order;
+  each revision also waits for its original's obligation on that target to
+  become terminal. An unresolvable or failing target retries with backoff for
+  15 min, independently of other targets and the channel's fetch position.
+  After that window, the connector stores and posts one notice in Buzz as omp
+  in that thread: "luna isn't running — not delivered", then closes the
+  obligation as expired.
+- Delivery is at least once per target. Each obligation is marked delivered
+  after its send; a crash between the two can repeat that target's message.
+  The inbox item is done only once all its obligations are terminal. Handling
+  failures leave the item pending with backoff, without a retry limit.
 
 ### hcom → Buzz (outbound)
 
@@ -299,9 +306,13 @@ Outbox rows commit before the hosted cursors advance; a crash between re-reads
 M and the inserts are no-ops. Then `POST /events` with a freshly signed NIP-98
 header and `x-auth-tag`, as the agent key. A resend after a lost ack is a relay
 duplicate (`duplicate:`), not a second post. A 401 is a bug, not a retry case
-(NIP-98 headers are never reused). An entry still unacknowledged as its
-`created_at` nears the 900 s admission window is looked up by id and re-signed
-only if the relay never stored it.
+(NIP-98 headers are never reused). Only a relay rejection of `created_at`
+triggers recovery: look up every id that row has prepared, retaining the id
+and signed event actually found for the ack and delivery status. If none is
+found, query kinds `{5, 9005}` by `#e` over all prepared ids, without `#h`.
+A deletion settles the row as deleted, never re-posted. Re-sign only when both
+lookups succeed and find neither a prepared event nor a deletion; either lookup
+failing keeps the stored event for a later retry.
 
 ### Popup enrollment
 
@@ -409,13 +420,24 @@ connector ports its semantics; it doesn't invent new ones.
    backwards and never overwrites a newer value. Crash before commit: the walk
    repeats and the inbox dedupes. Nothing is ever dropped because the position
    moved; the position only says "fetched", never "handled".
+   Each inbox item also records its arrival time. A completed catch-up commits
+   its start time as the channel's durable caught-up marker in that same
+   transaction; live ingestion never changes it, and a failed walk changes
+   neither the marker nor the inbox.
 3. *Roster first.* A channel's newest 39002 roster (saved in `state.db`) and the
    configured people are applied before any message from that channel is
    handled, at startup and in every pass. A message whose sender isn't known yet
    stays pending instead of being marked done.
+   Edits (40003) and deletions (5, 9005) also wait for their original. An original
+   still pending keeps the revision pending. An original absent from the inbox
+   keeps the revision pending until the channel has completed a catch-up begun
+   after the revision's arrival; if it is still absent then, settle the revision
+   without delivery. A previous catch-up, another channel's catch-up, or an
+   ancestry lookup is not proof that this original has been handled.
 4. *Route.* Handling an inbox item computes its targets and, in one
    transaction, writes one obligation row per target
-   `(buzz_id, target, state, attempts, next_at)` and marks the item routed.
+   `(buzz_id, target, state, attempts, next_at, source_created_at, revision_of)`
+   and marks the item routed.
    Obligations exist before anything is sent. Crash after: the item is routed,
    obligations replay. Crash before: the item is re-routed.
 5. *Deliver.* Each obligation is delivered independently (hcom send as the
@@ -425,6 +447,10 @@ connector ports its semantics; it doesn't invent new ones.
    obligation closes as expired. An item is done only when every obligation is
    terminal. Delivery is at least once per target: a crash between the send
    and marking it done can repeat that one target's message.
+   Due obligations drain in source `(created_at, id)` order, not routing time.
+   A revision's obligation waits for the original's obligation on that same
+   target to become terminal, so it cannot precede its original even when it
+   is backdated or shares the same second. This never holds another target.
 6. *Handling failures* (ancestor lookup down, DB error) leave the item pending
    with backoff. There is no retry limit that drops work.
 
@@ -445,10 +471,14 @@ with the same compare-and-set; `--force` is the only way backwards.
    event with backoff.
 3. *Re-sign only when proven absent.* If the relay rejects the event's
    `created_at` as outside its window, the connector first queries by every id
-   this row has ever prepared. Found means acked. Not found means re-sign with a
-   new `created_at`, append the new id to the row's id list, publish. Lookup
-   failing keeps the original and retries later. This is the bridge's
-   prepare→publish rule.
+   this row has ever prepared. Found means acked; the ack atomically retains the
+   found id and signed event, so the delivery status names what the relay holds.
+   An empty by-id lookup is not enough: the relay hides soft-deleted originals.
+   Query `{"kinds":[5,9005],"#e":[all prepared ids]}` without `#h`; a signed
+   tombstone referencing any prepared id settles the row as deleted, never
+   re-posted. Only two successful empty lookups permit re-signing with a new
+   `created_at`, appending the new id to the row's id list, and publishing.
+   Either lookup failing keeps the stored event and retries later.
 4. *Ack.* Mark the row posted, then log the hcom delivery status for its hosted
    recipients.
 

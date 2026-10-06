@@ -88,6 +88,8 @@ pub struct Switches {
     /// Answer `/query` with this status (0: answer normally), so a lookup
     /// can fail while posting works.
     pub query_status: AtomicU16,
+    /// Fail the deletion lookup after an empty by-id lookup.
+    pub tombstone_query_status: AtomicU16,
 }
 
 struct Subscription {
@@ -586,6 +588,18 @@ fn query_events(events: &[Event], filters: &[Value], max_page: usize) -> Vec<Eve
     for filter in filters {
         let mut matches: Vec<_> = events
             .iter()
+            // relay-v0.2.1 buzz-db/event.rs:393 hides soft-deleted sources,
+            // but not the stored kind 5/9005 deletion that references them.
+            .filter(|event| {
+                !events.iter().any(|deletion| {
+                    matches!(deletion.kind, 5 | 9005)
+                        && verify(deletion)
+                        && deletion.tags.iter().any(|tag| {
+                            tag.first().is_some_and(|key| key == "e")
+                                && tag.get(1) == Some(&event.id)
+                        })
+                })
+            })
             .filter(|event| matches_filter(event, filter, events))
             .collect();
         matches.sort_by(|a, b| {
@@ -780,6 +794,21 @@ fn handle_http(stream: TcpStream, url: &str, state: &Mutex<State>, switches: &Sw
                 );
                 return;
             };
+            if filters
+                .iter()
+                .any(|filter| filter.get("#e").is_some() && filter["kinds"] == json!([5, 9005]))
+            {
+                let status = switches.tombstone_query_status.load(Ordering::SeqCst);
+                if status != 0 {
+                    respond(
+                        &mut stream,
+                        status,
+                        json!({"error":"error: tombstone query unavailable"}),
+                        switches,
+                    );
+                    return;
+                }
+            }
             // relay-v0.2.1 api/bridge.rs: `before_id` is a 64-hex id and only
             // valid together with `until`.
             for filter in filters {

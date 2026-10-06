@@ -665,6 +665,7 @@ fn run_session(session: &mut WsSession, handles: &ReaderHandles) -> bool {
 /// slack to now, plus its newest roster, stored in one transaction that moves
 /// the position. An error stores nothing and moves nothing.
 fn catch_up(handles: &ReaderHandles, channel: &ChannelRow) -> Result<usize> {
+    let started_at = crate::shared::time::now_epoch_f64();
     let position = handles
         .store
         .lock()
@@ -678,7 +679,7 @@ fn catch_up(handles: &ReaderHandles, channel: &ChannelRow) -> Result<usize> {
     handles
         .store
         .lock()
-        .store_fetched(&channel.id, &events, Some(nostr::now()))
+        .store_caught_up(&channel.id, &events, nostr::now(), started_at)
 }
 
 /// Every event in one channel from `since` on, or an error: never a partial
@@ -1697,7 +1698,7 @@ impl MainLoop {
                 .http
                 .post_event(&event, &identity.key, Some(&tag))
             {
-                Ok(()) => self.mark_posted(&row),
+                Ok(()) => self.mark_posted(&row, None),
                 Err(PublishError::RateLimited { retry_after }) => {
                     // Per-key: this signer's every write waits, not just this row.
                     self.hold_key(&identity.pubkey, retry_after);
@@ -1741,13 +1742,18 @@ impl MainLoop {
     /// The relay holds the post: mark the row posted, then log the hcom
     /// delivery status (`log_posted`, which also finishes any row a crash
     /// left posted but unlogged).
-    fn mark_posted(&mut self, row: &OutboxRow) {
+    fn mark_posted(&mut self, row: &OutboxRow, found: Option<&Event>) {
         crate::log::log_info(
             "buzz",
             "serve.posted",
-            &format!("{} {} -> {}", row.signer_name, row.buzz_id, row.destination),
+            &format!(
+                "{} {} -> {}",
+                row.signer_name,
+                found.map_or(row.buzz_id.as_str(), |event| event.id.as_str()),
+                row.destination
+            ),
         );
-        if let Err(error) = self.connector.store.lock().mark_outbox_posted(row) {
+        if let Err(error) = self.connector.store.lock().mark_outbox_posted(row, found) {
             // Not recorded: the next pass posts the same event again, and the
             // relay answers `duplicate:`.
             crate::log::log_warn("buzz", "serve.posted_unrecorded", &error.to_string());
@@ -1791,11 +1797,10 @@ impl MainLoop {
         }
     }
 
-    /// A post the relay refused as outside its admission window. Re-sign only
-    /// once the relay is proven not to hold any id this row ever prepared: a
-    /// lookup that finds one marks the row posted (the ack was lost, the post
-    /// was not), and a lookup that fails keeps the stored event for a later
-    /// try. Re-signing on anything less could post the message twice.
+    /// A post refused as outside the admission window. First look up every
+    /// prepared id; a found event is the ack. An empty lookup also needs a
+    /// deletion lookup, since /query hides soft-deleted events. Only absence
+    /// from both permits re-signing; a failed lookup keeps the prepared event.
     fn recover_rejected(&mut self, row: &OutboxRow, identity: &AgentIdentity) {
         let now = crate::shared::time::now_epoch_i64();
         let ids = match self.connector.store.lock().prepared_ids(row) {
@@ -1817,33 +1822,81 @@ impl MainLoop {
         let auth = identity.auth_tag(&self.connector.owner);
         let tag = serde_json::to_string(&auth).unwrap_or_default();
         let filter = json!({ "ids": ids, "kinds": store::CHANNEL_KINDS });
-        match self
+        let events = match self
             .connector
             .http
             .query(&filter, &identity.key, Some(&tag))
         {
-            Ok(events)
-                if events
-                    .iter()
-                    .any(|event| ids.contains(&event.id) && nostr::verify(event)) =>
-            {
-                crate::log::log_info(
-                    "buzz",
-                    "serve.rejected_but_present",
-                    &format!(
-                        "{} -> {}: the relay holds it",
-                        row.signer_name, row.destination
-                    ),
-                );
-                self.mark_posted(row);
-            }
-            Ok(_) => self.resign_row(row, identity),
+            Ok(events) => events,
             Err(error) => {
                 if let PublishError::RateLimited { retry_after } = &error {
                     self.hold_key(&identity.pubkey, *retry_after);
                 }
                 let next = now + post_retry_delay(row.attempts).as_secs() as i64;
                 self.retry_row(row, next, &format!("lookup before re-sign failed: {error}"));
+                return;
+            }
+        };
+        if let Some(found) = events
+            .iter()
+            .find(|event| ids.contains(&event.id) && nostr::verify(event))
+        {
+            self.mark_posted(row, Some(found));
+            return;
+        }
+
+        if let Err(wait) = self.take_http_token(&identity.pubkey) {
+            self.retry_row(
+                row,
+                now + wait.as_secs().max(1) as i64,
+                "HTTP token bucket exhausted before deletion lookup",
+            );
+            return;
+        }
+        // No #h: standard NIP-09 tombstones need not carry a channel tag.
+        let filter = json!({ "kinds": [5, 9005], "#e": ids });
+        match self
+            .connector
+            .http
+            .query(&filter, &identity.key, Some(&tag))
+        {
+            Ok(events) => {
+                if let Some(tombstone) = events.iter().find(|event| {
+                    matches!(event.kind, route::KIND_DELETE | route::KIND_CHANNEL_DELETE)
+                        && nostr::verify(event)
+                        && event.tags.iter().any(|tag| {
+                            tag.first().is_some_and(|key| key == "e")
+                                && tag.get(1).is_some_and(|id| ids.contains(id))
+                        })
+                }) {
+                    let recorded = self
+                        .connector
+                        .store
+                        .lock()
+                        .mark_outbox_deleted(row, &tombstone.id);
+                    match recorded {
+                        Ok(()) => crate::log::log_info(
+                            "buzz",
+                            "serve.rejected_but_deleted",
+                            &format!(
+                                "{} -> {}: deletion {} references a prepared id",
+                                row.signer_name, row.destination, tombstone.id
+                            ),
+                        ),
+                        Err(error) => {
+                            self.retry_row(row, now + 1, &format!("deletion unrecorded: {error}"))
+                        }
+                    }
+                } else {
+                    self.resign_row(row, identity);
+                }
+            }
+            Err(error) => {
+                if let PublishError::RateLimited { retry_after } = &error {
+                    self.hold_key(&identity.pubkey, *retry_after);
+                }
+                let next = now + post_retry_delay(row.attempts).as_secs() as i64;
+                self.retry_row(row, next, &format!("deletion lookup failed: {error}"));
             }
         }
     }
@@ -2419,11 +2472,23 @@ impl MainLoop {
         };
         let (original, original_state) = if revision {
             let store = self.connector.store.lock();
+            let state = store.inbox_state(&subject)?;
+            if state.is_none() {
+                if !store.caught_up_after(&channel.id, &event.id)? {
+                    return Ok(Handled::Wait("its original is not fetched yet".into()));
+                }
+                crate::log::log_info(
+                    "buzz",
+                    "serve.inbound_skipped",
+                    &format!("{}: original absent after channel catch-up", event.id),
+                );
+                return Ok(Handled::Done);
+            }
             (
                 store
                     .cached_event(&subject)?
                     .and_then(|cached| serde_json::from_str::<Event>(&cached.json).ok()),
-                store.inbox_state(&subject)?,
+                state,
             )
         } else {
             (None, None)
@@ -2465,7 +2530,7 @@ impl MainLoop {
                     text: delivery.text,
                 };
                 self.connector.store.lock().route_item(
-                    &event.id,
+                    &event,
                     &delivery.targets,
                     &owed,
                     crate::shared::time::now_epoch_i64(),
@@ -3700,6 +3765,173 @@ mod tests {
 
     #[test]
     #[serial]
+    fn revision_round_recovery_logs_the_id_the_relay_actually_holds() {
+        let mut harness = harness("mbai");
+        enrolled_home(&mut harness);
+        harness.set_http_status(503);
+        harness.send("luna", "lost ack", &["michael"], None);
+        harness.step();
+        harness.set_http_status(0);
+        let found = age_unposted(&harness, 1100);
+        harness.relay.seed(found.clone());
+        let absent = age_unposted(&harness, 1000);
+        // Stop after the durable ack, as a crash before the hcom status log
+        // would. Recovery must remember which prepared event was found.
+        harness
+            .main
+            .db
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER no_status BEFORE INSERT ON events
+                 WHEN NEW.type = 'status' AND json_extract(NEW.data, '$.context') = 'deliver:luna'
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        harness.step();
+        let posted = harness.store().posted_unlogged().unwrap().remove(0);
+        assert_eq!(posted.buzz_id, found.id, "the found id survives the crash");
+        assert_eq!(
+            serde_json::from_str::<Event>(&posted.signed_json).unwrap(),
+            found,
+            "the stored signature belongs to the found id"
+        );
+        harness
+            .main
+            .db
+            .conn()
+            .execute_batch("DROP TRIGGER no_status")
+            .unwrap();
+        harness.main = MainLoop::for_test(
+            harness.main.connector,
+            harness.main.db,
+            harness.main.epoch.clone(),
+        );
+        harness.step();
+        let mut stmt = harness
+            .main
+            .db
+            .conn()
+            .prepare(
+                "SELECT json_extract(data, '$.detail') FROM events
+                 WHERE type = 'status' AND instance = 'michael'
+                   AND json_extract(data, '$.context') = 'deliver:luna'",
+            )
+            .unwrap();
+        let details = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            details,
+            vec![format!(
+                "hcom #{} posted to Buzz {} as {}",
+                posted.hcom_id, CHANNEL_ID, found.id
+            )]
+        );
+        assert_ne!(found.id, absent.id);
+        assert_eq!(posts_saying(&harness, "lost ack"), vec![found]);
+    }
+
+    fn deleted_rejection(kind: u16) {
+        let mut harness = harness("mbai");
+        enrolled_home(&mut harness);
+        harness.set_http_status(503);
+        harness.send("luna", "removed", &["michael"], None);
+        harness.step();
+        harness.set_http_status(0);
+        let deleted = age_unposted(&harness, 1100);
+        let current = age_unposted(&harness, 1000);
+        let row = harness.store().unsent_outbox().unwrap().remove(0);
+        let prepared = harness.store().prepared_ids(&row).unwrap();
+        // Only the tombstone is queryable. It targets an earlier prepared id
+        // and has no h tag: a channel-scoped or current-id-only lookup misses it.
+        harness.relay.seed(sign(
+            UnsignedEvent {
+                created_at: nostr::now(),
+                kind,
+                tags: vec![vec!["e".into(), deleted.id]],
+                content: String::new(),
+            },
+            &owner_key(),
+        ));
+        harness.step();
+        assert_eq!(
+            harness.store().outbox_counts().unwrap(),
+            vec![("deleted".to_string(), 1)],
+            "a deleted post is settled, not re-signed"
+        );
+        assert_eq!(harness.store().prepared_ids(&row).unwrap(), prepared);
+        harness.main = MainLoop::for_test(
+            harness.main.connector,
+            harness.main.db,
+            harness.main.epoch.clone(),
+        );
+        harness.step();
+        assert!(harness.store().unsent_outbox().unwrap().is_empty());
+        assert!(posts_saying(&harness, "removed").is_empty());
+        assert!(prepared.contains(&current.id));
+    }
+
+    #[test]
+    #[serial]
+    fn revision_round_a_nip09_tombstone_prevents_reposting() {
+        deleted_rejection(route::KIND_DELETE);
+    }
+
+    #[test]
+    #[serial]
+    fn revision_round_a_nip29_tombstone_prevents_reposting() {
+        deleted_rejection(route::KIND_CHANNEL_DELETE);
+    }
+
+    #[test]
+    #[serial]
+    fn revision_round_a_failed_tombstone_lookup_keeps_the_prepared_event() {
+        let mut harness = harness("mbai");
+        enrolled_home(&mut harness);
+        harness.set_http_status(503);
+        harness.send("luna", "uncertain deletion", &["michael"], None);
+        harness.step();
+        harness.set_http_status(0);
+        let aged = age_unposted(&harness, 1000);
+        harness
+            .relay
+            .switches
+            .tombstone_query_status
+            .store(503, Ordering::SeqCst);
+        harness.step();
+        let rows = harness.store().unsent_outbox().unwrap();
+        assert_eq!(rows[0].buzz_id, aged.id, "failed lookup proves nothing");
+        assert_eq!(
+            serde_json::from_str::<Event>(&rows[0].signed_json).unwrap(),
+            aged
+        );
+        assert!(posts_saying(&harness, "uncertain deletion").is_empty());
+        harness
+            .relay
+            .switches
+            .tombstone_query_status
+            .store(0, Ordering::SeqCst);
+        // An unrelated tombstone isn't evidence that this post was deleted.
+        harness.relay.seed(sign(
+            UnsignedEvent {
+                created_at: nostr::now(),
+                kind: route::KIND_DELETE,
+                tags: vec![vec!["e".into(), "f".repeat(64)]],
+                content: String::new(),
+            },
+            &owner_key(),
+        ));
+        harness.store().make_outbox_due().unwrap();
+        harness.step_until(|h| !posts_saying(h, "uncertain deletion").is_empty());
+        let posts = posts_saying(&harness, "uncertain deletion");
+        assert_eq!(posts.len(), 1);
+        assert!(posts[0].created_at > aged.created_at);
+    }
+
+    #[test]
+    #[serial]
     fn a_failed_lookup_keeps_the_original_and_retries() {
         // A refused post whose lookup fails proves nothing about whether the
         // relay holds it: the stored event stays until a lookup answers.
@@ -3793,7 +4025,7 @@ mod tests {
         harness.send("luna", "second", &["michael"], None);
         harness.step();
         let row = harness.store().unsent_outbox().unwrap().remove(0);
-        harness.store().mark_outbox_posted(&row).unwrap();
+        harness.store().mark_outbox_posted(&row, None).unwrap();
         harness.set_http_status(0);
         harness.main = MainLoop::for_test(
             harness.main.connector,
@@ -4490,6 +4722,270 @@ mod tests {
                 .and_then(|m| m.thread.clone()),
             edit_notice.thread,
             "the edit rides the same Buzz thread"
+        );
+    }
+
+    fn revision_before_original(kind: u16) {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        let original = sign(
+            UnsignedEvent {
+                created_at: nostr::now() - 600,
+                kind: route::KIND_MESSAGE,
+                tags: vec![
+                    vec!["h".into(), CHANNEL_ID.into()],
+                    vec!["p".into(), public_hex(&agent_key())],
+                ],
+                content: "original from history".into(),
+            },
+            &human_key(),
+        );
+        let revision = sign(
+            UnsignedEvent {
+                created_at: nostr::now() - 30,
+                kind,
+                tags: vec![
+                    vec!["h".into(), CHANNEL_ID.into()],
+                    vec!["e".into(), original.id.clone()],
+                    vec!["p".into(), public_hex(&agent_key())],
+                ],
+                content: "revised from history".into(),
+            },
+            &human_key(),
+        );
+        // The bounded WS batch contains the revision; its older original is
+        // queryable (including by ancestry lookup) but not in the inbox yet.
+        harness.relay.seed(original.clone());
+        let handles = reader_handles(&harness.main.connector);
+        let channel = handles.channels[0].clone();
+        ingest_live(&handles, CHANNEL_ID, revision.clone(), false).unwrap();
+        harness.step();
+        assert_eq!(
+            harness.inbox_state(&revision.id).as_deref(),
+            Some("pending")
+        );
+        assert!(harness.unread("luna").is_empty());
+        catch_up(&handles, &channel).unwrap();
+        harness.store().make_inbox_due().unwrap();
+        harness.step();
+        harness.step();
+        let messages = harness.unread("luna");
+        assert_eq!(messages.len(), 2, "original, then its revision");
+        assert_eq!(messages[0].text, original.content);
+        let prefix = if kind == route::KIND_EDIT {
+            "(edited) "
+        } else {
+            "(deleted)"
+        };
+        assert!(messages[1].text.starts_with(prefix), "{messages:?}");
+        assert_eq!(messages[0].thread, messages[1].thread);
+        assert_eq!(harness.inbox_state(&revision.id).as_deref(), Some("done"));
+    }
+
+    #[test]
+    #[serial]
+    fn revision_round_an_edit_waits_for_its_original_to_be_fetched() {
+        revision_before_original(route::KIND_EDIT);
+    }
+
+    #[test]
+    #[serial]
+    fn revision_round_a_nip09_deletion_waits_for_its_original_to_be_fetched() {
+        revision_before_original(route::KIND_DELETE);
+    }
+
+    #[test]
+    #[serial]
+    fn revision_round_a_nip29_deletion_waits_for_its_original_to_be_fetched() {
+        revision_before_original(route::KIND_CHANNEL_DELETE);
+    }
+
+    #[test]
+    #[serial]
+    fn revision_round_an_absent_original_waits_for_a_new_channel_catch_up() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        harness.add_channel(OTHER_CHANNEL_ID, "other");
+        harness.store().upsert_channel(CHANNEL_ID, "infra").unwrap();
+        harness
+            .store()
+            .upsert_channel(OTHER_CHANNEL_ID, "other")
+            .unwrap();
+        let handles = reader_handles(&harness.main.connector);
+        let channel = handles
+            .channels
+            .iter()
+            .find(|c| c.id == CHANNEL_ID)
+            .unwrap();
+        let other = handles
+            .channels
+            .iter()
+            .find(|c| c.id == OTHER_CHANNEL_ID)
+            .unwrap();
+        // An earlier completed fetch, even in the same second, cannot settle
+        // a newly stored revision. created_at is old; arrival time matters.
+        catch_up(&handles, channel).unwrap();
+        let revision = sign(
+            UnsignedEvent {
+                created_at: nostr::now() - 600,
+                kind: route::KIND_EDIT,
+                tags: vec![
+                    vec!["h".into(), CHANNEL_ID.into()],
+                    vec!["e".into(), "f".repeat(64)],
+                    vec!["p".into(), public_hex(&agent_key())],
+                ],
+                content: "outside the fetched history".into(),
+            },
+            &human_key(),
+        );
+        harness.offer(revision.clone());
+        harness.step();
+        assert_eq!(
+            harness.inbox_state(&revision.id).as_deref(),
+            Some("pending")
+        );
+        catch_up(&handles, other).unwrap();
+        harness.store().make_inbox_due().unwrap();
+        harness.step();
+        assert_eq!(
+            harness.inbox_state(&revision.id).as_deref(),
+            Some("pending")
+        );
+        harness
+            .relay
+            .switches
+            .query_status
+            .store(503, Ordering::SeqCst);
+        assert!(catch_up(&handles, channel).is_err());
+        harness.store().make_inbox_due().unwrap();
+        harness.step();
+        assert_eq!(
+            harness.inbox_state(&revision.id).as_deref(),
+            Some("pending")
+        );
+        harness
+            .relay
+            .switches
+            .query_status
+            .store(0, Ordering::SeqCst);
+        catch_up(&handles, channel).unwrap();
+        harness.main = MainLoop::for_test(
+            harness.main.connector,
+            harness.main.db,
+            harness.main.epoch.clone(),
+        );
+        harness.store().make_inbox_due().unwrap();
+        harness.step();
+        assert_eq!(harness.inbox_state(&revision.id).as_deref(), Some("done"));
+        assert!(harness.unread("luna").is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn revision_round_historical_obligations_deliver_in_source_order() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        let at = nostr::now() - 600;
+        let make = |created_at, content| {
+            sign(
+                UnsignedEvent {
+                    created_at,
+                    kind: route::KIND_MESSAGE,
+                    tags: vec![
+                        vec!["h".into(), CHANNEL_ID.into()],
+                        vec!["p".into(), public_hex(&agent_key())],
+                    ],
+                    content,
+                },
+                &human_key(),
+            )
+        };
+        let first = make(at, "older message".into());
+        let second = (0..1000)
+            .map(|i| make(at + 100, format!("newer message {i}")))
+            .find(|event| event.id < first.id)
+            .expect("a newer event whose id sorts before the older event");
+        harness.offer(first.clone());
+        harness.offer(second.clone());
+        let channel = reader_handles(&harness.main.connector).channels.remove(0);
+        let now = crate::shared::time::now_epoch_i64();
+        let due = harness.store().due_inbox(CHANNEL_ID, now).unwrap();
+        for item in due {
+            harness.main.handle_item(&channel, item);
+        }
+        // Pin both routing times to the same second: timestamp/ID source
+        // order must win over the obligation's retry/expiry bookkeeping.
+        harness.store().age_obligation(&first.id, now).unwrap();
+        harness.store().age_obligation(&second.id, now).unwrap();
+        harness.main.deliver_obligations();
+        assert_eq!(
+            harness
+                .unread("luna")
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.content.as_str(), second.content.as_str()]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn revision_round_a_backdated_revision_cannot_overtake_its_original() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        let original = message(
+            &human_key(),
+            CHANNEL_ID,
+            "original",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        let revision = sign(
+            UnsignedEvent {
+                created_at: original.created_at - 1,
+                kind: route::KIND_EDIT,
+                tags: vec![
+                    vec!["h".into(), CHANNEL_ID.into()],
+                    vec!["e".into(), original.id.clone()],
+                    vec!["p".into(), public_hex(&agent_key())],
+                ],
+                content: "backdated edit".into(),
+            },
+            &human_key(),
+        );
+        harness.offer(original.clone());
+        harness.offer(revision.clone());
+        let channel = reader_handles(&harness.main.connector).channels.remove(0);
+        // The original is routed but not sent when the revision is routed.
+        for event in [&original, &revision] {
+            let cached = harness.store().cached_event(&event.id).unwrap().unwrap();
+            harness.main.handle_item(
+                &channel,
+                InboxItem {
+                    event: cached,
+                    attempts: 0,
+                },
+            );
+        }
+        let now = crate::shared::time::now_epoch_i64();
+        // Make the revision older in both bookkeeping and source order.
+        harness.store().age_obligation(&original.id, now).unwrap();
+        harness
+            .store()
+            .age_obligation(&revision.id, now - 1)
+            .unwrap();
+        harness.main.deliver_obligations();
+        harness.main.deliver_obligations();
+        assert_eq!(
+            harness
+                .unread("luna")
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["original", "(edited) backdated edit"]
         );
     }
 
