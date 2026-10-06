@@ -351,17 +351,27 @@ fn is_buzz_channel(inst: &InstanceInfo) -> bool {
             .starts_with(BUZZ_CHANNEL_PREFIX)
 }
 
+/// Base name of a row: the part before a `:DEVICE` suffix, or the whole name.
+fn row_base(name: &str) -> &str {
+    split_device_suffix(name).map_or(name, |(base, _)| base)
+}
+
 /// `base:suffix` on a hosted Buzz person: Michael in the `#infra` channel.
 ///
 /// Resolves to BOTH ordinary rows — the person and the channel — so both land
 /// in `mentions` / `exact_targets` as plain targets and nothing new travels on
 /// the wire. On another device the same input resolves to the mirror pair
-/// (`michael:MBAI`, `ch_infra:MBAI`), because each side goes through ordinary
-/// bare-name resolution and mirrors carry the origin's `tool` string.
+/// (`michael:MBAI`, `ch_infra:MBAI`): the person goes through ordinary
+/// bare-name resolution, mirrors carry the origin's `tool` string, and the
+/// channel is the `ch_<suffix>` row on the person's own device.
+///
+/// The person may also be named exactly, device suffix included
+/// (`michael:MBAI:infra`). That is the form to use when the bare name is
+/// ambiguous or lives only on a suffix-only device.
 ///
 /// `None` = not this shape, so the caller keeps today's behaviour. `Some(Err)`
-/// = the base IS a buzz person but the `ch_<suffix>` side is not addressable,
-/// which is a mistake worth naming rather than a prefix match to hunt for.
+/// = a buzz person is behind the base but the address can't complete, which is
+/// worth naming rather than reporting as an unknown agent.
 fn buzz_person_in_channel(
     target: &str,
     instances: &[InstanceInfo],
@@ -372,42 +382,88 @@ fn buzz_person_in_channel(
         return None;
     }
 
-    let person_name = match bare_resolution(base, instances, fleet) {
-        Some(Ok(exact)) => exact,
-        // A refusal (ambiguous base, or one live only on suffix-only devices)
-        // proves nothing about the buzz shape: leave those targets to today's
-        // branches, which own those messages.
-        Some(Err(_)) | None => return None,
+    let person = if base.contains(':') {
+        // Exact person form: a device-qualified name bypasses the fleet
+        // resolver, exactly as it does for a plain target.
+        row_named(instances, base)?
+    } else {
+        match bare_resolution(base, instances, fleet) {
+            Some(Ok(exact)) => row_named(instances, &exact)?,
+            Some(Err(refusal)) => {
+                return buzz_person_refusal(target, base, suffix, &refusal, instances);
+            }
+            None => return None,
+        }
     };
-    let person = row_named(instances, &person_name)?;
     // A non-buzz base keeps today's behaviour exactly.
     if !is_buzz_person(person) {
         return None;
     }
 
-    let channel_target = format!("{BUZZ_CHANNEL_PREFIX}{suffix}");
-    let channel_name = match bare_resolution(&channel_target, instances, fleet) {
-        Some(Ok(exact)) => exact,
-        Some(Err(msg)) => return Some(Err(msg)),
-        None => {
-            return Some(Err(format!(
-                "@{target}: @{person_name} is a buzz person, but no live channel row {} to address them in",
-                channel_target
-            )));
-        }
-    };
-    let channel = row_named(instances, &channel_name)?;
-    // The channel has to be a hosted Buzz channel on the person's own device:
-    // a `ch_` row elsewhere, or a non-buzz row of that name, is not the
-    // channel this address means.
-    if !is_buzz_channel(channel) || channel.origin != person.origin {
+    // The channel is the `ch_<suffix>` row on the person's own device: picked
+    // by origin, not by bare-name resolution, because the person already
+    // fixed the device (and a suffix-only device would refuse a bare lookup).
+    let channel_base = format!("{BUZZ_CHANNEL_PREFIX}{suffix}");
+    let named_channel: Vec<&InstanceInfo> = instances
+        .iter()
+        .filter(|inst| row_base(&inst.name).eq_ignore_ascii_case(&channel_base))
+        .collect();
+    if named_channel.is_empty() {
         return Some(Err(format!(
-            "@{target}: {} is not a live buzz channel on @{person_name}'s device",
-            channel_name
+            "@{target}: @{} is a buzz person, but no live channel row {channel_base} to address them in",
+            person.name
         )));
     }
+    match named_channel
+        .iter()
+        .find(|channel| is_buzz_channel(channel) && channel.origin == person.origin)
+    {
+        Some(channel) => Some(Ok(vec![person.name.clone(), channel.name.clone()])),
+        None => Some(Err(format!(
+            "@{target}: {} is not a live buzz channel on @{}'s device",
+            named_channel
+                .iter()
+                .map(|channel| channel.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            person.name
+        ))),
+    }
+}
 
-    Some(Ok(vec![person_name, channel_name]))
+/// The base's bare resolution refused: it is ambiguous, or live only on a
+/// suffix-only device. When a buzz person is behind that refusal the sender
+/// meant the channel form, so surface the refusal with the exact
+/// `person:DEVICE:channel` forms that work, instead of letting the target fall
+/// through to "non-existent agent". No buzz person behind it: `None`, today's
+/// behaviour.
+fn buzz_person_refusal(
+    target: &str,
+    base: &str,
+    suffix: &str,
+    refusal: &str,
+    instances: &[InstanceInfo],
+) -> Option<Result<Vec<String>, String>> {
+    let people: Vec<&InstanceInfo> = instances
+        .iter()
+        .filter(|inst| is_buzz_person(inst) && row_base(&inst.name).eq_ignore_ascii_case(base))
+        .collect();
+    if people.is_empty() {
+        return None;
+    }
+    let exact_forms: Vec<String> = people
+        .iter()
+        .filter(|person| person.name.contains(':'))
+        .map(|person| format!("@{}:{suffix}", person.name))
+        .collect();
+    let mut msg = format!("@{target}: {refusal}");
+    if !exact_forms.is_empty() {
+        msg.push_str(&format!(
+            "\nFor the channel form, name the person exactly: {}",
+            exact_forms.join(", ")
+        ));
+    }
+    Some(Err(msg))
 }
 
 /// Match a target against instance names.
@@ -420,9 +476,10 @@ fn buzz_person_in_channel(
 /// 2. An explicit device-qualified name bypasses the fleet resolver.
 /// 3. Legacy exact, tag-group and unique remote-prefix matching when the
 ///    fleet has no candidates for the bare input.
-/// 4. A `base:suffix` whose suffix is not a device id and whose base is a
-///    hosted Buzz person expands to that person and the `ch_<suffix>` channel
-///    row on the same device.
+/// 4. A colon target nothing above matched — no exact name, no unique
+///    device prefix — whose suffix is not a device id and whose base is a
+///    hosted Buzz person expands to that person and the `ch_<suffix>`
+///    channel row on the same device.
 ///
 /// Special case: bigboss:SUFFIX resolves to bigboss (virtual identity, device-agnostic).
 fn match_target(
@@ -476,13 +533,6 @@ fn match_target(
     }
 
     if target.contains(':') {
-        // `person:channel` on a hosted Buzz row. Ahead of the prefix branch
-        // below: a lowercase colon target has no other meaning today, so this
-        // takes nothing away, and it must beat prefix matching or `michael:infra`
-        // would be hunted as a device prefix.
-        if let Some(expansion) = buzz_person_in_channel(target, instances, fleet) {
-            return expansion;
-        }
         let target_lower = target.to_ascii_lowercase();
         let mut candidates: Vec<(String, String)> = instances
             .iter()
@@ -508,6 +558,14 @@ fn match_target(
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+        }
+        // `person:channel` on a hosted Buzz row. Last, and only when nothing
+        // prefix-matched: a lowercase colon target already prefix-matches
+        // device suffixes case-insensitively (`michael:mb` -> `michael:MBAI`),
+        // so every target that resolved before keeps resolving and a device
+        // always wins over a channel slug.
+        if let Some(expansion) = buzz_person_in_channel(target, instances, fleet) {
+            return expansion;
         }
     }
 
@@ -1604,6 +1662,76 @@ mod tests {
             match_target("ch_infra", &instances, &fleet()).unwrap(),
             vec!["ch_infra".to_string()]
         );
+    }
+
+    #[test]
+    fn a_unique_device_prefix_on_a_buzz_person_still_resolves_to_the_device() {
+        // Colon targets have always prefix-matched device suffixes,
+        // case-insensitively. The channel expansion must not take that away:
+        // `michael:mb` is still Michael on MBAI, never "#mb".
+        let instances = mirrored_buzz_rows();
+        for target in ["michael:MB", "michael:mba", "michael:m"] {
+            assert_eq!(
+                match_target(target, &instances, &fleet()).unwrap(),
+                vec!["michael:MBAI".to_string()],
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_suffix_only_buzz_person_names_the_exact_channel_form() {
+        // The buzz host is suffix-only, so bare `michael` refuses. The channel
+        // form must say why and what to type, not "non-existent agent"...
+        let fleet = fleet_with(SuffixOnly::parse("MBAI"), "test-uuid-0000");
+        let instances = mirrored_buzz_rows();
+        let err = match_target("michael:infra", &instances, &fleet).unwrap_err();
+        assert!(err.contains("suffix-only"), "{err}");
+        assert!(err.contains("@michael:MBAI:infra"), "{err}");
+        // ...and the exact form it names resolves to the mirror pair.
+        assert_eq!(
+            match_target("michael:MBAI:infra", &instances, &fleet).unwrap(),
+            vec!["michael:MBAI".to_string(), "ch_infra:MBAI".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_buzz_person_offers_only_the_buzz_exact_form() {
+        // A plain agent `michael` on another device makes bare `michael`
+        // ambiguous. Only the buzz person can be in a channel, so only its
+        // exact form is offered.
+        let mut instances = mirrored_buzz_rows();
+        instances.push(mirror_with_tool("michael", "BOXE", "device-boxe", None));
+        let err = match_target("michael:infra", &instances, &fleet()).unwrap_err();
+        assert!(
+            err.contains("multiple live agents named 'michael'"),
+            "{err}"
+        );
+        assert!(err.contains("@michael:MBAI:infra"), "{err}");
+        assert!(!err.contains("@michael:BOXE:infra"), "{err}");
+        assert_eq!(
+            match_target("michael:MBAI:infra", &instances, &fleet()).unwrap(),
+            vec!["michael:MBAI".to_string(), "ch_infra:MBAI".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_non_buzz_base_keeps_the_unmatched_result() {
+        // No buzz person behind the refusal: today's behaviour, unmatched,
+        // for both the bare and the exact person form.
+        let instances = vec![
+            mirror_with_tool("luna", "BOXE", "device-boxe", None),
+            mirror_with_tool("luna", "MOXE", "device-moxe", None),
+            info_with_tool("ch_infra", None, Some(BUZZ_TOOL)),
+        ];
+        for target in ["luna:infra", "luna:BOXE:infra"] {
+            assert!(
+                match_target(target, &instances, &fleet())
+                    .unwrap()
+                    .is_empty(),
+                "{target}"
+            );
+        }
     }
 
     #[test]

@@ -29,8 +29,9 @@ Targets before '--':
   With '--' (or --stdin/--file/--base64) every positional is a target and the
   '@' is optional: 'hcom send luna -- text'. That form is the one to use in
   PowerShell, which swallows a bare '@luna' as splatting.
-  Without '--' a bare positional is the message text, so the '@' is needed
-  there: 'hcom send @luna hello'.
+  Without '--' the '@' is what marks a target: 'hcom send @luna hello' sends
+  'hello' to luna, while 'hcom send luna' broadcasts the text 'luna'. Piped
+  input follows the same rule: 'echo hi | hcom send @luna', or use --stdin.
 
 Inline bundle (attach structured context):
     --title <text>                 Create and attach bundle inline
@@ -45,8 +46,8 @@ Examples:
     hcom send luna -- Hello there!
     hcom send luna nova --intent request -- Can you help?
     hcom send -- Broadcast message to everyone
-    echo 'Complex message' | hcom send luna
-    hcom send luna <<'EOF'
+    echo 'Complex message' | hcom send @luna
+    hcom send @luna <<'EOF'
     Multi-line message with special chars
     EOF";
 
@@ -873,19 +874,29 @@ fn resolve_message(
     }
 
     // No message source found
-    let targets_str = if args.positionals.is_empty() {
+    Err(no_message_hint(&args.positionals))
+}
+
+/// The "no message" error, with two commands that DO address the targets.
+///
+/// Both spell the targets without `@` (PowerShell swallows a bare `@name`),
+/// so both must separate the message: `--` for an inline body, `--stdin` for
+/// a piped one. A piped `hcom send luna` with no source flag would instead
+/// take `luna` as the message text and broadcast it.
+fn no_message_hint(positionals: &[String]) -> String {
+    let targets_str = if positionals.is_empty() {
         "target".to_string()
     } else {
-        args.positionals
+        positionals
             .iter()
             .take(3)
             .map(|t| t.strip_prefix('@').unwrap_or(t))
             .collect::<Vec<_>>()
             .join(" ")
     };
-    Err(format!(
-        "No message provided.\nUse: hcom send {targets_str} -- your message\n Or: echo 'msg' | hcom send {targets_str}"
-    ))
+    format!(
+        "No message provided.\nUse: hcom send {targets_str} -- your message\n Or: echo 'msg' | hcom send {targets_str} --stdin"
+    )
 }
 
 /// Read message from stdin pipe.
@@ -896,6 +907,31 @@ fn read_stdin() -> Result<String, String> {
     } else {
         Err("No input received on stdin".to_string())
     }
+}
+
+/// Split positionals into `(targets, compat_message)` — the one place both
+/// target grammars live, keyed on how the message arrives:
+///   - Separated with `--` (or --stdin/--file/--base64): every positional is
+///     a target and the `@` is optional. Nothing else could be the message,
+///     so there is nothing to disambiguate — and PowerShell swallows a bare
+///     `@name` before hcom ever sees it, which turns `hcom send @michael --
+///     text` into a broadcast.
+///   - Otherwise the pre-`--` compatibility form is unchanged: `@x` args are
+///     targets, one bare arg is the message text, and a lone `@name message`
+///     arg is the whole text with mentions parsed from it.
+fn split_positionals(args: &SendArgs) -> Result<(Vec<String>, Option<String>), String> {
+    if !args.has_separator() && !args.stdin && args.file.is_none() && args.base64.is_none() {
+        return Ok(process_positionals(&args.positionals));
+    }
+    let mut targets = Vec::with_capacity(args.positionals.len());
+    for arg in &args.positionals {
+        let target = arg.strip_prefix('@').unwrap_or(arg);
+        if target.is_empty() {
+            return Err("Empty target '@' is not allowed".to_string());
+        }
+        targets.push(target.to_string());
+    }
+    Ok((targets, None))
 }
 
 /// Process positional args without `--` separator.
@@ -1042,30 +1078,13 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     };
 
     // ── Process positional args: separate targets from bare message text ──
-    // Two grammars, keyed on how the message arrives:
-    //   - Separated with `--` (or --stdin/--file/--base64): every positional
-    //     is a target and the `@` is optional. Nothing else could be the
-    //     message, so there is nothing to disambiguate — and PowerShell
-    //     swallows a bare `@name` before hcom ever sees it, which turns
-    //     `hcom send @michael -- text` into a broadcast.
-    //   - Otherwise the pre-`--` compatibility form is unchanged: `@x` args
-    //     are targets, one bare arg is the message text, and a lone
-    //     `@name message` arg is the whole text with mentions parsed from it.
-    let (effective_targets, compat_message) =
-        if !args.has_separator() && !args.stdin && args.file.is_none() && args.base64.is_none() {
-            process_positionals(&args.positionals)
-        } else {
-            let mut validated = Vec::with_capacity(args.positionals.len());
-            for arg in &args.positionals {
-                let target = arg.strip_prefix('@').unwrap_or(arg);
-                if target.is_empty() {
-                    eprintln!("Error: Empty target '@' is not allowed");
-                    return 1;
-                }
-                validated.push(target.to_string());
-            }
-            (validated, None)
-        };
+    let (effective_targets, compat_message) = match split_positionals(args) {
+        Ok(split) => split,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
 
     // ── Resolve message ──
     let (mut message, name_was_stripped) = if let Some(msg) = compat_message {
@@ -1924,6 +1943,76 @@ mod tests {
         assert!(
             crate::commands::help::get_command_help("send").contains("send name -- message text")
         );
+    }
+
+    /// Every send command the help shows reading the message from a pipe or
+    /// a heredoc, as argv after `send`: piped/heredoc examples in both help
+    /// surfaces, the SEND_HELP stdin rows, and the no-message hint.
+    fn documented_piped_sends() -> Vec<Vec<String>> {
+        let help = crate::commands::help::get_command_help("send");
+        let hint = no_message_hint(&["luna".to_string()]);
+        let mut sends = Vec::new();
+        for line in SEND_AFTER_HELP
+            .lines()
+            .chain(help.lines())
+            .chain(hint.lines())
+        {
+            let command = if let Some((before, after)) = line.split_once("hcom send ") {
+                if !before.contains('|') && !after.contains("<<") {
+                    continue;
+                }
+                // Drop a heredoc marker and the closing quote of prose.
+                after
+                    .split("<<")
+                    .next()
+                    .unwrap()
+                    .split('\'')
+                    .next()
+                    .unwrap()
+            } else if let Some((row, _)) = line.split_once("Message from stdin") {
+                row.trim().strip_prefix("send").unwrap_or_default()
+            } else {
+                continue;
+            };
+            sends.push(command.split_whitespace().map(str::to_string).collect());
+        }
+        sends
+    }
+
+    #[test]
+    fn every_documented_piped_send_addresses_its_target() {
+        // Without `--` or a source flag a bare positional is the message text,
+        // so a piped `hcom send luna` broadcasts "luna" and drops the pipe.
+        // Every documented piped form must classify its positional as a target.
+        let sends = documented_piped_sends();
+        assert!(sends.len() >= 6, "extractor found only {sends:?}");
+        for tokens in sends {
+            let argv: Vec<&str> = std::iter::once("send")
+                .chain(tokens.iter().map(String::as_str))
+                .collect();
+            let (targets, compat) = split_positionals(&send_argv(&argv)).unwrap();
+            assert!(
+                !targets.is_empty() && compat.is_none(),
+                "documented `hcom {}` would broadcast {compat:?} instead of addressing a target",
+                argv.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn without_the_separator_an_at_target_and_a_word_send_the_word_to_the_target() {
+        // What the help says `hcom send @luna hello` does: "hello" to luna
+        // only, not a broadcast of "@luna hello".
+        let (db, path, _env) = luna_db();
+        let args = send_argv(&["send", "@luna", "hello"]);
+        assert!(!args.had_separator);
+        assert_eq!(cmd_send(&db, &args, Some(&sender_ctx())), 0);
+        let (_, data) = last_message(&db);
+        assert_eq!(data["text"], "hello");
+        assert_eq!(data["scope"], serde_json::json!("mentions"));
+        assert_eq!(data["exact_targets"], serde_json::json!(["luna"]));
+        cleanup_test_db(path);
     }
 
     #[test]

@@ -130,9 +130,11 @@ swallows it, which turns `hcom send @luna -- text` into a broadcast to
 everyone instead of a message to luna. Quote it (`'@luna'`) if you prefer the
 `@` form.
 
-Without `--` the rule is different, and unchanged: a bare positional is the
-message text, not a target. `hcom send @luna hello` is a broadcast of the text
-`@luna hello`, with luna mentioned in the body.
+Without `--` the rule is different, and unchanged: the `@` is what marks a
+target, and a single bare word is the message text. `hcom send @luna hello`
+sends `hello` to luna; `hcom send luna` broadcasts the text `luna` to everyone.
+The same goes for piped input: `echo hi | hcom send @luna`, or drop the `@` and
+add `--stdin` (`echo hi | hcom send luna --stdin`).
 
 **Common mistake:** Forgetting `--` before the message text. Without `--`, the message text might be parsed as flags.
 

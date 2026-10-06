@@ -320,7 +320,8 @@ const SEND_HELP: &[HelpEntry] = &[
     ),
     ("  send name1 name2 -- message", "Multiple targets"),
     ("  send -- message text", "Broadcast to all"),
-    ("  send name", "Message from stdin (pipe or heredoc)"),
+    ("  send @name", "Message from stdin (pipe or heredoc)"),
+    ("  send name --stdin", "Message from stdin, without the @"),
     ("  send name --file <path>", "Message from file"),
     (
         "  send name --base64 <encoded>",
@@ -353,11 +354,11 @@ const SEND_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "Without --, a bare positional is the message text instead:",
+        "Without --, the @ is what marks a target: 'hcom send @luna hello'",
     ),
     (
         "",
-        "'hcom send @luna hello' is a broadcast of the text '@luna hello'.",
+        "sends 'hello' to luna, while 'hcom send luna' broadcasts the text 'luna'.",
     ),
     ("", ""),
     ("Envelope:", ""),
@@ -401,8 +402,8 @@ const SEND_HELP: &[HelpEntry] = &[
         "",
     ),
     ("  hcom send -- Broadcast message to everyone", ""),
-    ("  echo 'Complex message' | hcom send luna", ""),
-    ("  hcom send luna <<'EOF'", ""),
+    ("  echo 'Complex message' | hcom send @luna", ""),
+    ("  hcom send @luna <<'EOF'", ""),
     ("  Multi-line message with special chars", ""),
     ("  EOF", ""),
 ];
