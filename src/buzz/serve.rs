@@ -1637,28 +1637,46 @@ impl MainLoop {
             _ => {}
         }
 
-        let ancestry = self.load_ancestry(&event)?;
-        let root = root_id.or(parent_id).unwrap_or_else(|| event.id.clone());
+        // An edit or deletion addresses a previous event through its `e` tag:
+        // the delivered check, the thread and the targets all follow that
+        // original, not the revision itself.
+        let revision = matches!(
+            event.kind,
+            route::KIND_EDIT | route::KIND_DELETE | route::KIND_CHANNEL_DELETE
+        );
+        let subject = if revision {
+            route::tag(&event, "e").unwrap_or(&event.id).to_string()
+        } else {
+            event.id.clone()
+        };
+        let original = if revision {
+            self.connector
+                .store
+                .lock()
+                .cached_event(&subject)?
+                .and_then(|cached| serde_json::from_str::<Event>(&cached.json).ok())
+        } else {
+            None
+        };
+        let threaded = original.as_ref().unwrap_or(&event);
+        let ancestry = self.load_ancestry(threaded)?;
+        let (root_id, parent_id) = if original.is_some() {
+            route::thread_refs(threaded)
+        } else {
+            (root_id, parent_id)
+        };
+        let root = root_id.or(parent_id).unwrap_or_else(|| threaded.id.clone());
         let input = InboundEvent {
             event: event.clone(),
             channel: channel.clone(),
             root_id: root,
             ancestry,
+            original,
         };
 
         let people = self.route_inputs_people()?;
         let roster = self.agent_roster();
         let kinds = self.author_kinds(&people);
-        // An edit or deletion addresses a previous event through its `e` tag,
-        // so the delivered check follows that reference, not the event's own id.
-        let subject = if matches!(
-            event.kind,
-            route::KIND_EDIT | route::KIND_DELETE | route::KIND_CHANNEL_DELETE
-        ) {
-            route::tag(&event, "e").unwrap_or(&event.id).to_string()
-        } else {
-            event.id.clone()
-        };
         let delivered = self
             .connector
             .store

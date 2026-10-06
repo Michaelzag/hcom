@@ -123,6 +123,10 @@ pub struct InboundEvent {
     /// Chain from the event's parent up to (and excluding) the root, nearest
     /// first. Empty for a top-level post.
     pub ancestry: Vec<Ancestor>,
+    /// For an edit or deletion: the event it revises. Deployed clients write
+    /// only `h` + `e` on 40003/9005, so the people to notify come from the
+    /// original's `p` tags, not the revision's.
+    pub original: Option<Event>,
 }
 
 /// hcom thread name for a Buzz thread.
@@ -353,9 +357,11 @@ pub fn route_inbound(
         AuthorKind::Person | AuthorKind::Unknown => {}
     }
 
-    // Targets: explicit p-tags plus the author of any ancestor that is an
-    // agent, minus the sender (a human never messages themselves here).
-    let mut targets: BTreeSet<String> = tags_all(event, "p")
+    // Targets: explicit p-tags (the original's, for a revision) plus the author
+    // of any ancestor that is an agent, minus the sender (a human never
+    // messages themselves here).
+    let tagged = input.original.as_ref().unwrap_or(event);
+    let mut targets: BTreeSet<String> = tags_all(tagged, "p")
         .into_iter()
         .filter_map(|pubkey| agent_name_for(pubkey, roster))
         .collect();
@@ -379,7 +385,14 @@ pub fn route_inbound(
         sender: sender_person.name.clone(),
         targets: targets.into_iter().collect(),
         thread: thread_name(&input.channel.slug, &input.root_id),
-        text: format!("{prefix}{}", event.content.trim()),
+        // A tombstone is empty; say which message went away.
+        text: format!(
+            "{prefix}{}",
+            match (event.kind, &input.original) {
+                (KIND_DELETE | KIND_CHANNEL_DELETE, Some(original)) => original.content.trim(),
+                _ => event.content.trim(),
+            }
+        ),
         root_id: input.root_id.clone(),
         channel_id: input.channel.id.clone(),
     })
@@ -736,6 +749,7 @@ mod tests {
             event,
             channel: channel("chan-1", "infra"),
             ancestry,
+            original: None,
         }
     }
 
@@ -1003,19 +1017,16 @@ mod tests {
             "typo",
             vec![vec!["p".into(), public_hex(&luna)]],
         );
+        // The deployed CLI's build_edit: kind 40003 with only `h` and a bare
+        // `e`. No `p` tag rides along, so the targets must come from the
+        // original the edit revises.
         let edit = sign(
             UnsignedEvent {
                 created_at: 1_700_000_100,
                 kind: KIND_EDIT,
                 tags: vec![
                     vec!["h".into(), "chan-1".into()],
-                    vec![
-                        "e".into(),
-                        original.id.clone(),
-                        String::new(),
-                        "root".into(),
-                    ],
-                    vec!["p".into(), public_hex(&luna)],
+                    vec!["e".into(), original.id.clone()],
                 ],
                 content: "fixed".into(),
             },
@@ -1026,19 +1037,17 @@ mod tests {
         let mut kinds = HashMap::new();
         kinds.insert(public_hex(&michael), AuthorKind::Person);
 
-        let routed = route_inbound(
-            &inbound(
-                edit.clone(),
-                vec![Ancestor {
-                    buzz_id: original.id,
-                    author: public_hex(&luna),
-                }],
-            ),
-            &people,
-            &roster_with(&["luna@mbai"]),
-            &kinds,
-            true,
+        let mut input = inbound(edit.clone(), vec![]);
+        input.root_id = original.id.clone();
+        let without_original =
+            route_inbound(&input, &people, &roster_with(&["luna@mbai"]), &kinds, true);
+        assert_eq!(
+            without_original,
+            Inbound::Skip(InboundSkip::NoTargets),
+            "the revision alone names nobody"
         );
+        input.original = Some(original.clone());
+        let routed = route_inbound(&input, &people, &roster_with(&["luna@mbai"]), &kinds, true);
         let Inbound::Deliver(delivery) = routed else {
             panic!("an edit of a delivered post must deliver, got {routed:?}");
         };
@@ -1070,12 +1079,11 @@ mod tests {
                 UnsignedEvent {
                     created_at: 1_700_000_200,
                     kind,
-                    tags: vec![vec![
-                        "e".into(),
-                        original.id.clone(),
-                        String::new(),
-                        "reply".into(),
-                    ]],
+                    // build_delete_message / build_delete_compat: `h` + bare `e`.
+                    tags: vec![
+                        vec!["h".into(), "chan-1".into()],
+                        vec!["e".into(), original.id.clone()],
+                    ],
                     content: String::new(),
                 },
                 &michael,
@@ -1084,23 +1092,17 @@ mod tests {
             let mut kinds = HashMap::new();
             kinds.insert(public_hex(&michael), AuthorKind::Person);
 
-            let routed = route_inbound(
-                &inbound(
-                    deletion,
-                    vec![Ancestor {
-                        buzz_id: original.id,
-                        author: public_hex(&luna),
-                    }],
-                ),
-                &people,
-                &roster_with(&["luna@mbai"]),
-                &kinds,
-                true,
-            );
+            let mut input = inbound(deletion, vec![]);
+            input.root_id = original.id.clone();
+            input.original = Some(original);
+            let routed = route_inbound(&input, &people, &roster_with(&["luna@mbai"]), &kinds, true);
             let Inbound::Deliver(delivery) = routed else {
                 panic!("a kind {kind} deletion must deliver, got {routed:?}");
             };
-            assert!(delivery.text.starts_with("(deleted) "));
+            assert_eq!(
+                delivery.text, "(deleted) oops",
+                "an empty tombstone names the message it removed"
+            );
             assert_eq!(delivery.targets, vec!["luna@mbai"]);
         }
     }
