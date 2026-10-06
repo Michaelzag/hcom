@@ -1712,6 +1712,29 @@ mod tests {
     }
 
     #[test]
+    fn test_find_collision_partner_matches_nonzero_offset_timestamps() {
+        // A tool transcript or relay peer may supply RFC3339 timestamps with
+        // nonzero offsets. Insert normalizes them to UTC, so the text window
+        // keeps matching: 10:00:00+08:00 and 10:00:01+08:00 are one second
+        // apart and must collide; the same wall clock in UTC is 8h away.
+        let (db, path) = setup_full_test_db();
+        let edit = |instance: &str, ts: &str| {
+            db.log_status_event(instance, "active", "tool:Edit", Some("/r/a.rs"), Some(ts))
+                .unwrap();
+            db.get_last_event_id()
+        };
+        edit("luna", "2026-09-30T10:00:00+08:00");
+        let near = edit("nova", "2026-09-30T10:00:01+08:00");
+        assert_eq!(
+            find_collision_partner(&db, near, "nova", "/r/a.rs").as_deref(),
+            Some("luna")
+        );
+        let far = edit("mira", "2026-09-30T10:00:01+00:00");
+        assert_eq!(find_collision_partner(&db, far, "mira", "/r/a.rs"), None);
+        cleanup_test_db(path);
+    }
+
+    #[test]
     fn test_collision_self_relevance_matches_filter_constants() {
         let sql = collision_self_relevance_sql("luna");
         assert!(sql.contains(FILE_WRITE_CONTEXTS));
