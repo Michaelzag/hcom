@@ -117,7 +117,22 @@ pub struct InstanceInfo {
     /// not that device's canonical short id (a probed slot, or relay's
     /// 4-char import fallback).
     pub origin: Option<String>,
+    /// `tool` of the row, verbatim from the column (relay mirrors carry the
+    /// origin's value). Hosted participants are recognized by their tool
+    /// string — see [`BUZZ_TOOL`]; `None` when the row was built in memory
+    /// by a caller that has no row behind it.
+    pub tool: Option<String>,
 }
+
+/// `instances.tool` value on rows a Buzz connector hosts: humans in a bridged
+/// channel (`michael`) and the channels themselves (`ch_infra`). The column is
+/// a free string, so this is a value comparison and not an enum variant.
+pub const BUZZ_TOOL: &str = "buzz";
+
+/// Base name of a hosted Buzz channel row (`ch_infra`). A person row never
+/// starts with this, so a `base:suffix` target can't pick its own base as
+/// the channel to expand into.
+pub const BUZZ_CHANNEL_PREFIX: &str = "ch_";
 
 impl InstanceInfo {
     /// Full display name: "{tag}-{name}" if tag, else just "{name}".
@@ -131,13 +146,14 @@ impl InstanceInfo {
 
 /// Every row a message may be delivered to or a bare name resolved against
 /// (the live-row predicate), carrying the `origin_device_id` the fleet
-/// suffix-only flag needs. A row that fails to read is an error, never a
-/// missing row: callers decide "not live" from this list.
+/// suffix-only flag needs and the `tool` the hosted-participant check needs.
+/// A row that fails to read is an error, never a missing row: callers decide
+/// "not live" from this list.
 pub(crate) fn deliverable_instances(
     conn: &rusqlite::Connection,
 ) -> rusqlite::Result<Vec<InstanceInfo>> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT name, tag, origin_device_id FROM instances WHERE {}",
+        "SELECT name, tag, origin_device_id, tool FROM instances WHERE {}",
         crate::fleet_names::LIVE_ROW_PREDICATE
     ))?;
     stmt.query_map([], |row| {
@@ -145,6 +161,7 @@ pub(crate) fn deliverable_instances(
             name: row.get::<_, String>(0)?,
             tag: row.get::<_, Option<String>>(1)?,
             origin: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
+            tool: row.get::<_, Option<String>>(3)?.filter(|s| !s.is_empty()),
         })
     })?
     .collect()
@@ -239,6 +256,160 @@ fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String 
     msg
 }
 
+/// Fleet bare-name resolution for one input, lifted out of `match_target` so
+/// the `base` of a `base:suffix` target resolves by exactly the same rules a
+/// bare `@base` does.
+///
+/// `None` = no live row carries the name (caller falls through); `Some(Ok)` =
+/// one exact form; `Some(Err)` = the refusal that names the exact forms.
+fn bare_resolution(
+    target: &str,
+    instances: &[InstanceInfo],
+    fleet: &FleetCtx,
+) -> Option<Result<String, String>> {
+    let mut candidates: Vec<BareCandidate> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for inst in instances {
+        if inst.origin.is_none()
+            && (inst.name.eq_ignore_ascii_case(target)
+                || inst.full_name().eq_ignore_ascii_case(target))
+        {
+            if seen.insert(inst.name.as_str()) {
+                candidates.push(BareCandidate {
+                    exact: inst.name.clone(),
+                    suffix_only: !fleet.own_uuid.is_empty()
+                        && fleet.so.device_is_listed(&fleet.own_uuid),
+                    display_match: !inst.name.eq_ignore_ascii_case(target),
+                });
+            }
+        } else if let Some((base, suffix)) = split_device_suffix(&inst.name) {
+            // Remote mirror row x:DEV whose base matches the bare input.
+            if base.eq_ignore_ascii_case(target) && seen.insert(inst.name.as_str()) {
+                candidates.push(BareCandidate {
+                    exact: inst.name.clone(),
+                    suffix_only: fleet
+                        .so
+                        .mirror_is_suffix_only(inst.origin.as_deref().unwrap_or_default(), suffix),
+                    display_match: false,
+                });
+            }
+        }
+    }
+    match resolve_bare_name(target, &candidates) {
+        BareOutcome::Single(exact) => Some(Ok(exact)),
+        BareOutcome::Refuse(msg) => Some(Err(msg)),
+        BareOutcome::NoCandidate => None,
+    }
+}
+
+/// The device-suffix shape `relay::control::split_device_suffix` recognizes:
+/// exactly four ASCII uppercase alphanumerics. Restated here (rather than
+/// called through a synthetic `x:SUFFIX`) so the connector owns that function;
+/// `device_suffix_shape_matches_split_device_suffix` pins the two together.
+fn is_device_suffix_shape(suffix: &str) -> bool {
+    suffix.len() == 4
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// True when `suffix` names a device in this fleet: the uppercase 4-char shape,
+/// or a case-insensitive match against the short id a live remote mirror row
+/// carries. A device id always wins over a channel slug — `michael:mbai` is
+/// Michael on device MBAI, never Michael in a `#mbai` channel.
+fn suffix_is_device_id(suffix: &str, instances: &[InstanceInfo]) -> bool {
+    is_device_suffix_shape(suffix)
+        || instances.iter().any(|inst| {
+            split_device_suffix(&inst.name)
+                .is_some_and(|(_, known)| known.eq_ignore_ascii_case(suffix))
+        })
+}
+
+/// The live row behind an exact resolved name (case-insensitive; the resolver
+/// returns canonical row spelling, so this is a lookup by name).
+fn row_named<'a>(instances: &'a [InstanceInfo], name: &str) -> Option<&'a InstanceInfo> {
+    instances
+        .iter()
+        .find(|inst| inst.name.eq_ignore_ascii_case(name))
+}
+
+/// A hosted Buzz person row: `tool = "buzz"`, and not itself a channel row.
+fn is_buzz_person(inst: &InstanceInfo) -> bool {
+    inst.tool.as_deref() == Some(BUZZ_TOOL)
+        && !inst
+            .name
+            .to_ascii_lowercase()
+            .starts_with(BUZZ_CHANNEL_PREFIX)
+}
+
+/// A hosted Buzz channel row: `tool = "buzz"` and a `ch_` base name.
+fn is_buzz_channel(inst: &InstanceInfo) -> bool {
+    inst.tool.as_deref() == Some(BUZZ_TOOL)
+        && inst
+            .name
+            .to_ascii_lowercase()
+            .starts_with(BUZZ_CHANNEL_PREFIX)
+}
+
+/// `base:suffix` on a hosted Buzz person: Michael in the `#infra` channel.
+///
+/// Resolves to BOTH ordinary rows — the person and the channel — so both land
+/// in `mentions` / `exact_targets` as plain targets and nothing new travels on
+/// the wire. On another device the same input resolves to the mirror pair
+/// (`michael:MBAI`, `ch_infra:MBAI`), because each side goes through ordinary
+/// bare-name resolution and mirrors carry the origin's `tool` string.
+///
+/// `None` = not this shape, so the caller keeps today's behaviour. `Some(Err)`
+/// = the base IS a buzz person but the `ch_<suffix>` side is not addressable,
+/// which is a mistake worth naming rather than a prefix match to hunt for.
+fn buzz_person_in_channel(
+    target: &str,
+    instances: &[InstanceInfo],
+    fleet: &FleetCtx,
+) -> Option<Result<Vec<String>, String>> {
+    let (base, suffix) = target.rsplit_once(':')?;
+    if base.is_empty() || suffix.is_empty() || suffix_is_device_id(suffix, instances) {
+        return None;
+    }
+
+    let person_name = match bare_resolution(base, instances, fleet) {
+        Some(Ok(exact)) => exact,
+        // A refusal (ambiguous base, or one live only on suffix-only devices)
+        // proves nothing about the buzz shape: leave those targets to today's
+        // branches, which own those messages.
+        Some(Err(_)) | None => return None,
+    };
+    let person = row_named(instances, &person_name)?;
+    // A non-buzz base keeps today's behaviour exactly.
+    if !is_buzz_person(person) {
+        return None;
+    }
+
+    let channel_target = format!("{BUZZ_CHANNEL_PREFIX}{suffix}");
+    let channel_name = match bare_resolution(&channel_target, instances, fleet) {
+        Some(Ok(exact)) => exact,
+        Some(Err(msg)) => return Some(Err(msg)),
+        None => {
+            return Some(Err(format!(
+                "@{target}: @{person_name} is a buzz person, but no live channel row {} to address them in",
+                channel_target
+            )));
+        }
+    };
+    let channel = row_named(instances, &channel_name)?;
+    // The channel has to be a hosted Buzz channel on the person's own device:
+    // a `ch_` row elsewhere, or a non-buzz row of that name, is not the
+    // channel this address means.
+    if !is_buzz_channel(channel) || channel.origin != person.origin {
+        return Some(Err(format!(
+            "@{target}: {} is not a live buzz channel on @{person_name}'s device",
+            channel_name
+        )));
+    }
+
+    Some(Ok(vec![person_name, channel_name]))
+}
+
 /// Match a target against instance names.
 ///
 /// Resolution order:
@@ -249,6 +420,9 @@ fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String 
 /// 2. An explicit device-qualified name bypasses the fleet resolver.
 /// 3. Legacy exact, tag-group and unique remote-prefix matching when the
 ///    fleet has no candidates for the bare input.
+/// 4. A `base:suffix` whose suffix is not a device id and whose base is a
+///    hosted Buzz person expands to that person and the `ch_<suffix>` channel
+///    row on the same device.
 ///
 /// Special case: bigboss:SUFFIX resolves to bigboss (virtual identity, device-agnostic).
 fn match_target(
@@ -256,42 +430,10 @@ fn match_target(
     instances: &[InstanceInfo],
     fleet: &FleetCtx,
 ) -> Result<Vec<String>, String> {
-    if !target.contains(':') {
-        let mut candidates: Vec<BareCandidate> = Vec::new();
-        let mut seen: HashSet<&str> = HashSet::new();
-        for inst in instances {
-            if inst.origin.is_none()
-                && (inst.name.eq_ignore_ascii_case(target)
-                    || inst.full_name().eq_ignore_ascii_case(target))
-            {
-                if seen.insert(inst.name.as_str()) {
-                    candidates.push(BareCandidate {
-                        exact: inst.name.clone(),
-                        suffix_only: !fleet.own_uuid.is_empty()
-                            && fleet.so.device_is_listed(&fleet.own_uuid),
-                        display_match: !inst.name.eq_ignore_ascii_case(target),
-                    });
-                }
-            } else if let Some((base, suffix)) = split_device_suffix(&inst.name) {
-                // Remote mirror row x:DEV whose base matches the bare input.
-                if base.eq_ignore_ascii_case(target) && seen.insert(inst.name.as_str()) {
-                    candidates.push(BareCandidate {
-                        exact: inst.name.clone(),
-                        suffix_only: fleet.so.mirror_is_suffix_only(
-                            inst.origin.as_deref().unwrap_or_default(),
-                            suffix,
-                        ),
-                        display_match: false,
-                    });
-                }
-            }
-        }
-        match resolve_bare_name(target, &candidates) {
-            BareOutcome::Single(exact) => return Ok(vec![exact]),
-            BareOutcome::Refuse(msg) => return Err(msg),
-            // No live candidate: fall through to the legacy branches below.
-            BareOutcome::NoCandidate => {}
-        }
+    if !target.contains(':')
+        && let Some(outcome) = bare_resolution(target, instances, fleet)
+    {
+        return outcome.map(|exact| vec![exact]);
     }
     let exact_base: Vec<String> = instances
         .iter()
@@ -334,6 +476,13 @@ fn match_target(
     }
 
     if target.contains(':') {
+        // `person:channel` on a hosted Buzz row. Ahead of the prefix branch
+        // below: a lowercase colon target has no other meaning today, so this
+        // takes nothing away, and it must beat prefix matching or `michael:infra`
+        // would be hunted as a device prefix.
+        if let Some(expansion) = buzz_person_in_channel(target, instances, fleet) {
+            return expansion;
+        }
         let target_lower = target.to_ascii_lowercase();
         let mut candidates: Vec<(String, String)> = instances
             .iter()
@@ -376,6 +525,7 @@ fn target_instances_with_sender(enabled_instances: &[InstanceInfo]) -> Vec<Insta
             tag: None,
             // The virtual identity has no row: it is never a mirror.
             origin: None,
+            tool: None,
         });
     }
     instances
@@ -1130,6 +1280,7 @@ mod tests {
             name: format!("{base}:ZZZZ"),
             tag: None,
             origin: Some(device_uuid.to_string()),
+            tool: None,
         }
     }
 
@@ -1251,11 +1402,208 @@ mod tests {
     // ---- compute_scope ----
 
     fn info(name: &str, tag: Option<&str>) -> InstanceInfo {
+        info_with_tool(name, tag, None)
+    }
+
+    /// A row as `deliverable_instances` reads it, including the `tool` string a
+    /// hosted participant is recognized by.
+    fn info_with_tool(name: &str, tag: Option<&str>, tool: Option<&str>) -> InstanceInfo {
         InstanceInfo {
             name: name.to_string(),
             tag: tag.map(|t| t.to_string()),
             origin: None,
+            tool: tool.map(|t| t.to_string()),
         }
+    }
+
+    /// A relay mirror of `base:SHORT` on `origin_device_id`, carrying the
+    /// origin's `tool` string verbatim the way relay state does.
+    fn mirror_with_tool(
+        base: &str,
+        suffix: &str,
+        origin: &str,
+        tool: Option<&str>,
+    ) -> InstanceInfo {
+        InstanceInfo {
+            name: format!("{base}:{suffix}"),
+            tag: None,
+            origin: Some(origin.to_string()),
+            tool: tool.map(|t| t.to_string()),
+        }
+    }
+
+    // ---- person-in-channel (`person:channel` on hosted Buzz rows) ----
+
+    const MBAI: &str = "device-mbai-uuid";
+
+    /// Local hosted rows: buzz person `michael` plus channel `ch_infra`.
+    fn local_buzz_rows() -> Vec<InstanceInfo> {
+        vec![
+            info_with_tool("michael", None, Some(BUZZ_TOOL)),
+            info_with_tool("ch_infra", None, Some(BUZZ_TOOL)),
+        ]
+    }
+
+    /// The same hosted rows as seen from another device: relay mirrors of both,
+    /// each carrying the origin's `tool` verbatim.
+    fn mirrored_buzz_rows() -> Vec<InstanceInfo> {
+        vec![
+            mirror_with_tool("michael", "MBAI", MBAI, Some(BUZZ_TOOL)),
+            mirror_with_tool("ch_infra", "MBAI", MBAI, Some(BUZZ_TOOL)),
+        ]
+    }
+
+    #[test]
+    fn buzz_person_in_channel_resolves_to_person_and_channel() {
+        let instances = local_buzz_rows();
+        assert_eq!(
+            match_target("michael:infra", &instances, &fleet()).unwrap(),
+            vec!["michael".to_string(), "ch_infra".to_string()]
+        );
+    }
+
+    #[test]
+    fn buzz_person_in_channel_resolves_to_both_mirrors_off_device() {
+        // Nothing device-specific about the input: on another device the same
+        // `michael:infra` resolves through ordinary bare-name resolution to the
+        // mirror pair, which is what goes on the wire.
+        let instances = mirrored_buzz_rows();
+        assert_eq!(
+            match_target("michael:infra", &instances, &fleet()).unwrap(),
+            vec!["michael:MBAI".to_string(), "ch_infra:MBAI".to_string()]
+        );
+    }
+
+    #[test]
+    fn both_sides_land_as_ordinary_targets_in_mentions() {
+        // The expansion is not a new routing kind: both rows land in
+        // `mentions` (and so in `exact_targets`) as plain targets.
+        let instances = local_buzz_rows();
+        let targets = vec!["michael:infra".to_string()];
+        let scope = compute_scope("status?", &instances, Some(&targets), &fleet()).unwrap();
+        assert_eq!(scope.scope, MessageScope::Mentions);
+        assert_eq!(
+            scope.mentions,
+            vec!["michael".to_string(), "ch_infra".to_string()]
+        );
+    }
+
+    #[test]
+    fn buzz_person_in_channel_without_that_channel_errors_naming_it() {
+        let instances = vec![info_with_tool("michael", None, Some(BUZZ_TOOL))];
+        let targets = vec!["michael:nochan".to_string()];
+        let err = compute_scope("status?", &instances, Some(&targets), &fleet()).unwrap_err();
+        assert!(err.contains("ch_nochan"), "{err}");
+        assert!(err.contains("michael"), "{err}");
+    }
+
+    #[test]
+    fn device_id_wins_over_a_matching_channel_slug() {
+        // `michael:BOXE` is a device address, not "#boxe": the expansion must
+        // not fire and the ordinary device rules must still apply.
+        let mut instances = local_buzz_rows();
+        instances.push(mirror_with_tool("michael", "BOXE", "device-boxe", None));
+        instances.push(info_with_tool("ch_boxe", None, Some(BUZZ_TOOL)));
+        assert_eq!(
+            match_target("michael:BOXE", &instances, &fleet()).unwrap(),
+            vec!["michael:BOXE".to_string()]
+        );
+    }
+
+    #[test]
+    fn non_buzz_base_keeps_todays_behaviour() {
+        // `luna:infra` stays an unmatched colon target for a plain agent —
+        // exactly what it did before the buzz expansion existed.
+        let instances = vec![
+            info("luna", None),
+            info_with_tool("ch_infra", None, Some(BUZZ_TOOL)),
+        ];
+        assert!(
+            match_target("luna:infra", &instances, &fleet())
+                .unwrap()
+                .is_empty()
+        );
+        let targets = vec!["luna:infra".to_string()];
+        let err = compute_scope("status?", &instances, Some(&targets), &fleet()).unwrap_err();
+        assert!(err.contains("non-existent or stopped"), "{err}");
+    }
+
+    #[test]
+    fn a_lowercase_suffix_naming_a_live_device_short_id_is_a_device() {
+        // The 4-uppercase rule alone would let `michael:boxe` through as a
+        // channel slug; the short id a live mirror row carries is a device too.
+        let instances = vec![
+            mirror_with_tool("michael", "BOXE", "device-boxe", None),
+            mirror_with_tool("ch_boxe", "MBAI", MBAI, Some(BUZZ_TOOL)),
+        ];
+        assert_eq!(
+            match_target("michael:boxe", &instances, &fleet()).unwrap(),
+            vec!["michael:BOXE".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_channel_row_base_never_expands_into_a_person_in_channel() {
+        // `ch_infra:whatever` has a channel base: it keeps today's behaviour
+        // (unmatched), so a channel address can't reach into another channel.
+        let instances = local_buzz_rows();
+        assert!(
+            match_target("ch_infra:infra", &instances, &fleet())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_channel_on_another_device_is_not_this_persons_channel() {
+        // The channel has to be on the person's own device. Here the person is
+        // local and the only `ch_infra` mirror lives on another device.
+        let instances = vec![
+            info_with_tool("michael", None, Some(BUZZ_TOOL)),
+            mirror_with_tool("ch_infra", "MBAI", MBAI, Some(BUZZ_TOOL)),
+        ];
+        let targets = vec!["michael:infra".to_string()];
+        let err = compute_scope("status?", &instances, Some(&targets), &fleet()).unwrap_err();
+        assert!(err.contains("ch_infra:MBAI"), "{err}");
+    }
+
+    #[test]
+    fn a_non_buzz_ch_row_is_not_a_channel_for_a_buzz_person() {
+        // The tool string is what makes a row hosted; a plain agent called
+        // `ch_infra` does not complete the address.
+        let instances = vec![
+            info_with_tool("michael", None, Some(BUZZ_TOOL)),
+            info_with_tool("ch_infra", None, Some("claude")),
+        ];
+        let targets = vec!["michael:infra".to_string()];
+        let err = compute_scope("status?", &instances, Some(&targets), &fleet()).unwrap_err();
+        assert!(err.contains("not a live buzz channel"), "{err}");
+    }
+
+    #[test]
+    fn device_suffix_shape_matches_split_device_suffix() {
+        // `suffix_is_device_id` restates the 4-uppercase-alnum rule instead of
+        // calling through a synthetic name; this pins the two together.
+        for suffix in ["MBAI", "BOX1", "AB", "ABCDE", "mbai", "mb_1"] {
+            let via_helper = is_device_suffix_shape(suffix);
+            let via_relay =
+                crate::relay::control::split_device_suffix(&format!("x:{suffix}")).is_some();
+            assert_eq!(via_helper, via_relay, "suffix {suffix}");
+        }
+    }
+
+    #[test]
+    fn buzz_person_and_channel_addresses_themselves_unchanged() {
+        // The two plain addresses keep resolving to exactly one row each.
+        let instances = local_buzz_rows();
+        assert_eq!(
+            match_target("michael", &instances, &fleet()).unwrap(),
+            vec!["michael".to_string()]
+        );
+        assert_eq!(
+            match_target("ch_infra", &instances, &fleet()).unwrap(),
+            vec!["ch_infra".to_string()]
+        );
     }
 
     #[test]

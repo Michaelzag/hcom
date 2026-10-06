@@ -18,11 +18,19 @@ use crate::shared::{
 
 const SEND_AFTER_HELP: &str = "\
 Target matching:
-    @luna                          exact base name
+    luna                           exact base name (the '@' is optional)
+    @luna                          same target, '@' form
     @api-luna                      exact full name
     @api-                          all local agents with exact tag 'api'
     @luna:BOXE                     exact or uniquely prefixed remote agent
   Partial local names are rejected to avoid accidental fan-out.
+
+Targets before '--':
+  With '--' (or --stdin/--file/--base64) every positional is a target and the
+  '@' is optional: 'hcom send luna -- text'. That form is the one to use in
+  PowerShell, which swallows a bare '@luna' as splatting.
+  Without '--' a bare positional is the message text, so the '@' is needed
+  there: 'hcom send @luna hello'.
 
 Inline bundle (attach structured context):
     --title <text>                 Create and attach bundle inline
@@ -34,11 +42,11 @@ Inline bundle (attach structured context):
   See 'hcom bundle --help' for bundle details
 
 Examples:
-    hcom send @luna -- Hello there!
-    hcom send @luna @nova --intent request -- Can you help?
+    hcom send luna -- Hello there!
+    hcom send luna nova --intent request -- Can you help?
     hcom send -- Broadcast message to everyone
-    echo 'Complex message' | hcom send @luna
-    hcom send @luna <<'EOF'
+    echo 'Complex message' | hcom send luna
+    hcom send luna <<'EOF'
     Multi-line message with special chars
     EOF";
 
@@ -866,18 +874,12 @@ fn resolve_message(
 
     // No message source found
     let targets_str = if args.positionals.is_empty() {
-        "@target".to_string()
+        "target".to_string()
     } else {
         args.positionals
             .iter()
             .take(3)
-            .map(|t| {
-                if t.starts_with('@') {
-                    t.clone()
-                } else {
-                    format!("@{t}")
-                }
-            })
+            .map(|t| t.strip_prefix('@').unwrap_or(t))
             .collect::<Vec<_>>()
             .join(" ")
     };
@@ -1039,32 +1041,28 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
-    // ── Process positional args: separate @targets from bare message text ──
-    // Matches Python behavior in messaging.py:
-    //   - Single "@name message" (with space) → entire text is message, @mention parsed by compute_scope
-    //   - Non-@ args → message text (broadcast)
-    //   - Pure @targets → explicit targets
+    // ── Process positional args: separate targets from bare message text ──
+    // Two grammars, keyed on how the message arrives:
+    //   - Separated with `--` (or --stdin/--file/--base64): every positional
+    //     is a target and the `@` is optional. Nothing else could be the
+    //     message, so there is nothing to disambiguate — and PowerShell
+    //     swallows a bare `@name` before hcom ever sees it, which turns
+    //     `hcom send @michael -- text` into a broadcast.
+    //   - Otherwise the pre-`--` compatibility form is unchanged: `@x` args
+    //     are targets, one bare arg is the message text, and a lone
+    //     `@name message` arg is the whole text with mentions parsed from it.
     let (effective_targets, compat_message) =
         if !args.has_separator() && !args.stdin && args.file.is_none() && args.base64.is_none() {
             process_positionals(&args.positionals)
         } else {
-            // With -- separator or explicit source: validate @targets
-            let mut validated = Vec::new();
+            let mut validated = Vec::with_capacity(args.positionals.len());
             for arg in &args.positionals {
-                if let Some(stripped) = arg.strip_prefix('@') {
-                    if stripped.is_empty() {
-                        eprintln!("Error: Empty target '@' is not allowed");
-                        return 1;
-                    }
-                    validated.push(stripped.to_string());
-                } else {
-                    let mut msg = format!("Error: Unexpected argument '{arg}'");
-                    if arg.chars().all(|c| c.is_alphabetic()) && arg.len() <= 20 {
-                        msg.push_str(&format!("\nDid you mean @{arg}? Targets require @"));
-                    }
-                    eprintln!("{msg}");
+                let target = arg.strip_prefix('@').unwrap_or(arg);
+                if target.is_empty() {
+                    eprintln!("Error: Empty target '@' is not allowed");
                     return 1;
                 }
+                validated.push(target.to_string());
             }
             (validated, None)
         };
@@ -1368,7 +1366,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             "[hcom] Note: '--name {sender_name}' was stripped from the end of your message body."
         );
         println!("  Correct syntax (--name goes BEFORE --):");
-        println!("    hcom send --name {sender_name} @target -- your message");
+        println!("    hcom send --name {sender_name} target -- your message");
         println!("  To send '--name {sender_name}' as literal text, don't put it at the very end.");
     }
 
@@ -1727,6 +1725,205 @@ mod tests {
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         let _ = std::fs::remove_file(wal);
         let _ = std::fs::remove_file(shm);
+    }
+
+    // ── no-`@` targets (`hcom send luna -- hi`) ──
+
+    /// Parse argv the way the router does, including the `had_separator` flag
+    /// clap cannot see, and run the real `cmd_send`.
+    fn send_argv(argv: &[&str]) -> SendArgs {
+        let mut args = SendArgs::try_parse_from(argv).unwrap();
+        args.had_separator = argv.contains(&"--");
+        args
+    }
+
+    /// A live row named `luna` plus the test sender.
+    fn luna_db() -> (HcomDb, PathBuf, TestEnv) {
+        let (db, path, env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('luna', 'sess-luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+        (db, path, env)
+    }
+
+    /// The command context the router hands `cmd_send`: this seat as the
+    /// sender identity, so a send resolves and persists instead of refusing
+    /// for want of an identity.
+    fn sender_ctx() -> CommandContext {
+        CommandContext {
+            explicit_name: None,
+            identity: Some(sender(SenderKind::Instance, "sender")),
+            go: false,
+        }
+    }
+
+    fn delivered_to_luna(db: &HcomDb) -> Vec<String> {
+        let (_, data) = last_message(db);
+        data["delivered_to"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| n.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    #[serial]
+    fn separator_makes_every_positional_a_target_without_an_at_sign() {
+        // The PowerShell-safe form: no `@` to be swallowed, and `luna` lands
+        // in exact_targets as an ordinary target.
+        let (db, path, _env) = luna_db();
+        let rc = cmd_send(
+            &db,
+            &send_argv(&["send", "luna", "--", "hi"]),
+            Some(&sender_ctx()),
+        );
+        assert_eq!(rc, 0);
+        let (_, data) = last_message(&db);
+        assert_eq!(data["text"], "hi");
+        assert_eq!(delivered_to_luna(&db), vec!["luna".to_string()]);
+        assert_eq!(data["exact_targets"], serde_json::json!(["luna"]));
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_source_flag_makes_positionals_targets_without_an_at_sign() {
+        // Same rule for `--stdin`: the message arrives from the pipe, so the
+        // positionals can only be targets.
+        let (db, path, _env) = luna_db();
+        let msg_file = std::env::temp_dir().join(format!(
+            "hcom_send_stdin_{}_{}.txt",
+            std::process::id(),
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&msg_file, "hi from file").unwrap();
+
+        let args = SendArgs::try_parse_from(["send", "--file", msg_file.to_str().unwrap(), "luna"])
+            .unwrap();
+        assert_eq!(args.positionals, vec!["luna"]);
+        assert_eq!(cmd_send(&db, &args, Some(&sender_ctx())), 0);
+
+        let (_, data) = last_message(&db);
+        assert_eq!(data["text"], "hi from file");
+        assert_eq!(delivered_to_luna(&db), vec!["luna".to_string()]);
+        assert_eq!(data["exact_targets"], serde_json::json!(["luna"]));
+        let _ = std::fs::remove_file(&msg_file);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_leading_at_sign_is_still_accepted_with_the_separator() {
+        // Both spellings reach the same target, so existing invocations and
+        // new no-`@` ones agree on the wire.
+        let (db, path, _env) = luna_db();
+        assert_eq!(
+            cmd_send(
+                &db,
+                &send_argv(&["send", "@luna", "--", "hi"]),
+                Some(&sender_ctx())
+            ),
+            0
+        );
+        let (_, data) = last_message(&db);
+        assert_eq!(data["exact_targets"], serde_json::json!(["luna"]));
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn several_no_at_positionals_are_several_targets() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('luna', 'sess-luna', 1000.0), ('nova', 'sess-nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            cmd_send(
+                &db,
+                &send_argv(&["send", "luna", "nova", "--", "hi"]),
+                Some(&sender_ctx())
+            ),
+            0
+        );
+        let (_, data) = last_message(&db);
+        let mut targets = data["exact_targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        targets.sort();
+        assert_eq!(targets, vec!["luna".to_string(), "nova".to_string()]);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn without_the_separator_a_bare_positional_is_still_the_message() {
+        // Compatibility unchanged: `hcom send luna` sends "luna" to everyone,
+        // it does not address the agent named luna.
+        let (db, path, _env) = luna_db();
+        let args = SendArgs::try_parse_from(["send", "luna"]).unwrap();
+        assert!(!args.had_separator);
+        assert_eq!(cmd_send(&db, &args, Some(&sender_ctx())), 0);
+        let (_, data) = last_message(&db);
+        assert_eq!(data["text"], "luna");
+        assert_eq!(data["scope"], serde_json::json!("broadcast"));
+        assert!(data.get("exact_targets").is_none());
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn without_the_separator_an_at_name_still_addresses_the_agent() {
+        // The other half of the compatibility contract: with no `--`, `@luna`
+        // is a target and the message still has to come from stdin.
+        let (db, path, _env) = luna_db();
+        let args = SendArgs::try_parse_from(["send", "@luna"]).unwrap();
+        assert!(!args.had_separator);
+        // No message source and stdin is a terminal-less test process: the
+        // resolution refuses rather than silently broadcasting.
+        assert_eq!(cmd_send(&db, &args, Some(&sender_ctx())), 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "nothing may be persisted for a refused send");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_lone_at_sign_is_still_rejected_as_a_target() {
+        // `send @ -- hi` reaches clap's parser and never cmd_send; the empty
+        // target is refused there. Same for a stripped-to-nothing positional.
+        assert!(SendArgs::try_parse_from(["send", "@", "--", "hi"]).is_err());
+        let args = send_argv(&["send", "@luna", "--", "hi"]);
+        assert_eq!(args.positionals, vec!["@luna"]);
+    }
+
+    #[test]
+    fn no_at_form_is_documented_as_the_primary_send_form() {
+        // The help is what an agent reads first: it has to show the no-`@`
+        // form, not just the `@` form.
+        assert!(SEND_AFTER_HELP.contains("hcom send luna -- Hello there!"));
+        assert!(
+            crate::commands::help::get_command_help("send").contains("send name -- message text")
+        );
     }
 
     #[test]
