@@ -201,6 +201,7 @@ pub const OMP_REROOT_PROMPT_WINDOW: Duration = Duration::from_secs(30);
 /// before leftovers are abandoned (the screen model keeps them for launch
 /// diagnostics); a dead consumer delays shutdown by this bound instead of
 /// hanging it forever.
+#[cfg(unix)]
 pub const POST_EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Proxy-only option consumed before the wrapped tool's argument vector is built.
