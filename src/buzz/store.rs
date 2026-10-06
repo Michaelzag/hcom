@@ -17,6 +17,11 @@
 //!   and it only moves in the transaction that stored what it points at.
 //! - `obligations`: one row per (inbound event, hcom target), written in the
 //!   transaction that marks the event routed, before anything is sent.
+//!
+//! Outbound work is `outbox`, one row per (epoch, hcom id, destination)
+//! holding the signed event every retry sends, and `outbox_ids`, every event
+//! id a row has ever prepared, so a refused post is looked up by all of them
+//! before it is ever re-signed.
 
 use std::path::Path;
 
@@ -34,9 +39,9 @@ pub const OBLIGATION_WINDOW_SECS: i64 = 15 * 60;
 /// subscription starts the same distance before now.
 pub const BACKFILL_SLACK_SECS: u64 = 960;
 
-/// An entry older than this and still unacked is looked up by id before it is
-/// re-signed with a fresh `created_at`.
-pub const STALE_OUTBOX_SECS: u64 = 840;
+/// Columns of an outbox row, in `row_to_outbox` order.
+const OUTBOX_COLUMNS: &str = "epoch, hcom_id, destination, signer_name, signed_json, buzz_id, \
+     recipients, state, attempts, next_at, last_error";
 
 /// Kinds the reader subscribes to, per bridged channel.
 pub const CHANNEL_KINDS: &[u16] = &[9, 40002, 45001, 45003, 40003, 5, 9005, 39002];
@@ -152,15 +157,22 @@ pub struct SavedRoster {
 
 /// One outbound post: a signed event bound to a destination channel.
 ///
-/// The epoch is not a field: the store stamps the epoch it was queued under, so
-/// a caller cannot queue a post against a stale one.
+/// States: `pending` and `retry` (owed to the relay, the stored event resent
+/// as is), `posted` (acknowledged), `logged` (its hcom delivery status
+/// written) and `failed` (the relay will never take it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {
+    /// The hcom DB epoch the row was prepared under. `prepare_outbox` stamps
+    /// the store's own, so a caller cannot prepare against a stale one.
+    pub epoch: String,
     pub hcom_id: i64,
     pub destination: String,
     pub signer_name: String,
     pub signed_json: String,
     pub buzz_id: String,
+    /// Hosted rows the hcom message was for, whose delivery status is logged
+    /// once the relay acknowledges the post.
+    pub recipients: Vec<String>,
     pub state: String,
     pub attempts: u32,
     pub next_at: i64,
@@ -354,6 +366,7 @@ impl Store {
                 signer_name TEXT NOT NULL,
                 signed_json TEXT NOT NULL,
                 buzz_id TEXT NOT NULL,
+                recipients TEXT NOT NULL,
                 state TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_at INTEGER NOT NULL DEFAULT 0,
@@ -361,7 +374,13 @@ impl Store {
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (epoch, hcom_id, destination));
              CREATE INDEX IF NOT EXISTS outbox_due ON outbox (state, next_at);
-             CREATE INDEX IF NOT EXISTS outbox_buzz ON outbox (buzz_id);",
+             CREATE TABLE IF NOT EXISTS outbox_ids (
+                buzz_id TEXT PRIMARY KEY,
+                epoch TEXT NOT NULL,
+                hcom_id INTEGER NOT NULL,
+                destination TEXT NOT NULL);
+             CREATE INDEX IF NOT EXISTS outbox_ids_row
+                ON outbox_ids (epoch, hcom_id, destination);",
         )?;
         Ok(())
     }
@@ -1199,14 +1218,18 @@ impl Store {
 
     // ── outbox ───────────────────────────────────────────────────────────
 
-    /// Queue one signed post. The (epoch, hcom id, destination) key makes a
-    /// re-read of the same hcom message a no-op.
-    pub fn enqueue_outbox(&self, row: &OutboxRow) -> Result<bool> {
-        let inserted = self.conn.execute(
+    /// Prepare one post: its signed event and the hosted recipients it is
+    /// for, keyed (epoch, hcom id, destination), plus the event's id in the
+    /// row's id history, in one transaction. A re-read of the same hcom
+    /// message prepares nothing new, so the stored event is the one every
+    /// retry sends. The store stamps its own epoch, never the row's.
+    pub fn prepare_outbox(&self, row: &OutboxRow) -> Result<bool> {
+        let tx = self.write_txn()?;
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO outbox
-                (epoch, hcom_id, destination, signer_name, signed_json, buzz_id,
+                (epoch, hcom_id, destination, signer_name, signed_json, buzz_id, recipients,
                  state, attempts, next_at, last_error, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, NULL, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, ?8, NULL, ?9)",
             params![
                 self.epoch,
                 row.hcom_id,
@@ -1214,10 +1237,19 @@ impl Store {
                 row.signer_name,
                 row.signed_json,
                 row.buzz_id,
+                serde_json::to_string(&row.recipients)?,
                 row.next_at,
                 crate::shared::time::now_epoch_i64()
             ],
         )?;
+        if inserted == 1 {
+            tx.execute(
+                "INSERT OR IGNORE INTO outbox_ids (buzz_id, epoch, hcom_id, destination)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![row.buzz_id, self.epoch, row.hcom_id, row.destination],
+            )?;
+        }
+        tx.commit()?;
         Ok(inserted == 1)
     }
 
@@ -1226,96 +1258,123 @@ impl Store {
     /// Not epoch-filtered: an unposted row carries its own signed event, so it
     /// still goes out after a `hcom reset` moved every hcom id under it.
     pub fn due_outbox(&self, destination: &str, now: i64) -> Result<Vec<OutboxRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT epoch, hcom_id, destination, signer_name, signed_json, buzz_id,
-                    state, attempts, next_at, last_error
-             FROM outbox
-             WHERE destination = ?1 AND state IN ('pending', 'retry')
-               AND next_at <= ?2
-             ORDER BY hcom_id, buzz_id",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {OUTBOX_COLUMNS} FROM outbox
+             WHERE destination = ?1 AND state IN ('pending', 'retry') AND next_at <= ?2
+             ORDER BY hcom_id, buzz_id"
+        ))?;
         let rows = stmt
             .query_map(params![destination, now], row_to_outbox)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Outbox rows unacked for longer than `STALE_OUTBOX_SECS`.
-    pub fn stale_outbox(&self, now: i64) -> Result<Vec<OutboxRow>> {
+    /// Every event id this row has ever prepared, oldest first: any of them
+    /// may be the one the relay stored.
+    pub fn prepared_ids(&self, row: &OutboxRow) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT epoch, hcom_id, destination, signer_name, signed_json, buzz_id,
-                    state, attempts, next_at, last_error
-             FROM outbox
-             WHERE state IN ('pending', 'retry') AND created_at <= ?1
-             ORDER BY created_at, hcom_id",
+            "SELECT buzz_id FROM outbox_ids
+             WHERE epoch = ?1 AND hcom_id = ?2 AND destination = ?3
+             ORDER BY rowid",
         )?;
-        let rows = stmt
-            .query_map(params![now - STALE_OUTBOX_SECS as i64], row_to_outbox)?
+        let ids = stmt
+            .query_map(params![row.epoch, row.hcom_id, row.destination], |r| {
+                r.get(0)
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        Ok(ids)
     }
 
-    /// Acknowledge a delivered post, identified by its Buzz event id: the id
-    /// is globally unique, so it survives an epoch change the hcom id does not.
-    pub fn ack_outbox(&self, buzz_id: &str) -> Result<()> {
+    /// The relay acknowledged the post (or holds one of its prepared ids).
+    pub fn mark_outbox_posted(&self, row: &OutboxRow) -> Result<()> {
         self.conn.execute(
-            "UPDATE outbox SET state = 'sent', attempts = attempts + 1, last_error = NULL
-             WHERE buzz_id = ?1",
-            params![buzz_id],
+            "UPDATE outbox SET state = 'posted', attempts = attempts + 1, last_error = NULL
+             WHERE epoch = ?1 AND hcom_id = ?2 AND destination = ?3
+               AND state IN ('pending', 'retry')",
+            params![row.epoch, row.hcom_id, row.destination],
         )?;
         Ok(())
     }
 
-    /// Reschedule a post that failed transiently.
-    pub fn retry_outbox(&self, buzz_id: &str, next_at: i64, error: &str) -> Result<()> {
+    /// Posted rows whose hcom delivery status isn't logged yet: right after
+    /// the ack, or after a crash between the two.
+    pub fn posted_unlogged(&self) -> Result<Vec<OutboxRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {OUTBOX_COLUMNS} FROM outbox WHERE state = 'posted'
+             ORDER BY created_at, hcom_id"
+        ))?;
+        let rows = stmt
+            .query_map([], row_to_outbox)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The delivery status is logged: the row is finished.
+    pub fn mark_outbox_logged(&self, row: &OutboxRow) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbox SET state = 'logged'
+             WHERE epoch = ?1 AND hcom_id = ?2 AND destination = ?3 AND state = 'posted'",
+            params![row.epoch, row.hcom_id, row.destination],
+        )?;
+        Ok(())
+    }
+
+    /// Reschedule a post that failed transiently. Its stored event stays.
+    pub fn retry_outbox(&self, row: &OutboxRow, next_at: i64, error: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE outbox
-             SET state = 'retry', attempts = attempts + 1, next_at = ?2, last_error = ?3
-             WHERE buzz_id = ?1",
-            params![buzz_id, next_at, error],
+             SET state = 'retry', attempts = attempts + 1, next_at = ?4, last_error = ?5
+             WHERE epoch = ?1 AND hcom_id = ?2 AND destination = ?3
+               AND state IN ('pending', 'retry')",
+            params![row.epoch, row.hcom_id, row.destination, next_at, error],
         )?;
         Ok(())
     }
 
     /// Mark a post the relay will never accept.
-    pub fn fail_outbox(&self, buzz_id: &str, error: &str) -> Result<()> {
+    pub fn fail_outbox(&self, row: &OutboxRow, error: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE outbox SET state = 'failed', attempts = attempts + 1, last_error = ?2
-             WHERE buzz_id = ?1",
-            params![buzz_id, error],
+            "UPDATE outbox SET state = 'failed', attempts = attempts + 1, last_error = ?4
+             WHERE epoch = ?1 AND hcom_id = ?2 AND destination = ?3
+               AND state IN ('pending', 'retry')",
+            params![row.epoch, row.hcom_id, row.destination, error],
         )?;
         Ok(())
     }
 
-    /// Swap an outbox row's signed event for a re-signed one, after an id
-    /// lookup proved the relay never stored the old one. Keyed by the old Buzz
-    /// id, which is unique across epochs, so a row queued before an hcom
-    /// reset is re-signed in place rather than lost. The row goes straight back
-    /// to the publisher.
-    pub fn replace_outbox_event(
-        &self,
-        old_buzz_id: &str,
-        buzz_id: &str,
-        signed_json: &str,
-        created_at: i64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE outbox
-             SET buzz_id = ?2, signed_json = ?3, created_at = ?4,
-                 state = 'retry', next_at = ?4
-             WHERE buzz_id = ?1",
-            params![old_buzz_id, buzz_id, signed_json, created_at],
+    /// Swap a row's signed event for a re-signed one, once a lookup over
+    /// every id it ever prepared proved the relay holds none of them, and add
+    /// the new id to that history, in one transaction. The row goes straight
+    /// back to the publisher.
+    pub fn resign_outbox(&self, row: &OutboxRow, buzz_id: &str, signed_json: &str) -> Result<()> {
+        let tx = self.write_txn()?;
+        tx.execute(
+            "UPDATE outbox SET buzz_id = ?4, signed_json = ?5, state = 'retry', next_at = 0
+             WHERE epoch = ?1 AND hcom_id = ?2 AND destination = ?3
+               AND state IN ('pending', 'retry')",
+            params![
+                row.epoch,
+                row.hcom_id,
+                row.destination,
+                buzz_id,
+                signed_json
+            ],
         )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO outbox_ids (buzz_id, epoch, hcom_id, destination)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![buzz_id, row.epoch, row.hcom_id, row.destination],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Move an outbox row's `created_at`, so a test can age it past the
-    /// re-check window without waiting 14 minutes.
+    /// Make every unposted row due now, so a test need not wait out backoff.
     #[cfg(test)]
-    pub fn age_outbox(&self, buzz_id: &str, created_at: i64) -> Result<()> {
+    pub fn make_outbox_due(&self) -> Result<()> {
         self.conn.execute(
-            "UPDATE outbox SET created_at = ?2 WHERE buzz_id = ?1",
-            params![buzz_id, created_at],
+            "UPDATE outbox SET next_at = 0 WHERE state IN ('pending', 'retry')",
+            [],
         )?;
         Ok(())
     }
@@ -1325,7 +1384,8 @@ impl Store {
         state_counts(&self.conn, "outbox")
     }
 
-    /// Every non-sent outbox row, for `hcom buzz down`'s leftovers report.
+    /// Every outbox row the relay hasn't acknowledged, for `hcom buzz down`'s
+    /// leftovers report.
     pub fn unsent_outbox(&self) -> Result<Vec<OutboxRow>> {
         unsent_outbox_on(&self.conn)
     }
@@ -1512,13 +1572,11 @@ fn enrolled_count_on(conn: &Connection) -> Result<i64> {
 }
 
 fn unsent_outbox_on(conn: &Connection) -> Result<Vec<OutboxRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT epoch, hcom_id, destination, signer_name, signed_json, buzz_id,
-                state, attempts, next_at, last_error
-         FROM outbox
-         WHERE state != 'sent'
-         ORDER BY created_at, hcom_id",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {OUTBOX_COLUMNS} FROM outbox
+         WHERE state NOT IN ('posted', 'logged')
+         ORDER BY created_at, hcom_id"
+    ))?;
     let rows = stmt
         .query_map([], row_to_outbox)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1555,16 +1613,19 @@ fn row_to_cached(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedEvent> {
 }
 
 fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
+    let recipients: String = row.get(6)?;
     Ok(OutboxRow {
+        epoch: row.get(0)?,
         hcom_id: row.get(1)?,
         destination: row.get(2)?,
         signer_name: row.get(3)?,
         signed_json: row.get(4)?,
         buzz_id: row.get(5)?,
-        state: row.get(6)?,
-        attempts: row.get::<_, i64>(7)? as u32,
-        next_at: row.get(8)?,
-        last_error: row.get(9)?,
+        recipients: serde_json::from_str(&recipients).unwrap_or_default(),
+        state: row.get(7)?,
+        attempts: row.get::<_, i64>(8)? as u32,
+        next_at: row.get(9)?,
+        last_error: row.get(10)?,
     })
 }
 
@@ -2100,55 +2161,97 @@ mod tests {
         assert!(err.to_string().contains("hcom buzz serve"), "{err}");
     }
 
-    #[test]
-    fn outbox_is_keyed_by_epoch_hcom_id_and_destination() {
-        let (_dir, store) = store();
-        let row = |id: i64, destination: &str| OutboxRow {
-            hcom_id: id,
+    fn outbox_row(hcom_id: i64, destination: &str, buzz_id: &str) -> OutboxRow {
+        OutboxRow {
+            epoch: String::new(),
+            hcom_id,
             destination: destination.into(),
             signer_name: "luna".into(),
             signed_json: "{}".into(),
-            buzz_id: format!("buzz-{id}-{destination}"),
+            buzz_id: buzz_id.into(),
+            recipients: vec!["michael".into()],
             state: "pending".into(),
             attempts: 0,
             next_at: 0,
             last_error: None,
-        };
+        }
+    }
 
-        assert!(store.enqueue_outbox(&row(1, "chan-1")).unwrap());
+    /// The row as the store holds it, epoch stamped.
+    fn stored_row(store: &Store, hcom_id: i64, destination: &str) -> OutboxRow {
+        store
+            .unsent_outbox()
+            .unwrap()
+            .into_iter()
+            .chain(store.posted_unlogged().unwrap())
+            .find(|row| row.hcom_id == hcom_id && row.destination == destination)
+            .expect("a stored row")
+    }
+
+    #[test]
+    fn outbox_is_keyed_by_epoch_hcom_id_and_destination() {
+        let (_dir, store) = store();
+        assert!(store.prepare_outbox(&outbox_row(1, "chan-1", "a")).unwrap());
         assert!(
-            !store.enqueue_outbox(&row(1, "chan-1")).unwrap(),
-            "same key twice"
+            !store.prepare_outbox(&outbox_row(1, "chan-1", "b")).unwrap(),
+            "a re-read keeps the event first prepared"
         );
+        assert_eq!(stored_row(&store, 1, "chan-1").buzz_id, "a");
         assert!(
-            store.enqueue_outbox(&row(1, "chan-2")).unwrap(),
+            store.prepare_outbox(&outbox_row(1, "chan-2", "c")).unwrap(),
             "other destination"
         );
         assert!(
-            store.enqueue_outbox(&row(2, "chan-1")).unwrap(),
+            store.prepare_outbox(&outbox_row(2, "chan-1", "d")).unwrap(),
             "other message"
         );
+        let first = stored_row(&store, 1, "chan-1");
+        assert_eq!(first.epoch, "epoch-1", "stamped by the store");
+        assert_eq!(first.recipients, vec!["michael".to_string()]);
 
         assert_eq!(store.due_outbox("chan-1", 100).unwrap().len(), 2);
-        assert_eq!(store.unsent_outbox().unwrap().len(), 3);
-
-        store.retry_outbox("buzz-1-chan-1", 900, "503").unwrap();
+        store.retry_outbox(&first, 900, "503").unwrap();
         assert_eq!(store.due_outbox("chan-1", 100).unwrap().len(), 1);
         assert_eq!(store.due_outbox("chan-1", 1000).unwrap().len(), 2);
 
-        store.ack_outbox("buzz-1-chan-1").unwrap();
+        store.mark_outbox_posted(&first).unwrap();
         store
-            .fail_outbox("buzz-2-chan-1", "rejected: nope")
+            .fail_outbox(&stored_row(&store, 2, "chan-1"), "rejected: nope")
             .unwrap();
         assert_eq!(store.unsent_outbox().unwrap().len(), 2);
+        assert_eq!(store.posted_unlogged().unwrap().len(), 1);
+        store.mark_outbox_logged(&first).unwrap();
+        assert!(store.posted_unlogged().unwrap().is_empty());
 
         let counts = store.outbox_counts().unwrap();
-        assert!(counts.iter().any(|(state, n)| state == "sent" && *n == 1));
-        assert!(counts.iter().any(|(state, n)| state == "failed" && *n == 1));
-        assert!(
-            counts
-                .iter()
-                .any(|(state, n)| state == "pending" && *n == 1)
+        assert!(counts.contains(&("logged".to_string(), 1)));
+        assert!(counts.contains(&("failed".to_string(), 1)));
+        assert!(counts.contains(&("pending".to_string(), 1)));
+    }
+
+    #[test]
+    fn a_row_remembers_every_id_it_prepared() {
+        let (_dir, store) = store();
+        store.prepare_outbox(&outbox_row(1, "chan-1", "a")).unwrap();
+        let row = stored_row(&store, 1, "chan-1");
+        store.resign_outbox(&row, "b", "{\"b\":1}").unwrap();
+        let row = stored_row(&store, 1, "chan-1");
+        assert_eq!(row.buzz_id, "b");
+        assert_eq!(row.state, "retry");
+        store.resign_outbox(&row, "c", "{\"c\":1}").unwrap();
+        assert_eq!(
+            store
+                .prepared_ids(&stored_row(&store, 1, "chan-1"))
+                .unwrap(),
+            vec!["a", "b", "c"]
+        );
+        // Another row's ids are its own.
+        store.prepare_outbox(&outbox_row(1, "chan-2", "x")).unwrap();
+        assert_eq!(
+            store
+                .prepared_ids(&stored_row(&store, 1, "chan-2"))
+                .unwrap(),
+            vec!["x"]
         );
     }
 
@@ -2156,17 +2259,7 @@ mod tests {
     fn an_epoch_change_keeps_unposted_outbox_sendable() {
         let (_dir, mut store) = store();
         store
-            .enqueue_outbox(&OutboxRow {
-                hcom_id: 7,
-                destination: "chan-1".into(),
-                signer_name: "luna".into(),
-                signed_json: "{}".into(),
-                buzz_id: "buzz-7".into(),
-                state: "pending".into(),
-                attempts: 0,
-                next_at: 0,
-                last_error: None,
-            })
+            .prepare_outbox(&outbox_row(7, "chan-1", "buzz-7"))
             .unwrap();
 
         store.adopt_epoch("epoch-2".into()).unwrap();
@@ -2177,9 +2270,12 @@ mod tests {
             "an unposted post still goes out after hcom reset"
         );
         assert_eq!(due[0].hcom_id, 7);
-        assert_eq!(store.unsent_outbox().unwrap().len(), 1);
+        assert_eq!(
+            due[0].epoch, "epoch-1",
+            "keyed under the epoch it was prepared in"
+        );
 
-        store.ack_outbox("buzz-7").unwrap();
+        store.mark_outbox_posted(&due[0]).unwrap();
         assert!(store.unsent_outbox().unwrap().is_empty());
         assert_eq!(store.epoch(), "epoch-2");
     }
@@ -2187,55 +2283,23 @@ mod tests {
     #[test]
     fn outbox_rows_under_one_epoch_do_not_collide_after_a_change() {
         let (_dir, mut store) = store();
-        let row = |id: i64, buzz: &str| OutboxRow {
-            hcom_id: id,
-            destination: "chan-1".into(),
-            signer_name: "luna".into(),
-            signed_json: "{}".into(),
-            buzz_id: buzz.into(),
-            state: "pending".into(),
-            attempts: 0,
-            next_at: 0,
-            last_error: None,
-        };
-        store.enqueue_outbox(&row(1, "buzz-1")).unwrap();
+        store
+            .prepare_outbox(&outbox_row(1, "chan-1", "buzz-1"))
+            .unwrap();
 
-        // After a reset, hcom ids restart from 1 and a new message queues under
-        // the same id: the unposted row must not be swallowed by its key.
+        // After a reset, hcom ids restart from 1 and a new message is
+        // prepared under the same id: the unposted row must not swallow it.
         store.adopt_epoch("epoch-2".into()).unwrap();
-        store.enqueue_outbox(&row(1, "buzz-1-fresh")).unwrap();
-        assert_eq!(store.due_outbox("chan-1", 100).unwrap().len(), 2);
-        store.ack_outbox("buzz-1").unwrap();
+        store
+            .prepare_outbox(&outbox_row(1, "chan-1", "buzz-1-fresh"))
+            .unwrap();
+        let due = store.due_outbox("chan-1", 100).unwrap();
+        assert_eq!(due.len(), 2);
+        let old = due.iter().find(|row| row.buzz_id == "buzz-1").unwrap();
+        store.mark_outbox_posted(old).unwrap();
         let due = store.due_outbox("chan-1", 100).unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].buzz_id, "buzz-1-fresh");
-    }
-
-    #[test]
-    fn stale_outbox_only_returns_old_unacked_rows() {
-        let (_dir, store) = store();
-        let now = crate::shared::time::now_epoch_i64();
-        store
-            .enqueue_outbox(&OutboxRow {
-                hcom_id: 1,
-                destination: "chan-1".into(),
-                signer_name: "luna".into(),
-                signed_json: "{}".into(),
-                buzz_id: "a".into(),
-                state: "pending".into(),
-                attempts: 0,
-                next_at: 0,
-                last_error: None,
-            })
-            .unwrap();
-        assert!(store.stale_outbox(now).unwrap().is_empty(), "fresh row");
-        assert!(
-            store
-                .stale_outbox(now + STALE_OUTBOX_SECS as i64 + 5)
-                .unwrap()
-                .len()
-                == 1
-        );
     }
 
     #[test]
@@ -2243,19 +2307,11 @@ mod tests {
         let (_dir, store) = store();
         for (id, error) in [(1_i64, "first"), (2, "second")] {
             store
-                .enqueue_outbox(&OutboxRow {
-                    hcom_id: id,
-                    destination: "chan-1".into(),
-                    signer_name: "luna".into(),
-                    signed_json: "{}".into(),
-                    buzz_id: format!("b{id}"),
-                    state: "pending".into(),
-                    attempts: 0,
-                    next_at: 0,
-                    last_error: None,
-                })
+                .prepare_outbox(&outbox_row(id, "chan-1", &format!("b{id}")))
                 .unwrap();
-            store.fail_outbox(&format!("b{id}"), error).unwrap();
+            store
+                .fail_outbox(&stored_row(&store, id, "chan-1"), error)
+                .unwrap();
         }
         let errors = store.recent_errors(10).unwrap();
         assert_eq!(errors.len(), 2);

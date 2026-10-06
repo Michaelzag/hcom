@@ -85,6 +85,9 @@ pub struct Switches {
     /// Store a posted event, then answer 503: an acknowledgement lost after
     /// the relay kept the event.
     pub drop_ack: AtomicBool,
+    /// Answer `/query` with this status (0: answer normally), so a lookup
+    /// can fail while posting works.
+    pub query_status: AtomicU16,
 }
 
 struct Subscription {
@@ -758,6 +761,16 @@ fn handle_http(stream: TcpStream, url: &str, state: &Mutex<State>, switches: &Sw
             );
         }
         ("POST", "/query") => {
+            let query_status = switches.query_status.load(Ordering::SeqCst);
+            if query_status != 0 {
+                respond(
+                    &mut stream,
+                    query_status,
+                    json!({"error":"error: query unavailable"}),
+                    switches,
+                );
+                return;
+            }
             let Some(filters) = value.as_array() else {
                 respond(
                     &mut stream,

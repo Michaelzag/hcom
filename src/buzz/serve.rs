@@ -56,8 +56,6 @@ const WS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Post retry backoff bounds.
 const POST_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const POST_BACKOFF_MAX: Duration = Duration::from_secs(60);
-/// An outbox entry older than this is looked up by id before a re-send.
-const STALE_RECHECK_AFTER: Duration = Duration::from_secs(store::STALE_OUTBOX_SECS);
 
 /// A signing key and its identity.
 #[derive(Clone)]
@@ -468,7 +466,6 @@ pub fn serve(config: Config) -> Result<i32> {
         notify,
         epoch,
         last_enroll: Instant::now(),
-        last_stale_check: Instant::now(),
         buckets,
         held_until: HashMap::new(),
         draining: false,
@@ -1037,7 +1034,6 @@ struct MainLoop {
     notify: crate::notify::NotifyServer,
     epoch: String,
     last_enroll: Instant,
-    last_stale_check: Instant,
     buckets: HashMap<String, TokenBucket>,
     /// A 429's `retry in Ns`, per signing key: every write by that key waits.
     held_until: HashMap<String, Instant>,
@@ -1057,7 +1053,6 @@ impl MainLoop {
             notify: crate::notify::NotifyServer::new().expect("notify endpoint"),
             epoch,
             last_enroll: Instant::now(),
-            last_stale_check: Instant::now(),
             buckets: HashMap::new(),
             held_until: HashMap::new(),
             draining: false,
@@ -1129,10 +1124,8 @@ impl MainLoop {
         self.reregister_missing_rows();
         self.scan_outbound();
         self.flush_all_channels();
-        if self.last_stale_check.elapsed() >= Duration::from_secs(60) {
-            self.last_stale_check = Instant::now();
-            self.recheck_stale_outbox();
-        }
+        // Finishes rows a crash left acknowledged but not yet logged.
+        self.log_posted();
     }
 
     /// `hcom reset` replaced hcom.db: the open connection still points at the
@@ -1545,52 +1538,74 @@ impl MainLoop {
                 posts
             }
         };
+        // The hosted rows this message was for: their delivery status is
+        // logged once the relay holds the post.
+        let hosted = self.hosted_rows();
+        let mut recipients: Vec<String> = outbound
+            .delivered_to
+            .iter()
+            .filter(|name| hosted.contains(name))
+            .cloned()
+            .collect();
+        if !recipients.iter().any(|name| name == hosted_row) {
+            recipients.push(hosted_row.to_string());
+        }
         for destination in posts {
-            self.queue_post(&identity, hcom_id, &destination, &message.text)?;
+            self.prepare_post(&identity, hcom_id, &destination, &message.text, &recipients)?;
         }
         Ok(())
     }
 
-    /// Sign one post and queue it. Signing first means the Buzz id is known
-    /// before the send, which is what makes the outbox idempotent.
+    /// Sign one post and store it before the hosted cursor moves. Signing
+    /// first means the Buzz id is known before the send; storing it means
+    /// every retry sends that same event.
+    ///
+    /// The event carries `["hcom", "<epoch>:<hcom id>"]`, so two distinct
+    /// sends with the same text, signer, channel and second are two events,
+    /// never one id that acknowledges both. A re-read of the same message is
+    /// a no-op by key and keeps the event first stored.
     ///
     /// The outbox records `identity.row` (`luna`, or `luna:BOXE` for a
     /// mirror). The publisher re-derives the key from it for NIP-98, so it must
     /// carry the device: the bare name derives this device's key, and the
     /// relay refuses a header that doesn't match the event's author.
-    fn queue_post(
+    fn prepare_post(
         &self,
         identity: &AgentIdentity,
         hcom_id: i64,
         destination: &route::Destination,
         text: &str,
+        recipients: &[String],
     ) -> Result<()> {
+        let store = self.connector.store.lock();
+        let mut tags = route::message_tags(destination);
+        tags.push(vec!["hcom".into(), format!("{}:{hcom_id}", store.epoch())]);
         let event = sign(
             UnsignedEvent {
                 created_at: nostr::now(),
                 kind: route::KIND_MESSAGE,
-                tags: route::message_tags(destination),
+                tags,
                 content: route::post_content(text),
             },
             &identity.key,
         );
         let row = OutboxRow {
+            epoch: store.epoch().to_string(),
             hcom_id,
             destination: destination.channel_id.clone(),
             signer_name: identity.row.clone(),
             signed_json: serde_json::to_string(&event)?,
             buzz_id: event.id.clone(),
+            recipients: recipients.to_vec(),
             state: "pending".into(),
             attempts: 0,
             next_at: 0,
             last_error: None,
         };
-        // Re-reading a message after a crash re-queues nothing: the key is
-        // already there, so the same Buzz id is posted at most once.
-        if self.connector.store.lock().enqueue_outbox(&row)? {
+        if store.prepare_outbox(&row)? {
             crate::log::log_info(
                 "buzz",
-                "serve.queued",
+                "serve.prepared",
                 &format!("{} #{hcom_id} -> {}", identity.row, destination.channel_id),
             );
         }
@@ -1682,17 +1697,7 @@ impl MainLoop {
                 .http
                 .post_event(&event, &identity.key, Some(&tag))
             {
-                Ok(()) => {
-                    crate::log::log_info(
-                        "buzz",
-                        "serve.posted",
-                        &format!("{} {} -> {channel_id}", row.signer_name, row.buzz_id),
-                    );
-                    {
-                        let store = self.connector.store.lock();
-                        let _ = store.ack_outbox(&row.buzz_id);
-                    }
-                }
+                Ok(()) => self.mark_posted(&row),
                 Err(PublishError::RateLimited { retry_after }) => {
                     // Per-key: this signer's every write waits, not just this row.
                     self.hold_key(&identity.pubkey, retry_after);
@@ -1711,12 +1716,13 @@ impl MainLoop {
                         + post_retry_delay(row.attempts).as_secs() as i64;
                     self.retry_row(&row, next, "relay timed out");
                 }
-                // An outage longer than the relay's ±900 s admission window:
-                // the event was never stored, so it goes out again re-signed.
+                // The relay refuses a created_at outside its ±900 s window
+                // before it checks for a duplicate, so this says nothing about
+                // whether it stored the event earlier: find out first.
                 Err(PublishError::Rejected(message))
                     if message.contains("too far from server time") =>
                 {
-                    self.resign_row(&row, &identity);
+                    self.recover_rejected(&row, &identity);
                 }
                 Err(PublishError::Rejected(message)) => {
                     // The relay will never accept this event.
@@ -1732,51 +1738,120 @@ impl MainLoop {
         }
     }
 
-    /// An outbox entry unacked past `STALE_OUTBOX_SECS` (inside the relay's
-    /// 900 s admission window) is looked up by id first; only if the relay
-    /// answers that it never stored it is it re-signed with a fresh
-    /// `created_at`. A failed lookup proves nothing, so it waits for the next
-    /// check rather than risk posting twice.
-    fn recheck_stale_outbox(&mut self) {
-        let now = crate::shared::time::now_epoch_i64();
-        let stale = self
-            .connector
-            .store
-            .lock()
-            .stale_outbox(now)
-            .unwrap_or_default();
-        for row in stale {
-            let identity = self.connector.agent_identity(&row.signer_name);
-            let auth = identity.auth_tag(&self.connector.owner);
-            let tag = serde_json::to_string(&auth).unwrap_or_default();
-            let filter = json!({ "ids": [row.buzz_id], "kinds": store::CHANNEL_KINDS });
-            match self
-                .connector
-                .http
-                .query(&filter, &identity.key, Some(&tag))
-            {
-                // The relay has it after all: the lost ack, not a lost post.
-                Ok(events) if !events.is_empty() => {
-                    let _ = self.connector.store.lock().ack_outbox(&row.buzz_id);
-                    crate::log::log_info(
-                        "buzz",
-                        "serve.stale_present",
-                        &format!("{} {channel}", row.signer_name, channel = row.destination),
-                    );
-                }
-                Ok(_) => self.resign_row(&row, &identity),
-                Err(error) => crate::log::log_warn(
-                    "buzz",
-                    "serve.stale_lookup_failed",
-                    &format!("{}: {error}; checking again later", row.buzz_id),
-                ),
+    /// The relay holds the post: mark the row posted, then log the hcom
+    /// delivery status (`log_posted`, which also finishes any row a crash
+    /// left posted but unlogged).
+    fn mark_posted(&mut self, row: &OutboxRow) {
+        crate::log::log_info(
+            "buzz",
+            "serve.posted",
+            &format!("{} {} -> {}", row.signer_name, row.buzz_id, row.destination),
+        );
+        if let Err(error) = self.connector.store.lock().mark_outbox_posted(row) {
+            // Not recorded: the next pass posts the same event again, and the
+            // relay answers `duplicate:`.
+            crate::log::log_warn("buzz", "serve.posted_unrecorded", &error.to_string());
+            return;
+        }
+        self.log_posted();
+    }
+
+    /// Log the hcom delivery status of every posted row for its hosted
+    /// recipients, then mark it logged. Runs right after an ack and on every
+    /// tick, so a crash between the two is finished on restart.
+    fn log_posted(&mut self) {
+        let posted = match self.connector.store.lock().posted_unlogged() {
+            Ok(posted) => posted,
+            Err(error) => {
+                crate::log::log_warn("buzz", "serve.posted_unreadable", &error.to_string());
+                return;
+            }
+        };
+        for row in posted {
+            let detail = format!(
+                "hcom #{} posted to Buzz {} as {}",
+                row.hcom_id, row.destination, row.buzz_id
+            );
+            let logged = row.recipients.iter().try_for_each(|recipient| {
+                self.db.log_status_event(
+                    recipient,
+                    crate::shared::ST_LISTENING,
+                    &format!("deliver:{}", row.signer_name),
+                    Some(&detail),
+                    None,
+                )
+            });
+            if let Err(error) = logged {
+                crate::log::log_warn("buzz", "serve.status_unlogged", &error.to_string());
+                continue;
+            }
+            if let Err(error) = self.connector.store.lock().mark_outbox_logged(&row) {
+                crate::log::log_warn("buzz", "serve.status_unrecorded", &error.to_string());
             }
         }
     }
 
-    /// Re-sign an outbox row the relay never stored, with a fresh `created_at`.
-    /// Only the timestamp changes, so the thread shape, mentions and content
-    /// are exactly what the relay would have received.
+    /// A post the relay refused as outside its admission window. Re-sign only
+    /// once the relay is proven not to hold any id this row ever prepared: a
+    /// lookup that finds one marks the row posted (the ack was lost, the post
+    /// was not), and a lookup that fails keeps the stored event for a later
+    /// try. Re-signing on anything less could post the message twice.
+    fn recover_rejected(&mut self, row: &OutboxRow, identity: &AgentIdentity) {
+        let now = crate::shared::time::now_epoch_i64();
+        let ids = match self.connector.store.lock().prepared_ids(row) {
+            Ok(ids) if !ids.is_empty() => ids,
+            Ok(_) => vec![row.buzz_id.clone()],
+            Err(error) => {
+                self.retry_row(row, now + 1, &format!("prepared ids unreadable: {error}"));
+                return;
+            }
+        };
+        if let Err(wait) = self.take_http_token(&identity.pubkey) {
+            self.retry_row(
+                row,
+                now + wait.as_secs().max(1) as i64,
+                "HTTP token bucket exhausted",
+            );
+            return;
+        }
+        let auth = identity.auth_tag(&self.connector.owner);
+        let tag = serde_json::to_string(&auth).unwrap_or_default();
+        let filter = json!({ "ids": ids, "kinds": store::CHANNEL_KINDS });
+        match self
+            .connector
+            .http
+            .query(&filter, &identity.key, Some(&tag))
+        {
+            Ok(events)
+                if events
+                    .iter()
+                    .any(|event| ids.contains(&event.id) && nostr::verify(event)) =>
+            {
+                crate::log::log_info(
+                    "buzz",
+                    "serve.rejected_but_present",
+                    &format!(
+                        "{} -> {}: the relay holds it",
+                        row.signer_name, row.destination
+                    ),
+                );
+                self.mark_posted(row);
+            }
+            Ok(_) => self.resign_row(row, identity),
+            Err(error) => {
+                if let PublishError::RateLimited { retry_after } = &error {
+                    self.hold_key(&identity.pubkey, *retry_after);
+                }
+                let next = now + post_retry_delay(row.attempts).as_secs() as i64;
+                self.retry_row(row, next, &format!("lookup before re-sign failed: {error}"));
+            }
+        }
+    }
+
+    /// Re-sign an outbox row the relay holds no version of, with a fresh
+    /// `created_at`. Only the timestamp changes, so the thread shape, mentions,
+    /// hcom identity and content are exactly what the relay would have
+    /// received; the new id joins the row's id history.
     fn resign_row(&mut self, row: &OutboxRow, identity: &AgentIdentity) {
         let Ok(previous) = serde_json::from_str::<Event>(&row.signed_json) else {
             self.fail_row(row, "unreadable signed event");
@@ -1794,19 +1869,18 @@ impl MainLoop {
             &identity.key,
         );
         let signed = serde_json::to_string(&event).unwrap_or_default();
-        let now = crate::shared::time::now_epoch_i64();
-        if let Err(error) =
-            self.connector
-                .store
-                .lock()
-                .replace_outbox_event(&row.buzz_id, &event.id, &signed, now)
+        if let Err(error) = self
+            .connector
+            .store
+            .lock()
+            .resign_outbox(row, &event.id, &signed)
         {
             crate::log::log_warn("buzz", "serve.resign_failed", &error.to_string());
             return;
         }
         crate::log::log_info(
             "buzz",
-            "serve.stale_resigned",
+            "serve.resigned",
             &format!(
                 "{} -> {}: {} is now {}",
                 row.signer_name, row.destination, row.buzz_id, event.id
@@ -1842,9 +1916,13 @@ impl MainLoop {
             "serve.post_retry",
             &format!("{} {}: {error}", row.signer_name, row.destination),
         );
+        if let Err(failure) = self
+            .connector
+            .store
+            .lock()
+            .retry_outbox(row, next_at, error)
         {
-            let store = self.connector.store.lock();
-            let _ = store.retry_outbox(&row.buzz_id, next_at, error);
+            crate::log::log_warn("buzz", "serve.retry_unrecorded", &failure.to_string());
         }
     }
 
@@ -1854,9 +1932,8 @@ impl MainLoop {
             "serve.post_failed",
             &format!("{} {}: {error}", row.signer_name, row.destination),
         );
-        {
-            let store = self.connector.store.lock();
-            let _ = store.fail_outbox(&row.buzz_id, error);
+        if let Err(failure) = self.connector.store.lock().fail_outbox(row, error) {
+            crate::log::log_warn("buzz", "serve.fail_unrecorded", &failure.to_string());
         }
     }
 
@@ -3288,7 +3365,7 @@ mod tests {
 
         assert_eq!(
             harness.store().outbox_counts().unwrap(),
-            vec![("sent".to_string(), 1)]
+            vec![("logged".to_string(), 1)]
         );
         assert!(harness.unread("michael").is_empty(), "the cursor advanced");
     }
@@ -3308,7 +3385,7 @@ mod tests {
                 .outbox_counts()
                 .unwrap()
                 .iter()
-                .any(|(state, _)| state == "sent" || state == "failed")
+                .any(|(state, _)| state == "logged" || state == "failed")
         });
 
         let remote = public_hex(&nostr::derive_secret(&SEED, "luna@boxe"));
@@ -3322,7 +3399,7 @@ mod tests {
         assert_eq!(posts[0].content, "from the laptop");
         assert_eq!(
             harness.store().outbox_counts().unwrap(),
-            vec![("sent".to_string(), 1)]
+            vec![("logged".to_string(), 1)]
         );
     }
 
@@ -3472,10 +3549,7 @@ mod tests {
         // post are separate writes, and enrollment's writes were rate limited
         // too, so give the loop the passes it needs.
         harness.set_http_status(0);
-        harness
-            .store()
-            .retry_outbox(&buzz_id, 0, "rate limited")
-            .unwrap();
+        harness.store().make_outbox_due().unwrap();
         harness.main.held_until.clear();
         harness.step_until(|h| !h.agent_posts().is_empty());
 
@@ -3484,7 +3558,7 @@ mod tests {
         assert_eq!(posts[0].id, buzz_id);
         assert_eq!(
             harness.store().outbox_counts().unwrap(),
-            vec![("sent".to_string(), 1)]
+            vec![("logged".to_string(), 1)]
         );
     }
 
@@ -3501,22 +3575,19 @@ mod tests {
         harness.send("luna", "during the switchover", &["michael"], None);
         harness.step();
 
-        let buzz_id = {
-            let store = harness.store();
-            assert!(
-                store
-                    .outbox_counts()
-                    .unwrap()
-                    .iter()
-                    .any(|(s, _)| s == "retry"),
-                "the post waits instead of failing"
-            );
-            store.unsent_outbox().unwrap()[0].buzz_id.clone()
-        };
+        assert!(
+            harness
+                .store()
+                .outbox_counts()
+                .unwrap()
+                .iter()
+                .any(|(s, _)| s == "retry"),
+            "the post waits instead of failing"
+        );
 
         // The relay comes back and the queued post catches up on its own.
         harness.set_http_status(0);
-        harness.store().retry_outbox(&buzz_id, 0, "503").unwrap();
+        harness.store().make_outbox_due().unwrap();
         harness.step_until(|h| !h.agent_posts().is_empty());
 
         assert_eq!(
@@ -3569,66 +3640,178 @@ mod tests {
         );
     }
 
-    /// Queue one post that stays unposted (the relay is refusing writes), and
-    /// return its Buzz id.
-    fn queue_one_unposted(harness: &mut Harness) -> String {
-        harness.use_home_channel("michael", "michael");
-        harness.add_person("michael", Some("michael"));
-        harness.add_agent("luna");
+    /// Re-sign the one unposted row `age` seconds into the past through the
+    /// store's own re-sign, as if it was prepared that long ago and the outage
+    /// outlasted the relay's admission window. Returns the event now stored.
+    fn age_unposted(harness: &Harness, age: u64) -> Event {
+        let row = harness.store().unsent_outbox().unwrap().remove(0);
+        let previous: Event = serde_json::from_str(&row.signed_json).unwrap();
+        let aged = sign(
+            UnsignedEvent {
+                created_at: previous.created_at - age,
+                kind: previous.kind,
+                tags: previous.tags,
+                content: previous.content,
+            },
+            &agent_key(),
+        );
+        harness
+            .store()
+            .resign_outbox(&row, &aged.id, &serde_json::to_string(&aged).unwrap())
+            .unwrap();
+        aged
+    }
+
+    /// The agent's kind 9 posts with this content, as the relay stored them.
+    fn posts_saying(harness: &Harness, content: &str) -> Vec<Event> {
+        harness
+            .agent_posts()
+            .into_iter()
+            .filter(|post| post.content == content)
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn a_window_rejection_finds_an_earlier_prepared_id_and_never_re_signs() {
+        // The relay stored an earlier version of the post but the ack was
+        // lost; the outage then outlasted the 900 s window, so the version the
+        // row holds now is refused as too old. Looking up only that version,
+        // or none, and re-signing posts the message twice.
+        let mut harness = harness("mbai");
+        enrolled_home(&mut harness);
         harness.set_http_status(503);
-        harness.send("luna", "held back", &["michael"], None);
+        harness.send("luna", "late", &["michael"], None);
+        harness.step();
+        harness.set_http_status(0);
+        let stored = age_unposted(&harness, 1100);
+        harness.relay.seed(stored.clone());
+        age_unposted(&harness, 1000);
+        harness.step_until(|h| h.store().unsent_outbox().unwrap().is_empty());
+
+        let posts = posts_saying(&harness, "late");
+        assert_eq!(posts.len(), 1, "posted once: {posts:?}");
+        assert_eq!(posts[0].id, stored.id, "the version the relay already held");
+        assert_eq!(
+            harness.store().outbox_counts().unwrap(),
+            vec![("logged".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_failed_lookup_keeps_the_original_and_retries() {
+        // A refused post whose lookup fails proves nothing about whether the
+        // relay holds it: the stored event stays until a lookup answers.
+        let mut harness = harness("mbai");
+        enrolled_home(&mut harness);
+        harness.set_http_status(503);
+        harness.send("luna", "late", &["michael"], None);
+        harness.step();
+        harness.set_http_status(0);
+        let aged = age_unposted(&harness, 1000);
+        harness
+            .relay
+            .switches
+            .query_status
+            .store(503, Ordering::SeqCst);
         harness.step();
         let rows = harness.store().unsent_outbox().unwrap();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        rows[0].buzz_id.clone()
-    }
-
-    #[test]
-    #[serial]
-    fn an_unacked_post_is_rechecked_before_the_relays_900s_window_closes() {
-        let mut harness = harness("mbai");
-        let old = queue_one_unposted(&mut harness);
-        harness.set_http_status(0);
-        let now = crate::shared::time::now_epoch_i64();
-        // 850 s old: past the 840 s re-check point, inside the relay's 900 s.
-        harness.store().age_outbox(&old, now - 850).unwrap();
-        harness.main.recheck_stale_outbox();
-
-        let rows = harness.store().unsent_outbox().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_ne!(rows[0].buzz_id, old, "re-signed with a fresh created_at");
+        assert_eq!(rows[0].buzz_id, aged.id, "kept until a lookup succeeds");
+        assert!(posts_saying(&harness, "late").is_empty());
+
+        // The lookup works again and finds nothing: now it is re-signed.
+        harness
+            .relay
+            .switches
+            .query_status
+            .store(0, Ordering::SeqCst);
+        harness.store().make_outbox_due().unwrap();
+        harness.step_until(|h| !posts_saying(h, "late").is_empty());
+        let posts = posts_saying(&harness, "late");
+        assert_eq!(posts.len(), 1);
+        assert!(posts[0].created_at > aged.created_at, "a fresh timestamp");
     }
 
     #[test]
     #[serial]
-    fn a_failed_lookup_never_re_signs() {
-        // The relay may have stored the original; a 503 on the lookup proves
-        // nothing, and re-signing would post the message twice.
+    fn two_identical_sends_in_one_second_are_two_buzz_posts() {
+        // Same signer, text, channel, mentions and second: without the hcom
+        // message identity in the event they are one id, one post, and the
+        // ack for it settles both rows.
         let mut harness = harness("mbai");
-        let old = queue_one_unposted(&mut harness);
-        let now = crate::shared::time::now_epoch_i64();
-        harness.store().age_outbox(&old, now - 850).unwrap();
-        harness.main.recheck_stale_outbox();
+        enrolled_home(&mut harness);
+        harness.send("luna", "ok", &["michael"], None);
+        harness.send("luna", "ok", &["michael"], None);
+        harness.step_until(|h| posts_saying(h, "ok").len() >= 2);
 
-        let rows = harness.store().unsent_outbox().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].buzz_id, old, "kept until a lookup succeeds");
+        let posts = posts_saying(&harness, "ok");
+        assert_eq!(posts.len(), 2, "two sends, two posts: {posts:?}");
+        let identities: std::collections::BTreeSet<_> = posts
+            .iter()
+            .map(|post| route::tag(post, "hcom").map(str::to_string))
+            .collect();
+        assert_eq!(identities.len(), 2, "each carries its own hcom message id");
+        assert!(identities.iter().all(Option::is_some));
     }
 
     #[test]
     #[serial]
-    fn a_stale_row_from_before_an_hcom_reset_is_re_signed_not_deleted() {
+    fn an_acked_post_logs_its_delivery_status_even_across_a_crash() {
+        let status_details = |harness: &Harness| -> Vec<String> {
+            let mut stmt = harness
+                .main
+                .db
+                .conn()
+                .prepare("SELECT data FROM events WHERE type = 'status' AND instance = 'michael'")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter_map(|data| serde_json::from_str::<Value>(&data).ok())
+                .filter(|data| data["context"] == "deliver:luna")
+                .filter_map(|data| data["detail"].as_str().map(str::to_string))
+                .collect()
+        };
         let mut harness = harness("mbai");
-        let old = queue_one_unposted(&mut harness);
+        enrolled_home(&mut harness);
+        harness.send("luna", "first", &["michael"], None);
+        harness.step_until(|h| !posts_saying(h, "first").is_empty());
+        let first = posts_saying(&harness, "first").remove(0);
+        assert!(
+            status_details(&harness)
+                .iter()
+                .any(|detail| detail.contains(&first.id)),
+            "the ack is logged for Michael: {:?}",
+            status_details(&harness)
+        );
+
+        // The relay acknowledged a second post and the process died before
+        // logging it: the restart writes the status.
+        harness.set_http_status(503);
+        harness.send("luna", "second", &["michael"], None);
+        harness.step();
+        let row = harness.store().unsent_outbox().unwrap().remove(0);
+        harness.store().mark_outbox_posted(&row).unwrap();
         harness.set_http_status(0);
-        harness.store().adopt_epoch("after-reset".into()).unwrap();
-        let now = crate::shared::time::now_epoch_i64();
-        harness.store().age_outbox(&old, now - 850).unwrap();
-        harness.main.recheck_stale_outbox();
-
-        let rows = harness.store().unsent_outbox().unwrap();
-        assert_eq!(rows.len(), 1, "the unposted message survives");
-        assert_ne!(rows[0].buzz_id, old);
+        harness.main = MainLoop::for_test(
+            harness.main.connector,
+            harness.main.db,
+            harness.main.epoch.clone(),
+        );
+        harness.step();
+        assert!(
+            status_details(&harness)
+                .iter()
+                .any(|detail| detail.contains(&row.buzz_id)),
+            "logged after the restart: {:?}",
+            status_details(&harness)
+        );
+        assert_eq!(
+            harness.store().outbox_counts().unwrap(),
+            vec![("logged".to_string(), 2)]
+        );
     }
 
     /// Michael's home channel with luna already enrolled in it, so a test sees
@@ -3669,27 +3852,7 @@ mod tests {
         harness.send("luna", "late", &["michael"], None);
         harness.step();
         harness.set_http_status(0);
-        // The outage outlasted the relay's 900 s admission window.
-        let row = harness.store().unsent_outbox().unwrap().remove(0);
-        let previous: Event = serde_json::from_str(&row.signed_json).unwrap();
-        let aged = sign(
-            UnsignedEvent {
-                created_at: previous.created_at - 1000,
-                kind: previous.kind,
-                tags: previous.tags,
-                content: previous.content,
-            },
-            &agent_key(),
-        );
-        harness
-            .store()
-            .replace_outbox_event(
-                &row.buzz_id,
-                &aged.id,
-                &serde_json::to_string(&aged).unwrap(),
-                0,
-            )
-            .unwrap();
+        let aged = age_unposted(&harness, 1000);
         harness.step_until(|h| !h.agent_posts().is_empty());
 
         let posts = harness.agent_posts();
@@ -3739,7 +3902,7 @@ mod tests {
         // A restart: a fresh loop over the same state, relay healthy again. The
         // message is not re-routed, and the queued post goes out once.
         harness.set_http_status(0);
-        harness.store().retry_outbox(&buzz_id, 0, "503").unwrap();
+        harness.store().make_outbox_due().unwrap();
         harness.main = MainLoop::for_test(
             harness.main.connector,
             harness.main.db,
@@ -3768,7 +3931,7 @@ mod tests {
         // `hcom reset` replaces the database, so the epoch the loop computes
         // differs from the one the store was opened with.
         harness.set_http_status(0);
-        harness.store().retry_outbox(&buzz_id, 0, "503").unwrap();
+        harness.store().make_outbox_due().unwrap();
         harness.main.epoch = "before-reset".to_string();
         let before = harness.main.epoch.clone();
         harness.step_until(|h| h.main.epoch != before);
