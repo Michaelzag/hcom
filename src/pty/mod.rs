@@ -196,6 +196,13 @@ fn strip_focus_events(buf: &[u8]) -> Option<Vec<u8>> {
 /// Window in which a newly resumed omp may ask to re-root its missing cwd.
 pub const OMP_REROOT_PROMPT_WINDOW: Duration = Duration::from_secs(30);
 
+/// Bound for forwarding queued and still-unread PTY output to stdout after
+/// the proxy loop exits. A paused-but-open consumer gets this long to resume
+/// before leftovers are abandoned (the screen model keeps them for launch
+/// diagnostics); a dead consumer delays shutdown by this bound instead of
+/// hanging it forever.
+pub const POST_EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Proxy-only option consumed before the wrapped tool's argument vector is built.
 pub const ANSWER_OMP_REROOT_PROMPT_OPTION: &str = "--hcom-answer-omp-reroot-prompt";
 
@@ -901,13 +908,6 @@ impl Proxy {
                 EXIT_WAS_KILLED.store(true, Ordering::Release);
                 break;
             }
-
-            // The master may be omitted while stdout is backed up. Detect
-            // child exit independently so backpressure cannot prevent cleanup.
-            if self.child.try_wait()?.is_some() {
-                break;
-            }
-
             // Collect raw fds for polling (avoid holding borrows)
             let master_raw = self.pty_master.as_raw_fd();
             let stdin_raw = stdin_fd.as_raw_fd();
@@ -934,6 +934,15 @@ impl Proxy {
                 poll_fds.push(PollFd::new(master_fd, master_events));
                 Some(0)
             };
+            // While the master is omitted (stdout backed up past 1 MiB, nothing
+            // queued for the child) the read/EOF path below cannot observe the
+            // exit, so detect it independently — otherwise backpressure
+            // prevents cleanup forever. When the master IS polled, fall
+            // through: the normal path forwards trailing PTY bytes to stdout
+            // before EOF/HUP ends the loop.
+            if master_idx.is_none() && self.child.try_wait()?.is_some() {
+                break;
+            }
 
             // Only include stdin in poll set while we're actively polling it.
             // When stdin is a non-TTY (e.g. /dev/null in headless mode), we stop
@@ -1191,7 +1200,7 @@ impl Proxy {
                                 omp_reroot_answered,
                             )
                         {
-                            write_all(&self.pty_master, b"y\r")?;
+                            child_input.push(b"y\r");
                             omp_reroot_answered = true;
                             if let Some(name) = &self.config.instance_name {
                                 let _ = HcomDb::open().and_then(|db| {
@@ -1497,8 +1506,33 @@ impl Proxy {
             }
         }
 
-        // Flush what the terminal can accept without delaying shutdown forever.
-        let flush_deadline = Instant::now() + Duration::from_millis(250);
+        // The loop can exit with the child gone and bytes still unread in the
+        // PTY (fast exit) or queued behind backpressure. Move a bounded batch
+        // into terminal_output (and the screen model) so the flush below
+        // forwards them instead of dropping them into the screen-only drain.
+        // Past the cap the screen model still preserves launch diagnostics.
+        {
+            let mut buf = [0u8; 65536];
+            let mut moved = 0usize;
+            while moved < 1024 * 1024 {
+                match nix_read(&self.pty_master, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        terminal_output.push(&buf[..n]);
+                        self.screen.process(&buf[..n]);
+                        moved += n;
+                    }
+                    // EAGAIN/EIO/closed: nothing more to take.
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Flush what the terminal can accept, giving a paused-but-open stdout
+        // consumer POST_EXIT_FLUSH_TIMEOUT to resume. A dead consumer delays
+        // shutdown by that bound instead of hanging it forever (the hang this
+        // fixes); a closed fd ends the flush at once.
+        let flush_deadline = Instant::now() + POST_EXIT_FLUSH_TIMEOUT;
         while !terminal_output.is_empty() && Instant::now() < flush_deadline {
             let mut output_poll = [PollFd::new(stdout_fd.as_fd(), PollFlags::POLLOUT)];
             match poll(&mut output_poll, PollTimeout::from(10u16)) {
@@ -1510,6 +1544,15 @@ impl Proxy {
                     if terminal_output.flush(&stdout_fd).is_err() {
                         break;
                     }
+                }
+                Ok(_)
+                    if output_poll[0].revents().is_some_and(|events| {
+                        events.intersects(
+                            PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL,
+                        )
+                    }) =>
+                {
+                    break;
                 }
                 Err(Errno::EINTR) => continue,
                 Err(_) => break,
