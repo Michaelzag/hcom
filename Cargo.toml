@@ -55,6 +55,13 @@ webpki-roots = "1.0.6"
 rustls-native-certs = "0.8.3"
 lru = "0.18.1"
 
+# Buzz (blocking Nostr transports; no additional async runtime).
+k256 = { version = "0.14", default-features = false, features = ["schnorr", "std"] }
+hkdf = "0.13"
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+bech32 = "0.12"
+
 # Unix-only: PTY, signals, fd polling, file locks, process groups.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.2", features = ["term", "signal", "poll", "process", "fs", "ioctl"] }
@@ -79,6 +86,7 @@ portable-pty = "0.9"
 
 [dev-dependencies]
 serial_test = "3"
+parking_lot = "0.12"
 
 # vt100 0.16.2 panics when a downward resize orphans a double-width character's
 # "wide" flag and it's later erased (index out of bounds in Row::clear_wide).
