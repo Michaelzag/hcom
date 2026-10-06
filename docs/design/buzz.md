@@ -383,6 +383,80 @@ tool, without `--go`, and the broadcast would reach more than three rows
   98,304 bytes like the existing events RPC; `--before <buzz-id>` continues. It
   needs the new CLI on the calling device.
 
+### Durability model
+
+Both directions are explicit state machines with an idempotency key and named
+crash points. The reference implementation for every rule here is the interim
+Python bridge (zagcom `bridge/` at 5e65670: `service.py`, `buzz.py`,
+`read_worker.py` and their tests), which already solved and tested them. The
+connector ports its semantics; it doesn't invent new ones.
+
+**Inbound (relay event → hcom delivery).**
+
+1. *Fetch.* Per channel, a durable read position `(created_at, id)`. Every read
+   (reconnect backfill, CLOSED recovery, periodic catch-up) is an HTTP `/query`
+   keyset walk from `position.created_at - 960 s` forward, paging on
+   `(until, before_id)` exactly like the bridge's `query_all`: it ends only on an
+   empty page, and a repeated page, a non-advancing key or a bad signature is an
+   error, never a short success. 960 s = the relay's 900 s backdated admission
+   window plus 60 s NIP-98 skew. The live `#h` subscription uses the same
+   `since = now - 960` so a backdated publication arriving live is never
+   outside both paths. No page-count cap ends a walk as "complete".
+2. *Store.* Each verified event is inserted into the channel inbox (key: Buzz
+   event id, `INSERT OR IGNORE`) in the same transaction that advances the read
+   position, and the position only moves to keys that transaction stored. A
+   position update is compare-and-set on `(created_at, id)`: it never moves
+   backwards and never overwrites a newer value. Crash before commit: the walk
+   repeats and the inbox dedupes. Nothing is ever dropped because the position
+   moved; the position only says "fetched", never "handled".
+3. *Roster first.* A channel's newest 39002 roster (saved in `state.db`) and the
+   configured people are applied before any message from that channel is
+   handled, at startup and in every pass. A message whose sender isn't known yet
+   stays pending instead of being marked done.
+4. *Route.* Handling an inbox item computes its targets and, in one
+   transaction, writes one obligation row per target
+   `(buzz_id, target, state, attempts, next_at)` and marks the item routed.
+   Obligations exist before anything is sent. Crash after: the item is routed,
+   obligations replay. Crash before: the item is re-routed.
+5. *Deliver.* Each obligation is delivered independently (hcom send as the
+   person's row) and marked done after the send. An unresolvable or failing
+   target stays durable with exponential backoff and is never discarded; after
+   15 min unresolved the "isn't running" notice is posted once and the
+   obligation closes as expired. An item is done only when every obligation is
+   terminal. Delivery is at least once per target: a crash between the send
+   and marking it done can repeat that one target's message.
+6. *Handling failures* (ancestor lookup down, DB error) leave the item pending
+   with backoff. There is no retry limit that drops work.
+
+`hcom buzz cursor set` runs under the connector's lock (refuses while `serve`
+holds it, and `serve` refuses to start while the command holds it) and writes
+with the same compare-and-set; `--force` is the only way backwards.
+
+**Outbound (hcom message → relay ack).**
+
+1. *Prepare.* For each `(epoch, hcom_id, destination)` the connector signs one
+   event and stores it before advancing the hosted row's cursor: key =
+   `(epoch, hcom_id, destination)`, plus the prepared event id. The signed event
+   carries an `["hcom", "<epoch>:<hcom_id>"]` tag, so two distinct sends with
+   the same text, signer, channel and second can never share an id. A retry of
+   the same row reuses the same signed event.
+2. *Publish.* POST the stored event with a fresh NIP-98 header. OK, or
+   `duplicate:`, means acked. Transport errors, 5xx and 429 retry the same
+   event with backoff.
+3. *Re-sign only when proven absent.* If the relay rejects the event's
+   `created_at` as outside its window, the connector first queries by every id
+   this row has ever prepared. Found means acked. Not found means re-sign with a
+   new `created_at`, append the new id to the row's id list, publish. Lookup
+   failing keeps the original and retries later. This is the bridge's
+   prepare→publish rule.
+4. *Ack.* Mark the row posted, then log the hcom delivery status for its hosted
+   recipients.
+
+Crash points: before prepare commits, the hcom message is re-read (cursor not
+advanced) and prepared again under the same key; after prepare but before ack,
+the same event is re-published (duplicate at worst); after ack but before the
+status log, the status is written on restart.
+
 ### Faults, budgets, backoff
 
 - Per-pubkey token buckets under the relay limits: HTTP 240/min per signing key,
