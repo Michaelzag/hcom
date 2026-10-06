@@ -73,6 +73,9 @@ pub struct Switches {
     pub http_retry_header: AtomicU16,
     pub pong_received: AtomicBool,
     pub oversized_body: AtomicBool,
+    /// Answer every REQ with CLOSED "not a channel member", as the deployed
+    /// relay does for a reader that is not (yet) in the channel.
+    pub refuse_req: AtomicBool,
 }
 
 struct Subscription {
@@ -87,6 +90,7 @@ struct State {
     events: Vec<Event>,
     subscriptions: Vec<Subscription>,
     auth_ids: HashSet<String>,
+    ws_connections: usize,
 }
 
 pub struct FakeRelay {
@@ -111,6 +115,18 @@ impl FakeRelay {
     pub fn http_requests(&self) -> usize {
         self.state.lock().auth_ids.len()
     }
+
+    /// WebSocket connections accepted so far: what a reconnect loop's
+    /// discipline is judged by.
+    pub fn ws_connections(&self) -> usize {
+        self.state.lock().ws_connections
+    }
+
+    /// A WebSocket endpoint over this relay's store and switches, so one test
+    /// can backfill over HTTP and stream over WS from the same history.
+    pub fn ws_twin(&self) -> Self {
+        Self::start_with(false, self.state.clone(), self.switches.clone())
+    }
     /// Store an event as if it had arrived over the wire, so a test can seed a
     /// history the connector then backfills.
     pub fn seed(&self, event: Event) {
@@ -128,6 +144,14 @@ impl FakeRelay {
     }
 
     fn start(http: bool) -> Self {
+        Self::start_with(
+            http,
+            Arc::new(Mutex::new(State::default())),
+            Arc::new(Switches::default()),
+        )
+    }
+
+    fn start_with(http: bool, state: Arc<Mutex<State>>, switches: Arc<Switches>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!(
@@ -135,8 +159,6 @@ impl FakeRelay {
             if http { "http" } else { "ws" },
             listener.local_addr().unwrap()
         );
-        let state = Arc::new(Mutex::new(State::default()));
-        let switches = Arc::new(Switches::default());
         let server_state = state.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let server_url = url.clone();
@@ -232,6 +254,7 @@ fn handle_ws(
     let Ok(mut socket) = tungstenite::accept(stream) else {
         return;
     };
+    state.lock().ws_connections += 1;
     let challenge = uuid::Uuid::new_v4().to_string();
     if !send(&mut socket, json!(["AUTH", challenge])) {
         return;
@@ -403,6 +426,15 @@ fn handle_ws(
                 let Some(sub) = value.get(1).and_then(Value::as_str) else {
                     continue;
                 };
+                if switches.refuse_req.load(Ordering::SeqCst) {
+                    if !send(
+                        &mut socket,
+                        json!(["CLOSED", sub, "restricted: not a channel member"]),
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
                 let Some(array) = value.as_array() else {
                     continue;
                 };
@@ -542,10 +574,8 @@ fn query_events(events: &[Event], filters: &[Value]) -> Vec<Event> {
                 .cmp(&a.created_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        let limit = filter
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX);
+        // buzz-db event.rs:367-368: `q.limit.unwrap_or(100)`, newest first.
+        let limit = filter.get("limit").and_then(Value::as_u64).unwrap_or(100);
         for event in matches
             .into_iter()
             .take(usize::try_from(limit).unwrap_or(usize::MAX))

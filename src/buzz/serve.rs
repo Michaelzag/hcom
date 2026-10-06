@@ -427,14 +427,7 @@ pub fn serve(config: Config) -> Result<i32> {
     }
 
     let (tx, rx) = mpsc::channel::<InboundItem>();
-    let handles = ReaderHandles {
-        relay_url: connector.config.relay_url.clone(),
-        reader: connector.reader.clone(),
-        reader_auth_tag: connector.reader_auth_tag(),
-        channels: connector.channel_rows(),
-        store: connector.store.clone(),
-        shutdown: connector.shutdown.clone(),
-    };
+    let handles = reader_handles(&connector);
     let reader_thread = std::thread::Builder::new()
         .name("buzz-reader".into())
         .spawn(move || reader_loop(handles, tx))
@@ -465,11 +458,28 @@ pub fn serve(config: Config) -> Result<i32> {
 /// The reader thread's own view of what it needs.
 struct ReaderHandles {
     relay_url: String,
+    /// `/query` for backfill: pageable, unlike a REQ's single stored batch.
+    http: HttpRelay,
     reader: AgentIdentity,
     reader_auth_tag: [String; 4],
     channels: Vec<ChannelRow>,
     store: Arc<Mutex<Store>>,
     shutdown: Arc<AtomicBool>,
+}
+
+/// What the reader thread takes from the connector.
+fn reader_handles(connector: &Connector) -> ReaderHandles {
+    ReaderHandles {
+        relay_url: connector.config.relay_url.clone(),
+        http: HttpRelay {
+            base_url: connector.config.http_url.clone(),
+        },
+        reader: connector.reader.clone(),
+        reader_auth_tag: connector.reader_auth_tag(),
+        channels: connector.channel_rows(),
+        store: connector.store.clone(),
+        shutdown: connector.shutdown.clone(),
+    }
 }
 
 /// Enroll the connector's reader in one channel, before any subscription.
@@ -564,50 +574,153 @@ fn register_hosted_rows(db: &HcomDb, connector: &Connector, port: u16) {
     }
 }
 
-/// The reader thread: one WS session as the reader key, one REQ per channel.
+/// The reader thread: one WS session as the reader key. Every (re)connect
+/// backfills each channel from its cursor over paged HTTP `/query`, oldest
+/// first, then opens one live REQ per channel. A failed session backs off
+/// 1 s → 60 s; only a session that stayed up resets the backoff.
 fn reader_loop(handles: ReaderHandles, tx: mpsc::Sender<InboundItem>) {
     let mut attempt = 0u32;
     while !handles.shutdown.load(Ordering::SeqCst) {
-        let connected = WsSession::connect(
+        let started = Instant::now();
+        match WsSession::connect(
             &handles.relay_url,
             &handles.reader.key,
             Some(handles.reader_auth_tag.clone()),
             WS_TIMEOUT,
-        );
-        match connected {
+        ) {
             Ok(mut session) => {
-                attempt = 0;
-                if let Err(error) = subscribe_all(&mut session, &handles) {
-                    crate::log::log_warn(
-                        "buzz",
-                        "serve.reader_subscribe",
-                        &format!("{error}; reconnecting"),
-                    );
-                    continue;
-                }
-                if pump_session(&mut session, &handles, &tx) {
+                if run_session(&mut session, &handles, &tx) {
                     return;
                 }
             }
             Err(error) => {
-                let wait = backoff(attempt, BACKOFF_MIN, BACKOFF_MAX);
-                crate::log::log_warn(
-                    "buzz",
-                    "serve.reader_connect",
-                    &format!("{error}; retrying in {}s", wait.as_secs().max(1)),
-                );
-                attempt = attempt.saturating_add(1);
-                if sleep_unless(&handles.shutdown, wait) {
-                    return;
-                }
+                crate::log::log_warn("buzz", "serve.reader_connect", &error.to_string());
             }
+        }
+        if started.elapsed() >= HEALTHY_SESSION {
+            attempt = 0;
+        }
+        let wait = backoff(attempt, BACKOFF_MIN, BACKOFF_MAX);
+        attempt = attempt.saturating_add(1);
+        crate::log::log_warn(
+            "buzz",
+            "serve.reader_reconnect",
+            &format!("reconnecting in {}s", wait.as_secs().max(1)),
+        );
+        if sleep_unless(&handles.shutdown, wait) {
+            return;
         }
     }
 }
 
-/// Open one subscription per channel, staggered under the WS frame budget and
-/// backfilling from each channel's cursor.
-fn subscribe_all(session: &mut WsSession, handles: &ReaderHandles) -> Result<()> {
+/// A session that lasted this long was healthy: the next failure starts the
+/// backoff over rather than continuing it.
+const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+/// Events per backfill page; the relay's default and cap.
+const BACKFILL_PAGE: usize = 100;
+/// Most events one channel's backfill hands over before going live.
+const BACKFILL_MAX: usize = 10_000;
+
+/// One session: backfill, subscribe, pump. True when shutting down.
+fn run_session(
+    session: &mut WsSession,
+    handles: &ReaderHandles,
+    tx: &mpsc::Sender<InboundItem>,
+) -> bool {
+    // Live subscriptions start a little before the backfill does, so nothing
+    // lands in between; the overlap is deduped by Buzz id.
+    let live_since = nostr::now().saturating_sub(5);
+    for channel in &handles.channels {
+        match backfill_channel(handles, channel) {
+            Ok(events) => {
+                for event in events {
+                    let item = InboundItem {
+                        sub: sub_id(&channel.slug),
+                        event,
+                    };
+                    if tx.send(item).is_err() {
+                        return true;
+                    }
+                }
+            }
+            Err(error) => {
+                crate::log::log_warn(
+                    "buzz",
+                    "serve.backfill_failed",
+                    &format!("{}: {error}", channel.slug),
+                );
+                return false;
+            }
+        }
+    }
+    if let Err(error) = subscribe_all(session, handles, live_since) {
+        crate::log::log_warn("buzz", "serve.reader_subscribe", &error.to_string());
+        return false;
+    }
+    pump_session(session, handles, tx, live_since)
+}
+
+/// Everything in one channel since its cursor (less the relay's 960 s
+/// admission slack), oldest first, paged with `until` because the relay
+/// answers at most 100 events, newest first. A channel with no cursor yet
+/// starts at now: it has no history the connector owes anyone.
+fn backfill_channel(handles: &ReaderHandles, channel: &ChannelRow) -> Result<Vec<Event>> {
+    let cursor = handles
+        .store
+        .lock()
+        .channel(&channel.id)?
+        .and_then(|row| row.cursor_created_at)
+        .unwrap_or_else(nostr::now);
+    let since = cursor.saturating_sub(store::BACKFILL_SLACK_SECS);
+    let tag = serde_json::to_string(&handles.reader_auth_tag)?;
+
+    let mut events: Vec<Event> = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    let mut until: Option<u64> = None;
+    loop {
+        // Always carry kinds: the relay refuses an unscoped query filter.
+        let mut filter = json!({
+            "kinds": store::CHANNEL_KINDS,
+            "#h": [channel.id],
+            "since": since,
+            "limit": BACKFILL_PAGE,
+        });
+        if let Some(until) = until {
+            filter["until"] = json!(until);
+        }
+        let page = handles
+            .http
+            .query(&filter, &handles.reader.key, Some(&tag))?;
+        let full = page.len() >= BACKFILL_PAGE;
+        let oldest = page.iter().map(|event| event.created_at).min();
+        let before = events.len();
+        events.extend(
+            page.into_iter()
+                .filter(|event| ids.insert(event.id.clone())),
+        );
+        // `until` is inclusive, so a page ending mid-second is re-read and
+        // deduped; a page that brings nothing new means we are done.
+        if !full || events.len() == before || events.len() >= BACKFILL_MAX {
+            break;
+        }
+        until = oldest;
+    }
+    events.sort_by_key(|event| event.created_at);
+    Ok(events)
+}
+
+/// The live filter for one channel.
+fn live_filter(channel_id: &str, since: u64) -> Value {
+    // Always carry kinds: the relay refuses an unscoped query filter.
+    json!({
+        "kinds": store::CHANNEL_KINDS,
+        "#h": [channel_id],
+        "since": since,
+    })
+}
+
+/// Open one live subscription per channel, staggered under the WS frame budget.
+fn subscribe_all(session: &mut WsSession, handles: &ReaderHandles, since: u64) -> Result<()> {
     let mut budget = TokenBucket::new(WS_FRAMES_PER_WINDOW, Duration::from_secs(5));
     for (index, channel) in handles.channels.iter().enumerate() {
         if let Err(wait) = budget.take() {
@@ -617,22 +730,7 @@ fn subscribe_all(session: &mut WsSession, handles: &ReaderHandles) -> Result<()>
         if index > 0 {
             sleep(REQ_STAGGER);
         }
-        let since = handles
-            .store
-            .lock()
-            .channel(&channel.id)
-            .ok()
-            .flatten()
-            .and_then(|row| row.cursor_created_at)
-            .map(|cursor| cursor.saturating_sub(store::BACKFILL_SLACK_SECS))
-            .unwrap_or(0);
-        // Always carry kinds: the relay refuses an unscoped query filter.
-        let filter = json!({
-            "kinds": store::CHANNEL_KINDS,
-            "#h": [channel.id],
-            "since": since,
-        });
-        session.req(&sub_id(&channel.slug), &[filter])?;
+        session.req(&sub_id(&channel.slug), &[live_filter(&channel.id, since)])?;
     }
     Ok(())
 }
@@ -643,13 +741,38 @@ fn sub_id(slug: &str) -> String {
 }
 
 /// Read one session until it fails or the process stops. True when shutting
-/// down; false hands the session back to the reconnect loop.
+/// down; false hands the session back to the reconnect loop. A CLOSED channel
+/// is parked and re-requested with backoff (the usual cause, not yet being a
+/// member, fixes itself once omp's 9000 lands); its first event unparks it.
 fn pump_session(
     session: &mut WsSession,
     handles: &ReaderHandles,
     tx: &mpsc::Sender<InboundItem>,
+    since: u64,
 ) -> bool {
+    let mut closed: HashMap<String, (Instant, u32)> = HashMap::new();
     while !handles.shutdown.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        let due: Vec<String> = closed
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(sub, _)| sub.clone())
+            .collect();
+        for sub in due {
+            let Some(channel_id) = channel_for_sub(&handles.channels, &sub) else {
+                closed.remove(&sub);
+                continue;
+            };
+            if let Err(error) = session.req(&sub, &[live_filter(&channel_id, since)]) {
+                crate::log::log_warn("buzz", "serve.reader_error", &error.to_string());
+                return false;
+            }
+            // Wait for the answer before scheduling another try.
+            if let Some((at, _)) = closed.get_mut(&sub) {
+                *at = now + BACKOFF_MAX;
+            }
+        }
+
         match session.recv(Duration::from_millis(500)) {
             Err(error) => {
                 crate::log::log_warn("buzz", "serve.reader_error", &error.to_string());
@@ -657,12 +780,14 @@ fn pump_session(
             }
             Ok(None) => {}
             Ok(Some(RelayMsg::Event { sub, event })) => {
+                unpark(handles, &mut closed, &sub);
                 if tx.send(InboundItem { sub, event }).is_err() {
                     return true;
                 }
             }
             Ok(Some(RelayMsg::Eose(sub))) => {
-                crate::log::log_info("buzz", "serve.backfill_done", &sub);
+                unpark(handles, &mut closed, &sub);
+                crate::log::log_info("buzz", "serve.subscribed", &sub);
             }
             Ok(Some(RelayMsg::Closed { sub, reason })) => {
                 // One closed subscription parks its channel; the rest keep
@@ -673,7 +798,14 @@ fn pump_session(
                         .lock()
                         .set_channel_parked(&channel_id, Some(&reason));
                 }
-                crate::log::log_warn("buzz", "serve.channel_closed", &format!("{sub}: {reason}"));
+                let attempts = closed.get(&sub).map_or(0, |(_, n)| *n);
+                let wait = backoff(attempts, BACKOFF_MIN, BACKOFF_MAX);
+                closed.insert(sub.clone(), (Instant::now() + wait, attempts + 1));
+                crate::log::log_warn(
+                    "buzz",
+                    "serve.channel_closed",
+                    &format!("{sub}: {reason}; retrying in {}s", wait.as_secs().max(1)),
+                );
             }
             Ok(Some(RelayMsg::Notice(message))) => {
                 crate::log::log_warn("buzz", "serve.reader_notice", &message);
@@ -694,6 +826,16 @@ fn pump_session(
         }
     }
     true
+}
+
+/// A subscription answered: its channel is live again.
+fn unpark(handles: &ReaderHandles, closed: &mut HashMap<String, (Instant, u32)>, sub: &str) {
+    if closed.remove(sub).is_some()
+        && let Some(channel_id) = channel_for_sub(&handles.channels, sub)
+    {
+        let _ = handles.store.lock().set_channel_parked(&channel_id, None);
+        crate::log::log_info("buzz", "serve.channel_unparked", sub);
+    }
 }
 
 /// Channel id behind a `buzz-<slug>` subscription id.
@@ -4102,6 +4244,186 @@ mod tests {
         assert!(
             ServeLock::acquire(&path).is_ok(),
             "releasing the lock lets a new connector start"
+        );
+    }
+
+    /// A connector whose reader speaks WS to `ws` and HTTP to `http`, both over
+    /// the same fake store; the reader thread runs on its own, as in `serve`.
+    struct LiveReader {
+        _env: (
+            tempfile::TempDir,
+            std::path::PathBuf,
+            std::path::PathBuf,
+            crate::hooks::test_helpers::EnvGuard,
+        ),
+        http: FakeRelay,
+        ws: FakeRelay,
+        connector: Connector,
+        rx: mpsc::Receiver<InboundItem>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LiveReader {
+        fn start(before: impl FnOnce(&FakeRelay)) -> Self {
+            let env = crate::hooks::test_helpers::isolated_test_env();
+            let http = FakeRelay::http();
+            let ws = http.ws_twin();
+            before(&http);
+            let mut config = test_config(&http, "mbai");
+            config.relay_url = ws.url.clone();
+            let connector = Connector::load(config).unwrap();
+            connector
+                .store
+                .lock()
+                .upsert_channel(CHANNEL_ID, "infra")
+                .unwrap();
+            let (tx, rx) = mpsc::channel();
+            let handles = reader_handles(&connector);
+            let thread = std::thread::spawn(move || reader_loop(handles, tx));
+            Self {
+                _env: env,
+                http,
+                ws,
+                connector,
+                rx,
+                thread: Some(thread),
+            }
+        }
+
+        /// Inbound items until `count` arrived or the deadline passed.
+        fn take(&self, count: usize, deadline: Duration) -> Vec<Event> {
+            let end = Instant::now() + deadline;
+            let mut events = Vec::new();
+            while events.len() < count && Instant::now() < end {
+                if let Ok(item) = self.rx.recv_timeout(Duration::from_millis(100)) {
+                    events.push(item.event);
+                }
+            }
+            events
+        }
+
+        /// Post live, over WS, as the test human.
+        fn publish_live(&self, text: &str) -> Event {
+            let event = message(&human_key(), CHANNEL_ID, text, vec![]);
+            let tag = nostr::auth_tag(&owner_key(), &public_hex(&human_key()), "");
+            let mut session = WsSession::connect(
+                &self.ws.url,
+                &human_key(),
+                Some(tag),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            session.publish(&event).unwrap();
+            event
+        }
+
+        fn parked(&self) -> Option<String> {
+            self.connector
+                .store
+                .lock()
+                .channel(CHANNEL_ID)
+                .unwrap()
+                .and_then(|row| row.parked_reason)
+        }
+    }
+
+    impl Drop for LiveReader {
+        fn drop(&mut self) {
+            self.connector.shutdown.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn the_reader_backfills_every_page_in_order_then_streams_live_events() {
+        // 150 events since the cursor: more than the relay's 100-event default
+        // page, so a backfill that doesn't page loses the oldest 50.
+        let now = nostr::now();
+        let history: Vec<Event> = (0..150u64)
+            .map(|i| {
+                sign(
+                    UnsignedEvent {
+                        created_at: now - 300 + i,
+                        kind: route::KIND_MESSAGE,
+                        tags: vec![vec!["h".into(), CHANNEL_ID.into()]],
+                        content: format!("history {i}"),
+                    },
+                    &human_key(),
+                )
+            })
+            .collect();
+        let reader = LiveReader::start(|relay| {
+            for event in &history {
+                relay.seed(event.clone());
+            }
+        });
+
+        let backfill = reader.take(150, Duration::from_secs(15));
+        let mut ids: Vec<&str> = backfill.iter().map(|e| e.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 150, "every page arrives: got {}", ids.len());
+        assert!(
+            backfill
+                .windows(2)
+                .all(|w| w[0].created_at <= w[1].created_at),
+            "oldest first, so the cursor only ever moves forward"
+        );
+
+        let live = reader.publish_live("hello, live");
+        let streamed = reader.take(1, Duration::from_secs(10));
+        assert!(
+            streamed.iter().any(|e| e.id == live.id),
+            "the live event reaches the main loop"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_closed_channel_is_resubscribed_and_unparked() {
+        let reader = LiveReader::start(|relay| {
+            relay.switches.refuse_req.store(true, Ordering::SeqCst);
+        });
+        let end = Instant::now() + Duration::from_secs(10);
+        while reader.parked().is_none() && Instant::now() < end {
+            sleep(Duration::from_millis(50));
+        }
+        assert!(reader.parked().is_some(), "CLOSED parks the channel");
+
+        // Membership arrives (omp's 9000 landed): the next retry succeeds.
+        reader
+            .http
+            .switches
+            .refuse_req
+            .store(false, Ordering::SeqCst);
+        let end = Instant::now() + Duration::from_secs(10);
+        while reader.parked().is_some() && Instant::now() < end {
+            sleep(Duration::from_millis(50));
+        }
+        assert!(reader.parked().is_none(), "the channel is unparked");
+        let live = reader.publish_live("after the retry");
+        assert!(
+            reader
+                .take(1, Duration::from_secs(10))
+                .iter()
+                .any(|e| e.id == live.id)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_relay_that_drops_every_session_is_retried_with_backoff() {
+        let reader = LiveReader::start(|relay| {
+            relay.switches.drop_socket.store(true, Ordering::SeqCst);
+        });
+        sleep(Duration::from_secs(3));
+        let connections = reader.ws.ws_connections();
+        assert!(
+            connections <= 3,
+            "1 s then 2 s of backoff allows three tries in 3 s, not {connections}"
         );
     }
 
