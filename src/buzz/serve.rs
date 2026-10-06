@@ -1486,6 +1486,22 @@ impl MainLoop {
         {
             let store = self.connector.store.lock();
             let _ = store.put_enrollment(&identity.pubkey, channel_id, "enrolled");
+            // We just published this agent's kind 0, so its classification is
+            // known without waiting for the profile to come back. The reader
+            // only subscribes to `#h` kinds, so kind 0 never arrives on its
+            // own; without this a mention of an agent whose session has ended
+            // names nobody and is skipped instead of parked.
+            if !is_reader {
+                let _ = store.put_author(&Author {
+                    pubkey: identity.pubkey.clone(),
+                    kind: AuthorKind::Agent,
+                    hcom_name: Some(identity.name.clone()),
+                    device_label: identity
+                        .canonical
+                        .rsplit_once('@')
+                        .map(|(_, device)| device.to_string()),
+                });
+            }
         }
         crate::log::log_info(
             "buzz",
@@ -2862,6 +2878,46 @@ mod tests {
                 .iter()
                 .any(|(s, _)| s == "expired"),
             "the parked target is retired, not retried forever"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_mention_of_an_enrolled_agent_whose_row_is_gone_is_parked() {
+        // Live shape: the reader only subscribes to `#h` kinds, so an agent's
+        // kind 0 never comes back to it. What the connector knows about a
+        // finished session is what it published when it enrolled the agent.
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        harness.main.last_enroll = Instant::now() - ENROLL_INTERVAL - Duration::from_secs(1);
+        harness.step_until(|h| {
+            h.store()
+                .enrollment(&public_hex(&agent_key()), CHANNEL_ID)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("enrolled")
+        });
+        assert!(harness.main.db.delete_instance("luna").unwrap());
+
+        let event = message(
+            &human_key(),
+            CHANNEL_ID,
+            "luna, still there?",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        harness.offer(event);
+        harness.step();
+
+        assert!(
+            harness
+                .store()
+                .target_counts()
+                .unwrap()
+                .iter()
+                .any(|(state, n)| state == "parked" && *n == 1),
+            "the mention is parked for luna, not skipped as naming nobody"
         );
     }
 
