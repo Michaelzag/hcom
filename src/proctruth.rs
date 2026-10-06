@@ -2867,6 +2867,20 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         if matches!(inst.status.as_str(), "stopped" | "dead") {
             continue;
         }
+        // Connector-hosted rows (Buzz people/channels) are owned by one
+        // long-lived connector process, not by a harness that dies with the
+        // row. They carry no session, pid or bindings of their own, so any
+        // death evidence here would be about the connector, not the
+        // participant — skip them before the reap decision, not after.
+        if crate::hosted::is_hosted_tool(&inst.tool) {
+            crate::log::log(
+                "DEBUG",
+                "daemon",
+                "sweep.held",
+                &format!("name={} reason=hosted", inst.name),
+            );
+            continue;
+        }
         if inst.status == crate::instance_names::PLACEHOLDER_STATUS {
             continue;
         }
@@ -5450,6 +5464,55 @@ mod tests {
             "local row not swept: {swept:?}"
         );
         assert!(db.get_instance_full("empty-origin-row").unwrap().is_none());
+    }
+
+    /// A connector-hosted row is exempt from the sweep even in the exact
+    /// shape that gets an ordinary row released: stale `last_seen`, a dead
+    /// anchor pid, and a shell-shaped binding whose shell is dead too. The
+    /// adhoc row beside it is the control — same shape, reaped, so the test
+    /// fails on a build without the exemption rather than passing because the
+    /// fixture happened to be held.
+    #[test]
+    #[cfg(unix)]
+    fn sweep_exempts_hosted_rows_that_it_reaps_for_an_ordinary_row() {
+        let db = test_db();
+        let dead = dead_pid();
+
+        // Control: the shape the sweep releases.
+        insert_row(&db, "adhoc-vanished", "active", Some(dead));
+        db.set_process_binding(&format!("omp-{dead}-1-1"), "sess", "adhoc-vanished")
+            .unwrap();
+        age_row(&db, "adhoc-vanished");
+
+        // Subject: identical, but connector-hosted.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, pid)
+                 VALUES ('michael', 'listening', 1.0, 'buzz', ?1)",
+                rusqlite::params![dead],
+            )
+            .unwrap();
+        db.set_process_binding(&format!("omp-{dead}-1-2"), "sess", "michael")
+            .unwrap();
+        age_row(&db, "michael");
+
+        let swept = sweep_vanished_instances(&db);
+
+        assert!(
+            swept.contains(&"adhoc-vanished".to_string()),
+            "the ordinary row with the same death evidence must still be swept: {swept:?}"
+        );
+        assert!(db.get_instance_full("adhoc-vanished").unwrap().is_none());
+        assert!(
+            !swept.contains(&"michael".to_string()),
+            "the hosted row was reaped: {swept:?}"
+        );
+        let row = db
+            .get_instance_full("michael")
+            .unwrap()
+            .expect("hosted row deleted by the sweep");
+        assert_eq!(row.tool, "buzz");
+        assert_eq!(row.status, "listening");
     }
 
     /// Reap scope (kill arm): a name-only carrier that appears after the

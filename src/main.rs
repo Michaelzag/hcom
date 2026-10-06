@@ -20,6 +20,7 @@ mod delivery_policy;
 mod fanout_regression;
 pub mod fleet_names;
 pub mod hooks;
+pub mod hosted;
 pub mod identity;
 mod instance_binding;
 mod instance_lifecycle;

@@ -58,10 +58,17 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         // Only stop local instances. Every row comes with its binding epoch
         // from ONE snapshot, and each release is bound to that incarnation
         // (see `stop_read_instance`).
+        //
+        // Connector-hosted rows are exempt: one long-lived connector process
+        // owns them all, so `stop all` (the operator's "stop everything on
+        // this device" gesture, which every AI harness is covered by) must
+        // not take out the Buzz people and channels with it. An explicit
+        // `hcom stop <name>` still reaches them, and the connector
+        // re-registers within one loop.
         let instances = match db.iter_instances_with_bindings() {
             Ok(rows) => rows
                 .into_iter()
-                .filter(|(i, _)| !is_remote_instance(i))
+                .filter(|(i, _)| !is_remote_instance(i) && !crate::hosted::is_hosted_tool(&i.tool))
                 .collect::<Vec<_>>(),
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -990,5 +997,60 @@ mod tests {
         insert_mirror(&db, &form, FLEET_DEV);
         assert_eq!(resolve_stop_target(&db, "luna").unwrap(), form);
         assert_eq!(run_stop(&db, &["luna"]), 1, "remote stop stays refused");
+    }
+
+    // ── connector-hosted rows ─────────────────────────────────────────
+
+    /// A hosted participant registered through the real registration path,
+    /// beside an ordinary seeded seat that `stop all` is expected to stop.
+    fn seed_hosted(db: &HcomDb, name: &str) {
+        crate::hosted::register_hosted(db, name, crate::hosted::HOSTED_TOOL_BUZZ).unwrap();
+    }
+
+    /// `stop all` is the operator's stop-everything gesture and every harness
+    /// on the device is covered by it. Connector-hosted rows are not: one
+    /// long-lived connector owns all of them, so they are skipped. The
+    /// ordinary seat beside them proves the command still ran and still
+    /// stopped what it should.
+    #[test]
+    #[serial_test::serial]
+    fn stop_all_leaves_connector_hosted_rows() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        seed(&db, "navi", 1.0, "sess-navi", "proc-navi");
+        seed_hosted(&db, "michael");
+        seed_hosted(&db, "ch_infra");
+
+        assert_eq!(run_stop(&db, &["all"]), 0);
+
+        assert!(
+            db.get_instance_full("navi").unwrap().is_none(),
+            "the ordinary seat must still be stopped"
+        );
+        for name in ["michael", "ch_infra"] {
+            let row = db
+                .get_instance_full(name)
+                .unwrap()
+                .unwrap_or_else(|| panic!("stop all took the hosted row {name}"));
+            assert_eq!(row.tool, "buzz", "{name}");
+            assert_eq!(row.status, "listening", "{name} was stopped by 'all'");
+        }
+    }
+
+    /// The exemption is scoped to `all` only: naming the participant
+    /// explicitly still stops it, which is the operator's way to force the
+    /// issue when a hosted row should go away.
+    #[test]
+    #[serial_test::serial]
+    fn an_explicit_stop_still_reaches_a_hosted_row() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (_dir, db) = fleet_db();
+        seed_hosted(&db, "michael");
+
+        assert_eq!(run_stop(&db, &["michael"]), 0);
+        assert!(
+            db.get_instance_full("michael").unwrap().is_none(),
+            "an explicit stop must still stop the hosted row"
+        );
     }
 }
