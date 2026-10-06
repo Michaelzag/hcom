@@ -110,17 +110,31 @@ Without cleanup, orphan headless agents run indefinitely consuming resources. Al
 
 ## Broadcast vs Mention Routing
 
-**Broadcast (no @mentions):**
+**Broadcast (no targets):**
 ```bash
-hcom send -- "everyone sees this"  # No @ prefix = broadcast
+hcom send -- "everyone sees this"  # no target before --, so this broadcasts
 ```
 
 **Mention (targeted):**
 ```bash
-hcom send @luna -- "only luna sees this"         # Direct mention
-hcom send @worker- -- "all workers see this"     # Tag prefix
-hcom send @luna @nova -- "luna and nova see this" # Multiple mentions
+hcom send luna -- "only luna sees this"                  # direct, no @
+hcom send luna nova -- "luna and nova see this"          # multiple targets
+hcom send worker- -- "all workers see this"              # tag prefix
 ```
+
+**No `@` needed when the message is separated.** With `--` (or `--stdin`,
+`--file`, `--base64`) every positional before the message is a target, and the
+`@` is optional. `@luna` and `luna` mean the same thing there, so use the
+no-`@` form in PowerShell: PowerShell reads a bare `@luna` as splatting and
+swallows it, which turns `hcom send @luna -- text` into a broadcast to
+everyone instead of a message to luna. Quote it (`'@luna'`) if you prefer the
+`@` form.
+
+Without `--` the rule is different, and unchanged: the `@` is what marks a
+target, and a single bare word is the message text. `hcom send @luna hello`
+sends `hello` to luna; `hcom send luna` broadcasts the text `luna` to everyone.
+The same goes for piped input: `echo hi | hcom send @luna`, or drop the `@` and
+add `--stdin` (`echo hi | hcom send luna --stdin`).
 
 **Common mistake:** Forgetting `--` before the message text. Without `--`, the message text might be parsed as flags.
 
@@ -132,14 +146,14 @@ Agents are marked stale (inactive) if their heartbeat is not updated within tool
 
 **Wrong:** Not using intents, causing agents to over-respond:
 ```bash
-hcom send @worker- -- "FYI: I updated the config"  # No intent = ambiguous
+hcom send worker- -- "FYI: I updated the config"  # No intent = ambiguous
 ```
 
 **Right:**
 ```bash
-hcom send @worker- --intent inform -- "FYI: I updated the config"   # Worker won't respond
-hcom send @worker- --intent request -- "Review this code"           # Worker must respond
-hcom send @worker- --intent ack -- "Got it, thanks"                 # Worker ignores
+hcom send worker- --intent inform -- "FYI: I updated the config"   # Worker won't respond
+hcom send worker- --intent request -- "Review this code"           # Worker must respond
+hcom send worker- --intent ack -- "Got it, thanks"                 # Worker ignores
 ```
 
 The bootstrap teaches agents: `request -> always respond`, `inform -> respond only if useful`, `ack -> don't respond`.
@@ -151,7 +165,7 @@ The bootstrap teaches agents: `request -> always respond`, `inform -> respond on
 | `--thread` | Group related messages | Creates namespace for conversation isolation |
 | `--reply-to <id>` | Reference specific message | Links message to an event ID |
 | `@mentions` | Target specific agents | Controls delivery scope |
-| Broadcast (no @) | Everyone needs to see | Delivers to all active/listening agents |
+| Broadcast (no target) | Everyone needs to see | Delivers to all active/listening agents |
 
 ## TTY/PTY Issues
 

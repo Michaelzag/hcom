@@ -922,7 +922,7 @@ pub(crate) fn send_message_as_collected(
     // injected here lands on the same seat (a stopped or exited row is never
     // a candidate).
     let mut stmt = db.conn.prepare_cached(&format!(
-        "SELECT name, tag, origin_device_id FROM instances WHERE {}",
+        "SELECT name, tag, origin_device_id, tool FROM instances WHERE {}",
         crate::fleet_names::LIVE_ROW_PREDICATE
     ))?;
     let instances: Vec<InstanceInfo> = stmt
@@ -931,6 +931,7 @@ pub(crate) fn send_message_as_collected(
                 name: row.get::<_, String>(0)?,
                 tag: row.get::<_, Option<String>>(1)?,
                 origin: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
+                tool: row.get::<_, Option<String>>(3)?.filter(|s| !s.is_empty()),
             })
         })?
         .filter_map(|r| r.ok())

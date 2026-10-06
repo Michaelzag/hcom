@@ -71,6 +71,21 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// The same seam for `set_hosted_state`: fires between its candidate select
+// and its conditional writes, so a test can land a competing commit in
+// exactly the window the conditional `UPDATE ... WHERE` has to survive.
+thread_local! {
+    static TRANSITION_GAP_HOOK: std::cell::RefCell<Option<RegisterGap>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// Fires right after `set_hosted_state` commits, before its deferred wakes:
+// the window where a post-commit row write would clobber a concurrent stop.
+thread_local! {
+    static TRANSITION_COMMITTED_HOOK: std::cell::RefCell<Option<RegisterGap>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Does `tool` mark a row as connector-hosted?
 ///
 /// This is the one predicate every exemption keys off: the sweep's skip and
@@ -170,6 +185,29 @@ pub fn register_hosted(db: &HcomDb, name: &str, tool: &str) -> Result<RegisterOu
                     crate::shared::time::now_epoch_f64(),
                 ],
             )?;
+
+            // The same `life.created` record any other row gets, so the TUI,
+            // the relay and subscribers see the participant appear. The tool
+            // is not a released harness spec, so there is no auto-subscribe.
+            let launcher =
+                std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "connector".to_string());
+            let life = json!({
+                "action": "created",
+                "by": launcher,
+                "is_hcom_launched": false,
+                "is_subagent": false,
+                "parent_name": "",
+            });
+            db.log_event_collected("life", name, &life, &mut post)?;
+            log_transition(
+                db,
+                name,
+                None,
+                current_max,
+                ST_LISTENING,
+                CONTEXT_ONLINE,
+                &mut post,
+            )?;
             return Ok(RegisterOutcome::Created);
         };
 
@@ -186,53 +224,85 @@ pub fn register_hosted(db: &HcomDb, name: &str, tool: &str) -> Result<RegisterOu
             gate.arrive();
         }
 
-        // Existing hosted row: heartbeat ONLY. `status`/`status_context` are
-        // deliberately absent — `set_status_collected` below owns that
-        // transition, and it must read the row BEFORE any write to log the
-        // real prior status and to decide whether a transition wake fires.
-        // `last_event_id` is absent too, so the queued backlog survives.
-        let now = crate::shared::time::now_epoch_i64();
-        tx.execute(
-            "UPDATE instances SET last_stop = ?2, tcp_mode = 1 WHERE name = ?1",
-            rusqlite::params![name, now],
+        // Existing hosted row: one conditional write carrying every guard,
+        // inside the same transaction as the occupancy check, so it cannot
+        // land on a replacement row of another tool. `last_event_id` is not
+        // written, so the queued backlog survives. The prior state is read in
+        // this same snapshot and the status event is written here too: there
+        // is no second, post-commit write that could clobber a concurrent
+        // stop or re-read a row this transaction already moved.
+        let (old_status, old_context, position): (String, String, i64) = tx.query_row(
+            "SELECT status, status_context, last_event_id FROM instances WHERE name = ?1",
+            rusqlite::params![name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        let now = crate::shared::time::now_epoch_i64();
+        let written = tx.execute(
+            "UPDATE instances
+             SET status = ?2, status_time = ?3, status_context = ?4,
+                 status_detail = '', last_stop = ?3, tcp_mode = 1
+             WHERE name = ?1 AND tool = ?5
+               AND COALESCE(origin_device_id, '') = ''",
+            rusqlite::params![name, ST_LISTENING, now, CONTEXT_ONLINE, tool],
+        )?;
+        if written > 0 && (old_status != ST_LISTENING || old_context != CONTEXT_ONLINE) {
+            log_transition(
+                db,
+                name,
+                Some((&old_status, &old_context)),
+                position,
+                ST_LISTENING,
+                CONTEXT_ONLINE,
+                &mut post,
+            )?;
+        }
         Ok(RegisterOutcome::Refreshed)
     })?;
-
-    // The same `life.created` record any other row gets, so the TUI, the relay
-    // and subscribers see the participant appear. Written after the
-    // transaction commits: the fan-out it triggers must not hold the write
-    // lock. The tool is not a released harness spec, so auto-subscribe is a
-    // no-op for hosted tools today; the event is what matters.
-    if outcome == RegisterOutcome::Created {
-        let launcher =
-            std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "connector".to_string());
-        let event_data = json!({
-            "action": "created",
-            "by": launcher,
-            "is_hcom_launched": false,
-            "is_subagent": false,
-            "parent_name": "",
-        });
-        let _ = db.log_event_collected("life", name, &event_data, &mut post);
-    }
-
-    // Owns the online transition for BOTH branches. For a refresh the row is
-    // still on its previous status at this point, so this logs the real
-    // `old_status`/`old_context` and fires the transition wake — writing the
-    // status inside the transaction first made it report `listening`/
-    // `buzz:online` as the prior state of an offline row and skip the wake.
-    crate::instance_lifecycle::set_status_collected(
-        db,
-        name,
-        ST_LISTENING,
-        CONTEXT_ONLINE,
-        crate::instance_lifecycle::StatusUpdate::default(),
-        &mut post,
-    );
+    // Only the deferred effects run after commit: subscription TCP wakes and
+    // the transition wakes collected above. Nothing here writes a row.
     post.fire(db);
 
     Ok(outcome)
+}
+
+/// Write the status event for one hosted transition, from the prior state the
+/// caller read inside its own write transaction, and queue the delivery-loop
+/// wake into `post` when the status itself changed — the same event shape and
+/// wake rule as `instance_lifecycle::set_status`.
+///
+/// Call it inside the transaction that made the guarded row write. It writes
+/// the event row only, never the instance row: `set_status` re-writes the
+/// row by name, which after commit would clobber a concurrent stop and read a
+/// row this transaction already moved. `prior` is `None` for a row that did
+/// not exist before.
+fn log_transition(
+    db: &HcomDb,
+    name: &str,
+    prior: Option<(&str, &str)>,
+    position: i64,
+    status: &str,
+    context: &str,
+    post: &mut crate::hooks::common::PostCommit,
+) -> Result<()> {
+    let (old_status, old_context) = prior.unzip();
+    // Hosted rows carry no session, so the event has no `session` field.
+    let data = json!({
+        "status": status,
+        "context": context,
+        "position": position,
+        "old_status": old_status,
+        "old_context": old_context,
+        "old_detail": prior.map(|_| ""),
+        "new_status": status,
+        "new_context": context,
+        "new_detail": "",
+        "writer": "hosted",
+    });
+    db.log_event_collected("status", name, &data, post)?;
+    if old_status != Some(status) {
+        post.collect_wake(db, name, crate::notify::WakeKind::DELIVERY_LOOPS);
+    }
+    Ok(())
 }
 
 /// One connector heartbeat: touch `last_stop` on every live local hosted row
@@ -254,7 +324,10 @@ pub fn heartbeat_hosted(db: &HcomDb, tool: &str) -> Result<usize> {
 /// `inactive` / `buzz:offline`.
 ///
 /// `buzz:offline` is not an `exit:*` context, so the rows stay deliverable and
-/// everything sent while the connector is down queues on their cursors.
+/// everything sent while the connector is down queues on their cursors. Only
+/// rows that are actually online are transitioned: a row a concurrent
+/// [`stop_hosted`] already took down stays down rather than becoming
+/// deliverable again.
 pub fn set_hosted_offline(db: &HcomDb, tool: &str) -> Result<usize> {
     set_hosted_state(
         db,
@@ -262,80 +335,157 @@ pub fn set_hosted_offline(db: &HcomDb, tool: &str) -> Result<usize> {
         None,
         ST_INACTIVE,
         CONTEXT_OFFLINE,
-        &["stopped", "dead"],
+        &[CONTEXT_ONLINE],
     )
 }
 
 /// The rollback path: hosted rows of `tool` go `stopped` / `buzz:down`, which
 /// `fleet_names::LIVE_ROW_PREDICATE` refuses — a send aimed at them now fails
-/// instead of queueing.
+/// instead of queueing. This is the terminal transition, so it applies to
+/// every local hosted row of `tool` whatever state it is in.
 pub fn stop_hosted(db: &HcomDb, tool: &str) -> Result<usize> {
-    set_hosted_state(
-        db,
-        tool,
-        None,
-        "stopped",
-        CONTEXT_DOWN,
-        &["stopped", "dead"],
-    )
+    set_hosted_state(db, tool, None, "stopped", CONTEXT_DOWN, &[])
 }
 
-/// Stop one hosted row, the same way `stop_hosted` stops them all: for a
-/// participant that left every bridged channel while the connector runs.
+/// Stop one hosted row, the same terminal transition `stop_hosted` applies to
+/// them all: for a participant that left every bridged channel while the
+/// connector keeps running.
 pub fn stop_hosted_row(db: &HcomDb, tool: &str, name: &str) -> Result<usize> {
-    set_hosted_state(
-        db,
-        tool,
-        Some(name),
-        "stopped",
-        CONTEXT_DOWN,
-        &["stopped", "dead"],
-    )
+    set_hosted_state(db, tool, Some(name), "stopped", CONTEXT_DOWN, &[])
 }
 
-/// Shared liveness write for the non-create transitions: one UPDATE over the
-/// local hosted rows of `tool`, logging each status change the way the rest of
-/// the codebase does so the TUI and relay see it.
+/// Apply one hosted transition to every local row of `tool` that is in one of
+/// `from_contexts` (empty means "any context, but never already in the target
+/// state").
+///
+/// The candidate list, every row's write and every row's status event share
+/// ONE `BEGIN IMMEDIATE`. Each write is a single conditional `UPDATE ...
+/// WHERE name = ? AND tool = ? AND <expected prior state>`, and the status
+/// event is written in the same transaction from the prior state read just
+/// before it. That rules out the races the bulk form was exposed to:
+///
+/// - a concurrent `stop_hosted` cannot commit between our read and our write
+///   (the write lock excludes it), and one committed before us leaves the
+///   row outside our prior-state guard, so a stopped row is never made
+///   deliverable again by a stale offline write;
+/// - an explicit stop plus a relaunch that replaced the row with another
+///   tool fails the `tool = ?` guard, so a connector never writes liveness
+///   onto somebody else's identity;
+/// - nothing writes the row after commit, so a stop committed right after us
+///   stands, and the event's `old_status`/`old_context` are what the row
+///   really was.
+///
+/// Returns the number of rows actually moved; only those get a status event
+/// and, when the status changed, a delivery-loop wake after commit.
 fn set_hosted_state(
     db: &HcomDb,
     tool: &str,
     only: Option<&str>,
     status: &str,
     context: &str,
-    skip_statuses: &[&str],
+    from_contexts: &[&str],
 ) -> Result<usize> {
-    let names: Vec<String> = {
-        let mut stmt = db.conn().prepare(
-            "SELECT name FROM instances
-             WHERE COALESCE(origin_device_id, '') = ''
-               AND tool = ?1
-               AND (?2 IS NULL OR name = ?2)",
-        )?;
-        stmt.query_map(rusqlite::params![tool, only], |row| row.get::<_, String>(0))?
+    let mut post = crate::hooks::common::PostCommit::default();
+    let changed = db.with_immediate_transaction(|tx| {
+        let mut names: Vec<String> = if from_contexts.is_empty() {
+            let mut stmt = tx.prepare(
+                "SELECT name FROM instances
+                 WHERE COALESCE(origin_device_id, '') = ''
+                   AND tool = ?1
+                   AND status != ?2",
+            )?;
+            stmt.query_map(rusqlite::params![tool, status], |row| {
+                row.get::<_, String>(0)
+            })?
             .filter_map(|r| r.ok())
             .collect::<Vec<String>>()
-    };
-
-    let mut post = crate::hooks::common::PostCommit::default();
-    let mut changed = 0;
-    for name in &names {
-        let skip = db.get_instance_full(name)?;
-        if skip
-            .as_ref()
-            .is_some_and(|row| skip_statuses.contains(&row.status.as_str()) || row.status == status)
-        {
-            continue;
+        } else {
+            let placeholders = vec!["?"; from_contexts.len()].join(", ");
+            let sql = format!(
+                "SELECT name FROM instances
+                 WHERE COALESCE(origin_device_id, '') = ''
+                   AND tool = ?1
+                   AND status_context IN ({placeholders})"
+            );
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(tool.to_string())];
+            params.extend(
+                from_contexts
+                    .iter()
+                    .map(|c| Box::new(c.to_string()) as Box<dyn rusqlite::types::ToSql>),
+            );
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|b| b.as_ref()).collect();
+            let mut stmt = tx.prepare(&sql)?;
+            stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<String>>()
+        };
+        if let Some(only) = only {
+            names.retain(|name| name == only);
         }
-        crate::instance_lifecycle::set_status_collected(
-            db,
-            name,
-            status,
-            context,
-            crate::instance_lifecycle::StatusUpdate::default(),
-            &mut post,
-        );
-        changed += 1;
+
+        // Test seam: hands a competing writer its turn between the candidate
+        // select and the conditional writes below.
+        if let Some(gate) = TRANSITION_GAP_HOOK.with(|hook| hook.borrow_mut().take()) {
+            gate.arrive();
+        }
+
+        let now = crate::shared::time::now_epoch_i64();
+        let mut changed = 0;
+        for name in names {
+            // The prior state for the event comes from this snapshot, right
+            // before the write it describes.
+            let (old_status, old_context, position): (String, String, i64) = tx.query_row(
+                "SELECT status, status_context, last_event_id FROM instances WHERE name = ?1",
+                rusqlite::params![name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            // One conditional statement, carrying every guard. The prior-state
+            // guard is the context list when the caller named one, and
+            // "not already in the target state" otherwise — so an empty
+            // `from_contexts` is a real guard (any row not already stopped),
+            // not an empty IN () that matches nothing.
+            let n = tx.execute(
+                "UPDATE instances
+                 SET status = ?2, status_time = ?3, status_context = ?4, status_detail = ''
+                 WHERE name = ?1 AND tool = ?5
+                   AND COALESCE(origin_device_id, '') = ''
+                   AND CASE WHEN json_array_length(?6) = 0
+                            THEN status != ?2
+                            ELSE status_context IN (SELECT value FROM json_each(?6))
+                       END",
+                rusqlite::params![
+                    name,
+                    status,
+                    now,
+                    context,
+                    tool,
+                    serde_json::json!(from_contexts).to_string(),
+                ],
+            )?;
+            if n > 0 {
+                log_transition(
+                    db,
+                    &name,
+                    Some((&old_status, &old_context)),
+                    position,
+                    status,
+                    context,
+                    &mut post,
+                )?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    })?;
+
+    // Test seam: the window right after commit, where the old code wrote the
+    // row a second time.
+    if let Some(gate) = TRANSITION_COMMITTED_HOOK.with(|hook| hook.borrow_mut().take()) {
+        gate.arrive();
     }
+    // Only deferred effects from here: subscription TCP wakes and the
+    // transition wakes collected in the transaction. No row is written.
     post.fire(db);
     Ok(changed)
 }
@@ -349,12 +499,19 @@ mod tests {
     use std::path::PathBuf;
 
     /// `send_message` reaches the process-global relay path, so its ambient
-    /// `HCOM_DIR` has to be isolated and outlive the DB.
-    fn setup_test_db() -> (HcomDb, PathBuf, crate::hooks::test_helpers::EnvGuard) {
+    /// `HCOM_DIR` has to be isolated and outlive the DB. The `TempDir` is
+    /// returned rather than dropped: dropping it here would delete the
+    /// database file the returned handle still points at.
+    fn setup_test_db() -> (
+        HcomDb,
+        PathBuf,
+        tempfile::TempDir,
+        crate::hooks::test_helpers::EnvGuard,
+    ) {
         let (temp_dir, _hcom_dir, _home, guard) = crate::hooks::test_helpers::isolated_test_env();
         let db_path = temp_dir.path().join("hosted.db");
         let db = HcomDb::open_at(&db_path).unwrap();
-        (db, db_path, guard)
+        (db, db_path, temp_dir, guard)
     }
 
     fn cursor(db: &HcomDb, name: &str) -> i64 {
@@ -412,7 +569,7 @@ mod tests {
     #[test]
     #[serial]
     fn register_creates_a_listening_deliverable_row_with_no_backlog() {
-        let (db, _path, _guard) = setup_test_db();
+        let (db, _path, _dir, _guard) = setup_test_db();
 
         assert_eq!(
             register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap(),
@@ -454,7 +611,7 @@ mod tests {
     #[test]
     #[serial]
     fn re_register_preserves_the_cursor_and_the_queued_backlog() {
-        let (db, _path, _guard) = setup_test_db();
+        let (db, _path, _dir, _guard) = setup_test_db();
         register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
 
         let queued = send_to(&db, "michael", "while you were down").unwrap();
@@ -483,7 +640,7 @@ mod tests {
     #[test]
     #[serial]
     fn register_refuses_a_name_held_by_another_tool() {
-        let (db, _path, _guard) = setup_test_db();
+        let (db, _path, _dir, _guard) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, status, created_at, tool, status_context)
@@ -504,7 +661,7 @@ mod tests {
     #[test]
     #[serial]
     fn register_refuses_an_invalid_name() {
-        let (db, _path, _guard) = setup_test_db();
+        let (db, _path, _dir, _guard) = setup_test_db();
         let err = register_hosted(&db, "Sean Fitz", HOSTED_TOOL_BUZZ)
             .expect_err("a name that is not a base name is unroutable forever");
         assert!(err.to_string().contains("Invalid instance name"), "{err}");
@@ -514,7 +671,7 @@ mod tests {
     #[test]
     #[serial]
     fn register_refuses_a_bare_name_live_on_another_device() {
-        let (db, _path, _guard) = setup_test_db();
+        let (db, _path, _dir, _guard) = setup_test_db();
         let device = "11111111-1111-4111-8111-111111111111";
         let short = crate::relay::device_short_id(device);
         db.conn()
@@ -536,7 +693,7 @@ mod tests {
     #[test]
     #[serial]
     fn heartbeat_refreshes_live_rows_only() {
-        let (db, _path, _guard) = setup_test_db();
+        let (db, _path, _dir, _guard) = setup_test_db();
         register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
         register_hosted(&db, "ch_infra", HOSTED_TOOL_BUZZ).unwrap();
         db.conn()
@@ -562,7 +719,7 @@ mod tests {
     #[test]
     #[serial]
     fn offline_keeps_rows_deliverable_and_stop_refuses_sends() {
-        let (db, _path, _guard) = setup_test_db();
+        let (db, _path, _dir, _guard) = setup_test_db();
         register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
 
         assert_eq!(set_hosted_offline(&db, HOSTED_TOOL_BUZZ).unwrap(), 1);
@@ -750,7 +907,7 @@ mod tests {
     #[test]
     #[serial]
     fn an_explicit_name_launch_refuses_an_offline_hosted_row() {
-        let (db, _path, _guard) = setup_test_db();
+        let (db, _path, _dir, _guard) = setup_test_db();
         register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
         set_hosted_offline(&db, HOSTED_TOOL_BUZZ).unwrap();
         send_to(&db, "michael", "queued while offline").unwrap();
@@ -781,7 +938,7 @@ mod tests {
     #[test]
     #[serial]
     fn refresh_logs_the_real_prior_status_on_an_offline_to_online_transition() {
-        let (db, _path, _guard) = setup_test_db();
+        let (db, _path, _dir, _guard) = setup_test_db();
         register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
         set_hosted_offline(&db, HOSTED_TOOL_BUZZ).unwrap();
         assert_eq!(row(&db, "michael").status_context, "buzz:offline");
@@ -802,5 +959,323 @@ mod tests {
         assert_eq!(data["old_context"], "buzz:offline", "logged event: {data}");
         assert_eq!(data["new_status"], "listening", "logged event: {data}");
         assert_eq!(data["new_context"], "buzz:online", "logged event: {data}");
+    }
+
+    // ── regressions from the round-2 fauna review ────────────────────
+
+    /// A concurrent `stop_hosted` must not be undone by an in-flight
+    /// `set_hosted_offline`. The old bulk form read the row, decided, and
+    /// wrote outside any transaction: a stop landing in that window was
+    /// overwritten with `inactive`/`buzz:offline`, and a rolled-back
+    /// participant became deliverable again.
+    ///
+    /// The stop here commits INSIDE the offline sweep's candidate-select →
+    /// write window, which is precisely where the conditional
+    /// `... WHERE status_context IN (...)` has to refuse it.
+    #[test]
+    #[serial]
+    fn a_stop_committed_inside_the_offline_window_stays_stopped() {
+        let (temp_dir, _hcom_dir, _home, guard) = crate::hooks::test_helpers::isolated_test_env();
+        let path = temp_dir.path().join("hosted.db");
+        let db = HcomDb::open_at(&path).unwrap();
+        register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        TRANSITION_GAP_HOOK.with(|h| {
+            h.replace(Some(RegisterGap {
+                reached: reached_tx,
+                release: release_rx,
+            }))
+        });
+
+        // The rollback lands from its own connection, and commits BEFORE the
+        // sweep resumes. The sweep is holding only a read so far (it has
+        // selected candidates but not yet written), so this write succeeds —
+        // and the sweep's subsequent conditional UPDATE has to refuse the row
+        // whose `status_context` changed underneath it. The write lock is
+        // not what saves the row here; the `WHERE` guard is.
+        let rollback_path = path.clone();
+        let rollback = std::thread::spawn(move || {
+            let conn = HcomDb::open_raw(&rollback_path).unwrap();
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the offline sweep never reached the gap");
+            let result = conn
+                .conn()
+                .execute(
+                    "UPDATE instances
+                     SET status = 'stopped', status_context = 'buzz:down'
+                     WHERE name = 'michael' AND status_context = 'buzz:online'",
+                    [],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            release_tx.send(()).ok();
+            result
+        });
+
+        let swept = set_hosted_offline(&db, HOSTED_TOOL_BUZZ);
+        let rollback_result = rollback.join().expect("rollback thread panicked");
+        TRANSITION_GAP_HOOK.with(|h| h.replace(None));
+        let _ = guard;
+
+        // The rollback's write is refused outright: `set_hosted_state` holds the
+        // transaction's write lock from BEGIN IMMEDIATE, so a concurrent
+        // writer cannot commit between the candidate select and the
+        // conditional UPDATE at all. The conditional `WHERE` guards stay as
+        // the second line for any writer that committed before the lock was
+        // taken.
+        let rollback = rollback_result.expect_err(
+            "a rollback committed inside the sweep's transaction: \
+             the write lock did not exclude it",
+        );
+        assert!(
+            rollback.contains("locked") || rollback.contains("busy"),
+            "the competing write must be refused by the transaction's lock: {rollback}"
+        );
+        assert_eq!(swept.expect("the offline sweep ran"), 1);
+
+        assert_eq!(
+            row(&db, "michael").status_context,
+            "buzz:offline",
+            "the sweep moved the row while the rollback waited"
+        );
+
+        // A rollback that lands AFTER the sweep must still not be undone by a
+        // later sweep: the offline transition only applies to rows that were
+        // online when it ran, so a row already `buzz:down` is not a candidate
+        // and stays stopped.
+        assert_eq!(stop_hosted(&db, HOSTED_TOOL_BUZZ).unwrap(), 1);
+        assert_eq!(
+            set_hosted_offline(&db, HOSTED_TOOL_BUZZ).unwrap(),
+            0,
+            "the offline sweep must not resurrect a stopped row"
+        );
+
+        assert_eq!(row(&db, "michael").status, "stopped", "the rollback stands");
+        assert_eq!(row(&db, "michael").status_context, "buzz:down");
+        // And a send still refuses: the row is not deliverable again.
+        let refused = send_message(
+            &db,
+            &sender(),
+            "still there?",
+            None,
+            Some(&["michael".to_string()]),
+        )
+        .expect_err("a stopped row must not become deliverable again");
+        assert!(!refused.is_empty(), "{refused}");
+    }
+
+    /// The bulk transitions are name-based, so they must never write onto a
+    /// row that has been replaced by a different tool underneath them (an
+    /// explicit stop plus a relaunch). The `tool = ?` guard is what stops
+    /// this; without it a connector would stamp `buzz:offline` onto somebody
+    /// else's freshly launched identity. The replacement commits inside the
+    /// sweep's candidate-select → write window, where the candidate list is
+    /// already built and only the `WHERE` guards can still refuse it.
+    #[test]
+    #[serial]
+    fn a_bulk_transition_never_touches_a_replacement_row_of_another_tool() {
+        let (temp_dir, _hcom_dir, _home, guard) = crate::hooks::test_helpers::isolated_test_env();
+        let path = temp_dir.path().join("hosted.db");
+        let db = HcomDb::open_at(&path).unwrap();
+        register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        TRANSITION_GAP_HOOK.with(|h| {
+            h.replace(Some(RegisterGap {
+                reached: reached_tx,
+                release: release_rx,
+            }))
+        });
+
+        // The operator stops the participant and a harness claims the name.
+        let replacement_path = path.clone();
+        let replacement = std::thread::spawn(move || {
+            let conn = HcomDb::open_raw(&replacement_path).unwrap();
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the sweep never reached the gap");
+            let result = conn
+                .conn()
+                .execute(
+                    "UPDATE instances
+                     SET tool = 'codex', status = 'active', status_context = 'ready',
+                         status_time = 1
+                     WHERE name = 'michael'",
+                    [],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            release_tx.send(()).ok();
+            result
+        });
+
+        let swept = set_hosted_offline(&db, HOSTED_TOOL_BUZZ);
+        let replacement_result = replacement.join().expect("replacement thread panicked");
+        TRANSITION_GAP_HOOK.with(|h| h.replace(None));
+        let _ = guard;
+
+        // The replacement is refused by the sweep's write lock, so the row is
+        // still the connector's and the sweep legitimately moved it.
+        let replacement = replacement_result.expect_err(
+            "a replacement committed inside the sweep's transaction: \
+             the write lock did not exclude it",
+        );
+        assert!(
+            replacement.contains("locked") || replacement.contains("busy"),
+            "the competing write must be refused by the transaction's lock: {replacement}"
+        );
+        assert_eq!(swept.expect("the sweep ran"), 1);
+        assert_eq!(row(&db, "michael").status_context, "buzz:offline");
+
+        // Now the `tool = ?` guard, with the replacement committed for real:
+        // once another tool owns the name, no hosted transition may select
+        // or write that row.
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'codex', status = 'active',
+                                      status_context = 'ready', status_time = 1
+                 WHERE name = 'michael'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            stop_hosted(&db, HOSTED_TOOL_BUZZ).unwrap(),
+            0,
+            "a stop must not touch a row another tool now owns"
+        );
+        assert_eq!(
+            set_hosted_offline(&db, HOSTED_TOOL_BUZZ).unwrap(),
+            0,
+            "an offline sweep must not touch a row another tool now owns"
+        );
+        assert_eq!(row(&db, "michael").tool, "codex");
+        assert_eq!(row(&db, "michael").status_context, "ready");
+    }
+
+    /// Only rows the transition actually moved may log a status event. A row
+    /// already in the target state must produce no event at all — otherwise
+    /// every connector loop rewrites the same transition for every idle
+    /// participant and the event stream stops meaning "something changed".
+    #[test]
+    #[serial]
+    fn a_transition_logs_nothing_for_rows_it_did_not_change() {
+        let (db, _path, _dir, _guard) = setup_test_db();
+        register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
+        set_hosted_offline(&db, HOSTED_TOOL_BUZZ).unwrap();
+
+        let count = |db: &HcomDb| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE type = 'status' AND instance = 'michael'
+                       AND json_extract(data, '$.new_context') = 'buzz:offline'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let after_first = count(&db);
+        assert_eq!(after_first, 1, "the real transition logged once");
+
+        // A second sweep changes nothing, so it must log nothing.
+        assert_eq!(set_hosted_offline(&db, HOSTED_TOOL_BUZZ).unwrap(), 0);
+        assert_eq!(count(&db), after_first, "an unchanged row logged again");
+    }
+
+    /// Nothing may write the row after the transition commits. A stop that
+    /// lands right after the offline sweep commits must stand: the old code
+    /// called `set_status_collected` post-commit, which re-wrote the row by
+    /// name (`inactive`/`buzz:offline` over the stop, so a rolled-back
+    /// participant was deliverable again) and logged the stopped row as the
+    /// transition's prior state. The event must carry the state the sweep
+    /// really moved from, and the delivery-loop wake must still fire.
+    #[test]
+    #[serial]
+    fn a_stop_committed_right_after_the_offline_commit_stays_stopped() {
+        let (db, path, _dir, _guard) = setup_test_db();
+        register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
+
+        // A delivery loop listening for the row's wake.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        db.register_notify_port("michael", port).unwrap();
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        TRANSITION_COMMITTED_HOOK.with(|h| {
+            h.replace(Some(RegisterGap {
+                reached: reached_tx,
+                release: release_rx,
+            }))
+        });
+
+        // The rollback commits from its own connection once the sweep's
+        // transaction is durable and before anything else the sweep does.
+        let rollback = std::thread::spawn(move || {
+            let conn = HcomDb::open_raw(&path).unwrap();
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the offline sweep never committed");
+            let result = conn
+                .conn()
+                .execute(
+                    "UPDATE instances SET status = 'stopped', status_context = 'buzz:down'
+                     WHERE name = 'michael'",
+                    [],
+                )
+                .map_err(|e| e.to_string());
+            release_tx.send(()).ok();
+            result
+        });
+
+        let swept = set_hosted_offline(&db, HOSTED_TOOL_BUZZ);
+        let rollback = rollback.join().expect("rollback thread panicked");
+        TRANSITION_COMMITTED_HOOK.with(|h| h.replace(None));
+
+        assert_eq!(rollback.expect("the rollback committed"), 1);
+        assert_eq!(swept.expect("the offline sweep ran"), 1);
+
+        // The stop stands.
+        let row = row(&db, "michael");
+        assert_eq!(row.status, "stopped", "a post-commit write undid the stop");
+        assert_eq!(row.status_context, "buzz:down");
+
+        // The event describes the move the sweep made, from what the row was.
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'status' AND instance = 'michael'
+                   AND json_extract(data, '$.new_context') = 'buzz:offline'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["old_status"], "listening", "logged event: {data}");
+        assert_eq!(data["old_context"], "buzz:online", "logged event: {data}");
+        assert_eq!(data["new_status"], "inactive", "logged event: {data}");
+
+        // And the delivery loop was woken.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let woken = loop {
+            match listener.accept() {
+                Ok(_) => break true,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
+        assert!(woken, "the offline transition never woke the delivery loop");
     }
 }

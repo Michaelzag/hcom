@@ -48,6 +48,25 @@ run `hcom --help` for full command syntax and flags.
 
 ---
 
+## sending messages
+
+```bash
+hcom send luna -- "starting on the parser"      # one agent
+hcom send luna nova -- "review this diff"       # several agents
+hcom send worker- -- "FYI: config updated"      # everyone tagged 'worker'
+hcom send -- "deploy is happening now"          # no target before --: broadcast
+```
+
+No `@` is needed. With `--` (or `--stdin`, `--file`, `--base64`) every
+positional before the message is a target, and the `@` is optional — so this is
+the form to use in PowerShell, where a bare `@luna` is swallowed as splatting
+and turns the send into a broadcast.
+
+Without `--`, a bare positional is the message text instead: `hcom send luna`
+broadcasts the text "luna". Keep `--` before the message.
+
+---
+
 ## tool support
 
 | tool | delivery | connect |
@@ -109,7 +128,7 @@ hcom claude          # fresh start
 | symptom | diagnosis | fix |
 |---------|-----------|-----|
 | agent not in `hcom list` | agent stopped or never bound | relaunch or wait for binding |
-| message sent but not delivered | check `hcom events --last 5` | verify @mention matches agent name/tag |
+| message sent but not delivered | check `hcom events --last 5` | verify the target before `--` matches the agent name/tag |
 | message reaches more than one agent | duplicate base name across tags | target the full `@tag-name` to hit exactly one |
 | messages leaking between workflows | no thread isolation | always use `--thread` |
 
