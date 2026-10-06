@@ -599,7 +599,16 @@ impl HcomDb {
         // concurrent opener wait here instead, then see the winner's stamp.
         // Held by hand, not via `with_immediate_transaction`, because the
         // archive fallback must roll a partial migration back, not commit it.
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // Retried on SQLITE_BUSY past sqlite's own busy_timeout: a fresh-store
+        // init (WAL conversion + full schema + backfill) outlasts it, and a
+        // loser must back off instead of exiting 1.
+        let tx = retry_on_busy(
+            || {
+                Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+                    .map_err(anyhow::Error::from)
+            },
+            DEFAULT_SEND_WRITE_BUDGET,
+        )?;
         // Read the version this open migrates from ONCE, under the lock: the
         // v20 created_at-bits backfill is run-once, gated on the version found
         // here, not on whatever `init_db`/`try_apply_migrations` stamp

@@ -752,6 +752,24 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         return crate::commands::daemon::cmd_daemon(&cmd_argv[1..]);
     }
 
+    // `update --refresh-cache` only rewrites the update-notice flag file; it
+    // must not open the database. The stale-cache background child would
+    // otherwise race its parent's own fresh-store schema init and lose with
+    // SQLITE_BUSY. Parse failure falls through to the normal path, which
+    // reports it exactly as today.
+    if cmd == "update" {
+        use clap::Parser;
+        if let Ok(uargs) = crate::commands::update::UpdateArgs::try_parse_from(
+            std::iter::once(cmd.to_string()).chain(cmd_argv.iter().cloned()),
+        ) && uargs.refresh_cache
+        {
+            return if crate::update::refresh_update_cache().is_ok() {
+                0
+            } else {
+                1
+            };
+        }
+    }
     // Open DB (includes schema migration/compat check)
     let db = match HcomDb::open() {
         Ok(db) => db,
