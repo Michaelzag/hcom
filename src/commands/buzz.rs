@@ -160,7 +160,7 @@ fn cmd_status(db: &HcomDb, args: &StatusArgs) -> i32 {
     };
 
     let running = ServeLock::holder_pid(&Config::lock_path())
-        .is_some_and(|pid| crate::buzz::config::lock_holder_alive(pid));
+        .is_some_and(crate::buzz::config::lock_holder_alive);
     let mut channels = Vec::new();
     let mut parked = Vec::new();
     if let Ok(rows) = store.channels() {
@@ -276,12 +276,10 @@ fn cmd_status(db: &HcomDb, args: &StatusArgs) -> i32 {
 /// Hosted channel rows published by *this* device; the origin for `read` on a
 /// device without connector state.
 fn hosted_channel_rows(db: &HcomDb) -> Vec<String> {
-    let sql = format!(
-        "SELECT name, origin_device_id FROM instances
+    let sql = "SELECT name, origin_device_id FROM instances
          WHERE tool = ?1 AND COALESCE(origin_device_id, '') = ''
-         ORDER BY name"
-    );
-    let Ok(mut stmt) = db.conn().prepare(&sql) else {
+         ORDER BY name";
+    let Ok(mut stmt) = db.conn().prepare(sql) else {
         return Vec::new();
     };
     let Ok(rows) = stmt.query_map(rusqlite::params![crate::hosted::HOSTED_TOOL_BUZZ], |row| {
@@ -406,13 +404,13 @@ fn origin_device_of(db: &HcomDb, channel_id: &str) -> Result<String> {
 
 /// Resolve a channel argument to `(channel_id, slug)`.
 fn resolve_channel(arg: &str) -> Result<(String, String)> {
-    if let Ok(config) = Config::load() {
-        if let Some(channel) = config.channel_by_slug(arg) {
-            return Ok((
-                channel.id.clone(),
-                channel.slug.clone().unwrap_or_else(|| channel.id.clone()),
-            ));
-        }
+    if let Ok(config) = Config::load()
+        && let Some(channel) = config.channel_by_slug(arg)
+    {
+        return Ok((
+            channel.id.clone(),
+            channel.slug.clone().unwrap_or_else(|| channel.id.clone()),
+        ));
     }
     // Otherwise treat it as a channel id; the store knows the slug.
     if let Ok(store) = Store::open_read_only(&Config::state_db_path())
@@ -697,7 +695,7 @@ fn run_publish(args: &PublishArgs) -> Result<()> {
     let auth = connector.reader_auth_tag_for(&identity.pubkey);
 
     // Enroll if needed: kind 0 + 30177 as the signer, 9000 as omp.
-    if !publish_enroll(&connector, &identity, &channel_id)? {
+    if !publish_enroll(&connector, &identity, channel_id)? {
         bail!(
             "could not enroll {args_name} in {channel_id}",
             args_name = args.as_name

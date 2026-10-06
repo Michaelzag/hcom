@@ -206,6 +206,23 @@ pub fn agent_name_for(author: &str, roster: &AgentRoster) -> Option<String> {
     roster.by_pubkey.get(author).cloned()
 }
 
+/// The hcom name a profile marker claims: `zagcom/hcom-identity/v1:luna@boxe`
+/// names `luna`, device `boxe`.
+///
+/// The marker is the whole point of the kind 0, so the name comes from it
+/// rather than from a matching hcom row — an agent whose row is gone is still
+/// recognisable, which is exactly the parked-target case.
+pub fn identity_from_marker(about: &str) -> Option<(String, String)> {
+    let canonical = about
+        .strip_prefix(AGENT_MARKER_PREFIX)
+        .or_else(|| about.strip_prefix(READER_CANONICAL_PREFIX))?;
+    let (name, device) = canonical.rsplit_once('@')?;
+    if name.is_empty() || device.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), device.to_string()))
+}
+
 /// Classify a Buzz author from its kind 0 profile.
 ///
 /// `derived` is the pubkey → canonical `name@device` map (agents plus the
@@ -1096,6 +1113,31 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_names_the_agent_and_its_device() {
+        assert_eq!(
+            identity_from_marker(&format!("{AGENT_MARKER_PREFIX}luna@mbai")),
+            Some(("luna".to_string(), "mbai".to_string()))
+        );
+        assert_eq!(
+            identity_from_marker(&format!("{AGENT_MARKER_PREFIX}luna@boxe")),
+            Some(("luna".to_string(), "boxe".to_string()))
+        );
+        assert_eq!(
+            identity_from_marker(&format!("{READER_CANONICAL_PREFIX}reader@mbai")),
+            Some(("reader".to_string(), "mbai".to_string()))
+        );
+        assert_eq!(identity_from_marker("just a person"), None);
+        assert_eq!(
+            identity_from_marker(&format!("{AGENT_MARKER_PREFIX}nope")),
+            None
+        );
+        assert_eq!(
+            identity_from_marker(&format!("{AGENT_MARKER_PREFIX}@mbai")),
+            None
+        );
+    }
+
+    #[test]
     fn thread_names_are_stable_and_recognisable() {
         let root = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert_eq!(thread_name("infra", root), "buzz_infra_0123456789ab");
@@ -1299,7 +1341,7 @@ mod tests {
         )]);
         let routed = route_outbound(
             &message("luna", &["michael"], Some("buzz_infra_abc123")),
-            &outctx(&[michael.clone()], &channels, &threads),
+            &outctx(std::slice::from_ref(&michael), &channels, &threads),
         );
         assert_eq!(
             routed,

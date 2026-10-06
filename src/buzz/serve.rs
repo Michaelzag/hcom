@@ -13,11 +13,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use crate::buzz::config::{self, Config};
@@ -414,7 +415,7 @@ pub fn serve(config: Config) -> Result<i32> {
     let db = HcomDb::open().context("cannot open hcom.db")?;
     let epoch = hcom_epoch(&db)?;
     {
-        let mut store = connector.store.lock().expect("store lock");
+        let mut store = connector.store.lock();
         store.adopt_epoch(epoch.clone())?;
     }
 
@@ -474,21 +475,20 @@ fn register_hosted_rows(db: &HcomDb, connector: &Connector, port: u16) {
     let people: Vec<String> = connector
         .store
         .lock()
-        .expect("store lock")
         .active_people()
         .map(|people| people.into_iter().map(|p| p.name).collect())
         .unwrap_or_default();
     let mut names = people;
     names.extend(connector.channel_rows().iter().map(|c| c.row_name()));
 
-    let mut hosted = connector.hosted.lock().expect("hosted lock");
+    let mut hosted = connector.hosted.lock();
     for name in &names {
         match crate::hosted::register_hosted(db, name, crate::hosted::HOSTED_TOOL_BUZZ) {
             Ok(_) => {
                 let _ =
                     db.upsert_notify_endpoint(name, crate::notify::WakeKind::Listen.as_str(), port);
-                if !hosted.contains(name) {
-                    hosted.push(name.clone());
+                if !hosted.iter().any(|row| row == name) {
+                    hosted.push(name.to_string());
                 }
             }
             Err(error) => crate::log::log_warn(
@@ -556,7 +556,6 @@ fn subscribe_all(session: &mut WsSession, handles: &ReaderHandles) -> Result<()>
         let since = handles
             .store
             .lock()
-            .expect("store lock")
             .channel(&channel.id)
             .ok()
             .flatten()
@@ -604,10 +603,11 @@ fn pump_session(
             Ok(Some(RelayMsg::Closed { sub, reason })) => {
                 // One closed subscription parks its channel; the rest keep
                 // running, so a single failure never stops the connector.
-                if let Some(channel_id) = channel_for_sub(&handles.channels, &sub)
-                    && let Ok(store) = handles.store.lock()
-                {
-                    let _ = store.set_channel_parked(&channel_id, Some(&reason));
+                if let Some(channel_id) = channel_for_sub(&handles.channels, &sub) {
+                    let _ = handles
+                        .store
+                        .lock()
+                        .set_channel_parked(&channel_id, Some(&reason));
                 }
                 crate::log::log_warn("buzz", "serve.channel_closed", &format!("{sub}: {reason}"));
             }
@@ -667,6 +667,41 @@ struct MainLoop {
 }
 
 impl MainLoop {
+    /// Build a loop around an already-loaded connector, keeping the sending half
+    /// of the inbound channel so a test can inject exactly what the reader
+    /// thread would have handed over.
+    #[cfg(test)]
+    fn for_test(
+        connector: Connector,
+        db: HcomDb,
+        epoch: String,
+    ) -> (Self, mpsc::Sender<InboundItem>) {
+        let (tx, rx) = mpsc::channel();
+        let loop_self = Self {
+            connector,
+            db,
+            notify: crate::notify::NotifyServer::new().expect("notify endpoint"),
+            epoch,
+            inbound: rx,
+            last_enroll: Instant::now(),
+            last_stale_check: Instant::now(),
+            buckets: HashMap::new(),
+        };
+        (loop_self, tx)
+    }
+
+    /// One iteration of the main loop: inbound, tick, enrollment. Returns the
+    /// next wake wait. The tests drive this directly, so they exercise the
+    /// production loop body rather than a stand-in.
+    fn step(&mut self) {
+        self.drain_inbound();
+        self.tick();
+        if self.last_enroll.elapsed() >= ENROLL_INTERVAL {
+            self.last_enroll = Instant::now();
+            self.plan_enrollment();
+        }
+    }
+
     /// Run until SIGTERM/SIGINT, then shut down cleanly.
     fn run(&mut self) -> i32 {
         register_hosted_rows(&self.db, &self.connector, self.notify.port());
@@ -701,7 +736,7 @@ impl MainLoop {
     }
 
     fn hosted_rows(&self) -> Vec<String> {
-        self.connector.hosted.lock().expect("hosted lock").clone()
+        self.connector.hosted.lock().clone()
     }
 
     /// One pass: heartbeat, epoch check, re-register, parked retries, outbound.
@@ -721,13 +756,12 @@ impl MainLoop {
                 "hcom.db was replaced; hosted rows re-register",
             );
             self.epoch = epoch.clone();
-            if let Ok(mut store) = self.connector.store.lock() {
-                let _ = store.adopt_epoch(epoch);
-            }
+            let _ = self.connector.store.lock().adopt_epoch(epoch);
         }
         self.reregister_missing_rows();
         self.retry_parked_targets();
         self.scan_outbound();
+        self.flush_all_channels();
         if self.last_stale_check.elapsed() >= Duration::from_secs(60) {
             self.last_stale_check = Instant::now();
             self.recheck_stale_outbox();
@@ -738,17 +772,17 @@ impl MainLoop {
     /// has gone (an operator `hcom stop`, a reset, a deletion).
     fn reregister_missing_rows(&mut self) {
         let port = self.notify.port();
-        let people: Vec<String> = match self.connector.store.lock() {
-            Ok(store) => store
-                .active_people()
-                .map(|people| people.into_iter().map(|p| p.name).collect())
-                .unwrap_or_default(),
-            Err(_) => return,
-        };
-        let mut wanted = people;
+        let people: Vec<String> = self
+            .connector
+            .store
+            .lock()
+            .active_people()
+            .map(|people| people.into_iter().map(|p| p.name).collect())
+            .unwrap_or_default();
+        let mut wanted: Vec<String> = people;
         wanted.extend(self.connector.channel_rows().iter().map(|c| c.row_name()));
 
-        let mut hosted = self.connector.hosted.lock().expect("hosted lock");
+        let mut hosted = self.connector.hosted.lock();
         for name in wanted {
             if hosted.contains(&name) {
                 continue;
@@ -779,14 +813,17 @@ impl MainLoop {
     /// Retry parked inbound targets; after the window, say so in Buzz as omp.
     fn retry_parked_targets(&mut self) {
         let now = crate::shared::time::now_epoch_i64();
-        let due = match self.connector.store.lock() {
-            Ok(store) => store.due_targets(now).unwrap_or_default(),
-            Err(_) => return,
-        };
+        let due = self
+            .connector
+            .store
+            .lock()
+            .due_targets(now)
+            .unwrap_or_default();
         for target in due {
             match self.deliver_parked(&target.buzz_id, &target.target) {
                 Ok(true) => {
-                    if let Ok(store) = self.connector.store.lock() {
+                    {
+                        let store = self.connector.store.lock();
                         let _ =
                             store.update_target(&target.buzz_id, &target.target, "delivered", 0);
                     }
@@ -798,11 +835,12 @@ impl MainLoop {
                 }
             }
 
-            let parked_for = now.saturating_sub(target.first_parked_at.max(now));
+            let parked_for = now.saturating_sub(target.first_parked_at);
             if parked_for < PARK_WINDOW.as_secs() as i64 {
                 let attempts = target.attempts.saturating_add(1);
                 let next = now + park_retry_delay(attempts);
-                if let Ok(store) = self.connector.store.lock() {
+                {
+                    let store = self.connector.store.lock();
                     let _ = store.update_target(&target.buzz_id, &target.target, "parked", next);
                 }
                 continue;
@@ -810,7 +848,8 @@ impl MainLoop {
             // The window is over: the channel is told, as omp, in the same
             // thread. The cursor moved on regardless, so nothing stalls.
             self.announce_undelivered(&target.buzz_id, &target.target);
-            if let Ok(store) = self.connector.store.lock() {
+            {
+                let store = self.connector.store.lock();
                 let _ = store.expire_targets(&target.buzz_id, &target.target);
             }
         }
@@ -819,7 +858,7 @@ impl MainLoop {
     /// Try one parked delivery. `Ok(true)` when it resolved.
     fn deliver_parked(&mut self, buzz_id: &str, target: &str) -> Result<bool> {
         let event = {
-            let store = self.connector.store.lock().expect("store lock");
+            let store = self.connector.store.lock();
             store.cached_event(buzz_id)?
         };
         let Some(cached) = event else {
@@ -851,15 +890,16 @@ impl MainLoop {
     /// Post the "isn't running — not delivered" notice as omp.
     fn announce_undelivered(&mut self, buzz_id: &str, target: &str) {
         let channel_id = {
-            let store = self.connector.store.lock().expect("store lock");
+            let store = self.connector.store.lock();
             match store.cached_event(buzz_id) {
                 Ok(Some(cached)) => cached.channel_id,
                 _ => return,
             }
         };
         let text = format!("{target} isn't running — not delivered");
-        let identity = self.connector.agent_identity(OMP_ROW);
-        let _thread = route::thread_name(&self.channel_slug(&channel_id), buzz_id);
+        // Posted as omp's own key: it is a relay member and the channel admin, so
+        // no enrollment or delegation is needed, and the notice reads as coming
+        // from omp rather than from whichever agent failed.
         let event = sign(
             UnsignedEvent {
                 created_at: nostr::now(),
@@ -875,9 +915,13 @@ impl MainLoop {
                 },
                 content: text,
             },
-            &identity.key,
+            &self.connector.owner,
         );
-        match self.connector.http.post_event(&event, &identity.key, None) {
+        match self
+            .connector
+            .http
+            .post_event(&event, &self.connector.owner, None)
+        {
             Ok(()) => crate::log::log_info(
                 "buzz",
                 "serve.not_delivered",
@@ -1017,10 +1061,7 @@ impl MainLoop {
             next_at: 0,
             last_error: None,
         };
-        let queued = match self.connector.store.lock() {
-            Ok(store) => store.enqueue_outbox(&row),
-            Err(_) => return,
-        };
+        let queued = self.connector.store.lock().enqueue_outbox(&row);
         match queued {
             Ok(true) => crate::log::log_info(
                 "buzz",
@@ -1037,7 +1078,7 @@ impl MainLoop {
     /// The routing inputs for outbound decisions: active people, bridged
     /// channels, and every Buzz thread this connector has recorded.
     fn route_inputs(&self) -> Result<OutboundInputs> {
-        let store = self.connector.store.lock().expect("store lock");
+        let store = self.connector.store.lock();
         Ok(OutboundInputs {
             people: store
                 .active_people()?
@@ -1058,18 +1099,32 @@ impl MainLoop {
         })
     }
 
-    /// Post everything due for one Buzz channel.
-    fn flush_channel(&mut self, channel_id: &str) {
-        self.post_due(channel_id);
+    /// Post everything queued for every bridged channel.
+    ///
+    /// Queuing and posting are separate steps so a message addressed to two
+    /// channels becomes two independent outbox rows, and one failing never
+    /// holds the other.
+    fn flush_all_channels(&mut self) {
+        let channels: Vec<String> = self
+            .connector
+            .channel_rows()
+            .into_iter()
+            .map(|channel| channel.id)
+            .collect();
+        for channel_id in channels {
+            self.post_due(&channel_id);
+        }
     }
 
     /// Post every due outbox row for one Buzz channel, honoring budgets.
     fn post_due(&mut self, channel_id: &str) {
         let now = crate::shared::time::now_epoch_i64();
-        let due = match self.connector.store.lock() {
-            Ok(store) => store.due_outbox(channel_id, now).unwrap_or_default(),
-            Err(_) => return,
-        };
+        let due = self
+            .connector
+            .store
+            .lock()
+            .due_outbox(channel_id, now)
+            .unwrap_or_default();
         for row in due {
             if self.connector.shutdown.load(Ordering::SeqCst) {
                 return;
@@ -1111,7 +1166,8 @@ impl MainLoop {
                         "serve.posted",
                         &format!("{} {} -> {channel_id}", row.signer_name, row.buzz_id),
                     );
-                    if let Ok(store) = self.connector.store.lock() {
+                    {
+                        let store = self.connector.store.lock();
                         let _ = store.ack_outbox(&row.buzz_id);
                     }
                 }
@@ -1151,12 +1207,12 @@ impl MainLoop {
     /// `created_at`.
     fn recheck_stale_outbox(&mut self) {
         let now = crate::shared::time::now_epoch_i64();
-        let stale = match self.connector.store.lock() {
-            Ok(store) => store
-                .stale_outbox(now - STALE_RECHECK_AFTER.as_secs() as i64)
-                .unwrap_or_default(),
-            Err(_) => return,
-        };
+        let stale = self
+            .connector
+            .store
+            .lock()
+            .stale_outbox(now - STALE_RECHECK_AFTER.as_secs() as i64)
+            .unwrap_or_default();
         for row in stale {
             let identity = self.connector.agent_identity(&row.signer_name);
             let auth = identity.auth_tag(&self.connector.owner);
@@ -1169,7 +1225,8 @@ impl MainLoop {
             {
                 // The relay has it after all: the lost ack, not a lost post.
                 Ok(events) if !events.is_empty() => {
-                    if let Ok(store) = self.connector.store.lock() {
+                    {
+                        let store = self.connector.store.lock();
                         let _ = store.ack_outbox(&row.buzz_id);
                     }
                     crate::log::log_info(
@@ -1196,7 +1253,8 @@ impl MainLoop {
                     );
                     let signed = serde_json::to_string(&event).unwrap_or_default();
                     let now = crate::shared::time::now_epoch_i64();
-                    if let Ok(store) = self.connector.store.lock() {
+                    {
+                        let store = self.connector.store.lock();
                         let _ = store.replace_outbox_event(
                             row.hcom_id,
                             &row.destination,
@@ -1240,7 +1298,8 @@ impl MainLoop {
             "serve.post_retry",
             &format!("{} {}: {error}", row.signer_name, row.destination),
         );
-        if let Ok(store) = self.connector.store.lock() {
+        {
+            let store = self.connector.store.lock();
             let _ = store.retry_outbox(&row.buzz_id, next_at, error);
         }
     }
@@ -1251,7 +1310,8 @@ impl MainLoop {
             "serve.post_failed",
             &format!("{} {}: {error}", row.signer_name, row.destination),
         );
-        if let Ok(store) = self.connector.store.lock() {
+        {
+            let store = self.connector.store.lock();
             let _ = store.fail_outbox(&row.buzz_id, error);
         }
     }
@@ -1260,16 +1320,16 @@ impl MainLoop {
     fn flush_outbox(&mut self, budget: Duration) {
         let deadline = Instant::now() + budget;
         while Instant::now() < deadline && !self.connector.shutdown.load(Ordering::SeqCst) {
-            let pending: i64 = match self.connector.store.lock() {
-                Ok(store) => store
-                    .outbox_counts()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|(state, _)| state == "pending" || state == "retry")
-                    .map(|(_, count)| *count)
-                    .sum(),
-                Err(_) => return,
-            };
+            let pending: i64 = self
+                .connector
+                .store
+                .lock()
+                .outbox_counts()
+                .unwrap_or_default()
+                .iter()
+                .filter(|(state, _)| state == "pending" || state == "retry")
+                .map(|(_, count)| *count)
+                .sum();
             if pending == 0 {
                 return;
             }
@@ -1290,12 +1350,13 @@ impl MainLoop {
     /// The reader is enrolled the same way, so it exists as a channel member
     /// with role `bot` and is never classified as a person.
     fn ensure_enrolled(&mut self, identity: &AgentIdentity, channel_id: &str) -> bool {
-        let enrolled = self.connector.store.lock().ok().and_then(|store| {
-            store
-                .enrollment(&identity.pubkey, channel_id)
-                .ok()
-                .flatten()
-        });
+        let enrolled = self
+            .connector
+            .store
+            .lock()
+            .enrollment(&identity.pubkey, channel_id)
+            .ok()
+            .flatten();
         if enrolled.as_deref() == Some("enrolled") {
             return true;
         }
@@ -1345,7 +1406,8 @@ impl MainLoop {
                 return false;
             }
         }
-        if let Ok(store) = self.connector.store.lock() {
+        {
+            let store = self.connector.store.lock();
             let _ = store.put_enrollment(&identity.pubkey, channel_id, "enrolled");
         }
         crate::log::log_info(
@@ -1377,10 +1439,12 @@ impl MainLoop {
         }
 
         let now = crate::shared::time::now_epoch_i64();
-        let enrollments = match self.connector.store.lock() {
-            Ok(store) => store.enrollments().unwrap_or_default(),
-            Err(_) => return,
-        };
+        let enrollments = self
+            .connector
+            .store
+            .lock()
+            .enrollments()
+            .unwrap_or_default();
         for row in enrollments {
             if row.state != "enrolled" || row.agent_pubkey == self.connector.reader.pubkey {
                 continue;
@@ -1410,7 +1474,7 @@ impl MainLoop {
                 .http
                 .post_event(&event, &self.connector.owner, None)
                 .is_ok()
-                && let Ok(store) = self.connector.store.lock()
+                && let store = self.connector.store.lock()
             {
                 let _ = store.drop_enrollment(&row.agent_pubkey);
                 crate::log::log_info(
@@ -1472,7 +1536,7 @@ impl MainLoop {
             .ok_or_else(|| anyhow!("event on unknown subscription {}", item.sub))?;
 
         {
-            let store = self.connector.store.lock().expect("store lock");
+            let store = self.connector.store.lock();
             if !store.mark_seen(&event.id)? {
                 return Ok(());
             }
@@ -1480,7 +1544,7 @@ impl MainLoop {
 
         let (root_id, parent_id) = route::thread_refs(&event);
         {
-            let store = self.connector.store.lock().expect("store lock");
+            let store = self.connector.store.lock();
             store.cache_event(&store::cached_from_event(
                 &event,
                 &channel.id,
@@ -1508,12 +1572,21 @@ impl MainLoop {
         let people = self.route_inputs_people()?;
         let roster = self.agent_roster();
         let kinds = self.author_kinds(&people);
+        // An edit or deletion addresses a previous event through its `e` tag,
+        // so the delivered check follows that reference, not the event's own id.
+        let subject = if matches!(
+            event.kind,
+            route::KIND_EDIT | route::KIND_DELETE | route::KIND_CHANNEL_DELETE
+        ) {
+            route::tag(&event, "e").unwrap_or(&event.id).to_string()
+        } else {
+            event.id.clone()
+        };
         let delivered = self
             .connector
             .store
             .lock()
-            .map(|store| store.was_delivered(&event.id))
-            .unwrap_or(Ok(false))
+            .was_delivered(&subject)
             .unwrap_or(false);
 
         match route::route_inbound(&input, &people, &roster, &kinds, delivered) {
@@ -1522,14 +1595,39 @@ impl MainLoop {
                 "serve.inbound_skipped",
                 &format!("{}: {reason:?}", event.id),
             ),
-            route::Inbound::Deliver(delivery) => self.deliver_to_hcom(&event.id, delivery)?,
+            route::Inbound::Deliver(delivery) => {
+                // A target hcom cannot route is one with no deliverable row at
+                // all: `send_message` refuses it, and the whole event is parked
+                // for that target rather than dropped for the others.
+                let unroutable: Vec<String> = delivery
+                    .targets
+                    .iter()
+                    .filter(|target| {
+                        !self
+                            .db
+                            .get_instance_full(target)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|row| {
+                                crate::hosted::is_hosted_tool(&row.tool)
+                                    || !row.status.eq_ignore_ascii_case("stopped")
+                            })
+                    })
+                    .cloned()
+                    .collect();
+                if unroutable.is_empty() {
+                    self.deliver_to_hcom(&subject, delivery)?;
+                } else {
+                    self.park_all(&subject, &unroutable)?;
+                }
+            }
         }
         Ok(())
     }
 
     /// Active people rows, as routing rows.
     fn route_inputs_people(&self) -> Result<Vec<PersonRow>> {
-        let store = self.connector.store.lock().expect("store lock");
+        let store = self.connector.store.lock();
         Ok(store
             .active_people()?
             .into_iter()
@@ -1567,15 +1665,11 @@ impl MainLoop {
             .connector
             .store
             .lock()
-            .map(|store| {
-                store
-                    .authors_of_kind(AuthorKind::Agent)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|(pubkey, name)| name.map(|name| (pubkey, name)))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .authors_of_kind(AuthorKind::Agent)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(pubkey, name)| name.map(|name| (pubkey, name)))
+            .collect();
         for (pubkey, name) in cached {
             let identity = self.connector.agent_identity(&name);
             if identity.pubkey == pubkey && !identities.iter().any(|known| known.pubkey == pubkey) {
@@ -1611,7 +1705,7 @@ impl MainLoop {
             }
             hops += 1;
             let cached = {
-                let store = self.connector.store.lock().expect("store lock");
+                let store = self.connector.store.lock();
                 store.cached_event(&id)?
             };
             let (author, parent) = match cached {
@@ -1654,11 +1748,27 @@ impl MainLoop {
         }
     }
 
+    /// Park a whole inbound event: every target is unroutable, so nothing is
+    /// delivered and the retry window owns the outcome.
+    fn park_all(&mut self, buzz_id: &str, targets: &[String]) -> Result<()> {
+        let now = crate::shared::time::now_epoch_i64();
+        let store = self.connector.store.lock();
+        for target in targets {
+            store.park_target(buzz_id, target, now)?;
+        }
+        crate::log::log_warn(
+            "buzz",
+            "serve.parked",
+            &format!("{buzz_id}: {} has no deliverable row", targets.join(", ")),
+        );
+        Ok(())
+    }
+
     /// Send one delivery as the person's hosted row.
     fn deliver_to_hcom(&mut self, buzz_id: &str, delivery: route::InboundDelivery) -> Result<()> {
         let thread = delivery.thread.clone();
         {
-            let store = self.connector.store.lock().expect("store lock");
+            let store = self.connector.store.lock();
             store.put_thread(&thread, &delivery.channel_id, &delivery.root_id)?;
         }
         let targets = delivery.targets.clone();
@@ -1679,7 +1789,7 @@ impl MainLoop {
                 // At least once: the Buzz id is recorded right after the send, so
                 // a crash between the two repeats one message rather than
                 // dropping it.
-                let store = self.connector.store.lock().expect("store lock");
+                let store = self.connector.store.lock();
                 store.mark_delivered(buzz_id)?;
                 crate::log::log_info(
                     "buzz",
@@ -1696,7 +1806,7 @@ impl MainLoop {
                     &format!("{sender}: {error}"),
                 );
                 let now = crate::shared::time::now_epoch_i64();
-                let store = self.connector.store.lock().expect("store lock");
+                let store = self.connector.store.lock();
                 for target in &targets {
                     store.park_target(buzz_id, target, now)?;
                 }
@@ -1729,12 +1839,26 @@ impl MainLoop {
                 .person_name(pubkey)
                 .map(str::to_string)
                 .unwrap_or_else(|| {
+                    // A name already held by another Buzz person, or by a row
+                    // that is not one of our own `ch_` channel rows, gets the
+                    // `_bz` suffix rather than stealing that identity.
                     config::unique_person_name(&slug, |candidate| {
-                        crate::hosted::is_hosted_tool(&tool_of(&self.db, candidate))
-                            && !candidate.starts_with("ch_")
-                            || self.connector.store.lock().is_ok_and(|store| {
-                                store.person_by_name(candidate).is_ok_and(|p| p.is_some())
-                            })
+                        if self
+                            .connector
+                            .store
+                            .lock()
+                            .person_by_name(candidate)
+                            .ok()
+                            .flatten()
+                            .is_some()
+                        {
+                            return true;
+                        }
+                        self.db
+                            .get_instance_full(candidate)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|row| !row.name.starts_with("ch_"))
                     })
                 });
             let home = self
@@ -1742,9 +1866,10 @@ impl MainLoop {
                 .config
                 .person_home(pubkey)
                 .map(str::to_string);
-            if let Ok(store) = self.connector.store.lock() {
-                store.upsert_person(pubkey, &name, home.as_deref())?;
-            }
+            self.connector
+                .store
+                .lock()
+                .upsert_person(pubkey, &name, home.as_deref())?;
             self.host_person(&name);
         }
 
@@ -1752,19 +1877,20 @@ impl MainLoop {
         // the grace period, so a single missing roster does not churn rows.
         let listed: std::collections::HashSet<String> =
             members.iter().map(|(pubkey, _)| pubkey.clone()).collect();
-        let people = match self.connector.store.lock() {
-            Ok(store) => store.active_people().unwrap_or_default(),
-            Err(_) => return Ok(()),
-        };
+        let people = self
+            .connector
+            .store
+            .lock()
+            .active_people()
+            .unwrap_or_default();
         for person in people {
             if listed.contains(&person.pubkey) {
                 continue;
             }
             match person.left_at {
                 None => {
-                    if let Ok(store) = self.connector.store.lock() {
-                        store.retire_person(&person.pubkey, now)?;
-                    }
+                    let store = self.connector.store.lock();
+                    store.retire_person(&person.pubkey, now)?;
                 }
                 Some(left_at) if now.saturating_sub(left_at) >= PERSON_RETIRE_SECS => {
                     crate::log::log_info(
@@ -1772,7 +1898,8 @@ impl MainLoop {
                         "serve.person_retired",
                         &format!("{} left every bridged channel", person.name),
                     );
-                    if let Ok(store) = self.connector.store.lock() {
+                    {
+                        let store = self.connector.store.lock();
                         let _ = store.retire_person(&person.pubkey, left_at);
                     }
                 }
@@ -1791,7 +1918,7 @@ impl MainLoop {
                     crate::notify::WakeKind::Listen.as_str(),
                     self.notify.port(),
                 );
-                let mut hosted = self.connector.hosted.lock().expect("hosted lock");
+                let mut hosted = self.connector.hosted.lock();
                 if !hosted.iter().any(|row| row == name) {
                     hosted.push(name.to_string());
                 }
@@ -1805,6 +1932,10 @@ impl MainLoop {
     }
 
     /// A kind 0 event: cache the author's classification.
+    ///
+    /// The name comes from the profile's own marker, re-derived against this
+    /// seed, so an agent is recognised even when its hcom row has gone — that is
+    /// what lets an unresolvable target be parked instead of dropped.
     fn handle_profile(&mut self, event: &Event) -> Result<()> {
         let derived: HashMap<String, String> = self
             .all_known_identities()
@@ -1818,38 +1949,36 @@ impl MainLoop {
             &derived,
             &self.connector.seed,
         );
-        let author = match kind {
-            AuthorKind::Agent => {
-                let identity = self
-                    .all_known_identities()
-                    .into_iter()
-                    .find(|identity| identity.pubkey == event.pubkey);
-                Author {
-                    pubkey: event.pubkey.clone(),
-                    kind,
-                    hcom_name: identity.as_ref().map(|i| i.name.clone()),
-                    device_label: Some(
-                        identity
-                            .as_ref()
-                            .map(|i| i.canonical.clone())
-                            .unwrap_or_default(),
-                    ),
-                }
-            }
-            AuthorKind::Reader => Author {
+        let marker = serde_json::from_str::<Value>(&event.content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("about")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        let claimed = marker.as_deref().and_then(route::identity_from_marker);
+        let author = match (kind, claimed) {
+            (AuthorKind::Reader, _) => Author {
                 pubkey: event.pubkey.clone(),
                 kind,
                 hcom_name: Some(self.connector.reader.name.clone()),
                 device_label: Some(self.connector.reader.canonical.clone()),
             },
-            _ => Author {
+            (AuthorKind::Agent, Some((name, device))) => Author {
+                pubkey: event.pubkey.clone(),
+                kind,
+                hcom_name: Some(name),
+                device_label: Some(device),
+            },
+            (kind, _) => Author {
                 pubkey: event.pubkey.clone(),
                 kind,
                 hcom_name: None,
                 device_label: None,
             },
         };
-        let store = self.connector.store.lock().expect("store lock");
+        let store = self.connector.store.lock();
         store.put_author(&author)?;
         Ok(())
     }
@@ -1872,11 +2001,6 @@ impl MainLoop {
         Some((config::person_slug(name), profile))
     }
 }
-
-/// omp's own row name. The connector posts its notices (an undelivered-target
-/// notice, and nothing else) as this identity, so they are clearly not an
-/// agent's message. It is derived like every other row: `omp@<device_label>`.
-const OMP_ROW: &str = "omp";
 
 /// A snapshot of everything outbound routing reads, taken under one lock so
 /// the routing call does not hold the store.
@@ -1930,15 +2054,6 @@ fn exact_targets_of(db: &HcomDb, event_id: i64) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `tool` of a row, for the hosted-row filter.
-fn tool_of(db: &HcomDb, name: &str) -> String {
-    db.get_instance_full(name)
-        .ok()
-        .flatten()
-        .map(|row| row.tool)
-        .unwrap_or_default()
-}
-
 /// Backoff before retrying a parked inbound target.
 fn park_retry_delay(attempts: u32) -> i64 {
     backoff(attempts, Duration::from_secs(15), Duration::from_secs(300))
@@ -1949,4 +2064,1054 @@ fn park_retry_delay(attempts: u32) -> i64 {
 /// Backoff before retrying a failed post.
 fn post_retry_delay(attempts: u32) -> Duration {
     backoff(attempts, POST_BACKOFF_MIN, POST_BACKOFF_MAX)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buzz::testing::FakeRelay;
+    use serial_test::serial;
+
+    const SEED: [u8; 32] = [7; 32];
+    const CHANNEL_ID: &str = "11111111-2222-3333-4444-55555566666677";
+
+    fn owner_key() -> SecretKey {
+        SecretKey::from_bytes(&[3; 32]).unwrap()
+    }
+    fn human_key() -> SecretKey {
+        nostr::derive_secret(&SEED, "human@test")
+    }
+    fn agent_key() -> SecretKey {
+        nostr::derive_secret(&SEED, "luna@mbai")
+    }
+
+    /// TEST key material only: a seed file at mode 0600 and an owner env file.
+    fn write_key_files(dir: &std::path::Path) {
+        let seed_path = dir.join("seed.bin");
+        std::fs::write(&seed_path, SEED).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::write(
+            dir.join("owner.env"),
+            "BUZZ_PRIVATE_KEY=0303030303030303030303030303030303030303030303030303030303030303\n",
+        )
+        .unwrap();
+    }
+
+    /// The connector's config for the fake relay.
+    ///
+    /// Built in memory rather than round-tripped through the config file: the
+    /// loader rightly refuses a plaintext relay URL, and the fake relay speaks
+    /// plaintext HTTP on loopback. Config validation has its own tests; what
+    /// these tests care about is the loop, not the file.
+    fn test_config(relay: &FakeRelay, device: &str) -> Config {
+        std::fs::create_dir_all(Config::dir()).unwrap();
+        write_key_files(&Config::dir());
+        Config {
+            relay_url: relay.url.replace("http://", "ws://"),
+            http_url: relay.url.clone(),
+            device_label: device.to_string(),
+            seed_path: std::path::PathBuf::from("seed.bin"),
+            owner_env_path: std::path::PathBuf::from("owner.env"),
+            local_signers: vec!["qa".to_string()],
+            channels: vec![config::ChannelConfig {
+                id: CHANNEL_ID.to_string(),
+                slug: Some("infra".to_string()),
+                home: false,
+            }],
+            people: vec![],
+        }
+    }
+
+    /// An isolated HCOM_DIR, the fake relay, and the real main loop over the
+    /// real databases. A test drives `step` directly, so it exercises production
+    /// loop code rather than a stand-in for it.
+    struct Harness {
+        _dir: tempfile::TempDir,
+        _guard: crate::hooks::test_helpers::EnvGuard,
+        relay: FakeRelay,
+        main: MainLoop,
+        inbound: mpsc::Sender<InboundItem>,
+    }
+
+    impl Harness {
+        /// Register a person row and its hosted participant.
+        fn add_person(&mut self, name: &str, home: Option<&str>) -> String {
+            let pubkey = public_hex(&human_key());
+            self.main
+                .connector
+                .store
+                .lock()
+                .upsert_person(&pubkey, name, home)
+                .unwrap();
+            crate::hosted::register_hosted(&self.main.db, name, crate::hosted::HOSTED_TOOL_BUZZ)
+                .unwrap();
+            self.main.connector.hosted.lock().push(name.to_string());
+            pubkey
+        }
+
+        /// Make the configured channel a home channel for one person.
+        fn use_home_channel(&mut self, slug: &str, person: &str) {
+            let mut config = self.main.connector.config.clone();
+            config.channels = vec![config::ChannelConfig {
+                id: CHANNEL_ID.to_string(),
+                slug: Some(slug.to_string()),
+                home: true,
+            }];
+            config.people = vec![config::PersonConfig {
+                pubkey: public_hex(&human_key()),
+                name: Some(person.to_string()),
+                home: Some(slug.to_string()),
+            }];
+            self.main.connector.config = config;
+        }
+
+        /// Send an hcom message as `from`, the way the CLI would.
+        fn send(&self, from: &str, text: &str, targets: &[&str], thread: Option<&str>) {
+            let envelope = thread.map(|thread| crate::messages::MessageEnvelope {
+                thread: Some(thread.to_string()),
+                ..Default::default()
+            });
+            crate::commands::send::send_message(
+                &self.main.db,
+                &crate::shared::SenderIdentity {
+                    kind: crate::shared::SenderKind::Instance,
+                    name: from.to_string(),
+                    instance_data: Some(json!({ "name": from })),
+                    session_id: None,
+                },
+                text,
+                envelope.as_ref(),
+                Some(
+                    &targets
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<String>>(),
+                ),
+            )
+            .expect("the message should be accepted");
+        }
+
+        /// Register an ordinary hcom agent row, the way `hcom start` would: a
+        /// live participant with a normal tool, which is what makes it both
+        /// addressable in hcom and visible to the connector's agent roster.
+        fn add_agent(&self, name: &str) {
+            let now = crate::shared::time::now_epoch_i64();
+            let data = json!({
+                "name": name,
+                "tool": "claude",
+                "status": "listening",
+                "status_time": now,
+                "status_context": "ready",
+                "last_stop": now,
+                "tcp_mode": 0,
+                "last_event_id": self.main.db.get_last_event_id(),
+                "origin_device_id": "",
+                "directory": "",
+                "transcript_path": "",
+                "background": 0,
+                "name_announced": 0,
+                "created_at": crate::shared::time::now_epoch_f64(),
+            });
+            self.main
+                .db
+                .save_instance_named(name, data.as_object().unwrap())
+                .unwrap();
+        }
+
+        fn offer(&self, event: Event) {
+            self.inbound
+                .send(InboundItem {
+                    sub: sub_id("infra"),
+                    event,
+                })
+                .unwrap();
+        }
+
+        fn step(&mut self) {
+            self.main.step();
+        }
+
+        /// One loop pass per remaining unit of work, bounded: enrollment and the
+        /// post that depends on it are separate HTTP writes, so a single pass can
+        /// legitimately do only the first.
+        fn step_until(&mut self, wanted: impl Fn(&Self) -> bool) {
+            for _ in 0..8 {
+                if wanted(self) {
+                    return;
+                }
+                self.main.step();
+            }
+        }
+
+        /// Kind 9 posts the agent key made, as the fake relay stored them.
+        fn agent_posts(&self) -> Vec<Event> {
+            self.relay
+                .events()
+                .into_iter()
+                .filter(|e| e.kind == route::KIND_MESSAGE && e.pubkey == public_hex(&agent_key()))
+                .collect()
+        }
+
+        fn unread(&self, row: &str) -> Vec<crate::db::Message> {
+            self.main.db.get_unread_messages(row)
+        }
+
+        fn set_http_status(&self, status: u16) {
+            self.relay
+                .switches
+                .http_status
+                .store(status, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn store(&self) -> parking_lot::MutexGuard<'_, Store> {
+            self.main.connector.store.lock()
+        }
+    }
+
+    fn harness(device: &str) -> Harness {
+        let (_dir, _hcom_dir, _home, guard) = crate::hooks::test_helpers::isolated_test_env();
+        let relay = FakeRelay::http();
+        let config = test_config(&relay, device);
+        let channel_rows: Vec<String> = config
+            .channels
+            .iter()
+            .map(|c| format!("ch_{}", c.slug.clone().unwrap_or_else(|| c.id.clone())))
+            .collect();
+        let connector = Connector::load(config).unwrap();
+        let db = HcomDb::open().unwrap();
+        let epoch = hcom_epoch(&db).unwrap();
+        let (main, inbound) = MainLoop::for_test(connector, db, epoch);
+
+        // Startup registers one hosted row per bridged channel before the first
+        // loop pass, so a test starts in the same state `serve` would.
+        for row in &channel_rows {
+            crate::hosted::register_hosted(&main.db, row, crate::hosted::HOSTED_TOOL_BUZZ).unwrap();
+            main.connector.hosted.lock().push(row.clone());
+        }
+        Harness {
+            _dir,
+            _guard: guard,
+            relay,
+            main,
+            inbound,
+        }
+    }
+
+    fn message(key: &SecretKey, channel: &str, content: &str, tags: Vec<Vec<String>>) -> Event {
+        let mut all = vec![vec!["h".into(), channel.to_string()]];
+        all.extend(tags);
+        sign(
+            UnsignedEvent {
+                created_at: nostr::now(),
+                kind: route::KIND_MESSAGE,
+                tags: all,
+                content: content.to_string(),
+            },
+            key,
+        )
+    }
+
+    fn profile(key: &SecretKey, name: &str, about: &str) -> Event {
+        sign(
+            UnsignedEvent {
+                created_at: nostr::now(),
+                kind: route::KIND_PROFILE,
+                tags: vec![nostr::auth_tag(&owner_key(), &public_hex(key), "").to_vec()],
+                content: json!({"name": name, "display_name": name, "about": about}).to_string(),
+            },
+            key,
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn a_human_mention_becomes_an_hcom_message_from_that_person() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        let event = message(
+            &human_key(),
+            CHANNEL_ID,
+            "luna, deploy the thing",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        harness.offer(event.clone());
+        harness.step();
+
+        let messages = harness.unread("luna");
+        assert_eq!(messages.len(), 1, "the mention reached the agent's row");
+        assert_eq!(messages[0].from, "michael", "sent as the person");
+        assert_eq!(messages[0].text, "luna, deploy the thing");
+        assert!(
+            messages[0]
+                .thread
+                .as_deref()
+                .is_some_and(|t| t.starts_with("buzz_infra_")),
+            "the thread is the Buzz correlation: {:?}",
+            messages[0].thread
+        );
+        let store = harness.store();
+        assert!(
+            store.was_delivered(&event.id).unwrap(),
+            "recorded as delivered"
+        );
+        assert!(
+            store.cached_event(&event.id).unwrap().is_some(),
+            "cached for read"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_agent_send_posts_into_the_home_channel_and_enrolls_first() {
+        let mut harness = harness("mbai");
+        harness.use_home_channel("michael", "michael");
+        let michael = harness.add_person("michael", Some("michael"));
+        harness.add_agent("luna");
+
+        // The agent addresses Michael: the message lands on the person's hosted
+        // row, which the connector reads and posts as the agent.
+        harness.send("luna", "please deploy", &["michael"], None);
+        harness.step();
+
+        let posts = harness.agent_posts();
+        assert_eq!(posts.len(), 1, "exactly one post: {posts:?}");
+        assert_eq!(posts[0].content, "please deploy");
+        assert_eq!(route::tag(&posts[0], "h"), Some(CHANNEL_ID));
+        assert!(
+            posts[0]
+                .tags
+                .iter()
+                .any(|t| t.first().is_some_and(|n| n == "p") && t.get(1) == Some(&michael)),
+            "Michael is p-tagged: {:?}",
+            posts[0].tags
+        );
+
+        // Enrollment came first: kind 0, 30177, then omp's 9000 with role bot.
+        let events = harness.relay.events();
+        let agent_pubkey = public_hex(&agent_key());
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == route::KIND_PROFILE && e.pubkey == agent_pubkey),
+            "kind 0 published"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| { e.kind == 30177 && route::tag(e, "d") == Some(agent_pubkey.as_str()) })
+        );
+        let add = events
+            .iter()
+            .find(|e| e.kind == 9000 && route::tag(e, "p") == Some(agent_pubkey.as_str()))
+            .expect("kind 9000 add");
+        assert_eq!(route::tag(add, "h"), Some(CHANNEL_ID));
+        assert_eq!(route::tag(add, "role"), Some("bot"));
+
+        assert_eq!(
+            harness.store().outbox_counts().unwrap(),
+            vec![("sent".to_string(), 1)]
+        );
+        assert!(harness.unread("michael").is_empty(), "the cursor advanced");
+    }
+
+    #[test]
+    #[serial]
+    fn a_channel_row_posts_once_in_that_channel() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        harness.send("luna", "heads up", &["ch_infra"], None);
+        harness.step();
+
+        let posts = harness.agent_posts();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(route::tag(&posts[0], "h"), Some(CHANNEL_ID));
+    }
+
+    #[test]
+    #[serial]
+    fn a_broadcast_and_an_external_sender_never_reach_buzz() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+
+        // A broadcast is not forwarded: nothing addresses a Buzz row.
+        harness.send("luna", "everyone", &[], None);
+        // An external sender has no Buzz identity at all.
+        crate::commands::send::send_message(
+            &harness.main.db,
+            &crate::shared::SenderIdentity {
+                kind: crate::shared::SenderKind::External,
+                name: "ext_operator".into(),
+                instance_data: None,
+                session_id: None,
+            },
+            "from outside",
+            None,
+            Some(&["ch_infra".to_string()]),
+        )
+        .unwrap();
+        harness.step();
+
+        assert!(
+            harness.agent_posts().is_empty(),
+            "neither reached Buzz: {:?}",
+            harness.agent_posts()
+        );
+        assert!(harness.store().unsent_outbox().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_reply_in_a_buzz_thread_lands_in_that_thread() {
+        let mut harness = harness("mbai");
+        let michael = harness.add_person("michael", Some("michael"));
+        harness.add_agent("luna");
+
+        // Michael asks the agent something in the channel.
+        let root = message(
+            &human_key(),
+            CHANNEL_ID,
+            "how is the deploy?",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        harness.offer(root.clone());
+        harness.step();
+        let thread = harness.unread("luna")[0].thread.clone().unwrap();
+
+        // The agent answers with --reply-to, inheriting the buzz_* thread.
+        harness.send("luna", "shipped", &["michael"], Some(&thread));
+        harness.step();
+
+        let posts = harness.agent_posts();
+        assert_eq!(posts.len(), 1, "one reply: {posts:?}");
+        let reply = &posts[0];
+        assert_eq!(reply.content, "shipped");
+        assert_eq!(route::thread_refs(reply).1, Some(root.id.clone()));
+        assert!(
+            reply.tags.iter().any(|t| t.get(1) == Some(&michael)),
+            "the human is tagged"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_rate_limited_post_retries_without_duplicating() {
+        let mut harness = harness("mbai");
+        harness.use_home_channel("michael", "michael");
+        harness.add_person("michael", Some("michael"));
+        harness.add_agent("luna");
+
+        harness.set_http_status(429);
+        harness.send("luna", "only once", &["michael"], None);
+        harness.step();
+
+        let buzz_id = {
+            let store = harness.store();
+            assert!(
+                store
+                    .outbox_counts()
+                    .unwrap()
+                    .iter()
+                    .any(|(state, n)| state == "retry" && *n == 1),
+                "the post waits instead of being lost"
+            );
+            assert!(
+                harness.agent_posts().is_empty(),
+                "nothing posted under the 429"
+            );
+            let row = store.unsent_outbox().unwrap();
+            assert_eq!(row.len(), 1);
+            row[0].buzz_id.clone()
+        };
+
+        // The quota window closes and the retry time arrives. Enrollment and the
+        // post are separate writes, and enrollment's writes were rate limited
+        // too, so give the loop the passes it needs.
+        harness.set_http_status(0);
+        harness
+            .store()
+            .retry_outbox(&buzz_id, 0, "rate limited")
+            .unwrap();
+        harness.step_until(|h| !h.agent_posts().is_empty());
+
+        let posts = harness.agent_posts();
+        assert_eq!(posts.len(), 1, "exactly one post after the retry");
+        assert_eq!(posts[0].id, buzz_id);
+        assert_eq!(
+            harness.store().outbox_counts().unwrap(),
+            vec![("sent".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_server_error_window_backs_off_and_does_not_exit() {
+        let mut harness = harness("mbai");
+        harness.use_home_channel("michael", "michael");
+        harness.add_person("michael", Some("michael"));
+        harness.add_agent("luna");
+
+        // A buzz-pg switchover: every HTTP call answers 503 for a while.
+        harness.set_http_status(503);
+        harness.send("luna", "during the switchover", &["michael"], None);
+        harness.step();
+
+        let buzz_id = {
+            let store = harness.store();
+            assert!(
+                store
+                    .outbox_counts()
+                    .unwrap()
+                    .iter()
+                    .any(|(s, _)| s == "retry"),
+                "the post waits instead of failing"
+            );
+            store.unsent_outbox().unwrap()[0].buzz_id.clone()
+        };
+
+        // The relay comes back and the queued post catches up on its own.
+        harness.set_http_status(0);
+        harness.store().retry_outbox(&buzz_id, 0, "503").unwrap();
+        harness.step_until(|h| !h.agent_posts().is_empty());
+
+        assert_eq!(
+            harness.agent_posts().len(),
+            1,
+            "the post went out once the relay recovered"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_rejected_post_fails_loudly_instead_of_retrying_forever() {
+        let mut harness = harness("mbai");
+        harness.use_home_channel("michael", "michael");
+        harness.add_person("michael", Some("michael"));
+        harness.add_agent("luna");
+
+        harness.set_http_status(400);
+        harness.send("luna", "will be rejected", &["michael"], None);
+        // Enrollment's own writes fail too under a 400, so the row is retried
+        // rather than failed: only the post itself proves terminal handling.
+        harness
+            .main
+            .connector
+            .store
+            .lock()
+            .put_enrollment(&public_hex(&agent_key()), CHANNEL_ID, "enrolled")
+            .unwrap();
+        harness.step_until(|h| {
+            h.store()
+                .outbox_counts()
+                .unwrap()
+                .iter()
+                .any(|(s, _)| s == "failed")
+        });
+
+        let store = harness.store();
+        assert!(
+            store
+                .outbox_counts()
+                .unwrap()
+                .iter()
+                .any(|(s, _)| s == "failed"),
+            "a rejection is terminal: {:?}",
+            store.outbox_counts().unwrap()
+        );
+        assert!(
+            !store.recent_errors(5).unwrap().is_empty(),
+            "the reason is kept"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_restart_with_a_pending_outbox_posts_once() {
+        let mut harness = harness("mbai");
+        harness.use_home_channel("michael", "michael");
+        harness.add_person("michael", Some("michael"));
+        harness.add_agent("luna");
+
+        // The relay refuses everything, so the post stays queued while the
+        // hosted cursor advances past the message.
+        harness.set_http_status(503);
+        harness.send("luna", "survives a restart", &["michael"], None);
+        harness.step();
+        assert!(harness.unread("michael").is_empty(), "the cursor advanced");
+        assert!(harness.agent_posts().is_empty());
+
+        let buzz_id = harness.store().unsent_outbox().unwrap()[0].buzz_id.clone();
+
+        // A restart: a fresh loop over the same state, relay healthy again. The
+        // message is not re-routed, and the queued post goes out once.
+        harness.set_http_status(0);
+        harness.store().retry_outbox(&buzz_id, 0, "503").unwrap();
+        let (main, inbound) = MainLoop::for_test(
+            harness.main.connector,
+            harness.main.db,
+            harness.main.epoch.clone(),
+        );
+        harness.main = main;
+        harness.inbound = inbound;
+        harness.step_until(|h| !h.agent_posts().is_empty());
+
+        let posts = harness.agent_posts();
+        assert_eq!(posts.len(), 1, "no duplicate post after the restart");
+        assert_eq!(posts[0].id, buzz_id);
+    }
+
+    #[test]
+    #[serial]
+    fn an_epoch_change_keeps_unposted_outbox_sendable() {
+        let mut harness = harness("mbai");
+        harness.use_home_channel("michael", "michael");
+        harness.add_person("michael", Some("michael"));
+        harness.add_agent("luna");
+
+        harness.set_http_status(503);
+        harness.send("luna", "queued before the reset", &["michael"], None);
+        harness.step();
+        let buzz_id = harness.store().unsent_outbox().unwrap()[0].buzz_id.clone();
+
+        // `hcom reset` replaces the database, so the epoch the loop computes
+        // differs from the one the store was opened with.
+        harness.set_http_status(0);
+        harness.store().retry_outbox(&buzz_id, 0, "503").unwrap();
+        harness.main.epoch = "before-reset".to_string();
+        let before = harness.main.epoch.clone();
+        harness.step_until(|h| h.main.epoch != before);
+
+        assert_ne!(
+            harness.main.epoch, before,
+            "the loop recomputed the epoch after hcom reset"
+        );
+        assert!(
+            harness.agent_posts().iter().any(|e| e.id == buzz_id),
+            "the unposted post still goes out after hcom reset"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_unresolvable_target_is_parked_then_announced_in_buzz() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+
+        // A mention of an agent that is known (its kind 0 is cached, so the
+        // marker resolves it to a name) but whose session has ended: the send is
+        // refused, so the target is parked rather than dropped.
+        let ghost = nostr::derive_secret(&SEED, "ghost@mbai");
+        // Its kind 0 is delivered, so the connector classifies it as an agent
+        // and knows the name it claims — but no hcom row ever appears for it.
+        harness.offer(profile(
+            &ghost,
+            "ghost",
+            &format!("{}{}", route::AGENT_MARKER_PREFIX, "ghost@mbai"),
+        ));
+        harness.step();
+        let event = message(
+            &human_key(),
+            CHANNEL_ID,
+            "ghost, are you there?",
+            vec![vec!["p".into(), public_hex(&ghost)]],
+        );
+        harness.offer(event.clone());
+        harness.step();
+
+        {
+            let store = harness.store();
+            assert!(
+                store
+                    .target_counts()
+                    .unwrap()
+                    .iter()
+                    .any(|(state, n)| state == "parked" && *n == 1),
+                "the unresolvable target is parked"
+            );
+        }
+
+        // The window closes; the connector says so in Buzz, as omp. Age the row
+        // first, then give the loop the pass that notices.
+        harness.store().age_parked_target(&event.id, 0).unwrap();
+        harness.step_until(|h| {
+            h.relay
+                .events()
+                .iter()
+                .any(|e| e.content.contains("isn't running"))
+        });
+
+        let notice = harness
+            .relay
+            .events()
+            .into_iter()
+            .find(|e| e.content.contains("isn't running"))
+            .expect("the notice reached Buzz");
+        assert!(notice.content.contains("ghost"), "{}", notice.content);
+        assert_eq!(
+            notice.pubkey,
+            public_hex(&owner_key()),
+            "posted as omp itself"
+        );
+        assert_eq!(route::thread_refs(&notice).1, Some(event.id.clone()));
+        assert!(
+            harness
+                .store()
+                .target_counts()
+                .unwrap()
+                .iter()
+                .any(|(s, _)| s == "expired"),
+            "the parked target is retired, not retried forever"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_target_that_is_deliverable_is_delivered_not_announced() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+
+        let event = message(
+            &human_key(),
+            CHANNEL_ID,
+            "luna, ping",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        harness.offer(event.clone());
+        harness.step();
+        assert_eq!(harness.unread("luna").len(), 1, "delivered straight away");
+        assert!(harness.store().target_counts().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_forged_signature_is_refused() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        let mut event = message(
+            &human_key(),
+            CHANNEL_ID,
+            "trust me",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        // Same id, different content: verification must fail.
+        event.content = "actually something else".into();
+        harness.offer(event);
+        harness.step();
+
+        assert!(
+            harness.unread("luna").is_empty(),
+            "a tampered event never becomes an hcom message"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_duplicate_relay_delivery_is_deduped() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        let event = message(
+            &human_key(),
+            CHANNEL_ID,
+            "only once",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        harness.offer(event.clone());
+        harness.offer(event);
+        harness.step();
+
+        assert_eq!(harness.unread("luna").len(), 1, "one message, not two");
+    }
+
+    #[test]
+    #[serial]
+    fn an_edit_of_a_delivered_post_reaches_the_same_target() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+
+        let original = message(
+            &human_key(),
+            CHANNEL_ID,
+            "deploy at 3pm",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        harness.offer(original.clone());
+        harness.step();
+        assert_eq!(harness.unread("luna")[0].text, "deploy at 3pm");
+
+        let edit = sign(
+            UnsignedEvent {
+                created_at: nostr::now(),
+                kind: route::KIND_EDIT,
+                tags: vec![
+                    vec!["h".into(), CHANNEL_ID.into()],
+                    vec![
+                        "e".into(),
+                        original.id.clone(),
+                        String::new(),
+                        "root".into(),
+                    ],
+                    vec!["p".into(), public_hex(&agent_key())],
+                ],
+                content: "deploy at 4pm".into(),
+            },
+            &human_key(),
+        );
+        harness.offer(edit);
+        harness.step();
+
+        let messages = harness.unread("luna");
+        assert_eq!(messages.len(), 2, "the edit is a second message");
+        let edit_notice = messages.iter().find(|m| m.text.starts_with("(edited) "));
+        let edit_notice =
+            edit_notice.unwrap_or_else(|| panic!("expected an (edited) notice, got {messages:?}"));
+        assert!(edit_notice.text.contains("deploy at 4pm"));
+        assert_eq!(
+            messages
+                .iter()
+                .find(|m| m.text == "deploy at 3pm")
+                .and_then(|m| m.thread.clone()),
+            edit_notice.thread,
+            "the edit rides the same Buzz thread"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn the_reader_is_enrolled_and_never_becomes_a_person() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.main.last_enroll = Instant::now() - ENROLL_INTERVAL - Duration::from_secs(1);
+        harness.step();
+
+        let reader_pubkey = harness.main.connector.reader.pubkey.clone();
+        let events = harness.relay.events();
+
+        // The reader has a kind 0, marked as the connector rather than as an
+        // hcom agent, so a classifier can never read it as an agent.
+        let reader_profile = events
+            .iter()
+            .find(|e| e.kind == route::KIND_PROFILE && e.pubkey == reader_pubkey)
+            .expect("reader profile");
+        let about = serde_json::from_str::<Value>(&reader_profile.content)
+            .unwrap()
+            .get("about")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        assert!(
+            about.starts_with(route::READER_CANONICAL_PREFIX),
+            "the reader carries the connector marker: {about}"
+        );
+
+        // It is a channel member with role bot, so a roster counts it as an
+        // agent, never as a person.
+        let add = events
+            .iter()
+            .find(|e| e.kind == 9000 && route::tag(e, "p") == Some(reader_pubkey.as_str()))
+            .expect("the reader is enrolled as a bot");
+        assert_eq!(route::tag(add, "role"), Some("bot"));
+
+        let store = harness.store();
+        assert!(
+            store.person_by_pubkey(&reader_pubkey).unwrap().is_none(),
+            "the reader is not a person"
+        );
+        assert!(
+            store
+                .person_by_pubkey(&harness.main.connector.owner_pubkey)
+                .unwrap()
+                .is_none(),
+            "omp is not a person"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_roster_creates_a_hosted_row_and_a_bot_does_not() {
+        let mut harness = harness("mbai");
+        let agent_pubkey = public_hex(&agent_key());
+        let reader_pubkey = harness.main.connector.reader.pubkey.clone();
+        let human_pubkey = public_hex(&human_key());
+
+        // The connector needs the humans' kind 0 to slug their names.
+        harness
+            .relay
+            .seed(profile(&human_key(), "Michael", "just a person"));
+        harness.offer(sign(
+            UnsignedEvent {
+                created_at: nostr::now(),
+                kind: route::KIND_ROSTER,
+                tags: vec![
+                    vec!["d".into(), CHANNEL_ID.into()],
+                    vec![
+                        "p".into(),
+                        human_pubkey.clone(),
+                        String::new(),
+                        "member".into(),
+                    ],
+                    vec![
+                        "p".into(),
+                        agent_pubkey.clone(),
+                        String::new(),
+                        "bot".into(),
+                    ],
+                    vec![
+                        "p".into(),
+                        reader_pubkey.clone(),
+                        String::new(),
+                        "member".into(),
+                    ],
+                ],
+                content: String::new(),
+            },
+            &owner_key(),
+        ));
+        harness.step();
+
+        let store = harness.store();
+        let people = store.active_people().unwrap();
+        assert_eq!(
+            people.len(),
+            1,
+            "only the human became a person: {people:?}"
+        );
+        assert_eq!(people[0].name, "michael", "the profile name is slugged");
+        assert!(store.person_by_pubkey(&agent_pubkey).unwrap().is_none());
+        assert!(store.person_by_pubkey(&reader_pubkey).unwrap().is_none());
+
+        // And the person's hcom row exists as a Buzz-hosted participant.
+        let row = harness.main.db.get_instance_full("michael").unwrap();
+        assert!(row.is_some(), "the roster created the hosted row");
+        assert_eq!(row.unwrap().tool, crate::hosted::HOSTED_TOOL_BUZZ);
+    }
+
+    #[test]
+    #[serial]
+    fn an_agent_whose_row_was_stopped_by_hand_comes_back() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+
+        // The operator stops the row while the connector runs.
+        harness
+            .main
+            .db
+            .conn()
+            .execute(
+                "UPDATE instances SET status = 'stopped' WHERE name = 'michael'",
+                [],
+            )
+            .unwrap();
+        harness
+            .main
+            .connector
+            .hosted
+            .lock()
+            .retain(|n| n != "michael");
+        harness.step();
+
+        let row = harness
+            .main
+            .db
+            .get_instance_full("michael")
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            row.status, "stopped",
+            "an active roster row is restored while the connector runs"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_person_with_no_home_channel_gets_an_hcom_notice() {
+        let mut harness = harness("mbai");
+        // No home channel for this person and the only configured channel is a
+        // plain stream, so addressing the person must not post.
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        harness.send("luna", "hello", &["michael"], None);
+        harness.step();
+
+        assert!(
+            harness.agent_posts().is_empty(),
+            "nothing was posted for a person with no home channel"
+        );
+        let messages = harness.unread("luna");
+        let notice = messages
+            .iter()
+            .find(|m| m.text.contains("no home channel"))
+            .unwrap_or_else(|| panic!("expected a notice, got {messages:?}"));
+        assert!(notice.from == "michael", "it comes from the person's row");
+        assert!(notice.text.contains("@ch_warehouse"), "names the way out");
+    }
+
+    #[test]
+    #[serial]
+    fn token_buckets_and_backoff_stay_inside_their_bounds() {
+        let mut bucket = TokenBucket::new(2, Duration::from_secs(60));
+        assert!(bucket.take().is_ok());
+        assert!(bucket.take().is_ok());
+        assert!(bucket.take().is_err(), "the third call exceeds the budget");
+
+        let first = backoff(0, Duration::from_secs(1), Duration::from_secs(60));
+        assert!(
+            (Duration::from_secs(1)..=Duration::from_millis(1100)).contains(&first),
+            "the first backoff is the minimum plus jitter: {first:?}"
+        );
+        // Bounded at the maximum, with jitter on top but nowhere near 2x.
+        let late = backoff(30, Duration::from_secs(1), Duration::from_secs(60));
+        assert!(
+            late >= Duration::from_secs(60) && late <= Duration::from_secs(66),
+            "backoff stayed bounded: {late:?}"
+        );
+
+        let mut rolling = TokenBucket::new(1, Duration::from_millis(20));
+        assert!(rolling.take().is_ok());
+        assert!(rolling.take().is_err());
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(rolling.take().is_ok(), "the window refilled");
+    }
+
+    #[test]
+    #[serial]
+    fn the_lock_refuses_a_second_connector() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.lock");
+        let held = ServeLock::acquire(&path).unwrap();
+        let second = ServeLock::acquire(&path);
+        assert!(
+            second.is_err(),
+            "a live holder blocks a second serve: {:?}",
+            second.err()
+        );
+        drop(held);
+        assert!(
+            ServeLock::acquire(&path).is_ok(),
+            "releasing the lock lets a new connector start"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_stale_lock_from_a_dead_process_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.lock");
+        // Written without taking the lock, so only liveness can clear it.
+        std::fs::write(&path, "4294967294\n").unwrap();
+        assert!(!config::lock_holder_alive(4294967294));
+        assert!(
+            ServeLock::acquire(&path).is_ok(),
+            "a dead holder must not block a restart"
+        );
+    }
 }

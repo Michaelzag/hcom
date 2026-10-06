@@ -656,6 +656,17 @@ impl Store {
         Ok(rows)
     }
 
+    /// Move a parked target's window start, so a test can age it without
+    /// waiting out the real retry window.
+    #[cfg(test)]
+    pub fn age_parked_target(&self, buzz_id: &str, first_parked_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE inbound_targets SET first_parked_at = ?2, next_at = ?2 WHERE buzz_id = ?1",
+            params![buzz_id, first_parked_at],
+        )?;
+        Ok(())
+    }
+
     /// Mark a parked target resolved, given, or still parked with a longer wait.
     pub fn update_target(
         &self,

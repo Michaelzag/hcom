@@ -47,11 +47,29 @@ struct State {
 pub struct FakeRelay {
     pub url: String,
     pub switches: Arc<Switches>,
+    state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl FakeRelay {
+    /// Every event the relay has stored, oldest first.
+    ///
+    /// Reads the store directly rather than going back over HTTP, so an
+    /// assertion still works while the fault switches make calls fail.
+    pub fn events(&self) -> Vec<Event> {
+        self.state.lock().events.clone()
+    }
+
+    /// Store an event as if it had arrived over the wire, so a test can seed a
+    /// history the connector then backfills.
+    pub fn seed(&self, event: Event) {
+        let mut state = self.state.lock();
+        if !state.events.iter().any(|stored| stored.id == event.id) {
+            state.events.push(event);
+        }
+    }
+
     pub fn ws() -> Self {
         Self::start(false)
     }
@@ -69,6 +87,7 @@ impl FakeRelay {
         );
         let state = Arc::new(Mutex::new(State::default()));
         let switches = Arc::new(Switches::default());
+        let server_state = state.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let server_url = url.clone();
         let server_switches = switches.clone();
@@ -84,7 +103,7 @@ impl FakeRelay {
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .unwrap();
-                        let state = state.clone();
+                        let state = server_state.clone();
                         let switches = server_switches.clone();
                         let stop = server_stop.clone();
                         let url = server_url.clone();
@@ -110,6 +129,7 @@ impl FakeRelay {
         Self {
             url,
             switches,
+            state,
             stop,
             thread: Some(handle),
         }
