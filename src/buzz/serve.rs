@@ -58,8 +58,13 @@ const STALE_RECHECK_AFTER: Duration = Duration::from_secs(store::STALE_OUTBOX_SE
 /// A signing key and its identity.
 #[derive(Clone)]
 pub struct AgentIdentity {
-    /// The hcom name, without any device suffix.
+    /// The hcom name, without any device suffix (the profile's `name`).
     pub name: String,
+    /// The hcom row this identity speaks for, as this device addresses it:
+    /// `luna` locally, `luna:BOXE` for a mirror. Routing, the outbox and the
+    /// author cache all use this, so a mirror is never confused with a local
+    /// row of the same base name.
+    pub row: String,
     /// `name@device`, the derivation input.
     pub canonical: String,
     pub pubkey: String,
@@ -96,6 +101,7 @@ impl Connector {
         let key = nostr::derive_secret(&seed, &canonical);
         let reader = AgentIdentity {
             name: "reader".to_string(),
+            row: "reader".to_string(),
             canonical,
             pubkey: public_hex(&key),
             key,
@@ -150,6 +156,7 @@ impl Connector {
         let key = nostr::derive_secret(&self.seed, &canonical);
         AgentIdentity {
             name,
+            row: row_name.to_string(),
             canonical,
             pubkey: public_hex(&key),
             key,
@@ -1086,7 +1093,7 @@ impl MainLoop {
                 crate::log::log_info(
                     "buzz",
                     "serve.no_home_channel",
-                    &format!("{}: {text}", identity.name),
+                    &format!("{}: {text}", identity.row),
                 );
                 if let Err(error) = crate::commands::send::send_message(
                     &self.db,
@@ -1096,20 +1103,14 @@ impl MainLoop {
                         thread: message.thread.clone(),
                         ..Default::default()
                     }),
-                    Some(std::slice::from_ref(&identity.name)),
+                    Some(std::slice::from_ref(&identity.row)),
                 ) {
                     crate::log::log_warn("buzz", "serve.notice_failed", &error);
                 }
             }
             route::Outbound::Post(destinations) => {
                 for destination in destinations {
-                    self.queue_post(
-                        &message.from,
-                        &identity,
-                        hcom_id,
-                        &destination,
-                        &message.text,
-                    );
+                    self.queue_post(&identity, hcom_id, &destination, &message.text);
                 }
             }
         }
@@ -1118,13 +1119,12 @@ impl MainLoop {
     /// Sign one post and queue it. Signing first means the Buzz id is known
     /// before the send, which is what makes the outbox idempotent.
     ///
-    /// `signer_row` is the sender's full hcom row name (`luna`, or `luna:BOXE`
-    /// for a mirror). The publisher re-derives the key from it for NIP-98, so
-    /// it must carry the device: the bare name derives this device's key, and
-    /// the relay refuses a header that doesn't match the event's author.
+    /// The outbox records `identity.row` (`luna`, or `luna:BOXE` for a
+    /// mirror). The publisher re-derives the key from it for NIP-98, so it must
+    /// carry the device: the bare name derives this device's key, and the
+    /// relay refuses a header that doesn't match the event's author.
     fn queue_post(
         &self,
-        signer_row: &str,
         identity: &AgentIdentity,
         hcom_id: i64,
         destination: &route::Destination,
@@ -1142,7 +1142,7 @@ impl MainLoop {
         let row = OutboxRow {
             hcom_id,
             destination: destination.channel_id.clone(),
-            signer_name: signer_row.to_string(),
+            signer_name: identity.row.clone(),
             signed_json: serde_json::to_string(&event).unwrap_or_default(),
             buzz_id: event.id.clone(),
             state: "pending".into(),
@@ -1155,7 +1155,7 @@ impl MainLoop {
             Ok(true) => crate::log::log_info(
                 "buzz",
                 "serve.queued",
-                &format!("{} #{hcom_id} -> {}", identity.name, destination.channel_id),
+                &format!("{} #{hcom_id} -> {}", identity.row, destination.channel_id),
             ),
             // Re-reading a message after a crash re-queues nothing: the key is
             // already there, so the same Buzz id is posted at most once.
@@ -1504,21 +1504,16 @@ impl MainLoop {
             // own; without this a mention of an agent whose session has ended
             // names nobody and is skipped instead of parked.
             if !is_reader {
-                let device = identity
-                    .canonical
-                    .rsplit_once('@')
-                    .map(|(_, device)| device.to_string());
-                // A mirror is addressed as `luna:BOXE` on this device; the bare
-                // name would park a mention for a local row that never exists.
-                let row = match (&device, identity.remote) {
-                    (Some(device), true) => format!("{}:{}", identity.name, device.to_uppercase()),
-                    _ => identity.name.clone(),
-                };
+                // `row` keeps a mirror as `luna:BOXE`; the bare name would park
+                // a mention for a local row that never exists.
                 let _ = store.put_author(&Author {
                     pubkey: identity.pubkey.clone(),
                     kind: AuthorKind::Agent,
-                    hcom_name: Some(row),
-                    device_label: device,
+                    hcom_name: Some(identity.row.clone()),
+                    device_label: identity
+                        .canonical
+                        .rsplit_once('@')
+                        .map(|(_, device)| device.to_string()),
                 });
             }
         }
@@ -1815,8 +1810,8 @@ impl MainLoop {
         for identity in self.all_known_identities() {
             roster
                 .by_pubkey
-                .insert(identity.pubkey.clone(), identity.name.clone());
-            roster.deliverable.insert(identity.name);
+                .insert(identity.pubkey.clone(), identity.row.clone());
+            roster.deliverable.insert(identity.row);
         }
         roster
     }
@@ -1945,98 +1940,134 @@ impl MainLoop {
         Ok(())
     }
 
-    /// Roster event: upsert or retire people and re-key their hosted rows.
+    /// Roster event for one channel: record who is in it, host new people, and
+    /// retire anyone gone from every bridged channel once the grace period ends.
     fn handle_roster(&mut self, event: &Event) -> Result<()> {
-        let members = route::roster_members(event);
+        let Some(channel_id) = route::tag(event, "d").map(str::to_string) else {
+            return Ok(());
+        };
+        if !self
+            .connector
+            .channel_rows()
+            .iter()
+            .any(|c| c.id == channel_id)
+        {
+            return Ok(());
+        }
         let now = crate::shared::time::now_epoch_i64();
 
-        for (pubkey, role) in &members {
+        let mut here: Vec<String> = Vec::new();
+        for (pubkey, role) in route::roster_members(event) {
             // Role `bot` is an owned agent, and the reader and omp are ours:
             // none of them is ever a person.
             if role == "bot"
-                || pubkey == &self.connector.reader.pubkey
-                || pubkey == &self.connector.owner_pubkey
+                || pubkey == self.connector.reader.pubkey
+                || pubkey == self.connector.owner_pubkey
             {
                 continue;
             }
-            let Some((slug, profile)) = self.profile_for(pubkey) else {
+            let Some(name) = self.person_name_for(&pubkey) else {
                 continue;
             };
-            let _ = profile;
-            let name = self
-                .connector
-                .config
-                .person_name(pubkey)
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    // A name already held by another Buzz person, or by a row
-                    // that is not one of our own `ch_` channel rows, gets the
-                    // `_bz` suffix rather than stealing that identity.
-                    config::unique_person_name(&slug, |candidate| {
-                        if self
-                            .connector
-                            .store
-                            .lock()
-                            .person_by_name(candidate)
-                            .ok()
-                            .flatten()
-                            .is_some()
-                        {
-                            return true;
-                        }
-                        self.db
-                            .get_instance_full(candidate)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|row| !row.name.starts_with("ch_"))
-                    })
-                });
             let home = self
                 .connector
                 .config
-                .person_home(pubkey)
+                .person_home(&pubkey)
                 .map(str::to_string);
             self.connector
                 .store
                 .lock()
-                .upsert_person(pubkey, &name, home.as_deref())?;
+                .upsert_person(&pubkey, &name, home.as_deref())?;
             self.host_person(&name);
+            here.push(pubkey);
         }
-
-        // Anyone the roster no longer lists leaves: first mark, then stop after
-        // the grace period, so a single missing roster does not churn rows.
-        let listed: std::collections::HashSet<String> =
-            members.iter().map(|(pubkey, _)| pubkey.clone()).collect();
-        let people = self
-            .connector
+        self.connector
             .store
             .lock()
-            .active_people()
-            .unwrap_or_default();
+            .set_channel_members(&channel_id, &here)?;
+
+        // A roster covers one channel. Someone absent from every bridged
+        // channel starts the grace period; they stay a person until it ends,
+        // so a single missing roster does not churn rows.
+        let people = self.connector.store.lock().active_people()?;
         for person in people {
-            if listed.contains(&person.pubkey) {
+            if self
+                .connector
+                .store
+                .lock()
+                .is_member_anywhere(&person.pubkey)?
+            {
+                if person.left_at.is_some() {
+                    self.connector
+                        .store
+                        .lock()
+                        .clear_person_leaving(&person.pubkey)?;
+                }
                 continue;
             }
             match person.left_at {
-                None => {
-                    let store = self.connector.store.lock();
-                    store.retire_person(&person.pubkey, now)?;
-                }
+                None => self
+                    .connector
+                    .store
+                    .lock()
+                    .mark_person_leaving(&person.pubkey, now)?,
                 Some(left_at) if now.saturating_sub(left_at) >= PERSON_RETIRE_SECS => {
                     crate::log::log_info(
                         "buzz",
                         "serve.person_retired",
                         &format!("{} left every bridged channel", person.name),
                     );
-                    {
-                        let store = self.connector.store.lock();
-                        let _ = store.retire_person(&person.pubkey, left_at);
+                    self.connector
+                        .store
+                        .lock()
+                        .retire_person(&person.pubkey, left_at)?;
+                    self.connector
+                        .hosted
+                        .lock()
+                        .retain(|row| row != &person.name);
+                    if let Err(error) = crate::hosted::stop_hosted_row(
+                        &self.db,
+                        crate::hosted::HOSTED_TOOL_BUZZ,
+                        &person.name,
+                    ) {
+                        crate::log::log_warn("buzz", "serve.person_stop", &error.to_string());
                     }
                 }
                 Some(_) => {}
             }
         }
         Ok(())
+    }
+
+    /// The hcom name for a roster member: the config override, else the name
+    /// already stored for this pubkey (names are stable once assigned), else a
+    /// new slug from their kind 0. None when a new member has no profile yet.
+    fn person_name_for(&self, pubkey: &str) -> Option<String> {
+        if let Some(name) = self.connector.config.person_name(pubkey) {
+            return Some(name.to_string());
+        }
+        if let Ok(Some(person)) = self.connector.store.lock().person_by_pubkey(pubkey) {
+            return Some(person.name);
+        }
+        let (slug, _) = self.profile_for(pubkey)?;
+        // A name held by another Buzz person, or by a row that is not one of
+        // our own `ch_` rows, gets the `_bz` suffix instead of being stolen.
+        Some(config::unique_person_name(&slug, |candidate| {
+            let held = self
+                .connector
+                .store
+                .lock()
+                .person_by_name(candidate)
+                .ok()
+                .flatten()
+                .is_some_and(|other| other.pubkey != pubkey);
+            held || self
+                .db
+                .get_instance_full(candidate)
+                .ok()
+                .flatten()
+                .is_some_and(|row| !row.name.starts_with("ch_"))
+        }))
     }
 
     /// Register one person's hosted row and its notify endpoint.
@@ -2098,7 +2129,13 @@ impl MainLoop {
             (AuthorKind::Agent, Some((name, device))) => Author {
                 pubkey: event.pubkey.clone(),
                 kind,
-                hcom_name: Some(name),
+                // As this device addresses it: a mirror is `name:DEVICE`, and
+                // `agent_identity` re-derives the same key from that form.
+                hcom_name: Some(if device == self.connector.config.device_label {
+                    name
+                } else {
+                    format!("{name}:{}", device.to_uppercase())
+                }),
                 device_label: Some(device),
             },
             (kind, _) => Author {
@@ -2203,6 +2240,7 @@ mod tests {
 
     const SEED: [u8; 32] = [7; 32];
     const CHANNEL_ID: &str = "11111111-2222-3333-4444-55555566666677";
+    const OTHER_CHANNEL_ID: &str = "22222222-3333-4444-5555-666666777788";
 
     fn owner_key() -> SecretKey {
         SecretKey::from_bytes(&[3; 32]).unwrap()
@@ -2338,7 +2376,8 @@ mod tests {
                 "last_stop": now,
                 "tcp_mode": 0,
                 "last_event_id": self.main.db.get_last_event_id(),
-                "origin_device_id": "",
+                // A `name:DEVICE` row is a mirror of another device's agent.
+                "origin_device_id": if name.contains(':') { "boxe-device-uuid" } else { "" },
                 "directory": "",
                 "transcript_path": "",
                 "background": 0,
@@ -2358,6 +2397,33 @@ mod tests {
                     event,
                 })
                 .unwrap();
+        }
+
+        /// Deliver an event on one channel's subscription.
+        fn offer_on(&self, slug: &str, event: Event) {
+            self.inbound
+                .send(InboundItem {
+                    sub: sub_id(slug),
+                    event,
+                })
+                .unwrap();
+        }
+
+        /// Bridge a second channel, the way a config entry plus startup would.
+        fn add_channel(&mut self, id: &str, slug: &str) {
+            self.main
+                .connector
+                .config
+                .channels
+                .push(config::ChannelConfig {
+                    id: id.to_string(),
+                    slug: Some(slug.to_string()),
+                    home: false,
+                });
+            let row = format!("ch_{slug}");
+            crate::hosted::register_hosted(&self.main.db, &row, crate::hosted::HOSTED_TOOL_BUZZ)
+                .unwrap();
+            self.main.connector.hosted.lock().push(row);
         }
 
         fn step(&mut self) {
@@ -2453,6 +2519,28 @@ mod tests {
                 content: json!({"name": name, "display_name": name, "about": about}).to_string(),
             },
             key,
+        )
+    }
+
+    /// A kind 39002 roster for one channel: `(pubkey, role)` members.
+    fn roster(channel: &str, members: &[(&str, &str)]) -> Event {
+        let mut tags = vec![vec!["d".to_string(), channel.to_string()]];
+        for (pubkey, role) in members {
+            tags.push(vec![
+                "p".into(),
+                pubkey.to_string(),
+                String::new(),
+                role.to_string(),
+            ]);
+        }
+        sign(
+            UnsignedEvent {
+                created_at: nostr::now(),
+                kind: route::KIND_ROSTER,
+                tags,
+                content: String::new(),
+            },
+            &owner_key(),
         )
     }
 
@@ -2626,6 +2714,39 @@ mod tests {
             harness.agent_posts()
         );
         assert!(harness.store().unsent_outbox().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_reply_under_a_remote_agents_post_reaches_its_mirror_row() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna:BOXE");
+        let remote = nostr::derive_secret(&SEED, "luna@boxe");
+        let post = message(&remote, CHANNEL_ID, "build is green", vec![]);
+        harness.offer(post.clone());
+        harness.offer(message(
+            &human_key(),
+            CHANNEL_ID,
+            "nice, ship it",
+            vec![vec![
+                "e".into(),
+                post.id.clone(),
+                String::new(),
+                "reply".into(),
+            ]],
+        ));
+        harness.step();
+
+        assert_eq!(
+            harness.unread("luna:BOXE").len(),
+            1,
+            "the reply targets the mirror row, not a bare local `luna`"
+        );
+        assert!(
+            harness.store().target_counts().unwrap().is_empty(),
+            "nothing parked"
+        );
     }
 
     #[test]
@@ -3196,6 +3317,99 @@ mod tests {
         let row = harness.main.db.get_instance_full("michael").unwrap();
         assert!(row.is_some(), "the roster created the hosted row");
         assert_eq!(row.unwrap().tool, crate::hosted::HOSTED_TOOL_BUZZ);
+    }
+
+    #[test]
+    #[serial]
+    fn a_person_keeps_their_name_across_rosters() {
+        // Two bridged channels each send a roster at startup; the second one
+        // for the same person must not rename them `michael_bz`.
+        let mut harness = harness("mbai");
+        let human = public_hex(&human_key());
+        harness
+            .relay
+            .seed(profile(&human_key(), "Michael", "just a person"));
+        harness.offer(roster(CHANNEL_ID, &[(&human, "member")]));
+        harness.step();
+        // A later roster (someone else joined) still lists Michael.
+        let luna = public_hex(&agent_key());
+        harness.offer(roster(CHANNEL_ID, &[(&human, "member"), (&luna, "bot")]));
+        harness.step();
+
+        let people = harness.store().active_people().unwrap();
+        assert_eq!(
+            people.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["michael"],
+            "the stored name is reused, never suffixed against itself"
+        );
+        assert!(
+            harness
+                .main
+                .db
+                .get_instance_full("michael_bz")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn another_channels_roster_does_not_retire_a_member() {
+        let mut harness = harness("mbai");
+        harness.add_channel(OTHER_CHANNEL_ID, "ops");
+        harness.add_agent("luna");
+        let human = public_hex(&human_key());
+        harness
+            .relay
+            .seed(profile(&human_key(), "Michael", "just a person"));
+        harness.offer(roster(CHANNEL_ID, &[(&human, "member")]));
+        harness.step();
+        // `ops` doesn't list Michael: he is still in #infra.
+        harness.offer_on("ops", roster(OTHER_CHANNEL_ID, &[]));
+        harness.step();
+        assert_eq!(harness.store().active_people().unwrap().len(), 1);
+
+        harness.offer(message(
+            &human_key(),
+            CHANNEL_ID,
+            "luna, still with me?",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        ));
+        harness.step();
+        assert_eq!(harness.unread("luna").len(), 1, "his mention still lands");
+
+        // Leaving #infra too starts the grace period: still a person until it
+        // ends, then retired and the hosted row stopped.
+        harness.offer(roster(CHANNEL_ID, &[]));
+        harness.step();
+        let left_at = {
+            let person = harness.store().person_by_pubkey(&human).unwrap().unwrap();
+            assert!(person.active, "the grace period keeps him a person");
+            person.left_at.expect("leaving is recorded")
+        };
+        harness
+            .store()
+            .mark_person_leaving(&human, left_at - PERSON_RETIRE_SECS - 1)
+            .unwrap();
+        // The next roster (a distinct event: an agent was added) still lacks him.
+        let luna = public_hex(&agent_key());
+        harness.offer(roster(CHANNEL_ID, &[(&luna, "bot")]));
+        harness.step();
+        assert!(
+            !harness
+                .store()
+                .person_by_pubkey(&human)
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        let row = harness
+            .main
+            .db
+            .get_instance_full("michael")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "stopped", "the hosted row stops when he's gone");
     }
 
     #[test]

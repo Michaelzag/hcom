@@ -256,14 +256,41 @@ pub fn heartbeat_hosted(db: &HcomDb, tool: &str) -> Result<usize> {
 /// `buzz:offline` is not an `exit:*` context, so the rows stay deliverable and
 /// everything sent while the connector is down queues on their cursors.
 pub fn set_hosted_offline(db: &HcomDb, tool: &str) -> Result<usize> {
-    set_hosted_state(db, tool, ST_INACTIVE, CONTEXT_OFFLINE, &["stopped", "dead"])
+    set_hosted_state(
+        db,
+        tool,
+        None,
+        ST_INACTIVE,
+        CONTEXT_OFFLINE,
+        &["stopped", "dead"],
+    )
 }
 
 /// The rollback path: hosted rows of `tool` go `stopped` / `buzz:down`, which
 /// `fleet_names::LIVE_ROW_PREDICATE` refuses — a send aimed at them now fails
 /// instead of queueing.
 pub fn stop_hosted(db: &HcomDb, tool: &str) -> Result<usize> {
-    set_hosted_state(db, tool, "stopped", CONTEXT_DOWN, &["stopped", "dead"])
+    set_hosted_state(
+        db,
+        tool,
+        None,
+        "stopped",
+        CONTEXT_DOWN,
+        &["stopped", "dead"],
+    )
+}
+
+/// Stop one hosted row, the same way `stop_hosted` stops them all: for a
+/// participant that left every bridged channel while the connector runs.
+pub fn stop_hosted_row(db: &HcomDb, tool: &str, name: &str) -> Result<usize> {
+    set_hosted_state(
+        db,
+        tool,
+        Some(name),
+        "stopped",
+        CONTEXT_DOWN,
+        &["stopped", "dead"],
+    )
 }
 
 /// Shared liveness write for the non-create transitions: one UPDATE over the
@@ -272,6 +299,7 @@ pub fn stop_hosted(db: &HcomDb, tool: &str) -> Result<usize> {
 fn set_hosted_state(
     db: &HcomDb,
     tool: &str,
+    only: Option<&str>,
     status: &str,
     context: &str,
     skip_statuses: &[&str],
@@ -280,9 +308,10 @@ fn set_hosted_state(
         let mut stmt = db.conn().prepare(
             "SELECT name FROM instances
              WHERE COALESCE(origin_device_id, '') = ''
-               AND tool = ?1",
+               AND tool = ?1
+               AND (?2 IS NULL OR name = ?2)",
         )?;
-        stmt.query_map(rusqlite::params![tool], |row| row.get::<_, String>(0))?
+        stmt.query_map(rusqlite::params![tool, only], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
             .collect::<Vec<String>>()
     };

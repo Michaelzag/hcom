@@ -211,6 +211,10 @@ impl Store {
                 home_slug TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
                 left_at INTEGER);
+             CREATE TABLE IF NOT EXISTS memberships (
+                pubkey TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                PRIMARY KEY (pubkey, channel_id));
              CREATE TABLE IF NOT EXISTS authors (
                 pubkey TEXT PRIMARY KEY,
                 kind TEXT NOT NULL,
@@ -382,13 +386,62 @@ impl Store {
         Ok(())
     }
 
-    /// Mark a person as no longer in any bridged channel.
+    /// Retire a person: no longer a participant. The grace period is the
+    /// caller's business; see `mark_person_leaving`.
     pub fn retire_person(&self, pubkey: &str, at: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE people SET active = 0, left_at = ?2 WHERE pubkey = ?1",
             params![pubkey, at],
         )?;
         Ok(())
+    }
+
+    /// Start (or move) a person's grace period. They stay active meanwhile.
+    pub fn mark_person_leaving(&self, pubkey: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE people SET left_at = ?2 WHERE pubkey = ?1",
+            params![pubkey, at],
+        )?;
+        Ok(())
+    }
+
+    /// A person seen in a roster again: no grace period running.
+    pub fn clear_person_leaving(&self, pubkey: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE people SET left_at = NULL WHERE pubkey = ?1 AND active = 1",
+            params![pubkey],
+        )?;
+        Ok(())
+    }
+
+    /// Replace one channel's person members with what its roster lists.
+    pub fn set_channel_members(&self, channel_id: &str, pubkeys: &[String]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM memberships WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        for pubkey in pubkeys {
+            tx.execute(
+                "INSERT OR IGNORE INTO memberships (pubkey, channel_id) VALUES (?1, ?2)",
+                params![pubkey, channel_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// True when any bridged channel's last roster listed this person.
+    pub fn is_member_anywhere(&self, pubkey: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM memberships WHERE pubkey = ?1 LIMIT 1",
+                params![pubkey],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Every person row.
