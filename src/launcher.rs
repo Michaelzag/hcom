@@ -1659,6 +1659,23 @@ pub(crate) fn resolve_explicit_name_conflict(
     let Some(row) = db.get_instance(name).ok().flatten() else {
         return Ok(());
     };
+    // A connector-hosted row is not a resume handle: it belongs to a
+    // long-lived connector, carries a real cursor, and re-registers itself
+    // within one loop. The inactive branch below would delete it as stale
+    // state and the launch would take over the identity — silently dropping
+    // whatever queued on that cursor. Refuse instead, and say who owns it.
+    if row
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .is_some_and(crate::hosted::is_hosted_tool)
+    {
+        bail!(
+            "Instance '{}' is a connector-hosted participant (tool '{}'); \
+             stop the connector or pick a different name",
+            name,
+            row.get("tool").and_then(|v| v.as_str()).unwrap_or("")
+        );
+    }
     let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("");
     let status_context = row
         .get("status_context")

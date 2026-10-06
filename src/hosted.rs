@@ -41,6 +41,36 @@ const CONTEXT_OFFLINE: &str = "buzz:offline";
 /// Context of a hosted row rolled back to stopped — no longer deliverable.
 const CONTEXT_DOWN: &str = "buzz:down";
 
+/// Signals that registration has reached the point between its occupancy
+/// check and its row write. A test arms it with a two-party channel: the
+/// competing connection is released to commit there, and registration then
+/// runs its write against whatever that writer left behind.
+///
+/// This deliberately does NOT block inside the transaction — a barrier here
+/// would deadlock, since the competitor's own write needs the same lock we
+/// hold. The channel hands over immediately and the competitor proceeds
+/// independently.
+struct RegisterGap {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl RegisterGap {
+    fn arrive(&self) {
+        let _ = self.reached.send(());
+        // Bounded: if the competitor never replies (it lost the race to a
+        // lock it cannot get), registration must still finish.
+        let _ = self
+            .release
+            .recv_timeout(std::time::Duration::from_secs(10));
+    }
+}
+
+thread_local! {
+    static REGISTER_GAP_HOOK: std::cell::RefCell<Option<RegisterGap>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Does `tool` mark a row as connector-hosted?
 ///
 /// This is the one predicate every exemption keys off: the sweep's skip and
@@ -90,66 +120,90 @@ pub fn register_hosted(db: &HcomDb, name: &str, tool: &str) -> Result<RegisterOu
         bail!("{refusal}");
     }
 
-    let now = crate::shared::time::now_epoch_i64();
-    let existing = db.get_instance_full(name)?;
-
-    if let Some(row) = existing.as_ref()
-        && row.tool != tool
-    {
-        bail!(
-            "instance '{name}' already exists with tool '{}' (hosted participants need '{}')",
-            row.tool,
-            tool
-        );
-    }
-
-    let outcome = match existing {
-        // Existing hosted row: liveness only. `last_event_id` is deliberately
-        // absent from this update — the queued backlog survives the restart.
-        Some(_) => {
-            let updates = json!({
-                "status": ST_LISTENING,
-                "status_time": now,
-                "status_context": CONTEXT_ONLINE,
-                "status_detail": "",
-                "last_stop": now,
-                "tcp_mode": 1,
-            });
-            db.update_instance_fields(name, updates.as_object().expect("object literal"))?;
-            RegisterOutcome::Refreshed
-        }
-        // New row: no session_id, no pid, no bindings — process truth has
-        // nothing to release. Cursor at the current maximum, so a person who
-        // joins a channel is not handed the whole group backlog.
-        None => {
-            let mut data = json!({
-                "name": name,
-                "tool": tool,
-                "status": ST_LISTENING,
-                "status_time": now,
-                "status_context": CONTEXT_ONLINE,
-                "status_detail": "",
-                "last_stop": now,
-                "last_event_id": db.get_last_event_id(),
-                "tcp_mode": 1,
-                "created_at": crate::shared::time::now_epoch_f64(),
-                "directory": "",
-                "transcript_path": "",
-                "background": 0,
-                "name_announced": 0,
-                "origin_device_id": "",
-            });
-            let object = data.as_object_mut().expect("object literal");
-            db.save_instance_named(name, object)?;
-            RegisterOutcome::Created
-        }
-    };
-
-    // The same `life.created` record (and auto-subscribe) any other row gets,
-    // so the TUI, the relay and subscribers see the participant appear. The
-    // tool is not a released harness spec, so the auto-subscribe is a no-op
-    // for hosted tools today; the event is what matters.
+    // The occupancy check, the row write and the cursor decision share ONE
+    // `BEGIN IMMEDIATE` transaction. Two connectors racing to register the
+    // same participant (or a connector racing a harness) must serialize
+    // here: read-then-write outside a lock lets a stale creator overwrite a
+    // row another registration just wrote, and lets the new-row branch
+    // compute its cursor from a maximum that has already moved past a message
+    // queued for this participant.
     let mut post = crate::hooks::common::PostCommit::default();
+    let outcome = db.with_immediate_transaction(|tx| {
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT tool FROM instances WHERE name = ?1",
+                rusqlite::params![name],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+
+        let Some(row_tool) = existing else {
+            // Test seam: hands the competing writer its turn in the window
+            // between the occupancy check and the row write.
+            if let Some(gate) = REGISTER_GAP_HOOK.with(|hook| hook.borrow_mut().take()) {
+                gate.arrive();
+            }
+
+            // New row: no session_id, no pid, no bindings — process truth has
+            // nothing to release. The cursor is read INSIDE this transaction,
+            // so it cannot come from a stale maximum and skip a message queued
+            // since. A person who joins a channel is not handed the whole
+            // group backlog.
+            let now = crate::shared::time::now_epoch_i64();
+            let current_max: i64 =
+                tx.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| {
+                    r.get(0)
+                })?;
+            tx.execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_time, status_context, status_detail,
+                  last_stop, last_event_id, tcp_mode, created_at, directory,
+                  transcript_path, background, name_announced, origin_device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?4, ?6, 1, ?7, '', '', 0, 0, '')",
+                rusqlite::params![
+                    name,
+                    tool,
+                    ST_LISTENING,
+                    now,
+                    CONTEXT_ONLINE,
+                    current_max,
+                    crate::shared::time::now_epoch_f64(),
+                ],
+            )?;
+            return Ok(RegisterOutcome::Created);
+        };
+
+        if row_tool != tool {
+            bail!(
+                "instance '{name}' already exists with tool '{row_tool}' (hosted participants need '{tool}')"
+            );
+        }
+
+        // Test seam: hands the competing writer its turn in the window between
+        // the occupancy check and the row write. Fires on whichever branch
+        // the row takes, since either one can lose a race.
+        if let Some(gate) = REGISTER_GAP_HOOK.with(|hook| hook.borrow_mut().take()) {
+            gate.arrive();
+        }
+
+        // Existing hosted row: heartbeat ONLY. `status`/`status_context` are
+        // deliberately absent — `set_status_collected` below owns that
+        // transition, and it must read the row BEFORE any write to log the
+        // real prior status and to decide whether a transition wake fires.
+        // `last_event_id` is absent too, so the queued backlog survives.
+        let now = crate::shared::time::now_epoch_i64();
+        tx.execute(
+            "UPDATE instances SET last_stop = ?2, tcp_mode = 1 WHERE name = ?1",
+            rusqlite::params![name, now],
+        )?;
+        Ok(RegisterOutcome::Refreshed)
+    })?;
+
+    // The same `life.created` record any other row gets, so the TUI, the relay
+    // and subscribers see the participant appear. Written after the
+    // transaction commits: the fan-out it triggers must not hold the write
+    // lock. The tool is not a released harness spec, so auto-subscribe is a
+    // no-op for hosted tools today; the event is what matters.
     if outcome == RegisterOutcome::Created {
         let launcher =
             std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "connector".to_string());
@@ -163,8 +217,11 @@ pub fn register_hosted(db: &HcomDb, name: &str, tool: &str) -> Result<RegisterOu
         let _ = db.log_event_collected("life", name, &event_data, &mut post);
     }
 
-    // Status event so `hcom list` and the relay show the online transition,
-    // the same way a process-bound row's transitions are logged.
+    // Owns the online transition for BOTH branches. For a refresh the row is
+    // still on its previous status at this point, so this logs the real
+    // `old_status`/`old_context` and fires the transition wake — writing the
+    // status inside the transaction first made it report `listening`/
+    // `buzz:online` as the prior state of an offline row and skip the wake.
     crate::instance_lifecycle::set_status_collected(
         db,
         name,
@@ -509,5 +566,212 @@ mod tests {
         assert!(!is_hosted_tool("codex"));
         assert!(!is_hosted_tool(""));
         assert!(!is_hosted_tool("Buzz"));
+    }
+
+    // ── regressions from the PR-77 review ─────────────────────────────
+
+    /// Registration must serialize its occupancy check against a competing
+    /// writer. This arms the gap seam: a second connection tries to claim
+    /// the name exactly between the check and the row write.
+    ///
+    /// With the check and the write outside one `BEGIN IMMEDIATE`, the
+    /// competitor lands in that window and the connector's INSERT OR REPLACE
+    /// silently takes the row — and the other seat's cursor — with it. Here
+    /// the competitor is a plain INSERT against the committed row, so the
+    /// primary key is what protects the identity once the lock is in place.
+    #[test]
+    #[serial]
+    fn registration_refuses_a_name_a_concurrent_writer_took() {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (temp_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let path = temp_dir.path().join("hosted.db");
+        let db = HcomDb::open_at(&path).unwrap();
+
+        REGISTER_GAP_HOOK.with(|h| {
+            h.replace(Some(RegisterGap {
+                reached: reached_tx,
+                release: release_rx,
+            }))
+        });
+
+        // The competitor: waits for our window, then commits. It is a plain
+        // INSERT, so it collides with our committed primary key rather than
+        // replacing it.
+        let rival_path = path.clone();
+        let rival = std::thread::spawn(move || {
+            let conn = HcomDb::open_raw(&rival_path).unwrap();
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("registration never reached the gap");
+            let result = conn
+                .conn()
+                .execute(
+                    "INSERT INTO instances (name, tool, status, created_at, last_event_id)
+                     VALUES ('michael', 'codex', 'active', 1.0, 17)",
+                    [],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            release_tx.send(()).ok();
+            result
+        });
+
+        let outcome = register_hosted(&db, "michael", HOSTED_TOOL_BUZZ);
+        let rival_result = rival.join().expect("competitor thread panicked");
+        REGISTER_GAP_HOOK.with(|h| h.replace(None));
+
+        // Ours committed first, so the competitor's INSERT hits the primary
+        // key and loses — it cannot steal the identity.
+        assert!(
+            rival_result.is_err(),
+            "the competitor overwrote a committed hosted row: {rival_result:?}"
+        );
+        assert_eq!(outcome.unwrap(), RegisterOutcome::Created);
+        assert_eq!(row(&db, "michael").tool, "buzz", "the hosted row survived");
+    }
+
+    /// The same race, read from the cursor side: a message for this
+    /// participant is committed in the window between the occupancy check and
+    /// the INSERT. The transaction's write lock must make that attempt fail
+    /// outright, so the cursor can never be computed from a maximum that
+    /// already moved past the message.
+    #[test]
+    #[serial]
+    fn a_new_row_cursor_cannot_skip_a_message_queued_during_registration() {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (temp_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let path = temp_dir.path().join("hosted.db");
+        let db = HcomDb::open_at(&path).unwrap();
+
+        REGISTER_GAP_HOOK.with(|h| {
+            h.replace(Some(RegisterGap {
+                reached: reached_tx,
+                release: release_rx,
+            }))
+        });
+
+        let queued_path = path.clone();
+        let queue_thread = std::thread::spawn(move || {
+            let conn = HcomDb::open_raw(&queued_path).unwrap();
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("registration never reached the gap");
+            let result = conn
+                .log_event(
+                    "message",
+                    "luna",
+                    &json!({
+                        "from": "luna", "text": "queued in the window",
+                        "scope": "mentions", "mentions": ["michael"],
+                        "exact_targets": ["michael"], "delivered_to": ["michael"],
+                    }),
+                )
+                .map_err(|e| e.to_string());
+            release_tx.send(()).ok();
+            result
+        });
+
+        let outcome = register_hosted(&db, "michael", HOSTED_TOOL_BUZZ);
+        let queued_result = queue_thread.join().expect("queueing thread panicked");
+        REGISTER_GAP_HOOK.with(|h| h.replace(None));
+
+        assert_eq!(outcome.unwrap(), RegisterOutcome::Created);
+
+        // The window is inside our transaction, so the competing write is
+        // refused — nothing lands between our check and our INSERT. Without
+        // the lock the message would commit here and the cursor (read from
+        // whatever maximum was current) could sit above it, skipping it.
+        let queued = queued_result.expect_err(
+            "a message committed inside the registration window: \
+             the cursor can be computed from a maximum that skipped it",
+        );
+        assert!(
+            queued.contains("locked") || queued.contains("busy"),
+            "the competing write must be refused by the transaction's lock, \
+             not succeed: {queued}"
+        );
+
+        // And the invariant the connector depends on: the new row's cursor was
+        // taken from the maximum visible inside its own transaction, so it
+        // sits at or above every message that existed when the row was
+        // created, and no earlier message is skipped.
+        let created_max = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM events
+                 WHERE type = 'message' AND instance != 'michael'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert!(
+            cursor(&db, "michael") >= created_max,
+            "cursor {} is below message maximum {created_max}: \
+             a new hosted row would skip messages",
+            cursor(&db, "michael")
+        );
+    }
+
+    /// An explicit-name launch must refuse a hosted row, never delete it.
+    /// `resolve_explicit_name_conflict` treats an `inactive` row as a stale
+    /// resume handle and deletes it — for an offline hosted participant that
+    /// discards a real cursor and hands the identity to a harness.
+    #[test]
+    #[serial]
+    fn an_explicit_name_launch_refuses_an_offline_hosted_row() {
+        let (db, _path, _guard) = setup_test_db();
+        register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
+        set_hosted_offline(&db, HOSTED_TOOL_BUZZ).unwrap();
+        send_to(&db, "michael", "queued while offline").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_event_id = 37 WHERE name = 'michael'",
+                [],
+            )
+            .unwrap();
+
+        let err = crate::launcher::resolve_explicit_name_conflict(&db, "michael", None)
+            .expect_err("a hosted identity is not a stale resume handle");
+        assert!(
+            err.to_string().contains("connector-hosted"),
+            "the refusal must say who owns it: {err}"
+        );
+
+        let row = row(&db, "michael");
+        assert_eq!(row.tool, "buzz", "the hosted row survived");
+        assert_eq!(row.last_event_id, 37, "and kept its cursor");
+    }
+
+    /// A refresh must log the status the row was ACTUALLY in and wake the
+    /// delivery loop on offline→online. Writing the status inside the
+    /// registration transaction before the status helper read it made the
+    /// helper see `listening`/`buzz:online` on an offline row, log that as
+    /// the prior status, and skip the transition wake.
+    #[test]
+    #[serial]
+    fn refresh_logs_the_real_prior_status_on_an_offline_to_online_transition() {
+        let (db, _path, _guard) = setup_test_db();
+        register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
+        set_hosted_offline(&db, HOSTED_TOOL_BUZZ).unwrap();
+        assert_eq!(row(&db, "michael").status_context, "buzz:offline");
+
+        register_hosted(&db, "michael", HOSTED_TOOL_BUZZ).unwrap();
+
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'status' AND instance = 'michael'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["old_status"], "inactive", "logged event: {data}");
+        assert_eq!(data["old_context"], "buzz:offline", "logged event: {data}");
+        assert_eq!(data["new_status"], "listening", "logged event: {data}");
+        assert_eq!(data["new_context"], "buzz:online", "logged event: {data}");
     }
 }
