@@ -21,12 +21,26 @@ pub enum BrokerProbe {
 /// Result of testing a single broker: (host, port, outcome).
 pub type BrokerTestResult = (String, u16, BrokerProbe);
 
-/// Connect to the first resolved address that accepts. Resolution often lists
-/// IPv6 first, and on an IPv4-only network that address can never connect.
+/// Connect to the first resolved address that accepts, within one overall
+/// deadline. Resolution often lists IPv6 first, and on an IPv4-only network
+/// that address can never connect — hence trying every address. But each
+/// attempt shares the transport's overall 5s budget: rumqttc wraps its whole
+/// connect (DNS, every address attempt, CONNACK) in `connection_timeout`,
+/// with no per-address deadline. A per-address budget here would report a
+/// broker reachable via a later address that the transport itself, its 5s
+/// consumed by an earlier blackholed address, could never reach.
 fn connect_any(addrs: &[SocketAddr]) -> Option<TcpStream> {
-    addrs
-        .iter()
-        .find_map(|addr| TcpStream::connect_timeout(addr, CONNECT_TIMEOUT).ok())
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    for addr in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if let Ok(stream) = TcpStream::connect_timeout(addr, remaining) {
+            return Some(stream);
+        }
+    }
+    None
 }
 
 /// Test a single broker via TCP+TLS handshake. Returns round-trip ms or None.
@@ -223,5 +237,10 @@ mod tests {
             .unwrap();
         let stream = connect_any(&[dead, good]).expect("falls through to the live address");
         assert_eq!(stream.peer_addr().unwrap(), good);
+    }
+
+    #[test]
+    fn connect_any_on_no_addresses_returns_none() {
+        assert!(connect_any(&[]).is_none());
     }
 }
