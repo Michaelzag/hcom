@@ -972,9 +972,17 @@ impl Proxy {
                 PollFlags::POLLIN,
             ));
 
+            // While the child isn't consuming (child_input at/over the same
+            // high-water mark interactive stdin honors), exclude the inject
+            // listener AND clients from the poll set: bytes stay in senders'
+            // TCP buffers (producer backpressure) instead of piling up unread
+            // server-side, where they'd spin the loop and leak fds to EMFILE.
+            // The short poll timeout below still applies, so a drained queue
+            // re-registers everything next iteration.
+            let input_stalled = child_input.len() >= 1024 * 1024;
             // Include the inject listener unless we're in backoff (macOS spurious POLLIN).
             // Reset backoff here so it applies for exactly one iteration.
-            let include_listener = !listener_backoff;
+            let include_listener = !listener_backoff && !input_stalled;
             listener_backoff = false;
             let inject_listener_idx: Option<usize> = if include_listener {
                 let idx = poll_fds.len();
@@ -984,11 +992,13 @@ impl Proxy {
                 None
             };
 
-            // Add inject client fds
+            // Add inject client fds (skipped while stalled: see above)
             let client_raw_fds: Vec<i32> = self.inject_server.client_raw_fds().collect();
-            for raw_fd in &client_raw_fds {
-                let fd = unsafe { BorrowedFd::borrow_raw(*raw_fd) };
-                poll_fds.push(PollFd::new(fd, PollFlags::POLLIN));
+            if !input_stalled {
+                for raw_fd in &client_raw_fds {
+                    let fd = unsafe { BorrowedFd::borrow_raw(*raw_fd) };
+                    poll_fds.push(PollFd::new(fd, PollFlags::POLLIN));
+                }
             }
 
             // Poll timeout: 5s when debug enabled (for periodic dumps), otherwise block
@@ -998,10 +1008,9 @@ impl Proxy {
             } else {
                 10000u16 // 10s, allows runtime debug flag check
             };
-            // During a one-iteration listener backoff (macOS spurious POLLIN workaround)
-            // the inject listener is excluded from the poll set. Cap the timeout short
-            // so an inject connection arriving while we're backed off doesn't wait the
-            // full 10s for the listener to re-enter the poll set on the next iteration.
+            // While the listener is excluded (one-iteration backoff, or stalled
+            // input, both handled above) cap the timeout short so arrivals and
+            // queue drain are noticed next iteration instead of after 10s.
             if !include_listener {
                 poll_timeout = poll_timeout.min(100u16);
             }
@@ -1372,16 +1381,17 @@ impl Proxy {
             // Clients are pushed immediately after the listener (or immediately after
             // stdin when listener is in backoff), so their base index shifts by one
             // depending on whether the listener is present this iteration.
-            let clients_base = inject_listener_idx
-                .map_or_else(|| poll_fds.len() - client_raw_fds.len(), |idx| idx + 1);
-            for i in (0..client_raw_fds.len()).rev() {
+            // While stalled (see above) no client fds are registered: live_clients
+            // is 0, the loop is skipped, and the base below is unused.
+            let live_clients = if input_stalled {
+                0
+            } else {
+                client_raw_fds.len()
+            };
+            let clients_base =
+                inject_listener_idx.map_or_else(|| poll_fds.len() - live_clients, |idx| idx + 1);
+            for i in (0..live_clients).rev() {
                 let poll_idx = clients_base + i;
-                // Same high-water mark as interactive stdin above: while the child
-                // isn't consuming, leave injected bytes in the clients' TCP buffers
-                // (producer backpressure) instead of growing the queue without bound.
-                if child_input.len() >= 1024 * 1024 {
-                    continue;
-                }
                 if let Some(revents) = poll_fds[poll_idx].revents()
                     && (revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP))
                 {
