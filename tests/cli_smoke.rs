@@ -1432,3 +1432,59 @@ fn events_wait_cli_preexisting_unread_times_out_with_one() {
 fn events_wait_cli_arriving_unread_then_matching_status_exits_zero() {
     run_events_wait_cli_oracle(UnreadTiming::ArrivingAfterReadiness, 4, 0);
 }
+
+/// `update --refresh-cache` must never open the database: it only rewrites
+/// the update-notice flag file. Before the no-DB short-circuit, the
+/// stale-cache background child opened the same fresh store its parent was
+/// initializing, racing the WAL conversion + schema `BEGIN IMMEDIATE` and
+/// losing with SQLITE_BUSY (surfacing as `hcom start` exit 1). Two
+/// concurrent refresh processes mirror that race shape; neither may create
+/// the store, so the assertion is deterministic both ways (no timing).
+///
+/// The manifest fetch may fail without network, so exit codes are not
+/// asserted. Control first: `list` on the same fixture must create the
+/// store, proving the binary and HCOM_DIR wiring work (a vacuous pass is
+/// impossible — a broken fixture fails at the control).
+#[test]
+fn refresh_cache_never_creates_the_database() {
+    let h = Hcom::new();
+
+    let list_out = h.cmd().arg("list").output().expect("run hcom list");
+    assert!(
+        list_out.status.success(),
+        "control `list` failed: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let db_path = h.hcom_dir.join("hcom.db");
+    assert!(db_path.exists(), "control `list` did not create the store");
+
+    // Fresh again: remove every store file.
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+    }
+    assert!(!db_path.exists());
+
+    // Two concurrent refresh-cache processes: the stale-cache child shape.
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        children.push(ChildGuard::new(
+            h.cmd()
+                .args(["update", "--refresh-cache"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn hcom update --refresh-cache"),
+        ));
+    }
+    for child in children {
+        // Exit code varies with network reachability; the store assertion
+        // below is the oracle. Bounded so a hung fetch fails instead of
+        // wedging the suite (curl itself caps at 60s).
+        let _ = child.wait_bounded(Duration::from_secs(100));
+    }
+
+    assert!(
+        !db_path.exists(),
+        "`update --refresh-cache` created the store: a cache-only command must never open the database"
+    );
+}
