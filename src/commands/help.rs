@@ -314,13 +314,17 @@ const COMPACT_HELP: &[HelpEntry] = &[
 ];
 
 const SEND_HELP: &[HelpEntry] = &[
-    ("  send @name -- message text", "Direct message"),
-    ("  send @name1 @name2 -- message", "Multiple targets"),
+    (
+        "  send name -- message text",
+        "Direct message (@ is optional)",
+    ),
+    ("  send name1 name2 -- message", "Multiple targets"),
     ("  send -- message text", "Broadcast to all"),
     ("  send @name", "Message from stdin (pipe or heredoc)"),
-    ("  send @name --file <path>", "Message from file"),
+    ("  send name --stdin", "Message from stdin, without the @"),
+    ("  send name --file <path>", "Message from file"),
     (
-        "  send @name --base64 <encoded>",
+        "  send name --base64 <encoded>",
         "Message from base64 string",
     ),
     ("", ""),
@@ -328,13 +332,33 @@ const SEND_HELP: &[HelpEntry] = &[
     ("", "All flags must come before --."),
     ("", ""),
     ("Target matching:", ""),
-    ("  @luna", "exact base name"),
+    ("  luna", "exact base name (the @ is optional)"),
     ("  @api-luna", "exact full name"),
     ("  @api-", "all local agents with exact tag 'api'"),
     ("  @luna:BOXE", "exact or uniquely prefixed remote agent"),
     (
         "",
         "Partial local names are rejected to avoid accidental fan-out.",
+    ),
+    (
+        "",
+        "Before --, every positional is a target, with or without @:",
+    ),
+    (
+        "",
+        "'hcom send luna -- text' targets luna. PowerShell swallows a bare",
+    ),
+    (
+        "",
+        "@luna as splatting, so the no-@ form is the safe one there.",
+    ),
+    (
+        "",
+        "Without --, the @ is what marks a target: 'hcom send @luna hello'",
+    ),
+    (
+        "",
+        "sends 'hello' to luna, while 'hcom send luna' broadcasts the text 'luna'.",
     ),
     ("", ""),
     ("Envelope:", ""),
@@ -372,9 +396,9 @@ const SEND_HELP: &[HelpEntry] = &[
     ("", "See 'hcom bundle --help' for bundle details"),
     ("", ""),
     ("Examples:", ""),
-    ("  hcom send @luna -- Hello there!", ""),
+    ("  hcom send luna -- Hello there!", ""),
     (
-        "  hcom send @luna @nova --intent request -- Can you help?",
+        "  hcom send luna nova --intent request -- Can you help?",
         "",
     ),
     ("  hcom send -- Broadcast message to everyone", ""),

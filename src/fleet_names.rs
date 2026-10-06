@@ -562,4 +562,34 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert!(got[0].suffix_only, "own device is on the list");
     }
+
+    // ── Contract the `person:channel` expansion resolves each side through ──
+    //
+    // `messages::buzz_person_in_channel` looks its person and channel rows up
+    // by the name this resolver returns, so that name must be the row's own
+    // canonical spelling (not the caller's casing) and must carry a `:SHORT`
+    // suffix for a mirror row while the base still matches.
+
+    #[test]
+    fn resolve_bare_name_returns_the_canonical_row_spelling() {
+        let out = resolve_bare_name("x", &[cand("X:GIDU", false)]);
+        assert_eq!(out, BareOutcome::Single("X:GIDU".to_string()));
+        // Case-insensitive in, canonical out: the caller looks up the row by
+        // the returned name and compares that row's base against the input.
+        let out = resolve_bare_name("michael", &[cand("Michael", false)]);
+        assert_eq!(out, BareOutcome::Single("Michael".to_string()));
+    }
+
+    #[test]
+    fn a_mirror_base_matches_the_input_case_insensitively() {
+        // The same leg for a remote mirror: the base before `:SHORT` is what
+        // the input has to match, so a person address off-device resolves.
+        let out = resolve_bare_name("MICHAEL", &[cand("michael:MBAI", false)]);
+        assert_eq!(out, BareOutcome::Single("michael:MBAI".to_string()));
+        // A different base never matches, whatever the suffix.
+        assert_eq!(
+            resolve_bare_name("infra", &[cand("michael:MBAI", false)]),
+            BareOutcome::NoCandidate
+        );
+    }
 }
