@@ -1,8 +1,9 @@
 //! Blocking WebSocket sessions and NIP-98 authenticated HTTP requests.
 
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -74,8 +75,115 @@ fn is_timeout(error: &tungstenite::Error) -> bool {
     matches!(error, tungstenite::Error::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
 }
 
+/// Tungstenite and rustls may issue several reads for one frame. The budget
+/// belongs to the whole operation, not each successful partial socket read.
+struct DeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn remaining(&self) -> io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "relay deadline expired",
+            ))
+        } else {
+            Ok(remaining)
+        }
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(buffer)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+fn connect_socket(
+    url: &str,
+    timeout: Duration,
+) -> Result<WebSocket<MaybeTlsStream<DeadlineStream>>, PublishError> {
+    if timeout.is_zero() {
+        return Err(PublishError::Timeout);
+    }
+    let request = url.into_client_request().map_err(transport)?;
+    let host = request
+        .uri()
+        .host()
+        .ok_or_else(|| PublishError::Protocol("missing relay host".into()))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port = request
+        .uri()
+        .port_u16()
+        .unwrap_or(if request.uri().scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        });
+    let deadline = Instant::now() + timeout;
+    let mut last_error = io::Error::new(io::ErrorKind::NotFound, "relay host has no addresses");
+    let mut stream = None;
+    for address in (host, port).to_socket_addrs().map_err(transport)? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(PublishError::Timeout);
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(socket) => {
+                stream = Some(socket);
+                break;
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    let stream = DeadlineStream {
+        stream: stream.ok_or_else(|| transport(last_error))?,
+        deadline,
+    };
+    // Use the tree's existing AWS-LC backend explicitly. Neither client relies
+    // on installing a process-global provider, or on another caller doing so.
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(transport)?
+    .with_root_certificates(rustls::RootCertStore::from_iter(
+        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+    ))
+    .with_no_client_auth();
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_BYTES))
+        .max_frame_size(Some(MAX_WS_BYTES));
+    tungstenite::client_tls_with_config(
+        request,
+        stream,
+        Some(config),
+        Some(tungstenite::Connector::Rustls(Arc::new(tls))),
+    )
+    .map(|(socket, _)| socket)
+    .map_err(transport)
+}
+
 pub struct WsSession {
-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    socket: WebSocket<MaybeTlsStream<DeadlineStream>>,
     pending: VecDeque<RelayMsg>,
     timeout: Duration,
 }
@@ -87,48 +195,7 @@ impl WsSession {
         tag: Option<[String; 4]>,
         timeout: Duration,
     ) -> Result<Self, PublishError> {
-        if timeout.is_zero() {
-            return Err(PublishError::Timeout);
-        }
-        let request = url.into_client_request().map_err(transport)?;
-        let host = request
-            .uri()
-            .host()
-            .ok_or_else(|| PublishError::Protocol("missing relay host".into()))?;
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        let port =
-            request
-                .uri()
-                .port_u16()
-                .unwrap_or(if request.uri().scheme_str() == Some("wss") {
-                    443
-                } else {
-                    80
-                });
-        let deadline = Instant::now() + timeout;
-        let mut last_error = io::Error::new(io::ErrorKind::NotFound, "relay host has no addresses");
-        let mut stream = None;
-        for address in (host, port).to_socket_addrs().map_err(transport)? {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(PublishError::Timeout);
-            }
-            match TcpStream::connect_timeout(&address, remaining) {
-                Ok(socket) => {
-                    stream = Some(socket);
-                    break;
-                }
-                Err(error) => last_error = error,
-            }
-        }
-        let stream = stream.ok_or_else(|| transport(last_error))?;
-        stream.set_read_timeout(Some(timeout)).map_err(transport)?;
-        stream.set_write_timeout(Some(timeout)).map_err(transport)?;
-        let config = tungstenite::protocol::WebSocketConfig::default()
-            .max_message_size(Some(MAX_WS_BYTES))
-            .max_frame_size(Some(MAX_WS_BYTES));
-        let (socket, _) = tungstenite::client_tls_with_config(request, stream, Some(config), None)
-            .map_err(transport)?;
+        let socket = connect_socket(url, timeout)?;
         let mut session = Self {
             socket,
             pending: VecDeque::new(),
@@ -151,7 +218,7 @@ impl WsSession {
             }
         };
         let event = auth_event(key, url, &challenge, tag);
-        session.set_timeout(deadline.saturating_duration_since(Instant::now()))?;
+        session.set_deadline(deadline)?;
         session.send_value(&json!(["AUTH", event]))?;
         loop {
             let value = session.read_value(deadline)?.ok_or(PublishError::Timeout)?;
@@ -164,6 +231,8 @@ impl WsSession {
                     } if id == event.id => {
                         return if accepted {
                             Ok(session)
+                        } else if message.starts_with("error:") {
+                            Err(PublishError::Server(message))
                         } else {
                             Err(PublishError::Auth(message))
                         };
@@ -175,7 +244,11 @@ impl WsSession {
     }
 
     fn set_timeout(&mut self, timeout: Duration) -> Result<(), PublishError> {
-        if timeout.is_zero() {
+        self.set_deadline(Instant::now() + timeout)
+    }
+
+    fn set_deadline(&mut self, deadline: Instant) -> Result<(), PublishError> {
+        if deadline <= Instant::now() {
             return Err(PublishError::Timeout);
         }
         let stream = match self.socket.get_mut() {
@@ -183,8 +256,8 @@ impl WsSession {
             MaybeTlsStream::Rustls(stream) => &mut stream.sock,
             _ => return Err(PublishError::Protocol("unsupported TLS backend".into())),
         };
-        stream.set_read_timeout(Some(timeout)).map_err(transport)?;
-        stream.set_write_timeout(Some(timeout)).map_err(transport)
+        stream.deadline = deadline;
+        Ok(())
     }
 
     fn send_value(&mut self, value: &Value) -> Result<(), PublishError> {
@@ -201,7 +274,7 @@ impl WsSession {
             if remaining.is_zero() {
                 return Ok(None);
             }
-            self.set_timeout(remaining)?;
+            self.set_deadline(deadline)?;
             match self.socket.read() {
                 Ok(Message::Text(text)) => {
                     return serde_json::from_str(&text)
@@ -240,7 +313,7 @@ impl WsSession {
 
     pub fn publish(&mut self, event: &Event) -> Result<(), PublishError> {
         let deadline = Instant::now() + self.timeout;
-        self.set_timeout(self.timeout)?;
+        self.set_deadline(deadline)?;
         self.send_value(&json!(["EVENT", event]))?;
         loop {
             let value = self.read_value(deadline)?.ok_or(PublishError::Timeout)?;
@@ -255,9 +328,16 @@ impl WsSession {
                 } if id == event.id => {
                     return if accepted || message.starts_with("duplicate:") {
                         Ok(())
+                    } else if message.starts_with("error:") {
+                        Err(PublishError::Server(message))
                     } else {
                         Err(PublishError::Rejected(message))
                     };
+                }
+                RelayMsg::Notice(message)
+                    if message.starts_with("rate-limited: shared admission unavailable") =>
+                {
+                    return Err(PublishError::Server(message));
                 }
                 RelayMsg::Notice(message) if message.starts_with("rate-limited:") => {
                     return Err(PublishError::RateLimited {
@@ -322,6 +402,21 @@ pub struct HttpRelay {
 }
 
 impl HttpRelay {
+    fn agent() -> ureq::Agent {
+        let tls = ureq::tls::TlsConfig::builder()
+            .unversioned_rustls_crypto_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .build();
+        ureq::Agent::config_builder()
+            .tls_config(tls)
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build()
+            .into()
+    }
+
     fn post(
         &self,
         endpoint: &str,
@@ -330,12 +425,7 @@ impl HttpRelay {
         tag: Option<&str>,
     ) -> Result<Vec<u8>, PublishError> {
         let url = format!("{}{endpoint}", self.base_url.trim_end_matches('/'));
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .build()
-            .into();
+        let agent = Self::agent();
         let mut request = agent
             .post(&url)
             .header("Content-Type", "application/json")
@@ -807,6 +897,147 @@ mod tests {
             relay.query(&json!({}), &key(), None),
             Err(PublishError::Transport(_))
         ));
+    }
+
+    #[test]
+    fn https_handshake_failure_returns_error_without_provider_panic() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay = HttpRelay {
+            base_url: format!("https://{}", listener.local_addr().unwrap()),
+        };
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut hello = [0; 4096];
+            assert!(stream.read(&mut hello).unwrap() > 0);
+            // Deliberately close during TLS, rather than serving a certificate.
+            // Provider construction must succeed and return a transport error.
+        });
+        assert!(matches!(
+            relay.query(&json!({}), &key(), None),
+            Err(PublishError::Transport(_))
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ws_partial_frame_respects_absolute_deadline_and_resumes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (start, ready) = std::sync::mpsc::sync_channel(0);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            socket
+                .send(Message::Text(
+                    json!(["AUTH", "TEST challenge"]).to_string().into(),
+                ))
+                .unwrap();
+            let Message::Text(text) = socket.read().unwrap() else {
+                panic!("expected AUTH");
+            };
+            let auth: Value = serde_json::from_str(&text).unwrap();
+            socket
+                .send(Message::Text(
+                    json!(["OK", auth[1]["id"], true, ""]).to_string().into(),
+                ))
+                .unwrap();
+            ready.recv_timeout(TIMEOUT).unwrap();
+            let body = json!(["NOTICE", "drip"]).to_string();
+            assert!(body.len() < 126);
+            socket
+                .get_mut()
+                .write_all(&[0x81, body.len() as u8])
+                .unwrap();
+            // A constant 120 ms socket timeout would restart for every byte,
+            // returning the whole message after ~510 ms instead of timing out.
+            for byte in body.bytes() {
+                std::thread::sleep(Duration::from_millis(30));
+                socket.get_mut().write_all(&[byte]).unwrap();
+            }
+        });
+        let mut client = WsSession::connect(&url, &key(), None, TIMEOUT).unwrap();
+        start.send(()).unwrap();
+        let started = Instant::now();
+        assert_eq!(client.recv(Duration::from_millis(120)).unwrap(), None);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "recv exceeded its absolute budget: {elapsed:?}"
+        );
+        assert_eq!(
+            client.recv(TIMEOUT).unwrap(),
+            Some(RelayMsg::Notice("drip".into()))
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ws_backend_failures_are_server_errors_not_quota_or_rejection() {
+        let fake = FakeRelay::ws();
+        let mut client = session(&fake);
+        let event = message(&key(), "channel", 1700000000, "backend failure");
+        fake.switches.ws_status.store(500, Ordering::SeqCst);
+        assert!(matches!(
+            client.publish(&event),
+            Err(PublishError::Server(message)) if message == "error: database error"
+        ));
+        fake.switches.ws_status.store(503, Ordering::SeqCst);
+        assert!(matches!(
+            client.publish(&event),
+            Err(PublishError::Server(message)) if message == "rate-limited: shared admission unavailable"
+        ));
+        fake.switches.ws_status.store(400, Ordering::SeqCst);
+        assert!(matches!(
+            client.publish(&event),
+            Err(PublishError::Rejected(message)) if message == "invalid: rejected by test relay"
+        ));
+        fake.switches.rate_limited.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            client.publish(&event),
+            Err(PublishError::RateLimited { retry_after }) if retry_after == Duration::from_secs(3)
+        ));
+        client.publish(&event).unwrap();
+    }
+
+    #[test]
+    #[ignore = "live Buzz TLS smoke; no authentication or publication"]
+    fn live_tls_nip11_and_wss_challenge() {
+        // Use precisely the agent and socket connector used by the clients.
+        let mut response = HttpRelay::agent()
+            .get("https://zagcom.ffc-w.com/")
+            .header("Accept", "application/nostr+json")
+            .call()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(HTTP_ERROR_LIMIT)
+            .read_to_vec()
+            .unwrap();
+        let info: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            info["supported_nips"]
+                .as_array()
+                .is_some_and(|nips| nips.contains(&json!(42)))
+        );
+        println!("HTTPS NIP-11: status 200, advertises NIP-42, certificate verified");
+        let mut socket = connect_socket("wss://zagcom.ffc-w.com", Duration::from_secs(10)).unwrap();
+        let Message::Text(text) = socket.read().unwrap() else {
+            panic!("expected AUTH challenge");
+        };
+        let frame: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(frame[0], "AUTH");
+        assert!(
+            frame[1]
+                .as_str()
+                .is_some_and(|challenge| challenge.len() == 64
+                    && challenge.bytes().all(|c| c.is_ascii_hexdigit()))
+        );
+        println!("WSS: certificate verified, received AUTH challenge; no keys or AUTH sent");
     }
 
     #[test]

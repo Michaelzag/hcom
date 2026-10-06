@@ -23,6 +23,7 @@ pub struct Switches {
     pub rate_limited: AtomicBool,
     pub drop_socket: AtomicBool,
     pub refuse_auth: AtomicBool,
+    pub ws_status: AtomicU16,
     pub http_status: AtomicU16,
     pub http_retry_header: AtomicU16,
     pub pong_received: AtomicBool,
@@ -254,6 +255,26 @@ fn handle_ws(
                 let Ok(event) = serde_json::from_value::<Event>(value[1].clone()) else {
                     continue;
                 };
+                let injected = match switches.ws_status.swap(0, Ordering::SeqCst) {
+                    400 => Some(json!([
+                        "OK",
+                        event.id,
+                        false,
+                        "invalid: rejected by test relay"
+                    ])),
+                    500 => Some(json!(["OK", event.id, false, "error: database error"])),
+                    503 => Some(json!([
+                        "NOTICE",
+                        "rate-limited: shared admission unavailable"
+                    ])),
+                    _ => None,
+                };
+                if let Some(injected) = injected {
+                    if !send(&mut socket, injected) {
+                        break;
+                    }
+                    continue;
+                }
                 if event.pubkey != pubkey || !verify(&event) {
                     if !send(
                         &mut socket,
