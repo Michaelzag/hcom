@@ -1376,6 +1376,12 @@ impl Proxy {
                 .map_or_else(|| poll_fds.len() - client_raw_fds.len(), |idx| idx + 1);
             for i in (0..client_raw_fds.len()).rev() {
                 let poll_idx = clients_base + i;
+                // Same high-water mark as interactive stdin above: while the child
+                // isn't consuming, leave injected bytes in the clients' TCP buffers
+                // (producer backpressure) instead of growing the queue without bound.
+                if child_input.len() >= 1024 * 1024 {
+                    continue;
+                }
                 if let Some(revents) = poll_fds[poll_idx].revents()
                     && (revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP))
                 {
@@ -1499,19 +1505,14 @@ impl Proxy {
             }
         }
 
-        // Flush any held prefix bytes from title filter
-        if stdout_is_tty {
-            let remaining = title_filter.flush();
-            if !remaining.is_empty() {
-                terminal_output.push(&remaining);
-            }
-        }
-
         // The loop can exit with the child gone and bytes still unread in the
         // PTY (fast exit) or queued behind backpressure. Move a bounded batch
         // into terminal_output (and the screen model) so the flush below
         // forwards them instead of dropping them into the screen-only drain.
         // Past the cap the screen model still preserves launch diagnostics.
+        // Bytes take the same title-filter path as loop reads, so a trailing
+        // tool title sequence is stripped (or held for the flush below) just
+        // like mid-loop output; the screen model still sees the raw bytes.
         {
             let mut buf = [0u8; 65536];
             let mut moved = 0usize;
@@ -1519,13 +1520,28 @@ impl Proxy {
                 match nix_read(&self.pty_master, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        terminal_output.push(&buf[..n]);
-                        self.screen.process(&buf[..n]);
+                        let data = &buf[..n];
+                        let (filtered, _had_title) = if stdout_is_tty && title_enabled {
+                            title_filter.filter(data)
+                        } else {
+                            (data.to_vec(), false)
+                        };
+                        terminal_output.push(&filtered);
+                        self.screen.process(data);
                         moved += n;
                     }
                     // EAGAIN/EIO/closed: nothing more to take.
                     Err(_) => break,
                 }
+            }
+        }
+
+        // Flush any held bytes from the title filter, from loop reads and the
+        // drain above alike.
+        if stdout_is_tty {
+            let remaining = title_filter.flush();
+            if !remaining.is_empty() {
+                terminal_output.push(&remaining);
             }
         }
 
