@@ -120,7 +120,7 @@ fn test_default_hcom_dir() -> PathBuf {
 }
 
 /// Bidirectional mapping: HcomConfig field name <-> TOML dotted path.
-const TOML_KEY_MAP: &[(&str, &str)] = &[
+pub(crate) const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("terminal", "terminal.active"),
     ("tag", "launch.tag"),
     ("hints", "launch.hints"),
