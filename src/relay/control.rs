@@ -448,6 +448,8 @@ pub mod rpc_action {
     pub const SUB_CREATE: &str = "sub_create";
     pub const SUB_LIST: &str = "sub_list";
     pub const SUB_UNSUB: &str = "sub_unsub";
+    /// Read a bridged Buzz channel's cached events from the connector host.
+    pub const BUZZ_READ: &str = "buzz_read";
 }
 
 type RemoteRpcHandler = fn(&HcomDb, &Value, &str, &HcomConfig) -> Result<Value, String>;
@@ -466,6 +468,7 @@ const REMOTE_RPC_HANDLERS: &[(&str, RemoteRpcHandler)] = &[
     (rpc_action::SUB_CREATE, handle_remote_sub_create),
     (rpc_action::SUB_LIST, handle_remote_sub_list),
     (rpc_action::SUB_UNSUB, handle_remote_sub_unsub),
+    (rpc_action::BUZZ_READ, handle_remote_buzz_read),
 ];
 
 pub fn advertised_remote_capabilities() -> Vec<&'static str> {
@@ -1134,6 +1137,93 @@ fn handle_remote_events(
     }
     Ok(out)
 }
+
+/// Serve `hcom buzz read` on any device without connector state.
+///
+/// Reads the connector's cache read-only. A device that never ran a connector
+/// answers with an explicit error rather than an empty channel, so a caller can
+/// tell "no events" from "wrong device".
+fn handle_remote_buzz_read(
+    _db: &HcomDb,
+    params: &Value,
+    _initiated_by: &str,
+    _config: &HcomConfig,
+) -> Result<Value, String> {
+    let path = crate::buzz::config::Config::state_db_path();
+    let store = crate::buzz::store::Store::open_read_only(&path).map_err(|e| e.to_string())?;
+
+    let channel_id = params
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "buzz_read: channel_id is required".to_string())?;
+    let thread = params.get("thread").and_then(Value::as_str);
+    let before = params.get("before").and_then(Value::as_str);
+    let limit = usize_param(params, "limit", 20).clamp(1, 2000);
+    let byte_cap = usize_param(params, "max_bytes", REMOTE_EVENTS_BYTE_CAP)
+        .clamp(1024, REMOTE_EVENTS_BYTE_CAP);
+
+    let events = store
+        .list_events(Some(channel_id), thread, before, limit)
+        .map_err(|e| format!("buzz_read: {e}"))?;
+
+    let mut rendered: Vec<Value> = events
+        .iter()
+        .map(|event| {
+            json!({
+                "id": event.buzz_id,
+                "channel_id": event.channel_id,
+                "kind": event.kind,
+                "author": event.author,
+                "created_at": event.created_at,
+                "root_id": event.root_id,
+                "parent_id": event.parent_id,
+                "text": serde_json::from_str::<Value>(&event.json)
+                    .ok()
+                    .and_then(|value| value.get("content").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    let build = |events: &Vec<Value>, truncated: bool, marker: Option<&str>| {
+        let mut out = json!({"events": events, "count": events.len()});
+        if truncated {
+            out["truncated"] = json!(true);
+        }
+        if let Some(marker) = marker {
+            out["content_truncated"] = json!(marker);
+        }
+        out
+    };
+
+    let mut truncated = false;
+    let mut marker = None;
+    let mut out = build(&rendered, truncated, marker);
+    let mut len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
+    while len > byte_cap && !rendered.is_empty() {
+        if rendered.len() == 1 && byte_cap >= REMOTE_EVENTS_BYTE_CAP {
+            // One event wider than the cap can never travel whole, so cut its
+            // content and say so, rather than answering "no events".
+            let cut = BUZZ_CONTENT_CUT_MARKER;
+            let text = rendered[0]["text"].as_str().unwrap_or_default().to_string();
+            let keep = text.len().saturating_sub(cut.len() + 32);
+            rendered[0]["text"] = json!(format!(
+                "{}{cut}",
+                text.chars().take(keep).collect::<String>()
+            ));
+            marker = Some(cut);
+        } else {
+            rendered.pop();
+        }
+        truncated = true;
+        out = build(&rendered, truncated, marker);
+        len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
+    }
+    Ok(out)
+}
+
+/// Marker appended to an event's content cut to fit the RPC byte cap.
+const BUZZ_CONTENT_CUT_MARKER: &str = " …[truncated by buzz_read]";
 
 fn handle_remote_sub_create(
     db: &HcomDb,

@@ -156,14 +156,13 @@ impl Config {
             if !people.insert(person.pubkey.clone()) {
                 bail!("people: pubkey {} is listed twice", person.pubkey);
             }
-            if let Some(home) = &person.home {
-                if !self
+            if let Some(home) = &person.home
+                && !self
                     .channels
                     .iter()
                     .any(|c| c.slug.as_deref() == Some(home.as_str()) && c.home)
-                {
-                    bail!("people: home channel '{home}' is not a channel with home = true");
-                }
+            {
+                bail!("people: home channel '{home}' is not a channel with home = true");
             }
         }
         Ok(())

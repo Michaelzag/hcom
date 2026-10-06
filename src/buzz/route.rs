@@ -320,10 +320,8 @@ pub fn route_inbound(
     };
 
     // Edits and deletions address the same people the original reached.
-    if matches!(event.kind, KIND_EDIT | KIND_DELETE | KIND_CHANNEL_DELETE) {
-        if !already_delivered {
-            return Inbound::Skip(InboundSkip::NeverDelivered);
-        }
+    if matches!(event.kind, KIND_EDIT | KIND_DELETE | KIND_CHANNEL_DELETE) && !already_delivered {
+        return Inbound::Skip(InboundSkip::NeverDelivered);
     }
 
     // Our own posts, omp and the reader never come back as a person.
@@ -373,7 +371,7 @@ pub fn route_inbound(
 /// Render a name for the sender label of an inbound message.
 pub fn sender_label(name: &str, device: Option<&str>) -> String {
     match device {
-        Some(device) if device == "mbai" => name.to_string(),
+        Some("mbai") => name.to_string(),
         Some(device) => format!("{name} ({device})"),
         None => name.to_string(),
     }

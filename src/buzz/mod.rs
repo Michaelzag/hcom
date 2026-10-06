@@ -7,6 +7,7 @@ pub mod config;
 pub mod nostr;
 pub mod relay;
 pub mod route;
+pub mod serve;
 pub mod store;
 
 #[cfg(test)]

@@ -131,6 +131,8 @@ pub struct ParkedTarget {
     pub state: String,
     pub attempts: u32,
     pub next_at: i64,
+    /// When the target was first parked; the retry window runs from here.
+    pub first_parked_at: i64,
 }
 
 /// Enrollment state of one (agent, channel) pair.
@@ -235,6 +237,7 @@ impl Store {
                 state TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_at INTEGER NOT NULL DEFAULT 0,
+                first_parked_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (buzz_id, target));
              CREATE TABLE IF NOT EXISTS threads (
                 thread_name TEXT PRIMARY KEY,
@@ -492,6 +495,17 @@ impl Store {
             .optional()?)
     }
 
+    /// `(pubkey, hcom_name)` for every cached author of one kind.
+    pub fn authors_of_kind(&self, kind: AuthorKind) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT pubkey, hcom_name FROM authors WHERE kind = ?1 ORDER BY pubkey")?;
+        let rows = stmt
+            .query_map(params![kind.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     // ── events ───────────────────────────────────────────────────────────
 
     /// Cache an event for `read` and ancestry.
@@ -609,8 +623,9 @@ impl Store {
     /// Park an unresolvable inbound target for retry.
     pub fn park_target(&self, buzz_id: &str, target: &str, next_at: i64) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO inbound_targets (buzz_id, target, state, attempts, next_at)
-             VALUES (?1, ?2, 'parked', 0, ?3)
+            "INSERT INTO inbound_targets
+                (buzz_id, target, state, attempts, next_at, first_parked_at)
+             VALUES (?1, ?2, 'parked', 0, ?3, ?3)
              ON CONFLICT(buzz_id, target) DO UPDATE SET
                 state = 'parked', next_at = excluded.next_at",
             params![buzz_id, target, next_at],
@@ -621,7 +636,8 @@ impl Store {
     /// Parked targets whose retry time has come, oldest first.
     pub fn due_targets(&self, now: i64) -> Result<Vec<ParkedTarget>> {
         let mut stmt = self.conn.prepare(
-            "SELECT buzz_id, target, state, attempts, next_at FROM inbound_targets
+            "SELECT buzz_id, target, state, attempts, next_at, first_parked_at
+             FROM inbound_targets
              WHERE state = 'parked' AND next_at <= ?1
              ORDER BY next_at, buzz_id",
         )?;
@@ -633,6 +649,7 @@ impl Store {
                     state: row.get(2)?,
                     attempts: row.get(3)?,
                     next_at: row.get(4)?,
+                    first_parked_at: row.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -686,6 +703,23 @@ impl Store {
             params![thread_name, channel_id, root_id],
         )?;
         Ok(())
+    }
+
+    /// Every recorded Buzz thread, for outbound rule 1.
+    pub fn threads(&self) -> Result<Vec<ThreadRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT thread_name, channel_id, root_id FROM threads ORDER BY thread_name")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ThreadRow {
+                    thread_name: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    root_id: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Look up the Buzz thread behind an hcom thread name.
@@ -889,6 +923,13 @@ impl Store {
         Ok(())
     }
 
+    /// Remove an outbox row once its replacement is queued.
+    pub fn drop_outbox(&self, buzz_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM outbox WHERE buzz_id = ?1", params![buzz_id])?;
+        Ok(())
+    }
+
     /// Outbox counts by state, for `hcom buzz status`.
     pub fn outbox_counts(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self
@@ -961,6 +1002,111 @@ fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
 }
 
 impl ReadOnlyStore {
+    /// Bridged channels with cursors and parked reasons, for `buzz status`.
+    pub fn channels(&self) -> Result<Vec<ChannelRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, slug, cursor_created_at, parked_reason FROM channels ORDER BY slug",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ChannelRow {
+                    id: row.get(0)?,
+                    slug: row.get(1)?,
+                    cursor_created_at: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    parked_reason: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// One channel row by id.
+    pub fn channel(&self, id: &str) -> Result<Option<ChannelRow>> {
+        Ok(self.channels()?.into_iter().find(|row| row.id == id))
+    }
+
+    /// Every person row.
+    pub fn people(&self) -> Result<Vec<PersonRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT pubkey, name, home_slug, active, left_at FROM people ORDER BY name")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PersonRow {
+                    pubkey: row.get(0)?,
+                    name: row.get(1)?,
+                    home_slug: row.get(2)?,
+                    active: row.get::<_, i64>(3)? != 0,
+                    left_at: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Outbox counts by state.
+    pub fn outbox_counts(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state, COUNT(*) FROM outbox GROUP BY state")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Parked-target counts by state.
+    pub fn target_counts(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state, COUNT(*) FROM inbound_targets GROUP BY state")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Number of agent-channel pairs currently enrolled.
+    pub fn enrolled_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM enrollment WHERE state = 'enrolled'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Every outbox row that has not been acknowledged.
+    pub fn unsent_outbox(&self) -> Result<Vec<OutboxRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT epoch, hcom_id, destination, signer_name, signed_json, buzz_id,
+                    state, attempts, next_at, last_error
+             FROM outbox
+             WHERE state != 'sent'
+             ORDER BY created_at, hcom_id",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_outbox)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The most recent outbox failures, newest first.
+    pub fn recent_errors(&self, limit: usize) -> Result<Vec<(String, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT destination, hcom_id, COALESCE(last_error, '')
+             FROM outbox
+             WHERE last_error IS NOT NULL AND last_error != ''
+             ORDER BY created_at DESC, hcom_id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Cached events for `buzz read` and the `buzz_read` RPC.
     pub fn list_events(
         &self,

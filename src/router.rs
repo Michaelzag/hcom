@@ -41,6 +41,7 @@ const COMMANDS: &[&str] = &[
     "relay",
     "run",
     "update",
+    "buzz",
 ];
 
 fn is_command(name: &str) -> bool {
@@ -635,6 +636,7 @@ pub fn dispatch() -> anyhow::Result<()> {
                     | "relay"
                     | "run"
                     | "update"
+                    | "buzz"
             ) =>
         {
             let exit_code = dispatch_native_command(cmd, args);
@@ -894,6 +896,9 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::status::cmd_status(&db, &args, Some(&ctx))
         ),
+        "buzz" => clap_dispatch!(crate::commands::buzz::BuzzArgs, cmd, &cmd_argv, |args| {
+            crate::commands::buzz::cmd_buzz(&db, &args, Some(&ctx))
+        }),
         "bundle" => clap_dispatch!(
             crate::commands::bundle::BundleArgs,
             cmd,

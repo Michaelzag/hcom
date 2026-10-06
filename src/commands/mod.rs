@@ -2,6 +2,7 @@
 //!
 
 // Messaging
+pub mod buzz;
 pub mod listen;
 pub mod send;
 
