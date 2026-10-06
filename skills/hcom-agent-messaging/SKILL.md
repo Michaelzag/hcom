@@ -65,6 +65,12 @@ and turns the send into a broadcast.
 Without `--`, a bare positional is the message text instead: `hcom send luna`
 broadcasts the text "luna". Keep `--` before the message.
 
+**A send with `--` and no target is refused** rather than broadcast, because a
+swallowed target looks exactly like a deliberate broadcast. To really send to
+everyone, say so with `--go`: `hcom send --go -- "deploy is happening now"`.
+`--thread` sends are exempt: the thread's stored membership picks the
+recipients.
+
 ---
 
 ## tool support

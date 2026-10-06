@@ -330,6 +330,10 @@ const SEND_HELP: &[HelpEntry] = &[
     ("", ""),
     ("", "Everything after -- is the message (no quotes needed)."),
     ("", "All flags must come before --."),
+    (
+        "",
+        "-- with no target is refused; add --go to broadcast on purpose.",
+    ),
     ("", ""),
     ("Target matching:", ""),
     ("  luna", "exact base name (the @ is optional)"),

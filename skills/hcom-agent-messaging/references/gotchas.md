@@ -138,6 +138,18 @@ add `--stdin` (`echo hi | hcom send luna --stdin`).
 
 **Common mistake:** Forgetting `--` before the message text. Without `--`, the message text might be parsed as flags.
 
+**A send with `--` and no target is refused.** It names nobody, so hcom stops
+instead of broadcasting — a swallowed target looks exactly like a deliberate
+broadcast, and a broadcast to the whole fleet is expensive to undo:
+
+```
+Error: No targets, so this would broadcast to everyone.
+```
+
+Broadcast on purpose with `--go`: `hcom send --go -- "deploy is happening
+now"`. Sends carrying `--thread` are exempt; the thread's stored membership
+picks the recipients.
+
 ## Heartbeat and Stale Detection
 
 Agents are marked stale (inactive) if their heartbeat is not updated within tool-dependent thresholds. After system sleep/wake, hcom gives a grace period where heartbeat checks are suspended to prevent mass stale detection after laptop lid close/open.

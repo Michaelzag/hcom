@@ -32,6 +32,7 @@ Targets before '--':
   Without '--' the '@' is what marks a target: 'hcom send @luna hello' sends
   'hello' to luna, while 'hcom send luna' broadcasts the text 'luna'. Piped
   input follows the same rule: 'echo hi | hcom send @luna', or use --stdin.
+  A '--' send that names no target is refused; pass --go to broadcast.
 
 Inline bundle (attach structured context):
     --title <text>                 Create and attach bundle inline
@@ -162,6 +163,17 @@ impl SendArgs {
     /// Whether a `--` separator was present in the raw argv.
     fn has_separator(&self) -> bool {
         self.had_separator
+    }
+
+    /// Whether the message arrived explicitly separated from the targets:
+    /// `--`, or one of the `--stdin` / `--file` / `--base64` sources.
+    ///
+    /// This is exactly the condition under which every positional is read as
+    /// a target (`split_positionals`), so it is also the condition under
+    /// which naming no target is a deliberate-looking mistake: with a
+    /// separator the sender was addressing somebody in particular.
+    fn separated_message_source(&self) -> bool {
+        self.has_separator() || self.stdin || self.file.is_some() || self.base64.is_some()
     }
 
     /// Build inline bundle data from flags, or None if no bundle flags present.
@@ -920,7 +932,7 @@ fn read_stdin() -> Result<String, String> {
 ///     targets, one bare arg is the message text, and a lone `@name message`
 ///     arg is the whole text with mentions parsed from it.
 fn split_positionals(args: &SendArgs) -> Result<(Vec<String>, Option<String>), String> {
-    if !args.has_separator() && !args.stdin && args.file.is_none() && args.base64.is_none() {
+    if !args.separated_message_source() {
         return Ok(process_positionals(&args.positionals));
     }
     let mut targets = Vec::with_capacity(args.positionals.len());
@@ -1183,6 +1195,33 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         && preview_delivery.delivered_to.len() > 3
     {
         print_broadcast_preview(db, &preview_delivery.delivered_to);
+        return 1;
+    }
+
+    // ── Zero-target refusal (D6) ──
+    // A send whose message is separated with `--` (or comes from
+    // --stdin/--file/--base64) named its targets on purpose, so naming none
+    // is almost always a mistake — most often a target swallowed by the shell.
+    // PowerShell drops a bare `@michael` as splatting, and `hcom send @michael
+    // -- text` then arrives here as `hcom send -- text`, a broadcast that the
+    // AI-tool preview above does not always catch: it needs an AI-tool
+    // context, no --go, and more than three recipients. So refuse the
+    // zero-target case outright, whatever the context or the recipient count,
+    // unless the sender passes `--go` to mean it.
+    // A thread is exempt: `hcom send --thread x -- text` is how a workflow
+    // addresses nobody and lets the thread's stored membership decide.
+    if args.separated_message_source()
+        && !ctx.map(|c| c.go).unwrap_or(false)
+        && preview_delivery.original_scope == MessageScope::Broadcast
+        && !preview_delivery.is_thread_resolved
+        && envelope.thread.is_none()
+    {
+        eprintln!("Error: No targets, so this would broadcast to everyone.");
+        eprintln!("Name the targets before '--':");
+        eprintln!("  hcom send name -- your message");
+        eprintln!("  hcom send name1 name2 -- your message");
+        eprintln!("To broadcast on purpose, add --go after send:");
+        eprintln!("  hcom send --go -- your message");
         return 1;
     }
 
@@ -2012,6 +2051,133 @@ mod tests {
         assert_eq!(data["text"], "hello");
         assert_eq!(data["scope"], serde_json::json!("mentions"));
         assert_eq!(data["exact_targets"], serde_json::json!(["luna"]));
+        cleanup_test_db(path);
+    }
+
+    // ── zero-target refusal (D6) ──
+
+    fn message_count(db: &HcomDb) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The same context with `--go`, the operator's "yes, broadcast it".
+    fn go_ctx() -> CommandContext {
+        CommandContext {
+            go: true,
+            ..sender_ctx()
+        }
+    }
+
+    /// A DB with `luna` and `nova` live, so a broadcast would have more than
+    /// one recipient: the refusal must not depend on the count.
+    fn two_seat_db() -> (HcomDb, PathBuf, TestEnv) {
+        let (db, path, env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('luna', 'sess-luna', 1000.0), ('nova', 'sess-nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        (db, path, env)
+    }
+
+    #[test]
+    #[serial]
+    fn a_separated_send_with_no_targets_is_refused_without_go() {
+        // `hcom send -- hi` reached PowerShell intact after swallowing its
+        // target. It resolves to nothing and would broadcast; refuse before
+        // anything is persisted.
+        let (db, path, _env) = two_seat_db();
+        let rc = cmd_send(&db, &send_argv(&["send", "--", "hi"]), Some(&sender_ctx()));
+        assert_eq!(rc, 1);
+        assert_eq!(message_count(&db), 0, "nothing may be persisted");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_separated_send_with_no_targets_is_allowed_with_go() {
+        // `--go` is the operator saying "yes, to everyone".
+        let (db, path, _env) = two_seat_db();
+        let args = send_argv(&["send", "--", "hi"]);
+        assert!(args.positionals.is_empty());
+        assert_eq!(cmd_send(&db, &args, Some(&go_ctx())), 0);
+        let (_, data) = last_message(&db);
+        assert_eq!(data["scope"], serde_json::json!("broadcast"));
+        assert_eq!(data["text"], "hi");
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn an_explicit_source_flag_with_no_targets_is_refused_too() {
+        // Same rule for --file: the message came from somewhere, so the
+        // sender meant to address somebody.
+        let (db, path, _env) = two_seat_db();
+        let msg_file = std::env::temp_dir().join(format!(
+            "hcom_send_d6_{}_{}.txt",
+            std::process::id(),
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&msg_file, "hi from file").unwrap();
+        let args =
+            SendArgs::try_parse_from(["send", "--file", msg_file.to_str().unwrap()]).unwrap();
+        assert!(args.separated_message_source());
+        assert!(args.positionals.is_empty());
+        assert_eq!(cmd_send(&db, &args, Some(&sender_ctx())), 1);
+        assert_eq!(message_count(&db), 0, "nothing may be persisted");
+        let _ = std::fs::remove_file(&msg_file);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_thread_send_needs_no_targets_and_still_goes_through() {
+        // `--thread` is how a workflow addresses nobody and lets the stored
+        // membership decide, so the zero-target refusal must not touch it.
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES ('luna', 'sess-luna', 1000.0), ('nova', 'sess-nova', 1000.0)",
+                [],
+            )
+            .unwrap();
+        // Seed the thread with one real target; the next send names nobody.
+        let seed = send_argv(&["send", "luna", "--thread", "wf-1", "--", "opening"]);
+        assert_eq!(cmd_send(&db, &seed, Some(&sender_ctx())), 0);
+
+        let mut args = send_argv(&["send", "--thread", "wf-1", "--", "hi all"]);
+        args.thread = Some("wf-1".to_string());
+        assert!(args.positionals.is_empty());
+        assert_eq!(cmd_send(&db, &args, Some(&sender_ctx())), 0);
+        let (_, data) = last_message(&db);
+        assert_eq!(data["thread"], serde_json::json!("wf-1"));
+        assert_eq!(data["text"], "hi all");
+        // Thread membership carried the delivery: luna got both.
+        assert_eq!(unread_texts(&db, "luna").len(), 2);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn a_named_target_is_unaffected_by_the_zero_target_refusal() {
+        // The control: the refusal is about zero targets, not about `--`.
+        let (db, path, _env) = two_seat_db();
+        let rc = cmd_send(
+            &db,
+            &send_argv(&["send", "luna", "--", "hi"]),
+            Some(&sender_ctx()),
+        );
+        assert_eq!(rc, 0);
+        let (_, data) = last_message(&db);
+        assert_eq!(data["scope"], serde_json::json!("mentions"));
+        assert_eq!(delivered_to_luna(&db), vec!["luna".to_string()]);
         cleanup_test_db(path);
     }
 
