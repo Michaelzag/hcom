@@ -196,6 +196,14 @@ fn strip_focus_events(buf: &[u8]) -> Option<Vec<u8>> {
 /// Window in which a newly resumed omp may ask to re-root its missing cwd.
 pub const OMP_REROOT_PROMPT_WINDOW: Duration = Duration::from_secs(30);
 
+/// Bound for forwarding queued and still-unread PTY output to stdout after
+/// the proxy loop exits. A paused-but-open consumer gets this long to resume
+/// before leftovers are abandoned (the screen model keeps them for launch
+/// diagnostics); a dead consumer delays shutdown by this bound instead of
+/// hanging it forever.
+#[cfg(unix)]
+pub const POST_EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Proxy-only option consumed before the wrapped tool's argument vector is built.
 pub const ANSWER_OMP_REROOT_PROMPT_OPTION: &str = "--hcom-answer-omp-reroot-prompt";
 
@@ -825,6 +833,9 @@ impl Proxy {
     pub fn run(&mut self) -> Result<i32> {
         let stdin_fd = io::stdin();
         let stdout_fd = io::stdout();
+        let _stdout_flags = NonblockingGuard::new(stdout_fd.as_fd())?;
+        let mut terminal_output = PendingWrite::default();
+        let mut child_input = PendingWrite::default();
 
         // Check if stdout is a TTY before writing escape sequences
         let stdout_is_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
@@ -898,7 +909,6 @@ impl Proxy {
                 EXIT_WAS_KILLED.store(true, Ordering::Release);
                 break;
             }
-
             // Collect raw fds for polling (avoid holding borrows)
             let master_raw = self.pty_master.as_raw_fd();
             let stdin_raw = stdin_fd.as_raw_fd();
@@ -909,7 +919,31 @@ impl Proxy {
             let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_raw) };
             let inject_listener_fd = unsafe { BorrowedFd::borrow_raw(inject_listener_raw) };
 
-            let mut poll_fds = vec![PollFd::new(master_fd, PollFlags::POLLIN)];
+            // Stop reading child output under terminal backpressure, while still
+            // servicing input, screen requests, signals, and pending writes.
+            let mut master_events = PollFlags::empty();
+            if terminal_output.len() < 1024 * 1024 {
+                master_events |= PollFlags::POLLIN;
+            }
+            if !child_input.is_empty() {
+                master_events |= PollFlags::POLLOUT;
+            }
+            let mut poll_fds = Vec::new();
+            let master_idx = if master_events.is_empty() {
+                None
+            } else {
+                poll_fds.push(PollFd::new(master_fd, master_events));
+                Some(0)
+            };
+            // While the master is omitted (stdout backed up past 1 MiB, nothing
+            // queued for the child) the read/EOF path below cannot observe the
+            // exit, so detect it independently — otherwise backpressure
+            // prevents cleanup forever. When the master IS polled, fall
+            // through: the normal path forwards trailing PTY bytes to stdout
+            // before EOF/HUP ends the loop.
+            if master_idx.is_none() && self.child.try_wait()?.is_some() {
+                break;
+            }
 
             // Only include stdin in poll set while we're actively polling it.
             // When stdin is a non-TTY (e.g. /dev/null in headless mode), we stop
@@ -917,9 +951,20 @@ impl Proxy {
             // the poll set, not just pass empty events, because some platforms
             // (macOS) may still return immediately for a readable fd even with
             // events=0.
-            if poll_stdin {
+            let stdin_idx = if poll_stdin && child_input.len() < 1024 * 1024 {
+                let idx = poll_fds.len();
                 poll_fds.push(PollFd::new(stdin_borrowed, PollFlags::POLLIN));
-            }
+                Some(idx)
+            } else {
+                None
+            };
+            let stdout_idx = if terminal_output.is_empty() {
+                None
+            } else {
+                let idx = poll_fds.len();
+                poll_fds.push(PollFd::new(stdout_fd.as_fd(), PollFlags::POLLOUT));
+                Some(idx)
+            };
 
             let title_notify_idx = poll_fds.len();
             poll_fds.push(PollFd::new(
@@ -927,9 +972,17 @@ impl Proxy {
                 PollFlags::POLLIN,
             ));
 
+            // While the child isn't consuming (child_input at/over the same
+            // high-water mark interactive stdin honors), exclude the inject
+            // listener AND clients from the poll set: bytes stay in senders'
+            // TCP buffers (producer backpressure) instead of piling up unread
+            // server-side, where they'd spin the loop and leak fds to EMFILE.
+            // The short poll timeout below still applies, so a drained queue
+            // re-registers everything next iteration.
+            let input_stalled = child_input.len() >= 1024 * 1024;
             // Include the inject listener unless we're in backoff (macOS spurious POLLIN).
             // Reset backoff here so it applies for exactly one iteration.
-            let include_listener = !listener_backoff;
+            let include_listener = !listener_backoff && !input_stalled;
             listener_backoff = false;
             let inject_listener_idx: Option<usize> = if include_listener {
                 let idx = poll_fds.len();
@@ -939,11 +992,13 @@ impl Proxy {
                 None
             };
 
-            // Add inject client fds
+            // Add inject client fds (skipped while stalled: see above)
             let client_raw_fds: Vec<i32> = self.inject_server.client_raw_fds().collect();
-            for raw_fd in &client_raw_fds {
-                let fd = unsafe { BorrowedFd::borrow_raw(*raw_fd) };
-                poll_fds.push(PollFd::new(fd, PollFlags::POLLIN));
+            if !input_stalled {
+                for raw_fd in &client_raw_fds {
+                    let fd = unsafe { BorrowedFd::borrow_raw(*raw_fd) };
+                    poll_fds.push(PollFd::new(fd, PollFlags::POLLIN));
+                }
             }
 
             // Poll timeout: 5s when debug enabled (for periodic dumps), otherwise block
@@ -953,10 +1008,9 @@ impl Proxy {
             } else {
                 10000u16 // 10s, allows runtime debug flag check
             };
-            // During a one-iteration listener backoff (macOS spurious POLLIN workaround)
-            // the inject listener is excluded from the poll set. Cap the timeout short
-            // so an inject connection arriving while we're backed off doesn't wait the
-            // full 10s for the listener to re-enter the poll set on the next iteration.
+            // While the listener is excluded (one-iteration backoff, or stalled
+            // input, both handled above) cap the timeout short so arrivals and
+            // queue drain are noticed next iteration instead of after 10s.
             if !include_listener {
                 poll_timeout = poll_timeout.min(100u16);
             }
@@ -1041,7 +1095,23 @@ impl Proxy {
             // kernel PTY buffer (~4KB on macOS) splits them across reads. Writing each
             // read individually makes the terminal render partial frames (flicker).
             // Draining coalesces the fragments into one write.
-            if let Some(revents) = poll_fds[0].revents() {
+            if let Some(idx) = stdout_idx
+                && let Some(events) = poll_fds[idx].revents()
+            {
+                if events.intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
+                {
+                    break;
+                }
+                if events.contains(PollFlags::POLLOUT) {
+                    terminal_output.flush(&stdout_fd)?;
+                }
+            }
+            if let Some(idx) = master_idx
+                && let Some(revents) = poll_fds[idx].revents()
+            {
+                if revents.contains(PollFlags::POLLOUT) {
+                    child_input.flush(&self.pty_master)?;
+                }
                 if revents.contains(PollFlags::POLLIN) {
                     let mut coalesced = Vec::new();
                     let mut raw_chunks: Vec<Vec<u8>> = Vec::new();
@@ -1049,7 +1119,7 @@ impl Proxy {
                     let mut hit_eof = false;
                     let mut hit_error: Option<nix::Error> = None;
 
-                    // Drain loop: read until EAGAIN (no more data ready).
+                    // Drain a bounded batch so continuous output cannot starve queries.
                     // After EAGAIN, if we got data, do a short poll to catch trailing
                     // fragments — the kernel PTY buffer delivers ~1024-byte chunks, so
                     // a frame slightly larger than 1024 arrives as two reads separated
@@ -1057,6 +1127,9 @@ impl Proxy {
                     // chunk alone and the terminal renders a partial frame (flicker).
                     let mut eagain_retries = 0;
                     loop {
+                        if coalesced.len() >= 256 * 1024 {
+                            break;
+                        }
                         match nix_read(&self.pty_master, &mut buf) {
                             Ok(0) => {
                                 hit_eof = true;
@@ -1110,7 +1183,7 @@ impl Proxy {
 
                     // Single write of all coalesced data
                     if !coalesced.is_empty() {
-                        write_all(&stdout_fd, &coalesced)?;
+                        terminal_output.push(&coalesced);
                         pending_utf8 = pending_utf8_bytes(&coalesced);
                         pending_escape = if coalesced.contains(&0x1b) {
                             has_pending_escape(&coalesced)
@@ -1137,7 +1210,7 @@ impl Proxy {
                                 omp_reroot_answered,
                             )
                         {
-                            write_all(&self.pty_master, b"y\r")?;
+                            child_input.push(b"y\r");
                             omp_reroot_answered = true;
                             if let Some(name) = &self.config.instance_name {
                                 let _ = HcomDb::open().and_then(|db| {
@@ -1221,7 +1294,9 @@ impl Proxy {
             }
 
             // Handle stdin (only if we're still polling it)
-            if poll_stdin && let Some(revents) = poll_fds[1].revents() {
+            if let Some(idx) = stdin_idx
+                && let Some(revents) = poll_fds[idx].revents()
+            {
                 if revents.contains(PollFlags::POLLNVAL) {
                     // Some headless launch paths can inherit a stdin fd that poll()
                     // reports as invalid instead of readable EOF. Drop it from the
@@ -1279,9 +1354,9 @@ impl Proxy {
                             if self.config.target.name() == "copilot"
                                 && let Some(filtered) = focus_filtered
                             {
-                                write_all(&self.pty_master, &filtered)?;
+                                child_input.push(&filtered);
                             } else {
-                                write_all(&self.pty_master, &buf[..n])?;
+                                child_input.push(&buf[..n]);
                             }
                         }
                         Err(Errno::EAGAIN) => {}
@@ -1306,16 +1381,23 @@ impl Proxy {
             // Clients are pushed immediately after the listener (or immediately after
             // stdin when listener is in backoff), so their base index shifts by one
             // depending on whether the listener is present this iteration.
-            let clients_base = inject_listener_idx
-                .map_or_else(|| poll_fds.len() - client_raw_fds.len(), |idx| idx + 1);
-            for i in (0..client_raw_fds.len()).rev() {
+            // While stalled (see above) no client fds are registered: live_clients
+            // is 0, the loop is skipped, and the base below is unused.
+            let live_clients = if input_stalled {
+                0
+            } else {
+                client_raw_fds.len()
+            };
+            let clients_base =
+                inject_listener_idx.map_or_else(|| poll_fds.len() - live_clients, |idx| idx + 1);
+            for i in (0..live_clients).rev() {
                 let poll_idx = clients_base + i;
                 if let Some(revents) = poll_fds[poll_idx].revents()
                     && (revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP))
                 {
                     match self.inject_server.read_client(i)? {
                         inject::InjectResult::Inject(text) => {
-                            write_all(&self.pty_master, text.as_bytes())?;
+                            child_input.push(text.as_bytes());
                             // Injected keystrokes reach the PTY master directly and
                             // bypass the interactive stdin handler. When one answers a
                             // pending approval, publish the cleared edge synchronously
@@ -1422,7 +1504,7 @@ impl Proxy {
                         &purpose,
                         &current,
                     );
-                    write_all(&stdout_fd, escape.as_bytes())?;
+                    terminal_output.push(escape.as_bytes());
                     last_written_child.clear();
                     last_written_child.push_str(child);
                     last_written_name = name;
@@ -1433,11 +1515,75 @@ impl Proxy {
             }
         }
 
-        // Flush any held prefix bytes from title filter
+        // The loop can exit with the child gone and bytes still unread in the
+        // PTY (fast exit) or queued behind backpressure. Move a bounded batch
+        // into terminal_output (and the screen model) so the flush below
+        // forwards them instead of dropping them into the screen-only drain.
+        // Past the cap the screen model still preserves launch diagnostics.
+        // Bytes take the same title-filter path as loop reads, so a trailing
+        // tool title sequence is stripped (or held for the flush below) just
+        // like mid-loop output; the screen model still sees the raw bytes.
+        {
+            let mut buf = [0u8; 65536];
+            let mut moved = 0usize;
+            while moved < 1024 * 1024 {
+                match nix_read(&self.pty_master, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let data = &buf[..n];
+                        let (filtered, _had_title) = if stdout_is_tty && title_enabled {
+                            title_filter.filter(data)
+                        } else {
+                            (data.to_vec(), false)
+                        };
+                        terminal_output.push(&filtered);
+                        self.screen.process(data);
+                        moved += n;
+                    }
+                    // EAGAIN/EIO/closed: nothing more to take.
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Flush any held bytes from the title filter, from loop reads and the
+        // drain above alike.
         if stdout_is_tty {
             let remaining = title_filter.flush();
             if !remaining.is_empty() {
-                let _ = write_all(&stdout_fd, &remaining);
+                terminal_output.push(&remaining);
+            }
+        }
+
+        // Flush what the terminal can accept, giving a paused-but-open stdout
+        // consumer POST_EXIT_FLUSH_TIMEOUT to resume. A dead consumer delays
+        // shutdown by that bound instead of hanging it forever (the hang this
+        // fixes); a closed fd ends the flush at once.
+        let flush_deadline = Instant::now() + POST_EXIT_FLUSH_TIMEOUT;
+        while !terminal_output.is_empty() && Instant::now() < flush_deadline {
+            let mut output_poll = [PollFd::new(stdout_fd.as_fd(), PollFlags::POLLOUT)];
+            match poll(&mut output_poll, PollTimeout::from(10u16)) {
+                Ok(_)
+                    if output_poll[0]
+                        .revents()
+                        .is_some_and(|events| events.contains(PollFlags::POLLOUT)) =>
+                {
+                    if terminal_output.flush(&stdout_fd).is_err() {
+                        break;
+                    }
+                }
+                Ok(_)
+                    if output_poll[0].revents().is_some_and(|events| {
+                        events.intersects(
+                            PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL,
+                        )
+                    }) =>
+                {
+                    break;
+                }
+                Err(Errno::EINTR) => continue,
+                Err(_) => break,
+                _ => {}
             }
         }
 
@@ -1676,20 +1822,67 @@ fn title_wake_callback(write_fd: Arc<OwnedFd>) -> crate::delivery::TitleWake {
 }
 
 #[cfg(unix)]
-fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
-    let mut written = 0;
-    while written < data.len() {
-        match write(fd, &data[written..]) {
-            Ok(n) => written += n,
-            Err(Errno::EINTR) => continue,
-            Err(Errno::EAGAIN) => {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            Err(e) => bail!("write failed: {}", e),
-        }
+#[derive(Default)]
+struct PendingWrite {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+#[cfg(unix)]
+impl PendingWrite {
+    fn len(&self) -> usize {
+        self.bytes.len() - self.offset
     }
-    Ok(())
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn push(&mut self, bytes: &[u8]) {
+        if self.offset > 0 {
+            self.bytes.drain(..self.offset);
+            self.offset = 0;
+        }
+        self.bytes.extend_from_slice(bytes);
+    }
+    fn flush<F: AsFd>(&mut self, fd: &F) -> Result<()> {
+        // Bound work per iteration even when the peer consumes continuously.
+        let end = self.bytes.len().min(self.offset + 256 * 1024);
+        while self.offset < end {
+            match write(fd, &self.bytes[self.offset..end]) {
+                Ok(0) => bail!("write returned zero"),
+                Ok(n) => self.offset += n,
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => return Ok(()),
+                Err(e) => bail!("write failed: {}", e),
+            }
+        }
+        if self.offset == self.bytes.len() {
+            self.bytes.clear();
+            self.offset = 0;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct NonblockingGuard<'a> {
+    fd: BorrowedFd<'a>,
+    flags: OFlag,
+}
+
+#[cfg(unix)]
+impl<'a> NonblockingGuard<'a> {
+    fn new(fd: BorrowedFd<'a>) -> Result<Self> {
+        let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+        fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(Self { fd, flags })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for NonblockingGuard<'_> {
+    fn drop(&mut self) {
+        let _ = fcntl(self.fd, FcntlArg::F_SETFL(self.flags));
+    }
 }
 
 #[cfg(unix)]
@@ -1769,6 +1962,67 @@ mod tests {
     use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_write_preserves_bytes_across_backpressure() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let payload = vec![b'x'; 2 * 1024 * 1024];
+        let mut pending = super::PendingWrite::default();
+        pending.push(&payload);
+        // Stop consuming until the kernel buffer fills. flush must return,
+        // retaining the suffix, rather than sleep forever waiting for a reader.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let before = pending.len();
+            pending.flush(&writer).unwrap();
+            if pending.len() == before {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+        }
+        assert!(!pending.is_empty());
+        pending.push(b"tail");
+        let mut received = Vec::new();
+        let mut buf = [0u8; 65536];
+        while !pending.is_empty() {
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(n) if n > 0 => received.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    other => panic!("unexpected read: {other:?}"),
+                }
+            }
+            pending.flush(&writer).unwrap();
+        }
+        drop(writer);
+        reader.set_nonblocking(false).unwrap();
+        reader.read_to_end(&mut received).unwrap();
+        let mut expected = payload;
+        expected.extend_from_slice(b"tail");
+        assert_eq!(received, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_guard_restores_descriptor_flags() {
+        use std::os::fd::AsFd;
+        let (reader, _writer) = nix::unistd::pipe().unwrap();
+        let before = nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap();
+        {
+            let _guard = super::NonblockingGuard::new(reader.as_fd()).unwrap();
+            let during = nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap();
+            assert_ne!(during & libc::O_NONBLOCK, 0);
+        }
+        assert_eq!(
+            nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap(),
+            before
+        );
+    }
 
     #[test]
     fn adhoc_pty_target_stays_adhoc_for_delivery() {
