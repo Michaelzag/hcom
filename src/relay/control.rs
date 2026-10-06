@@ -1529,9 +1529,7 @@ mod tests {
                 &key,
             );
             store
-                .cache_event(
-                    &crate::buzz::store::cached_from_event(&event, channel, None, None).unwrap(),
-                )
+                .store_fetched(channel, std::slice::from_ref(&event), None)
                 .unwrap();
         }
     }

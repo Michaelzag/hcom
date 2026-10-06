@@ -5,20 +5,33 @@
 //! `relay_local_reset_ts`), so a `hcom reset` drops id-keyed lookups instead of
 //! replaying unrelated history. Buzz event ids need no epoch: the relay keeps
 //! them unique.
+//!
+//! Inbound work is three tables, each a step of the durability model in
+//! `docs/design/buzz.md`:
+//!
+//! - `inbox`: every fetched Buzz event, keyed by its id, with a handling state
+//!   (`pending` → `routed` → `done`). It is also the cache `read` lists and the
+//!   ancestry walk consults.
+//! - `channels.position_*`: how far a channel has been fetched, as the relay's
+//!   own sort key `(created_at, id)`. It only says "fetched", never "handled",
+//!   and it only moves in the transaction that stored what it points at.
+//! - `obligations`: one row per (inbound event, hcom target), written in the
+//!   transaction that marks the event routed, before anything is sent.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::buzz::nostr::Event;
 
-/// How long a parked inbound target keeps being retried before the connector
-/// says so in Buzz.
-pub const PARK_RETRY_WINDOW_SECS: u64 = 15 * 60;
+/// How long an inbound obligation keeps being retried before the connector
+/// says so in Buzz and closes it.
+pub const OBLIGATION_WINDOW_SECS: i64 = 15 * 60;
 
-/// Backfill window subtracted from a channel cursor, matching the relay's
-/// 900 s admission window for backdated events.
+/// How far before its read position a channel's catch-up starts: the relay's
+/// 900 s backdated admission window plus 60 s of NIP-98 clock skew. The live
+/// subscription starts the same distance before now.
 pub const BACKFILL_SLACK_SECS: u64 = 960;
 
 /// An entry older than this and still unacked is looked up by id before it is
@@ -27,6 +40,9 @@ pub const STALE_OUTBOX_SECS: u64 = 840;
 
 /// Kinds the reader subscribes to, per bridged channel.
 pub const CHANNEL_KINDS: &[u16] = &[9, 40002, 45001, 45003, 40003, 5, 9005, 39002];
+
+/// Kind of a channel roster.
+const KIND_ROSTER: u16 = 39002;
 
 /// What the connector knows about a Buzz author.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +90,8 @@ pub struct Author {
     pub device_label: Option<String>,
 }
 
-/// A cached Buzz event: enough for `read` and for ancestry walking.
+/// A fetched Buzz event: enough for `read`, for ancestry walking and for
+/// handling it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedEvent {
     pub buzz_id: String,
@@ -87,6 +104,13 @@ pub struct CachedEvent {
     pub json: String,
 }
 
+/// An inbox item still owed handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxItem {
+    pub event: CachedEvent,
+    pub attempts: u32,
+}
+
 /// A person row in the roster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonRow {
@@ -97,13 +121,33 @@ pub struct PersonRow {
     pub left_at: Option<i64>,
 }
 
+/// A channel's read position: the relay's sort key of the newest event a
+/// completed fetch stored. Ordered by `created_at`, then id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Position {
+    pub created_at: u64,
+    pub id: String,
+}
+
 /// A bridged channel's connector state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelRow {
     pub id: String,
     pub slug: String,
-    pub cursor_created_at: Option<u64>,
+    pub position: Option<Position>,
     pub parked_reason: Option<String>,
+}
+
+/// A channel's newest roster, saved so it is applied before any message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedRoster {
+    pub buzz_id: String,
+    pub created_at: u64,
+    pub json: String,
+    /// Every listed member resolved to a person row (or is not a person).
+    pub applied: bool,
+    pub attempts: u32,
+    pub next_at: i64,
 }
 
 /// One outbound post: a signed event bound to a destination channel.
@@ -123,10 +167,10 @@ pub struct OutboxRow {
     pub last_error: Option<String>,
 }
 
-/// What a parked target is owed: the routed delivery, exactly as it would have
-/// been sent, so a retry resends that and nothing re-derived.
+/// What one target is owed for an inbound event: the routed delivery, exactly
+/// as it is sent, so a retry resends that and nothing re-derived.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ParkedDelivery {
+pub struct OwedDelivery {
     /// The person row the message comes from.
     pub sender: String,
     pub thread: String,
@@ -135,17 +179,23 @@ pub struct ParkedDelivery {
     pub text: String,
 }
 
-/// A parked inbound target awaiting a live hcom row.
+/// One inbound event's obligation to one hcom target.
+///
+/// States: `pending` (owed, retried with backoff), `delivered`, `notice` (the
+/// window closed; the stored "isn't running" notice is being posted) and
+/// `expired` (the notice went out, or could never be posted).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParkedTarget {
+pub struct Obligation {
     pub buzz_id: String,
     pub target: String,
     pub state: String,
     pub attempts: u32,
     pub next_at: i64,
-    /// When the target was first parked; the retry window runs from here.
-    pub first_parked_at: i64,
-    pub delivery: ParkedDelivery,
+    /// When the obligation was written; the 15 min window runs from here.
+    pub first_at: i64,
+    pub delivery: OwedDelivery,
+    /// The signed notice, once the window closed.
+    pub notice_json: Option<String>,
 }
 
 /// Enrollment state of one (agent, channel) pair.
@@ -189,7 +239,8 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        // serve and the mbai-local CLI share this file; wait out a writer.
+        // serve, its reader thread and the mbai-local CLI share this file;
+        // wait out a writer.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut store = Self {
             conn,
@@ -229,7 +280,8 @@ impl Store {
              CREATE TABLE IF NOT EXISTS channels (
                 id TEXT PRIMARY KEY,
                 slug TEXT NOT NULL,
-                cursor_created_at INTEGER,
+                position_created_at INTEGER,
+                position_id TEXT,
                 parked_reason TEXT);
              CREATE TABLE IF NOT EXISTS people (
                 pubkey TEXT PRIMARY KEY,
@@ -246,7 +298,7 @@ impl Store {
                 kind TEXT NOT NULL,
                 hcom_name TEXT,
                 device_label TEXT);
-             CREATE TABLE IF NOT EXISTS events_cache (
+             CREATE TABLE IF NOT EXISTS inbox (
                 buzz_id TEXT PRIMARY KEY,
                 channel_id TEXT NOT NULL,
                 kind INTEGER NOT NULL,
@@ -254,26 +306,37 @@ impl Store {
                 created_at INTEGER NOT NULL,
                 root_id TEXT,
                 parent_id TEXT,
-                json TEXT NOT NULL);
-             CREATE INDEX IF NOT EXISTS events_cache_channel
-                ON events_cache (channel_id, created_at);
-             CREATE INDEX IF NOT EXISTS events_cache_author
-                ON events_cache (author, kind);
-             CREATE TABLE IF NOT EXISTS seen (buzz_id TEXT PRIMARY KEY);
-             CREATE TABLE IF NOT EXISTS delivered (buzz_id TEXT PRIMARY KEY);
-             CREATE TABLE IF NOT EXISTS inbound_targets (
+                json TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_at INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT);
+             CREATE INDEX IF NOT EXISTS inbox_channel
+                ON inbox (channel_id, created_at, buzz_id);
+             CREATE INDEX IF NOT EXISTS inbox_due ON inbox (state, channel_id, next_at);
+             CREATE TABLE IF NOT EXISTS rosters (
+                channel_id TEXT PRIMARY KEY,
+                buzz_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                json TEXT NOT NULL,
+                applied INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_at INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS obligations (
                 buzz_id TEXT NOT NULL,
                 target TEXT NOT NULL,
                 state TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_at INTEGER NOT NULL DEFAULT 0,
-                first_parked_at INTEGER NOT NULL DEFAULT 0,
+                first_at INTEGER NOT NULL,
                 sender TEXT NOT NULL,
                 thread TEXT NOT NULL,
                 root_id TEXT NOT NULL,
                 channel_id TEXT NOT NULL,
                 text TEXT NOT NULL,
+                notice_json TEXT,
                 PRIMARY KEY (buzz_id, target));
+             CREATE INDEX IF NOT EXISTS obligations_due ON obligations (state, next_at);
              CREATE TABLE IF NOT EXISTS threads (
                 thread_name TEXT PRIMARY KEY,
                 channel_id TEXT NOT NULL,
@@ -301,6 +364,15 @@ impl Store {
              CREATE INDEX IF NOT EXISTS outbox_buzz ON outbox (buzz_id);",
         )?;
         Ok(())
+    }
+
+    /// A write transaction that takes the write lock up front, so a
+    /// read-then-write inside it can never be overtaken by another writer.
+    fn write_txn(&self) -> Result<Transaction<'_>> {
+        Ok(Transaction::new_unchecked(
+            &self.conn,
+            TransactionBehavior::Immediate,
+        )?)
     }
 
     /// The hcom DB epoch this store's hcom event ids are scoped by.
@@ -335,7 +407,7 @@ impl Store {
 
     // ── channels ─────────────────────────────────────────────────────────
 
-    /// Insert or refresh a bridged channel row, preserving its cursor.
+    /// Insert or refresh a bridged channel row, preserving its position.
     pub fn upsert_channel(&self, id: &str, slug: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO channels (id, slug) VALUES (?1, ?2)
@@ -345,64 +417,118 @@ impl Store {
         Ok(())
     }
 
-    /// Every bridged channel with its cursor and parked reason.
+    /// Every bridged channel with its position and parked reason.
     pub fn channels(&self) -> Result<Vec<ChannelRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, slug, cursor_created_at, parked_reason FROM channels ORDER BY slug",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(ChannelRow {
-                    id: row.get(0)?,
-                    slug: row.get(1)?,
-                    cursor_created_at: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                    parked_reason: row.get(3)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        query_channels(&self.conn)
     }
 
     /// Look up one channel row.
     pub fn channel(&self, id: &str) -> Result<Option<ChannelRow>> {
+        Ok(query_channels(&self.conn)?
+            .into_iter()
+            .find(|row| row.id == id))
+    }
+
+    /// Give a channel bridged for the first time its starting position:
+    /// `now`, with an empty id. A channel that already has one keeps it.
+    pub fn start_position(&self, channel_id: &str, now: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE channels SET position_created_at = ?2, position_id = ''
+             WHERE id = ?1 AND position_created_at IS NULL",
+            params![channel_id, now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Store fetched events in a channel's inbox and, when `advance_until` is
+    /// given, move the channel's read position to the newest stored key whose
+    /// `created_at` is not after it — all in one transaction.
+    ///
+    /// Inserting is `INSERT OR IGNORE` by Buzz id, so a repeated fetch only
+    /// dedupes. The position moves by compare-and-set: never backwards, never
+    /// over a newer value. Capping it at `advance_until` (the fetch's wall
+    /// clock) keeps a future-dated event, which the relay admits up to 900 s
+    /// ahead, from pulling the position past what the next catch-up's 960 s
+    /// overlap can still cover. Returns how many events were new.
+    pub fn store_fetched(
+        &self,
+        channel_id: &str,
+        events: &[Event],
+        advance_until: Option<u64>,
+    ) -> Result<usize> {
+        let tx = self.write_txn()?;
+        let mut inserted = 0;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT OR IGNORE INTO inbox
+                    (buzz_id, channel_id, kind, author, created_at, root_id, parent_id, json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for event in events {
+                let (root_id, parent_id) = crate::buzz::route::thread_refs(event);
+                inserted += insert.execute(params![
+                    event.id,
+                    channel_id,
+                    event.kind,
+                    event.pubkey,
+                    event.created_at as i64,
+                    root_id,
+                    parent_id,
+                    serde_json::to_string(event).context("event serializes")?,
+                ])?;
+            }
+        }
+        let newest = advance_until.and_then(|limit| {
+            events
+                .iter()
+                .filter(|event| event.created_at <= limit)
+                .map(|event| Position {
+                    created_at: event.created_at,
+                    id: event.id.clone(),
+                })
+                .max()
+        });
+        if let Some(newest) = newest {
+            tx.execute(
+                "UPDATE channels SET position_created_at = ?2, position_id = ?3
+                 WHERE id = ?1
+                   AND (position_created_at IS NULL
+                        OR position_created_at < ?2
+                        OR (position_created_at = ?2 AND COALESCE(position_id, '') < ?3))",
+                params![channel_id, newest.created_at as i64, newest.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// The operator's `hcom buzz cursor set`: put a channel's position at
+    /// `since` (id empty, so the whole second is re-read).
+    ///
+    /// Without `force` this is one compare-and-set that only moves forward, so
+    /// two racing seeds can never leave the older value standing. Returns
+    /// false when it refused (the position is already later); seeding the
+    /// value it already holds is a no-op that succeeds.
+    pub fn seed_position(&self, channel_id: &str, since: u64, force: bool) -> Result<bool> {
+        let changed = if force {
+            self.conn.execute(
+                "UPDATE channels SET position_created_at = ?2, position_id = '' WHERE id = ?1",
+                params![channel_id, since as i64],
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE channels SET position_created_at = ?2, position_id = ''
+                 WHERE id = ?1 AND (position_created_at IS NULL OR position_created_at < ?2)",
+                params![channel_id, since as i64],
+            )?
+        };
+        if changed == 1 {
+            return Ok(true);
+        }
         Ok(self
-            .conn
-            .query_row(
-                "SELECT id, slug, cursor_created_at, parked_reason FROM channels WHERE id = ?1",
-                params![id],
-                |row| {
-                    Ok(ChannelRow {
-                        id: row.get(0)?,
-                        slug: row.get(1)?,
-                        cursor_created_at: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                        parked_reason: row.get(3)?,
-                    })
-                },
-            )
-            .optional()?)
-    }
-
-    /// Advance a channel's backfill cursor. Never moves it back: events arrive
-    /// out of order (backfill pages, retries), and a cursor that follows the
-    /// last one handled would re-read or skip history on the next start.
-    pub fn set_channel_cursor(&self, id: &str, created_at: u64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE channels
-             SET cursor_created_at = MAX(COALESCE(cursor_created_at, 0), ?2)
-             WHERE id = ?1",
-            params![id, created_at as i64],
-        )?;
-        Ok(())
-    }
-
-    /// Put a channel's cursor exactly here, backwards included: the operator's
-    /// `hcom buzz cursor set --force`, never the connector itself.
-    pub fn force_channel_cursor(&self, id: &str, created_at: u64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE channels SET cursor_created_at = ?2 WHERE id = ?1",
-            params![id, created_at as i64],
-        )?;
-        Ok(())
+            .channel(channel_id)?
+            .and_then(|row| row.position)
+            .is_some_and(|position| position.created_at == since))
     }
 
     /// Park (or unpark, with an empty reason) a channel subscription.
@@ -429,6 +555,23 @@ impl Store {
             params![pubkey, name, home_slug],
         )?;
         Ok(())
+    }
+
+    /// Insert a person row only when the pubkey has none. A configured person
+    /// is known from the first pass, but a configured person the rosters
+    /// retired stays retired. True when a row was created.
+    pub fn insert_person_if_absent(
+        &self,
+        pubkey: &str,
+        name: &str,
+        home_slug: Option<&str>,
+    ) -> Result<bool> {
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO people (pubkey, name, home_slug, active, left_at)
+             VALUES (?1, ?2, ?3, 1, NULL)",
+            params![pubkey, name, home_slug],
+        )?;
+        Ok(inserted == 1)
     }
 
     /// Retire a person: no longer a participant. The grace period is the
@@ -461,7 +604,7 @@ impl Store {
 
     /// Replace one channel's person members with what its roster lists.
     pub fn set_channel_members(&self, channel_id: &str, pubkeys: &[String]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_txn()?;
         tx.execute(
             "DELETE FROM memberships WHERE channel_id = ?1",
             params![channel_id],
@@ -491,21 +634,7 @@ impl Store {
 
     /// Every person row.
     pub fn people(&self) -> Result<Vec<PersonRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT pubkey, name, home_slug, active, left_at FROM people ORDER BY name")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(PersonRow {
-                    pubkey: row.get(0)?,
-                    name: row.get(1)?,
-                    home_slug: row.get(2)?,
-                    active: row.get::<_, i64>(3)? != 0,
-                    left_at: row.get(4)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        query_people(&self.conn)
     }
 
     /// Active person rows only, in name order.
@@ -515,42 +644,12 @@ impl Store {
 
     /// Look up one person by hcom name.
     pub fn person_by_name(&self, name: &str) -> Result<Option<PersonRow>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT pubkey, name, home_slug, active, left_at FROM people WHERE name = ?1",
-                params![name],
-                |row| {
-                    Ok(PersonRow {
-                        pubkey: row.get(0)?,
-                        name: row.get(1)?,
-                        home_slug: row.get(2)?,
-                        active: row.get::<_, i64>(3)? != 0,
-                        left_at: row.get(4)?,
-                    })
-                },
-            )
-            .optional()?)
+        Ok(self.people()?.into_iter().find(|p| p.name == name))
     }
 
     /// Look up one person by pubkey.
     pub fn person_by_pubkey(&self, pubkey: &str) -> Result<Option<PersonRow>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT pubkey, name, home_slug, active, left_at FROM people WHERE pubkey = ?1",
-                params![pubkey],
-                |row| {
-                    Ok(PersonRow {
-                        pubkey: row.get(0)?,
-                        name: row.get(1)?,
-                        home_slug: row.get(2)?,
-                        active: row.get::<_, i64>(3)? != 0,
-                        left_at: row.get(4)?,
-                    })
-                },
-            )
-            .optional()?)
+        Ok(self.people()?.into_iter().find(|p| p.pubkey == pubkey))
     }
 
     // ── authors ──────────────────────────────────────────────────────────
@@ -604,51 +703,23 @@ impl Store {
         Ok(rows)
     }
 
-    // ── events ───────────────────────────────────────────────────────────
+    // ── inbox ────────────────────────────────────────────────────────────
 
-    /// Cache an event for `read` and ancestry.
-    pub fn cache_event(&self, event: &CachedEvent) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO events_cache
-                (buzz_id, channel_id, kind, author, created_at, root_id, parent_id, json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(buzz_id) DO UPDATE SET
-                channel_id = excluded.channel_id,
-                kind = excluded.kind,
-                author = excluded.author,
-                created_at = excluded.created_at,
-                root_id = excluded.root_id,
-                parent_id = excluded.parent_id,
-                json = excluded.json",
-            params![
-                event.buzz_id,
-                event.channel_id,
-                event.kind,
-                event.author,
-                event.created_at as i64,
-                event.root_id,
-                event.parent_id,
-                event.json
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// One cached event by Buzz id.
+    /// One fetched event by Buzz id.
     pub fn cached_event(&self, buzz_id: &str) -> Result<Option<CachedEvent>> {
         Ok(self
             .conn
             .query_row(
                 "SELECT buzz_id, channel_id, kind, author, created_at, root_id, parent_id, json
-                 FROM events_cache WHERE buzz_id = ?1",
+                 FROM inbox WHERE buzz_id = ?1",
                 params![buzz_id],
                 row_to_cached,
             )
             .optional()?)
     }
 
-    /// Cached events in a channel, newest first, optionally limited to a thread
-    /// and continued before `before`.
+    /// Fetched events in a channel, newest first, optionally limited to a
+    /// thread and continued after `before` in that order.
     pub fn list_events(
         &self,
         channel_id: Option<&str>,
@@ -656,188 +727,343 @@ impl Store {
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<CachedEvent>> {
-        let mut sql = String::from(
-            "SELECT buzz_id, channel_id, kind, author, created_at, root_id, parent_id, json
-             FROM events_cache WHERE 1=1",
-        );
-        let mut binds: Vec<String> = Vec::new();
-        if let Some(channel_id) = channel_id {
-            sql.push_str(" AND channel_id = ?");
-            binds.push(channel_id.to_string());
-        }
-        if let Some(thread) = thread {
-            sql.push_str(" AND (buzz_id = ? OR root_id = ? OR parent_id = ?)");
-            binds.extend([thread.to_string(), thread.to_string(), thread.to_string()]);
-        }
-        if let Some(before) = before {
-            sql.push_str(
-                " AND created_at < (SELECT created_at FROM events_cache WHERE buzz_id = ?)",
-            );
-            binds.push(before.to_string());
-        }
-        sql.push_str(" ORDER BY created_at DESC, buzz_id ASC LIMIT ?");
-        binds.push(limit.to_string());
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(binds), row_to_cached)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        list_events_on(&self.conn, channel_id, thread, before, limit)
     }
 
-    /// True when an inbound event was already handled to completion.
-    pub fn was_seen(&self, buzz_id: &str) -> Result<bool> {
+    /// An inbox item's handling state, if it was fetched at all.
+    pub fn inbox_state(&self, buzz_id: &str) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT 1 FROM seen WHERE buzz_id = ?1",
+                "SELECT state FROM inbox WHERE buzz_id = ?1",
                 params![buzz_id],
-                |_| Ok(()),
+                |row| row.get(0),
             )
-            .optional()?
-            .is_some())
+            .optional()?)
     }
 
-    /// Record an inbound event as fully handled: delivered, parked or skipped.
-    /// Written last, so a crash or error before it leaves the event to be
-    /// handled again by the retry queue or the next backfill.
-    pub fn mark_seen(&self, buzz_id: &str) -> Result<bool> {
-        let inserted = self.conn.execute(
-            "INSERT OR IGNORE INTO seen (buzz_id) VALUES (?1)",
-            params![buzz_id],
-        )?;
-        Ok(inserted == 1)
-    }
-
-    /// True when the Buzz event was already handed to hcom.
-    pub fn was_delivered(&self, buzz_id: &str) -> Result<bool> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT 1 FROM delivered WHERE buzz_id = ?1",
-                params![buzz_id],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-    }
-
-    /// Record that the Buzz event reached hcom.
-    pub fn mark_delivered(&self, buzz_id: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO delivered (buzz_id) VALUES (?1)",
-            params![buzz_id],
-        )?;
-        Ok(())
-    }
-
-    // ── parked inbound targets ───────────────────────────────────────────
-
-    /// Park an unresolvable inbound target for retry, with what it is owed.
-    pub fn park_target(
-        &self,
-        buzz_id: &str,
-        target: &str,
-        next_at: i64,
-        delivery: &ParkedDelivery,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO inbound_targets
-                (buzz_id, target, state, attempts, next_at, first_parked_at,
-                 sender, thread, root_id, channel_id, text)
-             VALUES (?1, ?2, 'parked', 0, ?3, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(buzz_id, target) DO UPDATE SET
-                state = 'parked', next_at = excluded.next_at",
-            params![
-                buzz_id,
-                target,
-                next_at,
-                delivery.sender,
-                delivery.thread,
-                delivery.root_id,
-                delivery.channel_id,
-                delivery.text,
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Parked targets whose retry time has come, oldest first.
-    pub fn due_targets(&self, now: i64) -> Result<Vec<ParkedTarget>> {
+    /// A channel's items still owed handling whose retry time has come,
+    /// oldest first by the relay's key. Rosters are not among them: they are
+    /// adopted separately, before any message (`adopt_roster`).
+    pub fn due_inbox(&self, channel_id: &str, now: i64) -> Result<Vec<InboxItem>> {
         let mut stmt = self.conn.prepare(
-            "SELECT buzz_id, target, state, attempts, next_at, first_parked_at,
-                    sender, thread, root_id, channel_id, text
-             FROM inbound_targets
-             WHERE state = 'parked' AND next_at <= ?1
-             ORDER BY next_at, buzz_id",
+            "SELECT buzz_id, channel_id, kind, author, created_at, root_id, parent_id, json,
+                    attempts
+             FROM inbox
+             WHERE channel_id = ?1 AND state = 'pending' AND next_at <= ?2 AND kind != ?3
+             ORDER BY created_at, buzz_id",
         )?;
         let rows = stmt
-            .query_map(params![now], |row| {
-                Ok(ParkedTarget {
-                    buzz_id: row.get(0)?,
-                    target: row.get(1)?,
-                    state: row.get(2)?,
-                    attempts: row.get(3)?,
-                    next_at: row.get(4)?,
-                    first_parked_at: row.get(5)?,
-                    delivery: ParkedDelivery {
-                        sender: row.get(6)?,
-                        thread: row.get(7)?,
-                        root_id: row.get(8)?,
-                        channel_id: row.get(9)?,
-                        text: row.get(10)?,
-                    },
+            .query_map(params![channel_id, now, KIND_ROSTER], |row| {
+                Ok(InboxItem {
+                    event: row_to_cached(row)?,
+                    attempts: row.get::<_, i64>(8)? as u32,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Move a parked target's window start, so a test can age it without
-    /// waiting out the real retry window.
-    #[cfg(test)]
-    pub fn age_parked_target(&self, buzz_id: &str, first_parked_at: i64) -> Result<()> {
+    /// Leave an item pending, to be handled again at `next_at`. Nothing is
+    /// ever dropped for failing too often.
+    pub fn defer_item(
+        &self,
+        buzz_id: &str,
+        attempts: u32,
+        next_at: i64,
+        error: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "UPDATE inbound_targets SET first_parked_at = ?2, next_at = ?2 WHERE buzz_id = ?1",
-            params![buzz_id, first_parked_at],
+            "UPDATE inbox SET attempts = ?2, next_at = ?3, last_error = ?4
+             WHERE buzz_id = ?1 AND state = 'pending'",
+            params![buzz_id, attempts, next_at, error],
         )?;
         Ok(())
     }
 
-    /// Mark a parked target resolved, given, or still parked with a longer wait.
-    pub fn update_target(
+    /// An item that needs nothing delivered (our own post, no agent addressed,
+    /// a known non-person): handled.
+    pub fn finish_item(&self, buzz_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE inbox SET state = 'done', last_error = NULL WHERE buzz_id = ?1",
+            params![buzz_id],
+        )?;
+        Ok(())
+    }
+
+    /// Route an item: one obligation per target, the thread mapping, and the
+    /// item marked routed, in one transaction. Obligations exist before
+    /// anything is sent; a crash before the commit re-routes the item, one
+    /// after it replays the obligations.
+    pub fn route_item(
+        &self,
+        buzz_id: &str,
+        targets: &[String],
+        owed: &OwedDelivery,
+        now: i64,
+    ) -> Result<()> {
+        let tx = self.write_txn()?;
+        for target in targets {
+            tx.execute(
+                "INSERT OR IGNORE INTO obligations
+                    (buzz_id, target, state, attempts, next_at, first_at,
+                     sender, thread, root_id, channel_id, text)
+                 VALUES (?1, ?2, 'pending', 0, 0, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    buzz_id,
+                    target,
+                    now,
+                    owed.sender,
+                    owed.thread,
+                    owed.root_id,
+                    owed.channel_id,
+                    owed.text,
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO threads (thread_name, channel_id, root_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT(thread_name) DO UPDATE SET
+                channel_id = excluded.channel_id, root_id = excluded.root_id",
+            params![owed.thread, owed.channel_id, owed.root_id],
+        )?;
+        tx.execute(
+            "UPDATE inbox SET state = 'routed', last_error = NULL WHERE buzz_id = ?1",
+            params![buzz_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark routed items done once every obligation they own is terminal.
+    pub fn finish_routed(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE inbox SET state = 'done'
+             WHERE state = 'routed'
+               AND NOT EXISTS (
+                   SELECT 1 FROM obligations o
+                   WHERE o.buzz_id = inbox.buzz_id AND o.state IN ('pending', 'notice'))",
+            [],
+        )?)
+    }
+
+    /// Inbox counts by state, for `hcom buzz status`.
+    pub fn inbox_counts(&self) -> Result<Vec<(String, i64)>> {
+        state_counts(&self.conn, "inbox")
+    }
+
+    /// Make every pending item due now, so a test need not wait out backoff.
+    #[cfg(test)]
+    pub fn make_inbox_due(&self) -> Result<()> {
+        self.conn
+            .execute("UPDATE inbox SET next_at = 0 WHERE state = 'pending'", [])?;
+        Ok(())
+    }
+
+    // ── rosters ──────────────────────────────────────────────────────────
+
+    /// Rosters fetched for a channel and not yet adopted or discarded.
+    pub fn pending_rosters(&self, channel_id: &str) -> Result<Vec<CachedEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT buzz_id, channel_id, kind, author, created_at, root_id, parent_id, json
+             FROM inbox
+             WHERE channel_id = ?1 AND kind = ?2 AND state = 'pending'
+             ORDER BY created_at, buzz_id",
+        )?;
+        let rows = stmt
+            .query_map(params![channel_id, KIND_ROSTER], row_to_cached)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// A channel's saved roster.
+    pub fn saved_roster(&self, channel_id: &str) -> Result<Option<SavedRoster>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT buzz_id, created_at, json, applied, attempts, next_at
+                 FROM rosters WHERE channel_id = ?1",
+                params![channel_id],
+                |row| {
+                    Ok(SavedRoster {
+                        buzz_id: row.get(0)?,
+                        created_at: row.get::<_, i64>(1)? as u64,
+                        json: row.get(2)?,
+                        applied: row.get::<_, i64>(3)? != 0,
+                        attempts: row.get::<_, i64>(4)? as u32,
+                        next_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Save `newest` as the channel's roster (to be applied) and settle every
+    /// fetched roster item in `settled`, in one transaction.
+    pub fn adopt_roster(
+        &self,
+        channel_id: &str,
+        newest: Option<&CachedEvent>,
+        settled: &[String],
+    ) -> Result<()> {
+        let tx = self.write_txn()?;
+        if let Some(roster) = newest {
+            tx.execute(
+                "INSERT INTO rosters (channel_id, buzz_id, created_at, json, applied, attempts, next_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, 0)
+                 ON CONFLICT(channel_id) DO UPDATE SET
+                    buzz_id = excluded.buzz_id, created_at = excluded.created_at,
+                    json = excluded.json, applied = 0, attempts = 0, next_at = 0",
+                params![
+                    channel_id,
+                    roster.buzz_id,
+                    roster.created_at as i64,
+                    roster.json
+                ],
+            )?;
+        }
+        for buzz_id in settled {
+            tx.execute(
+                "UPDATE inbox SET state = 'done' WHERE buzz_id = ?1",
+                params![buzz_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The saved roster was applied in full.
+    pub fn roster_applied(&self, channel_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE rosters SET applied = 1 WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// The saved roster could not be applied in full (a member's profile is
+    /// missing or unreadable): try again at `next_at`.
+    pub fn defer_roster(&self, channel_id: &str, attempts: u32, next_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE rosters SET applied = 0, attempts = ?2, next_at = ?3 WHERE channel_id = ?1",
+            params![channel_id, attempts, next_at],
+        )?;
+        Ok(())
+    }
+
+    // ── obligations ──────────────────────────────────────────────────────
+
+    /// Obligations whose next step is due: deliveries to retry and notices to
+    /// post, oldest first.
+    pub fn due_obligations(&self, now: i64) -> Result<Vec<Obligation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT buzz_id, target, state, attempts, next_at, first_at,
+                    sender, thread, root_id, channel_id, text, notice_json
+             FROM obligations
+             WHERE state IN ('pending', 'notice') AND next_at <= ?1
+             ORDER BY first_at, buzz_id, target",
+        )?;
+        let rows = stmt
+            .query_map(params![now], |row| {
+                Ok(Obligation {
+                    buzz_id: row.get(0)?,
+                    target: row.get(1)?,
+                    state: row.get(2)?,
+                    attempts: row.get::<_, i64>(3)? as u32,
+                    next_at: row.get(4)?,
+                    first_at: row.get(5)?,
+                    delivery: OwedDelivery {
+                        sender: row.get(6)?,
+                        thread: row.get(7)?,
+                        root_id: row.get(8)?,
+                        channel_id: row.get(9)?,
+                        text: row.get(10)?,
+                    },
+                    notice_json: row.get(11)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The target's hcom send went through.
+    pub fn obligation_delivered(&self, buzz_id: &str, target: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE obligations SET state = 'delivered', attempts = attempts + 1, next_at = 0
+             WHERE buzz_id = ?1 AND target = ?2 AND state = 'pending'",
+            params![buzz_id, target],
+        )?;
+        Ok(())
+    }
+
+    /// Not deliverable yet, or the notice could not be posted yet: try again
+    /// at `next_at`. The obligation is never dropped for failing.
+    pub fn defer_obligation(
         &self,
         buzz_id: &str,
         target: &str,
-        state: &str,
+        attempts: u32,
         next_at: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE inbound_targets SET state = ?3, next_at = ?4 WHERE buzz_id = ?1 AND target = ?2",
-            params![buzz_id, target, state, next_at],
+            "UPDATE obligations SET attempts = ?3, next_at = ?4
+             WHERE buzz_id = ?1 AND target = ?2 AND state IN ('pending', 'notice')",
+            params![buzz_id, target, attempts, next_at],
         )?;
         Ok(())
     }
 
-    /// Drop parked targets whose retry window has expired.
-    pub fn expire_targets(&self, buzz_id: &str, target: &str) -> Result<()> {
+    /// The window closed: store the signed notice that says so, once. A
+    /// retry posts that same event, so the relay sees one notice however
+    /// often it is attempted.
+    pub fn obligation_notice(&self, buzz_id: &str, target: &str, notice_json: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE inbound_targets SET state = 'expired', next_at = 0
+            "UPDATE obligations SET state = 'notice', notice_json = ?3, next_at = 0
+             WHERE buzz_id = ?1 AND target = ?2 AND state = 'pending'",
+            params![buzz_id, target, notice_json],
+        )?;
+        Ok(())
+    }
+
+    /// The notice was posted (or can never be): the obligation is closed.
+    pub fn obligation_expired(&self, buzz_id: &str, target: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE obligations SET state = 'expired', next_at = 0
              WHERE buzz_id = ?1 AND target = ?2",
             params![buzz_id, target],
         )?;
         Ok(())
     }
 
-    /// Parked-target counts by state, for `hcom buzz status`.
-    pub fn target_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self
+    /// True when an event was routed to at least one target still owed it or
+    /// already given it: what an edit or deletion of it follows.
+    pub fn was_routed(&self, buzz_id: &str) -> Result<bool> {
+        Ok(self
             .conn
-            .prepare("SELECT state, COUNT(*) FROM inbound_targets GROUP BY state")?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+            .query_row(
+                "SELECT 1 FROM obligations
+                 WHERE buzz_id = ?1 AND state IN ('pending', 'delivered') LIMIT 1",
+                params![buzz_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Obligation counts by state, for `hcom buzz status`.
+    pub fn obligation_counts(&self) -> Result<Vec<(String, i64)>> {
+        state_counts(&self.conn, "obligations")
+    }
+
+    /// Move an obligation's window start, so a test can age it without
+    /// waiting out the real window.
+    #[cfg(test)]
+    pub fn age_obligation(&self, buzz_id: &str, first_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE obligations SET first_at = ?2, next_at = 0 WHERE buzz_id = ?1",
+            params![buzz_id, first_at],
+        )?;
+        Ok(())
     }
 
     // ── threads ──────────────────────────────────────────────────────────
@@ -921,11 +1147,7 @@ impl Store {
 
     /// Count of agent-channel pairs currently enrolled.
     pub fn enrolled_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM enrollment WHERE state = 'enrolled'",
-            [],
-            |row| row.get(0),
-        )?)
+        enrolled_count_on(&self.conn)
     }
 
     /// Every enrollment, for status output and the removal planner.
@@ -1100,46 +1322,223 @@ impl Store {
 
     /// Outbox counts by state, for `hcom buzz status`.
     pub fn outbox_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT state, COUNT(*) FROM outbox GROUP BY state")?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        state_counts(&self.conn, "outbox")
     }
 
     /// Every non-sent outbox row, for `hcom buzz down`'s leftovers report.
     pub fn unsent_outbox(&self) -> Result<Vec<OutboxRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT epoch, hcom_id, destination, signer_name, signed_json, buzz_id,
-                    state, attempts, next_at, last_error
-             FROM outbox
-             WHERE state != 'sent'
-             ORDER BY created_at, hcom_id",
-        )?;
-        let rows = stmt
-            .query_map([], row_to_outbox)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        unsent_outbox_on(&self.conn)
     }
 
     /// Most recent outbox failures, newest first, for status output.
     pub fn recent_errors(&self, limit: usize) -> Result<Vec<(String, i64, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT destination, hcom_id, COALESCE(last_error, '')
-             FROM outbox
-             WHERE last_error IS NOT NULL AND last_error != ''
-             ORDER BY created_at DESC, hcom_id DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        recent_errors_on(&self.conn, limit)
     }
+}
+
+impl ReadOnlyStore {
+    /// Bridged channels with positions and parked reasons, for `buzz status`.
+    pub fn channels(&self) -> Result<Vec<ChannelRow>> {
+        query_channels(&self.conn)
+    }
+
+    /// One channel row by id.
+    pub fn channel(&self, id: &str) -> Result<Option<ChannelRow>> {
+        Ok(self.channels()?.into_iter().find(|row| row.id == id))
+    }
+
+    /// Every person row.
+    pub fn people(&self) -> Result<Vec<PersonRow>> {
+        query_people(&self.conn)
+    }
+
+    /// Outbox counts by state.
+    pub fn outbox_counts(&self) -> Result<Vec<(String, i64)>> {
+        state_counts(&self.conn, "outbox")
+    }
+
+    /// Inbound obligation counts by state.
+    pub fn obligation_counts(&self) -> Result<Vec<(String, i64)>> {
+        state_counts(&self.conn, "obligations")
+    }
+
+    /// Inbox counts by state.
+    pub fn inbox_counts(&self) -> Result<Vec<(String, i64)>> {
+        state_counts(&self.conn, "inbox")
+    }
+
+    /// Number of agent-channel pairs currently enrolled.
+    pub fn enrolled_count(&self) -> Result<i64> {
+        enrolled_count_on(&self.conn)
+    }
+
+    /// Every outbox row that has not been acknowledged.
+    pub fn unsent_outbox(&self) -> Result<Vec<OutboxRow>> {
+        unsent_outbox_on(&self.conn)
+    }
+
+    /// The most recent outbox failures, newest first.
+    pub fn recent_errors(&self, limit: usize) -> Result<Vec<(String, i64, String)>> {
+        recent_errors_on(&self.conn, limit)
+    }
+
+    /// Fetched events for `buzz read` and the `buzz_read` RPC.
+    pub fn list_events(
+        &self,
+        channel_id: Option<&str>,
+        thread: Option<&str>,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CachedEvent>> {
+        list_events_on(&self.conn, channel_id, thread, before, limit)
+    }
+
+    /// Number of fetched events, for the RPC's answer summary.
+    pub fn event_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM inbox", [], |row| row.get(0))?)
+    }
+}
+
+fn query_channels(conn: &Connection) -> Result<Vec<ChannelRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, position_created_at, position_id, parked_reason
+         FROM channels ORDER BY slug",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            let created_at: Option<i64> = row.get(2)?;
+            let id: Option<String> = row.get(3)?;
+            Ok(ChannelRow {
+                id: row.get(0)?,
+                slug: row.get(1)?,
+                position: created_at.map(|created_at| Position {
+                    created_at: created_at as u64,
+                    id: id.unwrap_or_default(),
+                }),
+                parked_reason: row.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn query_people(conn: &Connection) -> Result<Vec<PersonRow>> {
+    let mut stmt =
+        conn.prepare("SELECT pubkey, name, home_slug, active, left_at FROM people ORDER BY name")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(PersonRow {
+                pubkey: row.get(0)?,
+                name: row.get(1)?,
+                home_slug: row.get(2)?,
+                active: row.get::<_, i64>(3)? != 0,
+                left_at: row.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Fetched events newest first, in the relay's own order (`created_at DESC,
+/// id ASC`). `before` continues after that event in the same order: earlier
+/// seconds, plus the rest of its own second, so a same-second neighbour on
+/// the next page is never skipped.
+fn list_events_on(
+    conn: &Connection,
+    channel_id: Option<&str>,
+    thread: Option<&str>,
+    before: Option<&str>,
+    limit: usize,
+) -> Result<Vec<CachedEvent>> {
+    let mut sql = String::from(
+        "SELECT buzz_id, channel_id, kind, author, created_at, root_id, parent_id, json
+         FROM inbox WHERE 1=1",
+    );
+    let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(channel_id) = channel_id {
+        sql.push_str(" AND channel_id = ?");
+        binds.push(channel_id.to_string().into());
+    }
+    if let Some(thread) = thread {
+        sql.push_str(" AND (buzz_id = ? OR root_id = ? OR parent_id = ?)");
+        for _ in 0..3 {
+            binds.push(thread.to_string().into());
+        }
+    }
+    if let Some(before) = before {
+        let anchor: Option<i64> = conn
+            .query_row(
+                "SELECT created_at FROM inbox WHERE buzz_id = ?1",
+                params![before],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(anchor) = anchor else {
+            anyhow::bail!("unknown --before event {before}");
+        };
+        sql.push_str(" AND (created_at < ? OR (created_at = ? AND buzz_id > ?))");
+        binds.push(anchor.into());
+        binds.push(anchor.into());
+        binds.push(before.to_string().into());
+    }
+    sql.push_str(" ORDER BY created_at DESC, buzz_id ASC LIMIT ?");
+    binds.push((limit as i64).into());
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(binds), row_to_cached)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn state_counts(conn: &Connection, table: &str) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT state, COUNT(*) FROM {table} GROUP BY state ORDER BY state"
+    ))?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn enrolled_count_on(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM enrollment WHERE state = 'enrolled'",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn unsent_outbox_on(conn: &Connection) -> Result<Vec<OutboxRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT epoch, hcom_id, destination, signer_name, signed_json, buzz_id,
+                state, attempts, next_at, last_error
+         FROM outbox
+         WHERE state != 'sent'
+         ORDER BY created_at, hcom_id",
+    )?;
+    let rows = stmt
+        .query_map([], row_to_outbox)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn recent_errors_on(conn: &Connection, limit: usize) -> Result<Vec<(String, i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT destination, hcom_id, COALESCE(last_error, '')
+         FROM outbox
+         WHERE last_error IS NOT NULL AND last_error != ''
+         ORDER BY created_at DESC, hcom_id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 fn row_to_cached(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedEvent> {
@@ -1169,176 +1568,6 @@ fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
     })
 }
 
-impl ReadOnlyStore {
-    /// Bridged channels with cursors and parked reasons, for `buzz status`.
-    pub fn channels(&self) -> Result<Vec<ChannelRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, slug, cursor_created_at, parked_reason FROM channels ORDER BY slug",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(ChannelRow {
-                    id: row.get(0)?,
-                    slug: row.get(1)?,
-                    cursor_created_at: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                    parked_reason: row.get(3)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// One channel row by id.
-    pub fn channel(&self, id: &str) -> Result<Option<ChannelRow>> {
-        Ok(self.channels()?.into_iter().find(|row| row.id == id))
-    }
-
-    /// Every person row.
-    pub fn people(&self) -> Result<Vec<PersonRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT pubkey, name, home_slug, active, left_at FROM people ORDER BY name")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(PersonRow {
-                    pubkey: row.get(0)?,
-                    name: row.get(1)?,
-                    home_slug: row.get(2)?,
-                    active: row.get::<_, i64>(3)? != 0,
-                    left_at: row.get(4)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Outbox counts by state.
-    pub fn outbox_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT state, COUNT(*) FROM outbox GROUP BY state")?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Parked-target counts by state.
-    pub fn target_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT state, COUNT(*) FROM inbound_targets GROUP BY state")?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Number of agent-channel pairs currently enrolled.
-    pub fn enrolled_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM enrollment WHERE state = 'enrolled'",
-            [],
-            |row| row.get(0),
-        )?)
-    }
-
-    /// Every outbox row that has not been acknowledged.
-    pub fn unsent_outbox(&self) -> Result<Vec<OutboxRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT epoch, hcom_id, destination, signer_name, signed_json, buzz_id,
-                    state, attempts, next_at, last_error
-             FROM outbox
-             WHERE state != 'sent'
-             ORDER BY created_at, hcom_id",
-        )?;
-        let rows = stmt
-            .query_map([], row_to_outbox)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// The most recent outbox failures, newest first.
-    pub fn recent_errors(&self, limit: usize) -> Result<Vec<(String, i64, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT destination, hcom_id, COALESCE(last_error, '')
-             FROM outbox
-             WHERE last_error IS NOT NULL AND last_error != ''
-             ORDER BY created_at DESC, hcom_id DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Cached events for `buzz read` and the `buzz_read` RPC.
-    pub fn list_events(
-        &self,
-        channel_id: Option<&str>,
-        thread: Option<&str>,
-        before: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<CachedEvent>> {
-        let mut sql = String::from(
-            "SELECT buzz_id, channel_id, kind, author, created_at, root_id, parent_id, json
-             FROM events_cache WHERE 1=1",
-        );
-        let mut binds: Vec<String> = Vec::new();
-        if let Some(channel_id) = channel_id {
-            sql.push_str(" AND channel_id = ?");
-            binds.push(channel_id.to_string());
-        }
-        if let Some(thread) = thread {
-            sql.push_str(" AND (buzz_id = ? OR root_id = ? OR parent_id = ?)");
-            binds.extend([thread.to_string(), thread.to_string(), thread.to_string()]);
-        }
-        if let Some(before) = before {
-            sql.push_str(
-                " AND created_at < (SELECT created_at FROM events_cache WHERE buzz_id = ?)",
-            );
-            binds.push(before.to_string());
-        }
-        sql.push_str(" ORDER BY created_at DESC, buzz_id ASC LIMIT ?");
-        binds.push(limit.to_string());
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(binds), row_to_cached)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Number of cached events, for the RPC's answer summary.
-    pub fn event_count(&self) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("SELECT COUNT(*) FROM events_cache", [], |row| row.get(0))?)
-    }
-}
-
-/// Build the cached row for a verified event.
-pub fn cached_from_event(
-    event: &Event,
-    channel_id: &str,
-    root_id: Option<&str>,
-    parent_id: Option<&str>,
-) -> Result<CachedEvent> {
-    Ok(CachedEvent {
-        buzz_id: event.id.clone(),
-        channel_id: channel_id.to_string(),
-        kind: event.kind,
-        author: event.pubkey.clone(),
-        created_at: event.created_at,
-        root_id: root_id.map(str::to_string),
-        parent_id: parent_id.map(str::to_string),
-        json: serde_json::to_string(event).context("event serializes")?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,16 +1580,42 @@ mod tests {
         (dir, store)
     }
 
-    fn event(key: &crate::buzz::nostr::SecretKey, kind: u16, created_at: u64) -> Event {
+    fn event_with(
+        key: &crate::buzz::nostr::SecretKey,
+        kind: u16,
+        created_at: u64,
+        tags: Vec<Vec<String>>,
+        content: &str,
+    ) -> Event {
+        let mut all = vec![vec!["h".into(), "chan-1".into()]];
+        all.extend(tags);
         sign(
             UnsignedEvent {
                 created_at,
                 kind,
-                tags: vec![vec!["h".into(), "chan-1".into()]],
-                content: format!("body {kind}"),
+                tags: all,
+                content: content.into(),
             },
             key,
         )
+    }
+
+    fn event(key: &crate::buzz::nostr::SecretKey, kind: u16, created_at: u64) -> Event {
+        event_with(key, kind, created_at, vec![], &format!("body {kind}"))
+    }
+
+    fn key() -> crate::buzz::nostr::SecretKey {
+        derive_secret(&[9; 32], "TEST@mbai")
+    }
+
+    fn owed() -> OwedDelivery {
+        OwedDelivery {
+            sender: "michael".into(),
+            thread: "buzz_infra_e1".into(),
+            root_id: "e1".into(),
+            channel_id: "chan-1".into(),
+            text: "ping".into(),
+        }
     }
 
     #[test]
@@ -1374,10 +1629,13 @@ mod tests {
     }
 
     #[test]
-    fn channel_cursor_survives_a_upsert() {
+    fn channel_position_survives_an_upsert() {
         let (_dir, store) = store();
         store.upsert_channel("chan-1", "infra").unwrap();
-        store.set_channel_cursor("chan-1", 1000).unwrap();
+        let fetched = event(&key(), 9, 1000);
+        store
+            .store_fetched("chan-1", std::slice::from_ref(&fetched), Some(5000))
+            .unwrap();
         store
             .set_channel_parked("chan-1", Some("closed: rate-limited"))
             .unwrap();
@@ -1385,7 +1643,13 @@ mod tests {
 
         let row = store.channel("chan-1").unwrap().unwrap();
         assert_eq!(row.slug, "infra-renamed");
-        assert_eq!(row.cursor_created_at, Some(1000));
+        assert_eq!(
+            row.position,
+            Some(Position {
+                created_at: 1000,
+                id: fetched.id.clone()
+            })
+        );
         assert_eq!(row.parked_reason.as_deref(), Some("closed: rate-limited"));
 
         store.set_channel_parked("chan-1", None).unwrap();
@@ -1400,21 +1664,105 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_only_moves_forward_unless_forced() {
+    fn the_position_moves_only_forward_and_only_to_what_was_stored() {
         let (_dir, store) = store();
         store.upsert_channel("chan-1", "infra").unwrap();
-        store.set_channel_cursor("chan-1", 2000).unwrap();
-        // A backfill page or a retried event older than what was handled.
-        store.set_channel_cursor("chan-1", 1500).unwrap();
+        let newer = event(&key(), 9, 2000);
+        let older = event(&key(), 9, 1500);
+        store
+            .store_fetched("chan-1", std::slice::from_ref(&newer), Some(9000))
+            .unwrap();
+        // A repeated or older fetch stores what it has but never moves back.
+        store
+            .store_fetched("chan-1", std::slice::from_ref(&older), Some(9000))
+            .unwrap();
         assert_eq!(
-            store.channel("chan-1").unwrap().unwrap().cursor_created_at,
-            Some(2000)
+            store.channel("chan-1").unwrap().unwrap().position,
+            Some(Position {
+                created_at: 2000,
+                id: newer.id.clone()
+            })
         );
-        store.force_channel_cursor("chan-1", 1500).unwrap();
+        assert!(store.cached_event(&older.id).unwrap().is_some());
+
+        // A live event before the channel caught up is stored, position still.
+        let early = event(&key(), 9, 3000);
+        store
+            .store_fetched("chan-1", std::slice::from_ref(&early), None)
+            .unwrap();
         assert_eq!(
-            store.channel("chan-1").unwrap().unwrap().cursor_created_at,
-            Some(1500),
-            "only the operator's override moves it back"
+            store
+                .channel("chan-1")
+                .unwrap()
+                .unwrap()
+                .position
+                .unwrap()
+                .created_at,
+            2000
+        );
+    }
+
+    #[test]
+    fn a_future_dated_event_never_pulls_the_position_past_the_fetch_clock() {
+        // The relay admits created_at up to 900 s ahead. A position there would
+        // start the next catch-up after events published in the meantime.
+        let (_dir, store) = store();
+        store.upsert_channel("chan-1", "infra").unwrap();
+        let now_ish = event(&key(), 9, 10_000);
+        let ahead = event(&key(), 9, 10_850);
+        store
+            .store_fetched("chan-1", &[now_ish.clone(), ahead.clone()], Some(10_010))
+            .unwrap();
+        assert_eq!(
+            store.channel("chan-1").unwrap().unwrap().position,
+            Some(Position {
+                created_at: 10_000,
+                id: now_ish.id
+            })
+        );
+        assert!(
+            store.cached_event(&ahead.id).unwrap().is_some(),
+            "stored all the same"
+        );
+    }
+
+    #[test]
+    fn a_seeded_position_is_compare_and_set() {
+        let (_dir, store) = store();
+        store.upsert_channel("chan-1", "infra").unwrap();
+        assert!(store.seed_position("chan-1", 5000, false).unwrap());
+        assert!(
+            store.seed_position("chan-1", 6000, false).unwrap(),
+            "forward"
+        );
+        assert!(
+            store.seed_position("chan-1", 6000, false).unwrap(),
+            "the same value again is a no-op"
+        );
+        assert!(
+            !store.seed_position("chan-1", 4000, false).unwrap(),
+            "never backwards without force"
+        );
+        assert_eq!(
+            store
+                .channel("chan-1")
+                .unwrap()
+                .unwrap()
+                .position
+                .unwrap()
+                .created_at,
+            6000
+        );
+        assert!(store.seed_position("chan-1", 4000, true).unwrap());
+        assert_eq!(
+            store
+                .channel("chan-1")
+                .unwrap()
+                .unwrap()
+                .position
+                .unwrap()
+                .created_at,
+            4000
         );
     }
 
@@ -1435,6 +1783,13 @@ mod tests {
         let person = store.person_by_pubkey(&"aa".repeat(32)).unwrap().unwrap();
         assert!(!person.active);
         assert_eq!(person.left_at, Some(12345));
+        assert!(store.active_people().unwrap().is_empty());
+        assert!(
+            !store
+                .insert_person_if_absent(&"aa".repeat(32), "michael", None)
+                .unwrap(),
+            "a configured person the rosters retired stays retired"
+        );
         assert!(store.active_people().unwrap().is_empty());
 
         store
@@ -1476,34 +1831,26 @@ mod tests {
     }
 
     #[test]
-    fn seen_and_delivered_are_dedupe_sets() {
+    fn fetched_events_filter_by_channel_and_thread() {
         let (_dir, store) = store();
-        assert!(store.mark_seen("e1").unwrap());
-        assert!(!store.mark_seen("e1").unwrap());
-        assert!(!store.was_delivered("e1").unwrap());
-        store.mark_delivered("e1").unwrap();
-        assert!(store.was_delivered("e1").unwrap());
-    }
-
-    #[test]
-    fn events_cache_filters_by_channel_and_thread() {
-        let (_dir, store) = store();
-        let key = derive_secret(&[9; 32], "TEST@mbai");
-        let root = event(&key, 9, 100);
-        let reply = event(&key, 9, 200);
-        let other = event(&key, 9, 300);
-
+        let root = event(&key(), 9, 100);
+        let reply = event_with(
+            &key(),
+            9,
+            200,
+            vec![vec![
+                "e".into(),
+                root.id.clone(),
+                String::new(),
+                "reply".into(),
+            ]],
+            "reply",
+        );
+        let other = event(&key(), 9, 300);
         store
-            .cache_event(&cached_from_event(&root, "chan-1", None, None).unwrap())
+            .store_fetched("chan-1", &[root.clone(), reply.clone()], None)
             .unwrap();
-        store
-            .cache_event(
-                &cached_from_event(&reply, "chan-1", Some(&root.id), Some(&root.id)).unwrap(),
-            )
-            .unwrap();
-        store
-            .cache_event(&cached_from_event(&other, "chan-2", None, None).unwrap())
-            .unwrap();
+        store.store_fetched("chan-2", &[other], None).unwrap();
 
         assert_eq!(
             store
@@ -1529,84 +1876,148 @@ mod tests {
             .unwrap();
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].buzz_id, root.id);
-
-        assert_eq!(
-            store
-                .list_events(Some("chan-1"), None, None, 1)
-                .unwrap()
-                .len(),
-            1
-        );
         assert!(store.cached_event(&reply.id).unwrap().is_some());
     }
 
     #[test]
-    fn parked_targets_retry_then_expire() {
-        let (_dir, store) = store();
-        let owed = ParkedDelivery {
-            sender: "michael".into(),
-            thread: "buzz_infra_e1".into(),
-            root_id: "e1".into(),
-            channel_id: "chan-1".into(),
-            text: "ping".into(),
-        };
-        store.park_target("e1", "luna", 500, &owed).unwrap();
-        store.park_target("e1", "nina", 100, &owed).unwrap();
+    fn continuing_a_read_keeps_same_second_events() {
+        // Two events in one second, read one at a time: continuing after the
+        // first must return the second, in both read paths.
+        let (dir, store) = store();
+        let first = event_with(&key(), 9, 700, vec![], "one");
+        let second = event_with(&key(), 9, 700, vec![], "two");
+        store
+            .store_fetched("chan-1", &[first, second], None)
+            .unwrap();
+        let reader = Store::open_read_only(&dir.path().join("state.db")).unwrap();
 
-        assert!(
-            store.due_targets(50).unwrap().is_empty(),
-            "nothing is due before its retry time"
-        );
-        let first = store.due_targets(200).unwrap();
-        assert_eq!(first.len(), 1, "only the target whose retry time has come");
-        assert_eq!(first[0].target, "nina");
+        for (label, page) in [
+            (
+                "store",
+                Box::new(|before: Option<&str>| {
+                    store.list_events(Some("chan-1"), None, before, 1).unwrap()
+                }) as Box<dyn Fn(Option<&str>) -> Vec<CachedEvent>>,
+            ),
+            (
+                "read-only",
+                Box::new(|before: Option<&str>| {
+                    reader.list_events(Some("chan-1"), None, before, 1).unwrap()
+                }),
+            ),
+        ] {
+            let head = page(None);
+            assert_eq!(head.len(), 1, "{label}");
+            let next = page(Some(&head[0].buzz_id));
+            assert_eq!(next.len(), 1, "{label}: the same-second neighbour follows");
+            assert_ne!(next[0].buzz_id, head[0].buzz_id, "{label}");
+            assert!(
+                page(Some(&next[0].buzz_id)).is_empty(),
+                "{label}: then nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn obligations_retry_then_close_through_a_stored_notice() {
+        let (_dir, store) = store();
+        let item = event(&key(), 9, 100);
+        store
+            .store_fetched("chan-1", std::slice::from_ref(&item), None)
+            .unwrap();
+        store
+            .route_item(&item.id, &["luna".into(), "nina".into()], &owed(), 50)
+            .unwrap();
         assert_eq!(
-            first[0].delivery, owed,
+            store.inbox_state(&item.id).unwrap().as_deref(),
+            Some("routed")
+        );
+        assert_eq!(
+            store.thread("buzz_infra_e1").unwrap().unwrap().root_id,
+            "e1",
+            "the thread is recorded with the obligations"
+        );
+
+        let due = store.due_obligations(60).unwrap();
+        assert_eq!(due.len(), 2);
+        assert_eq!(
+            due[0].delivery,
+            owed(),
             "the routed delivery comes back intact"
         );
 
-        let due = store.due_targets(600).unwrap();
-        assert_eq!(due.len(), 2);
-        assert_eq!(due[0].target, "nina", "oldest retry first");
+        store.defer_obligation(&item.id, "nina", 1, 500).unwrap();
+        store.obligation_delivered(&item.id, "luna").unwrap();
+        assert!(store.due_obligations(100).unwrap().is_empty());
+        assert_eq!(store.finish_routed().unwrap(), 0, "nina is still owed");
 
-        store.update_target("e1", "luna", "delivered", 0).unwrap();
-        assert!(
-            !store
-                .due_targets(600)
-                .unwrap()
-                .iter()
-                .any(|t| t.target == "luna")
-        );
+        store
+            .obligation_notice(&item.id, "nina", "{\"notice\":1}")
+            .unwrap();
+        let notice = store.due_obligations(600).unwrap();
+        assert_eq!(notice.len(), 1);
+        assert_eq!(notice[0].state, "notice");
+        assert_eq!(notice[0].notice_json.as_deref(), Some("{\"notice\":1}"));
+        assert_eq!(store.finish_routed().unwrap(), 0, "a notice is still owed");
 
-        store.expire_targets("e1", "nina").unwrap();
-        assert!(store.due_targets(i64::MAX / 2).unwrap().is_empty());
-        let counts = store.target_counts().unwrap();
+        store.obligation_expired(&item.id, "nina").unwrap();
+        assert_eq!(store.finish_routed().unwrap(), 1);
+        assert_eq!(
+            store.inbox_state(&item.id).unwrap().as_deref(),
+            Some("done")
+        );
+        let counts = store.obligation_counts().unwrap();
+        assert!(counts.contains(&("delivered".to_string(), 1)));
+        assert!(counts.contains(&("expired".to_string(), 1)));
+        assert!(store.was_routed(&item.id).unwrap(), "luna got it");
+    }
+
+    #[test]
+    fn a_failed_routing_write_leaves_no_obligation_and_the_item_pending() {
+        let (_dir, store) = store();
+        let item = event(&key(), 9, 100);
+        store
+            .store_fetched("chan-1", std::slice::from_ref(&item), None)
+            .unwrap();
+        store
+            .exec_for_test(
+                "CREATE TRIGGER no_nina BEFORE INSERT ON obligations
+                 WHEN NEW.target = 'nina'
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
         assert!(
-            counts
-                .iter()
-                .any(|(state, n)| state == "delivered" && *n == 1)
+            store
+                .route_item(&item.id, &["luna".into(), "nina".into()], &owed(), 50)
+                .is_err()
         );
         assert!(
-            counts
-                .iter()
-                .any(|(state, n)| state == "expired" && *n == 1)
+            store.due_obligations(100).unwrap().is_empty(),
+            "all or nothing"
+        );
+        assert_eq!(
+            store.inbox_state(&item.id).unwrap().as_deref(),
+            Some("pending")
         );
     }
 
     #[test]
     fn an_epoch_change_keeps_state_keyed_by_buzz_or_pubkey() {
         let (_dir, mut store) = store();
+        let item = event(&key(), 9, 100);
         store
-            .park_target("e1", "luna", 0, &ParkedDelivery::default())
+            .store_fetched("chan-1", std::slice::from_ref(&item), None)
             .unwrap();
-        assert_eq!(store.due_targets(100).unwrap().len(), 1);
+        store
+            .route_item(&item.id, &["luna".into()], &owed(), 0)
+            .unwrap();
+        assert_eq!(store.due_obligations(100).unwrap().len(), 1);
 
         assert!(store.adopt_epoch("epoch-2".into()).unwrap());
         assert!(!store.adopt_epoch("epoch-2".into()).unwrap(), "idempotent");
         assert_eq!(
-            store.due_targets(100).unwrap().len(),
+            store.due_obligations(100).unwrap().len(),
             1,
-            "a parked target is keyed by Buzz event id, not an hcom id"
+            "an obligation is keyed by Buzz event id, not an hcom id"
         );
     }
 
@@ -1632,6 +2043,61 @@ mod tests {
                 .channel_id,
             "chan-2"
         );
+    }
+
+    #[test]
+    fn enrollment_state_is_per_agent_and_channel() {
+        let (_dir, store) = store();
+        let agent = derive_secret(&[7; 32], "luna@mbai");
+        let agent_pubkey = crate::buzz::nostr::public_hex(&agent);
+        assert!(store.enrollment(&agent_pubkey, "chan-1").unwrap().is_none());
+
+        store
+            .put_enrollment(&agent_pubkey, "chan-1", "enrolled")
+            .unwrap();
+        assert_eq!(
+            store
+                .enrollment(&agent_pubkey, "chan-1")
+                .unwrap()
+                .as_deref(),
+            Some("enrolled")
+        );
+        assert!(store.enrollment(&agent_pubkey, "chan-2").unwrap().is_none());
+        assert_eq!(store.enrolled_count().unwrap(), 1);
+
+        let rows = store.enrollments().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel_id, "chan-1");
+        assert_eq!(rows[0].state, "enrolled");
+
+        store.drop_enrollment(&agent_pubkey, "chan-1").unwrap();
+        assert_eq!(store.enrolled_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn read_only_view_reads_the_same_inbox() {
+        let (dir, store) = store();
+        let event = event(&key(), 9, 500);
+        store
+            .store_fetched("chan-1", std::slice::from_ref(&event), None)
+            .unwrap();
+
+        let path = dir.path().join("state.db");
+        let reader = Store::open_read_only(&path).unwrap();
+        let rows = reader.list_events(Some("chan-1"), None, None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].buzz_id, event.id);
+        assert_eq!(rows[0].kind, 9);
+        assert_eq!(reader.event_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn read_only_open_of_a_missing_db_names_the_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(err) = Store::open_read_only(&dir.path().join("state.db")) else {
+            panic!("a missing state DB must be an error, not an empty answer");
+        };
+        assert!(err.to_string().contains("hcom buzz serve"), "{err}");
     }
 
     #[test]
@@ -1770,62 +2236,6 @@ mod tests {
                 .len()
                 == 1
         );
-    }
-
-    #[test]
-    fn enrollment_state_is_per_agent_and_channel() {
-        let (_dir, store) = store();
-        let agent = derive_secret(&[7; 32], "luna@mbai");
-        let agent_pubkey = crate::buzz::nostr::public_hex(&agent);
-        assert!(store.enrollment(&agent_pubkey, "chan-1").unwrap().is_none());
-
-        store
-            .put_enrollment(&agent_pubkey, "chan-1", "enrolled")
-            .unwrap();
-        assert_eq!(
-            store
-                .enrollment(&agent_pubkey, "chan-1")
-                .unwrap()
-                .as_deref(),
-            Some("enrolled")
-        );
-        assert!(store.enrollment(&agent_pubkey, "chan-2").unwrap().is_none());
-        assert_eq!(store.enrolled_count().unwrap(), 1);
-
-        let rows = store.enrollments().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].channel_id, "chan-1");
-        assert_eq!(rows[0].state, "enrolled");
-
-        store.drop_enrollment(&agent_pubkey, "chan-1").unwrap();
-        assert_eq!(store.enrolled_count().unwrap(), 0);
-    }
-
-    #[test]
-    fn read_only_view_reads_the_same_cache() {
-        let (dir, store) = store();
-        let key = derive_secret(&[9; 32], "TEST@mbai");
-        let event = event(&key, 9, 500);
-        store
-            .cache_event(&cached_from_event(&event, "chan-1", None, None).unwrap())
-            .unwrap();
-
-        let path = dir.path().join("state.db");
-        let reader = Store::open_read_only(&path).unwrap();
-        let rows = reader.list_events(Some("chan-1"), None, None, 10).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].buzz_id, event.id);
-        assert_eq!(rows[0].kind, 9);
-        assert_eq!(reader.event_count().unwrap(), 1);
-    }
-
-    #[test]
-    fn read_only_open_of_a_missing_db_names_the_absence() {
-        let dir = tempfile::tempdir().unwrap();
-        let Err(err) = Store::open_read_only(&dir.path().join("state.db")) else {
-            panic!("a missing state DB must be an error, not an empty answer");
-        };
-        assert!(err.to_string().contains("hcom buzz serve"), "{err}");
     }
 
     #[test]

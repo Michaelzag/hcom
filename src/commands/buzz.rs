@@ -226,7 +226,8 @@ fn cmd_status(db: &HcomDb, args: &StatusArgs) -> i32 {
                 channels.push(json!({
                     "channel": row.slug,
                     "id": row.id,
-                    "cursor": row.cursor_created_at,
+                    "cursor": row.position.as_ref().map(|p| p.created_at),
+                    "cursor_id": row.position.as_ref().map(|p| p.id.clone()),
                 }));
             }
         }
@@ -247,13 +248,16 @@ fn cmd_status(db: &HcomDb, args: &StatusArgs) -> i32 {
         .find(|(state, _)| state == "failed")
         .map(|(_, count)| *count)
         .unwrap_or(0);
-    let parked_targets = store
-        .target_counts()
-        .unwrap_or_default()
-        .iter()
-        .find(|(state, _)| state == "parked")
-        .map(|(_, count)| *count)
-        .unwrap_or(0);
+    let count_of = |counts: &[(String, i64)], wanted: &str| {
+        counts
+            .iter()
+            .find(|(state, _)| state == wanted)
+            .map(|(_, count)| *count)
+            .unwrap_or(0)
+    };
+    let obligations = store.obligation_counts().unwrap_or_default();
+    let owed_deliveries = count_of(&obligations, "pending") + count_of(&obligations, "notice");
+    let inbox_pending = count_of(&store.inbox_counts().unwrap_or_default(), "pending");
     let people = store.people().unwrap_or_default();
     let enrolled = store.enrolled_count().unwrap_or(0);
     let errors = store.recent_errors(5).unwrap_or_default();
@@ -270,7 +274,8 @@ fn cmd_status(db: &HcomDb, args: &StatusArgs) -> i32 {
                 "channels": channels,
                 "parked": parked,
                 "outbox": {"pending": pending, "retry": retrying, "failed": failed},
-                "parked_targets": parked_targets,
+                "owed_deliveries": owed_deliveries,
+                "inbox_pending": inbox_pending,
                 "people": people.len(),
                 "people_active": people.iter().filter(|p| p.active).count(),
                 "enrolled": enrolled,
@@ -306,8 +311,9 @@ fn cmd_status(db: &HcomDb, args: &StatusArgs) -> i32 {
             );
         }
     }
+    println!("outbox:    {pending} pending, {retrying} retrying, {failed} failed");
     println!(
-        "outbox:    {pending} pending, {retrying} retrying, {failed} failed, {parked_targets} parked targets"
+        "inbound:   {inbox_pending} event(s) awaiting handling, {owed_deliveries} delivery(ies) owed"
     );
     println!(
         "people:    {} ({} active)",
@@ -708,38 +714,46 @@ fn identity_json(connector: &Connector, name: &str) -> Value {
 }
 
 /// `hcom buzz cursor set <slug> --since <unix>`: seed where a channel's
-/// backfill starts. Only while the connector is down, so nothing races it.
+/// catch-up starts. The whole command runs under the connector lock, so it
+/// refuses while `serve` runs and `serve` refuses to start until it is done.
 fn run_cursor_set(args: &CursorSetArgs) -> Result<()> {
-    if ServeLock::holder_pid(&Config::lock_path()).is_some_and(crate::sys::process::is_alive) {
-        bail!("hcom buzz serve is running; stop it (hcom buzz down) before moving a cursor");
-    }
     let config = Config::load()?;
     let channel = config.channel_by_slug(&args.channel).ok_or_else(|| {
         anyhow::anyhow!("'{}' is not a bridged channel in the config", args.channel)
     })?;
     let slug = channel.slug.clone().unwrap_or_else(|| channel.id.clone());
-    let store = Store::open(&Config::state_db_path())?;
-    set_cursor(&store, &channel.id, &slug, args.since, args.force)?;
+    with_connector_lock(|| {
+        let store = Store::open(&Config::state_db_path())?;
+        seed_cursor(&store, &channel.id, &slug, args.since, args.force)
+    })?;
     println!("{slug}: cursor at {}", args.since);
     Ok(())
 }
 
-/// Seed one channel's cursor. Moving it back would replay history into hcom,
-/// so that takes `force`.
-fn set_cursor(store: &Store, channel_id: &str, slug: &str, since: u64, force: bool) -> Result<()> {
+/// Run `work` holding the single-connector lock: the one `serve` holds for
+/// its lifetime. Refuses, rather than waits, when it is taken.
+fn with_connector_lock<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _lock = ServeLock::acquire(&Config::lock_path())
+        .map_err(|error| anyhow::anyhow!("{error}; stop it (hcom buzz down) first"))?;
+    work()
+}
+
+/// Seed one channel's position with a compare-and-set. Moving it back would
+/// replay history into hcom, so that takes `force`; without it a seed never
+/// lowers a position, even one another writer just moved.
+fn seed_cursor(store: &Store, channel_id: &str, slug: &str, since: u64, force: bool) -> Result<()> {
     store.upsert_channel(channel_id, slug)?;
+    if store.seed_position(channel_id, since, force)? {
+        return Ok(());
+    }
     let current = store
         .channel(channel_id)?
-        .and_then(|row| row.cursor_created_at);
-    if let Some(current) = current
-        && since < current
-        && !force
-    {
-        bail!(
-            "{slug}'s cursor is already at {current}; moving it back to {since} replays history (use --force)"
-        );
-    }
-    store.force_channel_cursor(channel_id, since)
+        .and_then(|row| row.position)
+        .map(|position| position.created_at)
+        .unwrap_or_default();
+    bail!(
+        "{slug}'s cursor is already at {current}; moving it back to {since} replays history (use --force)"
+    )
 }
 
 fn cmd_prepare(args: &PrepareArgs) -> i32 {
@@ -1025,22 +1039,89 @@ mod tests {
     fn a_seeded_cursor_never_moves_back_without_force() {
         let (_env, _relay, connector) = setup();
         let store = connector.store.lock();
-        set_cursor(&store, CHANNEL, "infra", 5_000, false).unwrap();
+        let position = |store: &Store| {
+            store
+                .channel(CHANNEL)
+                .unwrap()
+                .unwrap()
+                .position
+                .unwrap()
+                .created_at
+        };
+        seed_cursor(&store, CHANNEL, "infra", 5_000, false).unwrap();
         assert!(
-            set_cursor(&store, CHANNEL, "infra", 6_000, false).is_ok(),
+            seed_cursor(&store, CHANNEL, "infra", 6_000, false).is_ok(),
             "forward is fine"
         );
-        let refused = set_cursor(&store, CHANNEL, "infra", 4_000, false).unwrap_err();
+        let refused = seed_cursor(&store, CHANNEL, "infra", 4_000, false).unwrap_err();
         assert!(refused.to_string().contains("--force"), "{refused}");
-        assert_eq!(
-            store.channel(CHANNEL).unwrap().unwrap().cursor_created_at,
-            Some(6_000)
-        );
-        set_cursor(&store, CHANNEL, "infra", 4_000, true).unwrap();
-        assert_eq!(
-            store.channel(CHANNEL).unwrap().unwrap().cursor_created_at,
-            Some(4_000)
-        );
+        assert_eq!(position(&store), 6_000);
+        seed_cursor(&store, CHANNEL, "infra", 4_000, true).unwrap();
+        assert_eq!(position(&store), 4_000);
+    }
+
+    #[test]
+    #[serial]
+    fn racing_cursor_seeds_never_lose_the_newer_value() {
+        // Two `cursor set` commands that both read 5000 must not commit 7000
+        // and then 6000. Each seed runs on its own connection, as separate
+        // processes would, and every round races four of them.
+        let (_env, _relay, _connector) = setup();
+        let path = Config::state_db_path();
+        let first = Store::open(&path).unwrap();
+        first.upsert_channel(CHANNEL, "infra").unwrap();
+        for round in 0..200u64 {
+            let base = 10_000 + round * 10;
+            first.seed_position(CHANNEL, base, true).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let racers: Vec<_> = (1..=4u64)
+                .map(|step| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let store = Store::open(&path).unwrap();
+                        barrier.wait();
+                        let _ = seed_cursor(&store, CHANNEL, "infra", base + step, false);
+                    })
+                })
+                .collect();
+            for racer in racers {
+                racer.join().unwrap();
+            }
+            let position = first
+                .channel(CHANNEL)
+                .unwrap()
+                .unwrap()
+                .position
+                .unwrap()
+                .created_at;
+            assert_eq!(
+                position,
+                base + 4,
+                "round {round}: the newest seed survived"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_cursor_seed_and_serve_exclude_each_other() {
+        let (_env, _relay, _connector) = setup();
+        // While the command holds the lock, serve cannot take it.
+        with_connector_lock(|| {
+            assert!(
+                ServeLock::acquire(&Config::lock_path()).is_err(),
+                "serve refuses to start while a cursor command runs"
+            );
+            Ok(())
+        })
+        .unwrap();
+        // While serve holds it, the command refuses.
+        let serve = ServeLock::acquire(&Config::lock_path()).unwrap();
+        let refused = with_connector_lock(|| Ok(())).unwrap_err();
+        assert!(refused.to_string().contains("hcom buzz down"), "{refused}");
+        drop(serve);
+        assert!(with_connector_lock(|| Ok(())).is_ok(), "free again");
     }
 
     #[test]

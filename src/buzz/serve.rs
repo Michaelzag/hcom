@@ -2,8 +2,9 @@
 //!
 //! Composition root and loops. Composition: config, keys, the lock, both
 //! databases, hosted rows and one shared notify endpoint. Loops: a reader
-//! thread holding the channel subscriptions, and a main loop that owns both
-//! databases, delivers inbound traffic and drains the outbox.
+//! thread that fetches every bridged channel into the inbox (live
+//! subscriptions plus paged HTTP catch-up), and a main loop that owns hcom: it
+//! handles the inbox, delivers inbound obligations and drains the outbox.
 //!
 //! Nothing here exits the process because the relay misbehaved. Only config and
 //! key load failures at startup, and a lock held by a live process, return an
@@ -12,8 +13,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,7 @@ use crate::buzz::nostr::{self, Event, SecretKey, UnsignedEvent, auth_tag, public
 use crate::buzz::relay::{HttpRelay, PublishError, RelayMsg, WsSession};
 use crate::buzz::route::{self, AgentRoster, Ancestor, ChannelRow, InboundEvent, PersonRow};
 use crate::buzz::store::{
-    self, Author, AuthorKind, OutboxRow, ParkedDelivery, ParkedTarget, Store,
+    self, Author, AuthorKind, CachedEvent, InboxItem, Obligation, OutboxRow, OwedDelivery, Store,
 };
 use crate::db::HcomDb;
 
@@ -43,8 +44,9 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Gap between REQs, so one reconnect never spends the WS frame budget at once.
 const REQ_STAGGER: Duration = Duration::from_millis(700);
-/// How long an unresolvable inbound target keeps being retried.
-const PARK_WINDOW: Duration = Duration::from_secs(15 * 60);
+/// Longest wait between tries of one channel's catch-up, of a pending inbox
+/// item and of an unapplied roster: they retry forever, so they back off far.
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// HTTP calls per signing key per minute (the relay allows 300).
 pub const HTTP_PER_MINUTE: usize = 240;
 /// WS frames per 5 s window (the relay allows 50).
@@ -86,6 +88,10 @@ pub struct Connector {
     pub store: Arc<Mutex<Store>>,
     /// Hosted rows currently registered, kept in step by the main loop.
     pub hosted: Arc<Mutex<Vec<String>>>,
+    /// The reader key's HTTP budget. The relay limits per signing key, and
+    /// both the reader thread (catch-up pages) and the main loop (ancestor
+    /// and profile lookups) sign as the reader, so they draw from one bucket.
+    pub reader_budget: SharedBudget,
     pub shutdown: Arc<AtomicBool>,
 }
 
@@ -123,6 +129,7 @@ impl Connector {
             reader,
             store: Arc::new(Mutex::new(store)),
             hosted: Arc::new(Mutex::new(Vec::new())),
+            reader_budget: SharedBudget::new(HTTP_PER_MINUTE, Duration::from_secs(60)),
             shutdown: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -305,6 +312,41 @@ impl TokenBucket {
     }
 }
 
+/// One signing key's token bucket shared between threads, plus the relay's
+/// own `retry in Ns` hold for that key.
+#[derive(Clone)]
+pub struct SharedBudget {
+    inner: Arc<Mutex<(TokenBucket, Option<Instant>)>>,
+}
+
+impl SharedBudget {
+    pub fn new(capacity: usize, window: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new((TokenBucket::new(capacity, window), None))),
+        }
+    }
+
+    /// Take one token, or say how long to wait.
+    pub fn take(&self) -> Result<(), Duration> {
+        let mut inner = self.inner.lock();
+        if let Some(until) = inner.1 {
+            let now = Instant::now();
+            if now < until {
+                return Err(until - now);
+            }
+            inner.1 = None;
+        }
+        inner.0.take()
+    }
+
+    /// Honor a 429's `retry in Ns` for every request this key signs.
+    pub fn hold(&self, retry_after: Duration) {
+        let until = Instant::now() + retry_after.max(Duration::from_secs(1));
+        let mut inner = self.inner.lock();
+        inner.1 = Some(inner.1.map_or(until, |held| held.max(until)));
+    }
+}
+
 /// Exponential backoff with jitter, bounded.
 pub fn backoff(attempt: u32, min: Duration, max: Duration) -> Duration {
     let factor = 1u32 << attempt.min(16);
@@ -339,7 +381,9 @@ impl ServeLock {
             let holder = Self::holder_pid(path);
             match holder {
                 Some(pid) if crate::sys::process::is_alive(pid) => {
-                    bail!("hcom buzz serve is already running (pid {pid})");
+                    bail!(
+                        "the Buzz connector lock is held by pid {pid} (hcom buzz serve or a cursor command)"
+                    );
                 }
                 other => {
                     crate::log::log_warn(
@@ -350,7 +394,7 @@ impl ServeLock {
                 }
             }
             if !matches!(crate::sys::fs::try_lock_exclusive(&file), Ok(true)) {
-                bail!("hcom buzz serve is already running");
+                bail!("the Buzz connector lock is held (hcom buzz serve or a cursor command)");
             }
         }
 
@@ -373,25 +417,6 @@ impl Drop for ServeLock {
         let _ = crate::sys::fs::try_lock_exclusive(&self.file);
     }
 }
-
-/// One inbound relay message, handed from the reader thread to the main loop.
-#[derive(Clone)]
-pub struct InboundItem {
-    pub sub: String,
-    pub event: Event,
-}
-
-/// An inbound item whose handling failed on something transient (a store
-/// error, an ancestor fetch during a relay outage). It isn't marked seen, so
-/// it is retried here with backoff, and a restart's backfill still covers it.
-struct PendingInbound {
-    due: Instant,
-    attempts: u32,
-    item: InboundItem,
-}
-
-/// Attempts before a failing inbound item is left to the next backfill.
-const INBOUND_RETRIES: u32 = 8;
 
 /// Start the connector and run until shutdown. Returns the process exit code.
 pub fn serve(config: Config) -> Result<i32> {
@@ -416,21 +441,24 @@ pub fn serve(config: Config) -> Result<i32> {
     // Enrollment is HTTP and omp is the channel admin, so this is one write per
     // channel, done before the reader thread exists.
     let mut buckets: HashMap<String, TokenBucket> = HashMap::new();
+    let started = nostr::now();
     for channel in connector.channel_rows() {
         {
-            // The row is the durable cursor holder; without it the backfill
-            // always restarts from zero and `status` reports no channels.
+            // The row holds the durable read position. A channel bridged for
+            // the first time starts at now: it has no history the connector
+            // owes anyone, and recording that keeps a later restart's
+            // catch-up from starting at whatever "now" is then.
             let store = connector.store.lock();
             let _ = store.upsert_channel(&channel.id, &channel.slug);
+            let _ = store.start_position(&channel.id, started);
         }
         enroll_reader(&connector, &channel.id, &mut buckets);
     }
 
-    let (tx, rx) = mpsc::channel::<InboundItem>();
     let handles = reader_handles(&connector);
     let reader_thread = std::thread::Builder::new()
         .name("buzz-reader".into())
-        .spawn(move || reader_loop(handles, tx))
+        .spawn(move || reader_loop(handles))
         .context("cannot spawn reader thread")?;
 
     let shutdown_flag = connector.shutdown.clone();
@@ -439,8 +467,6 @@ pub fn serve(config: Config) -> Result<i32> {
         db,
         notify,
         epoch,
-        inbound: rx,
-        pending_inbound: Vec::new(),
         last_enroll: Instant::now(),
         last_stale_check: Instant::now(),
         buckets,
@@ -458,10 +484,11 @@ pub fn serve(config: Config) -> Result<i32> {
 /// The reader thread's own view of what it needs.
 struct ReaderHandles {
     relay_url: String,
-    /// `/query` for backfill: pageable, unlike a REQ's single stored batch.
+    /// `/query` for catch-up: pageable, unlike a REQ's single stored batch.
     http: HttpRelay,
     reader: AgentIdentity,
     reader_auth_tag: [String; 4],
+    budget: SharedBudget,
     channels: Vec<ChannelRow>,
     store: Arc<Mutex<Store>>,
     shutdown: Arc<AtomicBool>,
@@ -476,6 +503,7 @@ fn reader_handles(connector: &Connector) -> ReaderHandles {
         },
         reader: connector.reader.clone(),
         reader_auth_tag: connector.reader_auth_tag(),
+        budget: connector.reader_budget.clone(),
         channels: connector.channel_rows(),
         store: connector.store.clone(),
         shutdown: connector.shutdown.clone(),
@@ -574,11 +602,13 @@ fn register_hosted_rows(db: &HcomDb, connector: &Connector, port: u16) {
     }
 }
 
-/// The reader thread: one WS session as the reader key. Every (re)connect
-/// backfills each channel from its cursor over paged HTTP `/query`, oldest
-/// first, then opens one live REQ per channel. A failed session backs off
-/// 1 s → 60 s; only a session that stayed up resets the backoff.
-fn reader_loop(handles: ReaderHandles, tx: mpsc::Sender<InboundItem>) {
+/// The reader thread: one WS session as the reader key, and every fetched
+/// event stored straight into the inbox. Every (re)connect opens one live REQ
+/// per channel first; a channel is caught up over paged HTTP `/query` once its
+/// REQ is answered, so anything published after the catch-up's last page
+/// still arrives live. A failed session backs off 1 s → 60 s; only a session
+/// that stayed up resets the backoff.
+fn reader_loop(handles: ReaderHandles) {
     let mut attempt = 0u32;
     while !handles.shutdown.load(Ordering::SeqCst) {
         let started = Instant::now();
@@ -589,7 +619,7 @@ fn reader_loop(handles: ReaderHandles, tx: mpsc::Sender<InboundItem>) {
             WS_TIMEOUT,
         ) {
             Ok(mut session) => {
-                if run_session(&mut session, &handles, &tx) {
+                if run_session(&mut session, &handles) {
                     return;
                 }
             }
@@ -616,97 +646,165 @@ fn reader_loop(handles: ReaderHandles, tx: mpsc::Sender<InboundItem>) {
 /// A session that lasted this long was healthy: the next failure starts the
 /// backoff over rather than continuing it.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
-/// Events per backfill page; the relay's default and cap.
-const BACKFILL_PAGE: usize = 100;
-/// Most events one channel's backfill hands over before going live.
-const BACKFILL_MAX: usize = 10_000;
+/// Events asked for per catch-up page. The relay clamps this to its own
+/// maximum; the walk doesn't care, because only an empty page ends it.
+const CATCH_UP_PAGE: usize = 500;
 
-/// One session: backfill, subscribe, pump. True when shutting down.
-fn run_session(
-    session: &mut WsSession,
-    handles: &ReaderHandles,
-    tx: &mpsc::Sender<InboundItem>,
-) -> bool {
-    // Live subscriptions start a little before the backfill does, so nothing
-    // lands in between; the overlap is deduped by Buzz id.
-    let live_since = nostr::now().saturating_sub(5);
-    for channel in &handles.channels {
-        match backfill_channel(handles, channel) {
-            Ok(events) => {
-                for event in events {
-                    let item = InboundItem {
-                        sub: sub_id(&channel.slug),
-                        event,
-                    };
-                    if tx.send(item).is_err() {
-                        return true;
-                    }
-                }
-            }
-            Err(error) => {
-                crate::log::log_warn(
-                    "buzz",
-                    "serve.backfill_failed",
-                    &format!("{}: {error}", channel.slug),
-                );
-                return false;
-            }
-        }
-    }
+/// One session: subscribe, then pump, catching each channel up once its
+/// subscription is answered. True when shutting down.
+fn run_session(session: &mut WsSession, handles: &ReaderHandles) -> bool {
+    // The live filter starts the relay's admission window (plus skew) before
+    // now: a publication backdated by up to 900 s that arrives live after the
+    // catch-up's last page is still inside it.
+    let live_since = nostr::now().saturating_sub(store::BACKFILL_SLACK_SECS);
     if let Err(error) = subscribe_all(session, handles, live_since) {
         crate::log::log_warn("buzz", "serve.reader_subscribe", &error.to_string());
         return false;
     }
-    pump_session(session, handles, tx, live_since)
+    pump_session(session, handles, live_since)
 }
 
-/// Everything in one channel since its cursor (less the relay's 960 s
-/// admission slack), oldest first, paged with `until` because the relay
-/// answers at most 100 events, newest first. A channel with no cursor yet
-/// starts at now: it has no history the connector owes anyone.
-fn backfill_channel(handles: &ReaderHandles, channel: &ChannelRow) -> Result<Vec<Event>> {
-    let cursor = handles
+/// Catch one channel up: everything from its read position less the admission
+/// slack to now, plus its newest roster, stored in one transaction that moves
+/// the position. An error stores nothing and moves nothing.
+fn catch_up(handles: &ReaderHandles, channel: &ChannelRow) -> Result<usize> {
+    let position = handles
         .store
         .lock()
         .channel(&channel.id)?
-        .and_then(|row| row.cursor_created_at)
-        .unwrap_or_else(nostr::now);
-    let since = cursor.saturating_sub(store::BACKFILL_SLACK_SECS);
-    let tag = serde_json::to_string(&handles.reader_auth_tag)?;
+        .and_then(|row| row.position);
+    let since = position
+        .map_or_else(nostr::now, |position| position.created_at)
+        .saturating_sub(store::BACKFILL_SLACK_SECS);
+    let mut events = walk_channel(handles, &channel.id, since)?;
+    events.extend(newest_rosters(handles, &channel.id)?);
+    handles
+        .store
+        .lock()
+        .store_fetched(&channel.id, &events, Some(nostr::now()))
+}
 
-    let mut events: Vec<Event> = Vec::new();
+/// Every event in one channel from `since` on, or an error: never a partial
+/// answer. Walks the relay's `created_at DESC, id ASC` order with the
+/// composite `(until, before_id)` cursor from the last row of each page
+/// (`until` alone re-reads a same-second batch and loses the rest of it), and
+/// ends only on an empty page, because a short page may just be the relay
+/// clamping its limit. A page that adds nothing, a cursor that doesn't move or
+/// an event failing its own signature is an error. There is no count cap.
+fn walk_channel(handles: &ReaderHandles, channel_id: &str, since: u64) -> Result<Vec<Event>> {
+    let mut events = Vec::new();
     let mut ids = std::collections::HashSet::new();
-    let mut until: Option<u64> = None;
+    let mut cursor: Option<(u64, String)> = None;
     loop {
         // Always carry kinds: the relay refuses an unscoped query filter.
         let mut filter = json!({
             "kinds": store::CHANNEL_KINDS,
-            "#h": [channel.id],
+            "#h": [channel_id],
             "since": since,
-            "limit": BACKFILL_PAGE,
+            "limit": CATCH_UP_PAGE,
         });
-        if let Some(until) = until {
+        if let Some((until, before_id)) = &cursor {
             filter["until"] = json!(until);
+            filter["before_id"] = json!(before_id);
         }
-        let page = handles
-            .http
-            .query(&filter, &handles.reader.key, Some(&tag))?;
-        let full = page.len() >= BACKFILL_PAGE;
-        let oldest = page.iter().map(|event| event.created_at).min();
-        let before = events.len();
-        events.extend(
-            page.into_iter()
-                .filter(|event| ids.insert(event.id.clone())),
-        );
-        // `until` is inclusive, so a page ending mid-second is re-read and
-        // deduped; a page that brings nothing new means we are done.
-        if !full || events.len() == before || events.len() >= BACKFILL_MAX {
-            break;
+        let page = reader_query(handles, &filter)?;
+        if page.is_empty() {
+            return Ok(events);
         }
-        until = oldest;
+        if let Some(bad) = page.iter().find(|event| !nostr::verify(event)) {
+            bail!("relay returned {} failing its own signature check", bad.id);
+        }
+        // The last row in the relay's order: the oldest second, and the
+        // largest id within it.
+        let last = page
+            .iter()
+            .min_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            })
+            .map(|event| (event.created_at, event.id.clone()))
+            .expect("page is not empty");
+        let known = ids.len();
+        for event in page {
+            if ids.insert(event.id.clone()) {
+                events.push(event);
+            }
+        }
+        if ids.len() == known {
+            bail!("relay repeated a page without advancing; refusing an incomplete catch-up");
+        }
+        if cursor.as_ref() == Some(&last) {
+            bail!("relay cursor did not advance; refusing an incomplete catch-up");
+        }
+        cursor = Some(last);
     }
-    events.sort_by_key(|event| event.created_at);
-    Ok(events)
+}
+
+/// A channel's roster, asked for by `d`. Rosters are replaceable, so the
+/// newest can be older than any catch-up window, yet it is what names the
+/// people whose messages the catch-up just fetched.
+fn newest_rosters(handles: &ReaderHandles, channel_id: &str) -> Result<Vec<Event>> {
+    let filter = json!({ "kinds": [route::KIND_ROSTER], "#d": [channel_id] });
+    let rosters = reader_query(handles, &filter)?;
+    if let Some(bad) = rosters.iter().find(|event| !nostr::verify(event)) {
+        bail!(
+            "relay returned roster {} failing its own signature check",
+            bad.id
+        );
+    }
+    Ok(rosters
+        .into_iter()
+        .filter(|event| route::tag(event, "d") == Some(channel_id))
+        .collect())
+}
+
+/// One `/query` signed as the reader, drawing on the reader key's shared
+/// budget and waiting it out unless the process is stopping.
+fn reader_query(handles: &ReaderHandles, filter: &Value) -> Result<Vec<Event>> {
+    while let Err(wait) = handles.budget.take() {
+        if sleep_unless(&handles.shutdown, wait) {
+            bail!("shutting down");
+        }
+    }
+    let tag = serde_json::to_string(&handles.reader_auth_tag)?;
+    handles
+        .http
+        .query(filter, &handles.reader.key, Some(&tag))
+        .map_err(|error| {
+            if let PublishError::RateLimited { retry_after } = &error {
+                handles.budget.hold(*retry_after);
+            }
+            anyhow!("{error}")
+        })
+}
+
+/// Store one live event. A bad signature is logged and dropped: the relay
+/// hands the genuine event to the next catch-up. The position moves only once
+/// this session caught the channel up; before that, a live event newer than
+/// the unfetched gap must not carry the position past it. An error means the
+/// event isn't stored, so the session ends and the reconnect's catch-up
+/// fetches it again.
+fn ingest_live(
+    handles: &ReaderHandles,
+    channel_id: &str,
+    event: Event,
+    caught_up: bool,
+) -> Result<()> {
+    if !nostr::verify(&event) {
+        crate::log::log_warn(
+            "buzz",
+            "serve.bad_signature",
+            &format!("{} failed signature verification", event.id),
+        );
+        return Ok(());
+    }
+    handles.store.lock().store_fetched(
+        channel_id,
+        std::slice::from_ref(&event),
+        caught_up.then(nostr::now),
+    )?;
+    Ok(())
 }
 
 /// The live filter for one channel.
@@ -740,36 +838,82 @@ fn sub_id(slug: &str) -> String {
     format!("buzz-{slug}")
 }
 
+/// One channel's read state within a session. Each channel runs on its own
+/// schedule, so one failing or closed channel never holds the others.
+#[derive(Default)]
+struct ChannelSync {
+    /// A catch-up completed this session: live events may move the position.
+    caught_up: bool,
+    /// The subscription is answered and a catch-up is owed, from this time.
+    catch_up_at: Option<Instant>,
+    /// Catch-up failures in a row, for this channel's backoff.
+    failures: u32,
+    /// CLOSED: request the subscription again at this time.
+    reopen_at: Option<Instant>,
+    /// CLOSED answers in a row, for this channel's backoff.
+    closes: u32,
+}
+
 /// Read one session until it fails or the process stops. True when shutting
-/// down; false hands the session back to the reconnect loop. A CLOSED channel
-/// is parked and re-requested with backoff (the usual cause, not yet being a
-/// member, fixes itself once omp's 9000 lands); its first event unparks it.
-fn pump_session(
-    session: &mut WsSession,
-    handles: &ReaderHandles,
-    tx: &mpsc::Sender<InboundItem>,
-    since: u64,
-) -> bool {
-    let mut closed: HashMap<String, (Instant, u32)> = HashMap::new();
+/// down; false hands the session back to the reconnect loop.
+///
+/// A channel's catch-up runs once its subscription is answered (EOSE), and
+/// again with backoff if it fails. A CLOSED channel is parked and requested
+/// again with backoff (the usual cause, not yet being a member, fixes itself
+/// once omp's 9000 lands); when it is answered it gets a full catch-up, so the
+/// gap while it was closed is drained from the old position, not skipped.
+fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) -> bool {
+    let mut sync: HashMap<String, ChannelSync> = handles
+        .channels
+        .iter()
+        .map(|channel| (channel.id.clone(), ChannelSync::default()))
+        .collect();
     while !handles.shutdown.load(Ordering::SeqCst) {
-        let now = Instant::now();
-        let due: Vec<String> = closed
-            .iter()
-            .filter(|(_, (at, _))| *at <= now)
-            .map(|(sub, _)| sub.clone())
-            .collect();
-        for sub in due {
-            let Some(channel_id) = channel_for_sub(&handles.channels, &sub) else {
-                closed.remove(&sub);
-                continue;
-            };
-            if let Err(error) = session.req(&sub, &[live_filter(&channel_id, since)]) {
-                crate::log::log_warn("buzz", "serve.reader_error", &error.to_string());
-                return false;
+        for channel in &handles.channels {
+            let state = sync
+                .get_mut(&channel.id)
+                .expect("every channel has a state");
+            let now = Instant::now();
+            if state.reopen_at.is_some_and(|at| at <= now) {
+                if let Err(error) =
+                    session.req(&sub_id(&channel.slug), &[live_filter(&channel.id, since)])
+                {
+                    crate::log::log_warn("buzz", "serve.reader_error", &error.to_string());
+                    return false;
+                }
+                // Wait for the answer before scheduling another try.
+                state.reopen_at = Some(now + BACKOFF_MAX);
             }
-            // Wait for the answer before scheduling another try.
-            if let Some((at, _)) = closed.get_mut(&sub) {
-                *at = now + BACKOFF_MAX;
+            if state.catch_up_at.is_some_and(|at| at <= now) {
+                match catch_up(handles, channel) {
+                    Ok(stored) => {
+                        state.caught_up = true;
+                        state.catch_up_at = None;
+                        state.failures = 0;
+                        crate::log::log_info(
+                            "buzz",
+                            "serve.caught_up",
+                            &format!("{}: {stored} new event(s)", channel.slug),
+                        );
+                    }
+                    Err(error) => {
+                        state.failures = state.failures.saturating_add(1);
+                        let wait = backoff(state.failures, BACKOFF_MIN, RETRY_BACKOFF_MAX);
+                        state.catch_up_at = Some(Instant::now() + wait);
+                        crate::log::log_warn(
+                            "buzz",
+                            "serve.catch_up_failed",
+                            &format!(
+                                "{}: {error}; retrying in {}s",
+                                channel.slug,
+                                wait.as_secs().max(1)
+                            ),
+                        );
+                    }
+                }
+                if handles.shutdown.load(Ordering::SeqCst) {
+                    return true;
+                }
             }
         }
 
@@ -780,27 +924,56 @@ fn pump_session(
             }
             Ok(None) => {}
             Ok(Some(RelayMsg::Event { sub, event })) => {
-                unpark(handles, &mut closed, &sub);
-                if tx.send(InboundItem { sub, event }).is_err() {
-                    return true;
+                let Some(channel) = channel_for_sub(&handles.channels, &sub) else {
+                    crate::log::log_warn("buzz", "serve.unknown_sub", &sub);
+                    continue;
+                };
+                let state = sync
+                    .get_mut(&channel.id)
+                    .expect("every channel has a state");
+                reopened(handles, state, channel);
+                if let Err(error) = ingest_live(handles, &channel.id, event, state.caught_up) {
+                    crate::log::log_warn(
+                        "buzz",
+                        "serve.store_failed",
+                        &format!("{}: {error}; reconnecting to catch up", channel.slug),
+                    );
+                    return false;
                 }
             }
             Ok(Some(RelayMsg::Eose(sub))) => {
-                unpark(handles, &mut closed, &sub);
+                let Some(channel) = channel_for_sub(&handles.channels, &sub) else {
+                    continue;
+                };
+                let state = sync
+                    .get_mut(&channel.id)
+                    .expect("every channel has a state");
+                reopened(handles, state, channel);
+                // From here on the subscription carries everything new, so a
+                // catch-up now leaves no gap behind it.
+                if !state.caught_up && state.catch_up_at.is_none() {
+                    state.catch_up_at = Some(Instant::now());
+                }
                 crate::log::log_info("buzz", "serve.subscribed", &sub);
             }
             Ok(Some(RelayMsg::Closed { sub, reason })) => {
+                let Some(channel) = channel_for_sub(&handles.channels, &sub) else {
+                    continue;
+                };
                 // One closed subscription parks its channel; the rest keep
                 // running, so a single failure never stops the connector.
-                if let Some(channel_id) = channel_for_sub(&handles.channels, &sub) {
-                    let _ = handles
-                        .store
-                        .lock()
-                        .set_channel_parked(&channel_id, Some(&reason));
-                }
-                let attempts = closed.get(&sub).map_or(0, |(_, n)| *n);
-                let wait = backoff(attempts, BACKOFF_MIN, BACKOFF_MAX);
-                closed.insert(sub.clone(), (Instant::now() + wait, attempts + 1));
+                let _ = handles
+                    .store
+                    .lock()
+                    .set_channel_parked(&channel.id, Some(&reason));
+                let state = sync
+                    .get_mut(&channel.id)
+                    .expect("every channel has a state");
+                state.caught_up = false;
+                state.catch_up_at = None;
+                let wait = backoff(state.closes, BACKOFF_MIN, BACKOFF_MAX);
+                state.closes = state.closes.saturating_add(1);
+                state.reopen_at = Some(Instant::now() + wait);
                 crate::log::log_warn(
                     "buzz",
                     "serve.channel_closed",
@@ -828,23 +1001,19 @@ fn pump_session(
     true
 }
 
-/// A subscription answered: its channel is live again.
-fn unpark(handles: &ReaderHandles, closed: &mut HashMap<String, (Instant, u32)>, sub: &str) {
-    if closed.remove(sub).is_some()
-        && let Some(channel_id) = channel_for_sub(&handles.channels, sub)
-    {
-        let _ = handles.store.lock().set_channel_parked(&channel_id, None);
-        crate::log::log_info("buzz", "serve.channel_unparked", sub);
+/// A closed subscription answered: its channel is live again.
+fn reopened(handles: &ReaderHandles, state: &mut ChannelSync, channel: &ChannelRow) {
+    if state.reopen_at.take().is_some() {
+        state.closes = 0;
+        let _ = handles.store.lock().set_channel_parked(&channel.id, None);
+        crate::log::log_info("buzz", "serve.channel_unparked", &channel.slug);
     }
 }
 
-/// Channel id behind a `buzz-<slug>` subscription id.
-fn channel_for_sub(channels: &[ChannelRow], sub: &str) -> Option<String> {
+/// The channel behind a `buzz-<slug>` subscription id.
+fn channel_for_sub<'a>(channels: &'a [ChannelRow], sub: &str) -> Option<&'a ChannelRow> {
     let slug = sub.strip_prefix("buzz-")?;
-    channels
-        .iter()
-        .find(|c| c.slug == slug)
-        .map(|c| c.id.clone())
+    channels.iter().find(|c| c.slug == slug)
 }
 
 /// Sleep unless shutdown arrives first. True when shutdown was requested.
@@ -860,14 +1029,13 @@ fn sleep_unless(shutdown: &AtomicBool, wait: Duration) -> bool {
     shutdown.load(Ordering::SeqCst)
 }
 
-/// The main loop. Owns both databases: it is the only writer to them.
+/// The main loop. Owns hcom: it handles the inbox the reader thread fills,
+/// delivers inbound obligations and drains the outbox.
 struct MainLoop {
     connector: Connector,
     db: HcomDb,
     notify: crate::notify::NotifyServer,
     epoch: String,
-    inbound: mpsc::Receiver<InboundItem>,
-    pending_inbound: Vec<PendingInbound>,
     last_enroll: Instant,
     last_stale_check: Instant,
     buckets: HashMap<String, TokenBucket>,
@@ -879,30 +1047,21 @@ struct MainLoop {
 }
 
 impl MainLoop {
-    /// Build a loop around an already-loaded connector, keeping the sending half
-    /// of the inbound channel so a test can inject exactly what the reader
-    /// thread would have handed over.
+    /// Build a loop around an already-loaded connector. A test stores events
+    /// with `ingest_live`, exactly as the reader thread does.
     #[cfg(test)]
-    fn for_test(
-        connector: Connector,
-        db: HcomDb,
-        epoch: String,
-    ) -> (Self, mpsc::Sender<InboundItem>) {
-        let (tx, rx) = mpsc::channel();
-        let loop_self = Self {
+    fn for_test(connector: Connector, db: HcomDb, epoch: String) -> Self {
+        Self {
             connector,
             db,
             notify: crate::notify::NotifyServer::new().expect("notify endpoint"),
             epoch,
-            inbound: rx,
-            pending_inbound: Vec::new(),
             last_enroll: Instant::now(),
             last_stale_check: Instant::now(),
             buckets: HashMap::new(),
             held_until: HashMap::new(),
             draining: false,
-        };
-        (loop_self, tx)
+        }
     }
 
     /// One iteration of the main loop: inbound, tick, enrollment. Returns the
@@ -954,7 +1113,7 @@ impl MainLoop {
         self.connector.hosted.lock().clone()
     }
 
-    /// One pass: heartbeat, epoch check, re-register, parked retries, outbound.
+    /// One pass: heartbeat, epoch check, re-register, outbound.
     fn tick(&mut self) {
         if let Err(error) =
             crate::hosted::heartbeat_hosted(&self.db, crate::hosted::HOSTED_TOOL_BUZZ)
@@ -968,7 +1127,6 @@ impl MainLoop {
             self.adopt_new_database();
         }
         self.reregister_missing_rows();
-        self.retry_parked_targets();
         self.scan_outbound();
         self.flush_all_channels();
         if self.last_stale_check.elapsed() >= Duration::from_secs(60) {
@@ -1052,52 +1210,72 @@ impl MainLoop {
         }
     }
 
-    /// Retry parked inbound targets; after the window, say so in Buzz as omp.
-    fn retry_parked_targets(&mut self) {
+    /// Work every due obligation: deliver it, or back it off, or (once its
+    /// window closed) post the "isn't running" notice and close it. Each
+    /// obligation is its own unit: one target failing never holds another,
+    /// and nothing is dropped for failing.
+    fn deliver_obligations(&mut self) {
         let now = crate::shared::time::now_epoch_i64();
-        let due = self
-            .connector
-            .store
-            .lock()
-            .due_targets(now)
-            .unwrap_or_default();
-        for target in due {
-            match self.deliver_parked(&target) {
-                Ok(true) => {
-                    let _ = self.connector.store.lock().update_target(
-                        &target.buzz_id,
-                        &target.target,
-                        "delivered",
-                        0,
+        let due = match self.connector.store.lock().due_obligations(now) {
+            Ok(due) => due,
+            Err(error) => {
+                crate::log::log_warn("buzz", "serve.obligations_unreadable", &error.to_string());
+                return;
+            }
+        };
+        for mut obligation in due {
+            if obligation.state != "notice" {
+                match self.deliver_obligation(&obligation) {
+                    Ok(true) => {
+                        if let Err(error) = self
+                            .connector
+                            .store
+                            .lock()
+                            .obligation_delivered(&obligation.buzz_id, &obligation.target)
+                        {
+                            // Sent but not recorded: the next pass sends it
+                            // again. At least once, never lost.
+                            crate::log::log_warn(
+                                "buzz",
+                                "serve.delivered_unrecorded",
+                                &error.to_string(),
+                            );
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => crate::log::log_warn(
+                        "buzz",
+                        "serve.deliver_failed",
+                        &format!("{} -> {}: {error}", obligation.buzz_id, obligation.target),
+                    ),
+                }
+                if now.saturating_sub(obligation.first_at) < store::OBLIGATION_WINDOW_SECS {
+                    let attempts = obligation.attempts.saturating_add(1);
+                    let _ = self.connector.store.lock().defer_obligation(
+                        &obligation.buzz_id,
+                        &obligation.target,
+                        attempts,
+                        now + park_retry_delay(attempts),
                     );
                     continue;
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    crate::log::log_warn("buzz", "serve.park_failed", &error.to_string());
+                // The window closed. The notice is signed once and stored, so
+                // however often posting it is retried, Buzz sees one notice.
+                let notice = serde_json::to_string(&self.undelivered_notice(&obligation))
+                    .expect("event serializes");
+                if let Err(error) = self.connector.store.lock().obligation_notice(
+                    &obligation.buzz_id,
+                    &obligation.target,
+                    &notice,
+                ) {
+                    crate::log::log_warn("buzz", "serve.notice_unrecorded", &error.to_string());
+                    continue;
                 }
+                obligation.state = "notice".into();
+                obligation.notice_json = Some(notice);
             }
-
-            let parked_for = now.saturating_sub(target.first_parked_at);
-            if parked_for < PARK_WINDOW.as_secs() as i64 {
-                let attempts = target.attempts.saturating_add(1);
-                let next = now + park_retry_delay(attempts);
-                let _ = self.connector.store.lock().update_target(
-                    &target.buzz_id,
-                    &target.target,
-                    "parked",
-                    next,
-                );
-                continue;
-            }
-            // The window is over: the channel is told, as omp, in the same
-            // thread. The cursor moved on regardless, so nothing stalls.
-            self.announce_undelivered(&target);
-            let _ = self
-                .connector
-                .store
-                .lock()
-                .expire_targets(&target.buzz_id, &target.target);
+            self.post_notice(&obligation);
         }
     }
 
@@ -1114,17 +1292,13 @@ impl MainLoop {
             })
     }
 
-    /// Resend one parked target exactly what was routed for it: from the
-    /// person, in the Buzz thread. `Ok(true)` once hcom delivered it.
-    fn deliver_parked(&mut self, target: &ParkedTarget) -> Result<bool> {
-        if !self.is_routable(&target.target) {
+    /// Send one target exactly what was routed for it: from the person, in the
+    /// Buzz thread. `Ok(true)` once hcom delivered it.
+    fn deliver_obligation(&mut self, obligation: &Obligation) -> Result<bool> {
+        if !self.is_routable(&obligation.target) {
             return Ok(false);
         }
-        let owed = &target.delivery;
-        self.connector
-            .store
-            .lock()
-            .put_thread(&owed.thread, &owed.channel_id, &owed.root_id)?;
+        let owed = &obligation.delivery;
         let delivered_to = crate::commands::send::send_message(
             &self.db,
             &hosted_identity(&owed.sender),
@@ -1133,29 +1307,31 @@ impl MainLoop {
                 thread: Some(owed.thread.clone()),
                 ..Default::default()
             }),
-            Some(std::slice::from_ref(&target.target)),
+            Some(std::slice::from_ref(&obligation.target)),
         )
         .map_err(|error| anyhow!("{error}"))?;
-        let reached = delivered_to.iter().any(|name| name == &target.target);
+        let reached = delivered_to.iter().any(|name| name == &obligation.target);
         if reached {
             crate::log::log_info(
                 "buzz",
-                "serve.park_delivered",
-                &format!("{} -> {}", target.buzz_id, target.target),
+                "serve.delivered",
+                &format!(
+                    "{} -> {} ({})",
+                    owed.sender, obligation.target, obligation.buzz_id
+                ),
             );
         }
         Ok(reached)
     }
 
-    /// Post the "isn't running — not delivered" notice as omp, in the thread
-    /// the message belonged to.
-    fn announce_undelivered(&mut self, target: &ParkedTarget) {
-        let owed = &target.delivery;
-        let text = format!("{} isn't running — not delivered", target.target);
-        // Posted as omp's own key: it is a relay member and the channel admin, so
-        // no enrollment or delegation is needed, and the notice reads as coming
-        // from omp rather than from whichever agent failed.
-        let event = sign(
+    /// The "isn't running — not delivered" notice for one closed obligation,
+    /// as omp, in the thread the message belonged to. Posted as omp's own key:
+    /// it is a relay member and the channel admin, so no enrollment or
+    /// delegation is needed, and the notice reads as coming from omp rather
+    /// than from whichever agent failed.
+    fn undelivered_notice(&self, obligation: &Obligation) -> Event {
+        let owed = &obligation.delivery;
+        sign(
             UnsignedEvent {
                 created_at: nostr::now(),
                 kind: route::KIND_MESSAGE,
@@ -1164,25 +1340,104 @@ impl MainLoop {
                     root_id: Some(owed.root_id.clone()),
                     mentions: Vec::new(),
                 }),
-                content: text,
+                content: format!("{} isn't running — not delivered", obligation.target),
             },
             &self.connector.owner,
-        );
+        )
+    }
+
+    /// Post a closed obligation's stored notice. Transient failures retry the
+    /// same event with backoff; a notice the relay will never take closes the
+    /// obligation with the reason logged.
+    fn post_notice(&mut self, obligation: &Obligation) {
+        let now = crate::shared::time::now_epoch_i64();
+        let retry = |main: &mut Self, next_at: i64, why: &str| {
+            crate::log::log_warn(
+                "buzz",
+                "serve.not_delivered_retry",
+                &format!("{} {}: {why}", obligation.buzz_id, obligation.target),
+            );
+            let _ = main.connector.store.lock().defer_obligation(
+                &obligation.buzz_id,
+                &obligation.target,
+                obligation.attempts.saturating_add(1),
+                next_at,
+            );
+        };
+        let Some(event) = obligation
+            .notice_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Event>(json).ok())
+        else {
+            crate::log::log_error(
+                "buzz",
+                "serve.not_delivered_failed",
+                &format!(
+                    "{} {}: unreadable notice",
+                    obligation.buzz_id, obligation.target
+                ),
+            );
+            let _ = self
+                .connector
+                .store
+                .lock()
+                .obligation_expired(&obligation.buzz_id, &obligation.target);
+            return;
+        };
+        let owner_pubkey = self.connector.owner_pubkey.clone();
+        if let Err(wait) = self.take_http_token(&owner_pubkey) {
+            retry(
+                self,
+                now + wait.as_secs().max(1) as i64,
+                "HTTP bucket exhausted",
+            );
+            return;
+        }
         match self
             .connector
             .http
             .post_event(&event, &self.connector.owner, None)
         {
-            Ok(()) => crate::log::log_info(
-                "buzz",
-                "serve.not_delivered",
-                &format!("{}: {}", target.buzz_id, target.target),
-            ),
-            Err(error) => crate::log::log_warn(
-                "buzz",
-                "serve.not_delivered_failed",
-                &format!("{}: {error}", target.target),
-            ),
+            Ok(()) => {
+                crate::log::log_info(
+                    "buzz",
+                    "serve.not_delivered",
+                    &format!("{}: {}", obligation.buzz_id, obligation.target),
+                );
+                let _ = self
+                    .connector
+                    .store
+                    .lock()
+                    .obligation_expired(&obligation.buzz_id, &obligation.target);
+            }
+            Err(PublishError::RateLimited { retry_after }) => {
+                self.hold_key(&owner_pubkey, retry_after);
+                retry(
+                    self,
+                    now + retry_after.as_secs().max(1) as i64,
+                    "rate limited",
+                );
+            }
+            Err(
+                error @ (PublishError::Server(_)
+                | PublishError::Transport(_)
+                | PublishError::Timeout),
+            ) => {
+                let next = now + post_retry_delay(obligation.attempts).as_secs() as i64;
+                retry(self, next, &error.to_string());
+            }
+            Err(error) => {
+                crate::log::log_error(
+                    "buzz",
+                    "serve.not_delivered_failed",
+                    &format!("{} {}: {error}", obligation.buzz_id, obligation.target),
+                );
+                let _ = self
+                    .connector
+                    .store
+                    .lock()
+                    .obligation_expired(&obligation.buzz_id, &obligation.target);
+            }
         }
     }
 
@@ -1867,139 +2122,243 @@ impl MainLoop {
             .collect()
     }
 
-    /// Handle every inbound relay message: verify, dedupe, cache, deliver.
-    /// Items that failed on something transient are retried with backoff
-    /// first; they were never marked seen, so a restart's backfill also covers
-    /// them.
+    /// One pass over the inbound side, in the model's order: configured
+    /// people, then per channel its newest roster and its due inbox items
+    /// (oldest first), then every due obligation. Nothing here drops work: a
+    /// failure leaves the item or the obligation pending with backoff.
     fn drain_inbound(&mut self) {
-        let now = Instant::now();
-        let (due, waiting): (Vec<PendingInbound>, Vec<PendingInbound>) =
-            std::mem::take(&mut self.pending_inbound)
-                .into_iter()
-                .partition(|pending| pending.due <= now);
-        self.pending_inbound = waiting;
-        for pending in due {
-            self.handle_or_requeue(pending.item, pending.attempts);
+        self.ensure_configured_people();
+        let now = crate::shared::time::now_epoch_i64();
+        for channel in self.connector.channel_rows() {
+            self.apply_roster(&channel);
+            let due = match self.connector.store.lock().due_inbox(&channel.id, now) {
+                Ok(due) => due,
+                Err(error) => {
+                    crate::log::log_warn("buzz", "serve.inbox_unreadable", &error.to_string());
+                    continue;
+                }
+            };
+            for item in due {
+                self.handle_item(&channel, item);
+            }
         }
-        while let Ok(item) = self.inbound.try_recv() {
-            self.handle_or_requeue(item, 0);
+        self.deliver_obligations();
+        if let Err(error) = self.connector.store.lock().finish_routed() {
+            crate::log::log_warn("buzz", "serve.finish_failed", &error.to_string());
         }
     }
 
-    fn handle_or_requeue(&mut self, item: InboundItem, attempts: u32) {
-        let Err(error) = self.handle_inbound(item.clone()) else {
-            return;
-        };
-        if attempts + 1 >= INBOUND_RETRIES {
-            crate::log::log_error(
-                "buzz",
-                "serve.inbound_gave_up",
-                &format!("{}: {error}; left to the next backfill", item.event.id),
-            );
-            return;
-        }
-        crate::log::log_warn(
-            "buzz",
-            "serve.inbound_retry",
-            &format!("{}: {error}", item.event.id),
-        );
-        self.pending_inbound.push(PendingInbound {
-            due: Instant::now() + backoff(attempts, BACKOFF_MIN, BACKOFF_MAX),
-            attempts: attempts + 1,
-            item,
-        });
-    }
-
-    /// Handle one inbound event to completion. It is marked seen only at the
-    /// end, once delivered, parked or skipped; an error leaves it unseen.
-    fn handle_inbound(&mut self, item: InboundItem) -> Result<()> {
-        let event = item.event;
-        if !nostr::verify(&event) {
-            crate::log::log_warn(
-                "buzz",
-                "serve.bad_signature",
-                &format!("{} failed signature verification", event.id),
-            );
-            return Ok(());
-        }
-        let Some(channel) = self
+    /// Configured people are people from the first pass, before any roster
+    /// names them. A configured person the rosters later retired stays
+    /// retired: only a missing row is created.
+    fn ensure_configured_people(&mut self) {
+        let configured: Vec<(String, String, Option<String>)> = self
             .connector
-            .channel_rows()
-            .into_iter()
-            .find(|c| item.sub == sub_id(&c.slug))
-        else {
-            crate::log::log_warn(
-                "buzz",
-                "serve.unknown_sub",
-                &format!("event on unknown subscription {}", item.sub),
+            .config
+            .people
+            .iter()
+            .filter_map(|person| {
+                Some((
+                    person.pubkey.clone(),
+                    person.name.clone()?,
+                    person.home.clone(),
+                ))
+            })
+            .collect();
+        for (pubkey, name, home) in configured {
+            let created = self.connector.store.lock().insert_person_if_absent(
+                &pubkey,
+                &name,
+                home.as_deref(),
             );
-            return Ok(());
-        };
-        if self.connector.store.lock().was_seen(&event.id)? {
-            return Ok(());
+            match created {
+                Ok(true) => self.host_person(&name),
+                Ok(false) => {}
+                Err(error) => crate::log::log_warn(
+                    "buzz",
+                    "serve.configured_person",
+                    &format!("{name}: {error}"),
+                ),
+            }
         }
-
-        let (root_id, parent_id) = route::thread_refs(&event);
-        {
-            let store = self.connector.store.lock();
-            store.cache_event(&store::cached_from_event(
-                &event,
-                &channel.id,
-                root_id.as_deref(),
-                parent_id.as_deref(),
-            )?)?;
-            store.set_channel_cursor(&channel.id, event.created_at)?;
-        }
-
-        match event.kind {
-            route::KIND_ROSTER => self.handle_roster(&event)?,
-            route::KIND_PROFILE => self.handle_profile(&event)?,
-            _ => self.route_and_deliver(&event, &channel, root_id, parent_id)?,
-        }
-        self.connector.store.lock().mark_seen(&event.id)?;
-        Ok(())
     }
 
-    /// Route a message-like event and deliver it, parking unroutable targets.
-    fn route_and_deliver(
-        &mut self,
-        event: &Event,
-        channel: &ChannelRow,
-        root_id: Option<String>,
-        parent_id: Option<String>,
-    ) -> Result<()> {
-        // A crash between the send and `mark_seen` must not deliver twice.
-        if self.connector.store.lock().was_delivered(&event.id)? {
+    /// Adopt a channel's newest fetched roster and apply the saved one if it
+    /// isn't applied yet. Runs before any of the channel's messages, so a
+    /// sender a roster names is a person by the time their message is handled.
+    fn apply_roster(&mut self, channel: &ChannelRow) {
+        if let Err(error) = self.adopt_newest_roster(channel) {
+            crate::log::log_warn(
+                "buzz",
+                "serve.roster_unreadable",
+                &format!("{}: {error}", channel.slug),
+            );
+        }
+        let now = crate::shared::time::now_epoch_i64();
+        let saved = match self.connector.store.lock().saved_roster(&channel.id) {
+            Ok(Some(saved)) if !saved.applied && saved.next_at <= now => saved,
+            _ => return,
+        };
+        let outcome = serde_json::from_str::<Event>(&saved.json)
+            .map_err(anyhow::Error::from)
+            .and_then(|event| self.handle_roster(&channel.id, &event));
+        let store = self.connector.store.lock();
+        let result = match outcome {
+            Ok(true) => store.roster_applied(&channel.id),
+            Ok(false) | Err(_) => {
+                let attempts = saved.attempts.saturating_add(1);
+                let wait = backoff(attempts, BACKOFF_MIN, RETRY_BACKOFF_MAX).as_secs() as i64;
+                if let Err(error) = &outcome {
+                    crate::log::log_warn(
+                        "buzz",
+                        "serve.roster_failed",
+                        &format!("{}: {error}", channel.slug),
+                    );
+                }
+                store.defer_roster(&channel.id, attempts, now + wait.max(1))
+            }
+        };
+        if let Err(error) = result {
+            crate::log::log_warn("buzz", "serve.roster_unrecorded", &error.to_string());
+        }
+    }
+
+    /// Save the newest of a channel's fetched rosters, if it is newer than the
+    /// saved one, and settle every fetched roster item. Newest is NIP-01's
+    /// rule for replaceable events: the later `created_at`, then the lower id.
+    fn adopt_newest_roster(&mut self, channel: &ChannelRow) -> Result<()> {
+        let store = self.connector.store.lock();
+        let fetched = store.pending_rosters(&channel.id)?;
+        if fetched.is_empty() {
             return Ok(());
         }
+        let newer = |a: &CachedEvent, created_at: u64, id: &str| {
+            a.created_at > created_at || (a.created_at == created_at && a.buzz_id.as_str() < id)
+        };
+        let mut newest: Option<&CachedEvent> = None;
+        for roster in &fetched {
+            let names_this_channel = serde_json::from_str::<Event>(&roster.json)
+                .is_ok_and(|event| route::tag(&event, "d") == Some(channel.id.as_str()));
+            if names_this_channel
+                && newest.is_none_or(|best| newer(roster, best.created_at, &best.buzz_id))
+            {
+                newest = Some(roster);
+            }
+        }
+        let saved = store.saved_roster(&channel.id)?;
+        let newest = newest.filter(|roster| {
+            saved
+                .as_ref()
+                .is_none_or(|saved| newer(roster, saved.created_at, &saved.buzz_id))
+        });
+        let settled: Vec<String> = fetched
+            .iter()
+            .map(|roster| roster.buzz_id.clone())
+            .collect();
+        store.adopt_roster(&channel.id, newest, &settled)
+    }
+
+    /// Handle one inbox item and record the outcome: done, routed (its
+    /// obligations already written), or left pending with backoff.
+    fn handle_item(&mut self, channel: &ChannelRow, item: InboxItem) {
+        let buzz_id = item.event.buzz_id.clone();
+        let outcome = self
+            .handle_event(channel, &item.event)
+            .unwrap_or_else(|error| Handled::Wait(error.to_string()));
+        let store = self.connector.store.lock();
+        let recorded = match outcome {
+            Handled::Done => store.finish_item(&buzz_id),
+            Handled::Routed => Ok(()),
+            Handled::Wait(reason) => {
+                let attempts = item.attempts.saturating_add(1);
+                let wait = backoff(attempts, BACKOFF_MIN, RETRY_BACKOFF_MAX).as_secs() as i64;
+                crate::log::log_warn(
+                    "buzz",
+                    "serve.inbound_pending",
+                    &format!("{buzz_id}: {reason}; again in {}s", wait.max(1)),
+                );
+                store.defer_item(
+                    &buzz_id,
+                    attempts,
+                    crate::shared::time::now_epoch_i64() + wait.max(1),
+                    &reason,
+                )
+            }
+        };
+        if let Err(error) = recorded {
+            crate::log::log_warn("buzz", "serve.inbound_unrecorded", &error.to_string());
+        }
+    }
+
+    /// Decide one fetched event: who sent it, who it is for, and (when
+    /// someone is) write their obligations.
+    fn handle_event(&mut self, channel: &ChannelRow, cached: &CachedEvent) -> Result<Handled> {
+        let event: Event = serde_json::from_str(&cached.json).context("stored event")?;
+        match event.kind {
+            // Rosters are adopted before messages; a stray one is settled.
+            route::KIND_ROSTER => return Ok(Handled::Done),
+            route::KIND_PROFILE => {
+                self.handle_profile(&event)?;
+                return Ok(Handled::Done);
+            }
+            _ => {}
+        }
+
+        let people = self.route_inputs_people()?;
+        let kinds = self.author_kinds(&people);
+        match kinds
+            .get(&event.pubkey)
+            .copied()
+            .unwrap_or(AuthorKind::Unknown)
+        {
+            AuthorKind::Agent | AuthorKind::Owner | AuthorKind::Reader => {
+                return Ok(Handled::Done);
+            }
+            AuthorKind::Person => {}
+            AuthorKind::Unknown => {
+                if self.known_not_a_person(channel, &event)? {
+                    crate::log::log_info(
+                        "buzz",
+                        "serve.inbound_skipped",
+                        &format!("{}: not a bridged person", event.id),
+                    );
+                    return Ok(Handled::Done);
+                }
+                return Ok(Handled::Wait("sender not known yet".into()));
+            }
+        }
+
         // An edit or deletion addresses a previous event through its `e` tag:
-        // the delivered check, the thread and the targets all follow that
+        // the routed check, the thread and the targets all follow that
         // original, not the revision itself.
         let revision = matches!(
             event.kind,
             route::KIND_EDIT | route::KIND_DELETE | route::KIND_CHANNEL_DELETE
         );
         let subject = if revision {
-            route::tag(event, "e").unwrap_or(&event.id).to_string()
+            route::tag(&event, "e").unwrap_or(&event.id).to_string()
         } else {
             event.id.clone()
         };
-        let original = if revision {
-            self.connector
-                .store
-                .lock()
-                .cached_event(&subject)?
-                .and_then(|cached| serde_json::from_str::<Event>(&cached.json).ok())
+        let (original, original_state) = if revision {
+            let store = self.connector.store.lock();
+            (
+                store
+                    .cached_event(&subject)?
+                    .and_then(|cached| serde_json::from_str::<Event>(&cached.json).ok()),
+                store.inbox_state(&subject)?,
+            )
         } else {
-            None
+            (None, None)
         };
-        let threaded = original.as_ref().unwrap_or(event);
+        if original_state.as_deref() == Some("pending") {
+            // Whether the revision reaches anyone depends on how the original
+            // was routed, so it waits for that.
+            return Ok(Handled::Wait("its original is not handled yet".into()));
+        }
+        let threaded = original.as_ref().unwrap_or(&event);
         let ancestry = self.load_ancestry(threaded)?;
-        let (root_id, parent_id) = if original.is_some() {
-            route::thread_refs(threaded)
-        } else {
-            (root_id, parent_id)
-        };
+        let (root_id, parent_id) = route::thread_refs(threaded);
         let root = root_id.or(parent_id).unwrap_or_else(|| threaded.id.clone());
         let input = InboundEvent {
             event: event.clone(),
@@ -2009,20 +2368,68 @@ impl MainLoop {
             original,
         };
 
-        let people = self.route_inputs_people()?;
         let roster = self.agent_roster();
-        let kinds = self.author_kinds(&people);
-        let delivered = self.connector.store.lock().was_delivered(&subject)?;
-
-        match route::route_inbound(&input, &people, &roster, &kinds, delivered) {
-            route::Inbound::Skip(reason) => crate::log::log_info(
-                "buzz",
-                "serve.inbound_skipped",
-                &format!("{}: {reason:?}", event.id),
-            ),
-            route::Inbound::Deliver(delivery) => self.deliver_to_hcom(&event.id, delivery)?,
+        let routed = self.connector.store.lock().was_routed(&subject)?;
+        match route::route_inbound(&input, &people, &roster, &kinds, routed) {
+            route::Inbound::Skip(reason) => {
+                crate::log::log_info(
+                    "buzz",
+                    "serve.inbound_skipped",
+                    &format!("{}: {reason:?}", event.id),
+                );
+                Ok(Handled::Done)
+            }
+            route::Inbound::Deliver(delivery) => {
+                let owed = OwedDelivery {
+                    sender: delivery.sender,
+                    thread: delivery.thread,
+                    root_id: delivery.root_id,
+                    channel_id: delivery.channel_id,
+                    text: delivery.text,
+                };
+                self.connector.store.lock().route_item(
+                    &event.id,
+                    &delivery.targets,
+                    &owed,
+                    crate::shared::time::now_epoch_i64(),
+                )?;
+                crate::log::log_info(
+                    "buzz",
+                    "serve.routed",
+                    &format!("{} -> {}", event.id, delivery.targets.join(",")),
+                );
+                Ok(Handled::Routed)
+            }
         }
-        Ok(())
+    }
+
+    /// True when an unclassified author is known not to be a bridged person,
+    /// so their message needs nothing: a retired person, a `bot` on the
+    /// channel's roster, or an author absent from an applied roster at least
+    /// as new as the message. Anything else may still become a person (a
+    /// listed member whose profile isn't readable yet, a roster that predates
+    /// them), so the message waits.
+    fn known_not_a_person(&self, channel: &ChannelRow, event: &Event) -> Result<bool> {
+        let store = self.connector.store.lock();
+        if store
+            .person_by_pubkey(&event.pubkey)?
+            .is_some_and(|person| !person.active)
+        {
+            return Ok(true);
+        }
+        let Some(saved) = store.saved_roster(&channel.id)? else {
+            return Ok(false);
+        };
+        let roster: Event = serde_json::from_str(&saved.json).context("saved roster")?;
+        Ok(
+            match route::roster_members(&roster)
+                .into_iter()
+                .find(|(pubkey, _)| pubkey == &event.pubkey)
+            {
+                Some((_, role)) => role == "bot",
+                None => saved.applied && saved.created_at >= event.created_at,
+            },
+        )
     }
 
     /// Active people rows, as routing rows.
@@ -2128,117 +2535,69 @@ impl MainLoop {
     fn fetch_event(&mut self, id: &str) -> Result<Option<(String, Option<String>)>> {
         // The relay refuses an unscoped filter, so kinds always ride along.
         let filter = json!({ "ids": [id], "kinds": store::CHANNEL_KINDS });
-        let tag = serde_json::to_string(&self.connector.reader_auth_tag()).unwrap_or_default();
-        match self
-            .connector
-            .http
-            .query(&filter, &self.connector.reader.key, Some(&tag))
-        {
-            Ok(events) => Ok(events
-                .into_iter()
-                .find(|event| event.id == id)
-                .map(|event| {
-                    let (root, reply) = route::thread_refs(&event);
-                    (event.pubkey, reply.or(root))
-                })),
-            // A 429 or a 5xx mid-switchover is not "no such event": without the
-            // ancestor a plain thread reply has no target, so the whole event
-            // goes back to the retry queue instead.
-            Err(error) => Err(anyhow!("ancestor {id}: {error}")),
-        }
+        // A 429 or a 5xx mid-switchover is not "no such event": without the
+        // ancestor a plain thread reply has no target, so the item stays
+        // pending instead.
+        let events = self
+            .reader_query(&filter)
+            .map_err(|error| anyhow!("ancestor {id}: {error}"))?;
+        Ok(events
+            .into_iter()
+            .find(|event| event.id == id && nostr::verify(event))
+            .map(|event| {
+                let (root, reply) = route::thread_refs(&event);
+                (event.pubkey, reply.or(root))
+            }))
     }
 
-    /// Send one routed delivery as the person's hosted row. Targets hcom can
-    /// route get it now; the rest are parked with exactly this delivery, so a
-    /// stopped agent never holds the message back from a live one.
-    fn deliver_to_hcom(&mut self, buzz_id: &str, delivery: route::InboundDelivery) -> Result<()> {
-        let (live, parked): (Vec<String>, Vec<String>) = delivery
-            .targets
-            .iter()
-            .cloned()
-            .partition(|target| self.is_routable(target));
-        let owed = ParkedDelivery {
-            sender: delivery.sender.clone(),
-            thread: delivery.thread.clone(),
-            root_id: delivery.root_id.clone(),
-            channel_id: delivery.channel_id.clone(),
-            text: delivery.text.clone(),
-        };
-        self.connector
-            .store
-            .lock()
-            .put_thread(&owed.thread, &owed.channel_id, &owed.root_id)?;
-
-        let mut refused: Vec<String> = Vec::new();
-        if !live.is_empty() {
-            match crate::commands::send::send_message(
-                &self.db,
-                &hosted_identity(&owed.sender),
-                &owed.text,
-                Some(&crate::messages::MessageEnvelope {
-                    thread: Some(owed.thread.clone()),
-                    ..Default::default()
-                }),
-                Some(&live),
-            ) {
-                Ok(delivered_to) => {
-                    // At least once: the Buzz id is recorded right after the
-                    // send, so a crash between the two repeats one message
-                    // rather than dropping it.
-                    self.connector.store.lock().mark_delivered(buzz_id)?;
-                    crate::log::log_info(
-                        "buzz",
-                        "serve.delivered",
-                        &format!("{} -> {} ({buzz_id})", owed.sender, delivered_to.join(",")),
-                    );
-                }
-                Err(error) => {
-                    crate::log::log_warn(
-                        "buzz",
-                        "serve.deliver_refused",
-                        &format!("{}: {error}", owed.sender),
-                    );
-                    refused = live;
-                }
-            }
-        }
-
-        // The cursor moves on regardless, so one sleeping laptop cannot stall
-        // a channel; the retry window owns these.
-        let unresolved: Vec<String> = parked.into_iter().chain(refused).collect();
-        if !unresolved.is_empty() {
-            let now = crate::shared::time::now_epoch_i64();
-            let store = self.connector.store.lock();
-            for target in &unresolved {
-                store.park_target(buzz_id, target, now, &owed)?;
-            }
-            crate::log::log_warn(
-                "buzz",
-                "serve.parked",
-                &format!("{buzz_id}: {} not deliverable now", unresolved.join(", ")),
+    /// One `/query` signed as the reader, on the reader key's shared budget.
+    /// An exhausted budget is an error the caller retries later; the main
+    /// loop never sleeps on it.
+    fn reader_query(&self, filter: &Value) -> Result<Vec<Event>> {
+        let budget = &self.connector.reader_budget;
+        if let Err(wait) = budget.take() {
+            bail!(
+                "reader HTTP budget exhausted; retry in {}s",
+                wait.as_secs().max(1)
             );
         }
-        Ok(())
+        let tag = serde_json::to_string(&self.connector.reader_auth_tag()).unwrap_or_default();
+        self.connector
+            .http
+            .query(filter, &self.connector.reader.key, Some(&tag))
+            .map_err(|error| {
+                if let PublishError::RateLimited { retry_after } = &error {
+                    budget.hold(*retry_after);
+                }
+                anyhow!("{error}")
+            })
     }
 
-    /// Roster event for one channel: record who is in it, host new people, and
-    /// retire anyone gone from every bridged channel once the grace period ends.
-    fn handle_roster(&mut self, event: &Event) -> Result<()> {
-        let Some(channel_id) = route::tag(event, "d").map(str::to_string) else {
-            return Ok(());
-        };
-        if !self
-            .connector
-            .channel_rows()
-            .iter()
-            .any(|c| c.id == channel_id)
-        {
-            return Ok(());
+    /// Apply a channel's roster: record who is in it, host new people, and
+    /// retire anyone gone from every bridged channel once the grace period
+    /// ends. True when every listed member is resolved; false when a member's
+    /// profile isn't readable yet, so the roster is applied again later and
+    /// their messages wait meanwhile.
+    ///
+    /// A roster that leaves out the reader means the reader lost the channel:
+    /// the channel is parked with that reason (shown by `hcom buzz status`)
+    /// until a roster lists it again.
+    fn handle_roster(&mut self, channel_id: &str, event: &Event) -> Result<bool> {
+        if route::tag(event, "d") != Some(channel_id) {
+            return Ok(true);
         }
         let now = crate::shared::time::now_epoch_i64();
+        let members = route::roster_members(event);
+        self.note_reader_listed(
+            channel_id,
+            members
+                .iter()
+                .any(|(pubkey, _)| pubkey == &self.connector.reader.pubkey),
+        );
 
+        let mut complete = true;
         let mut here: Vec<String> = Vec::new();
-        for (pubkey, role) in route::roster_members(event) {
+        for (pubkey, role) in members {
             // Role `bot` is an owned agent, and the reader and omp are ours:
             // none of them is ever a person.
             if role == "bot"
@@ -2248,6 +2607,7 @@ impl MainLoop {
                 continue;
             }
             let Some(name) = self.person_name_for(&pubkey) else {
+                complete = false;
                 continue;
             };
             let home = self
@@ -2265,7 +2625,7 @@ impl MainLoop {
         self.connector
             .store
             .lock()
-            .set_channel_members(&channel_id, &here)?;
+            .set_channel_members(channel_id, &here)?;
 
         // A roster covers one channel. Someone absent from every bridged
         // channel starts the grace period; they stay a person until it ends,
@@ -2317,7 +2677,30 @@ impl MainLoop {
                 Some(_) => {}
             }
         }
-        Ok(())
+        Ok(complete)
+    }
+
+    /// Park or unpark a channel on whether its roster lists the reader.
+    fn note_reader_listed(&self, channel_id: &str, listed: bool) {
+        let store = self.connector.store.lock();
+        let parked = store
+            .channel(channel_id)
+            .ok()
+            .flatten()
+            .and_then(|row| row.parked_reason);
+        if !listed {
+            if parked.as_deref() != Some(READER_NOT_LISTED) {
+                crate::log::log_error(
+                    "buzz",
+                    "serve.reader_lost",
+                    &format!("{channel_id}: {READER_NOT_LISTED}; add the reader back to resume"),
+                );
+            }
+            let _ = store.set_channel_parked(channel_id, Some(READER_NOT_LISTED));
+        } else if parked.as_deref() == Some(READER_NOT_LISTED) {
+            crate::log::log_info("buzz", "serve.reader_back", channel_id);
+            let _ = store.set_channel_parked(channel_id, None);
+        }
     }
 
     /// The hcom name for a roster member: the config override, else the name
@@ -2431,16 +2814,15 @@ impl MainLoop {
         Ok(())
     }
 
-    /// Fetch a person's kind 0 over HTTP, signed by the reader.
+    /// Fetch a person's newest kind 0 over HTTP, signed by the reader.
     fn profile_for(&self, pubkey: &str) -> Option<(String, Event)> {
         let filter = json!({ "kinds": [route::KIND_PROFILE], "authors": [pubkey] });
-        let tag = serde_json::to_string(&self.connector.reader_auth_tag()).unwrap_or_default();
-        let events = self
-            .connector
-            .http
-            .query(&filter, &self.connector.reader.key, Some(&tag))
-            .ok()?;
-        let profile = events.into_iter().next()?;
+        let profile = self
+            .reader_query(&filter)
+            .ok()?
+            .into_iter()
+            .filter(|event| event.pubkey == pubkey && nostr::verify(event))
+            .max_by_key(|event| event.created_at)?;
         let value: Value = serde_json::from_str(&profile.content).ok()?;
         let name = value
             .get("name")
@@ -2449,6 +2831,20 @@ impl MainLoop {
         Some((config::person_slug(name), profile))
     }
 }
+
+/// What handling one inbox item came to.
+enum Handled {
+    /// Nothing is owed: our own post, nobody addressed, not a person.
+    Done,
+    /// Its obligations are written; the item is done once they all are.
+    Routed,
+    /// Not decidable yet (sender unknown, ancestor unreadable, store error):
+    /// stays pending and is handled again after a backoff.
+    Wait(String),
+}
+
+/// Parked reason of a channel whose roster no longer lists the reader.
+const READER_NOT_LISTED: &str = "the reader is not on this channel's roster";
 
 /// A snapshot of everything outbound routing reads, taken under one lock so
 /// the routing call does not hold the store.
@@ -2545,7 +2941,6 @@ mod tests {
         _guard: crate::hooks::test_helpers::EnvGuard,
         relay: FakeRelay,
         main: MainLoop,
-        inbound: mpsc::Sender<InboundItem>,
     }
 
     impl Harness {
@@ -2634,23 +3029,35 @@ mod tests {
                 .unwrap();
         }
 
+        /// Store an event exactly as the reader thread does for a live event
+        /// on the `infra` subscription of a caught-up session.
         fn offer(&self, event: Event) {
-            self.inbound
-                .send(InboundItem {
-                    sub: sub_id("infra"),
-                    event,
-                })
-                .unwrap();
+            self.offer_on("infra", event);
         }
 
-        /// Deliver an event on one channel's subscription.
+        /// Store an event as live on one channel's subscription.
         fn offer_on(&self, slug: &str, event: Event) {
-            self.inbound
-                .send(InboundItem {
-                    sub: sub_id(slug),
-                    event,
-                })
-                .unwrap();
+            let handles = reader_handles(&self.main.connector);
+            let channel = channel_for_sub(&handles.channels, &sub_id(slug))
+                .expect("a bridged channel")
+                .id
+                .clone();
+            ingest_live(&handles, &channel, event, true).unwrap();
+        }
+
+        /// An inbox item's handling state.
+        fn inbox_state(&self, buzz_id: &str) -> Option<String> {
+            self.store().inbox_state(buzz_id).unwrap()
+        }
+
+        /// How many obligations are in one state.
+        fn obligations(&self, state: &str) -> i64 {
+            self.store()
+                .obligation_counts()
+                .unwrap()
+                .into_iter()
+                .find(|(s, _)| s == state)
+                .map_or(0, |(_, n)| n)
         }
 
         /// Bridge a second channel, the way a config entry plus startup would.
@@ -2723,7 +3130,7 @@ mod tests {
         let connector = Connector::load(config).unwrap();
         let db = HcomDb::open().unwrap();
         let epoch = hcom_epoch(&db).unwrap();
-        let (main, inbound) = MainLoop::for_test(connector, db, epoch);
+        let main = MainLoop::for_test(connector, db, epoch);
 
         // Startup registers one hosted row per bridged channel before the first
         // loop pass, so a test starts in the same state `serve` would.
@@ -2736,7 +3143,6 @@ mod tests {
             _guard: guard,
             relay,
             main,
-            inbound,
         }
     }
 
@@ -2766,8 +3172,11 @@ mod tests {
         )
     }
 
-    /// A kind 39002 roster for one channel: `(pubkey, role)` members.
+    /// A kind 39002 roster for one channel: `(pubkey, role)` members. Each one
+    /// is a second newer than the last, because a roster is replaceable and
+    /// two in the same second order by id, not by when they were made.
     fn roster(channel: &str, members: &[(&str, &str)]) -> Event {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut tags = vec![vec!["d".to_string(), channel.to_string()]];
         for (pubkey, role) in members {
             tags.push(vec![
@@ -2777,9 +3186,11 @@ mod tests {
                 role.to_string(),
             ]);
         }
+        let created_at = nostr::now().max(LAST.load(Ordering::SeqCst) + 1);
+        LAST.store(created_at, Ordering::SeqCst);
         sign(
             UnsignedEvent {
-                created_at: nostr::now(),
+                created_at,
                 kind: route::KIND_ROSTER,
                 tags,
                 content: String::new(),
@@ -2815,11 +3226,13 @@ mod tests {
             "the thread is the Buzz correlation: {:?}",
             messages[0].thread
         );
-        let store = harness.store();
-        assert!(
-            store.was_delivered(&event.id).unwrap(),
-            "recorded as delivered"
+        assert_eq!(
+            harness.inbox_state(&event.id).as_deref(),
+            Some("done"),
+            "handled to the end"
         );
+        assert_eq!(harness.obligations("delivered"), 1);
+        let store = harness.store();
         assert!(
             store.cached_event(&event.id).unwrap().is_some(),
             "cached for read"
@@ -2987,10 +3400,7 @@ mod tests {
             1,
             "the reply targets the mirror row, not a bare local `luna`"
         );
-        assert!(
-            harness.store().target_counts().unwrap().is_empty(),
-            "nothing parked"
-        );
+        assert_eq!(harness.obligations("pending"), 0, "nothing owed");
     }
 
     #[test]
@@ -3330,13 +3740,11 @@ mod tests {
         // message is not re-routed, and the queued post goes out once.
         harness.set_http_status(0);
         harness.store().retry_outbox(&buzz_id, 0, "503").unwrap();
-        let (main, inbound) = MainLoop::for_test(
+        harness.main = MainLoop::for_test(
             harness.main.connector,
             harness.main.db,
             harness.main.epoch.clone(),
         );
-        harness.main = main;
-        harness.inbound = inbound;
         harness.step_until(|h| !h.agent_posts().is_empty());
 
         let posts = harness.agent_posts();
@@ -3377,7 +3785,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn an_unresolvable_target_is_parked_then_announced_in_buzz() {
+    fn an_unresolvable_target_is_owed_then_announced_in_buzz() {
         let mut harness = harness("mbai");
         harness.add_person("michael", None);
         harness.add_agent("luna");
@@ -3403,21 +3811,15 @@ mod tests {
         harness.offer(event.clone());
         harness.step();
 
-        {
-            let store = harness.store();
-            assert!(
-                store
-                    .target_counts()
-                    .unwrap()
-                    .iter()
-                    .any(|(state, n)| state == "parked" && *n == 1),
-                "the unresolvable target is parked"
-            );
-        }
+        assert_eq!(
+            harness.obligations("pending"),
+            1,
+            "the unresolvable target is owed"
+        );
 
         // The window closes; the connector says so in Buzz, as omp. Age the row
         // first, then give the loop the pass that notices.
-        harness.store().age_parked_target(&event.id, 0).unwrap();
+        harness.store().age_obligation(&event.id, 0).unwrap();
         harness.step_until(|h| {
             h.relay
                 .events()
@@ -3438,20 +3840,16 @@ mod tests {
             "posted as omp itself"
         );
         assert_eq!(route::thread_refs(&notice).1, Some(event.id.clone()));
-        assert!(
-            harness
-                .store()
-                .target_counts()
-                .unwrap()
-                .iter()
-                .any(|(s, _)| s == "expired"),
-            "the parked target is retired, not retried forever"
+        assert_eq!(
+            harness.obligations("expired"),
+            1,
+            "the obligation is closed, not retried forever"
         );
     }
 
     #[test]
     #[serial]
-    fn a_mention_of_an_enrolled_agent_whose_row_is_gone_is_parked() {
+    fn a_mention_of_an_enrolled_agent_whose_row_is_gone_stays_owed() {
         // Live shape: the reader only subscribes to `#h` kinds, so an agent's
         // kind 0 never comes back to it. What the connector knows about a
         // finished session is what it published when it enrolled the agent.
@@ -3478,20 +3876,16 @@ mod tests {
         harness.offer(event);
         harness.step();
 
-        assert!(
-            harness
-                .store()
-                .target_counts()
-                .unwrap()
-                .iter()
-                .any(|(state, n)| state == "parked" && *n == 1),
-            "the mention is parked for luna, not skipped as naming nobody"
+        assert_eq!(
+            harness.obligations("pending"),
+            1,
+            "the mention is owed to luna, not skipped as naming nobody"
         );
     }
 
     #[test]
     #[serial]
-    fn live_targets_get_the_message_while_a_stopped_one_is_parked() {
+    fn live_targets_get_the_message_while_a_stopped_one_stays_owed() {
         let mut harness = harness("mbai");
         harness.add_person("michael", None);
         harness.add_agent("luna");
@@ -3525,20 +3919,12 @@ mod tests {
             1,
             "luna is live and gets it now"
         );
-        assert!(
-            harness
-                .store()
-                .target_counts()
-                .unwrap()
-                .iter()
-                .any(|(state, n)| state == "parked" && *n == 1),
-            "only nova is parked"
-        );
+        assert_eq!(harness.obligations("pending"), 1, "only nova is owed");
     }
 
     #[test]
     #[serial]
-    fn a_parked_target_is_redelivered_from_the_person_in_the_buzz_thread() {
+    fn an_owed_target_is_redelivered_from_the_person_in_the_buzz_thread() {
         let mut harness = harness("mbai");
         harness.add_person("michael", None);
         harness.add_agent("luna");
@@ -3566,7 +3952,7 @@ mod tests {
         harness.add_agent("luna");
         harness
             .store()
-            .age_parked_target(&event.id, crate::shared::time::now_epoch_i64())
+            .age_obligation(&event.id, crate::shared::time::now_epoch_i64())
             .unwrap();
         harness.step();
 
@@ -3610,18 +3996,17 @@ mod tests {
         harness.offer(reply.clone());
         harness.step();
         assert!(harness.unread("luna").is_empty());
-        assert!(
-            !harness.store().was_seen(&reply.id).unwrap(),
-            "an event that wasn't handled isn't marked seen"
+        assert_eq!(
+            harness.inbox_state(&reply.id).as_deref(),
+            Some("pending"),
+            "an event that wasn't handled stays pending"
         );
 
         harness.set_http_status(0);
-        for pending in &mut harness.main.pending_inbound {
-            pending.due = Instant::now();
-        }
+        harness.store().make_inbox_due().unwrap();
         harness.step();
         assert_eq!(harness.unread("luna").len(), 1, "the retry delivers it");
-        assert!(harness.store().was_seen(&reply.id).unwrap());
+        assert_eq!(harness.inbox_state(&reply.id).as_deref(), Some("done"));
     }
 
     #[test]
@@ -3640,7 +4025,213 @@ mod tests {
         harness.offer(event.clone());
         harness.step();
         assert_eq!(harness.unread("luna").len(), 1, "delivered straight away");
-        assert!(harness.store().target_counts().unwrap().is_empty());
+        assert_eq!(harness.obligations("pending"), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn history_from_a_sender_named_only_by_the_newer_roster_is_delivered() {
+        // A fresh state DB catches up a mention, then the roster that names its
+        // sender. Rosters are applied before messages, so the mention is from
+        // a person by the time it is handled, not skipped for good.
+        let mut harness = harness("mbai");
+        harness.add_agent("luna");
+        let human = public_hex(&human_key());
+        harness
+            .relay
+            .seed(profile(&human_key(), "Michael", "just a person"));
+        let mention = message(
+            &human_key(),
+            CHANNEL_ID,
+            "luna, from the history",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        harness.offer(mention.clone());
+        harness.offer(roster(CHANNEL_ID, &[(&human, "member")]));
+        harness.step();
+
+        let unread = harness.unread("luna");
+        assert_eq!(unread.len(), 1, "the mention reached luna");
+        assert_eq!(unread[0].from, "michael");
+    }
+
+    #[test]
+    #[serial]
+    fn a_configured_person_is_a_person_before_any_roster() {
+        let mut harness = harness("mbai");
+        harness.add_agent("luna");
+        harness.main.connector.config.people = vec![config::PersonConfig {
+            pubkey: public_hex(&human_key()),
+            name: Some("michael".into()),
+            home: None,
+        }];
+        harness.offer(message(
+            &human_key(),
+            CHANNEL_ID,
+            "luna, from the config",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        ));
+        harness.step();
+
+        let unread = harness.unread("luna");
+        assert_eq!(unread.len(), 1, "no roster needed for a configured person");
+        assert_eq!(unread[0].from, "michael");
+    }
+
+    #[test]
+    #[serial]
+    fn a_message_from_a_sender_not_yet_known_waits_for_the_roster() {
+        let mut harness = harness("mbai");
+        harness.add_agent("luna");
+        let human = public_hex(&human_key());
+        harness
+            .relay
+            .seed(profile(&human_key(), "Michael", "just a person"));
+        let mention = message(
+            &human_key(),
+            CHANNEL_ID,
+            "luna, are you there?",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        harness.offer(mention.clone());
+        harness.step();
+        assert!(harness.unread("luna").is_empty());
+        assert_eq!(
+            harness.inbox_state(&mention.id).as_deref(),
+            Some("pending"),
+            "kept until the sender is known, not settled"
+        );
+
+        harness.offer(roster(CHANNEL_ID, &[(&human, "member")]));
+        harness.store().make_inbox_due().unwrap();
+        harness.step();
+        assert_eq!(harness.unread("luna").len(), 1);
+        assert_eq!(harness.inbox_state(&mention.id).as_deref(), Some("done"));
+    }
+
+    #[test]
+    #[serial]
+    fn a_message_from_a_roster_bot_or_a_non_member_is_settled() {
+        let mut harness = harness("mbai");
+        harness.add_agent("luna");
+        let bot = nostr::derive_secret(&SEED, "someone-elses-bot@test");
+        let stranger = nostr::derive_secret(&SEED, "stranger@test");
+        let addressed = || vec![vec!["p".to_string(), public_hex(&agent_key())]];
+        let from_bot = message(&bot, CHANNEL_ID, "luna, beep", addressed());
+        let from_stranger = message(&stranger, CHANNEL_ID, "luna, hi", addressed());
+        harness.offer(from_bot.clone());
+        harness.offer(from_stranger.clone());
+        // A roster at least as new as both lists the bot as a bot and doesn't
+        // list the stranger: neither will ever be a person.
+        harness.offer(roster(CHANNEL_ID, &[(&public_hex(&bot), "bot")]));
+        harness.step();
+
+        assert_eq!(harness.inbox_state(&from_bot.id).as_deref(), Some("done"));
+        assert_eq!(
+            harness.inbox_state(&from_stranger.id).as_deref(),
+            Some("done")
+        );
+        assert!(harness.unread("luna").is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_target_whose_obligation_failed_to_commit_is_never_lost() {
+        // luna is live, nova's session is gone. Writing nova's obligation fails
+        // (a full disk): nothing is sent or settled on a partial record, and
+        // once writes work again both are owed, and nova gets it on return.
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        harness.add_agent("nova");
+        let nova = nostr::derive_secret(&SEED, "nova@mbai");
+        harness
+            .store()
+            .put_author(&Author {
+                pubkey: public_hex(&nova),
+                kind: AuthorKind::Agent,
+                hcom_name: Some("nova".into()),
+                device_label: Some("mbai".into()),
+            })
+            .unwrap();
+        assert!(harness.main.db.delete_instance("nova").unwrap());
+        harness
+            .store()
+            .exec_for_test(
+                "CREATE TRIGGER no_room BEFORE INSERT ON obligations WHEN NEW.target = 'nova'
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .unwrap();
+        let event = message(
+            &human_key(),
+            CHANNEL_ID,
+            "both of you, look",
+            vec![
+                vec!["p".into(), public_hex(&agent_key())],
+                vec!["p".into(), public_hex(&nova)],
+            ],
+        );
+        harness.offer(event.clone());
+        harness.step();
+        assert_eq!(harness.inbox_state(&event.id).as_deref(), Some("pending"));
+
+        harness
+            .store()
+            .exec_for_test("DROP TRIGGER no_room;")
+            .unwrap();
+        harness.store().make_inbox_due().unwrap();
+        harness.step();
+        assert_eq!(harness.unread("luna").len(), 1, "luna got it once");
+        assert_eq!(harness.obligations("pending"), 1, "nova is still owed");
+
+        harness.add_agent("nova");
+        harness
+            .store()
+            .age_obligation(&event.id, crate::shared::time::now_epoch_i64())
+            .unwrap();
+        harness.step();
+        assert_eq!(harness.unread("nova").len(), 1, "nova gets it on return");
+        assert_eq!(harness.unread("luna").len(), 1, "and luna not twice");
+        assert_eq!(harness.inbox_state(&event.id).as_deref(), Some("done"));
+    }
+
+    #[test]
+    #[serial]
+    fn an_item_failing_past_eight_attempts_is_still_retried() {
+        // A plain reply whose ancestor lookup fails through a long outage stays
+        // pending however many times it fails; it is never given up.
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        let post = message(&agent_key(), CHANNEL_ID, "deployed", vec![]);
+        harness.relay.seed(post.clone());
+        let reply = message(
+            &human_key(),
+            CHANNEL_ID,
+            "thanks",
+            vec![vec![
+                "e".into(),
+                post.id.clone(),
+                String::new(),
+                "reply".into(),
+            ]],
+        );
+        harness.set_http_status(503);
+        harness.offer(reply.clone());
+        for _ in 0..12 {
+            harness.store().make_inbox_due().unwrap();
+            harness.step();
+        }
+        assert_eq!(harness.inbox_state(&reply.id).as_deref(), Some("pending"));
+
+        harness.set_http_status(0);
+        harness.store().make_inbox_due().unwrap();
+        harness.step();
+        assert_eq!(
+            harness.unread("luna").len(),
+            1,
+            "delivered after the outage"
+        );
     }
 
     #[test]
@@ -4259,7 +4850,6 @@ mod tests {
         http: FakeRelay,
         ws: FakeRelay,
         connector: Connector,
-        rx: mpsc::Receiver<InboundItem>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -4277,34 +4867,70 @@ mod tests {
                 .lock()
                 .upsert_channel(CHANNEL_ID, "infra")
                 .unwrap();
-            let (tx, rx) = mpsc::channel();
             let handles = reader_handles(&connector);
-            let thread = std::thread::spawn(move || reader_loop(handles, tx));
+            let thread = std::thread::spawn(move || reader_loop(handles));
             Self {
                 _env: env,
                 http,
                 ws,
                 connector,
-                rx,
                 thread: Some(thread),
             }
         }
 
-        /// Inbound items until `count` arrived or the deadline passed.
-        fn take(&self, count: usize, deadline: Duration) -> Vec<Event> {
+        /// The channel's inbox once it holds `count` events or the deadline
+        /// passed.
+        fn inbox(&self, count: usize, deadline: Duration) -> Vec<CachedEvent> {
             let end = Instant::now() + deadline;
-            let mut events = Vec::new();
-            while events.len() < count && Instant::now() < end {
-                if let Ok(item) = self.rx.recv_timeout(Duration::from_millis(100)) {
-                    events.push(item.event);
+            loop {
+                let events = self
+                    .connector
+                    .store
+                    .lock()
+                    .list_events(Some(CHANNEL_ID), None, None, 1_000_000)
+                    .unwrap();
+                if events.len() >= count || Instant::now() >= end {
+                    return events;
                 }
+                sleep(Duration::from_millis(50));
             }
-            events
+        }
+
+        /// True once one event is in the inbox, false at the deadline.
+        fn stored(&self, id: &str, deadline: Duration) -> bool {
+            let end = Instant::now() + deadline;
+            while Instant::now() < end {
+                if self
+                    .connector
+                    .store
+                    .lock()
+                    .cached_event(id)
+                    .unwrap()
+                    .is_some()
+                {
+                    return true;
+                }
+                sleep(Duration::from_millis(50));
+            }
+            false
         }
 
         /// Post live, over WS, as the test human.
         fn publish_live(&self, text: &str) -> Event {
-            let event = message(&human_key(), CHANNEL_ID, text, vec![]);
+            self.publish_live_at(text, nostr::now())
+        }
+
+        /// Post live with a chosen `created_at`, as a client may backdate.
+        fn publish_live_at(&self, text: &str, created_at: u64) -> Event {
+            let event = sign(
+                UnsignedEvent {
+                    created_at,
+                    kind: route::KIND_MESSAGE,
+                    tags: vec![vec!["h".into(), CHANNEL_ID.into()]],
+                    content: text.into(),
+                },
+                &human_key(),
+            );
             let tag = nostr::auth_tag(&owner_key(), &public_hex(&human_key()), "");
             let mut session = WsSession::connect(
                 &self.ws.url,
@@ -4325,6 +4951,27 @@ mod tests {
                 .unwrap()
                 .and_then(|row| row.parked_reason)
         }
+
+        fn position(&self) -> Option<store::Position> {
+            self.connector
+                .store
+                .lock()
+                .channel(CHANNEL_ID)
+                .unwrap()
+                .and_then(|row| row.position)
+        }
+
+        /// Wait until a condition holds or the deadline passes.
+        fn wait_for(&self, deadline: Duration, done: impl Fn(&Self) -> bool) -> bool {
+            let end = Instant::now() + deadline;
+            while Instant::now() < end {
+                if done(self) {
+                    return true;
+                }
+                sleep(Duration::from_millis(50));
+            }
+            done(self)
+        }
     }
 
     impl Drop for LiveReader {
@@ -4336,17 +4983,13 @@ mod tests {
         }
     }
 
-    #[test]
-    #[serial]
-    fn the_reader_backfills_every_page_in_order_then_streams_live_events() {
-        // 150 events since the cursor: more than the relay's 100-event default
-        // page, so a backfill that doesn't page loses the oldest 50.
-        let now = nostr::now();
-        let history: Vec<Event> = (0..150u64)
+    /// `count` channel messages by the test human, `created_at` from `at(i)`.
+    fn history(count: usize, at: impl Fn(usize) -> u64) -> Vec<Event> {
+        (0..count)
             .map(|i| {
                 sign(
                     UnsignedEvent {
-                        created_at: now - 300 + i,
+                        created_at: at(i),
                         kind: route::KIND_MESSAGE,
                         tags: vec![vec!["h".into(), CHANNEL_ID.into()]],
                         content: format!("history {i}"),
@@ -4354,31 +4997,185 @@ mod tests {
                     &human_key(),
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn the_reader_catches_up_every_page_then_streams_live_events() {
+        // 150 events behind a relay that clamps pages to 100: a catch-up that
+        // stops on a short page or doesn't page loses some.
+        let now = nostr::now();
+        let events = history(150, |i| now - 300 + i as u64);
         let reader = LiveReader::start(|relay| {
-            for event in &history {
+            relay.switches.max_page.store(100, Ordering::SeqCst);
+            for event in &events {
                 relay.seed(event.clone());
             }
         });
 
-        let backfill = reader.take(150, Duration::from_secs(15));
-        let mut ids: Vec<&str> = backfill.iter().map(|e| e.id.as_str()).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), 150, "every page arrives: got {}", ids.len());
+        assert_eq!(reader.inbox(150, Duration::from_secs(15)).len(), 150);
+        let newest = events
+            .iter()
+            .max_by_key(|e| (e.created_at, e.id.clone()))
+            .unwrap();
+        let wanted = store::Position {
+            created_at: newest.created_at,
+            id: newest.id.clone(),
+        };
         assert!(
-            backfill
-                .windows(2)
-                .all(|w| w[0].created_at <= w[1].created_at),
-            "oldest first, so the cursor only ever moves forward"
+            reader.wait_for(Duration::from_secs(5), |r| r.position().as_ref()
+                == Some(&wanted)),
+            "the position is the newest stored key: {:?}",
+            reader.position()
         );
 
         let live = reader.publish_live("hello, live");
-        let streamed = reader.take(1, Duration::from_secs(10));
         assert!(
-            streamed.iter().any(|e| e.id == live.id),
-            "the live event reaches the main loop"
+            reader.stored(&live.id, Duration::from_secs(10)),
+            "the live event reaches the inbox"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn a_same_second_bucket_of_250_is_caught_up_whole() {
+        // 250 events in one second, then 30 a second earlier, behind 100-event
+        // pages: `until` alone re-reads the bucket's first page, and a walk
+        // that calls a repeated page the end loses 150 of the bucket and all
+        // the older history.
+        let second = nostr::now() - 100;
+        let mut events = history(250, |_| second);
+        events.extend(history(30, |_| second - 1));
+        let reader = LiveReader::start(|relay| {
+            relay.switches.max_page.store(100, Ordering::SeqCst);
+            for event in &events {
+                relay.seed(event.clone());
+            }
+        });
+
+        let stored = reader.inbox(280, Duration::from_secs(15));
+        assert_eq!(stored.len(), 280, "every event of the bucket and before it");
+        assert!(
+            reader.wait_for(Duration::from_secs(5), |r| r
+                .position()
+                .is_some_and(|p| p.created_at == second)),
+            "the position ends in the bucket's second: {:?}",
+            reader.position()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_backlog_past_ten_thousand_events_is_caught_up_whole() {
+        // No count cap ends a catch-up: 10,500 owed events all arrive, well
+        // past where a 10,000-event cap stops even after its last page.
+        let now = nostr::now();
+        let events = history(10_500, |i| now - 900 + (i % 800) as u64);
+        let reader = LiveReader::start(|relay| {
+            for event in &events {
+                relay.seed(event.clone());
+            }
+        });
+        assert_eq!(reader.inbox(10_500, Duration::from_secs(60)).len(), 10_500);
+    }
+
+    #[test]
+    #[serial]
+    fn a_relay_that_repeats_a_page_never_completes_a_catch_up() {
+        // A relay that ignores `before_id` hands back the same page: that is
+        // an error, never a short success that moves the position.
+        let second = nostr::now() - 100;
+        let events = history(150, |_| second);
+        let reader = LiveReader::start(|relay| {
+            relay.switches.max_page.store(100, Ordering::SeqCst);
+            relay
+                .switches
+                .ignore_before_id
+                .store(true, Ordering::SeqCst);
+            for event in &events {
+                relay.seed(event.clone());
+            }
+        });
+        sleep(Duration::from_secs(3));
+        assert_eq!(
+            reader.position(),
+            None,
+            "an incomplete catch-up never moves the position"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_backdated_publication_after_a_reconnect_reaches_the_inbox() {
+        // The relay admits created_at up to 900 s in the past. One published
+        // after the reconnect's catch-up must still reach the inbox live.
+        let now = nostr::now();
+        let old = history(1, |_| now - 700).remove(0);
+        let reader = LiveReader::start(|relay| relay.seed(old.clone()));
+        assert!(
+            reader.wait_for(Duration::from_secs(10), |r| r.position().is_some()),
+            "the first session caught up"
+        );
+
+        // The socket drops; the reader reconnects and catches up again.
+        let before = reader.ws.ws_connections();
+        reader
+            .http
+            .switches
+            .drop_socket
+            .store(true, Ordering::SeqCst);
+        sleep(Duration::from_millis(300));
+        reader
+            .http
+            .switches
+            .drop_socket
+            .store(false, Ordering::SeqCst);
+        assert!(
+            reader.wait_for(Duration::from_secs(10), |r| r.ws.ws_connections() > before),
+            "the reader reconnected"
+        );
+        let marker = reader.publish_live("after the reconnect");
+        assert!(
+            reader.stored(&marker.id, Duration::from_secs(10)),
+            "the new session is live"
+        );
+
+        let backdated = reader.publish_live_at("written ten minutes ago", nostr::now() - 600);
+        assert!(
+            reader.stored(&backdated.id, Duration::from_secs(10)),
+            "a backdated publication arriving live is inside the live filter"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_closed_channel_catches_up_what_it_missed() {
+        let reader = LiveReader::start(|relay| {
+            relay.switches.refuse_req.store(true, Ordering::SeqCst);
+        });
+        assert!(
+            reader.wait_for(Duration::from_secs(10), |r| r.parked().is_some()),
+            "CLOSED parks the channel"
+        );
+        // 150 publications while the subscription was closed: more than a
+        // REQ's single stored batch, and older than any fresh live filter.
+        let now = nostr::now();
+        for event in history(150, |i| now - 300 + i as u64) {
+            reader.http.seed(event);
+        }
+        reader
+            .http
+            .switches
+            .refuse_req
+            .store(false, Ordering::SeqCst);
+
+        assert_eq!(
+            reader.inbox(150, Duration::from_secs(20)).len(),
+            150,
+            "recovery drains the whole gap"
+        );
+        assert!(reader.parked().is_none(), "and the channel is unparked");
     }
 
     #[test]
@@ -4387,11 +5184,10 @@ mod tests {
         let reader = LiveReader::start(|relay| {
             relay.switches.refuse_req.store(true, Ordering::SeqCst);
         });
-        let end = Instant::now() + Duration::from_secs(10);
-        while reader.parked().is_none() && Instant::now() < end {
-            sleep(Duration::from_millis(50));
-        }
-        assert!(reader.parked().is_some(), "CLOSED parks the channel");
+        assert!(
+            reader.wait_for(Duration::from_secs(10), |r| r.parked().is_some()),
+            "CLOSED parks the channel"
+        );
 
         // Membership arrives (omp's 9000 landed): the next retry succeeds.
         reader
@@ -4399,18 +5195,12 @@ mod tests {
             .switches
             .refuse_req
             .store(false, Ordering::SeqCst);
-        let end = Instant::now() + Duration::from_secs(10);
-        while reader.parked().is_some() && Instant::now() < end {
-            sleep(Duration::from_millis(50));
-        }
-        assert!(reader.parked().is_none(), "the channel is unparked");
-        let live = reader.publish_live("after the retry");
         assert!(
-            reader
-                .take(1, Duration::from_secs(10))
-                .iter()
-                .any(|e| e.id == live.id)
+            reader.wait_for(Duration::from_secs(10), |r| r.parked().is_none()),
+            "the channel is unparked"
         );
+        let live = reader.publish_live("after the retry");
+        assert!(reader.stored(&live.id, Duration::from_secs(10)));
     }
 
     #[test]
