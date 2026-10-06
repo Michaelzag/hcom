@@ -967,6 +967,14 @@ impl Store {
         Ok(())
     }
 
+    /// Run raw SQL against the state DB, so a test can inject a failure
+    /// (a trigger that aborts writes) the way a full disk would.
+    #[cfg(test)]
+    pub fn exec_for_test(&self, sql: &str) -> Result<()> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+
     // ── outbox ───────────────────────────────────────────────────────────
 
     /// Queue one signed post. The (epoch, hcom id, destination) key makes a

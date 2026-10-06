@@ -427,8 +427,13 @@ pub enum Outbound {
     Post(Vec<Destination>),
     /// Nothing to post; drop the message.
     Drop,
-    /// Tell the agent why, as an hcom notice from the person with no home.
-    Notice { sender: String, text: String },
+    /// Some addressed people have no home channel: tell the agent why, as an
+    /// hcom notice from the first of them, and still post to everyone else.
+    Notice {
+        sender: String,
+        text: String,
+        posts: Vec<Destination>,
+    },
 }
 
 /// One hcom message considered for posting.
@@ -572,6 +577,21 @@ pub fn route_outbound(message: &HcomMessage, ctx: &OutboundContext<'_>) -> Outbo
             None => homeless.push(person),
         }
     }
+    let posts: Vec<Destination> = by_channel
+        .into_iter()
+        .filter_map(|(slug, mentions)| {
+            ctx.channels
+                .iter()
+                .find(|c| c.slug == slug)
+                .map(|c| Destination {
+                    channel_id: c.id.clone(),
+                    root_id: None,
+                    mentions,
+                })
+        })
+        .collect();
+    // People without a home get nothing posted; the agent hears why. Everyone
+    // else addressed still gets their post.
     if !homeless.is_empty() {
         return Outbound::Notice {
             sender: homeless[0].name.clone(),
@@ -583,26 +603,13 @@ pub fn route_outbound(message: &HcomMessage, ctx: &OutboundContext<'_>) -> Outbo
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            posts,
         };
     }
-    if by_channel.is_empty() {
+    if posts.is_empty() {
         return Outbound::Drop;
     }
-    Outbound::Post(
-        by_channel
-            .into_iter()
-            .filter_map(|(slug, mentions)| {
-                ctx.channels
-                    .iter()
-                    .find(|c| c.slug == slug)
-                    .map(|c| Destination {
-                        channel_id: c.id.clone(),
-                        root_id: None,
-                        mentions,
-                    })
-            })
-            .collect(),
-    )
+    Outbound::Post(posts)
 }
 
 impl ChannelRow {
@@ -1494,13 +1501,55 @@ mod tests {
             &outctx(&people, &channels, &BTreeMap::new()),
         );
         match routed {
-            Outbound::Notice { sender, text } => {
+            Outbound::Notice {
+                sender,
+                text,
+                posts,
+            } => {
                 assert_eq!(sender, "michael");
                 assert!(text.contains("no home channel"), "{text}");
                 assert!(text.contains("@ch_warehouse"), "names the way out: {text}");
+                assert!(posts.is_empty(), "nobody else to post to");
             }
             other => panic!("expected a notice, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_homeless_addressee_does_not_cost_the_others_their_post() {
+        let michael = person(&"m".repeat(64), "michael", Some("michael"));
+        let sean = person(&"s".repeat(64), "seanfitz", None);
+        let people = [michael, sean];
+        let channels = [channel("chan-michael", "michael")];
+        let routed = route_outbound(
+            &message("luna", &["michael", "seanfitz"], None),
+            &outctx(&people, &channels, &BTreeMap::new()),
+        );
+        let Outbound::Notice {
+            sender,
+            text,
+            posts,
+        } = routed
+        else {
+            panic!("expected posts plus a notice, got {routed:?}");
+        };
+        assert_eq!(
+            sender, "seanfitz",
+            "from the person who couldn't be reached"
+        );
+        assert!(
+            text.contains("seanfitz") && !text.contains("michael"),
+            "{text}"
+        );
+        assert_eq!(
+            posts,
+            vec![Destination {
+                channel_id: "chan-michael".into(),
+                root_id: None,
+                mentions: vec!["m".repeat(64)],
+            }],
+            "Michael still gets his post"
+        );
     }
 
     #[test]

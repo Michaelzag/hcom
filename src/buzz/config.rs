@@ -250,22 +250,6 @@ pub fn reader_canonical(device: &str) -> Result<String> {
     Ok(format!("reader@{}", device_label(device)?))
 }
 
-/// True when a lock file's owner process is gone (unix: kill(pid, 0)).
-pub fn lock_holder_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // Signal 0 tests for existence without delivering anything.
-        unsafe {
-            libc::kill(pid as libc::pid_t, 0) == 0 || *libc::__errno_location() == libc::EPERM
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
-}
-
 /// Path to the seed file when the config left it relative.
 pub fn resolve_relative(base: &Path, value: &Path) -> PathBuf {
     if value.is_absolute() {

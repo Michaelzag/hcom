@@ -210,8 +210,8 @@ fn cmd_status(db: &HcomDb, args: &StatusArgs) -> i32 {
         }
     };
 
-    let running = ServeLock::holder_pid(&Config::lock_path())
-        .is_some_and(crate::buzz::config::lock_holder_alive);
+    let running =
+        ServeLock::holder_pid(&Config::lock_path()).is_some_and(crate::sys::process::is_alive);
     let mut channels = Vec::new();
     let mut parked = Vec::new();
     if let Ok(rows) = store.channels() {
@@ -540,7 +540,7 @@ fn cmd_down(db: &HcomDb) -> i32 {
             terminate(pid);
             let wait_until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < wait_until {
-                if !crate::buzz::config::lock_holder_alive(pid) {
+                if !crate::sys::process::is_alive(pid) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -710,9 +710,7 @@ fn identity_json(connector: &Connector, name: &str) -> Value {
 /// `hcom buzz cursor set <slug> --since <unix>`: seed where a channel's
 /// backfill starts. Only while the connector is down, so nothing races it.
 fn run_cursor_set(args: &CursorSetArgs) -> Result<()> {
-    if ServeLock::holder_pid(&Config::lock_path())
-        .is_some_and(crate::buzz::config::lock_holder_alive)
-    {
+    if ServeLock::holder_pid(&Config::lock_path()).is_some_and(crate::sys::process::is_alive) {
         bail!("hcom buzz serve is running; stop it (hcom buzz down) before moving a cursor");
     }
     let config = Config::load()?;

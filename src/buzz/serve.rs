@@ -338,7 +338,7 @@ impl ServeLock {
             // liveness of the recorded pid decides.
             let holder = Self::holder_pid(path);
             match holder {
-                Some(pid) if config::lock_holder_alive(pid) => {
+                Some(pid) if crate::sys::process::is_alive(pid) => {
                     bail!("hcom buzz serve is already running (pid {pid})");
                 }
                 other => {
@@ -1054,20 +1054,26 @@ impl MainLoop {
             .unwrap_or_else(|| channel_id.to_string())
     }
 
-    /// Read each hosted row's unread messages and route them.
+    /// Read each hosted row's unread messages and route them. A row's cursor
+    /// advances only past messages whose outbox rows committed: a store error
+    /// stops that row here, and the next pass reads the rest again (re-queuing
+    /// is a no-op by key).
     fn scan_outbound(&mut self) {
         for row in self.hosted_rows() {
             let messages = self.db.get_unread_messages(&row);
-            let Some(last) = messages.last() else {
-                continue;
-            };
+            let mut handled = None;
             for message in &messages {
-                self.route_outbound_message(&row, message);
+                if let Err(error) = self.route_outbound_message(&row, message) {
+                    crate::log::log_warn(
+                        "buzz",
+                        "serve.queue_failed",
+                        &format!("{row} #{:?}: {error}; retrying next pass", message.event_id),
+                    );
+                    break;
+                }
+                handled = message.event_id.or(handled);
             }
-            // The cursor advances the way `hcom listen` advances it: past the
-            // batch, whatever the posts' fate, because the outbox already holds
-            // a signed copy of anything still owed to Buzz.
-            if let Some(id) = last.event_id {
+            if let Some(id) = handled {
                 let mut updates = serde_json::Map::new();
                 updates.insert("last_event_id".into(), json!(id));
                 crate::instances::update_instance_position(&self.db, &row, &updates);
@@ -1075,10 +1081,15 @@ impl MainLoop {
         }
     }
 
-    /// Route one hcom message, queueing a signed post per destination.
-    fn route_outbound_message(&mut self, hosted_row: &str, message: &crate::db::Message) {
+    /// Route one hcom message, queueing a signed post per destination. `Err`
+    /// only when something owed to Buzz could not be committed.
+    fn route_outbound_message(
+        &mut self,
+        hosted_row: &str,
+        message: &crate::db::Message,
+    ) -> Result<()> {
         let Some(hcom_id) = message.event_id else {
-            return;
+            return Ok(());
         };
         if route::is_unroutable_sender(&message.from) {
             crate::log::log_info(
@@ -1086,7 +1097,7 @@ impl MainLoop {
                 "serve.sender_skipped",
                 &format!("{hosted_row}: {} is not a Buzz identity", message.from),
             );
-            return;
+            return Ok(());
         }
 
         let identity = self.connector.agent_identity(&message.from);
@@ -1097,14 +1108,7 @@ impl MainLoop {
             exact_targets: exact_targets_of(&self.db, hcom_id),
             delivered_to: message.delivered_to.clone().unwrap_or_default(),
         };
-
-        let inputs = match self.route_inputs() {
-            Ok(inputs) => inputs,
-            Err(error) => {
-                crate::log::log_warn("buzz", "serve.route_inputs", &error.to_string());
-                return;
-            }
-        };
+        let inputs = self.route_inputs()?;
         let ctx = route::OutboundContext {
             people: &inputs.people,
             channels: &inputs.channels,
@@ -1112,34 +1116,42 @@ impl MainLoop {
             host_device: &inputs.host_device,
         };
 
-        match route::route_outbound(&outbound, &ctx) {
-            route::Outbound::Drop => {}
-            route::Outbound::Notice { sender, text } => {
-                // The agent learns this from hcom, as the person's row.
-                crate::log::log_info(
-                    "buzz",
-                    "serve.no_home_channel",
-                    &format!("{}: {text}", identity.row),
-                );
-                if let Err(error) = crate::commands::send::send_message(
-                    &self.db,
-                    &hosted_identity(&sender),
-                    &text,
-                    Some(&crate::messages::MessageEnvelope {
-                        thread: message.thread.clone(),
-                        ..Default::default()
-                    }),
-                    Some(std::slice::from_ref(&identity.row)),
-                ) {
-                    crate::log::log_warn("buzz", "serve.notice_failed", &error);
+        let posts = match route::route_outbound(&outbound, &ctx) {
+            route::Outbound::Drop => Vec::new(),
+            route::Outbound::Post(posts) => posts,
+            route::Outbound::Notice {
+                sender,
+                text,
+                posts,
+            } => {
+                // Every addressed person's row reads this message; only the
+                // one the notice comes from sends it, so the agent hears it once.
+                if sender == hosted_row {
+                    crate::log::log_info(
+                        "buzz",
+                        "serve.no_home_channel",
+                        &format!("{}: {text}", identity.row),
+                    );
+                    if let Err(error) = crate::commands::send::send_message(
+                        &self.db,
+                        &hosted_identity(&sender),
+                        &text,
+                        Some(&crate::messages::MessageEnvelope {
+                            thread: message.thread.clone(),
+                            ..Default::default()
+                        }),
+                        Some(std::slice::from_ref(&identity.row)),
+                    ) {
+                        crate::log::log_warn("buzz", "serve.notice_failed", &error);
+                    }
                 }
+                posts
             }
-            route::Outbound::Post(destinations) => {
-                for destination in destinations {
-                    self.queue_post(&identity, hcom_id, &destination, &message.text);
-                }
-            }
+        };
+        for destination in posts {
+            self.queue_post(&identity, hcom_id, &destination, &message.text)?;
         }
+        Ok(())
     }
 
     /// Sign one post and queue it. Signing first means the Buzz id is known
@@ -1155,7 +1167,7 @@ impl MainLoop {
         hcom_id: i64,
         destination: &route::Destination,
         text: &str,
-    ) {
+    ) -> Result<()> {
         let event = sign(
             UnsignedEvent {
                 created_at: nostr::now(),
@@ -1169,25 +1181,23 @@ impl MainLoop {
             hcom_id,
             destination: destination.channel_id.clone(),
             signer_name: identity.row.clone(),
-            signed_json: serde_json::to_string(&event).unwrap_or_default(),
+            signed_json: serde_json::to_string(&event)?,
             buzz_id: event.id.clone(),
             state: "pending".into(),
             attempts: 0,
             next_at: 0,
             last_error: None,
         };
-        let queued = self.connector.store.lock().enqueue_outbox(&row);
-        match queued {
-            Ok(true) => crate::log::log_info(
+        // Re-reading a message after a crash re-queues nothing: the key is
+        // already there, so the same Buzz id is posted at most once.
+        if self.connector.store.lock().enqueue_outbox(&row)? {
+            crate::log::log_info(
                 "buzz",
                 "serve.queued",
                 &format!("{} #{hcom_id} -> {}", identity.row, destination.channel_id),
-            ),
-            // Re-reading a message after a crash re-queues nothing: the key is
-            // already there, so the same Buzz id is posted at most once.
-            Ok(false) => {}
-            Err(error) => crate::log::log_warn("buzz", "serve.queue_failed", &error.to_string()),
+            );
         }
+        Ok(())
     }
 
     /// The routing inputs for outbound decisions: active people, bridged
@@ -3932,6 +3942,77 @@ mod tests {
 
     #[test]
     #[serial]
+    fn a_message_whose_outbox_write_fails_is_read_again() {
+        let mut harness = harness("mbai");
+        enrolled_home(&mut harness);
+        // The outbox insert fails, as on a full disk.
+        harness
+            .store()
+            .exec_for_test(
+                "CREATE TRIGGER no_room BEFORE INSERT ON outbox
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .unwrap();
+        harness.send("luna", "do not lose me", &["michael"], None);
+        harness.main.scan_outbound();
+        assert_eq!(
+            harness.unread("michael").len(),
+            1,
+            "the cursor stays put while nothing owed to Buzz is committed"
+        );
+
+        harness
+            .store()
+            .exec_for_test("DROP TRIGGER no_room;")
+            .unwrap();
+        harness.step_until(|h| !h.agent_posts().is_empty());
+        assert_eq!(harness.agent_posts().len(), 1);
+        assert!(harness.unread("michael").is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_homeless_addressee_gets_one_notice_and_the_others_still_get_posts() {
+        let mut harness = harness("mbai");
+        enrolled_home(&mut harness);
+        // A second person, with no home channel.
+        let sean = public_hex(&nostr::derive_secret(&SEED, "sean@test"));
+        harness
+            .store()
+            .upsert_person(&sean, "seanfitz", None)
+            .unwrap();
+        crate::hosted::register_hosted(
+            &harness.main.db,
+            "seanfitz",
+            crate::hosted::HOSTED_TOOL_BUZZ,
+        )
+        .unwrap();
+        harness.main.connector.hosted.lock().push("seanfitz".into());
+
+        harness.send("luna", "status update", &["michael", "seanfitz"], None);
+        harness.step_until(|h| !h.agent_posts().is_empty());
+        harness.step();
+
+        assert_eq!(
+            harness.agent_posts().len(),
+            1,
+            "Michael's home post still goes out"
+        );
+        let notices: Vec<_> = harness
+            .unread("luna")
+            .into_iter()
+            .filter(|m| m.text.contains("no home channel"))
+            .collect();
+        assert_eq!(
+            notices.len(),
+            1,
+            "one notice, not one per hosted row: {notices:?}"
+        );
+        assert_eq!(notices[0].from, "seanfitz");
+    }
+
+    #[test]
+    #[serial]
     fn a_person_with_no_home_channel_gets_an_hcom_notice() {
         let mut harness = harness("mbai");
         // No home channel for this person and the only configured channel is a
@@ -4031,7 +4112,7 @@ mod tests {
         let path = dir.path().join("serve.lock");
         // Written without taking the lock, so only liveness can clear it.
         std::fs::write(&path, "4294967294\n").unwrap();
-        assert!(!config::lock_holder_alive(4294967294));
+        assert!(!crate::sys::process::is_alive(4294967294));
         assert!(
             ServeLock::acquire(&path).is_ok(),
             "a dead holder must not block a restart"
