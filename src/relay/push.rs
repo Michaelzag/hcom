@@ -119,8 +119,13 @@ pub(crate) fn shrink_event(event: &mut Value) {
     data.remove(SHRINK_MARKER);
     let mut dropped: Vec<String> = Vec::new();
     if level == 1 {
-        for value in data.values_mut() {
-            shrink_strings(value);
+        // A cut inside `result` loses the answer just as surely as dropping
+        // the key: record it so the rpc_result trip below turns ok:false
+        // instead of reporting success on damaged JSON.
+        for (key, value) in data.iter_mut() {
+            if shrink_strings(value) && is_rpc_result && key == "result" {
+                dropped.push(key.clone());
+            }
         }
     } else {
         let doomed: Vec<String> = data
@@ -201,7 +206,7 @@ fn event_marker_dropped(data: &serde_json::Map<String, Value>) -> Option<Vec<Str
     })
 }
 
-fn shrink_strings(value: &mut Value) {
+fn shrink_strings(value: &mut Value) -> bool {
     match value {
         Value::String(s) => {
             let chars = s.chars().count();
@@ -210,11 +215,21 @@ fn shrink_strings(value: &mut Value) {
                 *s = format!(
                     "{kept}\n[truncated by hcom relay: {chars} characters, too large to relay]"
                 );
+                return true;
             }
+            false
         }
-        Value::Array(items) => items.iter_mut().for_each(shrink_strings),
-        Value::Object(map) => map.values_mut().for_each(shrink_strings),
-        _ => {}
+        Value::Array(items) => {
+            let mut cut = false;
+            items.iter_mut().for_each(|v| cut |= shrink_strings(v));
+            cut
+        }
+        Value::Object(map) => {
+            let mut cut = false;
+            map.values_mut().for_each(|v| cut |= shrink_strings(v));
+            cut
+        }
+        _ => false,
     }
 }
 
@@ -707,6 +722,20 @@ mod tests {
         shrink_event(&mut message);
         shrink_event(&mut message);
         assert!(message["data"].get("ok").is_none());
+    }
+
+    #[test]
+    fn an_rpc_result_cut_inside_result_at_level_one_is_a_failure() {
+        // Level 1 truncates long strings in place instead of dropping keys: a
+        // result.content past 4096 chars must still trip ok:false, or the
+        // requester prints damaged JSON with a success exit.
+        let mut event = json!({"id": 5, "type": "rpc_result", "data": {
+            "request_id": "req-3", "ok": true, "result": {"content": "z".repeat(5000)}
+        }});
+        shrink_event(&mut event);
+        assert_eq!(event["data"]["ok"], false);
+        let reason = event["data"]["result"]["error"].as_str().unwrap();
+        assert!(reason.contains("too large to relay"), "{reason}");
     }
 
     #[test]

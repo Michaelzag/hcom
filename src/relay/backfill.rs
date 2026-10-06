@@ -250,6 +250,7 @@ pub(crate) fn apply_answer(
 
     let reset_ts = local_reset_ts(db);
     let mut imported = 0u64;
+    let mut failed = 0u64;
     let mut oldest = gap.before;
     for event in events {
         let Some(remote_id) = event.get("id").and_then(|v| v.as_i64()) else {
@@ -258,32 +259,59 @@ pub(crate) fn apply_answer(
         if remote_id <= gap.after || remote_id >= gap.before {
             continue;
         }
-        oldest = oldest.min(remote_id);
+        // Skips that still narrow the gap: already have the event, or can
+        // never use it (control traffic, pre-reset history). Anything
+        // narrowed past is never re-asked for.
         if event.get("type").and_then(|v| v.as_str()) == Some("control")
             || event.get("instance").and_then(|v| v.as_str()) == Some("_device")
         {
+            oldest = oldest.min(remote_id);
             continue;
         }
         let event_ts = super::pull::event_epoch(event);
         if reset_ts > 0.0 && event_ts > 0.0 && event_ts < reset_ts {
+            oldest = oldest.min(remote_id);
             continue;
         }
         let ts = super::pull::event_ts_string(event);
         if already_imported(db, device_id, remote_id, &ts) {
+            oldest = oldest.min(remote_id);
             continue;
         }
-        super::pull::insert_remote_event(
+        // A failed insert must NOT narrow the gap or count: the event is
+        // still missing and the range stays open for the next tick.
+        match super::pull::insert_remote_event(
             db,
             device_id,
             &gap.short_id,
             remote_id,
             event,
             own_short_id,
-        );
-        imported += 1;
+        ) {
+            Ok(_) => {
+                oldest = oldest.min(remote_id);
+                imported += 1;
+            }
+            Err(e) => {
+                failed += 1;
+                log::log_warn(
+                    "relay",
+                    "relay.backfill_import_fail",
+                    &format!("event {remote_id}: {e:#}"),
+                );
+            }
+        }
     }
     gap.recovered += imported;
     gap.wide = false;
+    // Any failure keeps the whole range open: narrowing past successes would
+    // orphan the failed event above the new `before`, and the tick deletes
+    // closed gaps. The attempts budget still bounds retries.
+    if failed > 0 {
+        return Err(format!(
+            "{failed} event(s) failed to import; keeping the range open"
+        ));
+    }
 
     let more_below = truncated || events.len() >= asked_for;
     if more_below && oldest > gap.after + 1 && oldest < gap.before {
@@ -638,6 +666,38 @@ mod tests {
             Ok(AnswerOutcome::Done { imported: 0 })
         );
         assert_eq!(imported_texts(&db), vec!["only"]);
+    }
+
+    #[test]
+    #[serial]
+    fn failed_inserts_keep_the_gap_open() {
+        // Read-only store: every insert fails. Nothing may count, narrow,
+        // or close — the range stays open for the next tick instead of being
+        // retired as recovered.
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut gap = Gap {
+            after: 10,
+            before: 20,
+            short_id: "ABCD".into(),
+            detected_at: 0.0,
+            request_id: None,
+            sent_at: 0.0,
+            attempts: 1,
+            recovered: 0,
+            wide: false,
+            shrink: 0,
+        };
+        let response = answer("r1", vec![message(15, "only")], false);
+        db.conn().execute_batch("PRAGMA query_only=ON").unwrap();
+        let result = apply_answer(&db, PEER, "MINE", &mut gap, &response);
+        assert!(
+            result.is_err(),
+            "failed insert must not report success: {result:?}"
+        );
+        assert_eq!((gap.after, gap.before), (10, 20));
+        assert_eq!(gap.recovered, 0);
+        assert!(imported_texts(&db).is_empty());
     }
 
     #[test]

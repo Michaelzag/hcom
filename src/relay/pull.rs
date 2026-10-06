@@ -697,7 +697,9 @@ fn import_remote_events(
             continue;
         }
 
-        insert_remote_event(db, device_id, short_id, event_id, event, own_short_id);
+        // Live import keeps its historical behavior: a failed insert is dropped
+        // here (the cursor still advances past it). Backfill must not do that.
+        let _ = insert_remote_event(db, device_id, short_id, event_id, event, own_short_id);
 
         max_event_id = max_event_id.max(event_id);
     }
@@ -736,7 +738,7 @@ pub(crate) fn insert_remote_event(
     event_id: i64,
     event: &Value,
     own_short_id: &str,
-) {
+) -> anyhow::Result<i64> {
     let event_ts = event_epoch(event);
 
     // Namespace instance name
@@ -813,7 +815,7 @@ pub(crate) fn insert_remote_event(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    let _ = db.log_event_with_ts(event_type, &namespaced_instance, &data, Some(&ts_str));
+    let id = db.log_event_with_ts(event_type, &namespaced_instance, &data, Some(&ts_str))?;
 
     // Log per-message latency for message events
     if event_type == "message" && event_ts > 0.0 {
@@ -831,6 +833,7 @@ pub(crate) fn insert_remote_event(
             ],
         );
     }
+    Ok(id)
 }
 
 /// Reverse lookup: find short_id for a device UUID.
