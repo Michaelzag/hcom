@@ -8,7 +8,7 @@ hcom grows a Buzz connector: `hcom buzz serve`, a long-lived process inside the
 hcom binary that runs on exactly one host (mbai). It makes every Buzz human in a
 bridged channel an hcom participant (`michael`, `seanfitz`) and every hcom agent
 a Buzz identity humans can pick in the mention popup. Agents on any device talk
-to humans with plain `hcom send @michael`; the existing hcom relay carries the
+to humans with plain `hcom send michael -- text`; the existing hcom relay carries the
 message to mbai, where the connector posts it to Buzz as that agent. Human
 replies (mentions and plain thread replies) come back as ordinary hcom
 messages from `michael`. Humans never install anything. Adding a person means
@@ -326,14 +326,13 @@ place.
 | any of the above + `--reply-to <id>` of a Buzz-originated message | that conversation | reply in that Buzz thread |
 
 How it resolves, on the sender's device, before anything goes on the wire:
-`michael:infra` is a colon target whose suffix is not a device id (not four
-uppercase letters or digits matching a known device) and whose base is a
-`tool = "buzz"` person row; it expands to the two ordinary targets `michael`
+`michael:infra` is a colon target whose base is a `tool = "buzz"` person row
+and whose suffix is not a device: not a known device id, and not a
+case-insensitive prefix of one (`michael:mb` still means `michael:MBAI`, as
+colon targets always have). It expands to the two ordinary targets `michael`
 and `ch_infra` (`michael:MBAI` and `ch_infra:MBAI` on other devices). Nothing
-new travels in the event, so the connector's rule 2 handles it as a channel post
-addressed to Michael. A device id wins over a channel slug if both could match.
-Today a lowercase colon target only prefix-matches row names and fails as
-unmatched, so this takes no existing meaning away.
+new travels in the event, so the connector's rule 2 handles it as a channel
+post addressed to Michael. When a suffix could be either, the device wins.
 
 **No `@` needed.** In PowerShell a bare `@michael` is splatting: it's swallowed
 before hcom sees it (tested on KILA, pwsh 7.6.6: `@michael`, `@michael:infra` and
@@ -413,16 +412,18 @@ members, prepare_question, publish_question, publish_question_enrolled). The
 thin layer replaces its implementation, Python crypto + `buzz` CLI + raw HTTP,
 with calls to mbai-local `hcom buzz` subcommands that do the signing in-process:
 
-- `hcom buzz query --json` and `hcom buzz members <channel> --json`: signed
-  `/query` reads as `qa@mbai`.
-- `hcom buzz prepare --channel ch_warehouse --p <operator> --created-at <ts>
-  --json`: returns the signed kind 9 without sending it, using the
-  reservation's own `created_at`, so `qa` stores the exact question and its
+- `hcom buzz identity --as-name qa --json`: the signer's pubkey, no signing.
+- `hcom buzz query --as-name qa --json` and `hcom buzz members <channel>
+  --as-name qa --json`: signed `/query` reads as `qa@mbai`; `members` returns
+  the newest relay-signed 39002 roster for the channel.
+- `hcom buzz prepare --as-name qa --channel ch_warehouse --p <operator>
+  --created-at <ts> --json`: returns the signed kind 9 without sending it, using
+  the reservation's own `created_at`, so `qa` stores the exact question and its
   root id, as today.
-- `hcom buzz publish --json` with that event on stdin: enrolls if needed, posts
-  that exact event, confirms by id. Idempotent. An abandoned or withdrawn
-  question is never published, so the publication-truth rules in
-  `qa_workflow.py:663-727` hold unchanged.
+- `hcom buzz publish --as-name qa --json` with that event on stdin: enrolls if
+  not already enrolled, posts that exact event, confirms by id. Idempotent. An
+  abandoned or withdrawn question is never published, so the publication-truth
+  rules in `qa_workflow.py:663-727` hold unchanged.
 
 These sign only as identities listed in the connector config's
 `local_signers` (just `qa`), so no other process on mbai can sign as an
@@ -435,7 +436,7 @@ hcom text.
 
 What goes away is the remote-client and request-thread machinery. `qa` becomes
 an hcom participant on mbai: agents anywhere ask with
-`hcom send @qa --intent request -- title=<t> bead=<id> <question>`, and `qa`
+`hcom send qa --intent request -- title=<t> bead=<id> <question>`, and `qa`
 answers and forwards recorded answers with `hcom send`. Its row is registered
 with `hcom start --name qa` on service start and consumed with a plain
 `hcom listen --name qa --json` loop; a quiet listen timeout no longer marks a
