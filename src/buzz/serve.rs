@@ -10,7 +10,7 @@
 //! key load failures at startup, and a lock held by a live process, return an
 //! error.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
@@ -90,6 +90,10 @@ pub struct Connector {
     /// both the reader thread (catch-up pages) and the main loop (ancestor
     /// and profile lookups) sign as the reader, so they draw from one bucket.
     pub reader_budget: SharedBudget,
+    /// Channels that owe a follow-on catch-up: a revision whose original is
+    /// absent waits for a catch-up begun after it arrived, and a healthy
+    /// session runs none on its own. The main loop asks; the reader runs it.
+    pub catch_up_requests: Arc<Mutex<BTreeSet<String>>>,
     pub shutdown: Arc<AtomicBool>,
 }
 
@@ -128,6 +132,7 @@ impl Connector {
             store: Arc::new(Mutex::new(store)),
             hosted: Arc::new(Mutex::new(Vec::new())),
             reader_budget: SharedBudget::new(HTTP_PER_MINUTE, Duration::from_secs(60)),
+            catch_up_requests: Arc::new(Mutex::new(BTreeSet::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -249,8 +254,12 @@ fn split_device(name: &str) -> Option<(&str, String)> {
         .map(|(base, short)| (base, short.to_lowercase()))
 }
 
-/// The hcom DB epoch: `hcom.db`'s inode plus kv `relay_local_reset_ts`.
+/// The hcom DB epoch: `hcom.db`'s on-disk identity plus kv
+/// `relay_local_reset_ts`, as `{device}:{index}:{reset_ts}`.
 ///
+/// The identity is `dev:ino` on Unix and `volume-serial:file-index` on
+/// Windows (`sys::fs::file_identity`), `0:0` when the file can't be read, so a
+/// replaced file changes the epoch even when the reset marker is unset.
 /// Event ids restart from 1 after `hcom reset`, so any remembered id must be
 /// scoped by this value or it points at unrelated history. Mirrors the bridge's
 /// `database_epoch`.
@@ -261,20 +270,8 @@ pub fn hcom_epoch(db: &HcomDb) -> Result<String> {
         .flatten()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "none".to_string());
-    let path = crate::paths::db_path();
-    #[cfg(unix)]
-    let identity = {
-        use std::os::unix::fs::MetadataExt;
-        match std::fs::metadata(&path) {
-            Ok(meta) => format!("{}:{}", meta.dev(), meta.ino()),
-            Err(_) => "0:0".to_string(),
-        }
-    };
-    #[cfg(not(unix))]
-    let identity = std::fs::metadata(&path)
-        .map(|_| "present".to_string())
-        .unwrap_or_else(|_| "absent".to_string());
-    Ok(format!("{identity}:{reset_ts}"))
+    let (device, index) = crate::sys::fs::file_identity(&crate::paths::db_path()).unwrap_or((0, 0));
+    Ok(format!("{device}:{index}:{reset_ts}"))
 }
 
 /// A token bucket over a sliding window, one per signing key.
@@ -488,6 +485,8 @@ struct ReaderHandles {
     budget: SharedBudget,
     channels: Vec<ChannelRow>,
     store: Arc<Mutex<Store>>,
+    /// Follow-on catch-ups the main loop asked for, by channel id.
+    catch_up_requests: Arc<Mutex<BTreeSet<String>>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -503,6 +502,7 @@ fn reader_handles(connector: &Connector) -> ReaderHandles {
         budget: connector.reader_budget.clone(),
         channels: connector.channel_rows(),
         store: connector.store.clone(),
+        catch_up_requests: connector.catch_up_requests.clone(),
         shutdown: connector.shutdown.clone(),
     }
 }
@@ -859,7 +859,9 @@ struct ChannelSync {
 /// again with backoff if it fails. A CLOSED channel is parked and requested
 /// again with backoff (the usual cause, not yet being a member, fixes itself
 /// once omp's 9000 lands); when it is answered it gets a full catch-up, so the
-/// gap while it was closed is drained from the old position, not skipped.
+/// gap while it was closed is drained from the old position, not skipped. A
+/// caught-up channel also runs one follow-on catch-up when the main loop asks
+/// for it through `catch_up_requests`.
 fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) -> bool {
     let mut sync: HashMap<String, ChannelSync> = handles
         .channels
@@ -912,6 +914,15 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
                 if handles.shutdown.load(Ordering::SeqCst) {
                     return true;
                 }
+            }
+            // A revision waiting on an absent original asked for a catch-up
+            // begun after it arrived. A caught-up channel runs one next pass;
+            // one not caught up yet keeps the request until it is.
+            if state.caught_up
+                && state.catch_up_at.is_none()
+                && handles.catch_up_requests.lock().remove(&channel.id)
+            {
+                state.catch_up_at = Some(Instant::now());
             }
         }
 
@@ -2474,7 +2485,16 @@ impl MainLoop {
             let store = self.connector.store.lock();
             let state = store.inbox_state(&subject)?;
             if state.is_none() {
-                if !store.caught_up_after(&channel.id, &event.id)? {
+                let settled = store.caught_up_after(&channel.id, &event.id)?;
+                drop(store);
+                if !settled {
+                    // Only a catch-up begun after this item arrived can show
+                    // the original is absent, and a healthy session runs none
+                    // on its own: ask the reader for one.
+                    self.connector
+                        .catch_up_requests
+                        .lock()
+                        .insert(channel.id.clone());
                     return Ok(Handled::Wait("its original is not fetched yet".into()));
                 }
                 crate::log::log_info(
@@ -5290,15 +5310,26 @@ mod tests {
     fn an_hcom_reset_reopens_the_database_and_rehosts_the_rows() {
         let mut harness = harness("mbai");
         harness.add_person("michael", None);
+        let old_epoch = harness.main.epoch.clone();
 
-        // `hcom reset`: the database file is archived and a new one created.
+        // `hcom reset`: the database file is archived and a new one created,
+        // while the loop still holds the old file open. The loop's handle is
+        // let go for the rename, because Windows refuses to rename a file
+        // SQLite holds, then pointed at the archived file: the stale handle
+        // production holds after a reset.
         let path = crate::paths::db_path();
+        drop(std::mem::replace(
+            &mut harness.main.db,
+            HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap(),
+        ));
         for suffix in ["", "-wal", "-shm"] {
             let from = format!("{}{suffix}", path.display());
             if std::path::Path::new(&from).exists() {
                 std::fs::rename(&from, format!("{from}.archived")).unwrap();
             }
         }
+        let archived_path = std::path::PathBuf::from(format!("{}.archived", path.display()));
+        harness.main.db = HcomDb::open_raw(&archived_path).unwrap();
         let fresh = HcomDb::open().unwrap();
         let now = crate::shared::time::now_epoch_i64();
         let luna = json!({
@@ -5312,12 +5343,29 @@ mod tests {
         fresh
             .save_instance_named("luna", luna.as_object().unwrap())
             .unwrap();
+        // Neither file carries a reset marker, so only the file's identity
+        // can tell the loop it was replaced.
+        for db in [&harness.main.db, &fresh] {
+            assert_eq!(db.kv_get("relay_local_reset_ts").unwrap(), None);
+        }
         harness.step();
 
-        assert!(
-            fresh.get_instance_full("michael").unwrap().is_some(),
-            "the person's hosted row exists in the new database"
+        let epoch = harness.main.epoch.clone();
+        assert_ne!(
+            epoch, old_epoch,
+            "the loop adopted the new database's epoch"
         );
+        assert_eq!(
+            harness.store().epoch(),
+            epoch,
+            "the store scopes hcom ids by the new epoch"
+        );
+        for row in ["michael", "ch_infra"] {
+            assert!(
+                fresh.get_instance_full(row).unwrap().is_some(),
+                "{row}'s hosted row exists in the new database"
+            );
+        }
         harness.offer(message(
             &human_key(),
             CHANNEL_ID,
@@ -5328,8 +5376,20 @@ mod tests {
         assert_eq!(
             fresh.get_unread_messages("luna").len(),
             1,
-            "delivery goes to the live database, not the archived one"
+            "delivery goes to the live database"
         );
+        let archived = HcomDb::open_raw(&archived_path).unwrap();
+        let leaked = archived
+            .get_events_since(0, Some("message"), None)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event["data"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("after the reset"))
+            })
+            .count();
+        assert_eq!(leaked, 0, "the archived database receives nothing");
     }
 
     #[test]
@@ -5694,6 +5754,108 @@ mod tests {
             reader.stored(&live.id, Duration::from_secs(10)),
             "the live event reaches the inbox"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn revision_round_an_absent_original_settles_in_a_healthy_session() {
+        /// Stops and joins the reader even when an assertion fails first.
+        struct Running(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+                if let Some(thread) = self.1.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+        fn until(deadline: Duration, mut done: impl FnMut() -> bool) -> bool {
+            let end = Instant::now() + deadline;
+            while Instant::now() < end {
+                if done() {
+                    return true;
+                }
+                sleep(Duration::from_millis(50));
+            }
+            done()
+        }
+
+        // The reader thread and the main loop share one connector, as in
+        // `serve`, and the session stays up throughout.
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        harness.store().upsert_channel(CHANNEL_ID, "infra").unwrap();
+        // One event in history: the position moves once the first catch-up
+        // completes.
+        harness.relay.seed(message(
+            &human_key(),
+            CHANNEL_ID,
+            "before the session",
+            vec![],
+        ));
+        let ws = harness.relay.ws_twin();
+        harness.main.connector.config.relay_url = ws.url.clone();
+        let handles = reader_handles(&harness.main.connector);
+        let _reader = Running(
+            harness.main.connector.shutdown.clone(),
+            Some(std::thread::spawn(move || reader_loop(handles))),
+        );
+        assert!(
+            until(Duration::from_secs(15), || harness
+                .store()
+                .channel(CHANNEL_ID)
+                .unwrap()
+                .is_some_and(|row| row.position.is_some())),
+            "the first catch-up completes"
+        );
+
+        // An edit whose original the relay never had arrives live.
+        let revision = sign(
+            UnsignedEvent {
+                created_at: nostr::now(),
+                kind: route::KIND_EDIT,
+                tags: vec![
+                    vec!["h".into(), CHANNEL_ID.into()],
+                    vec!["e".into(), "f".repeat(64)],
+                    vec!["p".into(), public_hex(&agent_key())],
+                ],
+                content: "an edit of something never fetched".into(),
+            },
+            &human_key(),
+        );
+        let mut session = WsSession::connect(
+            &ws.url,
+            &human_key(),
+            Some(nostr::auth_tag(&owner_key(), &public_hex(&human_key()), "")),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        session.publish(&revision).unwrap();
+        assert!(
+            until(Duration::from_secs(10), || harness
+                .inbox_state(&revision.id)
+                .is_some()),
+            "the live edit reaches the inbox"
+        );
+        harness.step();
+        assert_eq!(
+            harness.inbox_state(&revision.id).as_deref(),
+            Some("pending"),
+            "no catch-up has begun since it arrived"
+        );
+
+        // No reconnect, no restart, no manual catch-up: the loop alone
+        // settles it.
+        assert!(
+            until(Duration::from_secs(20), || {
+                harness.step();
+                harness.inbox_state(&revision.id).as_deref() == Some("done")
+            }),
+            "the edit settles once a catch-up begun after it completes: {:?}",
+            harness.inbox_state(&revision.id)
+        );
+        assert!(harness.unread("luna").is_empty());
     }
 
     #[test]

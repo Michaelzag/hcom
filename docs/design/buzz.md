@@ -143,12 +143,25 @@ never in a child's environment.
 ### The hcom DB epoch
 
 `hcom reset` archives `hcom.db` and restarts event ids at 1. Every hcom event id
-the connector remembers is stored with an epoch: the `hcom.db` inode plus kv
-`relay_local_reset_ts`, the same rule the bridge uses (`hcom.py:475-500`). On an
-epoch change the connector drops its id-keyed lookups and re-registers its rows.
+the connector remembers is stored with an epoch: the `hcom.db` file identity
+plus kv `relay_local_reset_ts`, the same rule the bridge uses
+(`hcom.py:475-500`). On an epoch change the connector drops its id-keyed
+lookups and re-registers its rows.
 Unposted outbox rows are kept and sent until acknowledged: each holds a complete
 signed event and needs no hcom id to go out. Everything keyed by pubkey or Buzz
 event id carries over.
+
+Known limit: the identity is `device:inode` on Unix and
+`volume-serial:file-index` on Windows, so a replaced file is seen on both. A
+live `hcom reset` while `hcom buzz serve` runs is supported on Linux (mbai, the
+only connector host) but not on Windows. `hcom reset` archives by copy and then
+unlinks `hcom.db`/`-wal`/`-shm` (`src/commands/reset_ops.rs:47-80`), while the
+router's own `HcomDb` stays open across `cmd_reset`
+(`src/router.rs:775-782`, `915-917`; `src/commands/reset.rs:26`), and
+`stop all` leaves Buzz-hosted rows and their connector running
+(`src/commands/stop.rs:62-71`). SQLite on Windows opens without
+`FILE_SHARE_DELETE`, so the unlink fails there. Fixing it needs reset to release
+every handle or to reset in place; that's a follow-up outside this change.
 
 ### Who is who in hcom
 
@@ -434,6 +447,9 @@ connector ports its semantics; it doesn't invent new ones.
    after the revision's arrival; if it is still absent then, settle the revision
    without delivery. A previous catch-up, another channel's catch-up, or an
    ancestry lookup is not proof that this original has been handled.
+   A revision that waits on an absent original asks the reader for one
+   follow-on catch-up of its channel, so a healthy session that never
+   reconnects still runs one; that catch-up settles it.
 4. *Route.* Handling an inbox item computes its targets and, in one
    transaction, writes one obligation row per target
    `(buzz_id, target, state, attempts, next_at, source_created_at, revision_of)`
