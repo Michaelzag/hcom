@@ -10,7 +10,7 @@ bridged channel an hcom participant (`michael`, `seanfitz`) and every hcom agent
 a Buzz identity humans can pick in the mention popup. Agents on any device talk
 to humans with plain `hcom send @michael`; the existing hcom relay carries the
 message to mbai, where the connector posts it to Buzz as that agent. Human
-replies (mentions, plain thread replies, DM messages) come back as ordinary hcom
+replies (mentions and plain thread replies) come back as ordinary hcom
 messages from `michael`. Humans never install anything. Adding a person means
 adding them to a bridged Buzz channel. The Python `zagcom-bridge` is retired;
 warehouse Q&A survives as a small hcom participant on the new transport.
@@ -70,12 +70,7 @@ that shaped the design:
 - **Mention popup eligibility** for agent X owned by omp, seen by human H: X's
   kind 0 with the NIP-OA tag; omp's kind 30177 with `d` = X and
   `respond_to: "anyone"`; X in a stream/forum channel H belongs to, added by kind
-  9000 with role `bot`. Kind 10100 is optional (presence only). DMs only offer
-  the viewer's own agents.
-- **DMs:** kind 41010 with a `p` per other participant (1–8) opens or reuses a
-  DM (idempotent on the participant set); any admitted key, agents included, may
-  open one; the channel id comes back in the OK `response`. Desktop DM messages
-  p-tag the other participants.
+  9000 with role `bot`. Kind 10100 is optional (presence only).
 - **Private channels:** only owner/admin add members. omp is admin of `#infra`
   and `#warehouse`.
 - **buzz-pg switchovers** give ~40 s of relay 5xx. The connector must ride them.
@@ -221,15 +216,15 @@ One WS session as the reader. Per bridged channel: one REQ with that channel's
 `#h` for kinds `{9, 40002, 45001, 45003, 40003, 5, 9005, 39002}`, opened
 staggered (WS budget is 50 frames / 5 s). On (re)connect each channel backfills
 from its durable `created_at` cursor minus 960 s (the relay admits 900 s of
-backdating), deduplicated by Buzz event id. DMs are read by agent sessions (see
-outbound).
+backdating), deduplicated by Buzz event id. DMs are not bridged (operator
+ruling on D1).
 
 For each event E from author H, signature verified first:
 
 - **Skip** if H is a derived key (our own posts), omp or the reader.
 - **Targets** = agents p-tagged in E ∪ the agent author of any ancestor in E's
-  thread (walk `e` tags to the root; this is what catches plain thread replies)
-  ∪ the agent side of a DM. Minus H. An ancestor missing from the cache is
+  thread (walk `e` tags to the root; this is what catches plain thread
+  replies), minus H. An ancestor missing from the cache is
   fetched by id from the relay, and its author resolved through the profile
   marker, so replies under posts older than cutover still route.
 - Agent pubkey → hcom name: label `mbai` → bare name; otherwise
@@ -249,8 +244,7 @@ For each event E from author H, signature verified first:
   that target is parked per event and retried with backoff for 15 min. The
   channel cursor moves on regardless, so one sleeping laptop can't stall a
   channel. If it still can't be delivered, the connector says so in Buzz:
-  "luna isn't running — not delivered", as omp in a channel thread and as the
-  agent's own key in a DM (omp isn't a DM participant).
+  "luna isn't running — not delivered", as omp in that thread.
 - Delivery is at least once. The Buzz event id is recorded as delivered right
   after the send; a crash between the two can repeat that one message, and
   nothing is dropped.
@@ -282,10 +276,16 @@ Destinations, first rule that matches:
    (NIP-10 `e` tags), p-tagging every addressed person and the parent author.
 2. M targets `ch_<x>` rows → one top-level post per channel, p-tagging the
    addressed people.
-3. Otherwise (people only) → a DM from the agent to those people (41010,
-   idempotent on the participant set, at most 8 others). **Operator decision
-   D1.** Agents keep a conversation in its Buzz thread by answering with
-   `--reply-to`; the hcom agent-messaging skill says so.
+3. Otherwise (people only) → a top-level post in each addressed person's
+   **home channel**, @mentioning them. A home channel is a private bridged
+   channel per human (`#michael`), created by omp like `#warehouse`, so the
+   human can invite observers; the connector config maps human → home channel.
+   A person with no home channel configured gets nothing posted: the connector
+   sends the agent an hcom notice from that person's row ("seanfitz has no home
+   channel; address a channel row such as @ch_warehouse"). Two people with
+   different home channels get one post each. Agents keep a conversation in its
+   Buzz thread by answering with `--reply-to`; the hcom agent-messaging skill
+   says so. (Operator ruling D1, 2026-10-06: a channel per human, not DMs.)
 
 Before the first post into a channel the agent is enrolled: kind 0 (agent key),
 kind 30177 `{"name", "respond_to": "anyone", "parallelism": 1}` with `d` = agent
@@ -302,16 +302,6 @@ duplicate (`duplicate:`), not a second post. A 401 is a bug, not a retry case
 (NIP-98 headers are never reused). An entry still unacknowledged as its
 `created_at` nears the 900 s admission window is looked up by id and re-signed
 only if the relay never stored it.
-
-DM read path: an agent's WS session lives exactly as long as its hcom row is
-deliverable. On open it backfills `{kinds:[44100], #p:[self]}` (membership
-notices, stored globally and readable by their target) and each known DM `#h`
-from a per-agent cursor minus 960 s, then holds those subs live. Only 44100s
-whose channel is a DM (39000 marked `hidden`) get a `#h` sub; the rest are the
-agent's own channel enrollments, already covered by the reader. Nothing is
-missed while the session is closed, and messages for an agent whose row is gone
-take the unresolvable-target path. The session count tracks live agents, a few
-dozen; reconnects after a relay outage are staggered with jitter.
 
 ### Popup enrollment
 
@@ -427,12 +417,12 @@ those empty.
 
 1. PR: this design doc.
 2. PR: Nostr primitives + relay client + in-process fake relay.
-3. PR: core hosted participants + `send_message` id + `buzz_read` RPC.
-4. PR: connector (routing, enrollment, outbox, budgets, `hcom buzz` CLI incl.
-   the Q&A subcommands).
+3. PR: core hosted participants.
+4. PR: connector (routing, enrollment, outbox, budgets, `buzz_read` RPC,
+   `hcom buzz` CLI incl. the Q&A subcommands).
 5. Live end-to-end on a private test channel `#hcom-test` (created by omp) with
    a throwaway test-human key, never Michael's: mention, plain thread reply,
-   reply under a pre-cutover-style post, DM both directions, edit, delete,
+   reply under a pre-cutover-style post, a home-channel post, edit, delete,
    popup eligibility (checked against the directory data desktop reads), a send
    from a second relay device, a forced 5xx window and a 429.
 6. Report ready. With the operator's go via nami: release hcom (CDN +
@@ -449,13 +439,11 @@ nothing in Buzz changes.
 
 ## Decisions for the operator
 
-- **D1. Where `hcom send @michael` lands with no Buzz thread.** Recommend a DM
-  from that agent: private, a phone
-  notification, and the reply routes back to that agent. Alternative: a post in
-  a default bridged channel with an `@michael` mention; less code, public to the
-  channel.
+- **D1. Decided (operator, 2026-10-06):** `hcom send @michael` with no Buzz
+  thread posts in that human's private home channel (`#michael`), @mentioning
+  him, so observers can be invited. No DMs.
 - **D2. Popup.** Recommend enrolling every live hcom agent into every bridged
-  stream channel (`#infra`, `#hcom-test`, later `#warehouse`). Alternative:
+  stream channel (`#infra`, home channels, `#hcom-test`, later `#warehouse`). Alternative:
   only agents that have posted, a shorter list that hides agents you'd want to
   ping first.
 - **D3. Who may message agents.** Recommend any member of a bridged channel,
