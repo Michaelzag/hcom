@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 
 mod bootstrap;
+mod buzz;
 mod claude_actor;
 mod cli_context;
 pub mod commands;
