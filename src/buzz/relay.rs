@@ -809,7 +809,8 @@ mod tests {
             "",
         ))
         .unwrap();
-        let event = message(&key, "channel", 1700000000, "HTTP");
+        // Current: the relay refuses anything more than 900 s off its clock.
+        let event = message(&key, "channel", super::super::nostr::now(), "HTTP");
         relay.post_event(&event, &key, Some(&tag)).unwrap();
         relay.post_event(&event, &key, Some(&tag)).unwrap(); // unique NIP-98 on retry
         assert_eq!(

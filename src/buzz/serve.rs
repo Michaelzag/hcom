@@ -25,7 +25,9 @@ use crate::buzz::config::{self, Config};
 use crate::buzz::nostr::{self, Event, SecretKey, UnsignedEvent, auth_tag, public_hex, sign};
 use crate::buzz::relay::{HttpRelay, PublishError, RelayMsg, WsSession};
 use crate::buzz::route::{self, AgentRoster, Ancestor, ChannelRow, InboundEvent, PersonRow};
-use crate::buzz::store::{self, Author, AuthorKind, OutboxRow, Store};
+use crate::buzz::store::{
+    self, Author, AuthorKind, OutboxRow, ParkedDelivery, ParkedTarget, Store,
+};
 use crate::db::HcomDb;
 
 /// Backstop wake when no notify endpoint fires.
@@ -410,10 +412,23 @@ impl Drop for ServeLock {
 }
 
 /// One inbound relay message, handed from the reader thread to the main loop.
+#[derive(Clone)]
 pub struct InboundItem {
     pub sub: String,
     pub event: Event,
 }
+
+/// An inbound item whose handling failed on something transient (a store
+/// error, an ancestor fetch during a relay outage). It isn't marked seen, so
+/// it is retried here with backoff, and a restart's backfill still covers it.
+struct PendingInbound {
+    due: Instant,
+    attempts: u32,
+    item: InboundItem,
+}
+
+/// Attempts before a failing inbound item is left to the next backfill.
+const INBOUND_RETRIES: u32 = 8;
 
 /// Start the connector and run until shutdown. Returns the process exit code.
 pub fn serve(config: Config) -> Result<i32> {
@@ -469,9 +484,12 @@ pub fn serve(config: Config) -> Result<i32> {
         notify,
         epoch,
         inbound: rx,
+        pending_inbound: Vec::new(),
         last_enroll: Instant::now(),
         last_stale_check: Instant::now(),
         buckets,
+        held_until: HashMap::new(),
+        draining: false,
     };
     let code = main.run();
 
@@ -744,9 +762,15 @@ struct MainLoop {
     notify: crate::notify::NotifyServer,
     epoch: String,
     inbound: mpsc::Receiver<InboundItem>,
+    pending_inbound: Vec<PendingInbound>,
     last_enroll: Instant,
     last_stale_check: Instant,
     buckets: HashMap<String, TokenBucket>,
+    /// A 429's `retry in Ns`, per signing key: every write by that key waits.
+    held_until: HashMap<String, Instant>,
+    /// True while shutdown drains the outbox: posting continues even though
+    /// the shutdown flag is already set.
+    draining: bool,
 }
 
 impl MainLoop {
@@ -766,9 +790,12 @@ impl MainLoop {
             notify: crate::notify::NotifyServer::new().expect("notify endpoint"),
             epoch,
             inbound: rx,
+            pending_inbound: Vec::new(),
             last_enroll: Instant::now(),
             last_stale_check: Instant::now(),
             buckets: HashMap::new(),
+            held_until: HashMap::new(),
+            draining: false,
         };
         (loop_self, tx)
     }
@@ -833,13 +860,7 @@ impl MainLoop {
         if let Ok(epoch) = hcom_epoch(&self.db)
             && epoch != self.epoch
         {
-            crate::log::log_warn(
-                "buzz",
-                "serve.epoch_changed",
-                "hcom.db was replaced; hosted rows re-register",
-            );
-            self.epoch = epoch.clone();
-            let _ = self.connector.store.lock().adopt_epoch(epoch);
+            self.adopt_new_database();
         }
         self.reregister_missing_rows();
         self.retry_parked_targets();
@@ -851,8 +872,33 @@ impl MainLoop {
         }
     }
 
+    /// `hcom reset` replaced hcom.db: the open connection still points at the
+    /// archived file, so every send and scan would go to a dead database. Open
+    /// the new one, record its epoch, and host every row in it again.
+    fn adopt_new_database(&mut self) {
+        crate::log::log_warn(
+            "buzz",
+            "serve.epoch_changed",
+            "hcom.db was replaced; reopening it and re-registering hosted rows",
+        );
+        let db = match HcomDb::open() {
+            Ok(db) => db,
+            Err(error) => {
+                crate::log::log_error("buzz", "serve.reopen_failed", &error.to_string());
+                return;
+            }
+        };
+        self.db = db;
+        let epoch = hcom_epoch(&self.db).unwrap_or_default();
+        let _ = self.connector.store.lock().adopt_epoch(epoch.clone());
+        self.epoch = epoch;
+        self.connector.hosted.lock().clear();
+        register_hosted_rows(&self.db, &self.connector, self.notify.port());
+    }
+
     /// Re-register any hosted row the store still calls active whose hcom row
-    /// has gone (an operator `hcom stop`, a reset, a deletion).
+    /// is missing or stopped (an operator `hcom stop`, a deletion). The real
+    /// row is checked, not the connector's own list, which a stop never edits.
     fn reregister_missing_rows(&mut self) {
         let port = self.notify.port();
         let people: Vec<String> = self
@@ -865,9 +911,14 @@ impl MainLoop {
         let mut wanted: Vec<String> = people;
         wanted.extend(self.connector.channel_rows().iter().map(|c| c.row_name()));
 
-        let mut hosted = self.connector.hosted.lock();
         for name in wanted {
-            if hosted.contains(&name) {
+            let live = self
+                .db
+                .get_instance_full(&name)
+                .ok()
+                .flatten()
+                .is_some_and(|row| !row.status.eq_ignore_ascii_case("stopped"));
+            if live {
                 continue;
             }
             match crate::hosted::register_hosted(&self.db, &name, crate::hosted::HOSTED_TOOL_BUZZ) {
@@ -882,7 +933,10 @@ impl MainLoop {
                         "serve.row_restored",
                         &format!("{name} is back in the active roster"),
                     );
-                    hosted.push(name);
+                    let mut hosted = self.connector.hosted.lock();
+                    if !hosted.contains(&name) {
+                        hosted.push(name);
+                    }
                 }
                 Err(error) => crate::log::log_warn(
                     "buzz",
@@ -903,13 +957,14 @@ impl MainLoop {
             .due_targets(now)
             .unwrap_or_default();
         for target in due {
-            match self.deliver_parked(&target.buzz_id, &target.target) {
+            match self.deliver_parked(&target) {
                 Ok(true) => {
-                    {
-                        let store = self.connector.store.lock();
-                        let _ =
-                            store.update_target(&target.buzz_id, &target.target, "delivered", 0);
-                    }
+                    let _ = self.connector.store.lock().update_target(
+                        &target.buzz_id,
+                        &target.target,
+                        "delivered",
+                        0,
+                    );
                     continue;
                 }
                 Ok(false) => {}
@@ -922,64 +977,76 @@ impl MainLoop {
             if parked_for < PARK_WINDOW.as_secs() as i64 {
                 let attempts = target.attempts.saturating_add(1);
                 let next = now + park_retry_delay(attempts);
-                {
-                    let store = self.connector.store.lock();
-                    let _ = store.update_target(&target.buzz_id, &target.target, "parked", next);
-                }
+                let _ = self.connector.store.lock().update_target(
+                    &target.buzz_id,
+                    &target.target,
+                    "parked",
+                    next,
+                );
                 continue;
             }
             // The window is over: the channel is told, as omp, in the same
             // thread. The cursor moved on regardless, so nothing stalls.
-            self.announce_undelivered(&target.buzz_id, &target.target);
-            {
-                let store = self.connector.store.lock();
-                let _ = store.expire_targets(&target.buzz_id, &target.target);
-            }
+            self.announce_undelivered(&target);
+            let _ = self
+                .connector
+                .store
+                .lock()
+                .expire_targets(&target.buzz_id, &target.target);
         }
     }
 
-    /// Try one parked delivery. `Ok(true)` when it resolved.
-    fn deliver_parked(&mut self, buzz_id: &str, target: &str) -> Result<bool> {
-        let event = {
-            let store = self.connector.store.lock();
-            store.cached_event(buzz_id)?
-        };
-        let Some(cached) = event else {
-            // Nothing cached to redeliver: the notice already covered it.
-            return Ok(true);
-        };
-        let event: Event = serde_json::from_str(&cached.json)
-            .map_err(|e| anyhow!("cached event is unreadable: {e}"))?;
-        let thread = route::thread_name(&cached.channel_id, buzz_id);
-        crate::commands::send::send_message(
-            &self.db,
-            &hosted_identity(target),
-            &event.content,
-            Some(&crate::messages::MessageEnvelope {
-                thread: Some(thread),
-                ..Default::default()
-            }),
-            Some(&[target.to_string()]),
-        )
-        .map_err(|error| anyhow!("{error}"))?;
-        crate::log::log_info(
-            "buzz",
-            "serve.park_delivered",
-            &format!("{buzz_id} -> {target}"),
-        );
-        Ok(true)
+    /// True when hcom can deliver to `name` now: a hosted row, or any row that
+    /// isn't stopped. A name with no row at all is unroutable.
+    fn is_routable(&self, name: &str) -> bool {
+        self.db
+            .get_instance_full(name)
+            .ok()
+            .flatten()
+            .is_some_and(|row| {
+                crate::hosted::is_hosted_tool(&row.tool)
+                    || !row.status.eq_ignore_ascii_case("stopped")
+            })
     }
 
-    /// Post the "isn't running — not delivered" notice as omp.
-    fn announce_undelivered(&mut self, buzz_id: &str, target: &str) {
-        let channel_id = {
-            let store = self.connector.store.lock();
-            match store.cached_event(buzz_id) {
-                Ok(Some(cached)) => cached.channel_id,
-                _ => return,
-            }
-        };
-        let text = format!("{target} isn't running — not delivered");
+    /// Resend one parked target exactly what was routed for it: from the
+    /// person, in the Buzz thread. `Ok(true)` once hcom delivered it.
+    fn deliver_parked(&mut self, target: &ParkedTarget) -> Result<bool> {
+        if !self.is_routable(&target.target) {
+            return Ok(false);
+        }
+        let owed = &target.delivery;
+        self.connector
+            .store
+            .lock()
+            .put_thread(&owed.thread, &owed.channel_id, &owed.root_id)?;
+        let delivered_to = crate::commands::send::send_message(
+            &self.db,
+            &hosted_identity(&owed.sender),
+            &owed.text,
+            Some(&crate::messages::MessageEnvelope {
+                thread: Some(owed.thread.clone()),
+                ..Default::default()
+            }),
+            Some(std::slice::from_ref(&target.target)),
+        )
+        .map_err(|error| anyhow!("{error}"))?;
+        let reached = delivered_to.iter().any(|name| name == &target.target);
+        if reached {
+            crate::log::log_info(
+                "buzz",
+                "serve.park_delivered",
+                &format!("{} -> {}", target.buzz_id, target.target),
+            );
+        }
+        Ok(reached)
+    }
+
+    /// Post the "isn't running — not delivered" notice as omp, in the thread
+    /// the message belonged to.
+    fn announce_undelivered(&mut self, target: &ParkedTarget) {
+        let owed = &target.delivery;
+        let text = format!("{} isn't running — not delivered", target.target);
         // Posted as omp's own key: it is a relay member and the channel admin, so
         // no enrollment or delegation is needed, and the notice reads as coming
         // from omp rather than from whichever agent failed.
@@ -987,15 +1054,11 @@ impl MainLoop {
             UnsignedEvent {
                 created_at: nostr::now(),
                 kind: route::KIND_MESSAGE,
-                tags: {
-                    let mut tags = route::message_tags(&route::Destination {
-                        channel_id,
-                        root_id: Some(buzz_id.to_string()),
-                        mentions: Vec::new(),
-                    });
-                    tags.retain(|tag| tag.first().is_none_or(|n| n != "p"));
-                    tags
-                },
+                tags: route::message_tags(&route::Destination {
+                    channel_id: owed.channel_id.clone(),
+                    root_id: Some(owed.root_id.clone()),
+                    mentions: Vec::new(),
+                }),
                 content: text,
             },
             &self.connector.owner,
@@ -1008,12 +1071,12 @@ impl MainLoop {
             Ok(()) => crate::log::log_info(
                 "buzz",
                 "serve.not_delivered",
-                &format!("{buzz_id}: {target}"),
+                &format!("{}: {}", target.buzz_id, target.target),
             ),
             Err(error) => crate::log::log_warn(
                 "buzz",
                 "serve.not_delivered_failed",
-                &format!("{target}: {error}"),
+                &format!("{}: {error}", target.target),
             ),
         }
     }
@@ -1215,7 +1278,7 @@ impl MainLoop {
             .due_outbox(channel_id, now)
             .unwrap_or_default();
         for row in due {
-            if self.connector.shutdown.load(Ordering::SeqCst) {
+            if self.connector.shutdown.load(Ordering::SeqCst) && !self.draining {
                 return;
             }
             let event: Event = match serde_json::from_str(&row.signed_json) {
@@ -1261,7 +1324,8 @@ impl MainLoop {
                     }
                 }
                 Err(PublishError::RateLimited { retry_after }) => {
-                    // Per-key: only this signer waits.
+                    // Per-key: this signer's every write waits, not just this row.
+                    self.hold_key(&identity.pubkey, retry_after);
                     let next =
                         crate::shared::time::now_epoch_i64() + retry_after.as_secs().max(1) as i64;
                     self.retry_row(&row, next, "rate limited");
@@ -1277,6 +1341,13 @@ impl MainLoop {
                         + post_retry_delay(row.attempts).as_secs() as i64;
                     self.retry_row(&row, next, "relay timed out");
                 }
+                // An outage longer than the relay's ±900 s admission window:
+                // the event was never stored, so it goes out again re-signed.
+                Err(PublishError::Rejected(message))
+                    if message.contains("too far from server time") =>
+                {
+                    self.resign_row(&row, &identity);
+                }
                 Err(PublishError::Rejected(message)) => {
                     // The relay will never accept this event.
                     self.fail_row(&row, &message);
@@ -1291,16 +1362,18 @@ impl MainLoop {
         }
     }
 
-    /// An outbox entry unacked past the admission window is looked up by id
-    /// first; only if the relay never stored it is it re-signed with a fresh
-    /// `created_at`.
+    /// An outbox entry unacked past `STALE_OUTBOX_SECS` (inside the relay's
+    /// 900 s admission window) is looked up by id first; only if the relay
+    /// answers that it never stored it is it re-signed with a fresh
+    /// `created_at`. A failed lookup proves nothing, so it waits for the next
+    /// check rather than risk posting twice.
     fn recheck_stale_outbox(&mut self) {
         let now = crate::shared::time::now_epoch_i64();
         let stale = self
             .connector
             .store
             .lock()
-            .stale_outbox(now - STALE_RECHECK_AFTER.as_secs() as i64)
+            .stale_outbox(now)
             .unwrap_or_default();
         for row in stale {
             let identity = self.connector.agent_identity(&row.signer_name);
@@ -1314,71 +1387,83 @@ impl MainLoop {
             {
                 // The relay has it after all: the lost ack, not a lost post.
                 Ok(events) if !events.is_empty() => {
-                    {
-                        let store = self.connector.store.lock();
-                        let _ = store.ack_outbox(&row.buzz_id);
-                    }
+                    let _ = self.connector.store.lock().ack_outbox(&row.buzz_id);
                     crate::log::log_info(
                         "buzz",
                         "serve.stale_present",
                         &format!("{} {channel}", row.signer_name, channel = row.destination),
                     );
                 }
-                _ => {
-                    let previous: Event = match serde_json::from_str(&row.signed_json) {
-                        Ok(event) => event,
-                        Err(_) => continue,
-                    };
-                    // Only the timestamp changes, so the thread shape, mentions and
-                    // content are exactly what the relay would have received.
-                    let event = sign(
-                        UnsignedEvent {
-                            created_at: nostr::now(),
-                            kind: previous.kind,
-                            tags: previous.tags,
-                            content: previous.content,
-                        },
-                        &identity.key,
-                    );
-                    let signed = serde_json::to_string(&event).unwrap_or_default();
-                    let now = crate::shared::time::now_epoch_i64();
-                    {
-                        let store = self.connector.store.lock();
-                        let _ = store.replace_outbox_event(
-                            row.hcom_id,
-                            &row.destination,
-                            &event.id,
-                            &signed,
-                            now,
-                        );
-                        let _ = store.retry_outbox(
-                            &row.buzz_id,
-                            now,
-                            "re-signed after the relay never stored it",
-                        );
-                        let _ = store.drop_outbox(&row.buzz_id);
-                    }
-                    crate::log::log_info(
-                        "buzz",
-                        "serve.stale_resigned",
-                        &format!("{} -> {}", row.signer_name, row.destination),
-                    );
-                    crate::log::log_info(
-                        "buzz",
-                        "serve.stale_resigned",
-                        &format!("{} -> {}", row.signer_name, row.destination),
-                    );
-                }
+                Ok(_) => self.resign_row(&row, &identity),
+                Err(error) => crate::log::log_warn(
+                    "buzz",
+                    "serve.stale_lookup_failed",
+                    &format!("{}: {error}; checking again later", row.buzz_id),
+                ),
             }
         }
     }
 
+    /// Re-sign an outbox row the relay never stored, with a fresh `created_at`.
+    /// Only the timestamp changes, so the thread shape, mentions and content
+    /// are exactly what the relay would have received.
+    fn resign_row(&mut self, row: &OutboxRow, identity: &AgentIdentity) {
+        let Ok(previous) = serde_json::from_str::<Event>(&row.signed_json) else {
+            self.fail_row(row, "unreadable signed event");
+            return;
+        };
+        // Strictly newer than the original, so the id always changes even if
+        // the clock stepped back; an identical id would make this a no-op.
+        let event = sign(
+            UnsignedEvent {
+                created_at: nostr::now().max(previous.created_at + 1),
+                kind: previous.kind,
+                tags: previous.tags,
+                content: previous.content,
+            },
+            &identity.key,
+        );
+        let signed = serde_json::to_string(&event).unwrap_or_default();
+        let now = crate::shared::time::now_epoch_i64();
+        if let Err(error) =
+            self.connector
+                .store
+                .lock()
+                .replace_outbox_event(&row.buzz_id, &event.id, &signed, now)
+        {
+            crate::log::log_warn("buzz", "serve.resign_failed", &error.to_string());
+            return;
+        }
+        crate::log::log_info(
+            "buzz",
+            "serve.stale_resigned",
+            &format!(
+                "{} -> {}: {} is now {}",
+                row.signer_name, row.destination, row.buzz_id, event.id
+            ),
+        );
+    }
+
     /// Take one HTTP token for a signing key.
     fn take_http_token(&mut self, pubkey: &str) -> Result<(), Duration> {
+        if let Some(until) = self.held_until.get(pubkey) {
+            let now = Instant::now();
+            if now < *until {
+                return Err(*until - now);
+            }
+            self.held_until.remove(pubkey);
+        }
         self.buckets
             .entry(pubkey.to_string())
             .or_insert_with(|| TokenBucket::new(HTTP_PER_MINUTE, Duration::from_secs(60)))
             .take()
+    }
+
+    /// Honor a 429's `retry in Ns` for every write by this key.
+    fn hold_key(&mut self, pubkey: &str, retry_after: Duration) {
+        let until = Instant::now() + retry_after.max(Duration::from_secs(1));
+        let held = self.held_until.entry(pubkey.to_string()).or_insert(until);
+        *held = (*held).max(until);
     }
 
     fn retry_row(&self, row: &OutboxRow, next_at: i64, error: &str) {
@@ -1405,10 +1490,12 @@ impl MainLoop {
         }
     }
 
-    /// Bounded drain, used by shutdown.
+    /// Bounded drain, used by shutdown. Runs with the shutdown flag already
+    /// set, so it posts under `draining` until the queue empties or time is up.
     fn flush_outbox(&mut self, budget: Duration) {
         let deadline = Instant::now() + budget;
-        while Instant::now() < deadline && !self.connector.shutdown.load(Ordering::SeqCst) {
+        self.draining = true;
+        while Instant::now() < deadline {
             let pending: i64 = self
                 .connector
                 .store
@@ -1420,7 +1507,7 @@ impl MainLoop {
                 .map(|(_, count)| *count)
                 .sum();
             if pending == 0 {
-                return;
+                break;
             }
             let channels: Vec<String> = self
                 .connector
@@ -1433,6 +1520,7 @@ impl MainLoop {
             }
             sleep(Duration::from_millis(200));
         }
+        self.draining = false;
     }
 
     /// Enroll one identity in a channel: kind 0, kind 30177, then kind 9000.
@@ -1487,6 +1575,9 @@ impl MainLoop {
                 .http
                 .post_event(event, &signer, auth.as_deref())
             {
+                if let PublishError::RateLimited { retry_after } = &error {
+                    self.hold_key(&event.pubkey, *retry_after);
+                }
                 crate::log::log_warn(
                     "buzz",
                     "serve.enroll_failed",
@@ -1622,31 +1713,75 @@ impl MainLoop {
     }
 
     /// Handle every inbound relay message: verify, dedupe, cache, deliver.
+    /// Items that failed on something transient are retried with backoff
+    /// first; they were never marked seen, so a restart's backfill also covers
+    /// them.
     fn drain_inbound(&mut self) {
+        let now = Instant::now();
+        let (due, waiting): (Vec<PendingInbound>, Vec<PendingInbound>) =
+            std::mem::take(&mut self.pending_inbound)
+                .into_iter()
+                .partition(|pending| pending.due <= now);
+        self.pending_inbound = waiting;
+        for pending in due {
+            self.handle_or_requeue(pending.item, pending.attempts);
+        }
         while let Ok(item) = self.inbound.try_recv() {
-            if let Err(error) = self.handle_inbound(item) {
-                crate::log::log_warn("buzz", "serve.inbound", &error.to_string());
-            }
+            self.handle_or_requeue(item, 0);
         }
     }
 
+    fn handle_or_requeue(&mut self, item: InboundItem, attempts: u32) {
+        let Err(error) = self.handle_inbound(item.clone()) else {
+            return;
+        };
+        if attempts + 1 >= INBOUND_RETRIES {
+            crate::log::log_error(
+                "buzz",
+                "serve.inbound_gave_up",
+                &format!("{}: {error}; left to the next backfill", item.event.id),
+            );
+            return;
+        }
+        crate::log::log_warn(
+            "buzz",
+            "serve.inbound_retry",
+            &format!("{}: {error}", item.event.id),
+        );
+        self.pending_inbound.push(PendingInbound {
+            due: Instant::now() + backoff(attempts, BACKOFF_MIN, BACKOFF_MAX),
+            attempts: attempts + 1,
+            item,
+        });
+    }
+
+    /// Handle one inbound event to completion. It is marked seen only at the
+    /// end, once delivered, parked or skipped; an error leaves it unseen.
     fn handle_inbound(&mut self, item: InboundItem) -> Result<()> {
         let event = item.event;
         if !nostr::verify(&event) {
-            return Err(anyhow!("{} failed signature verification", event.id));
+            crate::log::log_warn(
+                "buzz",
+                "serve.bad_signature",
+                &format!("{} failed signature verification", event.id),
+            );
+            return Ok(());
         }
-        let channel = self
+        let Some(channel) = self
             .connector
             .channel_rows()
             .into_iter()
             .find(|c| item.sub == sub_id(&c.slug))
-            .ok_or_else(|| anyhow!("event on unknown subscription {}", item.sub))?;
-
-        {
-            let store = self.connector.store.lock();
-            if !store.mark_seen(&event.id)? {
-                return Ok(());
-            }
+        else {
+            crate::log::log_warn(
+                "buzz",
+                "serve.unknown_sub",
+                &format!("event on unknown subscription {}", item.sub),
+            );
+            return Ok(());
+        };
+        if self.connector.store.lock().was_seen(&event.id)? {
+            return Ok(());
         }
 
         let (root_id, parent_id) = route::thread_refs(&event);
@@ -1662,11 +1797,26 @@ impl MainLoop {
         }
 
         match event.kind {
-            route::KIND_ROSTER => return self.handle_roster(&event),
-            route::KIND_PROFILE => return self.handle_profile(&event),
-            _ => {}
+            route::KIND_ROSTER => self.handle_roster(&event)?,
+            route::KIND_PROFILE => self.handle_profile(&event)?,
+            _ => self.route_and_deliver(&event, &channel, root_id, parent_id)?,
         }
+        self.connector.store.lock().mark_seen(&event.id)?;
+        Ok(())
+    }
 
+    /// Route a message-like event and deliver it, parking unroutable targets.
+    fn route_and_deliver(
+        &mut self,
+        event: &Event,
+        channel: &ChannelRow,
+        root_id: Option<String>,
+        parent_id: Option<String>,
+    ) -> Result<()> {
+        // A crash between the send and `mark_seen` must not deliver twice.
+        if self.connector.store.lock().was_delivered(&event.id)? {
+            return Ok(());
+        }
         // An edit or deletion addresses a previous event through its `e` tag:
         // the delivered check, the thread and the targets all follow that
         // original, not the revision itself.
@@ -1675,7 +1825,7 @@ impl MainLoop {
             route::KIND_EDIT | route::KIND_DELETE | route::KIND_CHANNEL_DELETE
         );
         let subject = if revision {
-            route::tag(&event, "e").unwrap_or(&event.id).to_string()
+            route::tag(event, "e").unwrap_or(&event.id).to_string()
         } else {
             event.id.clone()
         };
@@ -1688,7 +1838,7 @@ impl MainLoop {
         } else {
             None
         };
-        let threaded = original.as_ref().unwrap_or(&event);
+        let threaded = original.as_ref().unwrap_or(event);
         let ancestry = self.load_ancestry(threaded)?;
         let (root_id, parent_id) = if original.is_some() {
             route::thread_refs(threaded)
@@ -1707,12 +1857,7 @@ impl MainLoop {
         let people = self.route_inputs_people()?;
         let roster = self.agent_roster();
         let kinds = self.author_kinds(&people);
-        let delivered = self
-            .connector
-            .store
-            .lock()
-            .was_delivered(&subject)
-            .unwrap_or(false);
+        let delivered = self.connector.store.lock().was_delivered(&subject)?;
 
         match route::route_inbound(&input, &people, &roster, &kinds, delivered) {
             route::Inbound::Skip(reason) => crate::log::log_info(
@@ -1720,32 +1865,7 @@ impl MainLoop {
                 "serve.inbound_skipped",
                 &format!("{}: {reason:?}", event.id),
             ),
-            route::Inbound::Deliver(delivery) => {
-                // A target hcom cannot route is one with no deliverable row at
-                // all: `send_message` refuses it, and the whole event is parked
-                // for that target rather than dropped for the others.
-                let unroutable: Vec<String> = delivery
-                    .targets
-                    .iter()
-                    .filter(|target| {
-                        !self
-                            .db
-                            .get_instance_full(target)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|row| {
-                                crate::hosted::is_hosted_tool(&row.tool)
-                                    || !row.status.eq_ignore_ascii_case("stopped")
-                            })
-                    })
-                    .cloned()
-                    .collect();
-                if unroutable.is_empty() {
-                    self.deliver_to_hcom(&subject, delivery)?;
-                } else {
-                    self.park_all(&subject, &unroutable)?;
-                }
-            }
+            route::Inbound::Deliver(delivery) => self.deliver_to_hcom(&event.id, delivery)?,
         }
         Ok(())
     }
@@ -1866,76 +1986,82 @@ impl MainLoop {
                     let (root, reply) = route::thread_refs(&event);
                     (event.pubkey, reply.or(root))
                 })),
-            Err(error) => {
-                crate::log::log_warn("buzz", "serve.fetch_failed", &error.to_string());
-                Ok(None)
-            }
+            // A 429 or a 5xx mid-switchover is not "no such event": without the
+            // ancestor a plain thread reply has no target, so the whole event
+            // goes back to the retry queue instead.
+            Err(error) => Err(anyhow!("ancestor {id}: {error}")),
         }
     }
 
-    /// Park a whole inbound event: every target is unroutable, so nothing is
-    /// delivered and the retry window owns the outcome.
-    fn park_all(&mut self, buzz_id: &str, targets: &[String]) -> Result<()> {
-        let now = crate::shared::time::now_epoch_i64();
-        let store = self.connector.store.lock();
-        for target in targets {
-            store.park_target(buzz_id, target, now)?;
-        }
-        crate::log::log_warn(
-            "buzz",
-            "serve.parked",
-            &format!("{buzz_id}: {} has no deliverable row", targets.join(", ")),
-        );
-        Ok(())
-    }
-
-    /// Send one delivery as the person's hosted row.
+    /// Send one routed delivery as the person's hosted row. Targets hcom can
+    /// route get it now; the rest are parked with exactly this delivery, so a
+    /// stopped agent never holds the message back from a live one.
     fn deliver_to_hcom(&mut self, buzz_id: &str, delivery: route::InboundDelivery) -> Result<()> {
-        let thread = delivery.thread.clone();
-        {
-            let store = self.connector.store.lock();
-            store.put_thread(&thread, &delivery.channel_id, &delivery.root_id)?;
-        }
-        let targets = delivery.targets.clone();
-        let sender = delivery.sender.clone();
-        let text = delivery.text.clone();
+        let (live, parked): (Vec<String>, Vec<String>) = delivery
+            .targets
+            .iter()
+            .cloned()
+            .partition(|target| self.is_routable(target));
+        let owed = ParkedDelivery {
+            sender: delivery.sender.clone(),
+            thread: delivery.thread.clone(),
+            root_id: delivery.root_id.clone(),
+            channel_id: delivery.channel_id.clone(),
+            text: delivery.text.clone(),
+        };
+        self.connector
+            .store
+            .lock()
+            .put_thread(&owed.thread, &owed.channel_id, &owed.root_id)?;
 
-        match crate::commands::send::send_message(
-            &self.db,
-            &hosted_identity(&sender),
-            &text,
-            Some(&crate::messages::MessageEnvelope {
-                thread: Some(thread),
-                ..Default::default()
-            }),
-            Some(&targets),
-        ) {
-            Ok(delivered_to) => {
-                // At least once: the Buzz id is recorded right after the send, so
-                // a crash between the two repeats one message rather than
-                // dropping it.
-                let store = self.connector.store.lock();
-                store.mark_delivered(buzz_id)?;
-                crate::log::log_info(
-                    "buzz",
-                    "serve.delivered",
-                    &format!("{sender} -> {} ({buzz_id})", delivered_to.join(",")),
-                );
-            }
-            Err(error) => {
-                // Park the targets: the cursor moves on regardless, so one
-                // sleeping laptop cannot stall a channel.
-                crate::log::log_warn(
-                    "buzz",
-                    "serve.deliver_refused",
-                    &format!("{sender}: {error}"),
-                );
-                let now = crate::shared::time::now_epoch_i64();
-                let store = self.connector.store.lock();
-                for target in &targets {
-                    store.park_target(buzz_id, target, now)?;
+        let mut refused: Vec<String> = Vec::new();
+        if !live.is_empty() {
+            match crate::commands::send::send_message(
+                &self.db,
+                &hosted_identity(&owed.sender),
+                &owed.text,
+                Some(&crate::messages::MessageEnvelope {
+                    thread: Some(owed.thread.clone()),
+                    ..Default::default()
+                }),
+                Some(&live),
+            ) {
+                Ok(delivered_to) => {
+                    // At least once: the Buzz id is recorded right after the
+                    // send, so a crash between the two repeats one message
+                    // rather than dropping it.
+                    self.connector.store.lock().mark_delivered(buzz_id)?;
+                    crate::log::log_info(
+                        "buzz",
+                        "serve.delivered",
+                        &format!("{} -> {} ({buzz_id})", owed.sender, delivered_to.join(",")),
+                    );
+                }
+                Err(error) => {
+                    crate::log::log_warn(
+                        "buzz",
+                        "serve.deliver_refused",
+                        &format!("{}: {error}", owed.sender),
+                    );
+                    refused = live;
                 }
             }
+        }
+
+        // The cursor moves on regardless, so one sleeping laptop cannot stall
+        // a channel; the retry window owns these.
+        let unresolved: Vec<String> = parked.into_iter().chain(refused).collect();
+        if !unresolved.is_empty() {
+            let now = crate::shared::time::now_epoch_i64();
+            let store = self.connector.store.lock();
+            for target in &unresolved {
+                store.park_target(buzz_id, target, now, &owed)?;
+            }
+            crate::log::log_warn(
+                "buzz",
+                "serve.parked",
+                &format!("{buzz_id}: {} not deliverable now", unresolved.join(", ")),
+            );
         }
         Ok(())
     }
@@ -2813,7 +2939,8 @@ mod tests {
             row[0].buzz_id.clone()
         };
 
-        // The quota window closes and the retry time arrives. Enrollment and the
+        // The quota window closes and the retry time arrives: the row is due
+        // and the key's `retry in 7s` hold has run out. Enrollment and the
         // post are separate writes, and enrollment's writes were rate limited
         // too, so give the loop the passes it needs.
         harness.set_http_status(0);
@@ -2821,6 +2948,7 @@ mod tests {
             .store()
             .retry_outbox(&buzz_id, 0, "rate limited")
             .unwrap();
+        harness.main.held_until.clear();
         harness.step_until(|h| !h.agent_posts().is_empty());
 
         let posts = harness.agent_posts();
@@ -2910,6 +3038,155 @@ mod tests {
         assert!(
             !store.recent_errors(5).unwrap().is_empty(),
             "the reason is kept"
+        );
+    }
+
+    /// Queue one post that stays unposted (the relay is refusing writes), and
+    /// return its Buzz id.
+    fn queue_one_unposted(harness: &mut Harness) -> String {
+        harness.use_home_channel("michael", "michael");
+        harness.add_person("michael", Some("michael"));
+        harness.add_agent("luna");
+        harness.set_http_status(503);
+        harness.send("luna", "held back", &["michael"], None);
+        harness.step();
+        let rows = harness.store().unsent_outbox().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        rows[0].buzz_id.clone()
+    }
+
+    #[test]
+    #[serial]
+    fn an_unacked_post_is_rechecked_before_the_relays_900s_window_closes() {
+        let mut harness = harness("mbai");
+        let old = queue_one_unposted(&mut harness);
+        harness.set_http_status(0);
+        let now = crate::shared::time::now_epoch_i64();
+        // 850 s old: past the 840 s re-check point, inside the relay's 900 s.
+        harness.store().age_outbox(&old, now - 850).unwrap();
+        harness.main.recheck_stale_outbox();
+
+        let rows = harness.store().unsent_outbox().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].buzz_id, old, "re-signed with a fresh created_at");
+    }
+
+    #[test]
+    #[serial]
+    fn a_failed_lookup_never_re_signs() {
+        // The relay may have stored the original; a 503 on the lookup proves
+        // nothing, and re-signing would post the message twice.
+        let mut harness = harness("mbai");
+        let old = queue_one_unposted(&mut harness);
+        let now = crate::shared::time::now_epoch_i64();
+        harness.store().age_outbox(&old, now - 850).unwrap();
+        harness.main.recheck_stale_outbox();
+
+        let rows = harness.store().unsent_outbox().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].buzz_id, old, "kept until a lookup succeeds");
+    }
+
+    #[test]
+    #[serial]
+    fn a_stale_row_from_before_an_hcom_reset_is_re_signed_not_deleted() {
+        let mut harness = harness("mbai");
+        let old = queue_one_unposted(&mut harness);
+        harness.set_http_status(0);
+        harness.store().adopt_epoch("after-reset".into()).unwrap();
+        let now = crate::shared::time::now_epoch_i64();
+        harness.store().age_outbox(&old, now - 850).unwrap();
+        harness.main.recheck_stale_outbox();
+
+        let rows = harness.store().unsent_outbox().unwrap();
+        assert_eq!(rows.len(), 1, "the unposted message survives");
+        assert_ne!(rows[0].buzz_id, old);
+    }
+
+    /// Michael's home channel with luna already enrolled in it, so a test sees
+    /// only post traffic.
+    fn enrolled_home(harness: &mut Harness) {
+        harness.use_home_channel("michael", "michael");
+        harness.add_person("michael", Some("michael"));
+        harness.add_agent("luna");
+        harness
+            .store()
+            .put_enrollment(&public_hex(&agent_key()), CHANNEL_ID, "enrolled")
+            .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn a_429_holds_every_queued_post_of_that_key() {
+        let mut harness = harness("mbai");
+        enrolled_home(&mut harness);
+        harness.set_http_status(429);
+        harness.send("luna", "one", &["michael"], None);
+        harness.send("luna", "two", &["michael"], None);
+        let before = harness.relay.http_requests();
+        harness.step();
+        assert_eq!(
+            harness.relay.http_requests() - before,
+            1,
+            "after 'retry in 7s' the key's next post waits instead of drawing another 429"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_post_that_aged_past_the_relay_window_is_re_signed_not_failed() {
+        let mut harness = harness("mbai");
+        enrolled_home(&mut harness);
+        harness.set_http_status(503);
+        harness.send("luna", "late", &["michael"], None);
+        harness.step();
+        harness.set_http_status(0);
+        // The outage outlasted the relay's 900 s admission window.
+        let row = harness.store().unsent_outbox().unwrap().remove(0);
+        let previous: Event = serde_json::from_str(&row.signed_json).unwrap();
+        let aged = sign(
+            UnsignedEvent {
+                created_at: previous.created_at - 1000,
+                kind: previous.kind,
+                tags: previous.tags,
+                content: previous.content,
+            },
+            &agent_key(),
+        );
+        harness
+            .store()
+            .replace_outbox_event(
+                &row.buzz_id,
+                &aged.id,
+                &serde_json::to_string(&aged).unwrap(),
+                0,
+            )
+            .unwrap();
+        harness.step_until(|h| !h.agent_posts().is_empty());
+
+        let posts = harness.agent_posts();
+        assert_eq!(posts.len(), 1, "{:?}", harness.store().outbox_counts());
+        assert_eq!(posts[0].content, "late");
+        assert!(posts[0].created_at > aged.created_at, "a fresh timestamp");
+    }
+
+    #[test]
+    #[serial]
+    fn shutdown_flushes_what_is_queued() {
+        let mut harness = harness("mbai");
+        enrolled_home(&mut harness);
+        harness.send("luna", "last words", &["michael"], None);
+        harness.main.scan_outbound();
+        harness
+            .main
+            .connector
+            .shutdown
+            .store(true, Ordering::SeqCst);
+        harness.main.shutdown();
+        assert_eq!(
+            harness.agent_posts().len(),
+            1,
+            "the bounded flush posts what was queued before exiting"
         );
     }
 
@@ -3092,6 +3369,141 @@ mod tests {
                 .any(|(state, n)| state == "parked" && *n == 1),
             "the mention is parked for luna, not skipped as naming nobody"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn live_targets_get_the_message_while_a_stopped_one_is_parked() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        harness.add_agent("nova");
+        let nova = nostr::derive_secret(&SEED, "nova@mbai");
+        // nova is known (enrolled earlier) but its session ended.
+        harness
+            .store()
+            .put_author(&Author {
+                pubkey: public_hex(&nova),
+                kind: AuthorKind::Agent,
+                hcom_name: Some("nova".into()),
+                device_label: Some("mbai".into()),
+            })
+            .unwrap();
+        assert!(harness.main.db.delete_instance("nova").unwrap());
+
+        harness.offer(message(
+            &human_key(),
+            CHANNEL_ID,
+            "both of you, look",
+            vec![
+                vec!["p".into(), public_hex(&agent_key())],
+                vec!["p".into(), public_hex(&nova)],
+            ],
+        ));
+        harness.step();
+
+        assert_eq!(
+            harness.unread("luna").len(),
+            1,
+            "luna is live and gets it now"
+        );
+        assert!(
+            harness
+                .store()
+                .target_counts()
+                .unwrap()
+                .iter()
+                .any(|(state, n)| state == "parked" && *n == 1),
+            "only nova is parked"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_parked_target_is_redelivered_from_the_person_in_the_buzz_thread() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        harness
+            .store()
+            .put_author(&Author {
+                pubkey: public_hex(&agent_key()),
+                kind: AuthorKind::Agent,
+                hcom_name: Some("luna".into()),
+                device_label: Some("mbai".into()),
+            })
+            .unwrap();
+        assert!(harness.main.db.delete_instance("luna").unwrap());
+
+        let event = message(
+            &human_key(),
+            CHANNEL_ID,
+            "luna, when you're back",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        harness.offer(event.clone());
+        harness.step();
+
+        // The session comes back; the next retry delivers what was routed.
+        harness.add_agent("luna");
+        harness
+            .store()
+            .age_parked_target(&event.id, crate::shared::time::now_epoch_i64())
+            .unwrap();
+        harness.step();
+
+        let unread = harness.unread("luna");
+        assert_eq!(unread.len(), 1, "redelivered once");
+        assert_eq!(
+            unread[0].from, "michael",
+            "from the person, not the agent itself"
+        );
+        assert_eq!(unread[0].text, "luna, when you're back");
+        let thread = route::thread_name("infra", &event.id);
+        assert_eq!(unread[0].thread.as_deref(), Some(thread.as_str()));
+        assert!(
+            harness.store().thread(&thread).unwrap().is_some(),
+            "the thread is recorded, so a reply goes back to Buzz"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_ancestor_fetch_failure_is_retried_not_dropped() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        // luna's post is on the relay but not in the cache, and the relay is in
+        // a 503 window when Michael's plain reply arrives.
+        let post = message(&agent_key(), CHANNEL_ID, "deployed", vec![]);
+        harness.relay.seed(post.clone());
+        let reply = message(
+            &human_key(),
+            CHANNEL_ID,
+            "thanks",
+            vec![vec![
+                "e".into(),
+                post.id.clone(),
+                String::new(),
+                "reply".into(),
+            ]],
+        );
+        harness.set_http_status(503);
+        harness.offer(reply.clone());
+        harness.step();
+        assert!(harness.unread("luna").is_empty());
+        assert!(
+            !harness.store().was_seen(&reply.id).unwrap(),
+            "an event that wasn't handled isn't marked seen"
+        );
+
+        harness.set_http_status(0);
+        for pending in &mut harness.main.pending_inbound {
+            pending.due = Instant::now();
+        }
+        harness.step();
+        assert_eq!(harness.unread("luna").len(), 1, "the retry delivers it");
+        assert!(harness.store().was_seen(&reply.id).unwrap());
     }
 
     #[test]
@@ -3414,11 +3826,12 @@ mod tests {
 
     #[test]
     #[serial]
-    fn an_agent_whose_row_was_stopped_by_hand_comes_back() {
+    fn a_hosted_row_stopped_or_deleted_by_hand_comes_back() {
         let mut harness = harness("mbai");
         harness.add_person("michael", None);
 
-        // The operator stops the row while the connector runs.
+        // The operator stops one row and deletes another while the connector
+        // runs; the connector's own bookkeeping still lists both.
         harness
             .main
             .db
@@ -3428,23 +3841,74 @@ mod tests {
                 [],
             )
             .unwrap();
-        harness
-            .main
-            .connector
-            .hosted
-            .lock()
-            .retain(|n| n != "michael");
+        assert!(harness.main.db.delete_instance("ch_infra").unwrap());
         harness.step();
 
-        let row = harness
+        let michael = harness
             .main
             .db
             .get_instance_full("michael")
             .unwrap()
             .unwrap();
         assert_ne!(
-            row.status, "stopped",
+            michael.status, "stopped",
             "an active roster row is restored while the connector runs"
+        );
+        assert!(
+            harness
+                .main
+                .db
+                .get_instance_full("ch_infra")
+                .unwrap()
+                .is_some(),
+            "a deleted channel row is recreated"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_hcom_reset_reopens_the_database_and_rehosts_the_rows() {
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+
+        // `hcom reset`: the database file is archived and a new one created.
+        let path = crate::paths::db_path();
+        for suffix in ["", "-wal", "-shm"] {
+            let from = format!("{}{suffix}", path.display());
+            if std::path::Path::new(&from).exists() {
+                std::fs::rename(&from, format!("{from}.archived")).unwrap();
+            }
+        }
+        let fresh = HcomDb::open().unwrap();
+        let now = crate::shared::time::now_epoch_i64();
+        let luna = json!({
+            "name": "luna", "tool": "claude", "status": "listening",
+            "status_time": now, "status_context": "ready", "last_stop": now,
+            "tcp_mode": 0, "last_event_id": fresh.get_last_event_id(),
+            "origin_device_id": "", "directory": "", "transcript_path": "",
+            "background": 0, "name_announced": 0,
+            "created_at": crate::shared::time::now_epoch_f64(),
+        });
+        fresh
+            .save_instance_named("luna", luna.as_object().unwrap())
+            .unwrap();
+        harness.step();
+
+        assert!(
+            fresh.get_instance_full("michael").unwrap().is_some(),
+            "the person's hosted row exists in the new database"
+        );
+        harness.offer(message(
+            &human_key(),
+            CHANNEL_ID,
+            "after the reset",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        ));
+        harness.step();
+        assert_eq!(
+            fresh.get_unread_messages("luna").len(),
+            1,
+            "delivery goes to the live database, not the archived one"
         );
     }
 

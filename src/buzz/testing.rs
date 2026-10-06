@@ -61,6 +61,11 @@ impl FakeRelay {
         self.state.lock().events.clone()
     }
 
+    /// Authenticated HTTP requests the relay has accepted a NIP-98 header for,
+    /// whatever it answered: what a client's request discipline is judged by.
+    pub fn http_requests(&self) -> usize {
+        self.state.lock().auth_ids.len()
+    }
     /// Store an event as if it had arrived over the wire, so a test can seed a
     /// history the connector then backfills.
     pub fn seed(&self, event: Event) {
@@ -605,6 +610,16 @@ fn handle_http(stream: TcpStream, url: &str, state: &Mutex<State>, switches: &Sw
                     &mut stream,
                     403,
                     json!({"error":"restricted: author mismatch"}),
+                    switches,
+                );
+                return;
+            }
+            // relay-v0.2.1 ingest.rs:1976-1982: MAX_TIMESTAMP_DRIFT_SECS = 900.
+            if event.created_at.abs_diff(now()) > 900 {
+                respond(
+                    &mut stream,
+                    400,
+                    json!({"error":"invalid: event timestamp too far from server time"}),
                     switches,
                 );
                 return;

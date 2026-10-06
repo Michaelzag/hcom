@@ -123,6 +123,18 @@ pub struct OutboxRow {
     pub last_error: Option<String>,
 }
 
+/// What a parked target is owed: the routed delivery, exactly as it would have
+/// been sent, so a retry resends that and nothing re-derived.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParkedDelivery {
+    /// The person row the message comes from.
+    pub sender: String,
+    pub thread: String,
+    pub root_id: String,
+    pub channel_id: String,
+    pub text: String,
+}
+
 /// A parked inbound target awaiting a live hcom row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParkedTarget {
@@ -133,6 +145,7 @@ pub struct ParkedTarget {
     pub next_at: i64,
     /// When the target was first parked; the retry window runs from here.
     pub first_parked_at: i64,
+    pub delivery: ParkedDelivery,
 }
 
 /// Enrollment state of one (agent, channel) pair.
@@ -242,6 +255,11 @@ impl Store {
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_at INTEGER NOT NULL DEFAULT 0,
                 first_parked_at INTEGER NOT NULL DEFAULT 0,
+                sender TEXT NOT NULL,
+                thread TEXT NOT NULL,
+                root_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                text TEXT NOT NULL,
                 PRIMARY KEY (buzz_id, target));
              CREATE TABLE IF NOT EXISTS threads (
                 thread_name TEXT PRIMARY KEY,
@@ -640,7 +658,22 @@ impl Store {
         Ok(rows)
     }
 
-    /// Mark an inbound event as processed. True when it was new.
+    /// True when an inbound event was already handled to completion.
+    pub fn was_seen(&self, buzz_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM seen WHERE buzz_id = ?1",
+                params![buzz_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Record an inbound event as fully handled: delivered, parked or skipped.
+    /// Written last, so a crash or error before it leaves the event to be
+    /// handled again by the retry queue or the next backfill.
     pub fn mark_seen(&self, buzz_id: &str) -> Result<bool> {
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO seen (buzz_id) VALUES (?1)",
@@ -673,15 +706,31 @@ impl Store {
 
     // ── parked inbound targets ───────────────────────────────────────────
 
-    /// Park an unresolvable inbound target for retry.
-    pub fn park_target(&self, buzz_id: &str, target: &str, next_at: i64) -> Result<()> {
+    /// Park an unresolvable inbound target for retry, with what it is owed.
+    pub fn park_target(
+        &self,
+        buzz_id: &str,
+        target: &str,
+        next_at: i64,
+        delivery: &ParkedDelivery,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO inbound_targets
-                (buzz_id, target, state, attempts, next_at, first_parked_at)
-             VALUES (?1, ?2, 'parked', 0, ?3, ?3)
+                (buzz_id, target, state, attempts, next_at, first_parked_at,
+                 sender, thread, root_id, channel_id, text)
+             VALUES (?1, ?2, 'parked', 0, ?3, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(buzz_id, target) DO UPDATE SET
                 state = 'parked', next_at = excluded.next_at",
-            params![buzz_id, target, next_at],
+            params![
+                buzz_id,
+                target,
+                next_at,
+                delivery.sender,
+                delivery.thread,
+                delivery.root_id,
+                delivery.channel_id,
+                delivery.text,
+            ],
         )?;
         Ok(())
     }
@@ -689,7 +738,8 @@ impl Store {
     /// Parked targets whose retry time has come, oldest first.
     pub fn due_targets(&self, now: i64) -> Result<Vec<ParkedTarget>> {
         let mut stmt = self.conn.prepare(
-            "SELECT buzz_id, target, state, attempts, next_at, first_parked_at
+            "SELECT buzz_id, target, state, attempts, next_at, first_parked_at,
+                    sender, thread, root_id, channel_id, text
              FROM inbound_targets
              WHERE state = 'parked' AND next_at <= ?1
              ORDER BY next_at, buzz_id",
@@ -703,6 +753,13 @@ impl Store {
                     attempts: row.get(3)?,
                     next_at: row.get(4)?,
                     first_parked_at: row.get(5)?,
+                    delivery: ParkedDelivery {
+                        sender: row.get(6)?,
+                        thread: row.get(7)?,
+                        root_id: row.get(8)?,
+                        channel_id: row.get(9)?,
+                        text: row.get(10)?,
+                    },
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -962,35 +1019,36 @@ impl Store {
         Ok(())
     }
 
-    /// Replace an outbox row's signed event after an id lookup proved the relay
-    /// never stored the old one. `hcom_id`/`destination` identify the row.
+    /// Swap an outbox row's signed event for a re-signed one, after an id
+    /// lookup proved the relay never stored the old one. Keyed by the old Buzz
+    /// id, which is unique across epochs, so a row queued before an hcom
+    /// reset is re-signed in place rather than lost. The row goes straight back
+    /// to the publisher.
     pub fn replace_outbox_event(
         &self,
-        hcom_id: i64,
-        destination: &str,
+        old_buzz_id: &str,
         buzz_id: &str,
         signed_json: &str,
         created_at: i64,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE outbox SET buzz_id = ?3, signed_json = ?4, created_at = ?5
-             WHERE epoch = ?1 AND hcom_id = ?2 AND destination = ?6",
-            params![
-                self.epoch,
-                hcom_id,
-                destination,
-                buzz_id,
-                signed_json,
-                created_at
-            ],
+            "UPDATE outbox
+             SET buzz_id = ?2, signed_json = ?3, created_at = ?4,
+                 state = 'retry', next_at = ?4
+             WHERE buzz_id = ?1",
+            params![old_buzz_id, buzz_id, signed_json, created_at],
         )?;
         Ok(())
     }
 
-    /// Remove an outbox row once its replacement is queued.
-    pub fn drop_outbox(&self, buzz_id: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM outbox WHERE buzz_id = ?1", params![buzz_id])?;
+    /// Move an outbox row's `created_at`, so a test can age it past the
+    /// re-check window without waiting 14 minutes.
+    #[cfg(test)]
+    pub fn age_outbox(&self, buzz_id: &str, created_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbox SET created_at = ?2 WHERE buzz_id = ?1",
+            params![buzz_id, created_at],
+        )?;
         Ok(())
     }
 
@@ -1419,8 +1477,15 @@ mod tests {
     #[test]
     fn parked_targets_retry_then_expire() {
         let (_dir, store) = store();
-        store.park_target("e1", "luna", 500).unwrap();
-        store.park_target("e1", "nina", 100).unwrap();
+        let owed = ParkedDelivery {
+            sender: "michael".into(),
+            thread: "buzz_infra_e1".into(),
+            root_id: "e1".into(),
+            channel_id: "chan-1".into(),
+            text: "ping".into(),
+        };
+        store.park_target("e1", "luna", 500, &owed).unwrap();
+        store.park_target("e1", "nina", 100, &owed).unwrap();
 
         assert!(
             store.due_targets(50).unwrap().is_empty(),
@@ -1429,6 +1494,10 @@ mod tests {
         let first = store.due_targets(200).unwrap();
         assert_eq!(first.len(), 1, "only the target whose retry time has come");
         assert_eq!(first[0].target, "nina");
+        assert_eq!(
+            first[0].delivery, owed,
+            "the routed delivery comes back intact"
+        );
 
         let due = store.due_targets(600).unwrap();
         assert_eq!(due.len(), 2);
@@ -1461,7 +1530,9 @@ mod tests {
     #[test]
     fn an_epoch_change_keeps_state_keyed_by_buzz_or_pubkey() {
         let (_dir, mut store) = store();
-        store.park_target("e1", "luna", 0).unwrap();
+        store
+            .park_target("e1", "luna", 0, &ParkedDelivery::default())
+            .unwrap();
         assert_eq!(store.due_targets(100).unwrap().len(), 1);
 
         assert!(store.adopt_epoch("epoch-2".into()).unwrap());
