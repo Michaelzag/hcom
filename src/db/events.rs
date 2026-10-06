@@ -1227,9 +1227,13 @@ impl HcomDb {
         timestamp: Option<&str>,
     ) -> Result<i64> {
         let ts = match timestamp {
-            // Supplied strings (tool transcripts, relay peers) take any shape;
-            // canonicalize to UTC so lexicographic timestamp ranges stay sound.
-            Some(t) => crate::shared::time::normalize_event_timestamp(t),
+            // Collision windows range over status timestamps as text, so only
+            // status rows are canonicalized to UTC. Every other type is stored
+            // verbatim: relay-forwarding identity keys on the stored message
+            // timestamp (`device:id:timestamp`), and rewriting it would break
+            // exactly-once markers across an upgrade.
+            Some(t) if event_type == "status" => crate::shared::time::normalize_event_timestamp(t),
+            Some(t) => t.to_string(),
             None => chrono_now_iso(),
         };
         let data_str = serde_json::to_string(data)?;
