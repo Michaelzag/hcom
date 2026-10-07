@@ -275,8 +275,10 @@ pub fn classify_profile(
             AuthorKind::Unknown
         };
     }
-    // A delegating non-member key that is not one we derived: role `bot` in the
-    // roster is the human-facing way to tell an agent from a person.
+    // A key we can derive from the seed but whose profile carries no marker (an
+    // agent that enrolled before the marker, say) is still ours. A roster role
+    // of `bot` deliberately decides nothing here: Buzz MANAGED agents owned by
+    // the operator are listed as bots on another seed and are senders.
     if derived.contains_key(pubkey) {
         return AuthorKind::Agent;
     }
@@ -425,8 +427,8 @@ pub struct Destination {
 pub enum Outbound {
     /// Post to these destinations.
     Post(Vec<Destination>),
-    /// Nothing to post; drop the message.
-    Drop,
+    /// Nothing to post; drop the message, for this reason.
+    Drop(OutboundDrop),
     /// Some addressed people have no home channel: tell the agent why, as an
     /// hcom notice from the first of them, and still post to everyone else.
     Notice {
@@ -434,6 +436,28 @@ pub enum Outbound {
         text: String,
         posts: Vec<Destination>,
     },
+}
+
+/// Why a message is not going to Buzz. Logged once per drop, so a message that
+/// leaves hcom unposted is never silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundDrop {
+    /// An external or system sender, never a Buzz identity.
+    UnroutableSender,
+    /// A person wrote it: a Buzz person is not posting to Buzz.
+    PersonSender,
+    /// Nothing addressed a person or a bridged channel (a broadcast).
+    NotAddressed,
+}
+
+impl OutboundDrop {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutboundDrop::UnroutableSender => "sender is not a Buzz identity",
+            OutboundDrop::PersonSender => "a person writes it, not an agent",
+            OutboundDrop::NotAddressed => "nothing addressed Buzz (broadcast)",
+        }
+    }
 }
 
 /// One hcom message considered for posting.
@@ -486,7 +510,7 @@ pub fn is_unroutable_sender(from: &str) -> bool {
 /// Route one hcom message to Buzz destinations.
 pub fn route_outbound(message: &HcomMessage, ctx: &OutboundContext<'_>) -> Outbound {
     if is_unroutable_sender(&message.from) {
-        return Outbound::Drop;
+        return Outbound::Drop(OutboundDrop::UnroutableSender);
     }
 
     // A message a hosted row sent is a person writing to another person or an
@@ -496,7 +520,7 @@ pub fn route_outbound(message: &HcomMessage, ctx: &OutboundContext<'_>) -> Outbo
         .iter()
         .any(|p| p.name.eq_ignore_ascii_case(&message.from))
     {
-        return Outbound::Drop;
+        return Outbound::Drop(OutboundDrop::PersonSender);
     }
 
     let addressed: Vec<&PersonRow> = ctx
@@ -548,7 +572,7 @@ pub fn route_outbound(message: &HcomMessage, ctx: &OutboundContext<'_>) -> Outbo
 
     // Nothing addressed: a broadcast or ordinary hcom fan-out. Never forwarded.
     if addressed.is_empty() && channels_addressed.is_empty() {
-        return Outbound::Drop;
+        return Outbound::Drop(OutboundDrop::NotAddressed);
     }
 
     // Rule 2: a channel row means one top-level post per channel.
@@ -607,7 +631,7 @@ pub fn route_outbound(message: &HcomMessage, ctx: &OutboundContext<'_>) -> Outbo
         };
     }
     if posts.is_empty() {
-        return Outbound::Drop;
+        return Outbound::Drop(OutboundDrop::NotAddressed);
     }
     Outbound::Post(posts)
 }
@@ -1561,7 +1585,7 @@ mod tests {
                 &message("luna", &[], None),
                 &outctx(&people, &channels, &BTreeMap::new())
             ),
-            Outbound::Drop
+            Outbound::Drop(OutboundDrop::NotAddressed)
         );
     }
 
@@ -1587,7 +1611,7 @@ mod tests {
         inherited.exact_targets = Vec::new();
         assert_eq!(
             route_outbound(&inherited, &outctx(&people, &channels, &BTreeMap::new())),
-            Outbound::Drop,
+            Outbound::Drop(OutboundDrop::NotAddressed),
             "an inherited ordinary thread with no targets reaches nobody"
         );
     }
@@ -1600,7 +1624,11 @@ mod tests {
             &message("michael", &["ch_infra"], None),
             &outctx(&people, &channels, &BTreeMap::new()),
         );
-        assert_eq!(routed, Outbound::Drop, "people do not post as agents");
+        assert_eq!(
+            routed,
+            Outbound::Drop(OutboundDrop::PersonSender),
+            "people do not post as agents"
+        );
     }
 
     #[test]
@@ -1613,7 +1641,7 @@ mod tests {
                     &message(from, &["michael"], None),
                     &outctx(&people, &channels, &BTreeMap::new())
                 ),
-                Outbound::Drop,
+                Outbound::Drop(OutboundDrop::UnroutableSender),
                 "{from} is not posted"
             );
         }

@@ -937,6 +937,15 @@ impl Store {
         Ok(())
     }
 
+    /// Drop one cached author, so a test can prove a classification path does
+    /// not lean on the cache.
+    #[cfg(test)]
+    pub fn delete_author_for_test(&self, pubkey: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM authors WHERE pubkey = ?1", params![pubkey])?;
+        Ok(())
+    }
+
     // ── rosters ──────────────────────────────────────────────────────────
 
     /// Rosters fetched for a channel and not yet adopted or discarded.
