@@ -2583,25 +2583,33 @@ impl MainLoop {
 
     /// True when an unclassified author is known not to be a bridged person,
     /// so their message needs nothing: a retired person, one of our own
-    /// identities (an agent derived from this seed, the reader, omp), or an
-    /// author absent from an applied roster at least as new as the message.
-    /// Anything else may still become a person (a listed member whose profile
-    /// isn't readable yet, a roster that predates them, a MANAGED bot we do
-    /// not derive), so the message waits for the roster that names them.
+    /// identities (an agent derived from this seed — by local row, enrollment,
+    /// or its own kind 0 — plus the reader and omp), or an author absent from
+    /// an applied roster at least as new as the message. Anything else may
+    /// still become a person (a listed member whose profile isn't readable yet,
+    /// a roster that predates them, a MANAGED bot we do not derive), so the
+    /// message waits for the roster that names them.
     fn known_not_a_person(&self, channel: &ChannelRow, event: &Event) -> Result<bool> {
-        // `own_pubkeys` reads the author table, so it must be resolved before
-        // the store guard below is taken: re-locking it here would deadlock.
-        let ours = self.own_pubkeys();
+        // Everything below reads the store, so all of it is resolved before the
+        // guard is taken: re-locking the mutex from inside one of these helpers
+        // would deadlock the connector on the first unclassified sender.
+        let known = self.own_pubkeys().contains(&event.pubkey)
+            || self
+                .person_name_and_profile(&event.pubkey)
+                .and_then(|(_, profile)| profile)
+                .is_some_and(|p| self.profile_is_ours(&event.pubkey, &p));
+        let retired = self
+            .connector
+            .store
+            .lock()
+            .person_by_pubkey(&event.pubkey)
+            .ok()
+            .flatten()
+            .is_some_and(|person| !person.active);
+        if retired || known {
+            return Ok(true);
+        }
         let store = self.connector.store.lock();
-        if store
-            .person_by_pubkey(&event.pubkey)?
-            .is_some_and(|person| !person.active)
-        {
-            return Ok(true);
-        }
-        if ours.contains(&event.pubkey) {
-            return Ok(true);
-        }
         let Some(saved) = store.saved_roster(&channel.id)? else {
             return Ok(false);
         };
@@ -2823,10 +2831,21 @@ impl MainLoop {
             if ours.contains(&pubkey) {
                 continue;
             }
-            let Some(name) = self.person_name_for(&pubkey) else {
+            // A member with no local record can still be one of ours: the bridge
+            // era enrolled agents this connector never wrote a row or an
+            // enrollment for. Their own kind 0 says so, and `classify_profile`
+            // re-derives the key from our seed rather than trusting the marker,
+            // so this stays an ownership test rather than a claim.
+            let Some((name, profile)) = self.person_name_and_profile(&pubkey) else {
                 complete = false;
                 continue;
             };
+            if let Some(kind0) = profile.filter(|p| self.profile_is_ours(&pubkey, p)) {
+                // Cache it as ours, so the next message from that key is
+                // classified without another profile fetch.
+                self.handle_profile(&kind0)?;
+                continue;
+            }
             let home = self
                 .connector
                 .config
@@ -2924,16 +2943,23 @@ impl MainLoop {
     /// already stored for this pubkey (names are stable once assigned), else a
     /// new slug from their kind 0. None when a new member has no profile yet.
     fn person_name_for(&self, pubkey: &str) -> Option<String> {
+        self.person_name_and_profile(pubkey).map(|(name, _)| name)
+    }
+
+    /// The hcom name for a roster member, and their kind 0 when it had to be
+    /// fetched (a member we already know by name or stored row doesn't need
+    /// one). `None` when a new member has no readable profile yet.
+    fn person_name_and_profile(&self, pubkey: &str) -> Option<(String, Option<Event>)> {
         if let Some(name) = self.connector.config.person_name(pubkey) {
-            return Some(name.to_string());
+            return Some((name.to_string(), None));
         }
         if let Ok(Some(person)) = self.connector.store.lock().person_by_pubkey(pubkey) {
-            return Some(person.name);
+            return Some((person.name, None));
         }
-        let (slug, _) = self.profile_for(pubkey)?;
+        let (slug, profile) = self.profile_for(pubkey)?;
         // A name held by another Buzz person, or by a row that is not one of
         // our own `ch_` rows, gets the `_bz` suffix instead of being stolen.
-        Some(config::unique_person_name(&slug, |candidate| {
+        let unique = config::unique_person_name(&slug, |candidate| {
             let held = self
                 .connector
                 .store
@@ -2948,7 +2974,23 @@ impl MainLoop {
                 .ok()
                 .flatten()
                 .is_some_and(|row| !row.name.starts_with("ch_"))
-        }))
+        });
+        Some((unique, Some(profile)))
+    }
+
+    /// True when this pubkey's own kind 0 re-derives from our seed, so it is
+    /// one of our agents however little local state names it.
+    fn profile_is_ours(&self, pubkey: &str, profile: &Event) -> bool {
+        matches!(
+            route::classify_profile(
+                pubkey,
+                profile,
+                &self.connector.owner_pubkey,
+                &HashMap::new(),
+                &self.connector.seed,
+            ),
+            AuthorKind::Agent
+        )
     }
 
     /// Register one person's hosted row and its notify endpoint.
@@ -4700,6 +4742,45 @@ mod tests {
         assert!(
             harness.unread("luna").is_empty(),
             "and its own posts do not come back as a person's"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_bridge_era_agent_of_ours_is_not_seeded_as_a_person() {
+        // The bridge enrolled our agents in Buzz before this connector had any
+        // local state: no hcom row, no cached author, no enrollment. All that
+        // names them is their own kind 0, whose marker re-derives the key from
+        // our seed. That is an ownership proof, so they are not people.
+        let mut harness = harness("mbai");
+        let ghost = nostr::derive_secret(&SEED, "ghost@mbai");
+        let ghost_pubkey = public_hex(&ghost);
+        // Only the relay has this profile; the connector has never seen it.
+        harness.relay.seed(profile(
+            &ghost,
+            "ghost",
+            &format!("{}{}", route::AGENT_MARKER_PREFIX, "ghost@mbai"),
+        ));
+        harness.offer(roster(CHANNEL_ID, &[(&ghost_pubkey, "bot")]));
+        harness.step();
+
+        let people = harness.store().active_people().unwrap();
+        assert!(
+            people.iter().all(|p| p.pubkey != ghost_pubkey),
+            "our own agent is never a person: {:?}",
+            people.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+
+        // And its own message settles rather than waiting for a roster that
+        // will never make it a person.
+        let post = message(&ghost, CHANNEL_ID, "reporting in", vec![]);
+        harness.offer(post.clone());
+        harness.store().make_inbox_due().unwrap();
+        harness.step();
+        assert_eq!(
+            harness.inbox_state(&post.id).as_deref(),
+            Some("done"),
+            "our own post is settled, not pending forever"
         );
     }
 
