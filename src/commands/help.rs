@@ -38,6 +38,53 @@ const FILTER_HELP: &[HelpEntry] = &[
     ("  --before TIME", "Before timestamp (ISO-8601)"),
 ];
 
+const BUZZ_HELP: &[HelpEntry] = &[
+    ("buzz serve", "Run the connector (one per host)"),
+    ("buzz status", "Channels, parked, outbox, people, errors"),
+    ("  --json", "Machine-readable output"),
+    (
+        "buzz read <channel>",
+        "Read a bridged channel's cached Buzz events",
+    ),
+    ("  --thread <root>", "Only this Buzz thread root"),
+    ("  --limit N", "How many events (default: 20)"),
+    ("  --before <id>", "Continue before this Buzz event id"),
+    ("buzz down", "Drain, stop the connector, stop hosted rows"),
+    (
+        "buzz cursor set <channel> --since <unix>",
+        "Seed a channel's backfill start (connector down)",
+    ),
+    ("  --force", "Allow moving an existing cursor backwards"),
+    ("", ""),
+    ("Addressing a Buzz human from hcom:", ""),
+    (
+        "  michael",
+        "Post in Michael's home channel, mentioning him",
+    ),
+    ("  michael:infra", "Post in #infra, mentioning him"),
+    ("  ch_infra", "Post in #infra"),
+    ("", "Add --reply-to <id> to answer inside a Buzz thread."),
+    ("", ""),
+    ("mbai-local (only for local_signers):", ""),
+    (
+        "  buzz identity --as-name <n>",
+        "The signer's name and pubkey; signs nothing",
+    ),
+    (
+        "  buzz query --as-name <n> --filter <json>",
+        "Signed relay query",
+    ),
+    ("  buzz members <channel> --as-name <n>", "Channel members"),
+    (
+        "  buzz prepare --as-name <n> --channel <c> --created-at <ts>",
+        "Sign a post, send nothing",
+    ),
+    (
+        "  buzz publish --as-name <n>",
+        "Post the signed event on stdin, confirm by id",
+    ),
+];
+
 // ── Per-command help registries ─────────────────────────────────────────
 
 const EVENTS_HELP: &[HelpEntry] = &[
@@ -1079,6 +1126,7 @@ Commands:\n\
   config       Get/set global and per-agent settings\n\
   run          Execute workflow scripts\n\
   relay        Cross-device sync + relay daemon\n\
+  buzz         Buzz connector: serve, status, read, down\n\
   archive      Query past hcom sessions\n\
   reset        Archive and clear database\n\
   hooks        Add or remove hooks\n\
@@ -1219,6 +1267,11 @@ pub fn get_command_help(name: &str) -> String {
         "term" => Some(TERM_HELP),
         "title" => Some(TITLE_HELP),
         "compact" => Some(COMPACT_HELP),
+        "buzz" => Some(BUZZ_HELP),
+        "buzz serve" => Some(BUZZ_HELP),
+        "buzz status" => Some(BUZZ_HELP),
+        "buzz read" => Some(BUZZ_HELP),
+        "buzz down" => Some(BUZZ_HELP),
         _ => None,
     };
 

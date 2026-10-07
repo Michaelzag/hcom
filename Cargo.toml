@@ -1,6 +1,6 @@
 [package]
 name = "hcom"
-version = "0.7.52"
+version = "0.7.53"
 edition = "2024"
 authors = ["hcom"]
 description = "Connect Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, and Copilot so agents can message, watch, and spawn each other across terminals"
@@ -39,6 +39,8 @@ unicode-width = "0.2"
 unicode-segmentation = "1.13.2"
 shell-words = "1"
 toml = "1.1.2"
+# Connector state guards: lock() returns the guard, so no poison path.
+parking_lot = "0.12"
 toml_edit = "0.25.10"
 tempfile = "3"
 rand = "0.10.0"
@@ -86,7 +88,6 @@ portable-pty = "0.9"
 
 [dev-dependencies]
 serial_test = "3"
-parking_lot = "0.12"
 
 # vt100 0.16.2 panics when a downward resize orphans a double-width character's
 # "wide" flag and it's later erased (index out of bounds in Row::clear_wide).

@@ -329,7 +329,14 @@ pub fn heartbeat_hosted(db: &HcomDb, tool: &str) -> Result<usize> {
 /// [`stop_hosted`] already took down stays down rather than becoming
 /// deliverable again.
 pub fn set_hosted_offline(db: &HcomDb, tool: &str) -> Result<usize> {
-    set_hosted_state(db, tool, ST_INACTIVE, CONTEXT_OFFLINE, &[CONTEXT_ONLINE])
+    set_hosted_state(
+        db,
+        tool,
+        None,
+        ST_INACTIVE,
+        CONTEXT_OFFLINE,
+        &[CONTEXT_ONLINE],
+    )
 }
 
 /// The rollback path: hosted rows of `tool` go `stopped` / `buzz:down`, which
@@ -337,7 +344,14 @@ pub fn set_hosted_offline(db: &HcomDb, tool: &str) -> Result<usize> {
 /// instead of queueing. This is the terminal transition, so it applies to
 /// every local hosted row of `tool` whatever state it is in.
 pub fn stop_hosted(db: &HcomDb, tool: &str) -> Result<usize> {
-    set_hosted_state(db, tool, "stopped", CONTEXT_DOWN, &[])
+    set_hosted_state(db, tool, None, "stopped", CONTEXT_DOWN, &[])
+}
+
+/// Stop one hosted row, the same terminal transition `stop_hosted` applies to
+/// them all: for a participant that left every bridged channel while the
+/// connector keeps running.
+pub fn stop_hosted_row(db: &HcomDb, tool: &str, name: &str) -> Result<usize> {
+    set_hosted_state(db, tool, Some(name), "stopped", CONTEXT_DOWN, &[])
 }
 
 /// Apply one hosted transition to every local row of `tool` that is in one of
@@ -366,13 +380,14 @@ pub fn stop_hosted(db: &HcomDb, tool: &str) -> Result<usize> {
 fn set_hosted_state(
     db: &HcomDb,
     tool: &str,
+    only: Option<&str>,
     status: &str,
     context: &str,
     from_contexts: &[&str],
 ) -> Result<usize> {
     let mut post = crate::hooks::common::PostCommit::default();
     let changed = db.with_immediate_transaction(|tx| {
-        let names: Vec<String> = if from_contexts.is_empty() {
+        let mut names: Vec<String> = if from_contexts.is_empty() {
             let mut stmt = tx.prepare(
                 "SELECT name FROM instances
                  WHERE COALESCE(origin_device_id, '') = ''
@@ -405,6 +420,9 @@ fn set_hosted_state(
                 .filter_map(|r| r.ok())
                 .collect::<Vec<String>>()
         };
+        if let Some(only) = only {
+            names.retain(|name| name == only);
+        }
 
         // Test seam: hands a competing writer its turn between the candidate
         // select and the conditional writes below.

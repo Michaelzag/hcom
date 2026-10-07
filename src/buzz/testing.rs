@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU16, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
     mpsc,
 };
 use std::thread::{self, JoinHandle};
@@ -18,6 +18,51 @@ use tungstenite::{Message, WebSocket};
 
 use super::nostr::{Event, now, sha256_hex, verify, verify_auth_tag};
 
+/// TEST owner key: scalar 3, never a real identity.
+pub const TEST_OWNER_ENV: &str =
+    "BUZZ_PRIVATE_KEY=0303030303030303030303030303030303030303030303030303030303030303\n";
+
+/// A connector config aimed at a fake relay, with TEST key files written into
+/// this test's isolated `Config::dir()`: the seed at mode 0600 and the owner
+/// env file.
+///
+/// Built in memory rather than round-tripped through the config file: the
+/// loader rightly refuses a plaintext relay URL, and the fake relay speaks
+/// plaintext HTTP on loopback. Config validation has its own tests.
+pub fn connector_config(
+    relay: &FakeRelay,
+    device: &str,
+    seed: &[u8; 32],
+    channel_id: &str,
+    slug: &str,
+) -> super::config::Config {
+    use super::config::{ChannelConfig, Config};
+    let dir = Config::dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let seed_path = dir.join("seed.bin");
+    std::fs::write(&seed_path, seed).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&seed_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::fs::write(dir.join("owner.env"), TEST_OWNER_ENV).unwrap();
+    Config {
+        relay_url: relay.url.replace("http://", "ws://"),
+        http_url: relay.url.clone(),
+        device_label: device.to_string(),
+        seed_path: std::path::PathBuf::from("seed.bin"),
+        owner_env_path: std::path::PathBuf::from("owner.env"),
+        local_signers: vec!["qa".to_string()],
+        channels: vec![ChannelConfig {
+            id: channel_id.to_string(),
+            slug: Some(slug.to_string()),
+            home: false,
+        }],
+        people: vec![],
+    }
+}
+
 #[derive(Default)]
 pub struct Switches {
     pub rate_limited: AtomicBool,
@@ -28,6 +73,23 @@ pub struct Switches {
     pub http_retry_header: AtomicU16,
     pub pong_received: AtomicBool,
     pub oversized_body: AtomicBool,
+    /// Answer every REQ with CLOSED "not a channel member", as the deployed
+    /// relay does for a reader that is not (yet) in the channel.
+    pub refuse_req: AtomicBool,
+    /// Largest page `/query` returns, whatever the filter asks for. Zero is
+    /// the deployed clamp, buzz-db's `DEFAULT_MAX_PAGE_LIMIT` of 1000.
+    pub max_page: AtomicUsize,
+    /// Ignore `before_id`, so a keyset walk sees the same page again: what a
+    /// client must refuse rather than call complete.
+    pub ignore_before_id: AtomicBool,
+    /// Store a posted event, then answer 503: an acknowledgement lost after
+    /// the relay kept the event.
+    pub drop_ack: AtomicBool,
+    /// Answer `/query` with this status (0: answer normally), so a lookup
+    /// can fail while posting works.
+    pub query_status: AtomicU16,
+    /// Fail the deletion lookup after an empty by-id lookup.
+    pub tombstone_query_status: AtomicU16,
 }
 
 struct Subscription {
@@ -42,16 +104,52 @@ struct State {
     events: Vec<Event>,
     subscriptions: Vec<Subscription>,
     auth_ids: HashSet<String>,
+    ws_connections: usize,
 }
 
 pub struct FakeRelay {
     pub url: String,
     pub switches: Arc<Switches>,
+    state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl FakeRelay {
+    /// Every event the relay has stored, oldest first.
+    ///
+    /// Reads the store directly rather than going back over HTTP, so an
+    /// assertion still works while the fault switches make calls fail.
+    pub fn events(&self) -> Vec<Event> {
+        self.state.lock().events.clone()
+    }
+
+    /// Authenticated HTTP requests the relay has accepted a NIP-98 header for,
+    /// whatever it answered: what a client's request discipline is judged by.
+    pub fn http_requests(&self) -> usize {
+        self.state.lock().auth_ids.len()
+    }
+
+    /// WebSocket connections accepted so far: what a reconnect loop's
+    /// discipline is judged by.
+    pub fn ws_connections(&self) -> usize {
+        self.state.lock().ws_connections
+    }
+
+    /// A WebSocket endpoint over this relay's store and switches, so one test
+    /// can backfill over HTTP and stream over WS from the same history.
+    pub fn ws_twin(&self) -> Self {
+        Self::start_with(false, self.state.clone(), self.switches.clone())
+    }
+    /// Store an event as if it had arrived over the wire, so a test can seed a
+    /// history the connector then backfills.
+    pub fn seed(&self, event: Event) {
+        let mut state = self.state.lock();
+        if !state.events.iter().any(|stored| stored.id == event.id) {
+            state.events.push(event);
+        }
+    }
+
     pub fn ws() -> Self {
         Self::start(false)
     }
@@ -60,6 +158,14 @@ impl FakeRelay {
     }
 
     fn start(http: bool) -> Self {
+        Self::start_with(
+            http,
+            Arc::new(Mutex::new(State::default())),
+            Arc::new(Switches::default()),
+        )
+    }
+
+    fn start_with(http: bool, state: Arc<Mutex<State>>, switches: Arc<Switches>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!(
@@ -67,8 +173,7 @@ impl FakeRelay {
             if http { "http" } else { "ws" },
             listener.local_addr().unwrap()
         );
-        let state = Arc::new(Mutex::new(State::default()));
-        let switches = Arc::new(Switches::default());
+        let server_state = state.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let server_url = url.clone();
         let server_switches = switches.clone();
@@ -87,7 +192,7 @@ impl FakeRelay {
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .unwrap();
-                        let state = state.clone();
+                        let state = server_state.clone();
                         let switches = server_switches.clone();
                         let stop = server_stop.clone();
                         let url = server_url.clone();
@@ -113,6 +218,7 @@ impl FakeRelay {
         Self {
             url,
             switches,
+            state,
             stop,
             thread: Some(handle),
         }
@@ -162,6 +268,7 @@ fn handle_ws(
     let Ok(mut socket) = tungstenite::accept(stream) else {
         return;
     };
+    state.lock().ws_connections += 1;
     let challenge = uuid::Uuid::new_v4().to_string();
     if !send(&mut socket, json!(["AUTH", challenge])) {
         return;
@@ -333,12 +440,21 @@ fn handle_ws(
                 let Some(sub) = value.get(1).and_then(Value::as_str) else {
                     continue;
                 };
+                if switches.refuse_req.load(Ordering::SeqCst) {
+                    if !send(
+                        &mut socket,
+                        json!(["CLOSED", sub, "restricted: not a channel member"]),
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
                 let Some(array) = value.as_array() else {
                     continue;
                 };
                 let filters = &array[2..];
                 let mut state = state.lock();
-                let events = query_events(&state.events, filters);
+                let events = query_events(&state.events, filters, max_page(switches));
                 state
                     .subscriptions
                     .retain(|s| s.client != client || s.sub != sub);
@@ -416,6 +532,9 @@ fn matches_filter(event: &Event, filter: &Value, events: &[Event]) -> bool {
     let Some(filter) = filter.as_object() else {
         return false;
     };
+    // buzz-db event.rs: with `before_id`, `until` is the composite keyset
+    // cursor `created_at < until OR (created_at = until AND id > before_id)`.
+    let before_id = filter.get("before_id").and_then(Value::as_str);
     filter.iter().all(|(key, value)| match key.as_str() {
         "ids" | "authors" => value.as_array().is_some_and(|values| {
             values.iter().any(|v| {
@@ -437,10 +556,14 @@ fn matches_filter(event: &Event, filter: &Value, events: &[Event]) -> bool {
         "since" => value
             .as_u64()
             .is_some_and(|since| event.created_at >= since),
-        "until" => value
-            .as_u64()
-            .is_some_and(|until| event.created_at <= until),
-        "limit" => true,
+        "until" => value.as_u64().is_some_and(|until| match before_id {
+            Some(before_id) => {
+                event.created_at < until
+                    || (event.created_at == until && event.id.as_str() > before_id)
+            }
+            None => event.created_at <= until,
+        }),
+        "limit" | "before_id" => true,
         tag if tag.starts_with('#') => value.as_array().is_some_and(|values| {
             values.iter().any(|v| {
                 v.as_str().is_some_and(|wanted| {
@@ -459,12 +582,24 @@ fn matches_filter(event: &Event, filter: &Value, events: &[Event]) -> bool {
     })
 }
 
-fn query_events(events: &[Event], filters: &[Value]) -> Vec<Event> {
+fn query_events(events: &[Event], filters: &[Value], max_page: usize) -> Vec<Event> {
     let mut result = Vec::new();
     let mut seen = HashSet::new();
     for filter in filters {
         let mut matches: Vec<_> = events
             .iter()
+            // relay-v0.2.1 buzz-db/event.rs:393 hides soft-deleted sources,
+            // but not the stored kind 5/9005 deletion that references them.
+            .filter(|event| {
+                !events.iter().any(|deletion| {
+                    matches!(deletion.kind, 5 | 9005)
+                        && verify(deletion)
+                        && deletion.tags.iter().any(|tag| {
+                            tag.first().is_some_and(|key| key == "e")
+                                && tag.get(1) == Some(&event.id)
+                        })
+                })
+            })
             .filter(|event| matches_filter(event, filter, events))
             .collect();
         matches.sort_by(|a, b| {
@@ -472,20 +607,28 @@ fn query_events(events: &[Event], filters: &[Value]) -> Vec<Event> {
                 .cmp(&a.created_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
+        // buzz-db event.rs:367-368: `q.limit.unwrap_or(100)`, newest first,
+        // clamped to the store's maximum page.
         let limit = filter
             .get("limit")
             .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX);
-        for event in matches
-            .into_iter()
-            .take(usize::try_from(limit).unwrap_or(usize::MAX))
-        {
+            .map_or(100, |limit| usize::try_from(limit).unwrap_or(usize::MAX))
+            .min(max_page);
+        for event in matches.into_iter().take(limit) {
             if seen.insert(&event.id) {
                 result.push(event.clone());
             }
         }
     }
     result
+}
+
+/// The page clamp in force: the switch, or the deployed default.
+fn max_page(switches: &Switches) -> usize {
+    match switches.max_page.load(Ordering::SeqCst) {
+        0 => 1000,
+        clamp => clamp,
+    }
 }
 
 fn handle_http(stream: TcpStream, url: &str, state: &Mutex<State>, switches: &Switches) {
@@ -589,6 +732,16 @@ fn handle_http(stream: TcpStream, url: &str, state: &Mutex<State>, switches: &Sw
                 );
                 return;
             }
+            // relay-v0.2.1 ingest.rs:1976-1982: MAX_TIMESTAMP_DRIFT_SECS = 900.
+            if event.created_at.abs_diff(now()) > 900 {
+                respond(
+                    &mut stream,
+                    400,
+                    json!({"error":"invalid: event timestamp too far from server time"}),
+                    switches,
+                );
+                return;
+            }
             if !verify(&event) {
                 respond(
                     &mut stream,
@@ -604,6 +757,16 @@ fn handle_http(stream: TcpStream, url: &str, state: &Mutex<State>, switches: &Sw
             if !duplicate {
                 state.events.push(event);
             }
+            drop(state);
+            if switches.drop_ack.load(Ordering::SeqCst) {
+                respond(
+                    &mut stream,
+                    503,
+                    json!({"error":"error: acknowledgement lost"}),
+                    switches,
+                );
+                return;
+            }
             respond(
                 &mut stream,
                 200,
@@ -612,6 +775,16 @@ fn handle_http(stream: TcpStream, url: &str, state: &Mutex<State>, switches: &Sw
             );
         }
         ("POST", "/query") => {
+            let query_status = switches.query_status.load(Ordering::SeqCst);
+            if query_status != 0 {
+                respond(
+                    &mut stream,
+                    query_status,
+                    json!({"error":"error: query unavailable"}),
+                    switches,
+                );
+                return;
+            }
             let Some(filters) = value.as_array() else {
                 respond(
                     &mut stream,
@@ -621,7 +794,54 @@ fn handle_http(stream: TcpStream, url: &str, state: &Mutex<State>, switches: &Sw
                 );
                 return;
             };
-            let events = query_events(&state.lock().events, filters);
+            if filters
+                .iter()
+                .any(|filter| filter.get("#e").is_some() && filter["kinds"] == json!([5, 9005]))
+            {
+                let status = switches.tombstone_query_status.load(Ordering::SeqCst);
+                if status != 0 {
+                    respond(
+                        &mut stream,
+                        status,
+                        json!({"error":"error: tombstone query unavailable"}),
+                        switches,
+                    );
+                    return;
+                }
+            }
+            // relay-v0.2.1 api/bridge.rs: `before_id` is a 64-hex id and only
+            // valid together with `until`.
+            for filter in filters {
+                if let Some(before_id) = filter.get("before_id") {
+                    let well_formed = before_id.as_str().is_some_and(|id| {
+                        id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
+                    });
+                    if !well_formed || filter.get("until").is_none() {
+                        respond(
+                            &mut stream,
+                            400,
+                            json!({"error":"before_id must be a 64-char hex event id with until"}),
+                            switches,
+                        );
+                        return;
+                    }
+                }
+            }
+            let filters: Vec<Value> = if switches.ignore_before_id.load(Ordering::SeqCst) {
+                filters
+                    .iter()
+                    .map(|filter| {
+                        let mut filter = filter.clone();
+                        if let Some(object) = filter.as_object_mut() {
+                            object.remove("before_id");
+                        }
+                        filter
+                    })
+                    .collect()
+            } else {
+                filters.clone()
+            };
+            let events = query_events(&state.lock().events, &filters, max_page(switches));
             respond(&mut stream, 200, json!(events), switches);
         }
         _ => respond(&mut stream, 404, json!({"error":"not found"}), switches),

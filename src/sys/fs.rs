@@ -235,37 +235,48 @@ pub fn set_executable(path: &Path) -> io::Result<()> {
 /// Stable identity of a file on disk, used to detect replacement (atomic
 /// rename/swap) of a path that keeps the same name.
 ///
-/// Unix: the inode number. Windows: the `nFileIndex` from
-/// `GetFileInformationByHandle`. Returns 0 when the file cannot be inspected.
+/// The file index half of [`file_identity`]: the inode number on Unix, the
+/// `nFileIndex` on Windows. Returns 0 when the file cannot be inspected.
 pub fn file_id(path: &Path) -> u64 {
+    file_identity(path).map_or(0, |(_, index)| index)
+}
+
+/// The `(device, file index)` pair that names one file on this machine, or
+/// `None` when the file cannot be inspected. Two files that exist at the same
+/// time never share it; a path replaced by another file reads a new one.
+///
+/// Unix: `st_dev` and `st_ino`. Windows: `GetFileInformationByHandle`'s
+/// `BY_HANDLE_FILE_INFORMATION`, as `dwVolumeSerialNumber` and
+/// `(nFileIndexHigh << 32) | nFileIndexLow`.
+pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).map(|m| m.ino()).unwrap_or(0)
+        std::fs::metadata(path)
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()))
     }
     #[cfg(windows)]
     {
-        file_id_win(path).unwrap_or(0)
-    }
-}
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
 
-#[cfg(windows)]
-fn file_id_win(path: &Path) -> Option<u64> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-
-    let file = std::fs::File::open(path).ok()?;
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: `file` owns a valid handle for the duration of the call and
-    // `info` is a properly sized output buffer.
-    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
-    if ok == 0 {
-        return None;
+        let file = std::fs::File::open(path).ok()?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` owns a valid handle for the duration of the call and
+        // `info` is a properly sized output buffer.
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
+        if ok == 0 {
+            return None;
+        }
+        Some((
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
     }
-    Some(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
 }
 
 #[cfg(test)]
@@ -317,5 +328,28 @@ mod tests {
         assert!(!try_lock_shared(&b).unwrap());
         drop(a);
         assert!(try_lock_shared(&b).unwrap());
+    }
+
+    #[test]
+    fn file_identity_names_one_file_and_only_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        // Both exist at once, each held open the way SQLite holds hcom.db.
+        let _held_a = open(&a);
+        let _held_b = open(&b);
+
+        let first = file_identity(&a).expect("an existing file has an identity");
+        assert_eq!(
+            file_identity(&a),
+            Some(first),
+            "the same file opened again reads the same identity"
+        );
+        assert_ne!(
+            file_identity(&b),
+            Some(first),
+            "two files that exist at the same time differ"
+        );
+        assert_eq!(file_identity(&dir.path().join("missing.db")), None);
     }
 }
