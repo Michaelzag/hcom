@@ -654,6 +654,19 @@ fn start_rebind(
         }
         updates.insert("name_announced".into(), serde_json::json!(1));
         db.update_instance_fields(&target_name, &updates)?;
+        // Initialization leaves a new row as a launch placeholder (inactive/
+        // "new"), but the caller is a running agent executing this command,
+        // not a launch awaiting its first hook. Left as a placeholder, the list and
+        // status sweeps stamp it launch_failed 30s later and send stops
+        // resolving @name while the session is alive.
+        lifecycle::set_status_collected(
+            db,
+            &target_name,
+            ST_ACTIVE,
+            "tool:start",
+            Default::default(),
+            &mut post,
+        );
         let restored_pid = match &anchor {
             Ok(matched) if !kept_remote_row => db
                 .set_instance_pid_if_unset(&target_name, matched.pid)?
@@ -1174,6 +1187,13 @@ fn start_bare(
     {
         eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
     }
+
+    // Same as the rebind: the row is a launch placeholder (pending|inactive /
+    // "new") until a status is written, but the caller is a running agent
+    // executing this command. A session whose hooks never write a status for
+    // it (an omp session without the plain-session opt-in, an idle tool) would
+    // otherwise be stamped launch_failed 30s later and drop out of @mentions.
+    lifecycle::set_status(db, &name, ST_ACTIVE, "tool:start", Default::default());
 
     // Claude builds old enough to expose neither session id leave nothing to
     // recognize this session by, so a later `hcom start` here mints another
@@ -2248,6 +2268,234 @@ mod tests {
         assert_eq!(life["renamed_to"], target.as_str());
         assert_eq!(life["snapshot"]["session_id"], "sess-r");
         assert_eq!(life["snapshot"]["last_event_id"], 9);
+    }
+
+    /// An omp session hcom never launched, running `hcom start` from its bash
+    /// tool: its own process id, no session id, no `HCOM_LAUNCHED`.
+    fn plain_omp_ctx(process_id: &str) -> HcomContext {
+        make_ctx(
+            &[("OMPCODE", "1"), ("HCOM_PROCESS_ID", process_id)],
+            "/tmp/project",
+        )
+    }
+
+    /// `hcom start` (bare) from [`plain_omp_ctx`]; returns the name it bound.
+    fn plain_omp_bare_start(db: &HcomDb, hcom_dir: &std::path::Path, process_id: &str) -> String {
+        crate::hooks::omp::install_omp_plugin().unwrap();
+        let ctx = plain_omp_ctx(process_id);
+        assert_eq!(start_bare(db, hcom_dir, &ctx, None).unwrap(), 0);
+        let name = db
+            .get_process_binding(process_id)
+            .unwrap()
+            .expect("bare start binds the calling process");
+        let row = db.get_instance_full(&name).unwrap().expect("started row");
+        assert!(row.session_id.is_none() && row.pid.is_none());
+        name
+    }
+
+    /// The row hcom's own launch path creates: a reserved name pre-registered
+    /// with its launcher process binding, session-less and never bound.
+    fn register_launch_placeholder(db: &HcomDb) -> String {
+        let name = crate::instance_names::generate_unique_name(db).unwrap();
+        crate::launcher::register_launch_instance(
+            db,
+            &name,
+            None,
+            "launch-proc",
+            "omp",
+            false,
+            None,
+            "/tmp/project",
+        )
+        .unwrap();
+        name
+    }
+
+    /// Backdate a row past the placeholder timeout, as 31s of wall time would.
+    fn age_past_placeholder_timeout(db: &HcomDb, name: &str) {
+        let aged = crate::shared::time::now_epoch_i64()
+            - crate::instance_lifecycle::LAUNCH_PLACEHOLDER_TIMEOUT
+            - 1;
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = ?1, status_time = ?2 WHERE name = ?3",
+                params![aged as f64, aged, name],
+            )
+            .unwrap();
+    }
+
+    /// The launch finalizers: the `hcom list` row render, then the `hcom
+    /// status` sweep.
+    fn run_launch_finalizers(db: &HcomDb) {
+        for row in db.iter_instances_full().unwrap() {
+            crate::instance_lifecycle::get_instance_status(&row, db);
+        }
+        crate::commands::status::finalize_timed_out_launches(db);
+    }
+
+    /// `@name` resolved against the deliverable rows, as send resolves it.
+    fn resolve_mention(db: &HcomDb, name: &str) -> Result<Vec<String>, String> {
+        let rows = crate::messages::deliverable_instances(db.conn()).unwrap();
+        crate::messages::compute_scope(
+            &format!("@{name} ping"),
+            &rows,
+            None,
+            &crate::fleet_names::FleetCtx::load(),
+        )
+        .map(|scope| scope.mentions)
+    }
+
+    /// `hcom send @name` from another identity, through the send command.
+    fn send_from_other(db: &HcomDb, name: &str) -> Result<Vec<String>, String> {
+        let sender = crate::shared::SenderIdentity {
+            kind: crate::shared::SenderKind::External,
+            name: "smoker".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        crate::commands::send::send_message(db, &sender, &format!("@{name} ping"), None, None)
+    }
+
+    fn assert_live_and_mentionable(db: &HcomDb, name: &str) {
+        let row = db.get_instance_full(name).unwrap().expect("row kept");
+        assert_ne!(
+            row.status_context, "launch_failed",
+            "a live session must not be stamped launch_failed"
+        );
+        assert_eq!(resolve_mention(db, name), Ok(vec![name.to_string()]));
+    }
+
+    fn assert_launch_failed_and_unmentionable(db: &HcomDb, name: &str) {
+        let row = db
+            .get_instance_full(name)
+            .unwrap()
+            .expect("placeholder row");
+        assert_eq!(row.status_context, "launch_failed");
+        let err = resolve_mention(db, name).expect_err("a failed launch is no recipient");
+        assert!(err.contains("non-existent or stopped"), "{err}");
+        assert!(send_from_other(db, name).is_err());
+    }
+
+    /// A session hcom never launched reclaims a name it has no history for
+    /// (the `@alias` incident): no session, no anchor pid. The reclaimed row
+    /// is the running caller, so past the launch-placeholder timeout the list
+    /// render and the status sweep must not stamp it launch_failed, and
+    /// `@name` must still resolve as a send recipient.
+    #[test]
+    #[serial]
+    fn test_start_rebind_row_survives_launch_placeholder_sweeps() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("alias_{}", std::process::id());
+
+        assert_eq!(
+            start_rebind(&db, &target, &plain_omp_ctx("proc-alias"), None, None).unwrap(),
+            0
+        );
+        let row = db
+            .get_instance_full(&target)
+            .unwrap()
+            .expect("reclaimed row");
+        assert!(
+            row.session_id.is_none(),
+            "no session was resolved or adopted"
+        );
+        assert!(row.pid.is_none(), "no anchor pid was restored");
+
+        age_past_placeholder_timeout(&db, &target);
+        run_launch_finalizers(&db);
+
+        assert_live_and_mentionable(&db, &target);
+    }
+
+    /// The fix is the rebind's own status write, not a weaker sweep: a real
+    /// launch placeholder beside the reclaimed row is still finalized.
+    #[test]
+    #[serial]
+    fn test_start_rebind_leaves_launch_placeholder_finalization_intact() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("alias_neg_{}", std::process::id());
+        assert_eq!(
+            start_rebind(&db, &target, &plain_omp_ctx("proc-alias"), None, None).unwrap(),
+            0
+        );
+        let launch = register_launch_placeholder(&db);
+
+        age_past_placeholder_timeout(&db, &target);
+        age_past_placeholder_timeout(&db, &launch);
+        run_launch_finalizers(&db);
+
+        assert_launch_failed_and_unmentionable(&db, &launch);
+    }
+
+    /// The reclaimed row, aged past the timeout, through the command entry
+    /// points: `hcom list` renders it, then another identity's `hcom send
+    /// @name` delivers to it.
+    #[test]
+    #[serial]
+    fn test_start_rebind_row_takes_mail_after_list_past_timeout() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("alias_grey_{}", std::process::id());
+        assert_eq!(
+            start_rebind(&db, &target, &plain_omp_ctx("proc-alias"), None, None).unwrap(),
+            0
+        );
+        age_past_placeholder_timeout(&db, &target);
+
+        let list = crate::commands::list::ListArgs::try_parse_from(["list"]).unwrap();
+        assert_eq!(crate::commands::list::cmd_list(&db, &list, None), 0);
+
+        assert_eq!(send_from_other(&db, &target), Ok(vec![target.clone()]));
+    }
+
+    /// Bare `hcom start` from an omp session hcom never launched: the plugin
+    /// never binds it (no plain-session opt-in), so no hook writes a status.
+    /// The row is the running caller and must survive the finalizers.
+    #[test]
+    #[serial]
+    fn test_start_bare_row_survives_launch_placeholder_sweeps() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let name = plain_omp_bare_start(&db, &hcom_dir, "proc-bare");
+
+        age_past_placeholder_timeout(&db, &name);
+        run_launch_finalizers(&db);
+
+        assert_live_and_mentionable(&db, &name);
+    }
+
+    /// A real launch placeholder beside a bare-started row is still finalized.
+    #[test]
+    #[serial]
+    fn test_start_bare_leaves_launch_placeholder_finalization_intact() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let name = plain_omp_bare_start(&db, &hcom_dir, "proc-bare");
+        let launch = register_launch_placeholder(&db);
+
+        age_past_placeholder_timeout(&db, &name);
+        age_past_placeholder_timeout(&db, &launch);
+        run_launch_finalizers(&db);
+
+        assert_launch_failed_and_unmentionable(&db, &launch);
+    }
+
+    /// The bare-started row, aged past the timeout, through `hcom list` and
+    /// then another identity's `hcom send @name`.
+    #[test]
+    #[serial]
+    fn test_start_bare_row_takes_mail_after_list_past_timeout() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let name = plain_omp_bare_start(&db, &hcom_dir, "proc-bare");
+        age_past_placeholder_timeout(&db, &name);
+
+        let list = crate::commands::list::ListArgs::try_parse_from(["list"]).unwrap();
+        assert_eq!(crate::commands::list::cmd_list(&db, &list, None), 0);
+
+        assert_eq!(send_from_other(&db, &name), Ok(vec![name.clone()]));
     }
 
     /// A competing reclaim commits the target row after this rebind planned
