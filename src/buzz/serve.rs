@@ -35,8 +35,11 @@ use crate::db::HcomDb;
 const TICK: Duration = Duration::from_secs(5);
 /// How often the enrollment planner runs.
 const ENROLL_INTERVAL: Duration = Duration::from_secs(60);
-/// How long an agent's hcom row must be gone before it leaves Buzz channels.
-const ENROLL_STALE_SECS: i64 = 3600;
+/// How long an agent's hcom row must be gone before it leaves Buzz channels:
+/// a day after the session ends, per the design (docs/design/buzz.md, popup
+/// enrollment). Long enough that an agent stays answerable for the rest of the
+/// working day it was talked to in.
+const ENROLL_STALE_SECS: i64 = 24 * 3600;
 /// How long a person stays registered after leaving every bridged channel.
 const PERSON_RETIRE_SECS: i64 = 24 * 3600;
 /// Reconnect backoff bounds for the reader.
@@ -1519,7 +1522,20 @@ impl MainLoop {
         };
 
         let posts = match route::route_outbound(&outbound, &ctx) {
-            route::Outbound::Drop => Vec::new(),
+            route::Outbound::Drop(reason) => {
+                // Never let a message leave hcom unaccounted for: a drop is a
+                // decision, and the operator is the one who has to see it.
+                crate::log::log_info(
+                    "buzz",
+                    "serve.outbound_dropped",
+                    &format!(
+                        "{hosted_row}: event {hcom_id} from {} dropped: {}",
+                        message.from,
+                        reason.as_str()
+                    ),
+                );
+                Vec::new()
+            }
             route::Outbound::Post(posts) => posts,
             route::Outbound::Notice {
                 sender,
@@ -2128,7 +2144,7 @@ impl MainLoop {
     }
 
     /// Enroll every deliverable agent row into every bridged channel, and remove
-    /// agents whose row has been gone for an hour.
+    /// agents whose row has been gone for `ENROLL_STALE_SECS` (a day).
     fn plan_enrollment(&mut self) {
         let roster: Vec<AgentIdentity> = self
             .deliverable_agents()
@@ -2566,17 +2582,21 @@ impl MainLoop {
     }
 
     /// True when an unclassified author is known not to be a bridged person,
-    /// so their message needs nothing: a retired person, a `bot` on the
-    /// channel's roster, or an author absent from an applied roster at least
-    /// as new as the message. Anything else may still become a person (a
-    /// listed member whose profile isn't readable yet, a roster that predates
-    /// them), so the message waits.
+    /// so their message needs nothing: a retired person, one of our own
+    /// identities (an agent derived from this seed, the reader, omp), or an
+    /// author absent from an applied roster at least as new as the message.
+    /// Anything else may still become a person (a listed member whose profile
+    /// isn't readable yet, a roster that predates them, a MANAGED bot we do
+    /// not derive), so the message waits for the roster that names them.
     fn known_not_a_person(&self, channel: &ChannelRow, event: &Event) -> Result<bool> {
         let store = self.connector.store.lock();
         if store
             .person_by_pubkey(&event.pubkey)?
             .is_some_and(|person| !person.active)
         {
+            return Ok(true);
+        }
+        if self.own_pubkeys().contains(&event.pubkey) {
             return Ok(true);
         }
         let Some(saved) = store.saved_roster(&channel.id)? else {
@@ -2588,7 +2608,7 @@ impl MainLoop {
                 .into_iter()
                 .find(|(pubkey, _)| pubkey == &event.pubkey)
             {
-                Some((_, role)) => role == "bot",
+                Some(_) => false,
                 None => saved.applied && saved.created_at >= event.created_at,
             },
         )
@@ -2646,6 +2666,20 @@ impl MainLoop {
             }
         }
         identities
+    }
+
+    /// The pubkeys this connector owns: the agents it can derive from its seed
+    /// plus the reader and omp. Everyone else on a roster is a sender, whatever
+    /// role the roster gives them.
+    fn own_pubkeys(&self) -> BTreeSet<String> {
+        let mut ours: BTreeSet<String> = self
+            .all_known_identities()
+            .into_iter()
+            .map(|identity| identity.pubkey)
+            .collect();
+        ours.insert(self.connector.reader.pubkey.clone());
+        ours.insert(self.connector.owner_pubkey.clone());
+        ours
     }
 
     /// hcom rows that are agents, mapped to their Buzz pubkeys.
@@ -2741,6 +2775,9 @@ impl MainLoop {
     /// profile isn't readable yet, so the roster is applied again later and
     /// their messages wait meanwhile.
     ///
+    /// Every member that is not one of our own identities becomes a person,
+    /// whatever role the roster gives them — see the note on the loop below.
+    ///
     /// A roster that leaves out the reader means the reader lost the channel:
     /// the channel is parked with that reason (shown by `hcom buzz status`)
     /// until a roster lists it again.
@@ -2759,13 +2796,13 @@ impl MainLoop {
 
         let mut complete = true;
         let mut here: Vec<String> = Vec::new();
-        for (pubkey, role) in members {
-            // Role `bot` is an owned agent, and the reader and omp are ours:
-            // none of them is ever a person.
-            if role == "bot"
-                || pubkey == self.connector.reader.pubkey
-                || pubkey == self.connector.owner_pubkey
-            {
+        // Our own identities — agents derived from this seed, the reader, omp —
+        // are never people. A roster role of `bot` is not that test: Buzz
+        // MANAGED agents owned by the operator (@infra, @domain) are listed as
+        // bots on another seed and are senders, like the people they were.
+        let ours = self.own_pubkeys();
+        for (pubkey, _) in members {
+            if ours.contains(&pubkey) {
                 continue;
             }
             let Some(name) = self.person_name_for(&pubkey) else {
@@ -3047,8 +3084,31 @@ fn exact_targets_of(db: &HcomDb, event_id: i64) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<Value>(&raw) else {
         return Vec::new();
     };
+    let exact = string_list(&value, "exact_targets");
+    if !exact.is_empty() {
+        return exact;
+    }
+    // `exact_targets` arrived in 0.7.47. A peer older than that stamps only
+    // `mentions`, and without a target the connector drops the post silently
+    // (event 1905294 from nina:MABE on 0.7.41, addressed to `ch_infra`). Fall
+    // back to `mentions`, which `db::pull` already normalised to local names.
+    //
+    // The `--reply-to` override deliberately omits `exact_targets` and carries
+    // its own `thread`, and rule 1 routes that thread, so a message with a
+    // thread is left exactly as it was.
+    if !value.get("thread").is_some_and(|t| !t.is_null()) {
+        let mentions = string_list(&value, "mentions");
+        if !mentions.is_empty() {
+            return mentions;
+        }
+    }
+    Vec::new()
+}
+
+/// The string entries of `field` on an event's stored data.
+fn string_list(value: &Value, field: &str) -> Vec<String> {
     value
-        .get("exact_targets")
+        .get(field)
         .and_then(Value::as_array)
         .map(|values| {
             values
@@ -4529,24 +4589,241 @@ mod tests {
     fn a_message_from_a_roster_bot_or_a_non_member_is_settled() {
         let mut harness = harness("mbai");
         harness.add_agent("luna");
-        let bot = nostr::derive_secret(&SEED, "someone-elses-bot@test");
+        // A key derived from our own seed: the connector's own agent identity,
+        // never a person.
+        let ours = nostr::derive_secret(&SEED, "luna@mbai");
         let stranger = nostr::derive_secret(&SEED, "stranger@test");
         let addressed = || vec![vec!["p".to_string(), public_hex(&agent_key())]];
-        let from_bot = message(&bot, CHANNEL_ID, "luna, beep", addressed());
+        let from_ours = message(&ours, CHANNEL_ID, "luna, beep", addressed());
         let from_stranger = message(&stranger, CHANNEL_ID, "luna, hi", addressed());
-        harness.offer(from_bot.clone());
+        harness.offer(from_ours.clone());
         harness.offer(from_stranger.clone());
-        // A roster at least as new as both lists the bot as a bot and doesn't
-        // list the stranger: neither will ever be a person.
-        harness.offer(roster(CHANNEL_ID, &[(&public_hex(&bot), "bot")]));
+        // A roster at least as new as both lists our own key as a bot and
+        // doesn't list the stranger: neither will ever be a person.
+        harness.offer(roster(CHANNEL_ID, &[(&public_hex(&ours), "bot")]));
         harness.step();
 
-        assert_eq!(harness.inbox_state(&from_bot.id).as_deref(), Some("done"));
+        assert_eq!(harness.inbox_state(&from_ours.id).as_deref(), Some("done"));
         assert_eq!(
             harness.inbox_state(&from_stranger.id).as_deref(),
             Some("done")
         );
         assert!(harness.unread("luna").is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_managed_bot_we_do_not_derive_is_a_sender() {
+        // Live shape: Buzz-MANAGED agents owned by the operator (@infra, @domain)
+        // are roster members with role `bot` whose keys come from another seed.
+        // Being a bot is not ours; their mentions of our agents must still
+        // reach hcom, as they did over the retired zagcom bridge.
+        let mut harness = harness("mbai");
+        harness.add_agent("luna");
+        // A foreign managed bot: a key this connector cannot derive, with the
+        // operator's profile name it is addressed by.
+        let managed = SecretKey::from_bytes(&[42; 32]).unwrap();
+        let managed_pubkey = public_hex(&managed);
+        harness
+            .relay
+            .seed(profile(&managed, "infra", "managed by buzz"));
+        let event = message(
+            &managed,
+            CHANNEL_ID,
+            "luna, standing down",
+            vec![vec!["p".into(), public_hex(&agent_key())]],
+        );
+        harness.offer(event.clone());
+        harness.offer(roster(
+            CHANNEL_ID,
+            &[(&managed_pubkey, "bot"), (&public_hex(&agent_key()), "bot")],
+        ));
+        harness.step();
+
+        let messages = harness.unread("luna");
+        assert_eq!(
+            messages.len(),
+            1,
+            "a foreign managed bot's mention reaches the agent"
+        );
+        assert_eq!(
+            messages[0].from, "infra",
+            "delivered under the sender's Buzz name, slugged as people are"
+        );
+        assert_eq!(messages[0].text, "luna, standing down");
+        assert_eq!(harness.inbox_state(&event.id).as_deref(), Some("done"));
+        assert_eq!(harness.obligations("delivered"), 1);
+    }
+
+    /// One legacy-shaped message event: `mentions` but no `exact_targets`,
+    /// which is every event a peer before 0.7.47 published.
+    fn seed_legacy_event(db: &HcomDb, data: Value) -> i64 {
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (?, 'message', 'luna', ?)",
+                rusqlite::params![crate::shared::time::now_epoch_i64(), data.to_string()],
+            )
+            .unwrap();
+        db.conn().last_insert_rowid()
+    }
+
+    /// The outbound message a hosted row reads for that stored event.
+    fn outbound_message(event_id: i64, from: &str, text: &str) -> crate::db::Message {
+        crate::db::Message {
+            from: from.to_string(),
+            text: text.to_string(),
+            intent: None,
+            thread: None,
+            event_id: Some(event_id),
+            timestamp: None,
+            delivered_to: None,
+            bundle_id: None,
+            relay: false,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_legacy_peer_message_without_exact_targets_still_posts() {
+        // Live case: event 1905294 from nina:MABE on 0.7.41 carried
+        // `mentions: ["ch_infra"]` and no `exact_targets` (added in 0.7.47),
+        // so `exact_targets_of` returned [] and route_outbound dropped it with
+        // no log at all. The delivery side has had a legacy fallback since;
+        // the outbound side did not.
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        let legacy = seed_legacy_event(
+            &harness.main.db,
+            json!({
+                "from": "luna",
+                "text": "nina says hi",
+                "scope": "mentions",
+                "mentions": ["ch_infra"],
+            }),
+        );
+        assert_eq!(
+            exact_targets_of(&harness.main.db, legacy),
+            vec!["ch_infra".to_string()],
+            "an old peer's mentions stand in for its missing exact targets"
+        );
+
+        harness
+            .main
+            .route_outbound_message("luna", &outbound_message(legacy, "luna", "nina says hi"))
+            .unwrap();
+        // The post is queued in the outbox; a tick flushes it to the relay.
+        harness.step();
+        let posts = harness.agent_posts();
+        assert_eq!(posts.len(), 1, "the message reaches #infra, not the void");
+        assert_eq!(posts[0].content, "nina says hi");
+        assert_eq!(route::tag(&posts[0], "h"), Some(CHANNEL_ID));
+    }
+
+    #[test]
+    #[serial]
+    fn a_broadcast_from_a_legacy_peer_is_still_not_forwarded() {
+        // The fallback must not turn an ordinary hcom fan-out into a Buzz
+        // broadcast: a legacy peer with no mentions at all still drops.
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        let broadcast = seed_legacy_event(
+            &harness.main.db,
+            json!({
+                "from": "luna",
+                "text": "to everyone",
+                "scope": "broadcast",
+                "mentions": [],
+            }),
+        );
+        assert!(exact_targets_of(&harness.main.db, broadcast).is_empty());
+        harness
+            .main
+            .route_outbound_message("luna", &outbound_message(broadcast, "luna", "to everyone"))
+            .unwrap();
+        harness.step();
+        assert!(
+            harness.agent_posts().is_empty(),
+            "a broadcast is not a post"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_reply_to_override_is_not_re_read_as_a_legacy_target() {
+        // `--reply-to` deliberately omits `exact_targets` and carries a thread;
+        // rule 1 routes that thread. Falling back to `mentions` there would
+        // change a thread answer into a fresh top-level post.
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        let reply = seed_legacy_event(
+            &harness.main.db,
+            json!({
+                "from": "luna",
+                "text": "answering",
+                "scope": "mentions",
+                "mentions": ["ch_infra"],
+                "thread": "buzz_infra_abc123",
+            }),
+        );
+        assert!(
+            exact_targets_of(&harness.main.db, reply).is_empty(),
+            "a thread override is left for rule 1, not converted to targets"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn exact_targets_still_win_over_a_legacy_mentions_field() {
+        // A current event that carries both is device-exact and must not be
+        // widened by the base-name fallback: `x` is not addressed by `x:DEVB`.
+        let harness = harness("mbai");
+        let id = seed_legacy_event(
+            &harness.main.db,
+            json!({
+                "from": "luna",
+                "text": "hi",
+                "scope": "mentions",
+                "mentions": ["x"],
+                "exact_targets": ["x:DEVB"],
+            }),
+        );
+        assert_eq!(exact_targets_of(&harness.main.db, id), vec!["x:DEVB"]);
+    }
+
+    #[test]
+    #[serial]
+    fn a_dropped_outbound_message_is_logged_with_its_reason() {
+        // A drop used to vanish: no log, no trace. Now every one names the
+        // event, the sender and why it did not go to Buzz.
+        let mut harness = harness("mbai");
+        harness.add_person("michael", None);
+        harness.add_agent("luna");
+        let drop = seed_legacy_event(
+            &harness.main.db,
+            json!({
+                "from": "michael",
+                "text": "person to person",
+                "scope": "broadcast",
+                "mentions": [],
+            }),
+        );
+        harness
+            .main
+            .route_outbound_message(
+                "michael",
+                &outbound_message(drop, "michael", "person to person"),
+            )
+            .unwrap();
+        harness.step();
+        assert!(harness.agent_posts().is_empty());
+        let logged = std::fs::read_to_string(crate::paths::log_path()).unwrap_or_default();
+        assert!(
+            logged.contains("serve.outbound_dropped")
+                && logged.contains(&format!("event {drop}"))
+                && logged.contains("a person writes it, not an agent"),
+            "the drop is accounted for with its event and reason:\n{logged}"
+        );
     }
 
     #[test]
@@ -5011,7 +5288,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn an_agent_gone_for_an_hour_is_removed_by_its_own_pubkey() {
+    fn an_agent_gone_for_a_day_is_removed_by_its_own_pubkey() {
         let mut harness = harness("mbai");
         harness.add_agent("luna");
         let luna = public_hex(&agent_key());
@@ -5025,7 +5302,7 @@ mod tests {
             Some("enrolled")
         );
 
-        // The session ends. The hour runs from when the row went missing, not
+        // The session ends. The day runs from when the row went missing, not
         // from when the agent was enrolled.
         assert!(harness.main.db.delete_instance("luna").unwrap());
         harness.main.plan_enrollment();
@@ -5058,6 +5335,50 @@ mod tests {
                 .enrollment(&luna, CHANNEL_ID)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn an_agent_missing_for_less_than_a_day_stays_in_the_popup() {
+        // The design (docs/design/buzz.md, D2) removes an agent 24 h after its
+        // row goes, not an hour: a session that ends mid-task must stay
+        // answerable for the rest of the day. The hour that 0.7.53 shipped with
+        // unenrolled @nami while the operator still expected replies.
+        assert_eq!(
+            ENROLL_STALE_SECS,
+            24 * 3600,
+            "removal is a day after the session ends, per the design"
+        );
+
+        let mut harness = harness("mbai");
+        harness.add_agent("luna");
+        let luna = public_hex(&agent_key());
+        harness.main.plan_enrollment();
+        assert!(harness.main.db.delete_instance("luna").unwrap());
+        harness.main.plan_enrollment();
+        let now = crate::shared::time::now_epoch_i64();
+
+        // Just under the threshold: still enrolled, so still in the popup.
+        harness
+            .store()
+            .age_enrollment(&luna, now - ENROLL_STALE_SECS + 60)
+            .unwrap();
+        harness.main.plan_enrollment();
+        assert!(
+            !harness.relay.events().iter().any(|e| e.kind == 9001),
+            "23 hours is not a day"
+        );
+
+        // Over the threshold: removed.
+        harness
+            .store()
+            .age_enrollment(&luna, now - ENROLL_STALE_SECS - 1)
+            .unwrap();
+        harness.main.plan_enrollment();
+        assert!(
+            harness.relay.events().iter().any(|e| e.kind == 9001),
+            "past a day it is removed"
         );
     }
 

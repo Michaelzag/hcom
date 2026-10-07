@@ -167,7 +167,7 @@ every handle or to reset in place; that's a follow-up outside this change.
 
 | Buzz thing | hcom participant | Name |
 |---|---|---|
-| A human member of any bridged channel (not omp, not a derived key, not role `bot`) | hosted row, `tool = "buzz"` | slug of kind 0 `name`/`display_name`, `[a-z0-9_]`, stable once assigned (stored by pubkey), overridable in config |
+| A member of any bridged channel that this connector does not own (see below) | hosted row, `tool = "buzz"` | slug of kind 0 `name`/`display_name`, `[a-z0-9_]`, stable once assigned (stored by pubkey), overridable in config |
 | A bridged channel | hosted row, `tool = "buzz"` | `ch_<slug>` (`ch_infra`, `ch_warehouse`) |
 
 A name collision with a non-buzz row gets a `_bz` suffix. Person rows appear the
@@ -175,6 +175,22 @@ first time the roster (kind 39002) shows them in a bridged channel, and are
 stopped 24 h after they leave every bridged channel. That's the whole
 onboarding story for coworkers. hcom `@` resolution is case-insensitive, so
 `@SeanFitz` works.
+
+**Who counts as a sender.** Being on the roster is the authority (D3), and the
+test is ownership, not the roster's role string. The only non-senders are the
+identities this connector owns: agents whose key re-derives from its own seed,
+the reader, and omp. Every other member is a sender, **including Buzz-MANAGED
+agents owned by the operator** — `@infra` and `@domain` are roster members with
+role `bot` on a different seed, and their mentions of our agents are real
+instructions, exactly as they were over the retired zagcom bridge. They get a
+person row and are addressed by the slug of their Buzz display name, so their
+posts arrive as ordinary hcom messages from that row.
+
+Role `bot` is a Buzz-side display convention, not an ownership claim: 0.7.53
+read it as one and silently dropped every managed bot's messages (`role == "bot"`
+in roster seeding, so `route_inbound` skipped them with `NotAPerson`). An agent
+of ours is recognised by re-deriving its key from our seed, which is what
+`classify_profile` already did for kind 0.
 
 ### Hosted participants (the core hcom change)
 
@@ -234,7 +250,8 @@ ruling on D1).
 
 For each event E from author H, signature verified first:
 
-- **Skip** if H is a derived key (our own posts), omp or the reader.
+- **Skip** if H is a derived key (our own posts), omp or the reader. A Buzz
+  MANAGED agent is not skipped: it is a sender (see *Who counts as a sender*).
 - **Targets** = agents p-tagged in E ∪ the agent author of any ancestor in E's
   thread (walk `e` tags to the root; this is what catches plain thread
   replies), minus H. An ancestor missing from the cache is
@@ -286,6 +303,20 @@ hosted rows) is acknowledged and dropped. `mentions` alone is never the test,
 because it also carries ordinary thread fan-out. 0.7.52 senders write the same
 fields, so this holds in the mixed period.
 
+**Legacy peers.** `exact_targets` arrived in 0.7.47. A peer older than that
+stamps only `mentions`, and a message with no target is dropped — so an agent
+on 0.7.41 addressing `ch_infra` said nothing and nothing said why (event 1905294
+from `nina:MABE`). When the event has no `exact_targets` **and no `thread`**,
+`mentions` stands in for the missing targets, mirroring the legacy fallback the
+delivery side has always had (`messages::mentions_delivers_to`). The `thread`
+guard is what keeps `--reply-to` behaviour intact: that path omits
+`exact_targets` by design and is routed by rule 1. A broadcast still carries no
+targets and is still dropped.
+
+Every drop is now logged at info (`serve.outbound_dropped`) with the hcom event
+id, the sender and the reason, so a message that does not reach Buzz is
+accounted for rather than silently acknowledged.
+
 Sender: M's `from` (`luna` local or `luna:BOXE` remote) gives the agent key.
 External (`ext_`) and system (`sys_`) senders are not posted; they're logged
 and dropped.
@@ -332,8 +363,11 @@ failing keeps the stored event for a later retry.
 Agents become pickable before they ever post: every deliverable hcom agent row
 (local or remote; not hosted rows, `sys_`/`_` names or subagents) is enrolled
 into every bridged stream/forum channel. When an agent's row has been gone for
-an hour, omp removes it from those channels (kind 9001), the same trigger that
-closes its session, so the popup lists agents that can answer.
+24 h, omp removes it from those channels (kind 9001), so the popup lists agents
+that can answer. The day runs from when the row went missing, not from when the
+agent was enrolled, and it is long enough that an agent stays answerable for the
+rest of the day it was talked to in — a session that ends mid-task is not
+unenrolled out from under the operator.
 
 ### Addressing
 
@@ -623,9 +657,9 @@ nothing in Buzz changes.
   thread posts in that human's private home channel (`#michael`), @mentioning
   him, so observers can be invited. No DMs.
 - **D2. Popup.** Recommend enrolling every live hcom agent into every bridged
-  stream channel (`#infra`, home channels, `#hcom-test`, later `#warehouse`). Alternative:
-  only agents that have posted, a shorter list that hides agents you'd want to
-  ping first.
+  stream channel (`#infra`, home channels, `#hcom-test`, later `#warehouse`), and
+  removing one 24 h after its row goes. Alternative: only agents that have
+  posted, a shorter list that hides agents you'd want to ping first.
 - **D3. Who may message agents.** Recommend any member of a bridged channel,
   each message labelled with its human sender: being in the channel is the
   authority. So coworkers like SeanFitz can instruct agents, and hcom delivery
