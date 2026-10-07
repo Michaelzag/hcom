@@ -2589,6 +2589,9 @@ impl MainLoop {
     /// isn't readable yet, a roster that predates them, a MANAGED bot we do
     /// not derive), so the message waits for the roster that names them.
     fn known_not_a_person(&self, channel: &ChannelRow, event: &Event) -> Result<bool> {
+        // `own_pubkeys` reads the author table, so it must be resolved before
+        // the store guard below is taken: re-locking it here would deadlock.
+        let ours = self.own_pubkeys();
         let store = self.connector.store.lock();
         if store
             .person_by_pubkey(&event.pubkey)?
@@ -2596,7 +2599,7 @@ impl MainLoop {
         {
             return Ok(true);
         }
-        if self.own_pubkeys().contains(&event.pubkey) {
+        if ours.contains(&event.pubkey) {
             return Ok(true);
         }
         let Some(saved) = store.saved_roster(&channel.id)? else {
@@ -2671,12 +2674,27 @@ impl MainLoop {
     /// The pubkeys this connector owns: the agents it can derive from its seed
     /// plus the reader and omp. Everyone else on a roster is a sender, whatever
     /// role the roster gives them.
+    ///
+    /// An agent whose hcom row has since gone is still ours, so the enrollment
+    /// table counts too: it is the record that we enrolled that key, and it
+    /// outlives both the row and the cached author. Missing it would re-admit a
+    /// finished agent of ours as a person and start a buzz_<channel> thread from
+    /// its own posts.
     fn own_pubkeys(&self) -> BTreeSet<String> {
         let mut ours: BTreeSet<String> = self
             .all_known_identities()
             .into_iter()
             .map(|identity| identity.pubkey)
             .collect();
+        ours.extend(
+            self.connector
+                .store
+                .lock()
+                .enrollments()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| row.agent_pubkey),
+        );
         ours.insert(self.connector.reader.pubkey.clone());
         ours.insert(self.connector.owner_pubkey.clone());
         ours
@@ -4653,6 +4671,36 @@ mod tests {
         assert_eq!(messages[0].text, "luna, standing down");
         assert_eq!(harness.inbox_state(&event.id).as_deref(), Some("done"));
         assert_eq!(harness.obligations("delivered"), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn our_own_finished_agent_is_never_seeded_as_a_person() {
+        // Regression: when the ownership test was "deliverable rows plus cached
+        // authors", an agent of ours whose session had ended — row deleted, and
+        // no cached kind 0 — matched nothing and was seeded as a person. Its own
+        // posts would then come back to hcom as a person talking to itself. The
+        // enrollment table is the record that outlives both.
+        let mut harness = harness("mbai");
+        harness.add_agent("luna");
+        let luna = public_hex(&agent_key());
+        harness.main.plan_enrollment();
+        assert!(harness.main.db.delete_instance("luna").unwrap());
+        // The enrollment survives; the author cache is what the old check used.
+        harness.store().delete_author_for_test(&luna).unwrap();
+        harness.offer(roster(CHANNEL_ID, &[(&luna, "bot")]));
+        harness.step();
+
+        let people = harness.store().active_people().unwrap();
+        assert!(
+            people.iter().all(|p| p.pubkey != luna),
+            "our own agent is never a person: {:?}",
+            people.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+        assert!(
+            harness.unread("luna").is_empty(),
+            "and its own posts do not come back as a person's"
+        );
     }
 
     /// One legacy-shaped message event: `mentions` but no `exact_targets`,
