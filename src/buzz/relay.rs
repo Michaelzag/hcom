@@ -149,17 +149,47 @@ fn connect_socket(
         match TcpStream::connect_timeout(&address, remaining) {
             Ok(socket) => {
                 // A blackholed path without a FIN must still die: keepalive
-                // probes (60 s idle, 15 s apart, 4 tries) fail a half-open
-                // socket even when the WS layer never reads again.
+                // probes (60 s idle, 15 s apart) fail a half-open socket
+                // even when the WS layer never reads again.
                 // `socket2` is already in Cargo.lock (via tokio); promoting
-                // it to a direct dependency adds no new crate.
+                // it to a direct dependency adds no new crate. `all`
+                // enables the retry-count builder; it pulls no extra
+                // dependencies.
                 let keepalive = socket2::TcpKeepalive::new()
                     .with_time(Duration::from_secs(60))
-                    .with_interval(Duration::from_secs(15))
-                    .with_retries(4);
-                socket2::SockRef::from(&socket)
-                    .set_tcp_keepalive(&keepalive)
-                    .map_err(transport)?;
+                    .with_interval(Duration::from_secs(15));
+                // `with_retries` exists only where socket2 provides it
+                // (this list mirrors socket2 0.6's own cfg); everywhere
+                // else time+interval still apply.
+                #[cfg(any(
+                    target_os = "android",
+                    target_os = "dragonfly",
+                    target_os = "emscripten",
+                    target_os = "freebsd",
+                    target_os = "fuchsia",
+                    target_os = "illumos",
+                    target_os = "ios",
+                    target_os = "visionos",
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "netbsd",
+                    target_os = "tvos",
+                    target_os = "watchos",
+                    target_os = "cygwin",
+                    target_os = "windows",
+                    target_os = "nuttx",
+                    all(target_os = "wasi", not(target_env = "p1")),
+                ))]
+                let keepalive = keepalive.with_retries(4);
+                // Best effort: a platform that refuses keepalive must not
+                // lose the connector over it.
+                if let Err(error) = socket2::SockRef::from(&socket).set_tcp_keepalive(&keepalive) {
+                    crate::log::log_warn(
+                        "buzz",
+                        "relay.keepalive",
+                        &format!("keeping the socket without keepalive: {error}"),
+                    );
+                }
                 stream = Some(socket);
                 break;
             }
