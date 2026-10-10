@@ -56,6 +56,15 @@ pub const HTTP_PER_MINUTE: usize = 240;
 pub const WS_FRAMES_PER_WINDOW: usize = 40;
 /// Connect/read timeout for the reader session.
 const WS_TIMEOUT: Duration = Duration::from_secs(10);
+/// No inbound frame for this long ends the session: the relay pings every
+/// 30 s and answers client pings, so a silent socket is half-open, not
+/// idle. Ending the session reconnects through the normal backoff and
+/// catch-up instead of waiting on `recv` timeouts forever (2026-10-08 stall:
+/// 18 replies lost on a socket the relay had already closed).
+const READ_IDLE_LIMIT: Duration = Duration::from_secs(90);
+/// How often a live session pings: a healthy relay's pongs keep it off the
+/// read-idle limit no matter how quiet the channels are.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// Post retry backoff bounds.
 const POST_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const POST_BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -491,6 +500,12 @@ struct ReaderHandles {
     /// Follow-on catch-ups the main loop asked for, by channel id.
     catch_up_requests: Arc<Mutex<BTreeSet<String>>>,
     shutdown: Arc<AtomicBool>,
+    /// End the session after this long with no inbound frame (test seam:
+    /// production uses READ_IDLE_LIMIT).
+    read_idle_limit: Duration,
+    /// Ping the relay this often so a healthy session never trips the limit
+    /// (test seam: production uses PING_INTERVAL).
+    ping_interval: Duration,
 }
 
 /// What the reader thread takes from the connector.
@@ -507,6 +522,8 @@ fn reader_handles(connector: &Connector) -> ReaderHandles {
         store: connector.store.clone(),
         catch_up_requests: connector.catch_up_requests.clone(),
         shutdown: connector.shutdown.clone(),
+        read_idle_limit: READ_IDLE_LIMIT,
+        ping_interval: PING_INTERVAL,
     }
 }
 
@@ -871,6 +888,10 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
         .iter()
         .map(|channel| (channel.id.clone(), ChannelSync::default()))
         .collect();
+    // The relay pings every 30 s, but an idle-but-healthy subscription must
+    // never depend on that alone: the session pings too, so only a truly
+    // silent (half-open) socket trips the read-idle limit below.
+    let mut last_ping = Instant::now();
     while !handles.shutdown.load(Ordering::SeqCst) {
         for channel in &handles.channels {
             let state = sync
@@ -929,12 +950,42 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
             }
         }
 
+        if last_ping.elapsed() >= handles.ping_interval {
+            if let Err(error) = session.ping() {
+                crate::log::log_warn("buzz", "serve.reader_error", &error.to_string());
+                return false;
+            }
+            last_ping = Instant::now();
+        }
         match session.recv(Duration::from_millis(500)) {
             Err(error) => {
                 crate::log::log_warn("buzz", "serve.reader_error", &error.to_string());
                 return false;
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // No inbound frame for the whole limit: the socket is
+                // half-open (the relay closed its side without a FIN
+                // reaching us). Never resubscribe here; end the session so
+                // the reconnect loop opens a fresh socket and catches up.
+                if session.idle() >= handles.read_idle_limit {
+                    let subs = handles
+                        .channels
+                        .iter()
+                        .map(|channel| channel.slug.clone())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    crate::log::log_warn(
+                        "buzz",
+                        "serve.read_stall",
+                        &format!(
+                            "no inbound frame for {}s on [{}]; reconnecting",
+                            session.idle().as_secs(),
+                            subs,
+                        ),
+                    );
+                    return false;
+                }
+            }
             Ok(Some(RelayMsg::Event { sub, event })) => {
                 let Some(channel) = channel_for_sub(&handles.channels, &sub) else {
                     crate::log::log_warn("buzz", "serve.unknown_sub", &sub);
@@ -6024,6 +6075,16 @@ mod tests {
 
     impl LiveReader {
         fn start(before: impl FnOnce(&FakeRelay)) -> Self {
+            Self::start_tuned(before, READ_IDLE_LIMIT, PING_INTERVAL)
+        }
+
+        /// `start` with the watchdog's durations overridden, so a test never
+        /// sleeps 90 s to prove a session ends (or doesn't).
+        fn start_tuned(
+            before: impl FnOnce(&FakeRelay),
+            read_idle_limit: Duration,
+            ping_interval: Duration,
+        ) -> Self {
             let env = crate::hooks::test_helpers::isolated_test_env();
             let http = FakeRelay::http();
             let ws = http.ws_twin();
@@ -6036,7 +6097,9 @@ mod tests {
                 .lock()
                 .upsert_channel(CHANNEL_ID, "infra")
                 .unwrap();
-            let handles = reader_handles(&connector);
+            let mut handles = reader_handles(&connector);
+            handles.read_idle_limit = read_idle_limit;
+            handles.ping_interval = ping_interval;
             let thread = std::thread::spawn(move || reader_loop(handles));
             Self {
                 _env: env,
@@ -6167,6 +6230,304 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// A relay that answers AUTH and every REQ with EOSE, then holds the
+    /// socket in silence: no events, no pings, no pongs, no close. The
+    /// 2026-10-08 stall, where the relay had closed its side without a FIN
+    /// reaching the connector.
+    struct SilentRelay {
+        url: String,
+        connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stop: std::sync::Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SilentRelay {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let server_connections = connections.clone();
+            let server_stop = stop.clone();
+            let thread = std::thread::spawn(move || {
+                let mut workers = Vec::new();
+                while !server_stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let index = server_connections.fetch_add(1, Ordering::SeqCst);
+                            let stop = server_stop.clone();
+                            workers.push(std::thread::spawn(move || {
+                                Self::serve(stream, index, &stop);
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(e) => panic!("silent relay listener: {e}"),
+                    }
+                }
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+            });
+            Self {
+                url,
+                connections,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// One session: AUTH it and answer every REQ with EOSE. The first
+        /// connection then goes read-dead: it holds the socket but never
+        /// reads again, so client pings sit unanswered and no pong, event or
+        /// close ever arrives — the 2026-10-08 stall, where the relay had
+        /// closed its side without a FIN reaching the connector. (Merely
+        /// swallowing pings at the WS layer doesn't work: tungstenite
+        /// flushes a queued pong on the next read.) Later connections stay
+        /// up normally, so the watchdog's reconnect lands on a live socket.
+        fn serve(stream: std::net::TcpStream, index: usize, stop: &AtomicBool) {
+            let mut socket = match tungstenite::accept(stream) {
+                Ok(socket) => socket,
+                Err(_) => return,
+            };
+            socket
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            // The client waits for the challenge before it authenticates.
+            if socket
+                .send(tungstenite::Message::Text(
+                    json!(["AUTH", "TEST challenge"]).to_string().into(),
+                ))
+                .is_err()
+            {
+                return;
+            }
+            let Ok(tungstenite::Message::Text(text)) = socket.read() else {
+                return;
+            };
+            let Ok(auth) = serde_json::from_str::<Value>(&text) else {
+                return;
+            };
+            let id = auth
+                .get(1)
+                .and_then(|event| event.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if socket
+                .send(tungstenite::Message::Text(
+                    json!(["OK", id, true, ""]).to_string().into(),
+                ))
+                .is_err()
+            {
+                return;
+            }
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                match socket.read() {
+                    Ok(tungstenite::Message::Text(text)) => {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text)
+                            && value.get(0).and_then(Value::as_str) == Some("REQ")
+                        {
+                            let sub = value
+                                .get(1)
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            if socket
+                                .send(tungstenite::Message::Text(
+                                    json!(["EOSE", sub]).to_string().into(),
+                                ))
+                                .is_err()
+                            {
+                                return;
+                            }
+                            // The first session dies here: never read
+                            // again, so nothing it sends is ever
+                            // answered. The kernel keeps the socket
+                            // ESTAB; the client sees only silence.
+                            if index == 0 {
+                                socket.get_mut().shutdown(std::net::Shutdown::Read).ok();
+                                while !stop.load(Ordering::SeqCst) {
+                                    std::thread::sleep(Duration::from_millis(50));
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    Ok(tungstenite::Message::Close(_)) => return,
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for SilentRelay {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Stops and joins the reader even when an assertion fails first.
+    struct ReaderRunning(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    impl Drop for ReaderRunning {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.1.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_silent_subscription_trips_the_watchdog_and_reconnects() {
+        // Without the watchdog this never recovers: the first session's
+        // `recv` timeouts return None forever, so an event seeded while it
+        // is silent never reaches the inbox and no second socket appears.
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let http = FakeRelay::http();
+        let silent = SilentRelay::start();
+        // History before the first session: a non-empty first catch-up moves
+        // the position (an empty one stores nothing and moves nothing).
+        http.seed(sign(
+            UnsignedEvent {
+                created_at: nostr::now() - 100,
+                kind: route::KIND_MESSAGE,
+                tags: vec![vec!["h".into(), CHANNEL_ID.into()]],
+                content: "before the silence".into(),
+            },
+            &human_key(),
+        ));
+        let mut config = test_config(&http, "mbai");
+        config.relay_url = silent.url.clone();
+        let connector = Connector::load(config).unwrap();
+        connector
+            .store
+            .lock()
+            .upsert_channel(CHANNEL_ID, "infra")
+            .unwrap();
+        let mut handles = reader_handles(&connector);
+        handles.read_idle_limit = Duration::from_millis(600);
+        handles.ping_interval = Duration::from_millis(150);
+        let _reader = ReaderRunning(
+            connector.shutdown.clone(),
+            Some(std::thread::spawn(move || reader_loop(handles))),
+        );
+        // The first session subscribes and its EOSE runs a catch-up, moving
+        // the position: proof the silent relay answered.
+        assert!(
+            {
+                let end = Instant::now() + Duration::from_secs(10);
+                while connector
+                    .store
+                    .lock()
+                    .channel(CHANNEL_ID)
+                    .unwrap()
+                    .is_some_and(|row| row.position.is_none())
+                    && Instant::now() < end
+                {
+                    sleep(Duration::from_millis(50));
+                }
+                connector
+                    .store
+                    .lock()
+                    .channel(CHANNEL_ID)
+                    .unwrap()
+                    .is_some_and(|row| row.position.is_some())
+            },
+            "the first session caught up (silent connections: {})",
+            silent.connections()
+        );
+        // Published while the socket is silent: only reachable over HTTP,
+        // so only a reconnect's catch-up can fetch it.
+        let missed = sign(
+            UnsignedEvent {
+                created_at: nostr::now(),
+                kind: route::KIND_MESSAGE,
+                tags: vec![vec!["h".into(), CHANNEL_ID.into()]],
+                content: "published while the socket was silent".into(),
+            },
+            &human_key(),
+        );
+        http.seed(missed.clone());
+        assert!(
+            {
+                let end = Instant::now() + Duration::from_secs(15);
+                while connector
+                    .store
+                    .lock()
+                    .cached_event(&missed.id)
+                    .unwrap()
+                    .is_none()
+                    && Instant::now() < end
+                {
+                    sleep(Duration::from_millis(50));
+                }
+                connector
+                    .store
+                    .lock()
+                    .cached_event(&missed.id)
+                    .unwrap()
+                    .is_some()
+            },
+            "the reconnect's catch-up fetched what the silent session missed \
+             (silent connections: {})",
+            silent.connections()
+        );
+        assert!(
+            silent.connections() >= 2,
+            "the watchdog ended the silent session: {} connection(s)",
+            silent.connections()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_healthy_but_quiet_session_never_trips_the_watchdog() {
+        // The fake relay answers client pings with pongs and sends nothing
+        // else: past several idle windows the session must still be the
+        // first one, and still live enough to stream.
+        let reader = LiveReader::start_tuned(
+            |_| {},
+            Duration::from_millis(600),
+            Duration::from_millis(150),
+        );
+        sleep(Duration::from_secs(2));
+        assert_eq!(
+            reader.ws.ws_connections(),
+            1,
+            "one quiet session, no reconnect"
+        );
+        assert!(
+            reader.ws.switches.pong_received.load(Ordering::SeqCst),
+            "the session pinged and the relay ponged"
+        );
+        let live = reader.publish_live("still here");
+        assert!(
+            reader.stored(&live.id, Duration::from_secs(10)),
+            "the un-reconnected session still streams live events"
+        );
     }
 
     #[test]
