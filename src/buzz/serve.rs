@@ -6257,6 +6257,10 @@ mod tests {
                 while !server_stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // Windows accepted sockets inherit the listener's
+                            // nonblocking mode; the handshake needs blocking
+                            // reads.
+                            stream.set_nonblocking(false).unwrap();
                             let index = server_connections.fetch_add(1, Ordering::SeqCst);
                             let stop = server_stop.clone();
                             workers.push(std::thread::spawn(move || {
@@ -6352,9 +6356,11 @@ mod tests {
                             // The first session dies here: never read
                             // again, so nothing it sends is ever
                             // answered. The kernel keeps the socket
-                            // ESTAB; the client sees only silence.
+                            // ESTAB; the client sees only silence. (No
+                            // `shutdown(Read)`: on Windows data arriving
+                            // after it resets the connection, which ends
+                            // the session by error, not by the watchdog.)
                             if index == 0 {
-                                socket.get_mut().shutdown(std::net::Shutdown::Read).ok();
                                 while !stop.load(Ordering::SeqCst) {
                                     std::thread::sleep(Duration::from_millis(50));
                                 }
