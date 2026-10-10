@@ -63,6 +63,9 @@ hkdf = "0.13"
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 bech32 = "0.12"
+# TCP keepalive for the reader's WS socket (already in Cargo.lock via tokio).
+# `all` enables the retry-count builder; it pulls no extra dependencies.
+socket2 = { version = "0.6", features = ["all"] }
 
 # Unix-only: PTY, signals, fd polling, file locks, process groups.
 [target.'cfg(unix)'.dependencies]

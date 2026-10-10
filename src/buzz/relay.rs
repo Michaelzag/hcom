@@ -148,6 +148,48 @@ fn connect_socket(
         }
         match TcpStream::connect_timeout(&address, remaining) {
             Ok(socket) => {
+                // A blackholed path without a FIN must still die: keepalive
+                // probes (60 s idle, 15 s apart) fail a half-open socket
+                // even when the WS layer never reads again.
+                // `socket2` is already in Cargo.lock (via tokio); promoting
+                // it to a direct dependency adds no new crate. `all`
+                // enables the retry-count builder; it pulls no extra
+                // dependencies.
+                let keepalive = socket2::TcpKeepalive::new()
+                    .with_time(Duration::from_secs(60))
+                    .with_interval(Duration::from_secs(15));
+                // `with_retries` exists only where socket2 provides it
+                // (this list mirrors socket2 0.6's own cfg); everywhere
+                // else time+interval still apply.
+                #[cfg(any(
+                    target_os = "android",
+                    target_os = "dragonfly",
+                    target_os = "emscripten",
+                    target_os = "freebsd",
+                    target_os = "fuchsia",
+                    target_os = "illumos",
+                    target_os = "ios",
+                    target_os = "visionos",
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "netbsd",
+                    target_os = "tvos",
+                    target_os = "watchos",
+                    target_os = "cygwin",
+                    target_os = "windows",
+                    target_os = "nuttx",
+                    all(target_os = "wasi", not(target_env = "p1")),
+                ))]
+                let keepalive = keepalive.with_retries(4);
+                // Best effort: a platform that refuses keepalive must not
+                // lose the connector over it.
+                if let Err(error) = socket2::SockRef::from(&socket).set_tcp_keepalive(&keepalive) {
+                    crate::log::log_warn(
+                        "buzz",
+                        "relay.keepalive",
+                        &format!("keeping the socket without keepalive: {error}"),
+                    );
+                }
                 stream = Some(socket);
                 break;
             }
@@ -186,6 +228,11 @@ pub struct WsSession {
     socket: WebSocket<MaybeTlsStream<DeadlineStream>>,
     pending: VecDeque<RelayMsg>,
     timeout: Duration,
+    /// When the last frame of any kind (TEXT, ping or pong) arrived. The
+    /// reader's watchdog ends a session that stays silent past its
+    /// read-idle limit, so a half-open socket reconnects instead of
+    /// waiting on `recv` timeouts forever.
+    last_inbound: Instant,
 }
 
 impl WsSession {
@@ -200,6 +247,7 @@ impl WsSession {
             socket,
             pending: VecDeque::new(),
             timeout,
+            last_inbound: Instant::now(),
         };
         // Buzz emits AUTH first and closes after five seconds. This deadline
         // covers both waiting for the challenge and receiving its acknowledgement.
@@ -277,12 +325,18 @@ impl WsSession {
             self.set_deadline(deadline)?;
             match self.socket.read() {
                 Ok(Message::Text(text)) => {
+                    self.last_inbound = Instant::now();
                     return serde_json::from_str(&text)
                         .map(Some)
                         .map_err(|_| PublishError::Protocol("invalid relay JSON".into()));
                 }
-                Ok(Message::Ping(_)) => self.socket.flush().map_err(transport)?,
-                Ok(Message::Pong(_)) => {}
+                Ok(Message::Ping(_)) => {
+                    self.last_inbound = Instant::now();
+                    self.socket.flush().map_err(transport)?;
+                }
+                Ok(Message::Pong(_)) => {
+                    self.last_inbound = Instant::now();
+                }
                 Ok(Message::Close(_)) => {
                     return Err(PublishError::Transport("relay closed socket".into()));
                 }
@@ -347,6 +401,21 @@ impl WsSession {
                 other => self.pending.push_back(other),
             }
         }
+    }
+
+    /// A websocket Ping. A live relay answers with a Pong, which counts as
+    /// inbound traffic and keeps an idle-but-healthy session off the
+    /// reader's read-idle limit no matter how quiet the channels are.
+    pub fn ping(&mut self) -> Result<(), PublishError> {
+        self.set_timeout(self.timeout)?;
+        self.socket
+            .send(Message::Ping(Vec::new().into()))
+            .map_err(transport)
+    }
+
+    /// How long since any frame (TEXT, ping or pong) arrived.
+    pub fn idle(&self) -> Duration {
+        self.last_inbound.elapsed()
     }
 
     pub fn recv(&mut self, timeout: Duration) -> Result<Option<RelayMsg>, PublishError> {
@@ -1042,6 +1111,71 @@ mod tests {
     }
 
     #[test]
+    fn ws_pongs_reset_read_idle_without_any_text_frame() {
+        // Pongs alone are inbound traffic: a session that only pings and
+        // gets ponged must never look stalled to the reader's watchdog,
+        // even with no EVENT, EOSE, NOTICE or server ping at all.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            socket
+                .send(Message::Text(
+                    json!(["AUTH", "TEST challenge"]).to_string().into(),
+                ))
+                .unwrap();
+            let Message::Text(text) = socket.read().unwrap() else {
+                panic!("expected AUTH");
+            };
+            let auth: Value = serde_json::from_str(&text).unwrap();
+            socket
+                .send(Message::Text(
+                    json!(["OK", auth[1]["id"], true, ""]).to_string().into(),
+                ))
+                .unwrap();
+            // Answer pings (tungstenite queues the pong; flushing sends it)
+            // and send nothing else whatsoever.
+            loop {
+                match socket.read() {
+                    Ok(Message::Ping(_)) => {
+                        if socket.flush().is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Close(_)) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        let mut client = WsSession::connect(&url, &key(), None, TIMEOUT).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            client.idle() >= Duration::from_millis(100),
+            "silence accumulates idle: {:?}",
+            client.idle()
+        );
+        // The pong lands during this wait and resets the clock mid-wait:
+        // without it the idle would be the whole 150 ms sleep plus this
+        // 100 ms wait (>= 250 ms); with it, only the time since the pong.
+        client.ping().unwrap();
+        assert_eq!(
+            client.recv(Duration::from_millis(100)).unwrap(),
+            None,
+            "a pong is traffic, not a message"
+        );
+        assert!(
+            client.idle() < Duration::from_millis(200),
+            "the pong reset the idle clock: {:?}",
+            client.idle()
+        );
+        drop(client);
+        server.join().unwrap();
+    }
+
     fn retry_after_parses_relay_and_header_and_floors_zero() {
         assert_eq!(
             parse_retry_after("rate-limited: quota exceeded; retry in 17s"),
