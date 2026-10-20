@@ -341,7 +341,7 @@ fn relay_status(db: &HcomDb) -> i32 {
 }
 
 /// Internal fast-path: wake the relay worker so queued events publish immediately.
-fn relay_push() -> i32 {
+pub(crate) fn relay_push() -> i32 {
     crate::relay::trigger_push();
     0
 }

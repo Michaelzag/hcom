@@ -35,6 +35,9 @@ enum ReplayPolicy {
     State { min_accepted_ts: Option<u64> },
 }
 
+/// KV counter of permanently skipped relayed events (forged sender suffixes).
+const FORGED_SENDER_SKIPS_KEY: &str = "relay_forged_sender_skips";
+
 fn state_ts_key(device_id: &str) -> String {
     format!("relay_state_ts_{}", device_id)
 }
@@ -230,11 +233,19 @@ pub fn handle_state_message(
         .cloned()
         .unwrap_or_default();
 
-    let short_id = state
+    let raw_short_id = state
         .get("short_id")
         .and_then(|v| v.as_str())
-        .unwrap_or(&device_id[..4.min(device_id.len())])
-        .to_uppercase();
+        .unwrap_or_else(|| device_id.get(..4.min(device_id.len())).unwrap_or(""));
+    if raw_short_id.len() != 4 || !raw_short_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        log::log_warn(
+            "relay",
+            "relay.bad_short_id",
+            "Ignoring malformed peer short id",
+        );
+        return false;
+    }
+    let short_id = raw_short_id.to_ascii_uppercase();
     let reset_ts = state
         .get("reset_ts")
         .and_then(|v| v.as_f64())
@@ -405,8 +416,19 @@ pub fn handle_state_message(
         .unwrap_or_default();
 
     let mut seen_instances = std::collections::HashSet::new();
+    // Hosted rows mirrored in must reach the durable name registry too: the
+    // row trigger covers the database side, but the file is what survives a
+    // reset on this device.
+    let mut imported_hosted: Vec<String> = Vec::new();
 
     for (name, inst) in &instances {
+        let tool = inst
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .unwrap_or("claude");
+        if crate::hosted::is_hosted_tool(tool) {
+            imported_hosted.push(name.clone());
+        }
         let status_time = inst
             .get("status_time")
             .and_then(|v| v.as_f64())
@@ -472,14 +494,25 @@ pub fn handle_state_message(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 inst.get("tag").and_then(|v| v.as_str()),
-                inst.get("tool")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("claude"),
+                tool,
                 inst.get("background")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
             ],
         );
+    }
+
+    // Mirror imports are a registration path like any other: the durable
+    // registry must know these names even if this database is reset before
+    // the next schema install re-derives them.
+    for name in &imported_hosted {
+        if let Err(e) = crate::hosted::persist_hosted_name(db.path(), name) {
+            crate::log::log_warn(
+                "relay",
+                "pull.hosted_name_persist_failed",
+                &format!("instance={name} err={e}"),
+            );
+        }
     }
 
     // Remove stale instances (no longer in remote state)
@@ -699,7 +732,12 @@ fn import_remote_events(
 
         // Live import keeps its historical behavior: a failed insert is dropped
         // here (the cursor still advances past it). Backfill must not do that.
-        let _ = insert_remote_event(db, device_id, short_id, event_id, event, own_short_id);
+        // A permanent skip (a forged sender suffix) makes progress the same way
+        // an insert does: counted, logged, and never asked for again.
+        match insert_remote_event(db, device_id, short_id, event_id, event, own_short_id) {
+            Ok(RemoteInsert::Inserted(_) | RemoteInsert::Skipped) => {}
+            Err(_) => {}
+        }
 
         max_event_id = max_event_id.max(event_id);
     }
@@ -729,6 +767,27 @@ pub(crate) fn event_ts_string(event: &Value) -> String {
     }
 }
 
+/// Outcome of namespacing and inserting one relayed event.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RemoteInsert {
+    /// Stored locally under this id.
+    Inserted(i64),
+    /// Permanently skipped — the event carries a forged sender suffix, so it
+    /// is never part of our history. Never retried and never a page error:
+    /// callers import around it and keep paginating.
+    Skipped,
+}
+
+/// Count one permanently skipped relayed event. Live import and backfill
+/// share this skip path, so they share one observable count.
+pub(crate) fn count_forged_sender_skip(db: &HcomDb) {
+    let count: u64 = safe_kv_get(db, FORGED_SENDER_SKIPS_KEY)
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0)
+        + 1;
+    safe_kv_set(db, FORGED_SENDER_SKIPS_KEY, Some(&count.to_string()));
+}
+
 /// Namespace one remote event and insert it locally. Shared by snapshot import
 /// and catch-up backfill so both produce identical rows.
 pub(crate) fn insert_remote_event(
@@ -738,11 +797,23 @@ pub(crate) fn insert_remote_event(
     event_id: i64,
     event: &Value,
     own_short_id: &str,
-) -> anyhow::Result<i64> {
+) -> anyhow::Result<RemoteInsert> {
     let event_ts = event_epoch(event);
 
     // Namespace instance name
     let instance = event.get("instance").and_then(|v| v.as_str()).unwrap_or("");
+    if instance
+        .split_once(':')
+        .is_some_and(|(_, suffix)| suffix != short_id)
+    {
+        log::log_warn(
+            "relay",
+            "relay.instance_suffix_mismatch",
+            &format!("device={device_id}, event_id={event_id}, instance={instance}"),
+        );
+        count_forged_sender_skip(db);
+        return Ok(RemoteInsert::Skipped);
+    }
     let namespaced_instance =
         if !instance.is_empty() && !instance.contains(':') && !instance.starts_with('_') {
             super::add_device_suffix(instance, short_id)
@@ -761,13 +832,20 @@ pub(crate) fn insert_remote_event(
     // - `mentions` / `delivered_to` strip *our own* suffix -> local delivery still matches
     if let Some(obj) = data.as_object_mut() {
         // Namespace 'from' field
-        if let Some(from) = obj.get("from").and_then(|v| v.as_str()).map(String::from)
-            && !from.contains(':')
-        {
-            obj.insert(
-                "from".to_string(),
-                Value::String(super::add_device_suffix(&from, short_id)),
-            );
+        if let Some(from) = obj.get("from").and_then(|v| v.as_str()) {
+            if let Some((_, suffix)) = from.split_once(':') {
+                if suffix != short_id {
+                    let error = format!(
+                        "device={device_id}, short={short_id}, event_id={event_id}, from={from}: sender suffix does not match publishing device"
+                    );
+                    log::log_warn("relay", "relay.sender_suffix_mismatch", &error);
+                    count_forged_sender_skip(db);
+                    return Ok(RemoteInsert::Skipped);
+                }
+            } else {
+                let namespaced = super::add_device_suffix(from, short_id);
+                obj.insert("from".to_string(), Value::String(namespaced));
+            }
         }
 
         // Strip own device suffix from mentions, delivered_to and
@@ -833,7 +911,7 @@ pub(crate) fn insert_remote_event(
             ],
         );
     }
-    Ok(id)
+    Ok(RemoteInsert::Inserted(id))
 }
 
 /// Reverse lookup: find short_id for a device UUID.
@@ -905,9 +983,76 @@ fn parse_ts(value: Option<&Value>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn review_relay_instance_namespace_is_bound_to_publisher() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        for (index, instance) in ["luna:HOST", "luna:HOST:PEER", "luna:PEER", "luna"]
+            .iter()
+            .enumerate()
+        {
+            let event = serde_json::json!({
+                "id": index + 1, "type": "life", "instance": instance, "ts": 1000.0,
+                "data": {"from": "luna", "action": "created"},
+            });
+            insert_remote_event(&db, "peer-device", "PEER", index as i64 + 1, &event, "MINE")
+                .unwrap();
+        }
+        let rows: Vec<String> = db
+            .conn()
+            .prepare("SELECT instance FROM events WHERE type = 'life' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec!["luna:PEER", "luna:PEER"]);
+    }
     use crate::hooks::test_helpers::isolated_test_env;
     use serde_json::json;
     use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn review_peer_short_id_rejects_unicode_lookalikes() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let payload = json!({
+            "state": {"short_id": "MBAІ", "reset_ts": 0.0, "instances": {}},
+            "events": [{"id": 1, "type": "message", "instance": "michael", "ts": 1000.0,
+                        "data": {"from": "michael", "text": "lookalike device"}}]
+        });
+        let topic = "relay-test/evil-device";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let psk = fixture_psk();
+        handle_state_message(
+            &db,
+            "evil-device",
+            &envelope,
+            "own-device",
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut ReplayGuard::default(),
+            },
+        );
+        let messages: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            messages, 0,
+            "malformed device identity must not enter history"
+        );
+        assert!(safe_kv_get(&db, "relay_short_MBAІ").is_none());
+    }
 
     fn fixture_psk() -> [u8; 32] {
         [0x33; 32]
@@ -918,6 +1063,83 @@ mod tests {
         let bytes = serde_json::to_vec(payload).unwrap();
         let now = crate::shared::time::now_epoch_f64() as u64;
         crate::relay::crypto::seal(&psk, relay_id, topic, &bytes, now).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn security_relay_sender_suffix_must_match_publisher() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let senders = [
+            "michael:HOST",
+            "luna",
+            "nova:PEER",
+            "michael:HOST:PEER",
+            "michael:",
+            "michael:peer",
+        ];
+        let events: Vec<_> = senders
+            .iter()
+            .enumerate()
+            .map(|(index, from)| {
+                json!({
+                    "id": index + 1,
+                    "type": "message",
+                    "instance": "luna",
+                    "ts": crate::shared::time::now_epoch_f64(),
+                    "data": {
+                        "from": from,
+                        "sender_kind": "instance",
+                        "scope": "mentions",
+                        "mentions": ["receiver"],
+                        "delivered_to": ["receiver"],
+                        "text": "relay suffix probe",
+                    },
+                })
+            })
+            .collect();
+        let payload = json!({
+            "state": {"short_id": "PEER", "reset_ts": 0.0, "instances": {}},
+            "events": events,
+        });
+        let topic = "relay-test/peer-device";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        handle_state_message(
+            &db,
+            "peer-device",
+            &envelope,
+            "own-device",
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
+        );
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT json_extract(data, '$.from') FROM events
+                 WHERE type = 'message' ORDER BY id",
+            )
+            .unwrap();
+        let imported: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            imported,
+            ["luna:PEER", "nova:PEER"],
+            "foreign, nested, empty, and wrong-case suffixes must not enter history"
+        );
+        assert_eq!(
+            safe_kv_get(&db, "relay_events_peer-device").as_deref(),
+            Some("6"),
+            "a rejected live event must not stall subsequent imports"
+        );
     }
 
     #[test]

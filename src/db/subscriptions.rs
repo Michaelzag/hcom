@@ -748,8 +748,27 @@ pub(crate) fn process_logged_event_collected(
                 .get("caller_kind")
                 .and_then(|v| v.as_str())
                 .unwrap_or("external");
-            if let Err(e) = send_message_as_collected(db, caller, caller_kind, on_hit_text, post) {
-                crate::log::log_error("db", "check_event_subscriptions.on_hit", &format!("{e}"));
+            let validation = if caller_kind == "instance" {
+                crate::identity::validate_protected_identity(db, caller)
+            } else {
+                crate::identity::validate_sender_name(db, caller)
+            };
+            if let Err(error) = validation {
+                crate::log::log_warn(
+                    "db",
+                    "subscription.sender_refused",
+                    &format!("subscription={sub_id}: {error}"),
+                );
+            } else {
+                if let Err(e) =
+                    send_message_as_collected(db, caller, caller_kind, on_hit_text, post)
+                {
+                    crate::log::log_error(
+                        "db",
+                        "check_event_subscriptions.on_hit",
+                        &format!("{e}"),
+                    );
+                }
             }
         }
 
@@ -2225,6 +2244,48 @@ mod tests {
     }
 
     #[test]
+    fn review_persisted_subscription_cannot_keep_speaking_as_operator() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name, created_at) VALUES ('dbadmin', 1.0)",
+                [],
+            )
+            .unwrap();
+        let sub = serde_json::json!({
+            "id": "sub-legacy-operator", "caller": "bigboss", "caller_kind": "external",
+            "sql": "type = 'message' AND msg_from = 'nova'", "created": 1.0,
+            "last_id": 0, "once": true, "on_hit_text": "@dbadmin forged legacy instruction"
+        });
+        db.kv_set("events_sub:sub-legacy-operator", Some(&sub.to_string()))
+            .unwrap();
+        db.log_event(
+            "message",
+            "nova",
+            &serde_json::json!({
+                "from": "nova", "sender_kind": "instance", "scope": "mentions",
+                "delivered_to": ["dbadmin"], "text": "trigger"
+            }),
+        )
+        .unwrap();
+        let forged: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'
+             AND json_extract(data, '$.from') = 'bigboss'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            forged, 0,
+            "pre-upgrade on-hit must not bypass the new sender policy"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
     fn test_on_hit_provenance_instance_caller() {
         let _env = crate::hooks::test_helpers::isolated_test_env();
         let (db, db_path) = setup_full_test_db();
@@ -2299,11 +2360,11 @@ mod tests {
             )
             .unwrap();
 
-        // Caller 'bigboss' is NOT in instances → external kind.
+        // Caller 'build_alarm' is external; the operator alias is not a script sender.
         // on_hit_text mentions @dbadmin → normal mention routing must deliver to dbadmin only.
         let sub = serde_json::json!({
             "id": "sub-onhit2",
-            "caller": "bigboss",
+            "caller": "build_alarm",
             "caller_kind": "external",
             "sql": "type = 'message' AND msg_from = 'nova'",
             "created": 1000.0,
@@ -2333,7 +2394,7 @@ mod tests {
                 "SELECT json_extract(data, '$.sender_kind'), \
                         json_extract(data, '$.scope'), \
                         json_extract(data, '$.delivered_to') \
-                 FROM events WHERE json_extract(data, '$.from') = 'bigboss' LIMIT 1",
+                 FROM events WHERE json_extract(data, '$.from') = 'build_alarm' LIMIT 1",
                 [],
                 |row| {
                     Ok((
@@ -2346,7 +2407,7 @@ mod tests {
             .ok();
         assert!(
             row.is_some(),
-            "on-hit message from bigboss should be logged"
+            "on-hit message from build_alarm should be logged"
         );
         let (kind, scope, delivered) = row.unwrap();
         assert_eq!(
@@ -2359,7 +2420,7 @@ mod tests {
             "delivered_to must include dbadmin"
         );
         assert!(
-            !delivered.contains("bigboss"),
+            !delivered.contains("build_alarm"),
             "caller itself is not auto-mentioned"
         );
 

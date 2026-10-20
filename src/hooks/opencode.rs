@@ -495,11 +495,6 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
         }
     };
 
-    // Pre-gate: non-participants with empty DB → exit 0, no output
-    if !common::hook_gate_check(&mut ctx, &db) {
-        return (0, String::new());
-    }
-
     // Strip hook name from argv to get handler args
     // argv comes as: ["opencode-start", "--session-id", "abc", ...]
     let handler_argv: Vec<String> = if !argv.is_empty() && argv[0] == hook_name {
@@ -507,6 +502,18 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
     } else {
         argv.to_vec()
     };
+
+    // Any explicit --name naming a protected identity is refused before the
+    // handler match (and before the activity gate, so the refusal is visible
+    // even against an empty database).
+    if let Some(refusal) = common::protected_hook_name_refusal(&db, &handler_argv) {
+        return refusal;
+    }
+
+    // Pre-gate: non-participants with empty DB → exit 0, no output
+    if !common::hook_gate_check(&mut ctx, &db) {
+        return (0, String::new());
+    }
 
     let handler_start = Instant::now();
     let hook_name_owned = hook_name.to_string();

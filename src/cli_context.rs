@@ -45,6 +45,7 @@ pub fn build_ctx_for_command(
     if let (Some(actor), Some(name)) = (verified_actor.as_ref(), explicit_name) {
         claude_actor::ensure_explicit_matches(db, actor, name)?;
     }
+    let inferred_identity = verified_actor.is_none() && explicit_name.is_none();
 
     let identity = if let Some(actor) = verified_actor {
         Some(actor)
@@ -67,6 +68,14 @@ pub fn build_ctx_for_command(
         // No explicit name: best-effort, swallow errors
         identity::resolve_identity(db, None, None, None, process_id, codex_thread_id, None).ok()
     };
+    // Recheck inferred identities too: a process binding left by an older
+    // version must not keep speaking/listening as a now-protected name.
+    if inferred_identity
+        && let Some(id) = &identity
+        && matches!(id.kind, SenderKind::Instance)
+    {
+        identity::validate_protected_identity(db, &id.name)?;
+    }
 
     Ok(CommandContext {
         explicit_name: explicit_name.map(|s| s.to_string()),
@@ -530,6 +539,31 @@ fn format_hook_messages_simple_from_msgs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_legacy_process_binding_cannot_retain_hosted_identity() {
+        let (db, _dir) = make_test_db();
+        crate::hosted::register_hosted(&db, "michael", crate::hosted::HOSTED_TOOL_BUZZ).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'adhoc' WHERE name = 'michael'",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings(process_id, instance_name, updated_at)
+             VALUES ('legacy-process', 'michael', 1000.0)",
+                [],
+            )
+            .unwrap();
+        for cmd in ["send", "listen"] {
+            assert!(
+                build_ctx_for_command(&db, Some(cmd), None, false, Some("legacy-process"), None)
+                    .is_err()
+            );
+        }
+    }
 
     fn make_test_db() -> (HcomDb, tempfile::TempDir) {
         crate::config::Config::init();

@@ -112,19 +112,30 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
             intent,
             reply_to,
         } => {
-            let mut argv: Vec<String> = vec!["send".into(), "--from".into(), "bigboss".into()];
-            if let Some(i) = intent {
-                argv.extend(["--intent".into(), i.clone()]);
+            // The compose box is the one path that speaks as the local
+            // operator. `--from bigboss` is refused on the CLI, so this goes
+            // through the in-process send instead of a subprocess argv; the
+            // send returns its feedback text rather than printing, keeping
+            // the TUI's stdout (and its sent-status labels) as they were.
+            let db = crate::db::HcomDb::open().map_err(|e| e.to_string())?;
+            match crate::commands::send::send_as_operator(
+                &db,
+                recipients,
+                body,
+                intent.as_deref(),
+                *reply_to,
+            ) {
+                Ok(stdout) => Ok(Response {
+                    exit_code: 0,
+                    stdout,
+                    stderr: String::new(),
+                }),
+                Err(message) => Ok(Response {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: format!("Error: {message}"),
+                }),
             }
-            if let Some(id) = reply_to {
-                argv.extend(["--reply-to".into(), id.to_string()]);
-            }
-            for r in recipients {
-                argv.push(format!("@{r}"));
-            }
-            argv.push("--".into());
-            argv.push(body.clone());
-            commands::run_native(&argv)
         }
 
         RpcOp::Tag { name, tag } => commands::run_native(&[

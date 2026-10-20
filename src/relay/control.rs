@@ -220,10 +220,23 @@ pub fn get_rpc_result(db: &HcomDb, request_id: &str) -> Option<Value> {
     serde_json::from_str(&data).ok()
 }
 
-/// Consume an RPC answer if it has arrived: return it and delete the row.
-pub(crate) fn take_rpc_result(db: &HcomDb, request_id: &str) -> Option<Value> {
-    let result = get_rpc_result(db, request_id)?;
-    delete_rpc_result(db, request_id);
+/// Consume an answer only from the device that owns the pending gap.
+pub(crate) fn take_rpc_result(db: &HcomDb, request_id: &str, device_id: &str) -> Option<Value> {
+    let (id, data): (i64, String) = db
+        .conn()
+        .query_row(
+            "SELECT id, data FROM events WHERE type = 'rpc_result'
+         AND json_extract(data, '$.request_id') = ?1
+         AND json_extract(data, '$._relay.device') = ?2
+         ORDER BY id DESC LIMIT 1",
+            rusqlite::params![request_id, device_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
+    let result = serde_json::from_str(&data).ok()?;
+    db.conn()
+        .execute("DELETE FROM events WHERE id = ?1", [id])
+        .ok()?;
     Some(result)
 }
 
@@ -1286,6 +1299,9 @@ fn handle_remote_sub_create(
             })
             .ok_or_else(|| format!("caller '{caller_input}' not found on this device"))?
     };
+    if caller_is_external {
+        crate::identity::validate_sender_label(&caller).map_err(|e| e.to_string())?;
+    }
 
     let mut filters: crate::core::filters::FilterMap = match params.get("filters") {
         Some(v) if !v.is_null() => {
@@ -1311,6 +1327,14 @@ fn handle_remote_sub_create(
     }
 
     let on_hit = params.get("on_hit").and_then(|v| v.as_str());
+    // An `--on-hit` message goes out from `caller` on THIS device, so the
+    // caller is a sender identity here: no peer mints this device's operator
+    // alias or its connector-hosted names.
+    if on_hit.is_some()
+        && let Err(e) = crate::identity::validate_protected_identity(db, &caller)
+    {
+        return Err(e.to_string());
+    }
     let outcome = if filters.is_empty() {
         crate::db::subscriptions::build_and_insert_sql_subscription(
             db, &sql_parts, &caller, once, on_hit,

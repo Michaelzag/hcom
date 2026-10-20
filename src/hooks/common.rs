@@ -104,6 +104,34 @@ pub fn hook_gate_check(ctx: &mut HcomContext, db: &HcomDb) -> bool {
     }
 }
 
+/// Refuse a hook invocation that claims a protected identity through `--name`.
+///
+/// The argv hook surfaces (omp, pi, opencode/kilo) are callable by any local
+/// process, so a raw `--name` naming a connector-hosted participant or the
+/// operator must not reach a handler: `*-read --name <hosted>` returns that
+/// row's private mail, `--ack` consumes it, and status/stop mutate the row.
+/// Checked in the dispatchers before the handler match and before the activity
+/// gate, so the refusal is explicit even against an empty database. The shared
+/// writers stay unguarded: the connector and the TUI call them in-process.
+pub(crate) fn protected_hook_name_refusal(db: &HcomDb, argv: &[String]) -> Option<(i32, String)> {
+    let name = argv
+        .iter()
+        .position(|a| a == "--name")
+        .and_then(|i| argv.get(i + 1))?;
+    let Err(error) = crate::identity::validate_protected_identity(db, name) else {
+        return None;
+    };
+    log::log_warn(
+        "hooks",
+        "hook.protected_name_refused",
+        &format!("name={name} err={error}"),
+    );
+    Some((
+        1,
+        serde_json::json!({ "error": error.to_string() }).to_string(),
+    ))
+}
+
 /// Convert a db::Message to a serde_json::Value object.
 pub(crate) fn message_to_value(m: &Message) -> Value {
     let mut obj = serde_json::Map::new();

@@ -81,7 +81,9 @@ pub struct EventsSubArgs {
     #[arg(long = "on-hit")]
     pub on_hit: Option<String>,
     /// Create the sub as an external sender (same semantics as `hcom send --from`).
-    /// Use `-b` as shorthand for `--as bigboss`.
+    /// Use `-b` as shorthand for `--as bigboss`. With `--on-hit` the caller is
+    /// the sender of the attached message, so the operator alias and
+    /// connector-hosted names are refused there too.
     #[arg(long = "as")]
     pub as_name: Option<String>,
     #[arg(short = 'b', long = "bigboss", default_value_t = false)]
@@ -495,6 +497,22 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
             }
         }
     };
+    if (args.from_bigboss || args.as_name.is_some())
+        && let Err(e) = crate::identity::validate_sender_label(&caller)
+    {
+        eprintln!("Error: {e}");
+        return 1;
+    }
+
+    // With `--on-hit` the attached message goes out from the caller, so the
+    // caller is a sender identity: the CLI mints neither the operator alias
+    // nor a connector-hosted name.
+    if args.on_hit.is_some()
+        && let Err(e) = crate::identity::validate_protected_identity(db, &caller)
+    {
+        eprintln!("Error: {e}");
+        return 1;
+    }
 
     // Filter-based subscription
     if !filters.is_empty() {
@@ -595,6 +613,19 @@ fn cmd_events_sub_remote_create(db: &HcomDb, args: &EventsSubArgs, device: &str)
             }
         }
     };
+    if caller_is_external && let Err(e) = crate::identity::validate_sender_label(&caller) {
+        eprintln!("Error: {e}");
+        return 1;
+    }
+
+    // Same sender policy as the local path: an `--on-hit` message goes out
+    // from `caller` on the remote device, and that device enforces this too.
+    if args.on_hit.is_some()
+        && let Err(e) = crate::identity::validate_protected_identity(db, &caller)
+    {
+        eprintln!("Error: {e}");
+        return 1;
+    }
 
     // Build filter map from CLI flags (no local name resolution — the remote side owns the namespace)
     let filters = args.filters.to_filter_map();

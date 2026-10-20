@@ -291,7 +291,7 @@ Anything else is forwarded to the tool: `--model sonnet`, `--yolo`, etc.
 
 ```bash
 hcom                                # TUI dashboard
-hcom send -b @luna -- hey           # one-off message to an agent
+hcom send --from build_alert @luna -- hey   # one-off message to an agent
 hcom list                           # show all active agents
 hcom list --context                 # + per-seat context size, jobs, idle time
 hcom compact <name>                   # compact an idle seat's context (prints tokens before -> after)
@@ -423,9 +423,13 @@ wake_intents = ["request"]               # default
 wake_prefixes = ["BLOCKED", "DECISION"]  # default
 ```
 
-A seat holds the `conductor` role only when its omp session carries the `conductor-role` marker (`omp --conductor`); the plugin registers it at bind, add-only, and the role ends with that instance row. The role holder receives no broadcasts. A targeted message reaches it only from the delegate, from a lead with a `wake_intents` intent whose text opens with a `wake_prefixes` word (`BLOCKED: …`), or from an external sender (`--from`, `-b`). Nothing else is dropped: `hcom send` reroutes it to the delegate and prints `<name> takes no cc; delivered to <delegate>`, and a message that arrives some other way (an older peer, a system notice) is forwarded to the delegate once when the holder's inbox is read, with the same notice to an agent sender. A broken block keeps its readable `delegate` and nothing else; with no readable delegate the holder gets everything targeted, and `hcom status`/`hcom list` say `delivery policy INVALID`. They also show `conductor role: <name>|NONE`; NONE means the filter is off. The plugin and binary must match: roll the binary to every host before relying on the role.
+A seat holds the `conductor` role only when its omp session carries the `conductor-role` marker (`omp --conductor`); the plugin registers it at bind, add-only, and the role ends with that instance row. The role holder receives no broadcasts. A targeted message reaches it only from the delegate, from a lead with a `wake_intents` intent whose text opens with a `wake_prefixes` word (`BLOCKED: …`), or from the local operator (the TUI compose box) or an external sender (`--from`). Nothing else is dropped: `hcom send` reroutes it to the delegate and prints `<name> takes no cc; delivered to <delegate>`, and a message that arrives some other way (an older peer, a system notice) is forwarded to the delegate once when the holder's inbox is read, with the same notice to an agent sender. A broken block keeps its readable `delegate` and nothing else; with no readable delegate the holder gets everything targeted, and `hcom status`/`hcom list` say `delivery policy INVALID`. They also show `conductor role: <name>|NONE`; NONE means the filter is off. The plugin and binary must match: roll the binary to every host before relying on the role.
 
-This guards against accidental load, not tampering: `--from` is unauthenticated (each such delivery is logged), and anything running as your user can edit `config.toml`.
+This guards against accidental load, not a process that can edit the database. Public CLI senders reserve `bigboss` and connector-hosted person/channel names known on this device. Hosted names stay reserved after a mirror expiry, a connector stop, `hcom reset`, or a deleted database: the reservation set is persisted in `hosted-names.json` beside the database (written at registration and mirror import, carried forward at reset, seeded into every fresh store) so nothing reopens the name before a connector or mirror re-registers it. The argv hook surfaces (`omp-*`, `pi-*`, `opencode-*`, shared by Kilo) and the PTY wrapper's `HCOM_INSTANCE_NAME` refuse protected names on the same policy. The TUI compose box and the connector keep their in-process send paths.
+
+Caller-chosen identities on start/launch use the existing lowercase base-name grammar (`[a-z0-9_]+`, at most 50 bytes). External script labels (`--from` and subscription `--as`) use ASCII letters, digits, underscores, dots and hyphens, optionally followed by a four-character uppercase alphanumeric `:SHORT`. Whitespace, controls, zero-width characters and other Unicode are rejected, not silently trimmed. Existing generated subagent identities can be longer than 50 bytes; name/agent-id/capability lookup, explicit `start --name` selection and stored instance subscriptions check their ownership without reapplying CLI label limits. Stored external subscription senders retain the input validation.
+
+Relay imports bind `from` and `instance` suffixes to the publishing device and backfill answers to the device requested. This does not authenticate that device: relay peers share a PSK and can publish on another peer's topic. Per-device signatures are outside this change.
 
 ### Per-project isolation
 

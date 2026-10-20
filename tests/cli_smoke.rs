@@ -275,6 +275,424 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
 }
 
 #[test]
+fn security_hosted_name_send_refused_including_aliases() {
+    let h = Hcom::new();
+    let recipient = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO instances (name, tool, status, tag, agent_id, created_at)
+         VALUES ('seanfitz', 'buzz', 'listening', 'team', 'a6d9caf', 1000.0),
+                ('ch_infra', 'buzz', 'inactive', NULL, NULL, 1000.0);",
+    )
+    .unwrap();
+    let (code, _, stderr) = h.run([
+        "send",
+        "seanfitz",
+        "--name",
+        &recipient,
+        "--",
+        "queued for Buzz",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let cursor: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = 'seanfitz'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    for name in ["seanfitz", "team-seanfitz", "a6d9caf", "ch_infra"] {
+        let (code, stdout, stderr) = h.run([
+            "send",
+            &recipient,
+            "--name",
+            name,
+            "--thread",
+            "buzz_infra_forged",
+            "--",
+            "forged instruction",
+        ]);
+        assert_ne!(
+            code, 0,
+            "hosted --name {name} sent successfully: {stdout} {stderr}"
+        );
+    }
+    let after: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = 'seanfitz'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, cursor, "forgery must not consume the Buzz outbox");
+    let messages: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(messages, 1, "only the genuine queued message may exist");
+}
+
+#[test]
+fn security_hosted_name_listen_and_other_commands_refused() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute(
+        "INSERT INTO instances (name, tool, status, created_at)
+         VALUES ('seanfitz', 'buzz', 'listening', 1000.0)",
+        [],
+    )
+    .unwrap();
+    let (code, _, stderr) = h.run([
+        "send",
+        "seanfitz",
+        "--name",
+        &sender,
+        "--",
+        "private queued reply",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let cursor: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = 'seanfitz'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    for args in [
+        vec!["listen", "--name", "seanfitz", "--timeout", "1", "--json"],
+        vec!["list", "--name", "seanfitz", "--json"],
+    ] {
+        let (code, stdout, stderr) = h.run(&args);
+        assert_ne!(code, 0, "{args:?}: {stdout} {stderr}");
+        assert!(!stdout.contains("private queued reply"), "{stdout}");
+    }
+    let after: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = 'seanfitz'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after, cursor,
+        "CLI must not acknowledge connector-owned mail"
+    );
+}
+
+#[test]
+fn security_external_hosted_names_refused_case_insensitively() {
+    let h = Hcom::new();
+    let recipient = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO instances (name, tool, status, origin_device_id, created_at)
+         VALUES ('michael', 'buzz', 'listening', '', 1000.0),
+                ('seanfitz', 'buzz', 'listening', '', 1000.0),
+                ('ch_infra', 'buzz', 'inactive', '', 1000.0),
+                ('jane:ABCD', 'buzz', 'listening', 'remote-device', 1000.0);
+         INSERT INTO kv (key, value)
+         VALUES ('relay_sync_time_remote-device', strftime('%s', 'now'));",
+    )
+    .unwrap();
+    for name in [
+        "michael",
+        "MICHAEL",
+        "Michael:MBAl",
+        "seanfitz",
+        "SEANFITZ",
+        "SeanFitz:MBAl",
+        "ch_infra",
+        "CH_INFRA:ABCD",
+        "jane",
+        "JANE:OTHER",
+    ] {
+        let (code, stdout, stderr) = h.run([
+            "send",
+            &recipient,
+            "--from",
+            name,
+            "--",
+            "forged instruction",
+        ]);
+        assert_ne!(code, 0, "hosted --from {name}: {stdout} {stderr}");
+    }
+    let messages: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(messages, 0, "no person/channel forgery may be recorded");
+
+    // A subscription whose --on-hit message would go out from a hosted name
+    // is the same forgery through another flag.
+    let (code, stdout, stderr) = h.run([
+        "events", "sub", "--as", "michael", "--on-hit", "forged", "--type", "status",
+    ]);
+    assert_ne!(code, 0, "hosted --as michael: {stdout} {stderr}");
+}
+
+#[test]
+fn security_external_script_names_still_deliver() {
+    let h = Hcom::new();
+    let recipient = h.start();
+    for name in ["michael_alert", "build_alarm:BOXE"] {
+        let (code, stdout, stderr) =
+            h.run(["send", &recipient, "--from", name, "--", "build finished"]);
+        assert_eq!(code, 0, "{stdout} {stderr}");
+        let (code, stdout, stderr) =
+            h.run(["listen", "--name", &recipient, "--timeout", "1", "--json"]);
+        assert_eq!(code, 0, "{stderr}");
+        let message: serde_json::Value = stdout
+            .lines()
+            .find_map(|line| serde_json::from_str(line).ok())
+            .expect("the script's message reached the ordinary agent");
+        assert_eq!(message["from"], name);
+        assert_eq!(message["text"], "build finished");
+    }
+}
+
+/// One argv-hook surface's raw-`--name` refusal matrix (HCOM-83-06): `read`,
+/// `ack`, `status` and `stop` naming a connector-hosted participant must all
+/// be refused before a handler runs — `read` would return the participant's
+/// private mail, `ack` would consume it, `status`/`stop` would mutate its
+/// row. The same hooks naming the agent's own identity must keep working.
+/// Kilo shares the opencode hook names and dispatcher.
+fn argv_hook_hosted_name_refusal_matrix(read: &str, status: &str, stop: &str) {
+    let h = Hcom::new();
+    let me = h.start();
+    let other = h.start();
+
+    // Hosted participant with one queued private message.
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO instances (name, tool, status, created_at)
+         VALUES ('michael', 'buzz', 'listening', 1000.0);",
+    )
+    .unwrap();
+    let (code, _stdout, stderr) = h.run([
+        "send",
+        "michael",
+        "--name",
+        &other,
+        "--",
+        "private connector-owned hook probe",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let cursor: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = 'michael'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(db);
+
+    // read: refused, nothing disclosed.
+    let (code, stdout, _) = h.run([read, "--name", "michael"]);
+    assert_ne!(code, 0, "hosted {read} must be refused: {stdout}");
+    assert!(stdout.contains("reserved"), "{read} refusal: {stdout}");
+    assert!(
+        !stdout.contains("private connector-owned hook probe"),
+        "{read} leaked hosted mail: {stdout}"
+    );
+
+    // ack: refused, cursor untouched.
+    let (code, stdout, _) = h.run([read, "--name", "michael", "--ack"]);
+    assert_ne!(code, 0, "hosted {read} --ack must be refused: {stdout}");
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let cursor_after: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = 'michael'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cursor_after, cursor,
+        "refused ack must not move the hosted cursor"
+    );
+    drop(db);
+
+    // status: refused, row untouched.
+    let (code, stdout, _) = h.run([
+        status,
+        "--name",
+        "michael",
+        "--status",
+        "active",
+        "--context",
+        "forged",
+    ]);
+    assert_ne!(code, 0, "hosted {status} must be refused: {stdout}");
+    assert!(stdout.contains("reserved"), "{status} refusal: {stdout}");
+
+    // stop: refused, row survives untouched.
+    let (code, stdout, _) = h.run([stop, "--name", "michael", "--reason", "forged"]);
+    assert_ne!(code, 0, "hosted {stop} must be refused: {stdout}");
+    assert!(stdout.contains("reserved"), "{stop} refusal: {stdout}");
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let (tool, status_value): (String, String) = db
+        .query_row(
+            "SELECT tool, status FROM instances WHERE name = 'michael'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("refused stop must leave the hosted row in place");
+    assert_eq!(tool, "buzz");
+    assert_eq!(status_value, "listening");
+    drop(db);
+
+    // The agent's own identity works on the same hooks.
+    let (code, stdout, stderr) = h.run([
+        status,
+        "--name",
+        &me,
+        "--status",
+        "active",
+        "--context",
+        "prompt",
+    ]);
+    assert_eq!(code, 0, "own {status}: {stdout} {stderr}");
+    let (code, _stdout, stderr) = h.run(["send", &me, "--name", &other, "--", "own mail"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, stdout, stderr) = h.run([read, "--name", &me]);
+    assert_eq!(code, 0, "own {read}: {stdout} {stderr}");
+    assert!(stdout.contains("own mail"), "own {read}: {stdout}");
+    let (code, stdout, stderr) = h.run([read, "--name", &me, "--ack"]);
+    assert_eq!(code, 0, "own {read} --ack: {stdout} {stderr}");
+    assert!(stdout.contains("acked"), "own ack: {stdout}");
+    let (code, stdout, stderr) = h.run([stop, "--name", &me, "--reason", "done"]);
+    assert_eq!(code, 0, "own {stop}: {stdout} {stderr}");
+}
+
+#[test]
+fn security_argv_hook_hosted_name_refused_omp() {
+    argv_hook_hosted_name_refusal_matrix("omp-read", "omp-status", "omp-stop");
+}
+
+#[test]
+fn security_argv_hook_hosted_name_refused_pi() {
+    argv_hook_hosted_name_refusal_matrix("pi-read", "pi-status", "pi-stop");
+}
+
+#[test]
+fn security_argv_hook_hosted_name_refused_opencode() {
+    argv_hook_hosted_name_refusal_matrix("opencode-read", "opencode-status", "opencode-stop");
+}
+
+/// The reservation set used to live only in `hcom.db`, so `hcom reset` (or a
+/// deleted database) reopened every name the hub had hosted until the
+/// connector or a mirror re-registered it. After a reset, and before any such
+/// re-registration, the hosted name must still be refused on the claim,
+/// external-send and hook-read paths — while unknown names stay mintable.
+#[test]
+fn security_hosted_reservation_survives_reset() {
+    let h = Hcom::new();
+    h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO instances (name, tool, status, created_at)
+         VALUES ('michael', 'buzz', 'listening', 1000.0);",
+    )
+    .unwrap();
+    drop(db);
+
+    let (code, stdout, stderr) = h.run(["reset"]);
+    assert_eq!(code, 0, "reset must succeed: {stdout} {stderr}");
+
+    // Control: a name the hub never hosted is still mintable, so the
+    // refusals below cannot come from a blanket lockout.
+    let (code, stdout, stderr) = h.run(["start", "--name", "freshagent"]);
+    assert_eq!(
+        code, 0,
+        "unknown name must stay mintable after reset: {stdout} {stderr}"
+    );
+
+    // Claim refused.
+    let (code, stdout, stderr) = h.run(["start", "--name", "michael"]);
+    assert_ne!(
+        code, 0,
+        "post-reset start as a hosted name must be refused: {stdout} {stderr}"
+    );
+    assert!(
+        format!("{stdout}{stderr}").contains("reserved"),
+        "{stdout}{stderr}"
+    );
+
+    // External send refused.
+    let (code, stdout, stderr) = h.run(["send", "freshagent", "--from", "michael", "--", "forged"]);
+    assert_ne!(
+        code, 0,
+        "post-reset --from a hosted name must be refused: {stdout} {stderr}"
+    );
+    assert!(
+        format!("{stdout}{stderr}").contains("reserved"),
+        "{stdout}{stderr}"
+    );
+
+    // Hook read refused, with no row and no re-registration in between.
+    let (code, stdout, stderr) = h.run(["omp-read", "--name", "michael"]);
+    assert_ne!(
+        code, 0,
+        "post-reset omp-read as a hosted name must be refused: {stdout} {stderr}"
+    );
+    assert!(
+        format!("{stdout}{stderr}").contains("reserved"),
+        "{stdout}{stderr}"
+    );
+}
+
+/// The PTY wrapper is another Action that never builds a CLI identity
+/// context: `HCOM_INSTANCE_NAME` flowed straight into the delivery loop,
+/// which reads that row's mail and injects it into the wrapped terminal. A
+/// protected identity there must refuse before anything spawns.
+#[test]
+fn security_pty_refuses_protected_instance_name() {
+    let h = Hcom::new();
+    h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO instances (name, tool, status, created_at)
+         VALUES ('michael', 'buzz', 'listening', 1000.0);",
+    )
+    .unwrap();
+    drop(db);
+
+    for name in ["michael", "bigboss"] {
+        let mut cmd = h.cmd();
+        // A deliberately fake tool: on a vulnerable base this wrapper would
+        // spawn whatever is named here as the hosted identity, so the probe
+        // must never name a tool that actually exists.
+        cmd.args(["pty", "hcom-no-such-tool"]);
+        cmd.env("HCOM_INSTANCE_NAME", name);
+        let out = cmd.output().expect("run hcom pty");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_ne!(
+            out.status.code().unwrap_or(-1),
+            0,
+            "pty as {name} must refuse: {combined}"
+        );
+        assert!(combined.contains(name), "pty as {name}: {combined}");
+        assert!(
+            combined.contains("reserved") || combined.contains("operator identity"),
+            "pty as {name}: {combined}"
+        );
+    }
+}
+
+#[test]
 fn start_send_events_roundtrip() {
     let h = Hcom::new();
     let sender = h.start();
@@ -520,36 +938,95 @@ fn start_as_reclaims_stopped_identity() {
 }
 
 #[test]
-fn bigboss_send_bypasses_identity_gate() {
-    // Wiki contract (messaging.md §@bigboss + reference_send_bigboss_flag memory):
-    // `send -b` is sender-as-bigboss and bypasses the identity gate that
-    // normally requires `--name` / a bound session. Sender_kind=external
-    // distinguishes the message from instance-to-instance traffic.
+fn security_operator_name_refused_on_cli() {
+    // The operator identity belongs to the TUI compose box alone: a local
+    // process must not mint `bigboss` through --from/-b/--name or an events
+    // --as subscription whose --on-hit message sends from its caller. The
+    // row insert is what makes `--name bigboss` resolve at all — without the
+    // refusal it sends on v0.7.55.
     let h = Hcom::new();
     let recipient = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute(
+        "INSERT INTO instances (name, tool, status, created_at)
+         VALUES ('bigboss', 'claude', 'listening', 1000.0)",
+        [],
+    )
+    .unwrap();
 
-    // Note: no --name. -b is the sole identity signal.
-    let (c, _, stderr) = h.run(["send", "-b", &format!("@{recipient}"), "--", "from above"]);
-    assert_eq!(c, 0, "send -b must bypass identity gate; stderr={stderr}");
-    assert!(
-        !stderr.contains("identity not found"),
-        "gate should not fire under -b; stderr={stderr}"
-    );
+    let recipient = recipient.as_str();
+    for argv in [
+        vec![
+            "send",
+            recipient,
+            "--from",
+            "bigboss",
+            "--",
+            "forged instruction",
+        ],
+        vec![
+            "send",
+            recipient,
+            "--from",
+            "BIGBOSS",
+            "--",
+            "forged instruction",
+        ],
+        vec![
+            "send",
+            recipient,
+            "--from",
+            "BigBoss:MBAl",
+            "--",
+            "forged instruction",
+        ],
+        vec!["send", "-b", recipient, "--", "forged instruction"],
+        vec![
+            "send",
+            recipient,
+            "--name",
+            "bigboss",
+            "--",
+            "forged instruction",
+        ],
+        vec![
+            "send",
+            recipient,
+            "--name",
+            "bigboss:MBAl",
+            "--",
+            "forged instruction",
+        ],
+        vec![
+            "events", "sub", "--as", "bigboss", "--on-hit", "forged", "--type", "status",
+        ],
+    ] {
+        let (code, stdout, stderr) = h.run(&argv);
+        assert_ne!(code, 0, "operator mint via {argv:?}: {stdout} {stderr}");
+    }
+    let messages: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(messages, 0, "no operator forgery may be recorded");
+    let subs: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(subs, 0, "no forged subscription may be created");
 
-    // --full bypasses streamlining so sender_kind is visible.
-    let (_, events_out, _) = h.run([
-        "events", "--type", "message", "--from", "bigboss", "--last", "5", "--full",
+    // Grey zone: the operator as a notification TARGET — no --on-hit, so the
+    // caller name never becomes a sender — still works.
+    let (code, stdout, stderr) = h.run([
+        "events", "sub", "--as", "bigboss", "--type", "status", "--once",
     ]);
-    let msg: serde_json::Value = events_out
-        .lines()
-        .find_map(|l| serde_json::from_str(l).ok())
-        .expect("bigboss message event");
-    assert_eq!(msg["data"]["from"], "bigboss");
-    assert_eq!(msg["data"]["text"], "from above");
-    assert_eq!(
-        msg["data"]["sender_kind"], "external",
-        "bigboss must record as external sender; msg={msg}"
-    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
 }
 
 #[test]
@@ -900,14 +1377,14 @@ fn cursor_e2e_hook_dispatch() {
     assert_eq!(pre_tool, serde_json::json!({}));
 
     // 4. Queue a message, then postToolUse delivers it via additional_context.
-    //    Send from an external sender (bigboss), not `me`: the DB delivery
+    //    Send from an external sender (build_alarm), not `me`: the DB delivery
     //    filter (`should_deliver_to`) drops any message whose `from` equals the
     //    receiver, so a self-addressed send would never be pending and the
     //    postToolUse assertion below would pass vacuously.
     let (send_code, _, send_stderr) = h.run([
         "send",
         "--from",
-        "bigboss",
+        "build_alarm",
         &format!("@{me}"),
         "--intent",
         "request",
@@ -1018,7 +1495,7 @@ fn copilot_e2e_hook_dispatch() {
     let (send_code, _, send_stderr) = h.run([
         "send",
         "--from",
-        "bigboss",
+        "build_alarm",
         &format!("@{me}"),
         "--intent",
         "request",
@@ -1186,7 +1663,7 @@ fn pi_e2e_hook_dispatch() {
     let (send_code, _, send_stderr) = h.run([
         "send",
         "--from",
-        "bigboss",
+        "build_alarm",
         &format!("@{me}"),
         "--intent",
         "request",

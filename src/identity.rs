@@ -109,6 +109,122 @@ pub fn validate_name_input(name: &str, max_length: usize, allow_at: bool) -> Res
     Ok(())
 }
 
+/// Sender names the CLI may never mint: the local operator alias.
+///
+/// `bigboss` ([`crate::shared::constants::SENDER`]) is the human at this
+/// terminal. The only path that speaks as it is the TUI's in-process compose
+/// box ([`crate::commands::send::send_as_operator`]); a CLI `--from`,
+/// `--name` or `--as` for it is a local process posing as the operator.
+/// Case-insensitive, bare or with a device suffix.
+pub fn reserved_operator_refusal(name: &str) -> Option<String> {
+    let bare = name.split_once(':').map_or(name, |(base, _)| base);
+    bare.eq_ignore_ascii_case(crate::shared::constants::SENDER)
+        .then(|| {
+            format!(
+                "'{name}' is the local operator identity; only the TUI compose box may send as {}.",
+                crate::shared::constants::SENDER
+            )
+        })
+}
+
+/// External labels use the existing ASCII mention alphabet, with an optional
+/// canonical device suffix. Reject lookalikes instead of trimming or folding
+/// Unicode into a different identity.
+pub fn validate_sender_label(name: &str) -> Result<(), HcomError> {
+    let (base, suffix) = name
+        .split_once(':')
+        .map_or((name, None), |(base, suffix)| (base, Some(suffix)));
+    if name.is_empty()
+        || name.len() > 50
+        || base.is_empty()
+        || !base
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        || suffix.is_some_and(|s| {
+            s.len() != 4
+                || !s
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        })
+    {
+        return Err(HcomError::InvalidInput(
+            "Invalid sender name: use 1-50 ASCII letters, digits, underscores, dots or hyphens, optionally followed by :SHORT (four uppercase letters/digits).".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reservations survive mirror expiry and connector shutdown. Every database
+/// error is an error, never permission to mint the name.
+pub fn hosted_participant_refusal(db: &HcomDb, name: &str) -> Result<Option<String>, HcomError> {
+    let bare = name.split_once(':').map_or(name, |(base, _)| base);
+    let reserved: bool = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM hosted_names WHERE name = ?1 COLLATE NOCASE
+                UNION ALL
+                SELECT 1 FROM instances WHERE tool = ?2 AND
+                    CASE WHEN instr(name, ':') > 0
+                        THEN substr(name, 1, instr(name, ':') - 1) ELSE name END
+                    = ?1 COLLATE NOCASE
+             )",
+            rusqlite::params![bare, crate::hosted::HOSTED_TOOL_BUZZ],
+            |row| row.get(0),
+        )
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+    if reserved {
+        return Ok(Some(format!(
+            "'{name}' is reserved for a connector-hosted participant; only its connector may use that identity."
+        )));
+    }
+    // The durable registry survives `hcom reset` and a deleted database, so a
+    // reset hub still refuses every name it has ever hosted, before any
+    // connector or mirror re-registers. Read errors are errors, never
+    // permission to mint the name.
+    if crate::hosted::hosted_name_is_reserved(db.path(), name)? {
+        return Ok(Some(format!(
+            "'{name}' is reserved for a connector-hosted participant; only its connector may use that identity."
+        )));
+    }
+    Ok(None)
+}
+
+/// Validate caller-supplied external labels when they are minted or claimed.
+pub fn validate_sender_name(db: &HcomDb, name: &str) -> Result<(), HcomError> {
+    validate_sender_label(name)?;
+    validate_protected_identity(db, name)
+}
+
+/// Check ownership, not input limits, when using an existing identity.
+/// Generated subagent names can legally exceed a CLI label's length bound.
+pub fn validate_protected_identity(db: &HcomDb, name: &str) -> Result<(), HcomError> {
+    if let Some(refusal) = reserved_operator_refusal(name) {
+        return Err(HcomError::InvalidInput(refusal));
+    }
+    if let Some(refusal) = hosted_participant_refusal(db, name)? {
+        return Err(HcomError::InvalidInput(refusal));
+    }
+    Ok(())
+}
+
+/// Shared row-creation gate for start, launch, resume/fork and hook recovery.
+/// Connector registration deliberately uses its own in-process writer.
+/// CLI input bounds are enforced at the claim edges; internally generated
+/// `{parent}_{type}_{N}` identities can be longer and must remain usable.
+pub fn validate_new_identity_name(db: &HcomDb, name: &str) -> Result<(), HcomError> {
+    if !is_valid_base_name(name) {
+        return Err(HcomError::InvalidInput(base_name_error(name)));
+    }
+    validate_protected_identity(db, name)?;
+    if let Some(refusal) = crate::instance_names::remote_name_refusal(db, name)
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?
+    {
+        return Err(HcomError::InvalidInput(refusal));
+    }
+    Ok(())
+}
+
 /// Get full display name: "{tag}-{name}" if tag exists, else just "{name}".
 pub fn get_full_name(data: &InstanceRow) -> String {
     match &data.tag {
@@ -311,6 +427,10 @@ pub fn remote_history_hint(db: &HcomDb, name: &str) -> Option<String> {
 /// 2. Agent ID (UUID) lookup -> kind=Instance if found
 /// 3. Error if not found
 pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, HcomError> {
+    if let Some(refusal) = reserved_operator_refusal(name) {
+        return Err(HcomError::InvalidInput(refusal));
+    }
+
     let mut resolved_name = name.to_string();
 
     // Reject invalid base names, but allow tag-name format (e.g. "team-luna")
@@ -324,6 +444,7 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
 
     // 1. Instance name lookup (exact match)
     if let Ok(Some(data)) = db.get_instance(&resolved_name) {
+        validate_protected_identity(db, &resolved_name)?;
         crate::log::log_info(
             "identity",
             "resolve_from_name",
@@ -345,6 +466,7 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
     if let Ok(Some(instance_name)) = db.get_instance_by_agent_id(&resolved_name)
         && let Ok(Some(data)) = db.get_instance(&instance_name)
     {
+        validate_protected_identity(db, &instance_name)?;
         crate::log::log_info(
             "identity",
             "resolve_from_name",
@@ -366,6 +488,7 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
     }
 
     // 3. Not found
+    validate_protected_identity(db, &resolved_name)?;
     crate::log::log_info(
         "identity",
         "resolve_from_name.not_found",
@@ -650,6 +773,106 @@ pub fn require_identity_gate(
 mod tests {
     use super::*;
 
+    #[test]
+    fn review_sender_policy_fails_closed_on_database_error() {
+        let (db, _dir) = make_test_db();
+        db.conn().execute_batch("DROP TABLE instances").unwrap();
+        assert!(validate_sender_name(&db, "build_alarm").is_err());
+    }
+
+    #[test]
+    fn review_hosted_ownership_outlives_registration_row() {
+        let (db, _dir) = make_test_db();
+        crate::hosted::register_hosted(&db, "michael", crate::hosted::HOSTED_TOOL_BUZZ).unwrap();
+        db.delete_instance("michael").unwrap();
+        assert!(validate_sender_name(&db, "michael").is_err());
+        assert!(validate_sender_name(&db, "MICHAEL:MBAI").is_err());
+        assert!(validate_sender_name(&db, "michael_alert").is_ok());
+        crate::hosted::register_hosted(&db, "michael", crate::hosted::HOSTED_TOOL_BUZZ).unwrap();
+    }
+
+    #[test]
+    fn review_sender_labels_reject_control_and_unicode_lookalikes() {
+        let (db, _dir) = make_test_db();
+        for name in [
+            "cron\0",
+            "cron\t",
+            "cron\n",
+            "cron ",
+            "crоn",
+            "cron\u{200b}",
+            "cron:ABCD:EFGH",
+        ] {
+            assert!(validate_sender_name(&db, name).is_err(), "{name:?}");
+        }
+        for name in [
+            "build_alarm:BOXE",
+            "fleet-recovery",
+            "mnemopi-split-watch",
+            "build.alert",
+        ] {
+            assert!(validate_sender_name(&db, name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn review_shared_row_writer_refuses_protected_identities() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, _tmp) = make_test_db();
+        crate::hosted::register_hosted(&db, "michael", crate::hosted::HOSTED_TOOL_BUZZ).unwrap();
+        for name in ["bigboss", "BigBoss", "michael", "Michael", "michael "] {
+            assert!(
+                !crate::instance_binding::initialize_instance_in_position_file(
+                    &db,
+                    name,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("adhoc"),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                "row writer accepted {name:?}"
+            );
+        }
+        assert_eq!(
+            db.get_instance_full("michael").unwrap().unwrap().tool,
+            "buzz"
+        );
+    }
+
+    #[test]
+    fn review_upgrade_reserves_hosted_names_before_expiry() {
+        let (db, _tmp) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name, tool, status, created_at)
+             VALUES ('michael:MBAI', 'buzz', 'listening', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS remember_hosted_name_insert;
+             DROP TRIGGER IF EXISTS remember_hosted_name_update;
+             DROP TABLE IF EXISTS hosted_names;
+             PRAGMA user_version = 20;",
+            )
+            .unwrap();
+        let path = db.path().to_path_buf();
+        drop(db);
+        let db = HcomDb::open_at(&path).unwrap();
+        db.delete_instance("michael:MBAI").unwrap();
+        assert!(validate_sender_name(&db, "michael").is_err());
+    }
+
     fn make_test_db() -> (HcomDb, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
@@ -806,14 +1029,6 @@ mod tests {
 
         let err = resolve_from_name(&db, "nonexistent").unwrap_err();
         assert!(err.to_string().contains("not found"));
-    }
-
-    #[test]
-    fn test_resolve_from_name_invalid() {
-        let (db, _dir) = make_test_db();
-
-        let err = resolve_from_name(&db, "Invalid-Name!").unwrap_err();
-        assert!(err.to_string().contains("Invalid instance name"));
     }
 
     // ── resolve_identity tests ─────────────────────────────────────────

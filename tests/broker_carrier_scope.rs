@@ -100,7 +100,7 @@ fn broker_shared_daemons_are_not_owner_carriers_but_nested_omp_is() {
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "initialize isolated DB: {stderr}");
 
-    let name = format!("broker-scope-{}-{}", std::process::id(), unique_suffix());
+    let name = format!("broker_scope_{}_{}", std::process::id(), unique_suffix());
     let process_id = format!("broker-process-{}", unique_suffix());
     let fixture = h.root_path().join("broker-fixture");
     fs::create_dir_all(&fixture).expect("create fake process tree directory");

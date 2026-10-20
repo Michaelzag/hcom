@@ -23,12 +23,15 @@ pub struct ResetArgs {
     pub target: Option<ResetTarget>,
 }
 
-pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) -> i32 {
+/// `db` is taken by value so it can be closed before the database files are
+/// unlinked: on Windows a delete fails with a sharing violation while any
+/// handle — including this command's own — still holds the WAL open.
+pub fn cmd_reset(db: HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) -> i32 {
     let target = args.target;
 
     // Confirmation gate: inside AI tools, require --go
     if is_inside_ai_tool() && !ctx.map(|c| c.go).unwrap_or(false) {
-        super::reset_preview::print_reset_preview(target, db);
+        super::reset_preview::print_reset_preview(target, &db);
         return 0;
     }
 
@@ -53,7 +56,10 @@ pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) ->
     let stop_args = crate::commands::stop::StopArgs {
         targets: vec!["all".into()],
     };
-    exit_codes.push(crate::commands::stop::cmd_stop(db, &stop_args, ctx));
+    exit_codes.push(crate::commands::stop::cmd_stop(&db, &stop_args, ctx));
+
+    // Close this command's own database handle before the unlink below.
+    drop(db);
 
     // Clean temp files
     super::reset_ops::clean_temp_files();

@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use crate::db::HcomDb;
 use crate::log;
 
+use super::pull::RemoteInsert;
 use super::{safe_kv_get, safe_kv_set};
 
 pub(crate) const GAP_KEY_PREFIX: &str = "relay_gap_";
@@ -205,6 +206,9 @@ pub(crate) fn apply_answer(
     gap: &mut Gap,
     response: &Value,
 ) -> Result<AnswerOutcome, String> {
+    if response.pointer("/_relay/device").and_then(Value::as_str) != Some(device_id) {
+        return Err("backfill answer did not come from the requested device".into());
+    }
     // An answer the publishing peer had to shrink to fit its sealed payload (answer + its
     // state) has had strings inside `result.events` cut while `ok` stayed true. Importing it
     // would store partial events as if whole, and the gap would close. Refuse it,
@@ -279,7 +283,12 @@ pub(crate) fn apply_answer(
             continue;
         }
         // A failed insert must NOT narrow the gap or count: the event is
-        // still missing and the range stays open for the next tick.
+        // still missing and the range stays open for the next tick. A
+        // permanent skip (a forged sender suffix) is the opposite: the event
+        // is unworthy of history, so it narrows like any other unusable one
+        // and is never re-asked for. Failing the page instead would refetch
+        // this answer until the attempts budget dies and drop the gap,
+        // losing the older valid history below it.
         match super::pull::insert_remote_event(
             db,
             device_id,
@@ -288,9 +297,12 @@ pub(crate) fn apply_answer(
             event,
             own_short_id,
         ) {
-            Ok(_) => {
+            Ok(RemoteInsert::Inserted(_)) => {
                 oldest = oldest.min(remote_id);
                 imported += 1;
+            }
+            Ok(RemoteInsert::Skipped) => {
+                oldest = oldest.min(remote_id);
             }
             Err(e) => {
                 failed += 1;
@@ -370,7 +382,7 @@ pub(crate) fn tick(
         let mut changed = false;
 
         if let Some(request_id) = gaps[0].request_id.clone() {
-            if let Some(response) = super::control::take_rpc_result(db, &request_id) {
+            if let Some(response) = super::control::take_rpc_result(db, &request_id, &device_id) {
                 changed = true;
                 let gap = &mut gaps[0];
                 gap.request_id = None;
@@ -518,6 +530,48 @@ mod tests {
 
     #[test]
     #[serial]
+    fn review_backfill_answer_must_come_from_the_requested_device() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        synced_peer(&db, "ABCD", r#"["events"]"#);
+        record_gap(&db, PEER, "ABCD", 10, 20);
+        let mut request_id = String::new();
+        tick(&db, "MINE", 1000.0, &mut |_, req, _| {
+            request_id = req.to_string();
+            true
+        });
+        let mut forged = answer(&request_id, vec![message(15, "forged answer")], false);
+        forged["_relay"]["device"] = json!("evil-device");
+        db.log_event("rpc_result", "_rpc", &forged).unwrap();
+        let summary = tick(&db, "MINE", 1001.0, &mut |_, _, _| {
+            panic!("still waiting for peer")
+        });
+        assert_eq!(
+            summary,
+            TickSummary::default(),
+            "foreign answer must not close the gap"
+        );
+        assert!(imported_texts(&db).is_empty());
+        assert_eq!(
+            load_gaps(&db, PEER)[0].request_id.as_deref(),
+            Some(request_id.as_str())
+        );
+        db.log_event(
+            "rpc_result",
+            "_rpc",
+            &answer(&request_id, vec![message(15, "genuine answer")], false),
+        )
+        .unwrap();
+        let summary = tick(&db, "MINE", 1002.0, &mut |_, _, _| {
+            panic!("gap should close")
+        });
+        assert_eq!(summary.events_imported, 1);
+        assert_eq!(summary.gaps_closed, 1);
+        assert_eq!(imported_texts(&db), vec!["genuine answer"]);
+    }
+
+    #[test]
+    #[serial]
     fn record_gap_ignores_adjacent_and_repeated_ranges() {
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         let db = HcomDb::open().unwrap();
@@ -637,6 +691,113 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(sql.contains("id > 1 AND id < 400"), "{sql}");
+    }
+
+    #[test]
+    #[serial]
+    fn a_forged_sender_in_the_newest_page_is_skipped_and_the_gap_still_recovers() {
+        // One forged sender suffix in the newest page of a multi-page
+        // backfill is a permanent per-event skip, not a page error: the rest
+        // of the page imports, pagination continues, and every valid event on
+        // every page lands. Failing the page would refetch that same answer
+        // until the attempts budget dies, drop the gap, and lose the older
+        // valid history below it.
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        synced_peer(&db, "ABCD", r#"["events"]"#);
+
+        // The gap holds 201 events: ids 1..=200 valid, id 201 forged at its top.
+        let forged = json!({
+            "id": 201,
+            "ts": "2026-09-26T10:03:21.000000+00:00",
+            "type": "message",
+            "instance": "luna",
+            "data": {"from": "michael:HOST", "text": "forged", "mentions": ["nova:MINE"], "scope": "mentions"},
+        });
+        record_gap(&db, PEER, "ABCD", 0, 202);
+
+        // Page 1 (newest-first, BACKFILL_BATCH events): the forged event
+        // beside the valid 200..=102.
+        let page1: Vec<Value> = std::iter::once(forged)
+            .chain((102..201).rev().map(|id| message(id, &format!("m{id}"))))
+            .collect();
+        let mut request_id = String::new();
+        let summary = tick(&db, "MINE", 1000.0, &mut |_, req, _| {
+            request_id = req.to_string();
+            true
+        });
+        assert_eq!(summary.requests_sent, 1);
+        db.log_event("rpc_result", "_rpc", &answer(&request_id, page1, false))
+            .unwrap();
+
+        let mut second: Option<(String, Value)> = None;
+        let summary = tick(&db, "MINE", 1001.0, &mut |_, req, params| {
+            second = Some((req.to_string(), params.clone()));
+            true
+        });
+        assert_eq!(
+            summary.events_imported, 99,
+            "the forged event is skipped; the rest of the page imports"
+        );
+        assert_eq!(summary.gaps_closed, 0);
+        let (request_id, params) = second.expect("pagination continues past the skip");
+        assert!(
+            params["sql"]
+                .as_str()
+                .unwrap()
+                .contains("id > 0 AND id < 102"),
+            "{params}"
+        );
+
+        // Page 2: the valid 101..=2.
+        let page2: Vec<Value> = (2..102)
+            .rev()
+            .map(|id| message(id, &format!("m{id}")))
+            .collect();
+        db.log_event("rpc_result", "_rpc", &answer(&request_id, page2, false))
+            .unwrap();
+        let mut third: Option<String> = None;
+        let summary = tick(&db, "MINE", 1002.0, &mut |_, req, _| {
+            third = Some(req.to_string());
+            true
+        });
+        assert_eq!(summary.events_imported, 100);
+        let request_id = third.expect("the oldest page is still asked for");
+
+        // Page 3: the oldest event alone, then the gap closes.
+        db.log_event(
+            "rpc_result",
+            "_rpc",
+            &answer(&request_id, vec![message(1, "m1")], false),
+        )
+        .unwrap();
+        let summary = tick(&db, "MINE", 1003.0, &mut |_, _, _| {
+            panic!("the gap must be closed")
+        });
+        assert_eq!(summary.events_imported, 1);
+        assert_eq!(summary.gaps_closed, 1);
+        assert!(load_gaps(&db, PEER).is_empty());
+
+        let expected: Vec<String> = (1..=200).map(|id| format!("m{id}")).collect();
+        assert_eq!(
+            imported_texts(&db),
+            expected,
+            "every valid event on every page recovered"
+        );
+        let forged_stored: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE json_extract(data, '$._relay.id') = 201",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(forged_stored, 0, "the forged event is absent");
+        assert_eq!(
+            safe_kv_get(&db, "relay_forged_sender_skips").as_deref(),
+            Some("1"),
+            "the skip is counted"
+        );
     }
 
     #[test]

@@ -1273,166 +1273,191 @@ pub(crate) fn initialize_instance_in_position_file_collected(
     cwd_override: Option<&str>,
     post: &mut PostCommit,
 ) -> bool {
-    let cwd = cwd_override.map(|s| s.to_string()).unwrap_or_else(|| {
-        std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default()
-    });
-    let is_launched = std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1");
+    // Join an existing writer transaction, or take the lock before checking
+    // ownership so a concurrent connector registration cannot be overwritten.
+    let mut initialize = || -> anyhow::Result<()> {
+        crate::identity::validate_new_identity_name(db, instance_name)?;
+        let cwd = cwd_override.map(|s| s.to_string()).unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
+        let is_launched = std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1");
 
-    match db.get_instance_full(instance_name) {
-        Ok(Some(existing)) => {
-            let mut updates = serde_json::Map::new();
-            updates.insert("directory".into(), serde_json::json!(cwd));
+        let success = match db.get_instance_full(instance_name) {
+            Ok(Some(existing)) => {
+                let mut updates = serde_json::Map::new();
+                updates.insert("directory".into(), serde_json::json!(cwd));
 
-            if let Some(sid) = session_id {
-                updates.insert("session_id".into(), serde_json::json!(sid));
-            }
-            if let Some(psid) = parent_session_id {
-                updates.insert("parent_session_id".into(), serde_json::json!(psid));
-            }
-            if let Some(pn) = parent_name {
-                updates.insert("parent_name".into(), serde_json::json!(pn));
-            }
-            if let Some(aid) = agent_id {
-                updates.insert("agent_id".into(), serde_json::json!(aid));
-            }
-            if let Some(tp) = transcript_path {
-                updates.insert("transcript_path".into(), serde_json::json!(tp));
-            }
-            if let Some(t) = tool {
-                updates.insert("tool".into(), serde_json::json!(t));
-            }
-            if let Some(t) = tag {
-                updates.insert("tag".into(), serde_json::json!(t));
-            }
-            if background {
-                updates.insert("background".into(), serde_json::json!(1));
-            }
+                if let Some(sid) = session_id {
+                    updates.insert("session_id".into(), serde_json::json!(sid));
+                }
+                if let Some(psid) = parent_session_id {
+                    updates.insert("parent_session_id".into(), serde_json::json!(psid));
+                }
+                if let Some(pn) = parent_name {
+                    updates.insert("parent_name".into(), serde_json::json!(pn));
+                }
+                if let Some(aid) = agent_id {
+                    updates.insert("agent_id".into(), serde_json::json!(aid));
+                }
+                if let Some(tp) = transcript_path {
+                    updates.insert("transcript_path".into(), serde_json::json!(tp));
+                }
+                if let Some(t) = tool {
+                    updates.insert("tool".into(), serde_json::json!(t));
+                }
+                if let Some(t) = tag {
+                    updates.insert("tag".into(), serde_json::json!(t));
+                }
+                if background {
+                    updates.insert("background".into(), serde_json::json!(1));
+                }
 
-            let is_true_placeholder = existing.session_id.is_none();
-            let is_pending_placeholder = is_true_placeholder
-                && existing.status == PLACEHOLDER_STATUS
-                && existing.status_context == PLACEHOLDER_CONTEXT;
-            if existing.last_event_id == 0 && is_true_placeholder {
+                let is_true_placeholder = existing.session_id.is_none();
+                let is_pending_placeholder = is_true_placeholder
+                    && existing.status == PLACEHOLDER_STATUS
+                    && existing.status_context == PLACEHOLDER_CONTEXT;
+                if existing.last_event_id == 0 && is_true_placeholder {
+                    let current_max = db.get_last_event_id();
+                    let launch_event_id = std::env::var("HCOM_LAUNCH_EVENT_ID")
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok());
+
+                    let eid = match launch_event_id {
+                        Some(id) if id <= current_max => id,
+                        _ => current_max,
+                    };
+                    updates.insert("last_event_id".into(), serde_json::json!(eid));
+                }
+
+                if is_launched {
+                    updates.insert("status_context".into(), serde_json::json!("new"));
+                }
+
+                if !updates.is_empty() {
+                    let _ = db.update_instance_fields(instance_name, &updates);
+                }
+
+                if is_pending_placeholder {
+                    auto_subscribe_defaults(
+                        db,
+                        instance_name,
+                        tool.unwrap_or(existing.tool.as_str()),
+                    );
+                }
+
+                true
+            }
+            Ok(None) => {
+                let now = now_epoch_f64();
                 let current_max = db.get_last_event_id();
                 let launch_event_id = std::env::var("HCOM_LAUNCH_EVENT_ID")
                     .ok()
                     .and_then(|s| s.parse::<i64>().ok());
 
-                let eid = match launch_event_id {
+                let initial_event_id = match launch_event_id {
                     Some(id) if id <= current_max => id,
                     _ => current_max,
                 };
-                updates.insert("last_event_id".into(), serde_json::json!(eid));
-            }
 
-            if is_launched {
-                updates.insert("status_context".into(), serde_json::json!("new"));
-            }
+                let mut data = serde_json::Map::new();
+                data.insert("name".into(), serde_json::json!(instance_name));
+                data.insert("last_event_id".into(), serde_json::json!(initial_event_id));
+                data.insert("directory".into(), serde_json::json!(cwd));
+                data.insert("last_stop".into(), serde_json::json!(0));
+                data.insert("created_at".into(), serde_json::json!(now));
+                data.insert(
+                    "session_id".into(),
+                    match session_id {
+                        Some(s) if !s.is_empty() => serde_json::json!(s),
+                        _ => serde_json::Value::Null,
+                    },
+                );
+                data.insert("transcript_path".into(), serde_json::json!(""));
+                data.insert("name_announced".into(), serde_json::json!(0));
+                data.insert("tag".into(), serde_json::Value::Null);
+                data.insert("status".into(), serde_json::json!(ST_INACTIVE));
+                data.insert("status_time".into(), serde_json::json!(now_epoch_i64()));
+                data.insert("status_context".into(), serde_json::json!("new"));
+                data.insert("tool".into(), serde_json::json!(tool.unwrap_or("claude")));
+                data.insert(
+                    "background".into(),
+                    serde_json::json!(if background { 1 } else { 0 }),
+                );
 
-            if !updates.is_empty() {
-                let _ = db.update_instance_fields(instance_name, &updates);
-            }
-
-            if is_pending_placeholder {
-                auto_subscribe_defaults(db, instance_name, tool.unwrap_or(existing.tool.as_str()));
-            }
-
-            true
-        }
-        Ok(None) => {
-            let now = now_epoch_f64();
-            let current_max = db.get_last_event_id();
-            let launch_event_id = std::env::var("HCOM_LAUNCH_EVENT_ID")
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok());
-
-            let initial_event_id = match launch_event_id {
-                Some(id) if id <= current_max => id,
-                _ => current_max,
-            };
-
-            let mut data = serde_json::Map::new();
-            data.insert("name".into(), serde_json::json!(instance_name));
-            data.insert("last_event_id".into(), serde_json::json!(initial_event_id));
-            data.insert("directory".into(), serde_json::json!(cwd));
-            data.insert("last_stop".into(), serde_json::json!(0));
-            data.insert("created_at".into(), serde_json::json!(now));
-            data.insert(
-                "session_id".into(),
-                match session_id {
-                    Some(s) if !s.is_empty() => serde_json::json!(s),
-                    _ => serde_json::Value::Null,
-                },
-            );
-            data.insert("transcript_path".into(), serde_json::json!(""));
-            data.insert("name_announced".into(), serde_json::json!(0));
-            data.insert("tag".into(), serde_json::Value::Null);
-            data.insert("status".into(), serde_json::json!(ST_INACTIVE));
-            data.insert("status_time".into(), serde_json::json!(now_epoch_i64()));
-            data.insert("status_context".into(), serde_json::json!("new"));
-            data.insert("tool".into(), serde_json::json!(tool.unwrap_or("claude")));
-            data.insert(
-                "background".into(),
-                serde_json::json!(if background { 1 } else { 0 }),
-            );
-
-            if let Some(t) = tag {
-                data.insert("tag".into(), serde_json::json!(t));
-            } else if (session_id.is_some() || parent_session_id.is_some() || is_launched)
-                && let Ok(hcom_config) = crate::config::HcomConfig::load(None)
-                && !hcom_config.tag.is_empty()
-            {
-                data.insert("tag".into(), serde_json::json!(hcom_config.tag));
-            }
-
-            // Resolve HCOM_TIMEOUT explicitly rather than leaving the column
-            // unset — the schema's DEFAULT 86400 would otherwise silently
-            // mask the configured value for every non-PTY instance (issue #71).
-            let effective_wait_timeout =
-                wait_timeout.unwrap_or_else(crate::config::HcomConfig::effective_timeout);
-            data.insert(
-                "wait_timeout".into(),
-                serde_json::json!(effective_wait_timeout),
-            );
-            if let Some(st) = subagent_timeout {
-                data.insert("subagent_timeout".into(), serde_json::json!(st));
-            }
-            if let Some(h) = hints {
-                data.insert("hints".into(), serde_json::json!(h));
-            }
-            if let Some(psid) = parent_session_id {
-                data.insert("parent_session_id".into(), serde_json::json!(psid));
-            }
-            if let Some(pn) = parent_name {
-                data.insert("parent_name".into(), serde_json::json!(pn));
-            }
-            if let Some(aid) = agent_id {
-                data.insert("agent_id".into(), serde_json::json!(aid));
-            }
-            if let Some(tp) = transcript_path {
-                data.insert("transcript_path".into(), serde_json::json!(tp));
-            }
-
-            match db.save_instance_named(instance_name, &data) {
-                Ok(true) => {
-                    log_created_and_auto_subscribe(
-                        db,
-                        instance_name,
-                        is_launched,
-                        parent_session_id,
-                        parent_name,
-                        tool.unwrap_or(""),
-                        post,
-                    );
-                    true
+                if let Some(t) = tag {
+                    data.insert("tag".into(), serde_json::json!(t));
+                } else if (session_id.is_some() || parent_session_id.is_some() || is_launched)
+                    && let Ok(hcom_config) = crate::config::HcomConfig::load(None)
+                    && !hcom_config.tag.is_empty()
+                {
+                    data.insert("tag".into(), serde_json::json!(hcom_config.tag));
                 }
-                Ok(false) => true,
-                Err(_) => false,
+
+                // Resolve HCOM_TIMEOUT explicitly rather than leaving the column
+                // unset — the schema's DEFAULT 86400 would otherwise silently
+                // mask the configured value for every non-PTY instance (issue #71).
+                let effective_wait_timeout =
+                    wait_timeout.unwrap_or_else(crate::config::HcomConfig::effective_timeout);
+                data.insert(
+                    "wait_timeout".into(),
+                    serde_json::json!(effective_wait_timeout),
+                );
+                if let Some(st) = subagent_timeout {
+                    data.insert("subagent_timeout".into(), serde_json::json!(st));
+                }
+                if let Some(h) = hints {
+                    data.insert("hints".into(), serde_json::json!(h));
+                }
+                if let Some(psid) = parent_session_id {
+                    data.insert("parent_session_id".into(), serde_json::json!(psid));
+                }
+                if let Some(pn) = parent_name {
+                    data.insert("parent_name".into(), serde_json::json!(pn));
+                }
+                if let Some(aid) = agent_id {
+                    data.insert("agent_id".into(), serde_json::json!(aid));
+                }
+                if let Some(tp) = transcript_path {
+                    data.insert("transcript_path".into(), serde_json::json!(tp));
+                }
+
+                match db.save_instance_named(instance_name, &data) {
+                    Ok(true) => {
+                        log_created_and_auto_subscribe(
+                            db,
+                            instance_name,
+                            is_launched,
+                            parent_session_id,
+                            parent_name,
+                            tool.unwrap_or(""),
+                            post,
+                        );
+                        true
+                    }
+                    Ok(false) => true,
+                    Err(_) => false,
+                }
             }
+            Err(_) => false,
+        };
+        if !success {
+            anyhow::bail!("Cannot register identity '{instance_name}'");
         }
-        Err(_) => false,
+        Ok(())
+    };
+    let result = if db.conn().is_autocommit() {
+        db.with_immediate_transaction(|_tx| initialize())
+    } else {
+        initialize()
+    };
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            crate::log::log_warn("identity", "registration.refused", &error.to_string());
+            false
+        }
     }
 }
 
