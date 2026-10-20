@@ -76,6 +76,12 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let rebind_target = start_args.as_name;
 
     let db = HcomDb::open()?;
+    for name in [flags.name.as_deref(), rebind_target.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        identity::validate_sender_label(name)?;
+    }
     let hcom_dir = paths::hcom_dir();
 
     let mut ctx = HcomContext::from_os();
@@ -440,20 +446,8 @@ fn start_rebind(
         None
     };
 
-    // Guard: the operator alias and connector-hosted rows are sender
-    // identities, not reclaimable seats. Claiming one with --as would put a
-    // local process behind a name it could then speak as.
-    if let Some(refusal) = crate::identity::reserved_operator_refusal(&target_name) {
-        eprintln!("Error: {refusal}");
-        return Ok(1);
-    }
-    if db
-        .get_instance_full(&target_name)?
-        .is_some_and(|row| crate::hosted::is_hosted_tool(&row.tool))
-    {
-        eprintln!(
-            "Error: '{target_name}' is a connector-hosted participant; it cannot be reclaimed with --as. Only its connector speaks for it."
-        );
+    if let Err(error) = identity::validate_new_identity_name(db, &target_name) {
+        eprintln!("Error: {error}");
         return Ok(1);
     }
 
@@ -1059,6 +1053,18 @@ fn start_bare(
     let explicit_name = explicit_name
         .map(|name| identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
     let explicit_name = explicit_name.as_deref();
+    if let Some(name) = explicit_name {
+        if db
+            .get_instance_full(name)?
+            .as_ref()
+            .is_some_and(crate::instances::is_remote_instance)
+        {
+            bail!(
+                "Remote start is not supported for '{name}'. Start it on the owning device instead."
+            );
+        }
+        identity::validate_new_identity_name(db, name)?;
+    }
 
     // A process already bound to a live seat is that seat. Binding it to a
     // second identity here would silently steal it — the valo incident, where
@@ -1145,14 +1151,6 @@ fn start_bare(
         instance_names::generate_unique_name(db)?
     };
 
-    // Remote instances are relay mirrors. Starting them remotely is intentionally
-    // unsupported because the useful remote lifecycle operations are launch/resume/kill.
-    if let Ok(Some(ref existing)) = db.get_instance_full(&name)
-        && crate::instances::is_remote_instance(existing)
-    {
-        bail!("Remote start is not supported for '{name}'. Start it on the owning device instead.");
-    }
-
     // Check if already exists and active (only for explicit names —
     // generate_unique_name creates a placeholder row we must skip past)
     if explicit_name.is_some()
@@ -1163,7 +1161,7 @@ fn start_bare(
         return Ok(0);
     }
 
-    instance_binding::initialize_instance_in_position_file(
+    if !instance_binding::initialize_instance_in_position_file(
         db,
         &name,
         claude_session_id.as_deref(),
@@ -1178,7 +1176,9 @@ fn start_bare(
         None,  // subagent_timeout
         None,  // hints
         None,  // cwd_override
-    );
+    ) {
+        bail!("Cannot register identity '{name}'");
+    }
 
     if let Some(ref session_id) = claude_session_id {
         db.set_session_binding(session_id, &name)?;
@@ -1917,7 +1917,7 @@ mod tests {
     fn test_start_rebind_self_identity_tree_rebinds() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        let target = format!("hcom-start-self-{}", std::process::id());
+        let target = format!("hcom_start_self_{}", std::process::id());
         let cwd = std::env::current_dir()
             .unwrap()
             .to_string_lossy()
@@ -1948,7 +1948,7 @@ mod tests {
     fn test_start_rebind_foreign_still_refuses_live_holder() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        let target = format!("hcom-start-foreign-{}", std::process::id());
+        let target = format!("hcom_start_foreign_{}", std::process::id());
         let cwd = std::env::current_dir()
             .unwrap()
             .to_string_lossy()
@@ -2075,7 +2075,7 @@ mod tests {
     fn test_start_rebind_refuses_pre_binding_orphan_outside_caller_tree() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        let target = format!("hcom-start-orphan-{}", std::process::id());
+        let target = format!("hcom_start_orphan_{}", std::process::id());
         let cwd = std::env::current_dir()
             .unwrap()
             .to_string_lossy()

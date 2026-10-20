@@ -381,6 +381,8 @@ pub(crate) fn generation_is_taken(
     taken_names.contains(name)
         || remote_bases.contains(&name.to_ascii_lowercase())
         || db.get_instance_full(name).ok().flatten().is_some()
+        || crate::identity::reserved_operator_refusal(name).is_some()
+        || crate::identity::hosted_participant_refusal(db, name).map_or(true, |r| r.is_some())
 }
 
 pub(crate) fn allocate_unreserved_name(db: &HcomDb) -> Result<String> {
@@ -427,6 +429,7 @@ pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
 
     let result = (|| -> Result<String> {
         let name = allocate_unreserved_name(db)?;
+        crate::identity::validate_new_identity_name(db, &name)?;
 
         // Reserve with placeholder row
         let now = now_epoch_i64();

@@ -38,7 +38,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 20;
+const SCHEMA_VERSION: i32 = 21;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -77,6 +77,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
         20,
         "SELECT 1;",
     ),
+    (21, "SELECT 1;"),
 ];
 
 /// Schema compatibility check result
@@ -553,6 +554,7 @@ impl HcomDb {
             END;
             ",
         )?;
+        crate::hosted::install_name_registry(&self.conn)?;
 
         // Set schema version
         self.conn
@@ -621,6 +623,7 @@ impl HcomDb {
                 self.init_db()?;
                 if opened_version < 20 {
                     self.migrate_created_at_bits(&tx)?;
+                    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
                 }
                 tx.commit()?;
                 Ok(())
@@ -637,6 +640,9 @@ impl HcomDb {
                             None => {
                                 if migrate_from < 20 {
                                     self.migrate_created_at_bits(&tx)?;
+                                    tx.execute_batch(&format!(
+                                        "PRAGMA user_version = {SCHEMA_VERSION}"
+                                    ))?;
                                 }
                                 tx.commit()?;
                                 return Ok(());
@@ -1007,6 +1013,9 @@ impl HcomDb {
             return Ok(false);
         }
         for next_version in (old_version + 1)..=SCHEMA_VERSION {
+            if next_version == 21 {
+                crate::hosted::install_name_registry(tx)?;
+            }
             if next_version == 17 {
                 let has_launch_context = tx
                     .prepare("PRAGMA table_info(instances)")?
@@ -2319,7 +2328,7 @@ pub(super) mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            20
+            SCHEMA_VERSION
         );
 
         for (name, original, expected_bits) in [
@@ -2504,7 +2513,7 @@ pub(super) mod tests {
             db.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            20
+            SCHEMA_VERSION
         );
 
         // Converged on the uninterrupted end state.
@@ -2683,7 +2692,7 @@ pub(super) mod tests {
                         .conn
                         .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                         .unwrap(),
-                    20,
+                    SCHEMA_VERSION,
                     "v{version} iter {iteration}"
                 );
 

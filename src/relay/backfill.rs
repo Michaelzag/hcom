@@ -206,6 +206,9 @@ pub(crate) fn apply_answer(
     gap: &mut Gap,
     response: &Value,
 ) -> Result<AnswerOutcome, String> {
+    if response.pointer("/_relay/device").and_then(Value::as_str) != Some(device_id) {
+        return Err("backfill answer did not come from the requested device".into());
+    }
     // An answer the publishing peer had to shrink to fit its sealed payload (answer + its
     // state) has had strings inside `result.events` cut while `ok` stayed true. Importing it
     // would store partial events as if whole, and the gap would close. Refuse it,
@@ -379,7 +382,7 @@ pub(crate) fn tick(
         let mut changed = false;
 
         if let Some(request_id) = gaps[0].request_id.clone() {
-            if let Some(response) = super::control::take_rpc_result(db, &request_id) {
+            if let Some(response) = super::control::take_rpc_result(db, &request_id, &device_id) {
                 changed = true;
                 let gap = &mut gaps[0];
                 gap.request_id = None;
@@ -523,6 +526,48 @@ mod tests {
             .unwrap()
             .filter_map(|r| r.ok())
             .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn review_backfill_answer_must_come_from_the_requested_device() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        synced_peer(&db, "ABCD", r#"["events"]"#);
+        record_gap(&db, PEER, "ABCD", 10, 20);
+        let mut request_id = String::new();
+        tick(&db, "MINE", 1000.0, &mut |_, req, _| {
+            request_id = req.to_string();
+            true
+        });
+        let mut forged = answer(&request_id, vec![message(15, "forged answer")], false);
+        forged["_relay"]["device"] = json!("evil-device");
+        db.log_event("rpc_result", "_rpc", &forged).unwrap();
+        let summary = tick(&db, "MINE", 1001.0, &mut |_, _, _| {
+            panic!("still waiting for peer")
+        });
+        assert_eq!(
+            summary,
+            TickSummary::default(),
+            "foreign answer must not close the gap"
+        );
+        assert!(imported_texts(&db).is_empty());
+        assert_eq!(
+            load_gaps(&db, PEER)[0].request_id.as_deref(),
+            Some(request_id.as_str())
+        );
+        db.log_event(
+            "rpc_result",
+            "_rpc",
+            &answer(&request_id, vec![message(15, "genuine answer")], false),
+        )
+        .unwrap();
+        let summary = tick(&db, "MINE", 1002.0, &mut |_, _, _| {
+            panic!("gap should close")
+        });
+        assert_eq!(summary.events_imported, 1);
+        assert_eq!(summary.gaps_closed, 1);
+        assert_eq!(imported_texts(&db), vec!["genuine answer"]);
     }
 
     #[test]

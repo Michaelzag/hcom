@@ -497,6 +497,10 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
             }
         }
     };
+    if let Err(e) = crate::identity::validate_sender_label(&caller) {
+        eprintln!("Error: {e}");
+        return 1;
+    }
 
     // With `--on-hit` the attached message goes out from the caller, so the
     // caller is a sender identity: the CLI mints neither the operator alias
@@ -607,6 +611,10 @@ fn cmd_events_sub_remote_create(db: &HcomDb, args: &EventsSubArgs, device: &str)
             }
         }
     };
+    if let Err(e) = crate::identity::validate_sender_label(&caller) {
+        eprintln!("Error: {e}");
+        return 1;
+    }
 
     // Same sender policy as the local path: an `--on-hit` message goes out
     // from `caller` on the remote device, and that device enforces this too.

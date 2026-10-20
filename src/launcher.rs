@@ -1640,6 +1640,8 @@ pub(crate) fn resolve_explicit_name_conflict(
     name: &str,
     session_id: Option<&str>,
 ) -> Result<()> {
+    crate::identity::validate_new_identity_name(db, name)?;
+
     // Process truth first: never spawn under a name whose prior subtree is
     // still alive (orphan) or whose newest binding is live-held — not even
     // over a free or inactive row. A reservation placeholder carries no
@@ -3917,6 +3919,25 @@ mod tests {
     }
 
     #[test]
+    fn review_launch_names_cannot_mint_operator_or_case_twins() {
+        let db = launcher_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name, tool, status, created_at)
+             VALUES ('michael:MBAI', 'buzz', 'stopped', 1.0)",
+                [],
+            )
+            .unwrap();
+        for name in ["bigboss", "BigBoss", "michael", "Michael", "michael "] {
+            assert!(
+                resolve_explicit_name_conflict(&db, name, None).is_err(),
+                "{name}"
+            );
+        }
+        assert!(resolve_explicit_name_conflict(&db, "qa", None).is_ok());
+    }
+
+    #[test]
     fn resolve_explicit_name_conflict_refuses_a_name_live_on_a_normal_remote() {
         // A fresh host with no local row must still refuse a name another
         // device is running, and the refusal names the suffixed form.
@@ -4022,7 +4043,7 @@ mod tests {
         // Even with no row at all, a live tree under the requested name
         // refuses the launch — spawning over it would orphan the holders.
         let db = launcher_test_db();
-        let name = format!("hcom-launch-orphan-{}", std::process::id());
+        let name = format!("hcom_launch_orphan_{}", std::process::id());
         let mut sleeper = std::process::Command::new("sleep")
             .arg("300")
             .env("HCOM_INSTANCE_NAME", &name)

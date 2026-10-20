@@ -3300,7 +3300,7 @@ mod tests {
 
         // (i) close — the byte-identical 0.7.29 production writer.
 
-        let close_name = format!("hcom-close-{}-oldwriter", std::process::id());
+        let close_name = format!("hcom_close_{}_oldwriter", std::process::id());
         assert!(
             crate::instance_binding::initialize_instance_in_position_file(
                 &db,

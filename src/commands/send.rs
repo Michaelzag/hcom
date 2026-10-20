@@ -977,11 +977,9 @@ fn process_positionals(positionals: &[String]) -> (Vec<String>, Option<String>) 
     (targets, None)
 }
 
-/// The TUI compose box's send: the one path that speaks as the local operator
-/// ([`SENDER`]). Returns the feedback text instead of printing — the TUI owns
-/// stdout and the rest of hcom runs it as a subprocess for exactly that
-/// reason. Not reachable from argv: the CLI refuses `--from bigboss` and
-/// `--name bigboss`, so no local process can pose as the operator through it.
+/// The TUI compose box's internal operator send. Return feedback instead of
+/// printing because the TUI owns stdout. This is not exposed as an argv
+/// option; the public CLI refuses the operator and hosted sender identities.
 pub fn send_as_operator(
     db: &HcomDb,
     recipients: &[String],

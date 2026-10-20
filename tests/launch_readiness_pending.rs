@@ -286,7 +286,7 @@ fn launched_seat_name(h: &Hcom) -> Option<String> {
     let mut stmt = db
         .prepare(
             "SELECT name FROM instances \
-             WHERE name NOT LIKE 'seeded-%' AND name NOT LIKE ':%' \
+             WHERE name NOT GLOB 'seeded_*' AND name NOT LIKE ':%' \
              ORDER BY created_at",
         )
         .ok()?;
@@ -452,7 +452,7 @@ fn a_resume_waits_longer_than_a_fresh_launch() {
         announced_wait_secs(&launch_cmd(&h, &fakebin), &["claude", "-p", "hi", "--go"]);
     assert_eq!(fresh_wait, 10, "a fresh launch keeps the 10 s window");
 
-    let name = seed_stopped_claude(&h, "seeded-lave");
+    let name = seed_stopped_claude(&h, "seeded_lave");
     fs::write(out.join(EXIT_NOW), "").expect("arm the immediate-exit tool");
     let resume_wait =
         announced_wait_secs(&launch_cmd(&h, &fakebin), &["r", &name, "-p", "hi", "--go"]);
@@ -553,14 +553,14 @@ fn a_resume_that_is_late_but_alive_is_pending_not_refused() {
     init(&h);
     // `luvo` is the bead's seat name; hcom's own name generator uses the same
     // ordinary names, so this one carries a prefix it never mints.
-    let session_id = "sid-resume-seeded-luvo".to_string();
+    let session_id = "sid-resume-seeded_luvo".to_string();
     // The resumed tool re-announces the SEEDED session id (what the resume
     // pre-set on the row) and binds at once, but reports ready only after the
     // 30 s resume window has passed — the shape luvo actually had: alive,
     // bound, late to report, and so unproven to the wait, never refused.
     let (fakebin, out) = install_fake_claude_seeded(&h, &session_id, 35);
-    let name = seed_stopped_claude(&h, "seeded-luvo");
-    assert_eq!(name, "seeded-luvo");
+    let name = seed_stopped_claude(&h, "seeded_luvo");
+    assert_eq!(name, "seeded_luvo");
 
     let (code, stdout, stderr) = run_bounded(
         {

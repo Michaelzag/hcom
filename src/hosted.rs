@@ -95,6 +95,40 @@ pub fn is_hosted_tool(tool: &str) -> bool {
     tool == HOSTED_TOOL_BUZZ
 }
 
+/// Retain connector-owned names even after their local or mirror rows expire.
+/// Triggers reserve the name in the same transaction as registration/import.
+pub(crate) fn install_name_registry(conn: &rusqlite::Connection) -> Result<()> {
+    let tool = HOSTED_TOOL_BUZZ;
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS hosted_names (
+             name TEXT PRIMARY KEY COLLATE NOCASE
+         );
+         CREATE TRIGGER IF NOT EXISTS remember_hosted_name_insert
+         AFTER INSERT ON instances WHEN NEW.tool = '{tool}' BEGIN
+             INSERT OR IGNORE INTO hosted_names(name)
+             VALUES (lower(CASE WHEN instr(NEW.name, ':') > 0
+                 THEN substr(NEW.name, 1, instr(NEW.name, ':') - 1) ELSE NEW.name END));
+         END;
+         CREATE TRIGGER IF NOT EXISTS remember_hosted_name_update
+         AFTER UPDATE OF name, tool ON instances WHEN NEW.tool = '{tool}' BEGIN
+             INSERT OR IGNORE INTO hosted_names(name)
+             VALUES (lower(CASE WHEN instr(NEW.name, ':') > 0
+                 THEN substr(NEW.name, 1, instr(NEW.name, ':') - 1) ELSE NEW.name END));
+         END;
+         INSERT OR IGNORE INTO hosted_names(name)
+         SELECT lower(CASE WHEN instr(name, ':') > 0
+             THEN substr(name, 1, instr(name, ':') - 1) ELSE name END)
+         FROM instances WHERE tool = '{tool}';
+         INSERT OR IGNORE INTO hosted_names(name)
+         SELECT lower(CASE WHEN instr(instance, ':') > 0
+             THEN substr(instance, 1, instr(instance, ':') - 1) ELSE instance END)
+         FROM events WHERE instance != '' AND json_valid(data)
+             AND (json_extract(data, '$.snapshot.tool') = '{tool}'
+                 OR json_extract(data, '$.context') GLOB 'buzz:*');"
+    ))?;
+    Ok(())
+}
+
 /// What a [`register_hosted`] call did to the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterOutcome {

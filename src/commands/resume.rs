@@ -1149,6 +1149,7 @@ fn append_restored_snapshot(
     // wakes collected, and `fire` runs only after commit. A bail drops `post`,
     // discarding wakes for the unwritten event.
     let post = db.with_immediate_transaction(|tx| {
+        crate::identity::validate_new_identity_name(db, name)?;
         let mut post = PostCommit::default();
         if newest_stopped_event_id(tx, name)? != restored.planned_newest_id {
             bail!(

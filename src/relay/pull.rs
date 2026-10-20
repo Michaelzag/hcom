@@ -233,11 +233,19 @@ pub fn handle_state_message(
         .cloned()
         .unwrap_or_default();
 
-    let short_id = state
+    let raw_short_id = state
         .get("short_id")
         .and_then(|v| v.as_str())
-        .unwrap_or(&device_id[..4.min(device_id.len())])
-        .to_uppercase();
+        .unwrap_or_else(|| device_id.get(..4.min(device_id.len())).unwrap_or(""));
+    if raw_short_id.len() != 4 || !raw_short_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        log::log_warn(
+            "relay",
+            "relay.bad_short_id",
+            "Ignoring malformed peer short id",
+        );
+        return false;
+    }
+    let short_id = raw_short_id.to_ascii_uppercase();
     let reset_ts = state
         .get("reset_ts")
         .and_then(|v| v.as_f64())
@@ -772,6 +780,18 @@ pub(crate) fn insert_remote_event(
 
     // Namespace instance name
     let instance = event.get("instance").and_then(|v| v.as_str()).unwrap_or("");
+    if instance
+        .split_once(':')
+        .is_some_and(|(_, suffix)| suffix != short_id)
+    {
+        log::log_warn(
+            "relay",
+            "relay.instance_suffix_mismatch",
+            &format!("device={device_id}, event_id={event_id}, instance={instance}"),
+        );
+        count_forged_sender_skip(db);
+        return Ok(RemoteInsert::Skipped);
+    }
     let namespaced_instance =
         if !instance.is_empty() && !instance.contains(':') && !instance.starts_with('_') {
             super::add_device_suffix(instance, short_id)
@@ -941,9 +961,76 @@ fn parse_ts(value: Option<&Value>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn review_relay_instance_namespace_is_bound_to_publisher() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        for (index, instance) in ["luna:HOST", "luna:HOST:PEER", "luna:PEER", "luna"]
+            .iter()
+            .enumerate()
+        {
+            let event = serde_json::json!({
+                "id": index + 1, "type": "life", "instance": instance, "ts": 1000.0,
+                "data": {"from": "luna", "action": "created"},
+            });
+            insert_remote_event(&db, "peer-device", "PEER", index as i64 + 1, &event, "MINE")
+                .unwrap();
+        }
+        let rows: Vec<String> = db
+            .conn()
+            .prepare("SELECT instance FROM events WHERE type = 'life' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec!["luna:PEER", "luna:PEER"]);
+    }
     use crate::hooks::test_helpers::isolated_test_env;
     use serde_json::json;
     use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn review_peer_short_id_rejects_unicode_lookalikes() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let payload = json!({
+            "state": {"short_id": "MBAІ", "reset_ts": 0.0, "instances": {}},
+            "events": [{"id": 1, "type": "message", "instance": "michael", "ts": 1000.0,
+                        "data": {"from": "michael", "text": "lookalike device"}}]
+        });
+        let topic = "relay-test/evil-device";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let psk = fixture_psk();
+        handle_state_message(
+            &db,
+            "evil-device",
+            &envelope,
+            "own-device",
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut ReplayGuard::default(),
+            },
+        );
+        let messages: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            messages, 0,
+            "malformed device identity must not enter history"
+        );
+        assert!(safe_kv_get(&db, "relay_short_MBAІ").is_none());
+    }
 
     fn fixture_psk() -> [u8; 32] {
         [0x33; 32]

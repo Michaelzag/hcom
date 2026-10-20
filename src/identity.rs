@@ -127,46 +127,105 @@ pub fn reserved_operator_refusal(name: &str) -> Option<String> {
         })
 }
 
-/// Sender names a connector owns: person and channel rows. Only the
-/// connector speaks or listens for them. Derived from the rows themselves
-/// ([`crate::hosted::is_hosted_tool`]), so a name a connector hosts tomorrow
-/// is protected without a code change. Case-insensitive, bare or with a
-/// device suffix.
-pub fn hosted_participant_refusal(db: &HcomDb, name: &str) -> Option<String> {
+/// External labels use the existing ASCII mention alphabet, with an optional
+/// canonical device suffix. Reject lookalikes instead of trimming or folding
+/// Unicode into a different identity.
+pub fn validate_sender_label(name: &str) -> Result<(), HcomError> {
+    let (base, suffix) = name
+        .split_once(':')
+        .map_or((name, None), |(base, suffix)| (base, Some(suffix)));
+    if name.is_empty()
+        || name.len() > 50
+        || base.is_empty()
+        || !base
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        || suffix.is_some_and(|s| {
+            s.len() != 4
+                || !s
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        })
+    {
+        return Err(HcomError::InvalidInput(
+            "Invalid sender name: use 1-50 ASCII letters, digits, underscores, dots or hyphens, optionally followed by :SHORT (four uppercase letters/digits).".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reservations survive mirror expiry and connector shutdown. Every database
+/// error is an error, never permission to mint the name.
+pub fn hosted_participant_refusal(db: &HcomDb, name: &str) -> Result<Option<String>, HcomError> {
     let bare = name.split_once(':').map_or(name, |(base, _)| base);
+    let reserved: bool = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM hosted_names WHERE name = ?1 COLLATE NOCASE)",
+            [bare],
+            |row| row.get(0),
+        )
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+    if reserved {
+        return Ok(Some(format!(
+            "'{name}' is reserved for a connector-hosted participant; only its connector may use that identity."
+        )));
+    }
+    // Also inspect current rows: protects stores written by an older process
+    // and fails closed if their schema or row values cannot be read.
     let mut stmt = db
         .conn()
         .prepare_cached("SELECT name, tool FROM instances")
-        .ok()?;
-    let mut rows = stmt.query([]).ok()?;
-    while let Ok(Some(row)) = rows.next() {
-        let (Ok(row_name), Ok(tool)) = (row.get::<_, String>(0), row.get::<_, String>(1)) else {
-            continue;
-        };
-        if !crate::hosted::is_hosted_tool(&tool) {
-            continue;
-        }
-        let row_bare = row_name
-            .split_once(':')
-            .map_or(row_name.as_str(), |(base, _)| base);
-        if bare.eq_ignore_ascii_case(row_bare) {
-            return Some(format!(
-                "'{name}' is a connector-hosted participant and cannot be used as a sender. Only its connector speaks for it."
-            ));
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?
+    {
+        let row_name = row
+            .get_ref(0)
+            .and_then(|v| v.as_str().map_err(Into::into))
+            .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+        let tool = row
+            .get_ref(1)
+            .and_then(|v| v.as_str().map_err(Into::into))
+            .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+        if crate::hosted::is_hosted_tool(tool)
+            && bare
+                .eq_ignore_ascii_case(row_name.split_once(':').map_or(row_name, |(base, _)| base))
+        {
+            return Ok(Some(format!(
+                "'{name}' is a connector-hosted participant; only its connector may use that identity."
+            )));
         }
     }
-    None
+    Ok(None)
 }
 
-/// Sender policy for every name the CLI mints as a sender (`--from`, and
-/// `--as` on a subscription whose `--on-hit` message goes out from its
-/// caller): the operator alias and connector-hosted participants are not
-/// CLI-reachable senders.
+/// Common policy for CLI-created senders and subscription on-hit callers.
 pub fn validate_sender_name(db: &HcomDb, name: &str) -> Result<(), HcomError> {
+    validate_sender_label(name)?;
     if let Some(refusal) = reserved_operator_refusal(name) {
         return Err(HcomError::InvalidInput(refusal));
     }
-    if let Some(refusal) = hosted_participant_refusal(db, name) {
+    if let Some(refusal) = hosted_participant_refusal(db, name)? {
+        return Err(HcomError::InvalidInput(refusal));
+    }
+    Ok(())
+}
+
+/// Shared row-creation gate for start, launch, resume/fork and hook recovery.
+/// Connector registration deliberately uses its own in-process writer.
+pub fn validate_new_identity_name(db: &HcomDb, name: &str) -> Result<(), HcomError> {
+    if !is_valid_base_name(name) || name.len() > 50 {
+        return Err(HcomError::InvalidInput(base_name_error(name)));
+    }
+    validate_sender_name(db, name)?;
+    if let Some(refusal) = crate::instance_names::remote_name_refusal(db, name)
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?
+    {
         return Err(HcomError::InvalidInput(refusal));
     }
     Ok(())
@@ -374,9 +433,7 @@ pub fn remote_history_hint(db: &HcomDb, name: &str) -> Option<String> {
 /// 2. Agent ID (UUID) lookup -> kind=Instance if found
 /// 3. Error if not found
 pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, HcomError> {
-    if let Some(refusal) = reserved_operator_refusal(name) {
-        return Err(HcomError::InvalidInput(refusal));
-    }
+    validate_sender_name(db, name)?;
 
     let mut resolved_name = name.to_string();
 
@@ -388,14 +445,10 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
             None => return Err(HcomError::InvalidInput(base_name_error(name))),
         }
     }
+    validate_sender_name(db, &resolved_name)?;
 
     // 1. Instance name lookup (exact match)
     if let Ok(Some(data)) = db.get_instance(&resolved_name) {
-        if crate::hosted::is_hosted_tool(data.get("tool").and_then(|v| v.as_str()).unwrap_or("")) {
-            return Err(HcomError::InvalidInput(format!(
-                "'{resolved_name}' is a connector-hosted participant; --name cannot use it. Only its connector may speak or listen for it."
-            )));
-        }
         crate::log::log_info(
             "identity",
             "resolve_from_name",
@@ -417,11 +470,7 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
     if let Ok(Some(instance_name)) = db.get_instance_by_agent_id(&resolved_name)
         && let Ok(Some(data)) = db.get_instance(&instance_name)
     {
-        if crate::hosted::is_hosted_tool(data.get("tool").and_then(|v| v.as_str()).unwrap_or("")) {
-            return Err(HcomError::InvalidInput(format!(
-                "'{instance_name}' is a connector-hosted participant; --name cannot use it. Only its connector may speak or listen for it."
-            )));
-        }
+        validate_sender_name(db, &instance_name)?;
         crate::log::log_info(
             "identity",
             "resolve_from_name",
@@ -727,6 +776,106 @@ pub fn require_identity_gate(
 mod tests {
     use super::*;
 
+    #[test]
+    fn review_sender_policy_fails_closed_on_database_error() {
+        let (db, _dir) = make_test_db();
+        db.conn().execute_batch("DROP TABLE instances").unwrap();
+        assert!(validate_sender_name(&db, "build_alarm").is_err());
+    }
+
+    #[test]
+    fn review_hosted_ownership_outlives_registration_row() {
+        let (db, _dir) = make_test_db();
+        crate::hosted::register_hosted(&db, "michael", crate::hosted::HOSTED_TOOL_BUZZ).unwrap();
+        db.delete_instance("michael").unwrap();
+        assert!(validate_sender_name(&db, "michael").is_err());
+        assert!(validate_sender_name(&db, "MICHAEL:MBAI").is_err());
+        assert!(validate_sender_name(&db, "michael_alert").is_ok());
+        crate::hosted::register_hosted(&db, "michael", crate::hosted::HOSTED_TOOL_BUZZ).unwrap();
+    }
+
+    #[test]
+    fn review_sender_labels_reject_control_and_unicode_lookalikes() {
+        let (db, _dir) = make_test_db();
+        for name in [
+            "cron\0",
+            "cron\t",
+            "cron\n",
+            "cron ",
+            "crоn",
+            "cron\u{200b}",
+            "cron:ABCD:EFGH",
+        ] {
+            assert!(validate_sender_name(&db, name).is_err(), "{name:?}");
+        }
+        for name in [
+            "build_alarm:BOXE",
+            "fleet-recovery",
+            "mnemopi-split-watch",
+            "build.alert",
+        ] {
+            assert!(validate_sender_name(&db, name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn review_shared_row_writer_refuses_protected_identities() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (db, _tmp) = make_test_db();
+        crate::hosted::register_hosted(&db, "michael", crate::hosted::HOSTED_TOOL_BUZZ).unwrap();
+        for name in ["bigboss", "BigBoss", "michael", "Michael", "michael "] {
+            assert!(
+                !crate::instance_binding::initialize_instance_in_position_file(
+                    &db,
+                    name,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("adhoc"),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                "row writer accepted {name:?}"
+            );
+        }
+        assert_eq!(
+            db.get_instance_full("michael").unwrap().unwrap().tool,
+            "buzz"
+        );
+    }
+
+    #[test]
+    fn review_upgrade_reserves_hosted_names_before_expiry() {
+        let (db, _tmp) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name, tool, status, created_at)
+             VALUES ('michael:MBAI', 'buzz', 'listening', 1.0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS remember_hosted_name_insert;
+             DROP TRIGGER IF EXISTS remember_hosted_name_update;
+             DROP TABLE IF EXISTS hosted_names;
+             PRAGMA user_version = 20;",
+            )
+            .unwrap();
+        let path = db.path().to_path_buf();
+        drop(db);
+        let db = HcomDb::open_at(&path).unwrap();
+        db.delete_instance("michael:MBAI").unwrap();
+        assert!(validate_sender_name(&db, "michael").is_err());
+    }
+
     fn make_test_db() -> (HcomDb, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
@@ -883,14 +1032,6 @@ mod tests {
 
         let err = resolve_from_name(&db, "nonexistent").unwrap_err();
         assert!(err.to_string().contains("not found"));
-    }
-
-    #[test]
-    fn test_resolve_from_name_invalid() {
-        let (db, _dir) = make_test_db();
-
-        let err = resolve_from_name(&db, "Invalid-Name!").unwrap_err();
-        assert!(err.to_string().contains("Invalid instance name"));
     }
 
     // ── resolve_identity tests ─────────────────────────────────────────

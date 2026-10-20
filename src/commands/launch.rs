@@ -48,6 +48,11 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     {
         bail!("--as value '{name}' must not contain ':' (that form addresses a remote device)");
     }
+    if let Some(name) = hcom_flags.as_name.as_deref()
+        && (!crate::identity::is_valid_base_name(name) || name.len() > 50)
+    {
+        bail!("{}", crate::identity::base_name_error(name));
+    }
 
     let tag = hcom_flags.tag;
     let terminal = hcom_flags.terminal;
@@ -1192,7 +1197,7 @@ mod tests {
     fn test_as_name_is_refused_on_remote_launch() {
         // The remote path never builds LaunchParams, so an explicit name
         // there must be refused rather than silently dropped.
-        let argv = s(&["omp", "--device", "BOXE", "--dir", ".", "--as", "X"]);
+        let argv = s(&["omp", "--device", "BOXE", "--dir", ".", "--as", "x"]);
         let err = run(
             &argv,
             &crate::router::GlobalFlags {
