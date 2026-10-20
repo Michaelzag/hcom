@@ -912,9 +912,17 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::archive::cmd_archive(&db, &args, Some(&ctx))
         ),
-        "reset" => clap_dispatch!(crate::commands::reset::ResetArgs, cmd, &cmd_argv, |args| {
-            crate::commands::reset::cmd_reset(&db, &args, Some(&ctx))
-        }),
+        // `reset` takes `db` by value and returns early: it must close the
+        // handle before the archive unlinks the database, so the post-command
+        // delivery below (which borrows `db`) must not run for it.
+        "reset" => {
+            return clap_dispatch!(
+                crate::commands::reset::ResetArgs,
+                cmd,
+                &cmd_argv,
+                move |args| { crate::commands::reset::cmd_reset(db, &args, Some(&ctx)) }
+            );
+        }
         "hooks" => clap_dispatch!(crate::commands::hooks::HooksArgs, cmd, &cmd_argv, |args| {
             crate::commands::hooks::cmd_hooks(&db, &args, Some(&ctx))
         }),
