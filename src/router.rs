@@ -754,6 +754,15 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         return crate::commands::daemon::cmd_daemon(&cmd_argv[1..]);
     }
 
+    // `relay push` is an internal fast-path that only wakes the relay daemon
+    // (a KV port read and a TCP connect) or spawns the worker. It must not
+    // HOLD the database open: stop/send/bundle spawn `hcom relay push` as a
+    // fire-and-forget child, and a handle held by that child raced `hcom
+    // reset`'s unlink of the database files on Windows (sharing violation).
+    if cmd == "relay" && cmd_argv.first().map(|s| s.as_str()) == Some("push") {
+        return crate::commands::relay::relay_push();
+    }
+
     // `update --refresh-cache` only rewrites the update-notice flag file; it
     // must not open the database. The stale-cache background child would
     // otherwise race its parent's own fresh-store schema init and lose with

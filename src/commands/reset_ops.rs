@@ -67,6 +67,31 @@ pub(crate) fn archive_and_clear_db() -> Result<Option<String>, String> {
     Ok(Some(session_archive.to_string_lossy().to_string()))
 }
 
+/// Remove one database file, tolerating same-host holders that release it
+/// within the retry window. `hcom reset` itself spawns fire-and-forget
+/// `hcom relay push` children during its stop step, and Windows refuses to
+/// delete a file any handle still holds — a self-inflicted, millisecond-scale
+/// race, not a foreign holder. Bounded retries cover it; a holder that
+/// persists still fails loud with the original message.
+fn remove_file_with_retry(path: &std::path::Path) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "could not remove {}: {err}. Stop other hcom processes using this database and retry",
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
 fn remove_database_files(
     db_file: &std::path::Path,
     db_wal: &std::path::Path,
@@ -75,16 +100,7 @@ fn remove_database_files(
     // Remove sidecars first and the primary DB last. If a sidecar is locked,
     // leave the primary database intact rather than creating a partial reset.
     for path in [db_wal, db_shm, db_file] {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(format!(
-                    "could not remove {}: {err}. Stop other hcom processes using this database and retry",
-                    path.display()
-                ));
-            }
-        }
+        remove_file_with_retry(path)?;
     }
     Ok(())
 }
