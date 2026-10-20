@@ -525,6 +525,7 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
             )
             .optional()?;
         if let Some(name) = existing {
+            crate::identity::validate_protected_identity(db, &name)?;
             txn.execute(
                 "UPDATE instances
                  SET parent_session_id = ?, parent_name = ?, tag = ?, directory = ?,
@@ -571,6 +572,7 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
                 .optional()?
                 .is_none()
         {
+            crate::identity::validate_new_identity_name(db, &candidate)?;
             txn.execute(
                 "INSERT INTO instances
                  (name, session_id, parent_session_id, parent_name, tag, agent_id,
@@ -613,6 +615,7 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
         }
 
         let candidate = format!("{pattern}{}", max_n + 1);
+        crate::identity::validate_new_identity_name(db, &candidate)?;
         txn.execute(
             "INSERT INTO instances \
              (name, session_id, parent_session_id, parent_name, tag, agent_id, \

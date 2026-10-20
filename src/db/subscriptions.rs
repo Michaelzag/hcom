@@ -744,17 +744,22 @@ pub(crate) fn process_logged_event_collected(
         let _ = send_sub_notification(db, caller, &notification, post);
 
         if let Some(on_hit_text) = sub.get("on_hit_text").and_then(|v| v.as_str()) {
-            if let Err(error) = crate::identity::validate_sender_name(db, caller) {
+            let caller_kind = sub
+                .get("caller_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("external");
+            let validation = if caller_kind == "instance" {
+                crate::identity::validate_protected_identity(db, caller)
+            } else {
+                crate::identity::validate_sender_name(db, caller)
+            };
+            if let Err(error) = validation {
                 crate::log::log_warn(
                     "db",
                     "subscription.sender_refused",
                     &format!("subscription={sub_id}: {error}"),
                 );
             } else {
-                let caller_kind = sub
-                    .get("caller_kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("external");
                 if let Err(e) =
                     send_message_as_collected(db, caller, caller_kind, on_hit_text, post)
                 {

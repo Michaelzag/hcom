@@ -161,8 +161,15 @@ pub fn hosted_participant_refusal(db: &HcomDb, name: &str) -> Result<Option<Stri
     let reserved: bool = db
         .conn()
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM hosted_names WHERE name = ?1 COLLATE NOCASE)",
-            [bare],
+            "SELECT EXISTS(
+                SELECT 1 FROM hosted_names WHERE name = ?1 COLLATE NOCASE
+                UNION ALL
+                SELECT 1 FROM instances WHERE tool = ?2 AND
+                    CASE WHEN instr(name, ':') > 0
+                        THEN substr(name, 1, instr(name, ':') - 1) ELSE name END
+                    = ?1 COLLATE NOCASE
+             )",
+            rusqlite::params![bare, crate::hosted::HOSTED_TOOL_BUZZ],
             |row| row.get(0),
         )
         .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
@@ -171,42 +178,18 @@ pub fn hosted_participant_refusal(db: &HcomDb, name: &str) -> Result<Option<Stri
             "'{name}' is reserved for a connector-hosted participant; only its connector may use that identity."
         )));
     }
-    // Also inspect current rows: protects stores written by an older process
-    // and fails closed if their schema or row values cannot be read.
-    let mut stmt = db
-        .conn()
-        .prepare_cached("SELECT name, tool FROM instances")
-        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| HcomError::DatabaseError(e.to_string()))?
-    {
-        let row_name = row
-            .get_ref(0)
-            .and_then(|v| v.as_str().map_err(Into::into))
-            .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
-        let tool = row
-            .get_ref(1)
-            .and_then(|v| v.as_str().map_err(Into::into))
-            .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
-        if crate::hosted::is_hosted_tool(tool)
-            && bare
-                .eq_ignore_ascii_case(row_name.split_once(':').map_or(row_name, |(base, _)| base))
-        {
-            return Ok(Some(format!(
-                "'{name}' is a connector-hosted participant; only its connector may use that identity."
-            )));
-        }
-    }
     Ok(None)
 }
 
-/// Common policy for CLI-created senders and subscription on-hit callers.
+/// Validate caller-supplied external labels when they are minted or claimed.
 pub fn validate_sender_name(db: &HcomDb, name: &str) -> Result<(), HcomError> {
     validate_sender_label(name)?;
+    validate_protected_identity(db, name)
+}
+
+/// Check ownership, not input limits, when using an existing identity.
+/// Generated subagent names can legally exceed a CLI label's length bound.
+pub fn validate_protected_identity(db: &HcomDb, name: &str) -> Result<(), HcomError> {
     if let Some(refusal) = reserved_operator_refusal(name) {
         return Err(HcomError::InvalidInput(refusal));
     }
@@ -218,11 +201,13 @@ pub fn validate_sender_name(db: &HcomDb, name: &str) -> Result<(), HcomError> {
 
 /// Shared row-creation gate for start, launch, resume/fork and hook recovery.
 /// Connector registration deliberately uses its own in-process writer.
+/// CLI input bounds are enforced at the claim edges; internally generated
+/// `{parent}_{type}_{N}` identities can be longer and must remain usable.
 pub fn validate_new_identity_name(db: &HcomDb, name: &str) -> Result<(), HcomError> {
-    if !is_valid_base_name(name) || name.len() > 50 {
+    if !is_valid_base_name(name) {
         return Err(HcomError::InvalidInput(base_name_error(name)));
     }
-    validate_sender_name(db, name)?;
+    validate_protected_identity(db, name)?;
     if let Some(refusal) = crate::instance_names::remote_name_refusal(db, name)
         .map_err(|e| HcomError::DatabaseError(e.to_string()))?
     {
@@ -433,7 +418,9 @@ pub fn remote_history_hint(db: &HcomDb, name: &str) -> Option<String> {
 /// 2. Agent ID (UUID) lookup -> kind=Instance if found
 /// 3. Error if not found
 pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, HcomError> {
-    validate_sender_name(db, name)?;
+    if let Some(refusal) = reserved_operator_refusal(name) {
+        return Err(HcomError::InvalidInput(refusal));
+    }
 
     let mut resolved_name = name.to_string();
 
@@ -445,10 +432,10 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
             None => return Err(HcomError::InvalidInput(base_name_error(name))),
         }
     }
-    validate_sender_name(db, &resolved_name)?;
 
     // 1. Instance name lookup (exact match)
     if let Ok(Some(data)) = db.get_instance(&resolved_name) {
+        validate_protected_identity(db, &resolved_name)?;
         crate::log::log_info(
             "identity",
             "resolve_from_name",
@@ -470,7 +457,7 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
     if let Ok(Some(instance_name)) = db.get_instance_by_agent_id(&resolved_name)
         && let Ok(Some(data)) = db.get_instance(&instance_name)
     {
-        validate_sender_name(db, &instance_name)?;
+        validate_protected_identity(db, &instance_name)?;
         crate::log::log_info(
             "identity",
             "resolve_from_name",
@@ -492,6 +479,7 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
     }
 
     // 3. Not found
+    validate_protected_identity(db, &resolved_name)?;
     crate::log::log_info(
         "identity",
         "resolve_from_name.not_found",

@@ -76,6 +76,105 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    #[serial_test::serial]
+    fn long_generated_subagent_resolves_by_name_id_and_capability() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let temp = TempDir::new().unwrap();
+        let db = HcomDb::open_raw(&temp.path().join("long-actor.db")).unwrap();
+        db.init_db().unwrap();
+        let parent = "p".repeat(45);
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name, session_id, tool, created_at)
+             VALUES (?1, 'sess-long-parent', 'claude', 1.0)",
+                [&parent],
+            )
+            .unwrap();
+        let child = crate::instance_names::allocate_subagent_instance(
+            &db,
+            &crate::instance_names::SubagentAllocation {
+                agent_id: "a6d9caf",
+                agent_type: "task",
+                parent_name: &parent,
+                parent_session_id: Some("sess-long-parent"),
+                parent_tag: None,
+                status: "active",
+                status_context: None,
+            },
+        )
+        .unwrap();
+        // This real allocator produces a 52-byte identity from a legal parent.
+        for selector in [child.as_str(), "a6d9caf"] {
+            let actor = identity::resolve_from_name(&db, selector).unwrap();
+            assert_eq!(actor.name, child);
+        }
+        let token = db
+            .issue_claude_actor_capability("sess-long-parent", "long-tool", Some("a6d9caf"), &child)
+            .unwrap();
+        let actor = resolve_actor_from_env(
+            &db,
+            &env(&[(ENV_VAR, &token), (SESSION_ENV_VAR, "sess-long-parent")]),
+        )
+        .unwrap()
+        .expect("capability resolves the generated child");
+        assert_eq!(actor.name, child);
+        let ctx = crate::cli_context::build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some(&child),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ctx.identity.as_ref().unwrap().name, child);
+        // Existing-instance subscriptions must retain the same identity too.
+        use clap::Parser;
+        let args = crate::commands::events::EventsArgs::try_parse_from([
+            "events",
+            "sub",
+            "--type",
+            "message",
+            "--from",
+            "nova",
+            "--once",
+            "--on-hit",
+            "long child callback",
+        ])
+        .unwrap();
+        assert_eq!(
+            crate::commands::events::cmd_events(&db, &args, Some(&ctx)),
+            0
+        );
+        db.log_event(
+            "message",
+            "nova",
+            &serde_json::json!({
+                "from": "nova", "sender_kind": "instance", "scope": "broadcast", "text": "trigger",
+            }),
+        )
+        .unwrap();
+        let callbacks: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'
+             AND json_extract(data, '$.from') = ?1
+             AND json_extract(data, '$.text') = 'long child callback'",
+                [&child],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            callbacks, 1,
+            "the stored instance sender is not an external label"
+        );
+        assert!(
+            identity::validate_sender_name(&db, &child).is_err(),
+            "a caller minting an external label still observes its input limit"
+        );
+    }
+
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()

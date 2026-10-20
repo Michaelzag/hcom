@@ -497,7 +497,9 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
             }
         }
     };
-    if let Err(e) = crate::identity::validate_sender_label(&caller) {
+    if (args.from_bigboss || args.as_name.is_some())
+        && let Err(e) = crate::identity::validate_sender_label(&caller)
+    {
         eprintln!("Error: {e}");
         return 1;
     }
@@ -506,7 +508,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
     // caller is a sender identity: the CLI mints neither the operator alias
     // nor a connector-hosted name.
     if args.on_hit.is_some()
-        && let Err(e) = crate::identity::validate_sender_name(db, &caller)
+        && let Err(e) = crate::identity::validate_protected_identity(db, &caller)
     {
         eprintln!("Error: {e}");
         return 1;
@@ -611,7 +613,7 @@ fn cmd_events_sub_remote_create(db: &HcomDb, args: &EventsSubArgs, device: &str)
             }
         }
     };
-    if let Err(e) = crate::identity::validate_sender_label(&caller) {
+    if caller_is_external && let Err(e) = crate::identity::validate_sender_label(&caller) {
         eprintln!("Error: {e}");
         return 1;
     }
@@ -619,7 +621,7 @@ fn cmd_events_sub_remote_create(db: &HcomDb, args: &EventsSubArgs, device: &str)
     // Same sender policy as the local path: an `--on-hit` message goes out
     // from `caller` on the remote device, and that device enforces this too.
     if args.on_hit.is_some()
-        && let Err(e) = crate::identity::validate_sender_name(db, &caller)
+        && let Err(e) = crate::identity::validate_protected_identity(db, &caller)
     {
         eprintln!("Error: {e}");
         return 1;

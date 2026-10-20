@@ -1299,7 +1299,9 @@ fn handle_remote_sub_create(
             })
             .ok_or_else(|| format!("caller '{caller_input}' not found on this device"))?
     };
-    crate::identity::validate_sender_label(&caller).map_err(|e| e.to_string())?;
+    if caller_is_external {
+        crate::identity::validate_sender_label(&caller).map_err(|e| e.to_string())?;
+    }
 
     let mut filters: crate::core::filters::FilterMap = match params.get("filters") {
         Some(v) if !v.is_null() => {
@@ -1329,7 +1331,7 @@ fn handle_remote_sub_create(
     // caller is a sender identity here: no peer mints this device's operator
     // alias or its connector-hosted names.
     if on_hit.is_some()
-        && let Err(e) = crate::identity::validate_sender_name(db, &caller)
+        && let Err(e) = crate::identity::validate_protected_identity(db, &caller)
     {
         return Err(e.to_string());
     }

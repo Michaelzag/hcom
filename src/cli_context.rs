@@ -45,6 +45,7 @@ pub fn build_ctx_for_command(
     if let (Some(actor), Some(name)) = (verified_actor.as_ref(), explicit_name) {
         claude_actor::ensure_explicit_matches(db, actor, name)?;
     }
+    let inferred_identity = verified_actor.is_none() && explicit_name.is_none();
 
     let identity = if let Some(actor) = verified_actor {
         Some(actor)
@@ -69,10 +70,11 @@ pub fn build_ctx_for_command(
     };
     // Recheck inferred identities too: a process binding left by an older
     // version must not keep speaking/listening as a now-protected name.
-    if let Some(id) = &identity
+    if inferred_identity
+        && let Some(id) = &identity
         && matches!(id.kind, SenderKind::Instance)
     {
-        identity::validate_sender_name(db, &id.name)?;
+        identity::validate_protected_identity(db, &id.name)?;
     }
 
     Ok(CommandContext {
