@@ -293,14 +293,20 @@ pub fn dispatch_pi_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
             );
         }
     };
-    if !common::hook_gate_check(&mut ctx, &db) {
-        return (0, String::new());
-    }
     let handler_argv: Vec<String> = if !argv.is_empty() && argv[0] == hook_name {
         argv[1..].to_vec()
     } else {
         argv.to_vec()
     };
+    // Any explicit --name naming a protected identity is refused before the
+    // handler match (and before the activity gate, so the refusal is visible
+    // even against an empty database).
+    if let Some(refusal) = common::protected_hook_name_refusal(&db, &handler_argv) {
+        return refusal;
+    }
+    if !common::hook_gate_check(&mut ctx, &db) {
+        return (0, String::new());
+    }
     let hook_name_owned = hook_name.to_string();
     let handler_start = Instant::now();
     let (exit_code, output) = common::dispatch_with_panic_guard(

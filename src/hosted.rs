@@ -24,10 +24,14 @@
 //! not posted yet. Hence [`RegisterOutcome::Refreshed`], which touches liveness
 //! only.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use anyhow::{Result, bail};
 use serde_json::json;
 
 use crate::db::HcomDb;
+use crate::shared::HcomError;
 use crate::shared::constants::{ST_INACTIVE, ST_LISTENING};
 
 /// The `tool` value a connector-hosted row carries.
@@ -126,6 +130,200 @@ pub(crate) fn install_name_registry(conn: &rusqlite::Connection) -> Result<()> {
              AND (json_extract(data, '$.snapshot.tool') = '{tool}'
                  OR json_extract(data, '$.context') GLOB 'buzz:*');"
     ))?;
+    // Reconcile with the reset-surviving registry in both directions: seed the
+    // table from it (a fresh or reset database starts closed, not empty) and
+    // carry the union back out (a name recorded only in this database reaches
+    // the durable file before anything can delete the database). Best effort:
+    // claim checks consult the file directly, so a failure here logs loudly
+    // without blocking schema install.
+    if let Err(e) = seed_name_registry_from_file(conn) {
+        crate::log::log_warn("hosted", "name_registry.seed_failed", &format!("{e}"));
+    }
+    if let Err(e) = carry_hosted_names_forward(conn) {
+        crate::log::log_warn("hosted", "name_registry.carry_failed", &format!("{e}"));
+    }
+    Ok(())
+}
+
+/// The durable reservation registry: `hosted-names.json` beside the database.
+///
+/// The SQL reservation set (`hosted_names`, its triggers, the history
+/// backfill) lives inside `hcom.db`, so `hcom reset` — which archives and
+/// deletes exactly that file — emptied it and reopened the impersonation
+/// window until the connector or a mirror re-registered every person. This
+/// file is the copy reset cannot touch: every registration and mirror import
+/// writes it, [`install_name_registry`] reconciles it with the table in both
+/// directions, and `hcom reset` carries reservations forward before deleting
+/// the database. All three reset flavors only remove `hcom.db*`, config files
+/// and `.tmp`/`flags` artifacts, so a registry beside the database survives.
+const HOSTED_NAMES_FILE: &str = "hosted-names.json";
+
+/// Reservation matching shape: bare (any `:SHORT` device suffix dropped) and
+/// lowercased — the same normalized form `hosted_names` stores, so every
+/// case/suffix spelling of a registered name matches.
+fn normalized_hosted_name(name: &str) -> String {
+    let bare = name.split_once(':').map_or(name, |(base, _)| base);
+    bare.to_lowercase()
+}
+
+fn hosted_names_file_for(db_file: &Path) -> std::path::PathBuf {
+    db_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(HOSTED_NAMES_FILE)
+}
+
+/// The registry lives beside a real database file. In-memory handles
+/// (`:memory:`, which reports itself as its own "path") have no durable
+/// neighbor: their registry is definitionally empty and their writes are
+/// no-ops. The database-side check still governs them.
+fn registry_applies(db_file: &Path) -> bool {
+    let text = db_file.as_os_str();
+    text != ":memory:" && !text.is_empty()
+}
+
+/// Normalized name -> name as first registered. A missing file is an empty
+/// registry (pre-upgrade installs); a read or parse error is an error, never
+/// permission to mint the name.
+fn load_hosted_names_registry(db_file: &Path) -> Result<BTreeMap<String, String>, HcomError> {
+    if !registry_applies(db_file) {
+        return Ok(BTreeMap::new());
+    }
+    let path = hosted_names_file_for(db_file);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(HcomError::DatabaseError(format!(
+                "reserved-name registry {} unreadable: {e}",
+                path.display()
+            )));
+        }
+    };
+    serde_json::from_str(&content).map_err(|e| {
+        HcomError::DatabaseError(format!(
+            "reserved-name registry {} unparsable: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn write_hosted_names_registry(
+    db_file: &Path,
+    names: &BTreeMap<String, String>,
+) -> Result<(), HcomError> {
+    if !registry_applies(db_file) {
+        return Ok(());
+    }
+    let path = hosted_names_file_for(db_file);
+    let body = serde_json::to_string(names)
+        .map_err(|e| HcomError::DatabaseError(format!("reserved-name registry encode failed: {e}")))?;
+    crate::paths::atomic_write_io(&path, &body).map_err(|e| {
+        HcomError::DatabaseError(format!(
+            "reserved-name registry {} unwritable: {e}",
+            path.display()
+        ))
+    })
+}
+
+/// Merge `name` into the durable registry. Deduplicated on the normalized
+/// form; concurrent first registrations may each rewrite the file, so the
+/// database reservation (and the carry-forward above) remains the authority
+/// that re-derives anything a lost write dropped.
+pub(crate) fn persist_hosted_name(db_file: &Path, name: &str) -> Result<(), HcomError> {
+    let mut names = load_hosted_names_registry(db_file)?;
+    names
+        .entry(normalized_hosted_name(name))
+        .or_insert_with(|| name.to_string());
+    write_hosted_names_registry(db_file, &names)
+}
+
+/// True when the durable registry reserves `name`, whatever spelling was used.
+pub(crate) fn hosted_name_is_reserved(db_file: &Path, name: &str) -> Result<bool, HcomError> {
+    Ok(load_hosted_names_registry(db_file)?.contains_key(&normalized_hosted_name(name)))
+}
+
+fn collect_raw_names(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    out: &mut BTreeMap<String, String>,
+) -> Result<(), HcomError> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+    for row in rows {
+        let raw = row.map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+        out.entry(normalized_hosted_name(&raw)).or_insert(raw);
+    }
+    Ok(())
+}
+
+/// Every hosted name this database has recorded: the reservation table, live
+/// rows and the hosted event history — the same shapes [`install_name_registry`]
+/// seeds from.
+fn known_hosted_names(conn: &rusqlite::Connection) -> Result<BTreeMap<String, String>, HcomError> {
+    let tool = HOSTED_TOOL_BUZZ;
+    let mut names = BTreeMap::new();
+    // The table is absent on pre-v21 stores mid-reset; the row and history
+    // shapes below still capture their hosted names.
+    let has_registry: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hosted_names')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+    if has_registry {
+        collect_raw_names(conn, "SELECT name FROM hosted_names", &mut names)?;
+    }
+    collect_raw_names(
+        conn,
+        &format!("SELECT name FROM instances WHERE tool = '{tool}'"),
+        &mut names,
+    )?;
+    collect_raw_names(
+        conn,
+        &format!(
+            "SELECT instance FROM events WHERE instance != '' AND json_valid(data)
+             AND (json_extract(data, '$.snapshot.tool') = '{tool}'
+                  OR json_extract(data, '$.context') GLOB 'buzz:*')"
+        ),
+        &mut names,
+    )?;
+    Ok(names)
+}
+
+/// Union every hosted name this database knows into the durable registry
+/// (database -> file). Runs at schema install and, strictly, at `hcom reset`
+/// before the database is deleted.
+pub(crate) fn carry_hosted_names_forward(conn: &rusqlite::Connection) -> Result<(), HcomError> {
+    let Some(db_file) = conn.path() else {
+        return Ok(()); // in-memory stores have no durable neighbor
+    };
+    let db_file = Path::new(db_file);
+    let mut names = load_hosted_names_registry(db_file)?;
+    for (normalized, original) in known_hosted_names(conn)? {
+        names.entry(normalized).or_insert(original);
+    }
+    write_hosted_names_registry(db_file, &names)
+}
+
+/// Seed the reservation table from the durable registry (file -> database), so
+/// a fresh or reset database starts closed instead of empty.
+fn seed_name_registry_from_file(conn: &rusqlite::Connection) -> Result<(), HcomError> {
+    let Some(db_file) = conn.path() else {
+        return Ok(());
+    };
+    for normalized in load_hosted_names_registry(Path::new(db_file))?.keys() {
+        conn.execute(
+            "INSERT OR IGNORE INTO hosted_names(name) VALUES (?1)",
+            rusqlite::params![normalized],
+        )
+        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -295,6 +493,19 @@ pub fn register_hosted(db: &HcomDb, name: &str, tool: &str) -> Result<RegisterOu
     // Only the deferred effects run after commit: subscription TCP wakes and
     // the transition wakes collected above. Nothing here writes a row.
     post.fire(db);
+
+    // The database reservation (row plus trigger-captured `hosted_names`
+    // entry) dies with `hcom reset`; the durable registry must not. Best
+    // effort: the database reservation is active regardless, and the next
+    // carry-forward (reset, schema install) re-derives anything this write
+    // lost.
+    if let Err(e) = persist_hosted_name(db.path(), name) {
+        crate::log::log_error(
+            "hosted",
+            "name_registry.persist_failed",
+            &format!("instance={name} err={e}"),
+        );
+    }
 
     Ok(outcome)
 }
@@ -598,6 +809,66 @@ mod tests {
             .into_iter()
             .filter_map(|m| m.event_id)
             .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn durable_registry_outlives_the_database_and_matches_normalized_forms() {
+        let (db, db_path, _dir, _guard) = setup_test_db();
+
+        // Captured by the row trigger alone (no registration call): the name
+        // must still reach the durable registry before any reset.
+        db.conn()
+            .execute_batch(
+                "INSERT INTO instances (name, tool, status, created_at)
+                 VALUES ('michael:ABCD', 'buzz', 'listening', 1000.0);",
+            )
+            .unwrap();
+        carry_hosted_names_forward(db.conn()).unwrap();
+        drop(db);
+
+        // What `hcom reset` does to the database.
+        std::fs::remove_file(&db_path).unwrap();
+        for spelling in ["michael", "Michael", "MICHAEL:MBAI"] {
+            assert!(
+                hosted_name_is_reserved(&db_path, spelling).unwrap(),
+                "{spelling} must stay reserved after the database is gone"
+            );
+        }
+        assert!(!hosted_name_is_reserved(&db_path, "michael_alert").unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn fresh_database_seeds_the_reservation_table_from_the_registry() {
+        let (db, db_path, _dir, _guard) = setup_test_db();
+        persist_hosted_name(&db_path, "michael").unwrap();
+
+        // No rows exist; the seed alone must close both halves of the check.
+        install_name_registry(db.conn()).unwrap();
+        let reserved: bool = db
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM hosted_names WHERE name = 'michael')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(reserved);
+        assert!(
+            crate::identity::hosted_participant_refusal(&db, "michael")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn corrupt_registry_is_an_error_never_permission_to_mint() {
+        let (db, db_path, _dir, _guard) = setup_test_db();
+        std::fs::write(hosted_names_file_for(&db_path), "{ not json").unwrap();
+        assert!(hosted_name_is_reserved(&db_path, "anything").is_err());
+        assert!(crate::identity::validate_protected_identity(&db, "anything").is_err());
     }
 
     #[test]

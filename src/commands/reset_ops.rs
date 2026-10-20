@@ -20,6 +20,16 @@ pub(crate) fn archive_and_clear_db() -> Result<Option<String>, String> {
         return Ok(None);
     }
 
+    // Carry hosted-name reservations into the durable registry before the
+    // database goes away. Strict: losing them would reopen the impersonation
+    // window this registry exists to close, so a failed carry aborts the
+    // reset with the database left intact.
+    {
+        let conn = rusqlite::Connection::open(&db_file).map_err(|e| e.to_string())?;
+        crate::hosted::carry_hosted_names_forward(&conn)
+            .map_err(|e| format!("could not preserve hosted-name reservations: {e}"))?;
+    }
+
     let has_content = {
         let conn = rusqlite::Connection::open(&db_file).map_err(|e| e.to_string())?;
         let event_count: i64 = conn

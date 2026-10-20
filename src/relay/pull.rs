@@ -416,8 +416,16 @@ pub fn handle_state_message(
         .unwrap_or_default();
 
     let mut seen_instances = std::collections::HashSet::new();
+    // Hosted rows mirrored in must reach the durable name registry too: the
+    // row trigger covers the database side, but the file is what survives a
+    // reset on this device.
+    let mut imported_hosted: Vec<String> = Vec::new();
 
     for (name, inst) in &instances {
+        let tool = inst.get("tool").and_then(|v| v.as_str()).unwrap_or("claude");
+        if crate::hosted::is_hosted_tool(tool) {
+            imported_hosted.push(name.clone());
+        }
         let status_time = inst
             .get("status_time")
             .and_then(|v| v.as_f64())
@@ -483,14 +491,25 @@ pub fn handle_state_message(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 inst.get("tag").and_then(|v| v.as_str()),
-                inst.get("tool")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("claude"),
+                tool,
                 inst.get("background")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
             ],
         );
+    }
+
+    // Mirror imports are a registration path like any other: the durable
+    // registry must know these names even if this database is reset before
+    // the next schema install re-derives them.
+    for name in &imported_hosted {
+        if let Err(e) = crate::hosted::persist_hosted_name(db.path(), name) {
+            crate::log::log_warn(
+                "relay",
+                "pull.hosted_name_persist_failed",
+                &format!("instance={name} err={e}"),
+            );
+        }
     }
 
     // Remove stale instances (no longer in remote state)

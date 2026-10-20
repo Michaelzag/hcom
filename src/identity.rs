@@ -178,6 +178,15 @@ pub fn hosted_participant_refusal(db: &HcomDb, name: &str) -> Result<Option<Stri
             "'{name}' is reserved for a connector-hosted participant; only its connector may use that identity."
         )));
     }
+    // The durable registry survives `hcom reset` and a deleted database, so a
+    // reset hub still refuses every name it has ever hosted, before any
+    // connector or mirror re-registers. Read errors are errors, never
+    // permission to mint the name.
+    if crate::hosted::hosted_name_is_reserved(db.path(), name)? {
+        return Ok(Some(format!(
+            "'{name}' is reserved for a connector-hosted participant; only its connector may use that identity."
+        )));
+    }
     Ok(None)
 }
 

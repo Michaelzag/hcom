@@ -128,6 +128,19 @@ pub fn run_pty(args: &[String]) -> Result<()> {
 
     let instance_name = config::Config::get().instance_name;
 
+    // `HCOM_INSTANCE_NAME` is caller-settable env, and the delivery loop reads
+    // and acks that row's mail into this terminal. A local process wrapping a
+    // tool as a connector-hosted participant or the operator would receive
+    // their private mail and move their cursor, so refuse before anything
+    // spawns. In-process owners (the connector, the TUI compose box) never
+    // come through the PTY wrapper.
+    if let Some(name) = instance_name.as_deref() {
+        let db = db::HcomDb::open().map_err(|e| anyhow::anyhow!("DB open failed: {e}"))?;
+        if let Err(error) = crate::identity::validate_protected_identity(&db, name) {
+            bail!("hcom pty: {error}");
+        }
+    }
+
     // Resolve tool to full path (PATH may be minimal in launched environments)
     let tool_exe = tool_str
         .parse::<tool::Tool>()
