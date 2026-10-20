@@ -424,7 +424,10 @@ const SEND_HELP: &[HelpEntry] = &[
     ),
     ("", ""),
     ("Sender:", ""),
-    ("  --from <name>", "External sender identity (alias: -b)"),
+    (
+        "  --from <name>",
+        "External sender identity (operator/hosted names refused)",
+    ),
     ("  --name <name>", "Your identity (agent name or UUID)"),
     ("", ""),
     ("Inline bundle (attach structured context):", ""),

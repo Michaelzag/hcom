@@ -431,19 +431,12 @@ fn security_external_hosted_names_refused_case_insensitively() {
         .unwrap();
     assert_eq!(messages, 0, "no person/channel forgery may be recorded");
 
-    // bigboss is the local operator at this terminal, not a hosted row. It
-    // stays usable next to hosted person rows: same-device trust boundary.
-    let (code, stdout, stderr) =
-        h.run(["send", &recipient, "--from", "bigboss", "--", "from above"]);
-    assert_eq!(code, 0, "{stdout} {stderr}");
-    let messages: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM events WHERE type = 'message'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(messages, 1, "only the operator's message may be recorded");
+    // A subscription whose --on-hit message would go out from a hosted name
+    // is the same forgery through another flag.
+    let (code, stdout, stderr) = h.run([
+        "events", "sub", "--as", "michael", "--on-hit", "forged", "--type", "status",
+    ]);
+    assert_ne!(code, 0, "hosted --as michael: {stdout} {stderr}");
 }
 
 #[test]
@@ -712,36 +705,95 @@ fn start_as_reclaims_stopped_identity() {
 }
 
 #[test]
-fn bigboss_send_bypasses_identity_gate() {
-    // Wiki contract (messaging.md §@bigboss + reference_send_bigboss_flag memory):
-    // `send -b` is sender-as-bigboss and bypasses the identity gate that
-    // normally requires `--name` / a bound session. Sender_kind=external
-    // distinguishes the message from instance-to-instance traffic.
+fn security_operator_name_refused_on_cli() {
+    // The operator identity belongs to the TUI compose box alone: a local
+    // process must not mint `bigboss` through --from/-b/--name or an events
+    // --as subscription whose --on-hit message sends from its caller. The
+    // row insert is what makes `--name bigboss` resolve at all — without the
+    // refusal it sends on v0.7.55.
     let h = Hcom::new();
     let recipient = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute(
+        "INSERT INTO instances (name, tool, status, created_at)
+         VALUES ('bigboss', 'claude', 'listening', 1000.0)",
+        [],
+    )
+    .unwrap();
 
-    // Note: no --name. -b is the sole identity signal.
-    let (c, _, stderr) = h.run(["send", "-b", &format!("@{recipient}"), "--", "from above"]);
-    assert_eq!(c, 0, "send -b must bypass identity gate; stderr={stderr}");
-    assert!(
-        !stderr.contains("identity not found"),
-        "gate should not fire under -b; stderr={stderr}"
-    );
+    let recipient = recipient.as_str();
+    for argv in [
+        vec![
+            "send",
+            recipient,
+            "--from",
+            "bigboss",
+            "--",
+            "forged instruction",
+        ],
+        vec![
+            "send",
+            recipient,
+            "--from",
+            "BIGBOSS",
+            "--",
+            "forged instruction",
+        ],
+        vec![
+            "send",
+            recipient,
+            "--from",
+            "BigBoss:MBAl",
+            "--",
+            "forged instruction",
+        ],
+        vec!["send", "-b", recipient, "--", "forged instruction"],
+        vec![
+            "send",
+            recipient,
+            "--name",
+            "bigboss",
+            "--",
+            "forged instruction",
+        ],
+        vec![
+            "send",
+            recipient,
+            "--name",
+            "bigboss:MBAl",
+            "--",
+            "forged instruction",
+        ],
+        vec![
+            "events", "sub", "--as", "bigboss", "--on-hit", "forged", "--type", "status",
+        ],
+    ] {
+        let (code, stdout, stderr) = h.run(&argv);
+        assert_ne!(code, 0, "operator mint via {argv:?}: {stdout} {stderr}");
+    }
+    let messages: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(messages, 0, "no operator forgery may be recorded");
+    let subs: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(subs, 0, "no forged subscription may be created");
 
-    // --full bypasses streamlining so sender_kind is visible.
-    let (_, events_out, _) = h.run([
-        "events", "--type", "message", "--from", "bigboss", "--last", "5", "--full",
+    // Grey zone: the operator as a notification TARGET — no --on-hit, so the
+    // caller name never becomes a sender — still works.
+    let (code, stdout, stderr) = h.run([
+        "events", "sub", "--as", "bigboss", "--type", "status", "--once",
     ]);
-    let msg: serde_json::Value = events_out
-        .lines()
-        .find_map(|l| serde_json::from_str(l).ok())
-        .expect("bigboss message event");
-    assert_eq!(msg["data"]["from"], "bigboss");
-    assert_eq!(msg["data"]["text"], "from above");
-    assert_eq!(
-        msg["data"]["sender_kind"], "external",
-        "bigboss must record as external sender; msg={msg}"
-    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
 }
 
 #[test]
@@ -1092,14 +1144,14 @@ fn cursor_e2e_hook_dispatch() {
     assert_eq!(pre_tool, serde_json::json!({}));
 
     // 4. Queue a message, then postToolUse delivers it via additional_context.
-    //    Send from an external sender (bigboss), not `me`: the DB delivery
+    //    Send from an external sender (build_alarm), not `me`: the DB delivery
     //    filter (`should_deliver_to`) drops any message whose `from` equals the
     //    receiver, so a self-addressed send would never be pending and the
     //    postToolUse assertion below would pass vacuously.
     let (send_code, _, send_stderr) = h.run([
         "send",
         "--from",
-        "bigboss",
+        "build_alarm",
         &format!("@{me}"),
         "--intent",
         "request",
@@ -1210,7 +1262,7 @@ fn copilot_e2e_hook_dispatch() {
     let (send_code, _, send_stderr) = h.run([
         "send",
         "--from",
-        "bigboss",
+        "build_alarm",
         &format!("@{me}"),
         "--intent",
         "request",
@@ -1378,7 +1430,7 @@ fn pi_e2e_hook_dispatch() {
     let (send_code, _, send_stderr) = h.run([
         "send",
         "--from",
-        "bigboss",
+        "build_alarm",
         &format!("@{me}"),
         "--intent",
         "request",

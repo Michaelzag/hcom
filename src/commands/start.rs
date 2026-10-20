@@ -440,6 +440,23 @@ fn start_rebind(
         None
     };
 
+    // Guard: the operator alias and connector-hosted rows are sender
+    // identities, not reclaimable seats. Claiming one with --as would put a
+    // local process behind a name it could then speak as.
+    if let Some(refusal) = crate::identity::reserved_operator_refusal(&target_name) {
+        eprintln!("Error: {refusal}");
+        return Ok(1);
+    }
+    if db
+        .get_instance_full(&target_name)?
+        .is_some_and(|row| crate::hosted::is_hosted_tool(&row.tool))
+    {
+        eprintln!(
+            "Error: '{target_name}' is a connector-hosted participant; it cannot be reclaimed with --as. Only its connector speaks for it."
+        );
+        return Ok(1);
+    }
+
     // Guard: a name with no row and no life history was never an identity, so
     // this is not a reclaim. From a process already holding a live identity it
     // would silently rename that identity away (a subagent following a

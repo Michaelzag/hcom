@@ -1592,15 +1592,16 @@ fn test_relay_roundtrip() {
     // coincidence rather than by actually observing this message's turn.
     let pre_send_event_b = last_event_id(&path_b);
 
-    // Send from bigboss (`-b`) rather than a synthetic `--from` label.
-    // `--from <name>` is a CLI-only sender stamp with no return route on
-    // the receiving device — the receiver sees `name:DEVICE` but can't
-    // address it back, so the reply dead-ends locally. bigboss is the
-    // one universally-addressable target; the agent's system prompt
-    // ("Prioritize @bigboss") makes the reply land cleanly, and bigboss
-    // messages relay back like any other event.
+    // Send from a rig label, not the operator: the CLI refuses
+    // `--from bigboss`/`-b` (the operator identity is the TUI compose box's
+    // alone). The question's sender stamp is free to be a label here because
+    // the reply does not go back to it: the mock answers `@bigboss`, the
+    // device-agnostic operator target, and its PONG relays back like any
+    // other event.
     let send_out = hcom_with_dir(
-        &format!("send -b @{launched_name}:{short_b} --intent request -- \"{question}\""),
+        &format!(
+            "send --from relay_probe @{launched_name}:{short_b} --intent request -- \"{question}\""
+        ),
         &path_a,
     );
     assert!(
@@ -1610,7 +1611,7 @@ fn test_relay_roundtrip() {
     );
     logln!(
         log,
-        "  OK: sent question from bigboss to @{launched_name}:{short_b}"
+        "  OK: sent question from relay_probe to @{launched_name}:{short_b}"
     );
 
     poll_until(
@@ -1649,7 +1650,7 @@ fn test_relay_roundtrip() {
                 let data = &ev["data"];
                 let ctx = data["context"].as_str().unwrap_or("");
                 let status = data["status"].as_str().unwrap_or("");
-                if ctx.starts_with("deliver:bigboss") {
+                if ctx.starts_with("deliver:relay_probe") {
                     saw_delivery = true;
                     continue;
                 }

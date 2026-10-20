@@ -1311,6 +1311,14 @@ fn handle_remote_sub_create(
     }
 
     let on_hit = params.get("on_hit").and_then(|v| v.as_str());
+    // An `--on-hit` message goes out from `caller` on THIS device, so the
+    // caller is a sender identity here: no peer mints this device's operator
+    // alias or its connector-hosted names.
+    if on_hit.is_some()
+        && let Err(e) = crate::identity::validate_sender_name(db, &caller)
+    {
+        return Err(e.to_string());
+    }
     let outcome = if filters.is_empty() {
         crate::db::subscriptions::build_and_insert_sql_subscription(
             db, &sql_parts, &caller, once, on_hit,

@@ -108,7 +108,8 @@ pub struct SendArgs {
     #[arg(long)]
     pub from: Option<String>,
 
-    /// Shorthand for --from bigboss
+    /// Shorthand for --from bigboss (refused on the CLI: the operator
+    /// identity belongs to the TUI's compose box alone)
     #[arg(short = 'b')]
     pub bigboss: bool,
 
@@ -976,35 +977,66 @@ fn process_positionals(positionals: &[String]) -> (Vec<String>, Option<String>) 
     (targets, None)
 }
 
-/// External scripts may choose a label, but not a hosted participant's name.
-///
-/// The protected set is derived from the local rows the connector owns
-/// (`hosted::is_hosted_tool`), not a hardcoded list: every person or channel
-/// name a connector hosts is refused here, bare or device-suffixed, in any
-/// case. `bigboss` is deliberately not special: it is the local operator at
-/// this terminal speaking through `-b`, on the same-device trust boundary.
-fn validate_external_sender(db: &HcomDb, name: &str) -> anyhow::Result<()> {
-    let bare = name.split_once(':').map_or(name, |(base, _)| base);
-
-    let mut stmt = db
-        .conn()
-        .prepare_cached("SELECT name, tool FROM instances")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        if !crate::hosted::is_hosted_tool(row.get_ref(1)?.as_str()?) {
-            continue;
-        }
-        let hosted_name = row.get_ref(0)?.as_str()?;
-        let hosted_bare = hosted_name
-            .split_once(':')
-            .map_or(hosted_name, |(base, _)| base);
-        if bare.eq_ignore_ascii_case(hosted_bare) {
-            anyhow::bail!(
-                "'{name}' is a connector-hosted participant and cannot be used with --from. Only its connector may send as it."
-            );
+/// The TUI compose box's send: the one path that speaks as the local operator
+/// ([`SENDER`]). Returns the feedback text instead of printing — the TUI owns
+/// stdout and the rest of hcom runs it as a subprocess for exactly that
+/// reason. Not reachable from argv: the CLI refuses `--from bigboss` and
+/// `--name bigboss`, so no local process can pose as the operator through it.
+pub fn send_as_operator(
+    db: &HcomDb,
+    recipients: &[String],
+    body: &str,
+    intent: Option<&str>,
+    reply_to: Option<u64>,
+) -> Result<String, String> {
+    let mut envelope = MessageEnvelope::default();
+    if let Some(val) = intent {
+        let val = val.to_lowercase();
+        validate_intent(&val)?;
+        envelope.intent = val.parse().ok();
+    }
+    // Ack requires reply_to
+    if envelope.intent.as_ref().map(|i| i.as_str()) == Some("ack") && reply_to.is_none() {
+        return Err("Intent 'ack' requires --reply-to <id>".to_string());
+    }
+    envelope.reply_to = reply_to.map(|id| id.to_string());
+    if let Some(reply_to) = &envelope.reply_to {
+        let Some(local_id) = resolve_reply_to_local(db, reply_to) else {
+            return Err("Invalid --reply-to: event not found or not a message".to_string());
+        };
+        if let Some(parent_thread) = get_thread_from_event(db, local_id) {
+            envelope.thread = Some(parent_thread);
         }
     }
-    Ok(())
+    validate_message(body)?;
+
+    let targets: Vec<String> = recipients
+        .iter()
+        .map(|r| r.trim_start_matches('@').to_string())
+        .collect();
+    let identity = SenderIdentity {
+        kind: SenderKind::External,
+        name: SENDER.to_string(),
+        instance_data: None,
+        session_id: None,
+    };
+    let has_envelope =
+        envelope.intent.is_some() || envelope.reply_to.is_some() || envelope.thread.is_some();
+    let delivery = send_message_resolved(
+        db,
+        &identity,
+        body,
+        if has_envelope { Some(&envelope) } else { None },
+        Some(&targets),
+    )
+    .map_err(|e| e.to_string())?;
+    crate::relay::worker::ensure_worker(true);
+    Ok(
+        std::iter::once(get_recipient_feedback(db, &delivery.delivered_to))
+            .chain(reroute_notices(&delivery))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 /// Main entry point for `hcom send` command.
@@ -1025,7 +1057,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             eprintln!("Error: Name contains invalid characters");
             return 1;
         }
-        if let Err(error) = validate_external_sender(db, name) {
+        if let Err(error) = identity::validate_sender_name(db, name) {
             eprintln!("Error: {error}");
             return 1;
         }
@@ -3984,6 +4016,34 @@ mod tests {
             let d = send(&db, from, text, Some(intent), None, &["kimi"]);
             assert_rerouted_to_mupe(&db, &d, text);
         }
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn tui_compose_send_delivers_from_the_operator() {
+        // The TUI compose box is the one in-process path that speaks as
+        // bigboss (the CLI refuses that name). Its send must look exactly
+        // like the old `send --from bigboss` did to everyone downstream.
+        let (db, path, _env) = policy_db(KIMI_POLICY);
+        let feedback = send_as_operator(
+            &db,
+            &["kimi".to_string()],
+            "compose box ping",
+            Some("request"),
+            None,
+        )
+        .unwrap();
+        assert!(feedback.contains("kimi"), "{feedback}");
+        let (_, data) = last_message(&db);
+        assert_eq!(data["from"], "bigboss");
+        assert_eq!(data["sender_kind"], "external");
+        assert_eq!(data["text"], "compose box ping");
+        assert_eq!(data["intent"], "request");
+        assert!(
+            unread_texts(&db, "kimi").contains(&"compose box ping".to_string()),
+            "{data}"
+        );
         cleanup_test_db(path);
     }
 

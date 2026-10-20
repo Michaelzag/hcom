@@ -109,6 +109,69 @@ pub fn validate_name_input(name: &str, max_length: usize, allow_at: bool) -> Res
     Ok(())
 }
 
+/// Sender names the CLI may never mint: the local operator alias.
+///
+/// `bigboss` ([`crate::shared::constants::SENDER`]) is the human at this
+/// terminal. The only path that speaks as it is the TUI's in-process compose
+/// box ([`crate::commands::send::send_as_operator`]); a CLI `--from`,
+/// `--name` or `--as` for it is a local process posing as the operator.
+/// Case-insensitive, bare or with a device suffix.
+pub fn reserved_operator_refusal(name: &str) -> Option<String> {
+    let bare = name.split_once(':').map_or(name, |(base, _)| base);
+    bare.eq_ignore_ascii_case(crate::shared::constants::SENDER)
+        .then(|| {
+            format!(
+                "'{name}' is the local operator identity; only the TUI compose box may send as {}.",
+                crate::shared::constants::SENDER
+            )
+        })
+}
+
+/// Sender names a connector owns: person and channel rows. Only the
+/// connector speaks or listens for them. Derived from the rows themselves
+/// ([`crate::hosted::is_hosted_tool`]), so a name a connector hosts tomorrow
+/// is protected without a code change. Case-insensitive, bare or with a
+/// device suffix.
+pub fn hosted_participant_refusal(db: &HcomDb, name: &str) -> Option<String> {
+    let bare = name.split_once(':').map_or(name, |(base, _)| base);
+    let mut stmt = db
+        .conn()
+        .prepare_cached("SELECT name, tool FROM instances")
+        .ok()?;
+    let mut rows = stmt.query([]).ok()?;
+    while let Ok(Some(row)) = rows.next() {
+        let (Ok(row_name), Ok(tool)) = (row.get::<_, String>(0), row.get::<_, String>(1)) else {
+            continue;
+        };
+        if !crate::hosted::is_hosted_tool(&tool) {
+            continue;
+        }
+        let row_bare = row_name
+            .split_once(':')
+            .map_or(row_name.as_str(), |(base, _)| base);
+        if bare.eq_ignore_ascii_case(row_bare) {
+            return Some(format!(
+                "'{name}' is a connector-hosted participant and cannot be used as a sender. Only its connector speaks for it."
+            ));
+        }
+    }
+    None
+}
+
+/// Sender policy for every name the CLI mints as a sender (`--from`, and
+/// `--as` on a subscription whose `--on-hit` message goes out from its
+/// caller): the operator alias and connector-hosted participants are not
+/// CLI-reachable senders.
+pub fn validate_sender_name(db: &HcomDb, name: &str) -> Result<(), HcomError> {
+    if let Some(refusal) = reserved_operator_refusal(name) {
+        return Err(HcomError::InvalidInput(refusal));
+    }
+    if let Some(refusal) = hosted_participant_refusal(db, name) {
+        return Err(HcomError::InvalidInput(refusal));
+    }
+    Ok(())
+}
+
 /// Get full display name: "{tag}-{name}" if tag exists, else just "{name}".
 pub fn get_full_name(data: &InstanceRow) -> String {
     match &data.tag {
@@ -311,6 +374,10 @@ pub fn remote_history_hint(db: &HcomDb, name: &str) -> Option<String> {
 /// 2. Agent ID (UUID) lookup -> kind=Instance if found
 /// 3. Error if not found
 pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, HcomError> {
+    if let Some(refusal) = reserved_operator_refusal(name) {
+        return Err(HcomError::InvalidInput(refusal));
+    }
+
     let mut resolved_name = name.to_string();
 
     // Reject invalid base names, but allow tag-name format (e.g. "team-luna")

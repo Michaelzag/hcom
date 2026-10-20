@@ -291,7 +291,7 @@ Anything else is forwarded to the tool: `--model sonnet`, `--yolo`, etc.
 
 ```bash
 hcom                                # TUI dashboard
-hcom send -b @luna -- hey           # one-off message to an agent
+hcom send --from build_alert @luna -- hey   # one-off message to an agent
 hcom list                           # show all active agents
 hcom list --context                 # + per-seat context size, jobs, idle time
 hcom compact <name>                   # compact an idle seat's context (prints tokens before -> after)
@@ -423,9 +423,9 @@ wake_intents = ["request"]               # default
 wake_prefixes = ["BLOCKED", "DECISION"]  # default
 ```
 
-A seat holds the `conductor` role only when its omp session carries the `conductor-role` marker (`omp --conductor`); the plugin registers it at bind, add-only, and the role ends with that instance row. The role holder receives no broadcasts. A targeted message reaches it only from the delegate, from a lead with a `wake_intents` intent whose text opens with a `wake_prefixes` word (`BLOCKED: …`), or from an external sender (`--from`, `-b`). Nothing else is dropped: `hcom send` reroutes it to the delegate and prints `<name> takes no cc; delivered to <delegate>`, and a message that arrives some other way (an older peer, a system notice) is forwarded to the delegate once when the holder's inbox is read, with the same notice to an agent sender. A broken block keeps its readable `delegate` and nothing else; with no readable delegate the holder gets everything targeted, and `hcom status`/`hcom list` say `delivery policy INVALID`. They also show `conductor role: <name>|NONE`; NONE means the filter is off. The plugin and binary must match: roll the binary to every host before relying on the role.
+A seat holds the `conductor` role only when its omp session carries the `conductor-role` marker (`omp --conductor`); the plugin registers it at bind, add-only, and the role ends with that instance row. The role holder receives no broadcasts. A targeted message reaches it only from the delegate, from a lead with a `wake_intents` intent whose text opens with a `wake_prefixes` word (`BLOCKED: …`), or from the local operator (the TUI compose box) or an external sender (`--from`). Nothing else is dropped: `hcom send` reroutes it to the delegate and prints `<name> takes no cc; delivered to <delegate>`, and a message that arrives some other way (an older peer, a system notice) is forwarded to the delegate once when the holder's inbox is read, with the same notice to an agent sender. A broken block keeps its readable `delegate` and nothing else; with no readable delegate the holder gets everything targeted, and `hcom status`/`hcom list` say `delivery policy INVALID`. They also show `conductor role: <name>|NONE`; NONE means the filter is off. The plugin and binary must match: roll the binary to every host before relying on the role.
 
-This guards against accidental load, not tampering: `--from` is unauthenticated (each such delivery is logged), it cannot take a connector-hosted participant's name — person and channel names a connector hosts are refused in any case or device form — and anything running as your user can edit `config.toml`.
+This guards against accidental load, not tampering: `--from` is unauthenticated (each such delivery is logged), it cannot take the operator's name or a connector-hosted participant's name — `bigboss` and person/channel names a connector hosts are refused in any case or device form — and anything running as your user can edit `config.toml`.
 
 ### Per-project isolation
 
