@@ -76,10 +76,9 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let rebind_target = start_args.as_name;
 
     let db = HcomDb::open()?;
-    for name in [flags.name.as_deref(), rebind_target.as_deref()]
-        .into_iter()
-        .flatten()
-    {
+    // --name may select an existing generated child; defer its claim bounds
+    // until the ordinary row-creation path, after child resolution.
+    if let Some(name) = rebind_target.as_deref() {
         identity::validate_sender_label(name)?;
     }
     let hcom_dir = paths::hcom_dir();
@@ -162,6 +161,11 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     if let Some(subagent) = subagent_via_name {
         return start_subagent(&db, &subagent);
     }
+    if verified_actor.is_none()
+        && let Some(name) = requested_name.as_deref()
+    {
+        identity::validate_sender_label(name)?;
+    }
 
     // A verified root actor stays the root even while children exist.
     let effective_name = verified_actor
@@ -185,6 +189,7 @@ fn detect_subagent(db: &HcomDb, check_id: &str) -> Option<InstanceRow> {
 
 /// Promote an existing dormant child row into active hcom participation.
 fn start_subagent(db: &HcomDb, info: &InstanceRow) -> Result<i32> {
+    identity::validate_protected_identity(db, &info.name)?;
     let parent_name = info.parent_name.as_deref().unwrap_or("");
     if parent_name.is_empty() || info.agent_id.as_deref().unwrap_or("").is_empty() {
         bail!(
