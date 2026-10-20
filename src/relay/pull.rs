@@ -422,7 +422,10 @@ pub fn handle_state_message(
     let mut imported_hosted: Vec<String> = Vec::new();
 
     for (name, inst) in &instances {
-        let tool = inst.get("tool").and_then(|v| v.as_str()).unwrap_or("claude");
+        let tool = inst
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .unwrap_or("claude");
         if crate::hosted::is_hosted_tool(tool) {
             imported_hosted.push(name.clone());
         }

@@ -90,6 +90,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// The same seam for registry persistence: fires between the read and the
+// write of one read-merge-write update, with the registry lock held — the
+// exact window a lost update would need, so a test can park one writer
+// there and land a competing writer inside it.
+thread_local! {
+    static REGISTRY_WRITE_GAP_HOOK: std::cell::RefCell<Option<RegisterGap>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Does `tool` mark a row as connector-hosted?
 ///
 /// This is the one predicate every exemption keys off: the sweep's skip and
@@ -157,6 +166,9 @@ pub(crate) fn install_name_registry(conn: &rusqlite::Connection) -> Result<()> {
 /// the database. All three reset flavors only remove `hcom.db*`, config files
 /// and `.tmp`/`flags` artifacts, so a registry beside the database survives.
 const HOSTED_NAMES_FILE: &str = "hosted-names.json";
+/// Sibling lock file ordering registry rewrites (see
+/// [`update_hosted_names_registry`]).
+const HOSTED_NAMES_LOCK: &str = "hosted-names.lock";
 
 /// Reservation matching shape: bare (any `:SHORT` device suffix dropped) and
 /// lowercased — the same normalized form `hosted_names` stores, so every
@@ -216,8 +228,9 @@ fn write_hosted_names_registry(
         return Ok(());
     }
     let path = hosted_names_file_for(db_file);
-    let body = serde_json::to_string(names)
-        .map_err(|e| HcomError::DatabaseError(format!("reserved-name registry encode failed: {e}")))?;
+    let body = serde_json::to_string(names).map_err(|e| {
+        HcomError::DatabaseError(format!("reserved-name registry encode failed: {e}"))
+    })?;
     crate::paths::atomic_write_io(&path, &body).map_err(|e| {
         HcomError::DatabaseError(format!(
             "reserved-name registry {} unwritable: {e}",
@@ -226,16 +239,59 @@ fn write_hosted_names_registry(
     })
 }
 
-/// Merge `name` into the durable registry. Deduplicated on the normalized
-/// form; concurrent first registrations may each rewrite the file, so the
-/// database reservation (and the carry-forward above) remains the authority
-/// that re-derives anything a lost write dropped.
-pub(crate) fn persist_hosted_name(db_file: &Path, name: &str) -> Result<(), HcomError> {
+/// Update the registry under the sibling `hosted-names.lock` flock.
+///
+/// Registry updates are read-merge-write, so they must serialize: without a
+/// lock, a writer paused after its read replaces the file with its stale
+/// snapshot and silently deletes a concurrent writer's addition — including
+/// a delayed registration overwriting `hcom reset`'s carry-forward before
+/// the fresh store is seeded. Every writer holds this lock across load,
+/// merge and write; readers need no lock because the file itself is still
+/// replaced by atomic rename.
+fn update_hosted_names_registry(
+    db_file: &Path,
+    merge: impl FnOnce(&mut BTreeMap<String, String>),
+) -> Result<(), HcomError> {
+    if !registry_applies(db_file) {
+        return Ok(());
+    }
+    let lock_path = hosted_names_file_for(db_file).with_file_name(HOSTED_NAMES_LOCK);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| {
+            HcomError::DatabaseError(format!(
+                "reserved-name lock {} unwritable: {e}",
+                lock_path.display()
+            ))
+        })?;
+    // Held until `lock_file` drops at function scope end.
+    crate::sys::fs::lock_exclusive(&lock_file).map_err(|e| {
+        HcomError::DatabaseError(format!(
+            "reserved-name lock {} unavailable: {e}",
+            lock_path.display()
+        ))
+    })?;
     let mut names = load_hosted_names_registry(db_file)?;
-    names
-        .entry(normalized_hosted_name(name))
-        .or_insert_with(|| name.to_string());
+    // Test seam: parks one writer inside its critical section, after the
+    // read and before the write.
+    if let Some(gate) = REGISTRY_WRITE_GAP_HOOK.with(|hook| hook.borrow_mut().take()) {
+        gate.arrive();
+    }
+    merge(&mut names);
     write_hosted_names_registry(db_file, &names)
+}
+
+/// Merge `name` into the durable registry, serialized with every other
+/// writer. Deduplicated on the normalized form.
+pub(crate) fn persist_hosted_name(db_file: &Path, name: &str) -> Result<(), HcomError> {
+    update_hosted_names_registry(db_file, |names| {
+        names
+            .entry(normalized_hosted_name(name))
+            .or_insert_with(|| name.to_string());
+    })
 }
 
 /// True when the durable registry reserves `name`, whatever spelling was used.
@@ -298,17 +354,18 @@ fn known_hosted_names(conn: &rusqlite::Connection) -> Result<BTreeMap<String, St
 
 /// Union every hosted name this database knows into the durable registry
 /// (database -> file). Runs at schema install and, strictly, at `hcom reset`
-/// before the database is deleted.
+/// before the database is deleted. Serialized with every other registry
+/// writer, so a delayed registration cannot overwrite what is carried.
 pub(crate) fn carry_hosted_names_forward(conn: &rusqlite::Connection) -> Result<(), HcomError> {
     let Some(db_file) = conn.path() else {
         return Ok(()); // in-memory stores have no durable neighbor
     };
-    let db_file = Path::new(db_file);
-    let mut names = load_hosted_names_registry(db_file)?;
-    for (normalized, original) in known_hosted_names(conn)? {
-        names.entry(normalized).or_insert(original);
-    }
-    write_hosted_names_registry(db_file, &names)
+    let known = known_hosted_names(conn)?;
+    update_hosted_names_registry(Path::new(db_file), move |names| {
+        for (normalized, original) in known {
+            names.entry(normalized).or_insert(original);
+        }
+    })
 }
 
 /// Seed the reservation table from the durable registry (file -> database), so
@@ -869,6 +926,56 @@ mod tests {
         std::fs::write(hosted_names_file_for(&db_path), "{ not json").unwrap();
         assert!(hosted_name_is_reserved(&db_path, "anything").is_err());
         assert!(crate::identity::validate_protected_identity(&db, "anything").is_err());
+    }
+
+    /// Lost-update regression (fauna round-7 blocker): registry writers
+    /// serialize their read-merge-write, so a writer parked after its read
+    /// cannot clobber a concurrent writer's committed addition. Writer A is
+    /// parked inside its critical section by the gap seam while writer B
+    /// runs; B must queue behind the held lock, and both names must survive.
+    #[test]
+    #[serial]
+    fn registry_writers_serialize_and_lose_no_names() {
+        let (_db, db_path, _dir, _guard) = setup_test_db();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let path_a = db_path.clone();
+        let writer_a = std::thread::spawn(move || {
+            REGISTRY_WRITE_GAP_HOOK.with(|hook| {
+                hook.replace(Some(RegisterGap {
+                    reached: reached_tx,
+                    release: release_rx,
+                }));
+            });
+            persist_hosted_name(&path_a, "alice")
+        });
+        reached_rx.recv().expect("writer A reached its gap");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let path_b = db_path.clone();
+        let writer_b = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let result = persist_hosted_name(&path_b, "bob");
+            let _ = done_tx.send(());
+            result
+        });
+        started_rx.recv().expect("writer B started");
+        let b_finished_while_a_parked = done_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+
+        let _ = release_tx.send(());
+        writer_a.join().unwrap().unwrap();
+        writer_b.join().unwrap().unwrap();
+
+        assert!(
+            !b_finished_while_a_parked,
+            "writer B must queue behind A's held registry lock, not race its read"
+        );
+        let names = load_hosted_names_registry(&db_path).unwrap();
+        assert!(names.contains_key("alice"), "{names:?}");
+        assert!(names.contains_key("bob"), "{names:?}");
     }
 
     #[test]

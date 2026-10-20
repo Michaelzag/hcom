@@ -126,7 +126,10 @@ pub(crate) fn protected_hook_name_refusal(db: &HcomDb, argv: &[String]) -> Optio
         "hook.protected_name_refused",
         &format!("name={name} err={error}"),
     );
-    Some((1, serde_json::json!({ "error": error.to_string() }).to_string()))
+    Some((
+        1,
+        serde_json::json!({ "error": error.to_string() }).to_string(),
+    ))
 }
 
 /// Convert a db::Message to a serde_json::Value object.

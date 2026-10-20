@@ -628,8 +628,7 @@ fn security_hosted_reservation_survives_reset() {
     );
 
     // External send refused.
-    let (code, stdout, stderr) =
-        h.run(["send", "freshagent", "--from", "michael", "--", "forged"]);
+    let (code, stdout, stderr) = h.run(["send", "freshagent", "--from", "michael", "--", "forged"]);
     assert_ne!(
         code, 0,
         "post-reset --from a hosted name must be refused: {stdout} {stderr}"
