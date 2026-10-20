@@ -275,6 +275,198 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
 }
 
 #[test]
+fn security_hosted_name_send_refused_including_aliases() {
+    let h = Hcom::new();
+    let recipient = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO instances (name, tool, status, tag, agent_id, created_at)
+         VALUES ('seanfitz', 'buzz', 'listening', 'team', 'a6d9caf', 1000.0),
+                ('ch_infra', 'buzz', 'inactive', NULL, NULL, 1000.0);",
+    )
+    .unwrap();
+    let (code, _, stderr) = h.run([
+        "send",
+        "seanfitz",
+        "--name",
+        &recipient,
+        "--",
+        "queued for Buzz",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let cursor: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = 'seanfitz'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    for name in ["seanfitz", "team-seanfitz", "a6d9caf", "ch_infra"] {
+        let (code, stdout, stderr) = h.run([
+            "send",
+            &recipient,
+            "--name",
+            name,
+            "--thread",
+            "buzz_infra_forged",
+            "--",
+            "forged instruction",
+        ]);
+        assert_ne!(
+            code, 0,
+            "hosted --name {name} sent successfully: {stdout} {stderr}"
+        );
+    }
+    let after: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = 'seanfitz'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, cursor, "forgery must not consume the Buzz outbox");
+    let messages: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(messages, 1, "only the genuine queued message may exist");
+}
+
+#[test]
+fn security_hosted_name_listen_and_other_commands_refused() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute(
+        "INSERT INTO instances (name, tool, status, created_at)
+         VALUES ('seanfitz', 'buzz', 'listening', 1000.0)",
+        [],
+    )
+    .unwrap();
+    let (code, _, stderr) = h.run([
+        "send",
+        "seanfitz",
+        "--name",
+        &sender,
+        "--",
+        "private queued reply",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let cursor: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = 'seanfitz'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    for args in [
+        vec!["listen", "--name", "seanfitz", "--timeout", "1", "--json"],
+        vec!["list", "--name", "seanfitz", "--json"],
+    ] {
+        let (code, stdout, stderr) = h.run(&args);
+        assert_ne!(code, 0, "{args:?}: {stdout} {stderr}");
+        assert!(!stdout.contains("private queued reply"), "{stdout}");
+    }
+    let after: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = 'seanfitz'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after, cursor,
+        "CLI must not acknowledge connector-owned mail"
+    );
+}
+
+#[test]
+fn security_external_hosted_names_refused_case_insensitively() {
+    let h = Hcom::new();
+    let recipient = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO instances (name, tool, status, origin_device_id, created_at)
+         VALUES ('michael', 'buzz', 'listening', '', 1000.0),
+                ('seanfitz', 'buzz', 'listening', '', 1000.0),
+                ('ch_infra', 'buzz', 'inactive', '', 1000.0),
+                ('jane:ABCD', 'buzz', 'listening', 'remote-device', 1000.0);
+         INSERT INTO kv (key, value)
+         VALUES ('relay_sync_time_remote-device', strftime('%s', 'now'));",
+    )
+    .unwrap();
+    for name in [
+        "michael",
+        "MICHAEL",
+        "Michael:MBAl",
+        "seanfitz",
+        "SEANFITZ",
+        "SeanFitz:MBAl",
+        "ch_infra",
+        "CH_INFRA:ABCD",
+        "jane",
+        "JANE:OTHER",
+    ] {
+        let (code, stdout, stderr) = h.run([
+            "send",
+            &recipient,
+            "--from",
+            name,
+            "--",
+            "forged instruction",
+        ]);
+        assert_ne!(code, 0, "hosted --from {name}: {stdout} {stderr}");
+    }
+    let messages: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(messages, 0, "no person/channel forgery may be recorded");
+
+    // bigboss is the local operator at this terminal, not a hosted row. It
+    // stays usable next to hosted person rows: same-device trust boundary.
+    let (code, stdout, stderr) =
+        h.run(["send", &recipient, "--from", "bigboss", "--", "from above"]);
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    let messages: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(messages, 1, "only the operator's message may be recorded");
+}
+
+#[test]
+fn security_external_script_names_still_deliver() {
+    let h = Hcom::new();
+    let recipient = h.start();
+    for name in ["michael_alert", "build_alarm:BOXE"] {
+        let (code, stdout, stderr) =
+            h.run(["send", &recipient, "--from", name, "--", "build finished"]);
+        assert_eq!(code, 0, "{stdout} {stderr}");
+        let (code, stdout, stderr) =
+            h.run(["listen", "--name", &recipient, "--timeout", "1", "--json"]);
+        assert_eq!(code, 0, "{stderr}");
+        let message: serde_json::Value = stdout
+            .lines()
+            .find_map(|line| serde_json::from_str(line).ok())
+            .expect("the script's message reached the ordinary agent");
+        assert_eq!(message["from"], name);
+        assert_eq!(message["text"], "build finished");
+    }
+}
+
+#[test]
 fn start_send_events_roundtrip() {
     let h = Hcom::new();
     let sender = h.start();

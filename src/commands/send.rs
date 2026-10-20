@@ -976,6 +976,37 @@ fn process_positionals(positionals: &[String]) -> (Vec<String>, Option<String>) 
     (targets, None)
 }
 
+/// External scripts may choose a label, but not a hosted participant's name.
+///
+/// The protected set is derived from the local rows the connector owns
+/// (`hosted::is_hosted_tool`), not a hardcoded list: every person or channel
+/// name a connector hosts is refused here, bare or device-suffixed, in any
+/// case. `bigboss` is deliberately not special: it is the local operator at
+/// this terminal speaking through `-b`, on the same-device trust boundary.
+fn validate_external_sender(db: &HcomDb, name: &str) -> anyhow::Result<()> {
+    let bare = name.split_once(':').map_or(name, |(base, _)| base);
+
+    let mut stmt = db
+        .conn()
+        .prepare_cached("SELECT name, tool FROM instances")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if !crate::hosted::is_hosted_tool(row.get_ref(1)?.as_str()?) {
+            continue;
+        }
+        let hosted_name = row.get_ref(0)?.as_str()?;
+        let hosted_bare = hosted_name
+            .split_once(':')
+            .map_or(hosted_name, |(base, _)| base);
+        if bare.eq_ignore_ascii_case(hosted_bare) {
+            anyhow::bail!(
+                "'{name}' is a connector-hosted participant and cannot be used with --from. Only its connector may send as it."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Main entry point for `hcom send` command.
 ///
 /// Returns exit code (0 = success, 1 = error).
@@ -992,6 +1023,10 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             '@', '|', '&', ';', '<', '>', '`', '$', '\'', '"', '\\', '\n', '\r',
         ]) {
             eprintln!("Error: Name contains invalid characters");
+            return 1;
+        }
+        if let Err(error) = validate_external_sender(db, name) {
+            eprintln!("Error: {error}");
             return 1;
         }
     }
@@ -3956,7 +3991,9 @@ mod tests {
     #[serial]
     fn external_from_non_instance_to_kimi_delivered_and_audited() {
         let (db, path, env) = policy_db(KIMI_POLICY);
-        // `--from michael`: unauthenticated External sender, the known bypass.
+        // An External sender stamped 'michael', as an old peer or a direct
+        // in-process caller can still produce. The CLI refuses `--from` for a
+        // hosted participant's name, so this is not reachable from `hcom send`.
         let michael = sender(SenderKind::External, "michael");
         let d = send(&db, &michael, "status?", None, None, &["kimi"]);
         assert_delivered_to_kimi(&db, &d, "status?");

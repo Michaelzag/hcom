@@ -324,6 +324,11 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
 
     // 1. Instance name lookup (exact match)
     if let Ok(Some(data)) = db.get_instance(&resolved_name) {
+        if crate::hosted::is_hosted_tool(data.get("tool").and_then(|v| v.as_str()).unwrap_or("")) {
+            return Err(HcomError::InvalidInput(format!(
+                "'{resolved_name}' is a connector-hosted participant; --name cannot use it. Only its connector may speak or listen for it."
+            )));
+        }
         crate::log::log_info(
             "identity",
             "resolve_from_name",
@@ -345,6 +350,11 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
     if let Ok(Some(instance_name)) = db.get_instance_by_agent_id(&resolved_name)
         && let Ok(Some(data)) = db.get_instance(&instance_name)
     {
+        if crate::hosted::is_hosted_tool(data.get("tool").and_then(|v| v.as_str()).unwrap_or("")) {
+            return Err(HcomError::InvalidInput(format!(
+                "'{instance_name}' is a connector-hosted participant; --name cannot use it. Only its connector may speak or listen for it."
+            )));
+        }
         crate::log::log_info(
             "identity",
             "resolve_from_name",

@@ -761,13 +761,19 @@ pub(crate) fn insert_remote_event(
     // - `mentions` / `delivered_to` strip *our own* suffix -> local delivery still matches
     if let Some(obj) = data.as_object_mut() {
         // Namespace 'from' field
-        if let Some(from) = obj.get("from").and_then(|v| v.as_str()).map(String::from)
-            && !from.contains(':')
-        {
-            obj.insert(
-                "from".to_string(),
-                Value::String(super::add_device_suffix(&from, short_id)),
-            );
+        if let Some(from) = obj.get("from").and_then(|v| v.as_str()) {
+            if let Some((_, suffix)) = from.split_once(':') {
+                if suffix != short_id {
+                    let error = format!(
+                        "device={device_id}, short={short_id}, event_id={event_id}, from={from}: sender suffix does not match publishing device"
+                    );
+                    log::log_warn("relay", "relay.sender_suffix_mismatch", &error);
+                    anyhow::bail!(error);
+                }
+            } else {
+                let namespaced = super::add_device_suffix(from, short_id);
+                obj.insert("from".to_string(), Value::String(namespaced));
+            }
         }
 
         // Strip own device suffix from mentions, delivered_to and
@@ -918,6 +924,83 @@ mod tests {
         let bytes = serde_json::to_vec(payload).unwrap();
         let now = crate::shared::time::now_epoch_f64() as u64;
         crate::relay::crypto::seal(&psk, relay_id, topic, &bytes, now).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn security_relay_sender_suffix_must_match_publisher() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let senders = [
+            "michael:HOST",
+            "luna",
+            "nova:PEER",
+            "michael:HOST:PEER",
+            "michael:",
+            "michael:peer",
+        ];
+        let events: Vec<_> = senders
+            .iter()
+            .enumerate()
+            .map(|(index, from)| {
+                json!({
+                    "id": index + 1,
+                    "type": "message",
+                    "instance": "luna",
+                    "ts": crate::shared::time::now_epoch_f64(),
+                    "data": {
+                        "from": from,
+                        "sender_kind": "instance",
+                        "scope": "mentions",
+                        "mentions": ["receiver"],
+                        "delivered_to": ["receiver"],
+                        "text": "relay suffix probe",
+                    },
+                })
+            })
+            .collect();
+        let payload = json!({
+            "state": {"short_id": "PEER", "reset_ts": 0.0, "instances": {}},
+            "events": events,
+        });
+        let topic = "relay-test/peer-device";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        handle_state_message(
+            &db,
+            "peer-device",
+            &envelope,
+            "own-device",
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
+        );
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT json_extract(data, '$.from') FROM events
+                 WHERE type = 'message' ORDER BY id",
+            )
+            .unwrap();
+        let imported: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            imported,
+            ["luna:PEER", "nova:PEER"],
+            "foreign, nested, empty, and wrong-case suffixes must not enter history"
+        );
+        assert_eq!(
+            safe_kv_get(&db, "relay_events_peer-device").as_deref(),
+            Some("6"),
+            "a rejected live event must not stall subsequent imports"
+        );
     }
 
     #[test]
