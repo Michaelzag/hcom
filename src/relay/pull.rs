@@ -35,6 +35,9 @@ enum ReplayPolicy {
     State { min_accepted_ts: Option<u64> },
 }
 
+/// KV counter of permanently skipped relayed events (forged sender suffixes).
+const FORGED_SENDER_SKIPS_KEY: &str = "relay_forged_sender_skips";
+
 fn state_ts_key(device_id: &str) -> String {
     format!("relay_state_ts_{}", device_id)
 }
@@ -699,7 +702,12 @@ fn import_remote_events(
 
         // Live import keeps its historical behavior: a failed insert is dropped
         // here (the cursor still advances past it). Backfill must not do that.
-        let _ = insert_remote_event(db, device_id, short_id, event_id, event, own_short_id);
+        // A permanent skip (a forged sender suffix) makes progress the same way
+        // an insert does: counted, logged, and never asked for again.
+        match insert_remote_event(db, device_id, short_id, event_id, event, own_short_id) {
+            Ok(RemoteInsert::Inserted(_) | RemoteInsert::Skipped) => {}
+            Err(_) => {}
+        }
 
         max_event_id = max_event_id.max(event_id);
     }
@@ -729,6 +737,27 @@ pub(crate) fn event_ts_string(event: &Value) -> String {
     }
 }
 
+/// Outcome of namespacing and inserting one relayed event.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RemoteInsert {
+    /// Stored locally under this id.
+    Inserted(i64),
+    /// Permanently skipped — the event carries a forged sender suffix, so it
+    /// is never part of our history. Never retried and never a page error:
+    /// callers import around it and keep paginating.
+    Skipped,
+}
+
+/// Count one permanently skipped relayed event. Live import and backfill
+/// share this skip path, so they share one observable count.
+pub(crate) fn count_forged_sender_skip(db: &HcomDb) {
+    let count: u64 = safe_kv_get(db, FORGED_SENDER_SKIPS_KEY)
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0)
+        + 1;
+    safe_kv_set(db, FORGED_SENDER_SKIPS_KEY, Some(&count.to_string()));
+}
+
 /// Namespace one remote event and insert it locally. Shared by snapshot import
 /// and catch-up backfill so both produce identical rows.
 pub(crate) fn insert_remote_event(
@@ -738,7 +767,7 @@ pub(crate) fn insert_remote_event(
     event_id: i64,
     event: &Value,
     own_short_id: &str,
-) -> anyhow::Result<i64> {
+) -> anyhow::Result<RemoteInsert> {
     let event_ts = event_epoch(event);
 
     // Namespace instance name
@@ -768,7 +797,8 @@ pub(crate) fn insert_remote_event(
                         "device={device_id}, short={short_id}, event_id={event_id}, from={from}: sender suffix does not match publishing device"
                     );
                     log::log_warn("relay", "relay.sender_suffix_mismatch", &error);
-                    anyhow::bail!(error);
+                    count_forged_sender_skip(db);
+                    return Ok(RemoteInsert::Skipped);
                 }
             } else {
                 let namespaced = super::add_device_suffix(from, short_id);
@@ -839,7 +869,7 @@ pub(crate) fn insert_remote_event(
             ],
         );
     }
-    Ok(id)
+    Ok(RemoteInsert::Inserted(id))
 }
 
 /// Reverse lookup: find short_id for a device UUID.
