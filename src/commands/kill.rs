@@ -1673,13 +1673,8 @@ mod tests {
         // A later helper window (the `hcom` TUI) opened under the same
         // instance identity must not take over the receipt: the kill still
         // closes the instance's own pane, never the helper's.
-        let (closed, log) = terminal_ownership_case(
-            "bura",
-            "gnome-terminal-seat-bura",
-            Some("bura"),
-            Some("/helper-cwd"),
-            false,
-        );
+        let (closed, log) =
+            terminal_ownership_case("bura", "", Some("bura"), Some("/helper-cwd"), false);
         assert!(closed);
         assert_eq!(log, "tui-/instance-cwd");
     }

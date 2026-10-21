@@ -601,7 +601,9 @@ pub fn get_terminal_preset(name: &str) -> Option<&TerminalPreset> {
 }
 
 /// Map environment variables to terminal presets for auto-detection.
-/// Used for same-terminal PTY launches to enable close-on-kill.
+/// Run-here close-on-kill is limited to identified panes (tmux, wezterm, kitty,
+/// zellij, herdr and waveterm). Window/workspace/unit detection does not grant
+/// ownership: those containers may hold other instances' tabs or panes.
 pub const TERMINAL_ENV_MAP: &[(&str, &str)] = &[
     // Herdr — most specific, manages its own terminal panes
     ("HERDR_PANE_ID", "herdr"),
