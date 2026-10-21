@@ -515,18 +515,24 @@ pub fn handle_state_message(
         }
     }
 
-    // Remove stale instances (no longer in remote state)
-    let current_remote: Vec<String> = db
-        .conn()
-        .prepare("SELECT name FROM instances WHERE origin_device_id = ?")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(params![device_id], |row| row.get::<_, String>(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    // Remove stale instances (no longer in remote state). A snapshot the
+    // origin trimmed to fit the wire budget (push::STATE_CUT_MARKER) omits
+    // instances it still has: deleting their mirrors would turn a size trim
+    // into a fake stop. The next full snapshot reconciles properly.
+    let current_remote: Vec<String> = if state.get(super::push::STATE_CUT_MARKER).is_some() {
+        Vec::new()
+    } else {
+        db.conn()
+            .prepare("SELECT name FROM instances WHERE origin_device_id = ?")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map(params![device_id], |row| row.get::<_, String>(0))
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    };
 
     for name in &current_remote {
         if !seen_instances.contains(name) {
@@ -1752,6 +1758,39 @@ mod tests {
             .unwrap()
             .expect("local row must survive");
         assert_eq!(local.status, "running");
+    }
+
+    #[test]
+    #[serial]
+    fn pull_keeps_mirrors_when_the_state_snapshot_was_cut() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        let base_ts = crate::shared::time::now_epoch_f64() as u64;
+
+        // D publishes {alpha, beta}: both rows mirror locally.
+        assert!(!deliver_state(
+            &db,
+            &mut guard,
+            &psk,
+            "device-d",
+            &state_payload("DEVA", &["alpha", "beta"]),
+            base_ts,
+        ));
+        assert!(db.get_instance_full("alpha:DEVA").unwrap().is_some());
+
+        // D's state had to be trimmed to fit the wire budget: the snapshot
+        // carries only beta and says so. alpha still exists on D.
+        let mut cut = state_payload("DEVA", &["beta"]);
+        cut["state"][crate::relay::push::STATE_CUT_MARKER] =
+            json!({"dropped_instances": 1, "original_bytes": 4096});
+        assert!(!deliver_state(&db, &mut guard, &psk, "device-d", &cut, base_ts + 1));
+
+        assert!(
+            db.get_instance_full("alpha:DEVA").unwrap().is_some(),
+            "a trimmed snapshot must not read as 'the origin stopped publishing alpha'"
+        );
     }
 
     /// Device-exact delivery through the REAL relay path (ffc-ravoc).
