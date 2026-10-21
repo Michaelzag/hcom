@@ -451,15 +451,101 @@ pub fn handle_state_message(
 
         let now = crate::shared::time::now_epoch_f64();
 
-        let _ = db.conn().execute(
-            "INSERT INTO instances (
-                name, origin_device_id, status, status_context, status_detail, status_time,
-                parent_name, directory, transcript_path, created_at,
-                session_id, parent_session_id, agent_id, wait_timeout, last_stop, tcp_mode,
-                tag, tool, background
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                status = excluded.status,
+        // A cut snapshot (push::STATE_CUT_MARKER) carries only the fields its
+        // wire budget allowed. Applying it must not blank the fields it omits:
+        // absent fields keep the mirror's values. A full snapshot keeps
+        // overwrite semantics, so a field the origin cleared still clears.
+        let cut = state.get(super::push::STATE_CUT_MARKER).is_some();
+        let status: Option<&str> = if cut {
+            inst.get("status").and_then(|v| v.as_str())
+        } else {
+            Some(
+                inst.get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown"),
+            )
+        };
+        let tool: Option<&str> = if cut {
+            inst.get("tool").and_then(|v| v.as_str())
+        } else {
+            Some(
+                inst.get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("claude"),
+            )
+        };
+        let context: Option<&str> = if cut {
+            inst.get("context").and_then(|v| v.as_str())
+        } else {
+            Some(inst.get("context").and_then(|v| v.as_str()).unwrap_or(""))
+        };
+        let detail: Option<&str> = if cut {
+            inst.get("detail").and_then(|v| v.as_str())
+        } else {
+            Some(inst.get("detail").and_then(|v| v.as_str()).unwrap_or(""))
+        };
+        let status_time: Option<i64> = if cut {
+            inst.get("status_time")
+                .and_then(|v| v.as_f64())
+                .map(|t| t as i64)
+        } else {
+            Some(status_time_i64)
+        };
+        let wait_timeout: Option<i64> = if cut {
+            inst.get("wait_timeout").and_then(|v| v.as_i64())
+        } else {
+            Some(
+                inst.get("wait_timeout")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(86400),
+            )
+        };
+        let last_stop: Option<f64> = if cut {
+            inst.get("last_stop").and_then(|v| v.as_f64())
+        } else {
+            Some(
+                inst.get("last_stop")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+            )
+        };
+        let tcp_mode: Option<bool> = if cut {
+            inst.get("tcp_mode").and_then(|v| v.as_bool())
+        } else {
+            Some(
+                inst.get("tcp_mode")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            )
+        };
+        let background: Option<bool> = if cut {
+            inst.get("background").and_then(|v| v.as_bool())
+        } else {
+            Some(
+                inst.get("background")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            )
+        };
+        let update_set = if cut {
+            "status = COALESCE(excluded.status, status),
+                status_context = COALESCE(excluded.status_context, status_context),
+                status_detail = COALESCE(excluded.status_detail, status_detail),
+                status_time = COALESCE(excluded.status_time, status_time),
+                parent_name = COALESCE(excluded.parent_name, parent_name),
+                directory = COALESCE(excluded.directory, directory),
+                transcript_path = COALESCE(excluded.transcript_path, transcript_path),
+                session_id = COALESCE(excluded.session_id, session_id),
+                parent_session_id = COALESCE(excluded.parent_session_id, parent_session_id),
+                agent_id = COALESCE(excluded.agent_id, agent_id),
+                wait_timeout = COALESCE(excluded.wait_timeout, wait_timeout),
+                last_stop = COALESCE(excluded.last_stop, last_stop),
+                tcp_mode = COALESCE(excluded.tcp_mode, tcp_mode),
+                tag = COALESCE(excluded.tag, tag),
+                tool = COALESCE(excluded.tool, tool),
+                background = COALESCE(excluded.background, background)"
+        } else {
+            "status = excluded.status,
                 status_context = excluded.status_context, status_detail = excluded.status_detail,
                 status_time = excluded.status_time,
                 parent_name = excluded.parent_name,
@@ -467,16 +553,26 @@ pub fn handle_state_message(
                 session_id = excluded.session_id, parent_session_id = excluded.parent_session_id,
                 agent_id = excluded.agent_id, wait_timeout = excluded.wait_timeout,
                 last_stop = excluded.last_stop, tcp_mode = excluded.tcp_mode,
-                tag = excluded.tag, tool = excluded.tool, background = excluded.background",
+                tag = excluded.tag, tool = excluded.tool, background = excluded.background"
+        };
+
+        let _ = db.conn().execute(
+            &format!(
+                "INSERT INTO instances (
+                name, origin_device_id, status, status_context, status_detail, status_time,
+                parent_name, directory, transcript_path, created_at,
+                session_id, parent_session_id, agent_id, wait_timeout, last_stop, tcp_mode,
+                tag, tool, background
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET {update_set}"
+            ),
             params![
                 namespaced,
                 device_id,
-                inst.get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown"),
-                inst.get("context").and_then(|v| v.as_str()).unwrap_or(""),
-                inst.get("detail").and_then(|v| v.as_str()).unwrap_or(""),
-                status_time_i64,
+                status,
+                context,
+                detail,
+                status_time,
                 parent,
                 inst.get("directory").and_then(|v| v.as_str()),
                 inst.get("transcript").and_then(|v| v.as_str()),
@@ -484,20 +580,12 @@ pub fn handle_state_message(
                 Option::<String>::None,
                 Option::<String>::None,
                 Option::<String>::None,
-                inst.get("wait_timeout")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(86400),
-                inst.get("last_stop")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0),
-                inst.get("tcp_mode")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+                wait_timeout,
+                last_stop,
+                tcp_mode,
                 inst.get("tag").and_then(|v| v.as_str()),
                 tool,
-                inst.get("background")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+                background,
             ],
         );
     }
