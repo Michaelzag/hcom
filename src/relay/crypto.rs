@@ -26,9 +26,9 @@ const TS_LEN: usize = 8;
 pub const HEADER_LEN: usize = 1 + NONCE_LEN + TS_LEN;
 pub const TAG_LEN: usize = 16;
 
-/// Wire cost of sealing one byte of plaintext: suite byte + nonce + timestamp
-/// + AEAD tag. Every publish-size budget subtracts this from its sealed cap to
-/// get the plaintext the payload may carry.
+/// Wire cost of sealing one byte of plaintext: suite byte, nonce, timestamp
+/// and AEAD tag. Every publish-size budget subtracts this from its sealed cap
+/// to get the plaintext the payload may carry.
 pub(crate) const SEALED_OVERHEAD_BYTES: usize = HEADER_LEN + TAG_LEN;
 
 #[derive(Debug)]
