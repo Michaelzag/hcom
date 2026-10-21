@@ -28,7 +28,9 @@ use rusqlite::params;
 use serde_json::json;
 
 use super::HcomDb;
-use crate::core::filters::{FILE_WRITE_CONTEXTS, build_sql_from_flags, is_uri_status_detail};
+use crate::core::filters::{
+    FILE_WRITE_CONTEXTS, build_sql_from_flags, collision_time_window_sql, is_uri_status_detail,
+};
 use crate::fleet_names::FleetCtx;
 use crate::hooks::common::PostCommit;
 use crate::messages::{InstanceInfo, MessageScope, ScopeResult, compute_scope, resolve_targets};
@@ -364,6 +366,59 @@ pub(crate) fn create_request_watches(
     }
 }
 
+/// Upgrade generated collision windows without changing subscription IDs,
+/// manual predicates, cursors, delivery settings or on-hit actions. These SQL
+/// predicates are persisted, so changing the generator alone leaves existing
+/// watchers on the unbounded historical scan.
+pub(crate) fn migrate_collision_windows(conn: &rusqlite::Connection) -> Result<()> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM kv WHERE key LIKE 'events_sub:%'
+             AND json_type(value, '$.filters.collision') IS NOT NULL",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for (key, raw) in rows {
+        let mut sub: serde_json::Value = serde_json::from_str(&raw)?;
+        let Some(sql) = sub.get("sql").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let mut bounded = sql.to_string();
+        for candidate in ["e", "e2"] {
+            let legacy = format!(
+                "ABS(strftime('%s', events_v.timestamp) - strftime('%s', {candidate}.timestamp)) < 30"
+            );
+            bounded = bounded.replace(&legacy, &collision_time_window_sql(candidate, "events_v"));
+            for separator in [" ", "\n"] {
+                bounded = bounded.replace(
+                    &format!("FROM events_v {candidate}{separator}"),
+                    &format!(
+                        "FROM events {candidate} INDEXED BY idx_events_status_time{separator}"
+                    ),
+                );
+            }
+            bounded = bounded
+                .replace(
+                    &format!("{candidate}.status_context"),
+                    &format!("json_extract({candidate}.data, '$.context')"),
+                )
+                .replace(
+                    &format!("{candidate}.status_detail"),
+                    &format!("json_extract({candidate}.data, '$.detail')"),
+                );
+        }
+        if bounded != sql {
+            sub["sql"] = json!(bounded);
+            conn.execute(
+                "UPDATE kv SET value = ?1 WHERE key = ?2",
+                params![sub.to_string(), key],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Remove all event subscriptions owned by an instance.
 pub(crate) fn cleanup_subscriptions(db: &HcomDb, name: &str) -> Result<u32> {
     let deleted = db.conn.execute(
@@ -374,6 +429,49 @@ pub(crate) fn cleanup_subscriptions(db: &HcomDb, name: &str) -> Result<u32> {
         params![name],
     )?;
     Ok(deleted as u32)
+}
+
+/// Notification-only subscriptions have no consumer once their owner row is
+/// gone or stopped. Stop hooks normally remove them, but crashed/deleted
+/// owners can bypass that path. Check before evaluating an expensive filter.
+/// Action subscriptions are different: their on-hit action can outlive the
+/// owner while retaining its frozen provenance, so preserve them.
+fn discard_dead_owner_subscription(
+    db: &HcomDb,
+    key: &str,
+    raw: &str,
+    sub: &serde_json::Value,
+) -> bool {
+    if sub.get("on_hit_text").is_some() {
+        return false;
+    }
+    let caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
+    match db.conn().query_row(
+        &format!(
+            "SELECT 1 FROM instances WHERE name = ?1 AND {}",
+            crate::fleet_names::LIVE_ROW_PREDICATE
+        ),
+        [caller],
+        |_| Ok(()),
+    ) {
+        Ok(()) => return false,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(_) => return false,
+    }
+    db.conn()
+        .execute(
+            &format!(
+                "DELETE FROM kv WHERE key = ?1 AND value = ?2
+                 AND NOT EXISTS (
+                     SELECT 1 FROM instances
+                     WHERE name = json_extract(kv.value, '$.caller')
+                       AND {}
+                 )",
+                crate::fleet_names::LIVE_ROW_PREDICATE
+            ),
+            params![key, raw],
+        )
+        .is_ok_and(|deleted| deleted == 1)
 }
 
 /// Remove delivery-only thread memberships for an instance name reuse.
@@ -584,6 +682,9 @@ pub(crate) fn process_logged_event_collected(
             Err(_) => continue,
         };
         if subscription_is_delivery_only(&sub) {
+            continue;
+        }
+        if discard_dead_owner_subscription(db, key, value, &sub) {
             continue;
         }
         let sub_id = sub
@@ -1034,8 +1135,9 @@ fn resolve_caller_kind(db: &HcomDb, caller: &str) -> &'static str {
 fn collision_self_relevance_sql(caller: &str) -> String {
     let caller_escaped = caller.replace('\'', "''");
     format!(
-        "(events_v.instance = '{caller_escaped}' OR EXISTS (SELECT 1 FROM events_v e2 WHERE e2.type = 'status' AND e2.status_context IN {ctx} AND e2.status_detail = events_v.status_detail AND e2.instance = '{caller_escaped}' AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e2.timestamp)) < 30))",
-        ctx = FILE_WRITE_CONTEXTS
+        "(events_v.instance = '{caller_escaped}' OR EXISTS (SELECT 1 FROM events e2 INDEXED BY idx_events_status_time WHERE e2.type = 'status' AND json_extract(e2.data, '$.context') IN {ctx} AND json_extract(e2.data, '$.detail') = events_v.status_detail AND e2.instance = '{caller_escaped}' AND {window}))",
+        ctx = FILE_WRITE_CONTEXTS,
+        window = collision_time_window_sql("e2", "events_v"),
     )
 }
 
@@ -1170,16 +1272,17 @@ fn find_collision_partner(
     db.conn
         .query_row(
             &format!(
-                "SELECT e.instance FROM events_v e
-                 WHERE e.type = 'status' AND e.status_context IN {}
-                 AND e.status_detail = ?
+                "SELECT e.instance FROM events e INDEXED BY idx_events_status_time
+                 WHERE e.type = 'status' AND json_extract(e.data, '$.context') IN {}
+                 AND json_extract(e.data, '$.detail') = ?
                  AND e.instance != ?
                  AND EXISTS (
                      SELECT 1 FROM events_v ev WHERE ev.id = ?
-                     AND ABS(strftime('%s', ev.timestamp) - strftime('%s', e.timestamp)) < 30
+                     AND {window}
                  )
                  ORDER BY e.id DESC LIMIT 1",
-                FILE_WRITE_CONTEXTS
+                FILE_WRITE_CONTEXTS,
+                window = collision_time_window_sql("e", "ev"),
             ),
             params![file_path, instance, event_id],
             |row| row.get::<_, String>(0),
@@ -1258,6 +1361,279 @@ mod tests {
 
     fn cleanup_test_db(path: PathBuf) {
         let _ = std::fs::remove_file(path);
+    }
+
+    // Frozen 0.7.57 generated predicate. Keep this independent of the new
+    // window helper so the equivalence fixture catches a changed boundary,
+    // timezone interpretation, caller relevance or URI rule.
+    fn legacy_collision_filter(caller: &str) -> String {
+        let caller = caller.replace('\'', "''");
+        format!(
+            "((type='status' AND status_context IN {ctx}
+              AND events_v.status_detail IS NOT NULL AND events_v.status_detail != ''
+              AND NOT {uri}
+              AND EXISTS (
+                  SELECT 1 FROM events_v e
+                  WHERE e.type='status' AND e.status_context IN {ctx}
+                    AND e.status_detail IS NOT NULL AND e.status_detail != ''
+                    AND e.status_detail=events_v.status_detail
+                    AND e.instance!=events_v.instance
+                    AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 30
+              )))
+             AND (events_v.instance='{caller}' OR EXISTS (
+                 SELECT 1 FROM events_v e2 WHERE e2.type='status'
+                   AND e2.status_context IN {ctx}
+                   AND e2.status_detail=events_v.status_detail AND e2.instance='{caller}'
+                   AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e2.timestamp)) < 30
+             ))",
+            ctx = FILE_WRITE_CONTEXTS,
+            uri = crate::core::filters::uri_status_detail_sql("events_v.status_detail"),
+        )
+    }
+
+    fn collision_plan(db: &HcomDb, sql: &str, id: i64) -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM events_v WHERE id=?1 AND ({sql})"
+            ))
+            .unwrap();
+        stmt.query_map([id], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn assert_bounded_collision_plan(plan: &[String]) {
+        let bounded = plan
+            .iter()
+            .filter(|step| {
+                step.contains("SEARCH")
+                    && step.contains("idx_events_status_time")
+                    && step.contains(">")
+                    && step.contains("<")
+            })
+            .count();
+        assert_eq!(
+            bounded, 2,
+            "both collision probes must seek the time window: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn collision_window_preserves_057_semantics_and_seeks_both_bounds() {
+        let (db, path) = collision_test_db();
+        let filters = HashMap::from([("collision".into(), vec!["true".into()])]);
+        let SubCreateOutcome::Created { final_sql, .. } =
+            create_filter_subscription(&db, &filters, &[], "two", false, None).unwrap()
+        else {
+            panic!("fresh collision subscription");
+        };
+        // Strict whole-second window, fractional seconds, equivalent timezone
+        // offsets, malformed time, other context/instance/path and URI cases.
+        let cases = [
+            (
+                "2026-10-21T12:00:29+00:00",
+                "two",
+                "tool:write",
+                false,
+                true,
+            ),
+            (
+                "2026-10-21T12:00:30+00:00",
+                "two",
+                "tool:write",
+                false,
+                false,
+            ),
+            (
+                "2026-10-21T11:59:31+00:00",
+                "two",
+                "tool:write",
+                false,
+                true,
+            ),
+            (
+                "2026-10-21T11:59:30+00:00",
+                "two",
+                "tool:write",
+                false,
+                false,
+            ),
+            (
+                "2026-10-21T12:00:29.999999+00:00",
+                "two",
+                "tool:write",
+                false,
+                true,
+            ),
+            (
+                "2026-10-21T13:00:29+01:00",
+                "two",
+                "tool:write",
+                false,
+                true,
+            ),
+            ("not-a-timestamp", "two", "tool:write", false, false),
+            (
+                "2026-10-21T12:00:01+00:00",
+                "one",
+                "tool:write",
+                false,
+                false,
+            ),
+            (
+                "2026-10-21T12:00:01+00:00",
+                "two",
+                "tool:read",
+                false,
+                false,
+            ),
+            (
+                "2026-10-21T12:00:01+00:00",
+                "two",
+                "tool:write",
+                true,
+                false,
+            ),
+        ];
+        let legacy = legacy_collision_filter("two");
+        for (index, (ts, instance, context, uri, expected)) in cases.into_iter().enumerate() {
+            let detail = if uri {
+                format!("agent://fixture-{index}")
+            } else {
+                format!("/fixture/{index}")
+            };
+            db.insert_event_row(
+                "status",
+                instance,
+                &json!({"context":context,"detail":detail}),
+                Some(ts),
+            )
+            .unwrap();
+            let id = db
+                .insert_event_row(
+                    "status",
+                    "one",
+                    &json!({"context":"tool:write","detail":detail}),
+                    Some("2026-10-21T12:00:00.900000+00:00"),
+                )
+                .unwrap();
+            let matches = |sql: &str| {
+                db.conn()
+                    .query_row(
+                        &format!("SELECT EXISTS(SELECT 1 FROM events_v WHERE id=?1 AND ({sql}))"),
+                        [id],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(matches(&legacy), expected, "legacy fixture case {index}");
+            assert_eq!(matches(&final_sql), expected, "bounded case {index}");
+            let partner = find_collision_partner(&db, id, "one", &detail);
+            // Partner lookup is only used after the URI guard matched.
+            if !uri {
+                assert_eq!(partner.is_some(), expected, "partner case {index}");
+            }
+        }
+        assert_bounded_collision_plan(&collision_plan(&db, &final_sql, db.get_last_event_id()));
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn collision_migration_bounds_existing_watch_without_losing_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hcom.db");
+        let db = HcomDb::open_at(&path).unwrap();
+        let original = json!({
+            "id":"stable-watch", "caller":"two", "filters":{"collision":["true"]},
+            "sql":format!("({}) AND instance != 'excluded'", legacy_collision_filter("two")),
+            "created":1.0, "last_id":17, "once":false,
+            "on_hit_text":"retain this action", "caller_kind":"instance",
+        });
+        db.kv_set("events_sub:stable-watch", Some(&original.to_string()))
+            .unwrap();
+        db.conn()
+            .execute_batch("DROP INDEX IF EXISTS idx_events_status_time; PRAGMA user_version=22;")
+            .unwrap();
+        drop(db);
+        let db = HcomDb::open_at(&path).unwrap();
+        let mut migrated: serde_json::Value =
+            serde_json::from_str(&db.kv_get("events_sub:stable-watch").unwrap().unwrap()).unwrap();
+        let sql = migrated["sql"].as_str().unwrap().to_string();
+        assert_bounded_collision_plan(&collision_plan(&db, &sql, 1));
+        migrated["sql"] = original["sql"].clone();
+        assert_eq!(
+            migrated, original,
+            "IDs, custom conditions, action and cursor must survive migration"
+        );
+        let excluded = db
+            .insert_event_row(
+                "status",
+                "excluded",
+                &json!({"context":"tool:write","detail":"/same"}),
+                Some("2026-10-21T12:00:00Z"),
+            )
+            .unwrap();
+        assert!(
+            !db.conn()
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM events_v WHERE id=?1 AND ({sql}))"),
+                    [excluded],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap(),
+            "the manual predicate must still exclude the event"
+        );
+    }
+
+    #[test]
+    fn dead_owner_subscriptions_are_collected_before_filter_evaluation() {
+        let (db, path) = collision_test_db();
+        db.conn()
+            .execute("UPDATE instances SET status='stopped' WHERE name='two'", [])
+            .unwrap();
+        for (id, owner, on_hit, kind) in [
+            ("missing", "gone", None, None),
+            ("stopped", "two", None, None),
+            ("live", "one", None, None),
+            (
+                "external-action",
+                "script",
+                Some("keep external action"),
+                Some("external"),
+            ),
+            (
+                "instance-action",
+                "two",
+                Some("keep frozen provenance"),
+                Some("instance"),
+            ),
+        ] {
+            let sub = json!({
+                "id":id,"caller":owner,"sql":"type='status'",
+                "filters":{"collision":["true"]},"last_id":0,"once":false,
+            });
+            let mut sub = sub;
+            if let Some(action) = on_hit {
+                sub["on_hit_text"] = json!(action);
+            }
+            if let Some(kind) = kind {
+                sub["caller_kind"] = json!(kind);
+            }
+            db.kv_set(&format!("events_sub:{id}"), Some(&sub.to_string()))
+                .unwrap();
+        }
+        let event = json!({"context":"tool:read","detail":"/unrelated"});
+        let id = db.insert_event_row("status", "one", &event, None).unwrap();
+        let mut post = PostCommit::default();
+        process_logged_event_collected(&db, id, "status", "one", &event, &mut post);
+        assert!(db.kv_get("events_sub:missing").unwrap().is_none());
+        assert!(db.kv_get("events_sub:stopped").unwrap().is_none());
+        assert!(db.kv_get("events_sub:live").unwrap().is_some());
+        assert!(db.kv_get("events_sub:external-action").unwrap().is_some());
+        assert!(db.kv_get("events_sub:instance-action").unwrap().is_some());
+        cleanup_test_db(path);
     }
 
     /// The reqwatch reply probe runs in the event fan-out, i.e. on the relay
@@ -1656,15 +2032,6 @@ mod tests {
         assert_ne!(h1, h3);
         assert_eq!(h1.len(), 64);
         assert_eq!(&h1[..8], "9dfe6f15");
-    }
-
-    #[test]
-    fn test_collision_self_relevance_matches_filter_constants() {
-        let sql = collision_self_relevance_sql("luna");
-        assert!(sql.contains(FILE_WRITE_CONTEXTS));
-        assert!(sql.contains("< 30"));
-        assert!(!sql.contains("tool:edit_file"));
-        assert!(!sql.contains("< 20"));
     }
 
     /// A store with instances `one` and `two`.

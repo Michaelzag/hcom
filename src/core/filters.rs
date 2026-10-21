@@ -61,6 +61,19 @@ pub fn uri_status_detail_sql(column: &str) -> String {
     )
 }
 
+/// The collision window is strict (less than 30 whole seconds), just like the
+/// original ABS(strftime(...) - strftime(...)) predicate. Express both bounds
+/// on the candidate's epoch so idx_events_status_time can seek the
+/// window even when timestamps have different ISO-8601 offsets.
+pub(crate) fn collision_time_window_sql(candidate: &str, event: &str) -> String {
+    format!(
+        "CAST(strftime('%s', {candidate}.timestamp) AS INTEGER) \
+         > CAST(strftime('%s', {event}.timestamp) AS INTEGER) - 30 \
+         AND CAST(strftime('%s', {candidate}.timestamp) AS INTEGER) \
+         < CAST(strftime('%s', {event}.timestamp) AS INTEGER) + 30"
+    )
+}
+
 /// All file operation contexts.
 pub const FILE_OP_CONTEXTS: &[&str] = &[
     "tool:Write",
@@ -434,15 +447,16 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
              AND events_v.status_detail != ''\n\
              AND NOT {uri}\n\
              AND EXISTS (\n\
-             \x20   SELECT 1 FROM events_v e\n\
-             \x20   WHERE e.type = 'status' AND e.status_context IN {ctx}\n\
-             \x20   AND e.status_detail IS NOT NULL AND e.status_detail != ''\n\
-             \x20   AND e.status_detail = events_v.status_detail\n\
+             \x20   SELECT 1 FROM events e INDEXED BY idx_events_status_time\n\
+             \x20   WHERE e.type = 'status' AND json_extract(e.data, '$.context') IN {ctx}\n\
+             \x20   AND json_extract(e.data, '$.detail') IS NOT NULL AND json_extract(e.data, '$.detail') != ''\n\
+             \x20   AND json_extract(e.data, '$.detail') = events_v.status_detail\n\
              \x20   AND e.instance != events_v.instance\n\
-             \x20   AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 30\n\
+             \x20   AND {window}\n\
              ))",
             ctx = FILE_WRITE_CONTEXTS,
-            uri = uri_status_detail_sql("events_v.status_detail")
+            uri = uri_status_detail_sql("events_v.status_detail"),
+            window = collision_time_window_sql("e", "events_v"),
         );
         clauses.push(collision_sql);
     }
@@ -743,15 +757,6 @@ mod tests {
         let sql = build_sql_from_flags(&filters).unwrap();
         assert!(sql.contains("timestamp >= '2024-01-01T00:00:00Z'"));
         assert!(sql.contains("timestamp < '2024-12-31T23:59:59Z'"));
-    }
-
-    #[test]
-    fn test_build_collision() {
-        let mut filters = FilterMap::new();
-        filters.insert("collision".into(), vec!["true".into()]);
-        let sql = build_sql_from_flags(&filters).unwrap();
-        assert!(sql.contains("EXISTS"));
-        assert!(sql.contains("ABS(strftime"));
     }
 
     fn sql_context_list_contains(list: &str, operation: &str) -> bool {

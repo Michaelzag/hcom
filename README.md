@@ -111,6 +111,8 @@ Each agent gets a queryable identity:
 
 Agents can subscribe to events and react instantly. Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
 
+Collision lookups use an indexed ±30-second window, including for subscriptions saved by earlier versions. Notification-only subscriptions are removed on the next logged event if their owner is gone or stopped; on-hit action subscriptions remain active and keep their original sender provenance.
+
 Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
 
 Any other AI tool without hooks can join by running `hcom start`. Any process can wake agents with `hcom send`.
