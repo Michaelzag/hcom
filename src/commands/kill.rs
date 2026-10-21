@@ -1546,17 +1546,31 @@ mod tests {
     use serial_test::serial;
 
     #[cfg(unix)]
-    fn terminal_ownership_case(target: &str, pane: &str, opened_as: Option<&str>) -> (bool, String) {
+    fn terminal_ownership_case(
+        target: &str,
+        pane: &str,
+        opened_as: Option<&str>,
+        helper_pane: Option<&str>,
+    ) -> (bool, String) {
         use std::collections::HashMap;
         let scratch = tempfile::tempdir().unwrap();
         let open = scratch.path().join("open.sh");
         let close = scratch.path().join("close.sh");
         let closed = scratch.path().join("closed");
-        std::fs::write(&open, "printf 'gnome-terminal-seat-%s\\n' \"$1\"\n").unwrap();
-        std::fs::write(&close, format!("printf '%s' \"$1\" > '{}'\n", closed.display())).unwrap();
+        std::fs::write(
+            &open,
+            "if [ -n \"$2\" ]; then printf 'tui-%s\\n' \"$2\"; else printf 'gnome-terminal-seat-%s\\n' \"$1\"; fi\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &close,
+            format!("printf '%s' \"$1\" > '{}'\n", closed.display()),
+        )
+        .unwrap();
         let config = format!(
-            "[terminal]\nactive = 'gnomeseat'\n[terminal.presets.gnomeseat]\nopen = 'sh {} {{instance_name}} {{script}}'\nclose = 'sh {} {{pane_id}}'\nbinary = 'sh'\npane_id_env = 'GNOME_SEAT_UNIT'\n",
-            open.display(), close.display()
+            "[terminal]\nactive = 'gnomeseat'\n[terminal.presets.gnomeseat]\nopen = 'sh {} {{instance_name}} {{cwd}} {{script}}'\nclose = 'sh {} {{pane_id}}'\nbinary = 'sh'\npane_id_env = 'GNOME_SEAT_UNIT'\n",
+            open.display(),
+            close.display()
         );
         let _guard = crate::hooks::test_helpers::isolated_test_env_with_config(Some(&config));
         let db = HcomDb::open_raw(&scratch.path().join("test.db")).unwrap();
@@ -1567,8 +1581,36 @@ mod tests {
                 ("HCOM_PROCESS_ID".to_string(), "launch-nonce".to_string()),
             ]);
             let (result, _) = terminal::launch_terminal(
-                ":", &env, None, false, false, Some("gnomeseat"), false, Some("omp"),
-            ).unwrap();
+                ":",
+                &env,
+                helper_pane.map(|_| "/instance-cwd"),
+                false,
+                false,
+                Some("gnomeseat"),
+                false,
+                Some("omp"),
+            )
+            .unwrap();
+            assert!(matches!(result, terminal::LaunchResult::Success));
+        }
+        if let Some(helper_pane) = helper_pane {
+            // A helper window (the `hcom` TUI) opened later under the same
+            // instance identity: same nonce, no tool instance being launched.
+            let env = HashMap::from([
+                ("HCOM_INSTANCE_NAME".to_string(), "bura".to_string()),
+                ("HCOM_PROCESS_ID".to_string(), "launch-nonce".to_string()),
+            ]);
+            let (result, _) = terminal::launch_terminal(
+                ":",
+                &env,
+                Some(helper_pane),
+                false,
+                false,
+                Some("gnomeseat"),
+                false,
+                None,
+            )
+            .unwrap();
             assert!(matches!(result, terminal::LaunchResult::Success));
         }
         // Exactly the metadata a manual omp start inherits from its shell.
@@ -1576,15 +1618,24 @@ mod tests {
             ("HCOM_LAUNCHED_PRESET", "gnomeseat"),
             ("GNOME_SEAT_UNIT", pane),
             ("HCOM_PROCESS_ID", "launch-nonce"),
-        ].into_iter().map(|(key, value)| {
+        ]
+        .into_iter()
+        .map(|(key, value)| {
             let old = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value); }
+            unsafe {
+                std::env::set_var(key, value);
+            }
             (key, old)
-        }).collect();
-        db.save_instance_named(target, &serde_json::Map::from_iter([
-            ("tool".into(), json!("omp")),
-            ("created_at".into(), json!(1.0)),
-        ])).unwrap();
+        })
+        .collect();
+        db.save_instance_named(
+            target,
+            &serde_json::Map::from_iter([
+                ("tool".into(), json!("omp")),
+                ("created_at".into(), json!(1.0)),
+            ]),
+        )
+        .unwrap();
         crate::instance_binding::capture_and_store_launch_context(&db, target);
         for (key, old) in saved {
             unsafe {
@@ -1596,7 +1647,10 @@ mod tests {
         }
         let row = db.get_instance_full(target).unwrap().unwrap();
         let (_, pane_closed, _, _, _) = kill_instance(&db, target, 2_000_000_000, &row, false);
-        (pane_closed, std::fs::read_to_string(closed).unwrap_or_default())
+        (
+            pane_closed,
+            std::fs::read_to_string(closed).unwrap_or_default(),
+        )
     }
 
     #[cfg(unix)]
@@ -1605,8 +1659,7 @@ mod tests {
     fn terminal_ownership_inherited_seat_is_not_closed() {
         // A hand-started omp inherits another seat's GNOME_SEAT_UNIT; the
         // resume/kill of its instance must not close that unit.
-        let (closed, log) =
-            terminal_ownership_case("bura", "gnome-terminal-seat-neka", None);
+        let (closed, log) = terminal_ownership_case("bura", "gnome-terminal-seat-neka", None, None);
         assert!(!closed, "bura must not close neka's terminal");
         assert_eq!(log, "");
     }
@@ -1614,9 +1667,26 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial]
+    fn terminal_ownership_helper_window_cannot_reroute_teardown() {
+        // A later helper window (the `hcom` TUI) opened under the same
+        // instance identity must not take over the receipt: the kill still
+        // closes the instance's own pane, never the helper's.
+        let (closed, log) = terminal_ownership_case(
+            "bura",
+            "gnome-terminal-seat-bura",
+            Some("bura"),
+            Some("/helper-cwd"),
+        );
+        assert!(closed);
+        assert_eq!(log, "tui-/instance-cwd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
     fn terminal_ownership_launched_seat_closes_its_own_pane() {
         let (closed, log) =
-            terminal_ownership_case("bura", "gnome-terminal-seat-bura", Some("bura"));
+            terminal_ownership_case("bura", "gnome-terminal-seat-bura", Some("bura"), None);
         assert!(closed);
         assert_eq!(log, "gnome-terminal-seat-bura");
     }
@@ -1625,7 +1695,7 @@ mod tests {
     #[test]
     #[serial]
     fn terminal_ownership_without_launch_closes_nothing() {
-        let (closed, log) = terminal_ownership_case("bura", "", None);
+        let (closed, log) = terminal_ownership_case("bura", "", None, None);
         assert!(!closed);
         assert_eq!(log, "");
     }
