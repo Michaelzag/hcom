@@ -38,7 +38,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 21;
+const SCHEMA_VERSION: i32 = 22;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -78,6 +78,11 @@ const MIGRATIONS: &[(i32, &str)] = &[
         "SELECT 1;",
     ),
     (21, "SELECT 1;"),
+    (
+        22,
+        "CREATE INDEX IF NOT EXISTS idx_events_msg_from
+             ON events(json_extract(data, '$.from'), id) WHERE type = 'message';",
+    ),
 ];
 
 /// Schema compatibility check result
@@ -492,6 +497,8 @@ impl HcomDb {
             CREATE INDEX IF NOT EXISTS idx_type ON events(type);
             CREATE INDEX IF NOT EXISTS idx_instance ON events(instance);
             CREATE INDEX IF NOT EXISTS idx_type_instance ON events(type, instance);
+            CREATE INDEX IF NOT EXISTS idx_events_msg_from
+                ON events(json_extract(data, '$.from'), id) WHERE type = 'message';
 
             -- Instance indexes
             CREATE INDEX IF NOT EXISTS idx_session_id ON instances(session_id);

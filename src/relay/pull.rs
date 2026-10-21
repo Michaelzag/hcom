@@ -515,7 +515,10 @@ pub fn handle_state_message(
         }
     }
 
-    // Remove stale instances (no longer in remote state)
+    // Remove stale instances (no longer in remote state). A trimmed snapshot
+    // carries every live name (see push::trim_state_to_budget), so an absent
+    // name is a real removal and reconciles like any other — on old and new
+    // pullers alike.
     let current_remote: Vec<String> = db
         .conn()
         .prepare("SELECT name FROM instances WHERE origin_device_id = ?")

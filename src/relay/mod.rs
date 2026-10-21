@@ -36,6 +36,16 @@ pub const DEFAULT_BROKERS: &[(&str, u16)] = &[
 /// Used for reconnect detection, stale-device cleanup, and status display.
 pub const DEVICE_STALE_SECS: f64 = 90.0;
 
+/// Maximum MQTT packet size we advertise on CONNECT (see client.rs). The
+/// broker silently drops any publish whose packet exceeds a subscriber's
+/// advertised maximum — the outage class this budget exists to prevent.
+pub const MQTT_MAX_PACKET_BYTES: usize = 128 * 1024;
+
+/// Application payload budget for EVERY sealed publish: keeps the sealed
+/// envelope, topic and MQTT framing under [`MQTT_MAX_PACKET_BYTES`] with
+/// headroom to spare. Nothing may publish a sealed payload above this.
+pub(crate) const MAX_SEALED_PAYLOAD_BYTES: usize = 112 * 1024;
+
 /// KV key where the relay worker writes a monotonically-increasing epoch timestamp
 /// on every event-loop tick. Readers use this as the authoritative liveness signal
 /// — it survives unclean exit (SIGKILL/panic) because a dead process can't refresh it,

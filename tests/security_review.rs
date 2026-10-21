@@ -206,6 +206,27 @@ fn review_hosted_reservation_survives_mirror_expiry() {
         [],
     )
     .unwrap();
+    // The sweep runs only against a live worker and a ticking fleet clock:
+    // give it both, plus a second, freshly-syncing peer so 'peer' is judged
+    // stale against the fleet's clock rather than wall time.
+    db.execute(
+        "INSERT INTO instances (name, tool, status, origin_device_id, created_at)
+         VALUES ('beta:PEER2', 'claude', 'listening', 'peer2', 1000.0)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO kv (key, value) VALUES ('relay_sync_time_peer2', ?1)",
+        [chrono::Utc::now().timestamp().to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO kv (key, value) VALUES
+            ('relay_status', 'ok'),
+            ('relay_worker_heartbeat', ?1)",
+        [chrono::Utc::now().timestamp().to_string()],
+    )
+    .unwrap();
     // The normal CLI cleanup expires this mirror; ownership must outlive it.
     h.run(["list", "--json"]);
     let rows: i64 = db

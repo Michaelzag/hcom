@@ -333,7 +333,7 @@ impl<'a> MqttRelay<'a> {
         let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
         mqttoptions.set_keep_alive(Duration::from_secs(30));
         mqttoptions.set_clean_start(true);
-        mqttoptions.set_max_packet_size(Some(128 * 1024));
+        mqttoptions.set_max_packet_size(Some(super::MQTT_MAX_PACKET_BYTES as u32));
 
         // TLS
         if use_tls {
@@ -915,8 +915,10 @@ impl<'a> MqttRelay<'a> {
             .and_then(|psk| seal_state_tombstone(&psk, &self.relay_id, &topic));
 
         let publish_result = tombstone.and_then(|payload| {
+            // try_publish: a blocking send can park shutdown on a stalled
+            // connection; a full queue just skips the tombstone.
             self.client
-                .publish(&topic, QoS::AtLeastOnce, true, payload)
+                .try_publish(&topic, QoS::AtLeastOnce, true, payload)
                 .map_err(|e| e.to_string())
         });
         if let Err(e) = publish_result {
@@ -1005,7 +1007,13 @@ impl EphemeralClient {
         payload: Vec<u8>,
         timeout: Duration,
     ) -> bool {
-        if self.client.publish(topic, qos, retain, payload).is_err() {
+        // try_publish: a blocking send can park the caller forever on a
+        // stalled connection, before the PUBACK timeout below ever starts.
+        if self
+            .client
+            .try_publish(topic, qos, retain, payload)
+            .is_err()
+        {
             return false;
         }
 

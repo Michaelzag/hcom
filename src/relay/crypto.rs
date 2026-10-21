@@ -26,6 +26,11 @@ const TS_LEN: usize = 8;
 pub const HEADER_LEN: usize = 1 + NONCE_LEN + TS_LEN;
 pub const TAG_LEN: usize = 16;
 
+/// Wire cost of sealing one byte of plaintext: suite byte, nonce, timestamp
+/// and AEAD tag. Every publish-size budget subtracts this from its sealed cap
+/// to get the plaintext the payload may carry.
+pub(crate) const SEALED_OVERHEAD_BYTES: usize = HEADER_LEN + TAG_LEN;
+
 #[derive(Debug)]
 pub enum CryptoError {
     BadKey,
@@ -170,6 +175,15 @@ pub fn fingerprint(psk: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealed_overhead_matches_the_real_envelope_cost() {
+        let k = key();
+        for pt in [&b""[..], b"hello world".as_slice(), &[0u8; 4096][..]] {
+            let env = seal(&k, "r", "r/a", pt, 1).unwrap();
+            assert_eq!(env.len(), pt.len() + SEALED_OVERHEAD_BYTES);
+        }
+    }
 
     fn key() -> [u8; 32] {
         let mut k = [0u8; 32];

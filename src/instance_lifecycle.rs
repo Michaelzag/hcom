@@ -767,8 +767,15 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
     deleted
 }
 
-/// Delete remote mirror rows of relay devices that have stopped syncing
-/// (no push within [`REMOTE_DEVICE_STALE_THRESHOLD`]).
+/// Delete remote mirror rows of relay devices that have stopped syncing.
+///
+/// A device is judged against the fleet's clock, not wall time: it is swept
+/// only once some other peer was heard more than
+/// [`REMOTE_DEVICE_STALE_THRESHOLD`] after it went quiet. A fleet-wide
+/// silence — or our own deaf or wedged spell — never ages anything out: if
+/// nothing is arriving, we are the ones cut off. The local relay must also be
+/// live (its worker heartbeating): a stale `relay_status` left by a wedged
+/// worker is not liveness, and a dead worker must not delete mirrors either.
 pub fn cleanup_stale_remote_instances(db: &HcomDb) {
     let now = now_epoch_f64();
     let sync_map: std::collections::HashMap<String, String> = db
@@ -776,6 +783,29 @@ pub fn cleanup_stale_remote_instances(db: &HcomDb) {
         .unwrap_or_default()
         .into_iter()
         .collect();
+
+    // Liveness: the worker heartbeat is the ticking signal; relay_status
+    // alone goes stale exactly when the worker wedges.
+    let heartbeat: f64 = crate::relay::safe_kv_get(db, crate::relay::HEARTBEAT_KEY)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let relay_live = crate::relay::safe_kv_get(db, "relay_status").as_deref()
+        == Some(crate::relay::RAW_STATUS_OK)
+        && heartbeat > 0.0
+        && (now - heartbeat) <= crate::relay::HEARTBEAT_STALE_SECS;
+    if !relay_live {
+        crate::log::log_info(
+            "cleanup",
+            "remote_stale_sweep_held",
+            "local relay not live (status or heartbeat); remote rows kept",
+        );
+        return;
+    }
+
+    let freshest_peer: f64 = sync_map
+        .values()
+        .filter_map(|s| s.parse::<f64>().ok())
+        .fold(0.0f64, f64::max);
 
     if let Ok(instances) = db.iter_instances_full() {
         let device_ids: std::collections::HashSet<String> = instances
@@ -786,7 +816,9 @@ pub fn cleanup_stale_remote_instances(db: &HcomDb) {
         for device_id in device_ids {
             let sync_val = sync_map.get(&format!("relay_sync_time_{device_id}"));
             let sync_time: f64 = sync_val.and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            if sync_time > 0.0 && (now - sync_time) <= REMOTE_DEVICE_STALE_THRESHOLD {
+            // Sweep only once the fleet's freshest activity is more than the
+            // threshold past this device's last push.
+            if (freshest_peer - sync_time) <= REMOTE_DEVICE_STALE_THRESHOLD {
                 continue;
             }
             if let Err(e) = db.conn().execute(
@@ -1245,6 +1277,147 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
             get_status_description(ST_INACTIVE, "exit:timeout"),
             "inactive: timeout"
         );
+    }
+
+    fn sweep_remote_rows(db: &HcomDb) {
+        cleanup_stale_remote_instances(db);
+    }
+
+    fn seed_remote_row(db: &HcomDb, name: &str, device: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, status, created_at)
+                 VALUES (?1, ?2, 'running', 1.0)",
+                rusqlite::params![name, device],
+            )
+            .unwrap();
+    }
+
+    fn set_sync(db: &HcomDb, device: &str, when: f64) {
+        db.kv_set(
+            &format!("relay_sync_time_{device}"),
+            Some(&when.to_string()),
+        )
+        .unwrap();
+    }
+
+    fn set_relay(db: &HcomDb, status: &str, heartbeat_age: f64) {
+        db.kv_set("relay_status", Some(status)).unwrap();
+        db.kv_set(
+            crate::relay::HEARTBEAT_KEY,
+            Some(&(now_epoch_f64() - heartbeat_age).to_string()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_stale_sweep_spares_remote_rows_while_local_relay_is_down() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        seed_remote_row(&db, "alpha:DEV1", "dev-1");
+        set_sync(&db, "dev-1", now_epoch_f64() - 200.0);
+        // The local relay is not live: nothing arriving is OUR failure, not
+        // the peer's. The heartbeat is fresh so the status is what holds.
+        set_relay(&db, "disconnected", 0.5);
+
+        sweep_remote_rows(&db);
+        assert!(
+            db.get_instance_full("alpha:DEV1").unwrap().is_some(),
+            "a disconnected local relay must not age remote rows out"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_stale_sweep_spares_all_peers_when_the_fleet_is_silent() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        seed_remote_row(&db, "alpha:DEV1", "dev-1");
+        seed_remote_row(&db, "beta:DEV2", "dev-2");
+        let now = now_epoch_f64();
+        set_sync(&db, "dev-1", now - 200.0);
+        set_sync(&db, "dev-2", now - 200.0);
+        set_relay(&db, "ok", 0.5);
+
+        // Every peer silent past the window: no peer's clock runs ahead of
+        // another's, so nothing may be aged out — we are the one cut off.
+        sweep_remote_rows(&db);
+        sweep_remote_rows(&db);
+        assert!(db.get_instance_full("alpha:DEV1").unwrap().is_some());
+        assert!(db.get_instance_full("beta:DEV2").unwrap().is_some());
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_stale_sweep_removes_one_silent_peer_while_others_arrive() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        seed_remote_row(&db, "alpha:DEV1", "dev-1");
+        seed_remote_row(&db, "beta:DEV2", "dev-2");
+        let now = now_epoch_f64();
+        set_sync(&db, "dev-1", now - 200.0);
+        set_sync(&db, "dev-2", now - 1.0);
+        set_relay(&db, "ok", 0.5);
+
+        sweep_remote_rows(&db);
+        assert!(
+            db.get_instance_full("alpha:DEV1").unwrap().is_none(),
+            "one silent peer must be swept while the fleet keeps arriving"
+        );
+        assert!(
+            db.get_instance_full("beta:DEV2").unwrap().is_some(),
+            "the live peer's mirrors must survive"
+        );
+        cleanup(path);
+    }
+
+    /// Review repro (91/89/86.5): a device that went deaf 91s ago must not be
+    /// swept while peers were heard 89s and 86.5s ago — 4.5s of fleet
+    /// activity is the gap between it and the freshest peer, far under the
+    /// threshold. Judged on wall time it looks 91s stale and dies.
+    #[test]
+    fn test_stale_sweep_spares_a_deaf_peer_within_the_fleet_window() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        seed_remote_row(&db, "alpha:DEV1", "dev-1");
+        seed_remote_row(&db, "beta:DEV2", "dev-2");
+        seed_remote_row(&db, "gamma:DEV3", "dev-3");
+        let now = now_epoch_f64();
+        set_sync(&db, "dev-1", now - 91.0);
+        set_sync(&db, "dev-2", now - 89.0);
+        set_sync(&db, "dev-3", now - 86.5);
+        set_relay(&db, "ok", 0.5);
+
+        sweep_remote_rows(&db);
+        assert!(
+            db.get_instance_full("alpha:DEV1").unwrap().is_some(),
+            "a peer 4.5s behind the fleet's freshest activity must survive"
+        );
+        assert!(db.get_instance_full("beta:DEV2").unwrap().is_some());
+        assert!(db.get_instance_full("gamma:DEV3").unwrap().is_some());
+        cleanup(path);
+    }
+
+    /// relay_status "ok" goes stale exactly when the worker wedges: the
+    /// worker heartbeat is the liveness signal, and a stale one holds the
+    /// sweep no matter what the status says.
+    #[test]
+    fn test_stale_sweep_holds_when_the_worker_heartbeat_is_stale() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        seed_remote_row(&db, "alpha:DEV1", "dev-1");
+        seed_remote_row(&db, "beta:DEV2", "dev-2");
+        let now = now_epoch_f64();
+        set_sync(&db, "dev-1", now - 200.0);
+        set_sync(&db, "dev-2", now - 1.0);
+        set_relay(&db, "ok", 60.0);
+
+        sweep_remote_rows(&db);
+        assert!(
+            db.get_instance_full("alpha:DEV1").unwrap().is_some(),
+            "a wedged worker (stale heartbeat) must not age remote rows out"
+        );
+        cleanup(path);
     }
 
     #[test]
