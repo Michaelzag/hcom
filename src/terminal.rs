@@ -1884,7 +1884,6 @@ fn write_terminal_id(
         _ => return,
     };
     if instance_launch
-        && !captured_id.is_empty()
         && let Some(name) = env
             .get("HCOM_INSTANCE_NAME")
             .filter(|name| !name.is_empty())
@@ -1894,6 +1893,10 @@ fn write_terminal_id(
             "instance_name": name,
             "process_id": process_id,
             "preset": preset,
+            // May be empty: openers like tmux print no pane id and the child
+            // captures its own pane through the environment instead. The
+            // receipt still proves the launch, so the proven-launch fallback
+            // in `closeable_terminal_id` can use those captured ids.
             "terminal_id": captured_id,
         });
         if fs::create_dir_all(&owners_dir).is_ok() {
@@ -2639,13 +2642,16 @@ fn zellij_terminal_pane_exists(session_name: &str, pane_id: &str) -> Option<bool
 pub fn kill_process(
     pid: u32,
     instance_names: &[String],
-    preset_name: &str,
-    pane_id: &str,
-    process_id: &str,
-    kitty_listen_on: &str,
-    terminal_id: &str,
-    zellij_session_name: &str,
+    info: &TerminalInfo,
 ) -> (KillResult, bool, Option<String>) {
+    let TerminalInfo {
+        preset_name,
+        pane_id,
+        process_id,
+        kitty_listen_on,
+        terminal_id,
+        zellij_session_name,
+    } = info;
     let pane_close = if let Some(owned_id) = closeable_terminal_id(
         &paths::hcom_path(&[".tmp", "terminal_owners"]),
         process_id,

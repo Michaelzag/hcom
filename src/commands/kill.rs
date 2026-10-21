@@ -1053,16 +1053,8 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
                 continue;
             }
         };
-        let (result, pane_closed, pane_retry_command) = terminal::kill_process(
-            orphan.pid,
-            &orphan.names,
-            &orphan.terminal_preset,
-            &orphan.pane_id,
-            &orphan.process_id,
-            &orphan.kitty_listen_on,
-            &orphan.terminal_id,
-            &orphan.zellij_session_name,
-        );
+        let (result, pane_closed, pane_retry_command) =
+            terminal::kill_process(orphan.pid, &orphan.names, &orphan_terminal_info(orphan));
         let names = orphan.names.join(", ");
         let pane_info = pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
         let result = normalize_kill_result(&names, orphan.pid, result, pane_closed);
@@ -1220,16 +1212,8 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
             }
         };
         let names = orphan.names.join(", ");
-        let (result, pane_closed, pane_retry_command) = terminal::kill_process(
-            orphan.pid,
-            &orphan.names,
-            &orphan.terminal_preset,
-            &orphan.pane_id,
-            &orphan.process_id,
-            &orphan.kitty_listen_on,
-            &orphan.terminal_id,
-            &orphan.zellij_session_name,
-        );
+        let (result, pane_closed, pane_retry_command) =
+            terminal::kill_process(orphan.pid, &orphan.names, &orphan_terminal_info(orphan));
         let result = normalize_kill_result(&names, orphan.pid, result, pane_closed);
         let pane_info = pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
         match result {
@@ -1302,12 +1286,7 @@ fn kill_single(
                 let (result, pane_closed, pane_retry_command) = terminal::kill_process(
                     orphan.pid,
                     &orphan.names,
-                    &orphan.terminal_preset,
-                    &orphan.pane_id,
-                    &orphan.process_id,
-                    &orphan.kitty_listen_on,
-                    &orphan.terminal_id,
-                    &orphan.zellij_session_name,
+                    &orphan_terminal_info(orphan),
                 );
                 let result = normalize_kill_result(target, orphan.pid, result, pane_closed);
                 let pane_info =
@@ -1472,6 +1451,18 @@ fn kill_single(
     )
 }
 
+/// The terminal metadata of a tracked orphan, for [`terminal::kill_process`].
+fn orphan_terminal_info(orphan: &crate::pidtrack::OrphanProcess) -> terminal::TerminalInfo {
+    terminal::TerminalInfo {
+        preset_name: orphan.terminal_preset.clone(),
+        pane_id: orphan.pane_id.clone(),
+        process_id: orphan.process_id.clone(),
+        kitty_listen_on: orphan.kitty_listen_on.clone(),
+        terminal_id: orphan.terminal_id.clone(),
+        zellij_session_name: orphan.zellij_session_name.clone(),
+    }
+}
+
 /// Kill a process and close its terminal pane.
 /// Returns (KillResult, pane_closed, pane_retry_command, preset_name, pane_id).
 fn kill_instance(
@@ -1484,7 +1475,7 @@ fn kill_instance(
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
         let (result, pane_closed, pane_retry_command) =
-            terminal::kill_process(pid, &[], "", "", "", "", "", "");
+            terminal::kill_process(pid, &[], &terminal::TerminalInfo::default());
         let result = normalize_kill_result(name, pid, result, pane_closed);
         log_info(
             "kill",
@@ -1508,16 +1499,8 @@ fn kill_instance(
         instance.launch_context.as_deref(),
     );
 
-    let (result, pane_closed, pane_retry_command) = terminal::kill_process(
-        pid,
-        std::slice::from_ref(&instance.name),
-        &ti.preset_name,
-        &ti.pane_id,
-        &ti.process_id,
-        &ti.kitty_listen_on,
-        &ti.terminal_id,
-        &ti.zellij_session_name,
-    );
+    let (result, pane_closed, pane_retry_command) =
+        terminal::kill_process(pid, std::slice::from_ref(&instance.name), &ti);
     let result = normalize_kill_result(name, pid, result, pane_closed);
 
     log_info(
@@ -1551,6 +1534,7 @@ mod tests {
         pane: &str,
         opened_as: Option<&str>,
         helper_pane: Option<&str>,
+        silent: bool,
     ) -> (bool, String) {
         use std::collections::HashMap;
         let scratch = tempfile::tempdir().unwrap();
@@ -1559,7 +1543,7 @@ mod tests {
         let closed = scratch.path().join("closed");
         std::fs::write(
             &open,
-            "if [ -n \"$2\" ]; then printf 'tui-%s\\n' \"$2\"; else printf 'gnome-terminal-seat-%s\\n' \"$1\"; fi\n",
+            "case \"$2\" in /silent-cwd) ;; /instance-cwd|/helper-cwd) printf 'tui-%s\\n' \"$2\" ;; *) printf 'gnome-terminal-seat-%s\\n' \"$1\" ;; esac\n",
         )
         .unwrap();
         std::fs::write(
@@ -1583,7 +1567,11 @@ mod tests {
             let (result, _) = terminal::launch_terminal(
                 ":",
                 &env,
-                helper_pane.map(|_| "/instance-cwd"),
+                if silent {
+                    Some("/silent-cwd")
+                } else {
+                    helper_pane.map(|_| "/instance-cwd")
+                },
                 false,
                 false,
                 Some("gnomeseat"),
@@ -1659,9 +1647,23 @@ mod tests {
     fn terminal_ownership_inherited_seat_is_not_closed() {
         // A hand-started omp inherits another seat's GNOME_SEAT_UNIT; the
         // resume/kill of its instance must not close that unit.
-        let (closed, log) = terminal_ownership_case("bura", "gnome-terminal-seat-neka", None, None);
+        let (closed, log) =
+            terminal_ownership_case("bura", "gnome-terminal-seat-neka", None, None, false);
         assert!(!closed, "bura must not close neka's terminal");
         assert_eq!(log, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn terminal_ownership_silent_opener_still_closes_own_pane() {
+        // tmux/tmux-split-style openers print no pane id and the child
+        // captures its own pane through the environment instead: a proven
+        // launch must still close that pane.
+        let (closed, log) =
+            terminal_ownership_case("bura", "silent-pane-7", Some("bura"), None, true);
+        assert!(closed);
+        assert_eq!(log, "silent-pane-7");
     }
 
     #[cfg(unix)]
@@ -1676,6 +1678,7 @@ mod tests {
             "gnome-terminal-seat-bura",
             Some("bura"),
             Some("/helper-cwd"),
+            false,
         );
         assert!(closed);
         assert_eq!(log, "tui-/instance-cwd");
@@ -1685,8 +1688,13 @@ mod tests {
     #[test]
     #[serial]
     fn terminal_ownership_launched_seat_closes_its_own_pane() {
-        let (closed, log) =
-            terminal_ownership_case("bura", "gnome-terminal-seat-bura", Some("bura"), None);
+        let (closed, log) = terminal_ownership_case(
+            "bura",
+            "gnome-terminal-seat-bura",
+            Some("bura"),
+            None,
+            false,
+        );
         assert!(closed);
         assert_eq!(log, "gnome-terminal-seat-bura");
     }
@@ -1695,7 +1703,7 @@ mod tests {
     #[test]
     #[serial]
     fn terminal_ownership_without_launch_closes_nothing() {
-        let (closed, log) = terminal_ownership_case("bura", "", None, None);
+        let (closed, log) = terminal_ownership_case("bura", "", None, None, false);
         assert!(!closed);
         assert_eq!(log, "");
     }
