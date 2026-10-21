@@ -199,12 +199,16 @@ fn reqwatch_reply_exists(db: &HcomDb, request_id: i64, target: &str, sub_caller:
     }
     db.conn()
         .query_row(
-            "SELECT 1 FROM events_v WHERE id > ? AND type = 'message' \
-             AND msg_from = ? AND (\
-               (msg_scope = 'mentions' AND EXISTS (\
-                  SELECT 1 FROM json_each(msg_delivered_to) WHERE value = ?\
+            // Indexed by idx_events_from_id: the reply is one of the target's
+            // few messages above the request id. A json_extract scan over the
+            // whole events_v range here ran once per fan-out pass and wedged
+            // the relay worker's receive thread on large histories.
+            "SELECT 1 FROM events WHERE id > ?1 AND type = 'message' \
+             AND json_extract(data, '$.from') = ?2 AND (\
+               (json_extract(data, '$.scope') = 'mentions' AND EXISTS (\
+                  SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?3\
                 )) \
-               OR json_extract(data, '$.reply_to_local') = ? \
+               OR json_extract(data, '$.reply_to_local') = ?4 \
              )",
             params![request_id, target, sub_caller, request_id],
             |_| Ok(true),
@@ -288,11 +292,13 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64, post: &mut PostCommit) {
                        WHERE name = ?3 AND status = 'listening' AND last_event_id >= ?4
                    )
                    AND NOT EXISTS (
-                       SELECT 1 FROM events_v
-                       WHERE id > ?4 AND type = 'message' AND msg_from = ?3
+                       SELECT 1 FROM events
+                       WHERE id > ?4 AND type = 'message'
+                         AND json_extract(data, '$.from') = ?3
                          AND (
-                             (msg_scope = 'mentions' AND EXISTS (
-                                 SELECT 1 FROM json_each(msg_delivered_to) WHERE value = ?5
+                             (json_extract(data, '$.scope') = 'mentions' AND EXISTS (
+                                 SELECT 1 FROM json_each(json_extract(data, '$.delivered_to'))
+                                 WHERE value = ?5
                              ))
                              OR json_extract(data, '$.reply_to_local') = ?4
                          )
@@ -1252,6 +1258,45 @@ mod tests {
 
     fn cleanup_test_db(path: PathBuf) {
         let _ = std::fs::remove_file(path);
+    }
+
+    /// The reqwatch reply probe runs in the event fan-out, i.e. on the relay
+    /// worker's receive thread, once per logged event while a request watch is
+    /// live. It must be an indexed lookup: as a json_extract scan over the
+    /// whole events range it took minutes on large histories and wedged the
+    /// worker (no heartbeat, no receives) until it finished.
+    #[test]
+    fn reqwatch_reply_probe_is_an_indexed_lookup_not_a_scan() {
+        let (db, db_path) = setup_full_test_db();
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM events WHERE id > ?1 AND type = 'message' \
+                 AND json_extract(data, '$.from') = ?2 AND (\
+                   (json_extract(data, '$.scope') = 'mentions' AND EXISTS (\
+                      SELECT 1 FROM json_each(json_extract(data, '$.delivered_to')) WHERE value = ?3\
+                    )) \
+                   OR json_extract(data, '$.reply_to_local') = ?4 \
+                 )",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params![1i64, "luna", "caller", 1i64], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        cleanup_test_db(db_path);
+        let joined = plan.join(" | ");
+        assert!(
+            joined.contains("idx_events_from_id"),
+            "the probe must use the sender index: {joined}"
+        );
+        assert!(
+            !joined.contains("SCAN events"),
+            "the probe must not scan the events table: {joined}"
+        );
     }
 
     fn bind_probe() -> TcpListener {
