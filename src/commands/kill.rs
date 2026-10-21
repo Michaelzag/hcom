@@ -1055,6 +1055,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         };
         let (result, pane_closed, pane_retry_command) = terminal::kill_process(
             orphan.pid,
+            &orphan.names,
             &orphan.terminal_preset,
             &orphan.pane_id,
             &orphan.process_id,
@@ -1221,6 +1222,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
         let names = orphan.names.join(", ");
         let (result, pane_closed, pane_retry_command) = terminal::kill_process(
             orphan.pid,
+            &orphan.names,
             &orphan.terminal_preset,
             &orphan.pane_id,
             &orphan.process_id,
@@ -1299,6 +1301,7 @@ fn kill_single(
                     .map_err(|e| anyhow::Error::msg(refused_capture_error(target, &e)))?;
                 let (result, pane_closed, pane_retry_command) = terminal::kill_process(
                     orphan.pid,
+                    &orphan.names,
                     &orphan.terminal_preset,
                     &orphan.pane_id,
                     &orphan.process_id,
@@ -1481,7 +1484,7 @@ fn kill_instance(
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
         let (result, pane_closed, pane_retry_command) =
-            terminal::kill_process(pid, "", "", "", "", "", "");
+            terminal::kill_process(pid, &[], "", "", "", "", "", "");
         let result = normalize_kill_result(name, pid, result, pane_closed);
         log_info(
             "kill",
@@ -1507,6 +1510,7 @@ fn kill_instance(
 
     let (result, pane_closed, pane_retry_command) = terminal::kill_process(
         pid,
+        std::slice::from_ref(&instance.name),
         &ti.preset_name,
         &ti.pane_id,
         &ti.process_id,
@@ -1540,6 +1544,91 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use serial_test::serial;
+
+    #[cfg(unix)]
+    fn terminal_ownership_case(target: &str, pane: &str, opened_as: Option<&str>) -> (bool, String) {
+        use std::collections::HashMap;
+        let scratch = tempfile::tempdir().unwrap();
+        let open = scratch.path().join("open.sh");
+        let close = scratch.path().join("close.sh");
+        let closed = scratch.path().join("closed");
+        std::fs::write(&open, "printf 'gnome-terminal-seat-%s\\n' \"$1\"\n").unwrap();
+        std::fs::write(&close, format!("printf '%s' \"$1\" > '{}'\n", closed.display())).unwrap();
+        let config = format!(
+            "[terminal]\nactive = 'gnomeseat'\n[terminal.presets.gnomeseat]\nopen = 'sh {} {{instance_name}} {{script}}'\nclose = 'sh {} {{pane_id}}'\nbinary = 'sh'\npane_id_env = 'GNOME_SEAT_UNIT'\n",
+            open.display(), close.display()
+        );
+        let _guard = crate::hooks::test_helpers::isolated_test_env_with_config(Some(&config));
+        let db = HcomDb::open_raw(&scratch.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        if let Some(name) = opened_as {
+            let env = HashMap::from([
+                ("HCOM_INSTANCE_NAME".to_string(), name.to_string()),
+                ("HCOM_PROCESS_ID".to_string(), "launch-nonce".to_string()),
+            ]);
+            let (result, _) = terminal::launch_terminal(
+                ":", &env, None, false, false, Some("gnomeseat"), false, Some("omp"),
+            ).unwrap();
+            assert!(matches!(result, terminal::LaunchResult::Success));
+        }
+        // Exactly the metadata a manual omp start inherits from its shell.
+        let saved: Vec<_> = [
+            ("HCOM_LAUNCHED_PRESET", "gnomeseat"),
+            ("GNOME_SEAT_UNIT", pane),
+            ("HCOM_PROCESS_ID", "launch-nonce"),
+        ].into_iter().map(|(key, value)| {
+            let old = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value); }
+            (key, old)
+        }).collect();
+        db.save_instance_named(target, &serde_json::Map::from_iter([
+            ("tool".into(), json!("omp")),
+            ("created_at".into(), json!(1.0)),
+        ])).unwrap();
+        crate::instance_binding::capture_and_store_launch_context(&db, target);
+        for (key, old) in saved {
+            unsafe {
+                match old {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        let row = db.get_instance_full(target).unwrap().unwrap();
+        let (_, pane_closed, _, _, _) = kill_instance(&db, target, 2_000_000_000, &row, false);
+        (pane_closed, std::fs::read_to_string(closed).unwrap_or_default())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn terminal_ownership_inherited_seat_is_not_closed() {
+        // A hand-started omp inherits another seat's GNOME_SEAT_UNIT; the
+        // resume/kill of its instance must not close that unit.
+        let (closed, log) =
+            terminal_ownership_case("bura", "gnome-terminal-seat-neka", None);
+        assert!(!closed, "bura must not close neka's terminal");
+        assert_eq!(log, "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn terminal_ownership_launched_seat_closes_its_own_pane() {
+        let (closed, log) =
+            terminal_ownership_case("bura", "gnome-terminal-seat-bura", Some("bura"));
+        assert!(closed);
+        assert_eq!(log, "gnome-terminal-seat-bura");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn terminal_ownership_without_launch_closes_nothing() {
+        let (closed, log) = terminal_ownership_case("bura", "", None);
+        assert!(!closed);
+        assert_eq!(log, "");
+    }
 
     #[test]
     fn test_kill_no_target_fails() {
