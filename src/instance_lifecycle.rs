@@ -46,6 +46,11 @@ pub const WAKE_GRACE_PERIOD: f64 = 60.0;
 /// Remote device stale threshold (90s without push).
 const REMOTE_DEVICE_STALE_THRESHOLD: f64 = 90.0;
 
+/// KV key holding the time the last fleet-wide silence reset every device's
+/// staleness clock (see [`cleanup_stale_remote_instances`]). Effective
+/// staleness runs from the later of a device's last sync and this floor.
+const STALE_CLOCK_RESET_KEY: &str = "relay_stale_reset_ts";
+
 /// Window for showing recently stopped instances (10 minutes).
 pub const RECENTLY_STOPPED_WINDOW: f64 = 600.0;
 
@@ -769,6 +774,13 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
 
 /// Delete remote mirror rows of relay devices that have stopped syncing
 /// (no push within [`REMOTE_DEVICE_STALE_THRESHOLD`]).
+///
+/// A fleet-wide silence means we are the one cut off: if the local relay is
+/// down, or nothing has arrived from ANY peer during the staleness window,
+/// every device looks dead and the sweep would delete the whole mirror set.
+/// In that case the sweep is skipped and the staleness clocks are reset (see
+/// [`STALE_CLOCK_RESET_KEY`]), so silence never counts against a device. A
+/// single device going quiet while others keep arriving is still swept.
 pub fn cleanup_stale_remote_instances(db: &HcomDb) {
     let now = now_epoch_f64();
     let sync_map: std::collections::HashMap<String, String> = db
@@ -776,6 +788,37 @@ pub fn cleanup_stale_remote_instances(db: &HcomDb) {
         .unwrap_or_default()
         .into_iter()
         .collect();
+
+    // Effective staleness runs from the later of the device's last sync and
+    // the last fleet-silence reset, so a quiet stretch that the sweep held
+    // through never ages a device.
+    let clock_floor: f64 = crate::relay::safe_kv_get(db, STALE_CLOCK_RESET_KEY)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
+    let freshest_peer: f64 = sync_map
+        .values()
+        .filter_map(|s| s.parse::<f64>().ok())
+        .fold(0.0f64, f64::max);
+    let relay_live = crate::relay::safe_kv_get(db, "relay_status").as_deref()
+        == Some(crate::relay::RAW_STATUS_OK);
+    let fleet_silent = freshest_peer <= 0.0 || (now - freshest_peer) > REMOTE_DEVICE_STALE_THRESHOLD;
+    if !relay_live || fleet_silent {
+        crate::relay::safe_kv_set(db, STALE_CLOCK_RESET_KEY, Some(&now.to_string()));
+        crate::log::log_info(
+            "cleanup",
+            "remote_stale_sweep_held",
+            &format!(
+                "relay_live={relay_live} freshest_peer_age={:.0}s; resetting staleness clocks",
+                if freshest_peer > 0.0 {
+                    now - freshest_peer
+                } else {
+                    -1.0
+                }
+            ),
+        );
+        return;
+    }
 
     if let Ok(instances) = db.iter_instances_full() {
         let device_ids: std::collections::HashSet<String> = instances
@@ -786,7 +829,8 @@ pub fn cleanup_stale_remote_instances(db: &HcomDb) {
         for device_id in device_ids {
             let sync_val = sync_map.get(&format!("relay_sync_time_{device_id}"));
             let sync_time: f64 = sync_val.and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            if sync_time > 0.0 && (now - sync_time) <= REMOTE_DEVICE_STALE_THRESHOLD {
+            let last_seen = sync_time.max(clock_floor);
+            if last_seen > 0.0 && (now - last_seen) <= REMOTE_DEVICE_STALE_THRESHOLD {
                 continue;
             }
             if let Err(e) = db.conn().execute(
@@ -1245,6 +1289,98 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
             get_status_description(ST_INACTIVE, "exit:timeout"),
             "inactive: timeout"
         );
+    }
+
+    fn sweep_remote_rows(db: &HcomDb) {
+        cleanup_stale_remote_instances(db);
+    }
+
+    fn seed_remote_row(db: &HcomDb, name: &str, device: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, status, created_at)
+                 VALUES (?1, ?2, 'running', 1.0)",
+                rusqlite::params![name, device],
+            )
+            .unwrap();
+    }
+
+    fn set_sync(db: &HcomDb, device: &str, when: f64) {
+        db.kv_set(
+            &format!("relay_sync_time_{device}"),
+            Some(&when.to_string()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_stale_sweep_spares_remote_rows_while_local_relay_is_down() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        seed_remote_row(&db, "alpha:DEV1", "dev-1");
+        set_sync(&db, "dev-1", now_epoch_f64() - 200.0);
+        // The local relay is not live: nothing arriving is OUR failure, not
+        // the peer's.
+        db.kv_set("relay_status", Some("disconnected")).unwrap();
+
+        sweep_remote_rows(&db);
+        assert!(
+            db.get_instance_full("alpha:DEV1").unwrap().is_some(),
+            "a disconnected local relay must not age remote rows out"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_stale_sweep_spares_all_peers_when_the_fleet_is_silent() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        seed_remote_row(&db, "alpha:DEV1", "dev-1");
+        seed_remote_row(&db, "beta:DEV2", "dev-2");
+        let now = now_epoch_f64();
+        set_sync(&db, "dev-1", now - 200.0);
+        set_sync(&db, "dev-2", now - 200.0);
+        db.kv_set("relay_status", Some("ok")).unwrap();
+
+        // Every peer silent past the window: we are the one cut off.
+        sweep_remote_rows(&db);
+        sweep_remote_rows(&db);
+        assert!(db.get_instance_full("alpha:DEV1").unwrap().is_some());
+        assert!(db.get_instance_full("beta:DEV2").unwrap().is_some());
+
+        // The reset restarted the clocks: dev-2 comes back while dev-1 stays
+        // quiet, and dev-1 is not swept on the strength of silence that was
+        // already held through.
+        set_sync(&db, "dev-2", now_epoch_f64());
+        sweep_remote_rows(&db);
+        assert!(
+            db.get_instance_full("alpha:DEV1").unwrap().is_some(),
+            "the stale clock must restart after a held sweep"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_stale_sweep_removes_one_silent_peer_while_others_arrive() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        seed_remote_row(&db, "alpha:DEV1", "dev-1");
+        seed_remote_row(&db, "beta:DEV2", "dev-2");
+        let now = now_epoch_f64();
+        set_sync(&db, "dev-1", now - 200.0);
+        set_sync(&db, "dev-2", now - 1.0);
+        db.kv_set("relay_status", Some("ok")).unwrap();
+
+        sweep_remote_rows(&db);
+        assert!(
+            db.get_instance_full("alpha:DEV1").unwrap().is_none(),
+            "one silent peer must be swept while the fleet keeps arriving"
+        );
+        assert!(
+            db.get_instance_full("beta:DEV2").unwrap().is_some(),
+            "the live peer's mirrors must survive"
+        );
+        cleanup(path);
     }
 
     #[test]
