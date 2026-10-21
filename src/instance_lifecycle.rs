@@ -802,7 +802,8 @@ pub fn cleanup_stale_remote_instances(db: &HcomDb) {
         .fold(0.0f64, f64::max);
     let relay_live = crate::relay::safe_kv_get(db, "relay_status").as_deref()
         == Some(crate::relay::RAW_STATUS_OK);
-    let fleet_silent = freshest_peer <= 0.0 || (now - freshest_peer) > REMOTE_DEVICE_STALE_THRESHOLD;
+    let fleet_silent =
+        freshest_peer <= 0.0 || (now - freshest_peer) > REMOTE_DEVICE_STALE_THRESHOLD;
     if !relay_live || fleet_silent {
         crate::relay::safe_kv_set(db, STALE_CLOCK_RESET_KEY, Some(&now.to_string()));
         crate::log::log_info(

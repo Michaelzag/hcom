@@ -1009,7 +1009,11 @@ impl EphemeralClient {
     ) -> bool {
         // try_publish: a blocking send can park the caller forever on a
         // stalled connection, before the PUBACK timeout below ever starts.
-        if self.client.try_publish(topic, qos, retain, payload).is_err() {
+        if self
+            .client
+            .try_publish(topic, qos, retain, payload)
+            .is_err()
+        {
             return false;
         }
 

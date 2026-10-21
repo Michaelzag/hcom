@@ -1785,7 +1785,14 @@ mod tests {
         let mut cut = state_payload("DEVA", &["beta"]);
         cut["state"][crate::relay::push::STATE_CUT_MARKER] =
             json!({"dropped_instances": 1, "original_bytes": 4096});
-        assert!(!deliver_state(&db, &mut guard, &psk, "device-d", &cut, base_ts + 1));
+        assert!(!deliver_state(
+            &db,
+            &mut guard,
+            &psk,
+            "device-d",
+            &cut,
+            base_ts + 1
+        ));
 
         assert!(
             db.get_instance_full("alpha:DEVA").unwrap().is_some(),

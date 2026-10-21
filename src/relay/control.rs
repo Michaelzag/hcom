@@ -698,7 +698,10 @@ fn emit_rpc_result(
     // cut answer becomes an explicit failure through shrink_event, never a
     // silent drop on the wire.
     let budget = rpc_answer_plain_budget(db);
-    while serde_json::to_string(&event["data"]).map(|s| s.len()).unwrap_or(0) > budget
+    while serde_json::to_string(&event["data"])
+        .map(|s| s.len())
+        .unwrap_or(0)
+        > budget
         && super::push::shrink_level(&event) < super::push::SHRINK_LAST_LEVEL
     {
         super::push::shrink_event(&mut event);

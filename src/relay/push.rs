@@ -43,11 +43,7 @@ pub(crate) const STATE_CUT_MARKER: &str = "_relay_state_cut";
 /// state is rebuilt on every push, so cutting it costs one snapshot, never an
 /// event.
 fn trim_state_to_budget(state: &mut Value) {
-    if serde_json::to_string(state)
-        .map(|s| s.len())
-        .unwrap_or(0)
-        <= MAX_STATE_PLAIN_BYTES
-    {
+    if serde_json::to_string(state).map(|s| s.len()).unwrap_or(0) <= MAX_STATE_PLAIN_BYTES {
         return;
     }
     // Level 1: cut long strings inside each instance row.
@@ -56,11 +52,7 @@ fn trim_state_to_budget(state: &mut Value) {
             shrink_strings(inst);
         }
     }
-    if serde_json::to_string(state)
-        .map(|s| s.len())
-        .unwrap_or(0)
-        <= MAX_STATE_PLAIN_BYTES
-    {
+    if serde_json::to_string(state).map(|s| s.len()).unwrap_or(0) <= MAX_STATE_PLAIN_BYTES {
         return;
     }
     // Level 2: drop whole instances until the snapshot fits. The instance map
@@ -69,7 +61,8 @@ fn trim_state_to_budget(state: &mut Value) {
     let mut dropped = 0u64;
     // Marker first, so the final size (marker included) is what the loop
     // fits the snapshot to.
-    state[STATE_CUT_MARKER] = json!({"dropped_instances": dropped, "original_bytes": original_bytes});
+    state[STATE_CUT_MARKER] =
+        json!({"dropped_instances": dropped, "original_bytes": original_bytes});
     loop {
         if serde_json::to_string(state).map(|s| s.len()).unwrap_or(0) <= MAX_STATE_PLAIN_BYTES {
             break;
@@ -82,7 +75,8 @@ fn trim_state_to_budget(state: &mut Value) {
             .and_then(|m| m.keys().next().cloned());
         match first_key {
             Some(key) => {
-                if let Some(instances) = state.get_mut("instances").and_then(|v| v.as_object_mut()) {
+                if let Some(instances) = state.get_mut("instances").and_then(|v| v.as_object_mut())
+                {
                     instances.remove(&key);
                 }
                 dropped += 1;
@@ -862,8 +856,24 @@ mod tests {
         );
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = push(&db, &client, "relay-test", "device-uuid", &[0x42; 32], false, false);
-            let second = push(&db, &client, "relay-test", "device-uuid", &[0x42; 32], false, false);
+            let _ = push(
+                &db,
+                &client,
+                "relay-test",
+                "device-uuid",
+                &[0x42; 32],
+                false,
+                false,
+            );
+            let second = push(
+                &db,
+                &client,
+                "relay-test",
+                "device-uuid",
+                &[0x42; 32],
+                false,
+                false,
+            );
             let _ = tx.send(second);
         });
         let done = rx.recv_timeout(std::time::Duration::from_secs(10));
@@ -915,8 +925,12 @@ mod tests {
         // wedge a peer's publish for good (they accumulate in the tail).
         let dir = tempfile::tempdir().unwrap();
         let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
-        for (id, etype) in [(5i64, "message"), (6, "rpc_result"), (7, "message"), (8, "rpc_result")]
-        {
+        for (id, etype) in [
+            (5i64, "message"),
+            (6, "rpc_result"),
+            (7, "message"),
+            (8, "rpc_result"),
+        ] {
             db.conn()
                 .execute(
                     "INSERT INTO events (id, timestamp, type, instance, data) VALUES (?1, '2026-10-20T00:00:00.000000+00:00', ?2, 'luna', '{}')",

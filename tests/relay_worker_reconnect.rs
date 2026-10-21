@@ -421,8 +421,11 @@ fn reconnect_resubscribes_on_the_new_session() {
     let seen = sessions.lock().clone();
     // `relay new` probes the broker with a bare TCP connect first; only
     // sessions that spoke MQTT count here.
-    let connected: Vec<(bool, bool)> =
-        seen.iter().filter(|(saw_connect, _)| *saw_connect).copied().collect();
+    let connected: Vec<(bool, bool)> = seen
+        .iter()
+        .filter(|(saw_connect, _)| *saw_connect)
+        .copied()
+        .collect();
     assert!(
         connected.len() >= 2,
         "expected an initial and a reconnect session, saw {seen:?}"
