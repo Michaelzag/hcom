@@ -85,8 +85,11 @@ const MIGRATIONS: &[(i32, &str)] = &[
     ),
     (
         23,
+        // Expression must stay identical to core::filters::status_epoch_sql.
         "CREATE INDEX IF NOT EXISTS idx_events_status_time
-             ON events(CAST(strftime('%s', timestamp) AS INTEGER)) WHERE type = 'status';",
+             ON events(CASE WHEN lower(timestamp) IN ('now', 'subsec', 'subsecond') THEN NULL
+                 ELSE CAST(strftime('%s', timestamp) AS INTEGER) END)
+             WHERE type = 'status';",
     ),
 ];
 
@@ -505,7 +508,9 @@ impl HcomDb {
             CREATE INDEX IF NOT EXISTS idx_events_msg_from
                 ON events(json_extract(data, '$.from'), id) WHERE type = 'message';
             CREATE INDEX IF NOT EXISTS idx_events_status_time
-                ON events(CAST(strftime('%s', timestamp) AS INTEGER)) WHERE type = 'status';
+                ON events(CASE WHEN lower(timestamp) IN ('now', 'subsec', 'subsecond') THEN NULL
+                    ELSE CAST(strftime('%s', timestamp) AS INTEGER) END)
+                WHERE type = 'status';
 
             -- Instance indexes
             CREATE INDEX IF NOT EXISTS idx_session_id ON instances(session_id);
@@ -1085,7 +1090,7 @@ impl HcomDb {
             };
             tx.execute_batch(sql)?;
             if next_version == 23 {
-                subscriptions::migrate_collision_windows(tx)?;
+                subscriptions::migrate_collision_windows(tx);
             }
             if next_version == 18 && has_status_time {
                 tx.execute(

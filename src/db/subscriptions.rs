@@ -94,16 +94,7 @@ pub(crate) fn create_filter_subscription(
         sql = format!("({sql}) AND {self_relevance}");
     }
 
-    let id_source = format!(
-        "{}:{}:{}:{}:{}",
-        caller,
-        serde_json::to_string(filters).unwrap_or_default(),
-        sql,
-        once,
-        on_hit.unwrap_or(""),
-    );
-    let hash = sha256_hash(&id_source);
-    let sub_id = format!("sub-{}", &hash[..8]);
+    let sub_id = filter_subscription_id(caller, filters, &sql, once, on_hit);
     let sub_key = format!("events_sub:{sub_id}");
 
     if db.kv_get(&sub_key).ok().flatten().is_some() {
@@ -426,19 +417,46 @@ fn bounded_collision_sql(sql: &str, caller: &str, filters: &FilterMap) -> Option
         })
 }
 
-/// Upgrade generated collision windows without changing subscription IDs,
-/// manual predicates, cursors, delivery settings or on-hit actions. These SQL
-/// predicates are persisted, so changing the generator alone leaves existing
-/// watchers on the unbounded historical scan. SQL that is not an exact
-/// generated shape (hand-edited, older generator) is left as it is: still
-/// correct, only unbounded.
-pub(crate) fn migrate_collision_windows(conn: &rusqlite::Connection) -> Result<()> {
+/// Content-addressed id of a filter subscription: re-issuing an identical
+/// request finds the existing watch instead of adding a second one.
+fn filter_subscription_id(
+    caller: &str,
+    filters: &FilterMap,
+    sql: &str,
+    once: bool,
+    on_hit: Option<&str>,
+) -> String {
+    let id_source = format!(
+        "{}:{}:{}:{}:{}",
+        caller,
+        serde_json::to_string(filters).unwrap_or_default(),
+        sql,
+        once,
+        on_hit.unwrap_or(""),
+    );
+    format!("sub-{}", &sha256_hash(&id_source)[..8])
+}
+
+/// Upgrade generated collision windows, keeping manual predicates, cursors,
+/// delivery settings and on-hit actions. These SQL predicates are persisted,
+/// so changing the generator alone leaves existing watchers on the unbounded
+/// historical scan. A generated `sub-` id is re-keyed to the id the current
+/// generator computes, so re-issuing the same watch still dedupes; if that id
+/// is taken, the row keeps its id. SQL that is not an exact generated shape
+/// (hand-edited, older generator) is left as it is: still correct, only
+/// unbounded. Never fails: a row it cannot upgrade keeps its old SQL, so this
+/// step can never send the store to the archive-and-recreate path.
+pub(crate) fn migrate_collision_windows(conn: &rusqlite::Connection) {
     let rows: Vec<(String, String)> = {
-        let mut stmt = conn.prepare(
+        let Ok(mut stmt) = conn.prepare(
             "SELECT key, value FROM kv WHERE key LIKE 'events_sub:%' AND value IS NOT NULL",
-        )?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?
+        ) else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))) else {
+            return;
+        };
+        rows.filter_map(|row| row.ok()).collect()
     };
     for (key, raw) in rows {
         let Ok(mut sub) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -465,13 +483,34 @@ pub(crate) fn migrate_collision_windows(conn: &rusqlite::Connection) -> Result<(
         {
             continue;
         }
+        let new_id = filter_subscription_id(
+            caller,
+            &filters,
+            &bounded,
+            sub.get("once").and_then(|v| v.as_bool()).unwrap_or(false),
+            sub.get("on_hit_text").and_then(|v| v.as_str()),
+        );
         sub["sql"] = json!(bounded);
-        conn.execute(
+        let new_key = format!("events_sub:{new_id}");
+        if key.starts_with("events_sub:sub-") {
+            let mut rekeyed = sub.clone();
+            rekeyed["id"] = json!(new_id);
+            // Fails on the primary key when the new id is already taken.
+            if conn
+                .execute(
+                    "UPDATE kv SET key = ?1, value = ?2 WHERE key = ?3",
+                    params![new_key, rekeyed.to_string(), key],
+                )
+                .is_ok()
+            {
+                continue;
+            }
+        }
+        let _ = conn.execute(
             "UPDATE kv SET value = ?1 WHERE key = ?2",
             params![sub.to_string(), key],
-        )?;
+        );
     }
-    Ok(())
 }
 
 /// Remove all event subscriptions owned by an instance.
@@ -486,12 +525,18 @@ pub(crate) fn cleanup_subscriptions(db: &HcomDb, name: &str) -> Result<u32> {
     Ok(deleted as u32)
 }
 
-/// Notification-only subscriptions have no consumer once their owner row is
-/// gone or stopped. Stop hooks normally remove them, but crashed/deleted
-/// owners can bypass that path. Check before evaluating an expensive filter.
-/// Action subscriptions are different: their on-hit action can outlive the
-/// owner while retaining its frozen provenance, so preserve them.
-fn discard_dead_owner_subscription(
+/// A notification-only subscription whose owner has no instance row at all
+/// can never deliver: notifications are addressed through that row. Stop
+/// paths normally remove such subscriptions, but an owner deleted without
+/// stopping bypasses them. Collect it before evaluating its filter.
+///
+/// A present row is never collected, however idle it looks: a parked Claude
+/// row (`inactive`/`exit:timeout`) or a hosted `stopped` row can return to
+/// service without re-subscribing. Remote mirror owners (`name:DEVICE`) are
+/// skipped too, because the stale-device sweep deletes their rows while the
+/// device is merely away. Action subscriptions keep their frozen provenance
+/// and may outlive the owner, so they are never collected here.
+fn discard_ownerless_subscription(
     db: &HcomDb,
     key: &str,
     raw: &str,
@@ -501,29 +546,24 @@ fn discard_dead_owner_subscription(
         return false;
     }
     let caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
-    match db.conn().query_row(
-        &format!(
-            "SELECT 1 FROM instances WHERE name = ?1 AND {}",
-            crate::fleet_names::LIVE_ROW_PREDICATE
-        ),
-        [caller],
-        |_| Ok(()),
-    ) {
+    if crate::relay::control::split_device_suffix(caller).is_some() {
+        return false;
+    }
+    match db
+        .conn()
+        .query_row("SELECT 1 FROM instances WHERE name = ?1", [caller], |_| {
+            Ok(())
+        }) {
         Ok(()) => return false,
         Err(rusqlite::Error::QueryReturnedNoRows) => {}
         Err(_) => return false,
     }
     db.conn()
         .execute(
-            &format!(
-                "DELETE FROM kv WHERE key = ?1 AND value = ?2
-                 AND NOT EXISTS (
-                     SELECT 1 FROM instances
-                     WHERE name = json_extract(kv.value, '$.caller')
-                       AND {}
-                 )",
-                crate::fleet_names::LIVE_ROW_PREDICATE
-            ),
+            "DELETE FROM kv WHERE key = ?1 AND value = ?2
+             AND NOT EXISTS (
+                 SELECT 1 FROM instances WHERE name = json_extract(kv.value, '$.caller')
+             )",
             params![key, raw],
         )
         .is_ok_and(|deleted| deleted == 1)
@@ -739,7 +779,7 @@ pub(crate) fn process_logged_event_collected(
         if subscription_is_delivery_only(&sub) {
             continue;
         }
-        if discard_dead_owner_subscription(db, key, value, &sub) {
+        if discard_ownerless_subscription(db, key, value, &sub) {
             continue;
         }
         let sub_id = sub
@@ -1767,6 +1807,129 @@ mod tests {
     }
 
     #[test]
+    fn migration_23_upgrades_in_place_despite_poison_rows() {
+        // Each case must upgrade in place; any migration error would send the
+        // store down ensure_schema's archive-and-recreate path.
+        for poison in [
+            "now",
+            "NOW",
+            "subsec",
+            "SubSecond",
+            "malformed-sub",
+            "null-sub",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hcom.db");
+            {
+                let db = HcomDb::open_at(&path).unwrap();
+                db.insert_event_row("message", "luna", &json!({"text":"keep me"}), None)
+                    .unwrap();
+                db.conn()
+                    .execute_batch(
+                        "DROP INDEX IF EXISTS idx_events_status_time; PRAGMA user_version=22;",
+                    )
+                    .unwrap();
+                let kv = |value: Option<&str>| {
+                    db.conn()
+                        .execute(
+                            "INSERT INTO kv(key, value) VALUES ('events_sub:broken', ?1)",
+                            [value],
+                        )
+                        .unwrap()
+                };
+                match poison {
+                    "malformed-sub" => kv(Some("{\"filters\":")),
+                    "null-sub" => kv(None),
+                    ts => db
+                        .conn()
+                        .execute(
+                            "INSERT INTO events(timestamp, type, instance, data)
+                             VALUES (?1, 'status', 'x:PEER', '{}')",
+                            [ts],
+                        )
+                        .unwrap(),
+                };
+            }
+            let db = HcomDb::open_at(&path).unwrap();
+            let (kept, version, indexed): (i64, i32, bool) = db
+                .conn()
+                .query_row(
+                    "SELECT (SELECT count(*) FROM events WHERE json_extract(data, '$.text') = 'keep me'),
+                            (SELECT user_version FROM pragma_user_version),
+                            EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_events_status_time')",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (kept, version, indexed),
+                (1, crate::db::SCHEMA_VERSION, true),
+                "{poison}: store must be upgraded in place"
+            );
+            assert!(
+                !dir.path().join("archive").exists(),
+                "{poison}: store must not be archived"
+            );
+        }
+    }
+
+    #[test]
+    fn status_events_with_current_time_keywords_still_insert() {
+        let (db, path) = collision_test_db();
+        let data = json!({"status":"active","context":"tool:write","detail":"/a"});
+        for ts in ["now", "NOW", "subsec", "SubSecond"] {
+            db.log_event_with_ts("status", "x:PEER", &data, Some(ts))
+                .unwrap_or_else(|e| panic!("status insert with ts {ts:?}: {e}"));
+        }
+        // The relay import path stores the peer's ts verbatim.
+        let peer = json!({"id": 5, "type": "status", "instance": "x", "ts": "now", "data": data});
+        let inserted =
+            crate::relay::pull::insert_remote_event(&db, "peer-device", "PEER", 5, &peer, "MINE")
+                .unwrap();
+        assert!(matches!(
+            inserted,
+            crate::relay::pull::RemoteInsert::Inserted(_)
+        ));
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn migrated_collision_watch_still_dedupes_reissued_request() {
+        let filters: FilterMap = HashMap::from([("collision".into(), vec!["1".into()])]);
+        let legacy = legacy_collision_filter("two");
+        // 0.7.57 keyed the watch by a hash over its then-current SQL text.
+        let old_id = filter_subscription_id("two", &filters, &legacy, false, None);
+        let row = json!({
+            "id":old_id, "caller":"two", "filters":filters, "sql":legacy,
+            "created":1.0, "last_id":0, "once":false,
+        });
+        let (db, _dir) = migrate_v22_store(&[(&old_id, row.to_string())]);
+        for name in ["one", "two"] {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, created_at) VALUES (?1, 1000.0)",
+                    [name],
+                )
+                .unwrap();
+        }
+        let outcome = create_filter_subscription(&db, &filters, &[], "two", false, None).unwrap();
+        let SubCreateOutcome::AlreadyExists { id } = outcome else {
+            panic!("re-issued watch must dedupe against the migrated one");
+        };
+        let stored: serde_json::Value =
+            serde_json::from_str(&db.kv_get(&format!("events_sub:{id}")).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(stored["id"], json!(id));
+        assert_eq!(stored["last_id"], json!(0), "cursor survives the re-key");
+        assert!(
+            db.kv_get(&format!("events_sub:{old_id}"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(write_pair_and_count_collision_alerts(&db, "/dup.rs"), 1);
+    }
+
+    #[test]
     fn collision_partner_lookup_seeks_window_and_returns_newest_partner() {
         let (db, path) = collision_test_db();
         let write = |instance: &str, ts: &str| {
@@ -1812,51 +1975,125 @@ mod tests {
     }
 
     #[test]
-    fn dead_owner_subscriptions_are_collected_before_filter_evaluation() {
-        let (db, path) = collision_test_db();
-        db.conn()
-            .execute("UPDATE instances SET status='stopped' WHERE name='two'", [])
-            .unwrap();
-        for (id, owner, on_hit, kind) in [
-            ("missing", "gone", None, None),
-            ("stopped", "two", None, None),
-            ("live", "one", None, None),
-            (
-                "external-action",
-                "script",
-                Some("keep external action"),
-                Some("external"),
-            ),
-            (
-                "instance-action",
-                "two",
-                Some("keep frozen provenance"),
-                Some("instance"),
-            ),
-        ] {
-            let sub = json!({
-                "id":id,"caller":owner,"sql":"type='status'",
-                "filters":{"collision":["true"]},"last_id":0,"once":false,
-            });
-            let mut sub = sub;
-            if let Some(action) = on_hit {
-                sub["on_hit_text"] = json!(action);
-            }
-            if let Some(kind) = kind {
-                sub["caller_kind"] = json!(kind);
-            }
-            db.kv_set(&format!("events_sub:{id}"), Some(&sub.to_string()))
+    fn ownerless_subscriptions_are_collected_and_present_owners_kept() {
+        let (db, path) = setup_full_test_db();
+        // Present rows in every idle-looking state the GC must not mistake
+        // for dead: (name, status, status_context, origin device).
+        let present = [
+            ("live", "active", "tool:write", ""),
+            ("claude_idle", "listening", "", ""),
+            ("adhoc_done", "inactive", "listen timeout", ""),
+            ("hosted_off", "inactive", "buzz:offline", ""),
+            ("hosted_down", "stopped", "buzz:down", ""),
+            ("dormant", "inactive", "subagent:dormant", ""),
+            ("placeholder", "pending", "new", ""),
+            ("launch_failed", "pending", "launch_failed", ""),
+            ("mirror:PEER", "listening", "", "peer-uuid"),
+        ];
+        for (name, status, context, origin) in present {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, status, status_context, origin_device_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 1000.0)",
+                    params![name, status, context, origin],
+                )
                 .unwrap();
         }
-        let event = json!({"context":"tool:read","detail":"/unrelated"});
-        let id = db.insert_event_row("status", "one", &event, None).unwrap();
-        let mut post = PostCommit::default();
-        process_logged_event_collected(&db, id, "status", "one", &event, &mut post);
-        assert!(db.kv_get("events_sub:missing").unwrap().is_none());
-        assert!(db.kv_get("events_sub:stopped").unwrap().is_none());
-        assert!(db.kv_get("events_sub:live").unwrap().is_some());
-        assert!(db.kv_get("events_sub:external-action").unwrap().is_some());
-        assert!(db.kv_get("events_sub:instance-action").unwrap().is_some());
+        let filters = HashMap::from([("collision".to_string(), vec!["1".to_string()])]);
+        let watch = |owner: &str, action: Option<&str>| match create_filter_subscription(
+            &db,
+            &filters,
+            &[],
+            owner,
+            false,
+            action,
+        )
+        .unwrap()
+        {
+            SubCreateOutcome::Created { id, .. } => id,
+            SubCreateOutcome::AlreadyExists { id } => id,
+        };
+        let ids: HashMap<&str, String> = present
+            .iter()
+            .map(|(name, ..)| (*name, watch(name, None)))
+            .chain([
+                ("gone", watch("gone", None)),
+                ("gone:PEER", watch("gone:PEER", None)),
+                ("gone_action", watch("gone_action", Some("keep the action"))),
+            ])
+            .collect();
+        let exists = |owner: &str| {
+            db.kv_get(&format!("events_sub:{}", ids[owner]))
+                .unwrap()
+                .is_some()
+        };
+        let fan_out = || {
+            let event = json!({"context":"tool:read","detail":"/unrelated"});
+            let id = db.insert_event_row("status", "live", &event, None).unwrap();
+            process_logged_event_collected(
+                &db,
+                id,
+                "status",
+                "live",
+                &event,
+                &mut PostCommit::default(),
+            );
+        };
+
+        // A non-PTY Claude Stop-hook poll timeout parks the row; the session
+        // keeps running.
+        crate::instance_lifecycle::set_status(
+            &db,
+            "claude_idle",
+            "inactive",
+            "exit:timeout",
+            Default::default(),
+        );
+        fan_out();
+        for (name, ..) in present {
+            assert!(exists(name), "{name}: present owner must keep its watch");
+        }
+        assert!(!exists("gone"), "an owner with no row is collected");
+        assert!(exists("gone:PEER"), "a missing mirror owner is only away");
+        assert!(exists("gone_action"), "action watches outlive their owner");
+
+        // The stale-device sweep deletes a quiet device's mirror rows; the
+        // device comes back later.
+        db.conn()
+            .execute("DELETE FROM instances WHERE name = 'mirror:PEER'", [])
+            .unwrap();
+        fan_out();
+        assert!(exists("mirror:PEER"), "mirror watch must survive the sweep");
+
+        // The Claude user returns without re-subscribing; collisions reach it.
+        crate::instance_lifecycle::set_status(
+            &db,
+            "claude_idle",
+            "active",
+            "prompt",
+            Default::default(),
+        );
+        for instance in ["live", "claude_idle"] {
+            db.log_event(
+                "status",
+                instance,
+                &json!({"status":"active","context":"tool:write","detail":"/after.rs"}),
+            )
+            .unwrap();
+        }
+        let alerts: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'
+                 AND json_extract(data, '$.text') LIKE '@claude_idle %COLLISION%/after.rs%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            alerts > 0,
+            "the returning Claude seat must get collision alerts"
+        );
         cleanup_test_db(path);
     }
 

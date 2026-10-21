@@ -61,16 +61,28 @@ pub fn uri_status_detail_sql(column: &str) -> String {
     )
 }
 
+/// Epoch seconds of a status row's timestamp, exactly as indexed by
+/// idx_events_status_time. strftime() treats 'now', 'subsec' and 'subsecond'
+/// as the current time, which SQLite refuses inside an index ("non-deterministic
+/// use of strftime()") on CREATE INDEX and on every later status insert. Relay
+/// peers' timestamps are stored verbatim, so those spellings map to NULL here;
+/// every other value keeps strftime's result.
+fn status_epoch_sql(column: &str) -> String {
+    format!(
+        "CASE WHEN lower({column}) IN ('now', 'subsec', 'subsecond') THEN NULL \
+         ELSE CAST(strftime('%s', {column}) AS INTEGER) END"
+    )
+}
+
 /// The collision window is strict (less than 30 whole seconds), just like the
 /// original ABS(strftime(...) - strftime(...)) predicate. Express both bounds
-/// on the candidate's epoch so idx_events_status_time can seek the
+/// on the candidate's indexed epoch so idx_events_status_time can seek the
 /// window even when timestamps have different ISO-8601 offsets.
 pub(crate) fn collision_time_window_sql(candidate: &str, event: &str) -> String {
+    let candidate = status_epoch_sql(&format!("{candidate}.timestamp"));
     format!(
-        "CAST(strftime('%s', {candidate}.timestamp) AS INTEGER) \
-         > CAST(strftime('%s', {event}.timestamp) AS INTEGER) - 30 \
-         AND CAST(strftime('%s', {candidate}.timestamp) AS INTEGER) \
-         < CAST(strftime('%s', {event}.timestamp) AS INTEGER) + 30"
+        "{candidate} > CAST(strftime('%s', {event}.timestamp) AS INTEGER) - 30 \
+         AND {candidate} < CAST(strftime('%s', {event}.timestamp) AS INTEGER) + 30"
     )
 }
 
