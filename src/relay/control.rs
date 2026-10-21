@@ -696,9 +696,12 @@ fn emit_rpc_result(
     // sealed-size budget at the source so one oversized answer (a huge
     // transcript, a big config) can never wedge the publish carrying it: a
     // cut answer becomes an explicit failure through shrink_event, never a
-    // silent drop on the wire.
+    // silent drop on the wire. The budget is the `result` budget
+    // (rpc_answer_plain_budget reserves the shell and envelopes around it),
+    // so compare the `result` itself against it — measuring the whole data
+    // object shrinks answers that fit and turns them into false failures.
     let budget = rpc_answer_plain_budget(db);
-    while serde_json::to_string(&event["data"])
+    while serde_json::to_string(&event["data"]["result"])
         .map(|s| s.len())
         .unwrap_or(0)
         > budget
@@ -2303,6 +2306,44 @@ mod tests {
             )
             .is_none(),
             "an oversized request must be refused at the source"
+        );
+    }
+
+    /// A result that fits its own budget must travel whole. The budget is the
+    /// `result` budget (rpc_answer_plain_budget reserves the shell around
+    /// it); comparing the whole rpc_result data object against it shrank
+    /// answers that fit and turned them into false failures.
+    #[test]
+    fn emit_rpc_result_keeps_a_result_that_fits_its_own_budget() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let budget = rpc_answer_plain_budget(&db);
+        let content_len = budget - 64;
+        emit_rpc_result(
+            &db,
+            "req-fit",
+            "transcript",
+            true,
+            &json!({"target": "luna", "content": "x".repeat(content_len)}),
+        );
+        let row: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'rpc_result' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let data: Value = serde_json::from_str(&row).unwrap();
+        assert!(
+            data.get("_relay_truncated").is_none(),
+            "a result within its budget must not be shrunk: {data}"
+        );
+        assert_eq!(data["ok"], json!(true));
+        assert_eq!(
+            data["result"]["content"].as_str().unwrap().len(),
+            content_len,
+            "the answer must reach the requester whole"
         );
     }
 
