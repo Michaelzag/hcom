@@ -30,102 +30,16 @@ const RETAINED_EVENT_TAIL: i64 = 50;
 pub(crate) const MAX_STATE_PLAIN_BYTES: usize =
     (MAX_SEALED_PAYLOAD_BYTES - crypto::SEALED_OVERHEAD_BYTES) / 2;
 
-/// A lean instance row keeps the name (the map key) plus these fields.
-const LEAN_INSTANCE_FIELDS: [&str; 4] = ["enabled", "status", "status_time", "tool"];
-
-/// Minimum plaintext the push envelope costs around the state:
-/// `{"state":…, "events":[]}`.
-const MIN_PUSH_ENVELOPE_BYTES: usize = 32;
-
-/// Returned when the roster cannot fit the whole publish budget even as bare
-/// names: a partial roster makes pre-0.7.56 pullers delete the omitted
-/// instances' mirrors, so the push is skipped instead.
+/// Returned when the full roster cannot fit the whole publish budget: the
+/// push is skipped (loudly) rather than cut, because pre-0.7.56 pullers
+/// delete the mirror of any name a snapshot stops carrying and every field
+/// carries data some consumer reads. The cursor stays put and the next cycle
+/// retries.
 pub(crate) const STATE_ROSTER_UNSENDABLE: &str = "state roster exceeds the whole publish budget; skipping the push rather than \
      sending a partial roster";
 
-/// Marker written on a state snapshot whose contents were trimmed to fit the
-/// wire budget. The pull side must not read a cut snapshot as "the origin
-/// stopped publishing these instances" and delete their mirrors, and a cut
-/// snapshot updates only the fields it carries. Older pullers ignore the
-/// marker, which is why trimming NEVER omits a live instance name: on those
-/// a cut snapshot costs field detail (restored by the next full snapshot),
-/// never a mirror row.
-pub(crate) const STATE_CUT_MARKER: &str = "_relay_state_cut";
-
-/// Bytes reserved for the cut marker inside the state budget, so a fitted
-/// snapshot never overflows once the marker is written.
-const STATE_CUT_MARKER_RESERVE: usize = 160;
-
 fn state_plain_len(state: &Value) -> usize {
     serde_json::to_string(state).map(|s| s.len()).unwrap_or(0)
-}
-
-/// Trim the state snapshot to the wire budget without ever omitting a live
-/// instance name:
-/// 1. cut long strings inside instance rows;
-/// 2. strip every instance to a lean shape ([`LEAN_INSTANCE_FIELDS`]);
-/// 3. strip every instance to bare names (`{}` values) — the roster as a
-///    whole still travels, and the publish's events make way for it.
-///
-/// Returns false when even a names-only roster cannot fit the whole publish
-/// budget: the caller must skip the push ([`STATE_ROSTER_UNSENDABLE`]) rather
-/// than send a partial roster. Pre-0.7.56 pullers ignore the cut marker and
-/// delete the mirror of any name a snapshot stops carrying, so there is no
-/// safe partial roster on a mixed fleet.
-fn trim_state_to_budget(state: &mut Value) -> bool {
-    if state_plain_len(state) + STATE_CUT_MARKER_RESERVE <= MAX_STATE_PLAIN_BYTES {
-        return true;
-    }
-    let original_bytes = state_plain_len(state);
-
-    // Level 1: cut long strings inside each instance row.
-    if let Some(instances) = state.get_mut("instances").and_then(|v| v.as_object_mut()) {
-        for inst in instances.values_mut() {
-            shrink_strings(inst);
-        }
-    }
-    let mut level = 1u64;
-    if state_plain_len(state) + STATE_CUT_MARKER_RESERVE <= MAX_STATE_PLAIN_BYTES {
-        state[STATE_CUT_MARKER] =
-            json!({"level": level, "dropped_instances": 0, "original_bytes": original_bytes});
-        return true;
-    }
-
-    // Level 2: lean rows. Every name stays advertised, so pullers of any
-    // version keep their mirrors; only field detail is lost.
-    if let Some(instances) = state.get_mut("instances").and_then(|v| v.as_object_mut()) {
-        for inst in instances.values_mut() {
-            let mut lean = serde_json::Map::new();
-            for field in LEAN_INSTANCE_FIELDS {
-                if let Some(v) = inst.get(field) {
-                    lean.insert(field.to_string(), v.clone());
-                }
-            }
-            *inst = Value::Object(lean);
-        }
-    }
-    level = 2;
-    if state_plain_len(state) + STATE_CUT_MARKER_RESERVE <= MAX_STATE_PLAIN_BYTES {
-        state[STATE_CUT_MARKER] =
-            json!({"level": level, "dropped_instances": 0, "original_bytes": original_bytes});
-        return true;
-    }
-
-    // Level 3: bare names. The whole roster still travels (events make way
-    // for it in the publish); only this level may exceed the state's usual
-    // half of the budget, up to the whole envelope.
-    if let Some(instances) = state.get_mut("instances").and_then(|v| v.as_object_mut()) {
-        for inst in instances.values_mut() {
-            *inst = json!({});
-        }
-    }
-    level = 3;
-    state[STATE_CUT_MARKER] =
-        json!({"level": level, "dropped_instances": 0, "original_bytes": original_bytes});
-    let hard_budget = MAX_SEALED_PAYLOAD_BYTES
-        .saturating_sub(crypto::SEALED_OVERHEAD_BYTES)
-        .saturating_sub(MIN_PUSH_ENVELOPE_BYTES);
-    state_plain_len(state) <= hard_budget
 }
 
 fn seal_bounded_payload(
@@ -137,11 +51,31 @@ fn seal_bounded_payload(
     topic: &str,
     now_secs: u64,
 ) -> Result<Vec<u8>, String> {
-    // The state is regenerated every push: bound it up front so it can never
-    // push a publish over the wire budget or starve the events sharing it.
-    if !trim_state_to_budget(state) {
+    // The state roster travels whole, exactly as 0.7.56 sent it: field-level
+    // trimming is out of scope for 0.7.57 (real rosters are a handful of
+    // instances). Room is made only by giving up events — see below.
+    if state_plain_len(state) > MAX_SEALED_PAYLOAD_BYTES {
         return Err(STATE_ROSTER_UNSENDABLE.to_string());
     }
+    // The tail anchor — the newest non-control retained-tail event — is what
+    // keeps a tail-only snapshot from reading as a recreated peer DB on the
+    // receiver (pull.rs's id-regression check wipes every mirror when the
+    // carried run's max falls under its import cursor). It is needed only
+    // when no new event rides along: any new event sits above the cursor and
+    // already keeps the check quiet, and new events follow prefix semantics
+    // (drop newest-first, so the cursor only advances through what is sent).
+    let has_new_event = events
+        .iter()
+        .any(|e| e["id"].as_i64().is_some_and(|id| id > last_push_id));
+    let anchor_id: Option<i64> = if has_new_event {
+        None
+    } else {
+        events
+            .iter()
+            .filter(|e| e["type"].as_str() != Some("control"))
+            .filter_map(|e| e["id"].as_i64())
+            .max()
+    };
     loop {
         let payload = json!({
             "state": state,
@@ -154,37 +88,36 @@ fn seal_bounded_payload(
             return Ok(sealed);
         }
 
-        // Retained tail events have already advanced the local cursor. Drop the oldest of those
-        // first so a large tail cannot starve new events forever. If only new events remain, trim
-        // from the end and publish the earliest prefix; the cursor advances only through that
-        // prefix and the remainder is sent on the next drain iteration.
-        if let Some(index) = events
-            .iter()
-            .position(|event| event["id"].as_i64().is_some_and(|id| id <= last_push_id))
+        // Give up events, never state: the roster and its fields are what
+        // every consumer reads. Retained tail events have already advanced
+        // the local cursor and go first (oldest first), then new events
+        // newest-first — the cursor advances only through what is published,
+        // so dropped new events are re-sent on the next drain iteration.
+        if let Some(index) = events.iter().position(|event| {
+            event["id"]
+                .as_i64()
+                .is_some_and(|id| id <= last_push_id && Some(id) != anchor_id)
+        }) {
+            events.remove(index);
+        } else if events.len() > 1
+            && let Some(index) = events
+                .iter()
+                .rposition(|event| event["id"].as_i64() != anchor_id)
         {
             events.remove(index);
-        } else if events.len() > 1 {
-            events.pop();
         } else if let Some(only) = events.first_mut()
             && shrink_level(only) < SHRINK_LAST_LEVEL
         {
-            // One new event larger than the whole budget used to be popped
-            // here. The cursor then stayed below it, every later push rebuilt
-            // the same batch and dropped the same event, and only the state
-            // snapshot went out: the device stopped relaying events for good
-            // while its instances still looked healthy. Send a shrunk copy so
-            // the cursor moves past it; the local row keeps the full event.
+            // Only the anchor is left and it is larger than the room the
+            // state leaves. Send a shrunk copy so it still rides (its id is
+            // what the receiver's regression check keys on); the local row
+            // keeps the full event.
             shrink_event(only);
-        } else if events.is_empty() {
-            // Nothing left to give up: the names-only state alone is over
-            // budget (trim_state_to_budget should have refused it first).
-            return Err(STATE_ROSTER_UNSENDABLE.to_string());
         } else {
-            // A names-only roster can leave no room for the last event. Drop
-            // it from this publish: the cursor does not advance past it and
-            // the next cycle retries. The state roster is never cut down for
-            // events — a partial roster deletes mirrors on old pullers.
-            events.clear();
+            // Nothing left to give up: the full state plus the anchor cannot
+            // fit the wire budget. Skip this push loudly rather than send a
+            // cut roster — the cursor stays put and the next cycle retries.
+            return Err(STATE_ROSTER_UNSENDABLE.to_string());
         }
     }
 }
@@ -561,10 +494,12 @@ pub fn push(
         Ok(sealed) => sealed,
         Err(e) if e == STATE_ROSTER_UNSENDABLE => {
             // No safe publish exists for this roster: skipping keeps every
-            // peer's mirrors intact (a partial roster deletes the omitted
-            // names on pre-0.7.56 pullers). The cursor does not advance and
-            // the next cycle retries.
+            // peer's mirrors intact (a cut roster deletes the omitted names
+            // on pre-0.7.56 pullers). Loud, and visible in `hcom relay
+            // status`: the cursor does not advance and the next cycle
+            // retries.
             crate::log::log_warn("relay", "relay.state_roster_unsendable", &e);
+            set_relay_status(db, "error", Some(&e), is_worker);
             return Ok((false, false));
         }
         Err(e) => return Err(e),
@@ -942,64 +877,26 @@ mod tests {
     }
 
     #[test]
-    fn oversized_state_keeps_every_name_and_stays_under_the_packet_budget() {
-        // A state snapshot alone above the wire budget must still go out, and
-        // trimming it must never omit a live instance name while names fit:
-        // pullers of 0.7.55/0.7.56 ignore the cut marker and delete the
-        // mirrors of any name a snapshot stops carrying. This is also the
-        // roster-starvation guard: a stable roster must not settle on one
-        // subset while the rest of the names never reach any puller.
+    fn over_budget_push_keeps_the_full_state_including_the_hosted_tool() {
+        // Room is made by giving up events, never state: the roster travels
+        // exactly as 0.7.56 sent it, every field included. tool='buzz' is the
+        // #83 security surface (validate_protected_identity keys on it), so
+        // it must survive any amount of event pressure.
         let mut instances = serde_json::Map::new();
-        for i in 0..300 {
+        for i in 0..40 {
             instances.insert(
                 format!("inst-{i:03}"),
-                json!({"detail": "x".repeat(1024), "status": "active", "status_time": 1.0, "tool": "claude"}),
+                json!({"detail": format!("row {i} "), "status": "active", "context": "tool:write",
+                       "status_time": 1.0, "tool": "buzz", "tag": "keep", "directory": "/w",
+                       "transcript": "/t", "wait_timeout": 86400, "last_stop": 0.0,
+                       "tcp_mode": false, "background": false}),
             );
         }
         let mut state = json!({"instances": instances});
-        let mut events = Vec::new();
-        let sealed = seal_bounded_payload(
-            &mut state,
-            &mut events,
-            0,
-            &[0x42; 32],
-            "relay-test",
-            "relay-test/device-test",
-            1_700_000_000,
-        )
-        .unwrap();
-
-        assert!(sealed.len() <= MAX_SEALED_PAYLOAD_BYTES);
-        assert!(
-            state_plain_len(&state) <= MAX_STATE_PLAIN_BYTES,
-            "the trimmed state must respect its own plaintext budget"
-        );
-        let marker = state
-            .get(STATE_CUT_MARKER)
-            .expect("a cut snapshot must be marked so the pull side keeps its mirrors");
-        assert_eq!(
-            state["instances"].as_object().unwrap().len(),
-            300,
-            "the whole roster fits lean; no name may be omitted: {marker}"
-        );
-    }
-
-    #[test]
-    fn names_only_roster_keeps_every_name_and_shrinks_events_instead() {
-        // Past even the lean fit, the roster travels as bare names and the
-        // publish's events make way for it. No name may be omitted at any
-        // level: pre-0.7.56 pullers delete the mirrors of names a snapshot
-        // stops carrying.
-        let mut instances = serde_json::Map::new();
-        for i in 0..4000 {
-            instances.insert(
-                format!("inst-{i:04}"),
-                json!({"status": "active", "detail": "x".repeat(64)}),
-            );
-        }
-        let mut state = json!({"instances": instances});
-        let mut events =
-            vec![json!({"id": 1, "type": "message", "data": {"text": "x".repeat(4096)}})];
+        let before = serde_json::to_string(&state).unwrap();
+        let mut events: Vec<Value> = (1..=30)
+            .map(|id| json!({"id": id, "type": "message", "data": {"text": "x".repeat(8192)}}))
+            .collect();
         let sealed = seal_bounded_payload(
             &mut state,
             &mut events,
@@ -1013,22 +910,27 @@ mod tests {
 
         assert!(sealed.len() <= MAX_SEALED_PAYLOAD_BYTES);
         assert_eq!(
-            state["instances"].as_object().unwrap().len(),
-            4000,
-            "the names-only fallback must keep the whole roster"
+            serde_json::to_string(&state).unwrap(),
+            before,
+            "an over-budget push must give up events, never state"
         );
     }
 
     #[test]
     fn unsendable_roster_skips_the_push_instead_of_sending_a_partial_roster() {
-        // When even bare names exceed the whole publish budget there is no
-        // safe publish: a partial roster deletes the omitted names' mirrors
-        // on pre-0.7.56 pullers, so the push is skipped instead.
+        // When even the whole publish budget cannot hold the roster there is
+        // no safe publish: a cut roster deletes the omitted names' mirrors on
+        // pre-0.7.56 pullers and drops fields consumers read, so the push is
+        // skipped loudly instead.
         let mut instances = serde_json::Map::new();
         for i in 0..20000 {
-            instances.insert(format!("inst-{i:05}"), json!({}));
+            instances.insert(
+                format!("inst-{i:05}"),
+                json!({"status": "active", "context": "tool:write", "status_time": 1.0, "tool": "claude"}),
+            );
         }
         let mut state = json!({"instances": instances});
+        let before = serde_json::to_string(&state).unwrap();
         let mut events = Vec::new();
         let error = seal_bounded_payload(
             &mut state,
@@ -1043,8 +945,8 @@ mod tests {
 
         assert_eq!(error, STATE_ROSTER_UNSENDABLE);
         assert_eq!(
-            state["instances"].as_object().unwrap().len(),
-            20000,
+            serde_json::to_string(&state).unwrap(),
+            before,
             "refusing to send must not cut the roster either"
         );
     }
