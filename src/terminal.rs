@@ -1865,15 +1865,59 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
 }
 
 /// Write captured terminal ID to temp file for child to read.
-fn write_terminal_id(env: &HashMap<String, String>, captured_id: &str) {
-    let captured_id = normalize_captured_terminal_id(captured_id);
-    if captured_id.is_empty() {
+///
+/// `instance_launch` is true only for a launch that opens the terminal *for*
+/// the tool instance named in `HCOM_INSTANCE_NAME` — the launcher paths that
+/// minted the `HCOM_PROCESS_ID` nonce. Only such a launch may write the
+/// ownership receipt that later lets cleanup close this pane; a helper window
+/// opened under a running instance's identity (the `hcom` TUI) must never
+/// redirect that instance's teardown at its own pane.
+fn write_terminal_id(
+    env: &HashMap<String, String>,
+    captured_id: &str,
+    preset: &str,
+    instance_launch: bool,
+) {
+    // Helper windows own neither the receipt nor the child's one-shot id file.
+    if !instance_launch {
         return;
     }
+    let captured_id = normalize_captured_terminal_id(captured_id);
     let process_id = match env.get("HCOM_PROCESS_ID") {
         Some(pid) if !pid.is_empty() => pid,
         _ => return,
     };
+    if let Some(name) = env
+        .get("HCOM_INSTANCE_NAME")
+        .filter(|name| !name.is_empty())
+    {
+        let owners_dir = paths::hcom_path(&[".tmp", "terminal_owners"]);
+        let receipt = serde_json::json!({
+            "instance_name": name,
+            "process_id": process_id,
+            "preset": preset,
+            // May be empty: openers like tmux print no pane id and the child
+            // captures its own pane through the environment instead. The
+            // receipt still proves the launch, so the proven-launch fallback
+            // in `closeable_terminal_id` can use those captured ids.
+            "terminal_id": captured_id,
+        });
+        if fs::create_dir_all(&owners_dir).is_ok() {
+            // Create-only: the nonce's first (instance) launch owns the
+            // receipt; a later window under the same identity cannot reroute
+            // the instance's teardown at another pane.
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(owners_dir.join(process_id))
+                .and_then(|mut file| {
+                    std::io::Write::write_all(&mut file, receipt.to_string().as_bytes())
+                });
+        }
+    }
+    if captured_id.is_empty() {
+        return;
+    }
     let ids_dir = paths::hcom_path(&[".tmp", "terminal_ids"]);
     fs::create_dir_all(&ids_dir).ok();
     fs::write(ids_dir.join(process_id), captured_id).ok();
@@ -2149,6 +2193,9 @@ pub fn launch_terminal(
 
     // Run in current terminal (blocking)
     if run_here {
+        if tool_id.is_some() {
+            record_run_here_terminal(&final_env, &terminal_mode);
+        }
         // Build full env (config + shell)
         let full_env = build_full_env(&final_env);
         if let Some(dir) = cwd {
@@ -2250,7 +2297,9 @@ pub fn launch_terminal(
             format!("warp://launch/hcom-{}", process_id),
         ];
         let (success, captured_id) = spawn_terminal_process(&final_argv, inside_ai_tool)?;
-        write_terminal_id(env, &captured_id);
+        if success {
+            write_terminal_id(env, &captured_id, &terminal_mode, tool_id.is_some());
+        }
         return if success {
             Ok((LaunchResult::Success, terminal_mode))
         } else {
@@ -2299,7 +2348,9 @@ pub fn launch_terminal(
             let final_argv = substitute_open_argv(&cmd_template, ctx)?;
             spawn_terminal_process(&final_argv, inside_ai_tool)?
         };
-        write_terminal_id(env, &captured_id);
+        if success {
+            write_terminal_id(env, &captured_id, &terminal_mode, tool_id.is_some());
+        }
         if success {
             Ok((LaunchResult::Success, terminal_mode))
         } else {
@@ -2369,7 +2420,9 @@ pub fn launch_terminal(
                 .collect()
         };
         let (success, captured_id) = spawn_terminal_process(&final_argv, inside_ai_tool)?;
-        write_terminal_id(env, &captured_id);
+        if success {
+            write_terminal_id(env, &captured_id, &terminal_mode, tool_id.is_some());
+        }
         if success {
             Ok((LaunchResult::Success, terminal_mode))
         } else {
@@ -2594,21 +2647,37 @@ fn zellij_terminal_pane_exists(session_name: &str, pane_id: &str) -> Option<bool
 /// Close terminal pane (if applicable) then SIGTERM the process group.
 pub fn kill_process(
     pid: u32,
-    preset_name: &str,
-    pane_id: &str,
-    process_id: &str,
-    kitty_listen_on: &str,
-    terminal_id: &str,
-    zellij_session_name: &str,
+    instance_names: &[String],
+    info: &TerminalInfo,
 ) -> (KillResult, bool, Option<String>) {
-    let pane_close = if !preset_name.is_empty() {
+    let TerminalInfo {
+        preset_name,
+        pane_id,
+        process_id,
+        kitty_listen_on,
+        terminal_id,
+        zellij_session_name,
+    } = info;
+    let pane_close = if let Some(owned_id) = closeable_terminal_id(
+        &paths::hcom_path(&[".tmp", "terminal_owners"]),
+        process_id,
+        instance_names,
+        preset_name,
+        pane_id,
+        terminal_id,
+    ) {
+        let pane_id = if is_zellij_preset(preset_name) {
+            owned_id.strip_prefix("terminal_").unwrap_or(&owned_id)
+        } else {
+            &owned_id
+        };
         close_terminal_pane(
             pid,
             preset_name,
             pane_id,
             process_id,
             kitty_listen_on,
-            terminal_id,
+            &owned_id,
             zellij_session_name,
         )
     } else {
@@ -2630,6 +2699,109 @@ pub fn kill_process(
     };
 
     (kill_result, pane_close.closed, pane_close.retry_command)
+}
+
+/// A run-here launch owns only a single, identified pane, never the enclosing
+/// window, workspace or systemd unit that may contain other instances.
+fn record_run_here_terminal(env: &HashMap<String, String>, preset: &str) {
+    let pane_var = match preset {
+        "tmux" | "tmux-split" => "TMUX_PANE",
+        "wezterm" | "wezterm-split" | "wezterm-tab" => "WEZTERM_PANE",
+        "kitty" | "kitty-split" | "kitty-tab" => "KITTY_WINDOW_ID",
+        "zellij" => "ZELLIJ_PANE_ID",
+        "herdr" => "HERDR_PANE_ID",
+        "waveterm" => "WAVETERM_BLOCKID",
+        _ => return,
+    };
+    if let Ok(pane_id) = std::env::var(pane_var)
+        && !pane_id.is_empty()
+        && !pane_id.starts_with("gnome-terminal-seat-")
+    {
+        write_terminal_id(env, &pane_id, preset, true);
+    }
+}
+
+/// Transfer an existing launch receipt with its runtime state. Missing receipts
+/// are pre-upgrade launches, not permission to manufacture ownership.
+pub(crate) fn rekey_terminal_owner(
+    placeholder: &str,
+    canonical: &str,
+    launch_context: &str,
+) -> Result<()> {
+    let context: serde_json::Value = serde_json::from_str(launch_context)?;
+    let Some(process_id) = context
+        .get("process_id")
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(());
+    };
+    let path = paths::hcom_path(&[".tmp", "terminal_owners", process_id]);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut receipt: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if receipt.get("instance_name").and_then(|name| name.as_str()) != Some(placeholder)
+        || receipt.get("process_id").and_then(|id| id.as_str()) != Some(process_id)
+    {
+        return Ok(());
+    }
+    receipt["instance_name"] = serde_json::json!(canonical);
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    serde_json::to_writer(file.as_file_mut(), &receipt)?;
+    file.persist(&path)?;
+    Ok(())
+}
+
+/// The terminal id a kill may close for this instance — `None` when this
+/// instance's own launch cannot be proven to have opened it.
+///
+/// Proof is the launch receipt the parent launcher writes after its opener
+/// succeeds ([`write_terminal_id`]): `<dir>/<process_id>` binds the launch
+/// nonce (`HCOM_PROCESS_ID`) to the instance name, the preset and the id the
+/// opener returned. An id merely inherited through the environment has no
+/// receipt behind it and is never closed. When the opener returned no id
+/// (presets that print nothing), a proven launch may fall back to the
+/// launch-context ids captured for its own pane.
+fn closeable_terminal_id(
+    owners_dir: &std::path::Path,
+    process_id: &str,
+    instance_names: &[String],
+    preset_name: &str,
+    fallback_pane_id: &str,
+    fallback_terminal_id: &str,
+) -> Option<String> {
+    if process_id.is_empty() {
+        return None;
+    }
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(owners_dir.join(process_id)).ok()?).ok()?;
+    if receipt.get("process_id")?.as_str()? != process_id
+        || receipt.get("preset")?.as_str()? != preset_name
+    {
+        return None;
+    }
+    let name = receipt.get("instance_name")?.as_str()?;
+    if !instance_names.iter().any(|candidate| candidate == name) {
+        return None;
+    }
+    let captured = receipt.get("terminal_id")?.as_str().unwrap_or("");
+    let id = [fallback_pane_id, fallback_terminal_id, captured]
+        .into_iter()
+        .find(|id| !id.is_empty())?;
+    // Per-seat systemd units must name this instance, even when a custom
+    // opener returns another seat's unit by mistake.
+    if let Some(seat) = id.strip_prefix("gnome-terminal-seat-") {
+        let seat = seat.strip_suffix(".service").unwrap_or(seat);
+        if !instance_names.iter().any(|candidate| {
+            seat == candidate || seat == candidate.split(':').next().unwrap_or(candidate)
+        }) {
+            return None;
+        }
+    }
+    Some(id.to_string())
 }
 
 /// Resolve terminal info from the canonical preset fields plus launch_context metadata.
@@ -2861,6 +3033,199 @@ mod tests {
     /// Build a `Vec<String>` argv from `&str` literals (test helper).
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn write_owner_receipt(dir: &std::path::Path, process_id: &str, json: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(process_id), json).unwrap();
+    }
+
+    #[test]
+    fn test_closeable_terminal_id_requires_own_launch_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = vec!["bura".to_string()];
+        // No receipt: inherited pane metadata closes nothing.
+        assert_eq!(
+            closeable_terminal_id(
+                dir.path(),
+                "nonce",
+                &names,
+                "gnomeseat",
+                "gnome-terminal-seat-neka",
+                "",
+            ),
+            None
+        );
+        write_owner_receipt(
+            dir.path(),
+            "nonce",
+            r#"{"instance_name":"bura","process_id":"nonce","preset":"gnomeseat","terminal_id":"pane-7"}"#,
+        );
+        assert_eq!(
+            closeable_terminal_id(dir.path(), "nonce", &names, "gnomeseat", "", "").as_deref(),
+            Some("pane-7")
+        );
+        // A receipt for another instance, nonce or preset proves nothing.
+        for receipt in [
+            r#"{"instance_name":"neka","process_id":"nonce","preset":"gnomeseat","terminal_id":"pane-7"}"#,
+            r#"{"instance_name":"bura","process_id":"other","preset":"gnomeseat","terminal_id":"pane-7"}"#,
+            r#"{"instance_name":"bura","process_id":"nonce","preset":"kitty-split","terminal_id":"pane-7"}"#,
+        ] {
+            write_owner_receipt(dir.path(), "nonce", receipt);
+            assert_eq!(
+                closeable_terminal_id(dir.path(), "nonce", &names, "gnomeseat", "", ""),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_closeable_terminal_id_falls_back_only_for_a_proven_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = vec!["luna:ABCD".to_string()];
+        write_owner_receipt(
+            dir.path(),
+            "nonce",
+            r#"{"instance_name":"luna:ABCD","process_id":"nonce","preset":"kitty-split","terminal_id":""}"#,
+        );
+        // The opener printed no id; the proven launch closes with its own
+        // captured pane id instead.
+        assert_eq!(
+            closeable_terminal_id(dir.path(), "nonce", &names, "kitty-split", "13", "term-1",)
+                .as_deref(),
+            Some("13")
+        );
+        // A per-seat unit must name this instance, receipt or not.
+        write_owner_receipt(
+            dir.path(),
+            "nonce",
+            r#"{"instance_name":"luna:ABCD","process_id":"nonce","preset":"gnomeseat","terminal_id":"gnome-terminal-seat-neka"}"#,
+        );
+        assert_eq!(
+            closeable_terminal_id(dir.path(), "nonce", &names, "gnomeseat", "", ""),
+            None
+        );
+        write_owner_receipt(
+            dir.path(),
+            "nonce",
+            r#"{"instance_name":"luna:ABCD","process_id":"nonce","preset":"gnomeseat","terminal_id":"gnome-terminal-seat-luna.service"}"#,
+        );
+        assert_eq!(
+            closeable_terminal_id(dir.path(), "nonce", &names, "gnomeseat", "", "").as_deref(),
+            Some("gnome-terminal-seat-luna.service")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn run_here_pane_ownership_smoke() {
+        if let Ok(preset) = std::env::var("HCOM_TEST_RUN_HERE_PRESET") {
+            let home = std::path::PathBuf::from(std::env::var_os("HCOM_DIR").unwrap());
+            crate::paths::test_roots::register(home.parent().unwrap());
+            crate::config::Config::init();
+            let env = HashMap::from([
+                ("HCOM_INSTANCE_NAME".into(), "bura".into()),
+                ("HCOM_PROCESS_ID".into(), "run-here-nonce".into()),
+            ]);
+            // Exercise the real exec path in a disposable child test process.
+            launch_terminal(
+                "exit 0",
+                &env,
+                None,
+                false,
+                true,
+                Some(&preset),
+                false,
+                Some("omp"),
+            )
+            .unwrap();
+            panic!("run-here should exec the script");
+        }
+        let vars: Vec<_> = TERMINAL_ENV_MAP
+            .iter()
+            .map(|(key, _)| *key)
+            .chain(["GNOME_SEAT_UNIT", "HCOM_TEST_RUN_HERE_PRESET"])
+            .collect();
+        let saved = vars
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        for key in &vars {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+        for (preset, var, pane, should_close) in [
+            ("tmux-split", "TMUX_PANE", "%7", true),
+            (
+                "gnomeseat",
+                "GNOME_SEAT_UNIT",
+                "gnome-terminal-seat-neka",
+                false,
+            ),
+        ] {
+            let config = format!(
+                "[terminal]\nactive = '{preset}'\n[terminal.presets.{preset}]\nopen = 'sh {{script}}'\nclose = 'sh {{}} {{pane_id}}'\npane_id_env = '{var}'\n"
+            );
+            let (_dir, hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+            let close = hcom.join("close.sh");
+            let log = hcom.join("closed");
+            fs::write(
+                &close,
+                format!("printf '%s' \"$1\" > '{}'\n", log.display()),
+            )
+            .unwrap();
+            fs::write(
+                hcom.join("config.toml"),
+                config.replace("{}", &close.to_string_lossy()),
+            )
+            .unwrap();
+            crate::config::Config::reset();
+            crate::config::Config::init();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "terminal::tests::run_here_pane_ownership_smoke",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("HCOM_TEST_RUN_HERE_PRESET", preset)
+                .env(var, pane)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let info = TerminalInfo {
+                preset_name: preset.into(),
+                pane_id: pane.into(),
+                process_id: "run-here-nonce".into(),
+                ..Default::default()
+            };
+            let (_, closed, _) = kill_process(2_000_000_000, &["bura".into()], &info);
+            assert_eq!(
+                closed,
+                should_close,
+                "{preset}: receipt={:?}; stdout={}; stderr={}",
+                fs::read_to_string(hcom.join(".tmp/terminal_owners/run-here-nonce")),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(&log).ok().as_deref(),
+                should_close.then_some(pane)
+            );
+        }
+        for (key, value) in saved {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 
     #[test]

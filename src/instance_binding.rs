@@ -13,6 +13,10 @@ use crate::instances::update_instance_position;
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
 use crate::shared::{ST_INACTIVE, ST_LISTENING};
 
+#[cfg(all(test, unix))]
+#[path = "instance_binding_terminal_tests.rs"]
+mod terminal_ownership_tests;
+
 /// Persist terminal launch metadata without clobbering other launch_context fields.
 ///
 /// The launcher owns the authoritative preset decision. launch_context is only
@@ -306,6 +310,42 @@ fn delete_true_placeholder_instance(db: &HcomDb, placeholder_name: &str) {
     }
 }
 
+fn rekey_migrated_terminal(db: &HcomDb, canonical: &str, ph: &InstanceRow) {
+    let Some(context) = ph.launch_context.as_deref() else {
+        return;
+    };
+    let nonce = |context: &str| {
+        serde_json::from_str::<serde_json::Value>(context)
+            .ok()?
+            .get("process_id")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    let Some(expected) = nonce(context).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    // A failed/rolled-back migration (or a canonical row retaining another
+    // incarnation's metadata) cannot transfer the placeholder's receipt.
+    if db
+        .get_instance_full(canonical)
+        .ok()
+        .flatten()
+        .and_then(|row| row.launch_context)
+        .and_then(|context| nonce(&context))
+        .as_deref()
+        != Some(expected.as_str())
+    {
+        return;
+    }
+    if let Err(error) = crate::terminal::rekey_terminal_owner(&ph.name, canonical, context) {
+        crate::log::log_error(
+            "binding",
+            "placeholder.migrate_terminal_owner",
+            &error.to_string(),
+        );
+    }
+}
+
 /// Carry runtime state the PTY wrapper wrote onto the placeholder row over to the
 /// canonical instance before the placeholder is deleted. The OS `pid` and terminal
 /// `launch_context` (pane_id) are written once at spawn under the launch name
@@ -334,10 +374,12 @@ fn migrate_placeholder_runtime_state(
             &format!("{e}"),
         );
     }
+    rekey_migrated_terminal(db, canonical_name, ph);
 }
 
 /// [`migrate_placeholder_runtime_state`] on the caller's transaction, with no
-/// BEGIN of its own. Errors are returned, for the caller to roll back or log.
+/// BEGIN of its own. Receipt ownership is re-keyed by the binding caller only
+/// after commit via `rekey_migrated_terminal`; rollback must not change files.
 fn migrate_placeholder_runtime_state_in_txn(
     db: &HcomDb,
     tx: &rusqlite::Transaction<'_>,
@@ -1009,6 +1051,9 @@ fn bind_session_to_process_body(
                 }
                 Ok(None)
             })?;
+            if let Some(ph) = placeholder_data.as_ref() {
+                rekey_migrated_terminal(db, canonical_name, ph);
+            }
             post.fire(db);
             if let Some(displaced) = &placeholder_name {
                 notify_session_switch_stop(db, displaced, released);
@@ -1109,6 +1154,11 @@ fn bind_session_to_process_body(
         })?;
         // Committed: fire the collected wakes. A rolled-back transaction never
         // reaches here, and its event rows are gone with the rollback.
+        // The transaction above moved the runtime state, not the filesystem.
+        // Re-key only after commit; rollback must leave the old receipt intact.
+        if let Some(ph) = placeholder_data.as_ref() {
+            rekey_migrated_terminal(db, &stopped_name, ph);
+        }
         post.fire(db);
         if let Some(displaced) = &placeholder_name {
             notify_session_switch_stop(db, displaced, released);
