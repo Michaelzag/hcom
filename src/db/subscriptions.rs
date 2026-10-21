@@ -199,7 +199,7 @@ fn reqwatch_reply_exists(db: &HcomDb, request_id: i64, target: &str, sub_caller:
     }
     db.conn()
         .query_row(
-            // Indexed by idx_events_from_id: the reply is one of the target's
+            // Indexed by idx_events_msg_from: the reply is one of the target's
             // few messages above the request id. A json_extract scan over the
             // whole events_v range here ran once per fan-out pass and wedged
             // the relay worker's receive thread on large histories.
@@ -1290,7 +1290,7 @@ mod tests {
         cleanup_test_db(db_path);
         let joined = plan.join(" | ");
         assert!(
-            joined.contains("idx_events_from_id"),
+            joined.contains("idx_events_msg_from"),
             "the probe must use the sender index: {joined}"
         );
         assert!(
