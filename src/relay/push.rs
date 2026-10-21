@@ -410,16 +410,14 @@ pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>,
         .conn()
         .prepare(
             "SELECT id, timestamp, type, instance, data FROM events
-             WHERE id > ?1
-             AND (id > ?2 OR type != 'rpc_result')
-             AND instance NOT LIKE '%:%'
+             WHERE id > ? AND instance NOT LIKE '%:%'
              AND instance != '_device'
              AND json_extract(data, '$._relay') IS NULL
              ORDER BY id LIMIT 101",
         )
         .ok()
         .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![tail_start_id, last_push_id], |row| {
+            stmt.query_map(rusqlite::params![tail_start_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -919,10 +917,14 @@ mod tests {
     }
 
     #[test]
-    fn retained_tail_never_carries_rpc_result_answers() {
-        // Answers are rendezvous rows the requester consumes once. Re-sending
-        // them in every snapshot's retained tail lets a handful of big answers
-        // wedge a peer's publish for good (they accumulate in the tail).
+    fn retained_tail_keeps_its_newest_event_so_snapshots_never_look_like_a_reset() {
+        // The receiver's recreated-DB detector compares the carried run's max
+        // id against its import cursor: a tail-only snapshot whose carried max
+        // falls under the cursor is read as "the peer's ids restarted" and
+        // wipes every mirror and imported row. rpc_result answers therefore
+        // stay in the retained tail (the wire budget is what keeps tail
+        // content of any size off the bus — seal_bounded_payload drops tail
+        // events first), and the newest tail event is always carried.
         let dir = tempfile::tempdir().unwrap();
         let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
         for (id, etype) in [
@@ -940,26 +942,23 @@ mod tests {
         }
         db.conn()
             .execute(
-                "INSERT INTO events (id, timestamp, type, instance, data) VALUES (20, '2026-10-20T00:00:01.000000+00:00', 'message', 'luna', '{}')",
+                "INSERT INTO events (id, timestamp, type, instance, data) VALUES (20, '2026-10-20T00:00:01.000000+00:00', 'rpc_result', 'luna', '{}')",
                 [],
             )
             .unwrap();
         super::safe_kv_set(&db, "relay_last_push_id", Some("20"));
 
         let (_state, events, _max_id, _more) = build_push_payload(&db, "device-uuid");
-        let tail_ids: Vec<i64> = events.iter().filter_map(|e| e["id"].as_i64()).collect();
-        assert!(
-            tail_ids.iter().all(|id| *id <= 20),
-            "the tail must still carry recent ordinary events: {tail_ids:?}"
-        );
-        let tail_types: Vec<&str> = events
+        let carried_max: i64 = events
             .iter()
-            .filter(|e| e["id"].as_i64().is_some_and(|id| id <= 20))
-            .filter_map(|e| e["type"].as_str())
-            .collect();
-        assert!(
-            tail_types.iter().all(|t| *t != "rpc_result"),
-            "rpc_result answers must never ride the retained tail: {tail_types:?}"
+            .filter(|e| e["type"].as_str() != Some("control"))
+            .filter_map(|e| e["id"].as_i64())
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            carried_max, 20,
+            "the newest tail event must always ride the snapshot, whatever its type: \
+             a carried max under the receive cursor reads as a recreated peer DB and wipes mirrors"
         );
     }
 }
