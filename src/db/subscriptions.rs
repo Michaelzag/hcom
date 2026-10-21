@@ -1810,11 +1810,15 @@ mod tests {
     fn migration_23_upgrades_in_place_despite_poison_rows() {
         // Each case must upgrade in place; any migration error would send the
         // store down ensure_schema's archive-and-recreate path.
+        // strftime reads a text time value only up to its first NUL.
         for poison in [
             "now",
             "NOW",
             "subsec",
             "SubSecond",
+            "now\u{0}junk",
+            "SUBSEC\u{0}x",
+            "blob-now",
             "malformed-sub",
             "null-sub",
         ] {
@@ -1840,6 +1844,14 @@ mod tests {
                 match poison {
                     "malformed-sub" => kv(Some("{\"filters\":")),
                     "null-sub" => kv(None),
+                    "blob-now" => db
+                        .conn()
+                        .execute(
+                            "INSERT INTO events(timestamp, type, instance, data)
+                             VALUES (CAST('now' AS BLOB), 'status', 'x:PEER', '{}')",
+                            [],
+                        )
+                        .unwrap(),
                     ts => db
                         .conn()
                         .execute(
@@ -1877,12 +1889,20 @@ mod tests {
     fn status_events_with_current_time_keywords_still_insert() {
         let (db, path) = collision_test_db();
         let data = json!({"status":"active","context":"tool:write","detail":"/a"});
-        for ts in ["now", "NOW", "subsec", "SubSecond"] {
+        for ts in [
+            "now",
+            "NOW",
+            "subsec",
+            "SubSecond",
+            "now\u{0}junk",
+            "Subsecond\u{0}",
+        ] {
             db.log_event_with_ts("status", "x:PEER", &data, Some(ts))
                 .unwrap_or_else(|e| panic!("status insert with ts {ts:?}: {e}"));
         }
         // The relay import path stores the peer's ts verbatim.
-        let peer = json!({"id": 5, "type": "status", "instance": "x", "ts": "now", "data": data});
+        let peer =
+            json!({"id": 5, "type": "status", "instance": "x", "ts": "now\u{0}junk", "data": data});
         let inserted =
             crate::relay::pull::insert_remote_event(&db, "peer-device", "PEER", 5, &peer, "MINE")
                 .unwrap();

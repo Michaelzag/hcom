@@ -62,14 +62,16 @@ pub fn uri_status_detail_sql(column: &str) -> String {
 }
 
 /// Epoch seconds of a status row's timestamp, exactly as indexed by
-/// idx_events_status_time. strftime() treats 'now', 'subsec' and 'subsecond'
-/// as the current time, which SQLite refuses inside an index ("non-deterministic
-/// use of strftime()") on CREATE INDEX and on every later status insert. Relay
-/// peers' timestamps are stored verbatim, so those spellings map to NULL here;
-/// every other value keeps strftime's result.
+/// idx_events_status_time. strftime() treats a time value of 'now', 'subsec'
+/// or 'subsecond' (any case, read up to the first NUL) as the current time,
+/// which SQLite refuses inside an index ("non-deterministic use of
+/// strftime()") on CREATE INDEX and on every later status insert. Relay peers'
+/// timestamps are stored verbatim, so any value starting with n or s maps to
+/// NULL. No other value starting with those letters parses as a time either,
+/// so every other row keeps strftime's result.
 fn status_epoch_sql(column: &str) -> String {
     format!(
-        "CASE WHEN lower({column}) IN ('now', 'subsec', 'subsecond') THEN NULL \
+        "CASE WHEN lower(substr(CAST({column} AS TEXT), 1, 1)) IN ('n', 's') THEN NULL \
          ELSE CAST(strftime('%s', {column}) AS INTEGER) END"
     )
 }

@@ -87,7 +87,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
         23,
         // Expression must stay identical to core::filters::status_epoch_sql.
         "CREATE INDEX IF NOT EXISTS idx_events_status_time
-             ON events(CASE WHEN lower(timestamp) IN ('now', 'subsec', 'subsecond') THEN NULL
+             ON events(CASE WHEN lower(substr(CAST(timestamp AS TEXT), 1, 1)) IN ('n', 's') THEN NULL
                  ELSE CAST(strftime('%s', timestamp) AS INTEGER) END)
              WHERE type = 'status';",
     ),
@@ -508,7 +508,7 @@ impl HcomDb {
             CREATE INDEX IF NOT EXISTS idx_events_msg_from
                 ON events(json_extract(data, '$.from'), id) WHERE type = 'message';
             CREATE INDEX IF NOT EXISTS idx_events_status_time
-                ON events(CASE WHEN lower(timestamp) IN ('now', 'subsec', 'subsecond') THEN NULL
+                ON events(CASE WHEN lower(substr(CAST(timestamp AS TEXT), 1, 1)) IN ('n', 's') THEN NULL
                     ELSE CAST(strftime('%s', timestamp) AS INTEGER) END)
                 WHERE type = 'status';
 
