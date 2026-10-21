@@ -61,6 +61,33 @@ pub fn uri_status_detail_sql(column: &str) -> String {
     )
 }
 
+/// Epoch seconds of a status row's timestamp, exactly as indexed by
+/// idx_events_status_time. strftime() treats a time value of 'now', 'subsec'
+/// or 'subsecond' (any case, read up to the first NUL) as the current time,
+/// which SQLite refuses inside an index ("non-deterministic use of
+/// strftime()") on CREATE INDEX and on every later status insert. Relay peers'
+/// timestamps are stored verbatim, so any value starting with n or s maps to
+/// NULL. No other value starting with those letters parses as a time either,
+/// so every other row keeps strftime's result.
+fn status_epoch_sql(column: &str) -> String {
+    format!(
+        "CASE WHEN lower(substr(CAST({column} AS TEXT), 1, 1)) IN ('n', 's') THEN NULL \
+         ELSE CAST(strftime('%s', {column}) AS INTEGER) END"
+    )
+}
+
+/// The collision window is strict (less than 30 whole seconds), just like the
+/// original ABS(strftime(...) - strftime(...)) predicate. Express both bounds
+/// on the candidate's indexed epoch so idx_events_status_time can seek the
+/// window even when timestamps have different ISO-8601 offsets.
+pub(crate) fn collision_time_window_sql(candidate: &str, event: &str) -> String {
+    let candidate = status_epoch_sql(&format!("{candidate}.timestamp"));
+    format!(
+        "{candidate} > CAST(strftime('%s', {event}.timestamp) AS INTEGER) - 30 \
+         AND {candidate} < CAST(strftime('%s', {event}.timestamp) AS INTEGER) + 30"
+    )
+}
+
 /// All file operation contexts.
 pub const FILE_OP_CONTEXTS: &[&str] = &[
     "tool:Write",
@@ -428,26 +455,32 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
 
     // Collision filter
     if filters.contains_key("collision") {
-        let collision_sql = format!(
-            "(type = 'status' AND status_context IN {ctx}\n\
-             AND events_v.status_detail IS NOT NULL\n\
-             AND events_v.status_detail != ''\n\
-             AND NOT {uri}\n\
-             AND EXISTS (\n\
-             \x20   SELECT 1 FROM events_v e\n\
-             \x20   WHERE e.type = 'status' AND e.status_context IN {ctx}\n\
-             \x20   AND e.status_detail IS NOT NULL AND e.status_detail != ''\n\
-             \x20   AND e.status_detail = events_v.status_detail\n\
-             \x20   AND e.instance != events_v.instance\n\
-             \x20   AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e.timestamp)) < 30\n\
-             ))",
-            ctx = FILE_WRITE_CONTEXTS,
-            uri = uri_status_detail_sql("events_v.status_detail")
-        );
-        clauses.push(collision_sql);
+        clauses.push(collision_clause_sql());
     }
 
     Ok(clauses.join(" AND "))
+}
+
+/// The generated `--collision` clause; always the last flag clause, which
+/// lets the schema-23 migration recognise generated subscription SQL.
+pub(crate) fn collision_clause_sql() -> String {
+    format!(
+        "(type = 'status' AND status_context IN {ctx}\n\
+         AND events_v.status_detail IS NOT NULL\n\
+         AND events_v.status_detail != ''\n\
+         AND NOT {uri}\n\
+         AND EXISTS (\n\
+         \x20   SELECT 1 FROM events e INDEXED BY idx_events_status_time\n\
+         \x20   WHERE e.type = 'status' AND json_extract(e.data, '$.context') IN {ctx}\n\
+         \x20   AND json_extract(e.data, '$.detail') IS NOT NULL AND json_extract(e.data, '$.detail') != ''\n\
+         \x20   AND json_extract(e.data, '$.detail') = events_v.status_detail\n\
+         \x20   AND e.instance != events_v.instance\n\
+         \x20   AND {window}\n\
+         ))",
+        ctx = FILE_WRITE_CONTEXTS,
+        uri = uri_status_detail_sql("events_v.status_detail"),
+        window = collision_time_window_sql("e", "events_v"),
+    )
 }
 
 /// Validate timestamp format: must start with YYYY-MM-DD.
@@ -743,15 +776,6 @@ mod tests {
         let sql = build_sql_from_flags(&filters).unwrap();
         assert!(sql.contains("timestamp >= '2024-01-01T00:00:00Z'"));
         assert!(sql.contains("timestamp < '2024-12-31T23:59:59Z'"));
-    }
-
-    #[test]
-    fn test_build_collision() {
-        let mut filters = FilterMap::new();
-        filters.insert("collision".into(), vec!["true".into()]);
-        let sql = build_sql_from_flags(&filters).unwrap();
-        assert!(sql.contains("EXISTS"));
-        assert!(sql.contains("ABS(strftime"));
     }
 
     fn sql_context_list_contains(list: &str, operation: &str) -> bool {

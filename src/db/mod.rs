@@ -38,7 +38,7 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 22;
+const SCHEMA_VERSION: i32 = 23;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -82,6 +82,14 @@ const MIGRATIONS: &[(i32, &str)] = &[
         22,
         "CREATE INDEX IF NOT EXISTS idx_events_msg_from
              ON events(json_extract(data, '$.from'), id) WHERE type = 'message';",
+    ),
+    (
+        23,
+        // Expression must stay identical to core::filters::status_epoch_sql.
+        "CREATE INDEX IF NOT EXISTS idx_events_status_time
+             ON events(CASE WHEN lower(substr(CAST(timestamp AS TEXT), 1, 1)) IN ('n', 's') THEN NULL
+                 ELSE CAST(strftime('%s', timestamp) AS INTEGER) END)
+             WHERE type = 'status';",
     ),
 ];
 
@@ -499,6 +507,10 @@ impl HcomDb {
             CREATE INDEX IF NOT EXISTS idx_type_instance ON events(type, instance);
             CREATE INDEX IF NOT EXISTS idx_events_msg_from
                 ON events(json_extract(data, '$.from'), id) WHERE type = 'message';
+            CREATE INDEX IF NOT EXISTS idx_events_status_time
+                ON events(CASE WHEN lower(substr(CAST(timestamp AS TEXT), 1, 1)) IN ('n', 's') THEN NULL
+                    ELSE CAST(strftime('%s', timestamp) AS INTEGER) END)
+                WHERE type = 'status';
 
             -- Instance indexes
             CREATE INDEX IF NOT EXISTS idx_session_id ON instances(session_id);
@@ -1077,6 +1089,9 @@ impl HcomDb {
                 false
             };
             tx.execute_batch(sql)?;
+            if next_version == 23 {
+                subscriptions::migrate_collision_windows(tx);
+            }
             if next_version == 18 && has_status_time {
                 tx.execute(
                     "UPDATE instances SET last_seen = status_time WHERE last_seen = 0",
