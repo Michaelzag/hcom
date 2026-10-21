@@ -441,27 +441,32 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
 
     // Collision filter
     if filters.contains_key("collision") {
-        let collision_sql = format!(
-            "(type = 'status' AND status_context IN {ctx}\n\
-             AND events_v.status_detail IS NOT NULL\n\
-             AND events_v.status_detail != ''\n\
-             AND NOT {uri}\n\
-             AND EXISTS (\n\
-             \x20   SELECT 1 FROM events e INDEXED BY idx_events_status_time\n\
-             \x20   WHERE e.type = 'status' AND json_extract(e.data, '$.context') IN {ctx}\n\
-             \x20   AND json_extract(e.data, '$.detail') IS NOT NULL AND json_extract(e.data, '$.detail') != ''\n\
-             \x20   AND json_extract(e.data, '$.detail') = events_v.status_detail\n\
-             \x20   AND e.instance != events_v.instance\n\
-             \x20   AND {window}\n\
-             ))",
-            ctx = FILE_WRITE_CONTEXTS,
-            uri = uri_status_detail_sql("events_v.status_detail"),
-            window = collision_time_window_sql("e", "events_v"),
-        );
-        clauses.push(collision_sql);
+        clauses.push(collision_clause_sql());
     }
 
     Ok(clauses.join(" AND "))
+}
+
+/// The generated `--collision` clause; always the last flag clause, which
+/// lets the schema-23 migration recognise generated subscription SQL.
+pub(crate) fn collision_clause_sql() -> String {
+    format!(
+        "(type = 'status' AND status_context IN {ctx}\n\
+         AND events_v.status_detail IS NOT NULL\n\
+         AND events_v.status_detail != ''\n\
+         AND NOT {uri}\n\
+         AND EXISTS (\n\
+         \x20   SELECT 1 FROM events e INDEXED BY idx_events_status_time\n\
+         \x20   WHERE e.type = 'status' AND json_extract(e.data, '$.context') IN {ctx}\n\
+         \x20   AND json_extract(e.data, '$.detail') IS NOT NULL AND json_extract(e.data, '$.detail') != ''\n\
+         \x20   AND json_extract(e.data, '$.detail') = events_v.status_detail\n\
+         \x20   AND e.instance != events_v.instance\n\
+         \x20   AND {window}\n\
+         ))",
+        ctx = FILE_WRITE_CONTEXTS,
+        uri = uri_status_detail_sql("events_v.status_detail"),
+        window = collision_time_window_sql("e", "events_v"),
+    )
 }
 
 /// Validate timestamp format: must start with YYYY-MM-DD.
