@@ -331,6 +331,110 @@ fn broker_drop_after_connack_reconnects_same_worker() {
     assert!(worker.is_running(), "worker died across the outage");
 }
 
+/// A reconnect must re-SUBSCRIBE on the new session: we connect with clean
+/// start, so no subscription survives a session and a worker that skips the
+/// resubscribe is silently deaf after every reconnect (the 2026-10-20
+/// fleet-wide stall class).
+#[cfg(unix)]
+#[test]
+fn reconnect_resubscribes_on_the_new_session() {
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    let h = Hcom::new();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake broker");
+    let port = listener.local_addr().expect("broker addr").port();
+    // Per accepted session: (saw CONNECT, saw SUBSCRIBE after it).
+    let sessions: Arc<Mutex<Vec<(bool, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let accept_thread = {
+        let sessions = Arc::clone(&sessions);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            while !stop.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut saw_connect = false;
+                let mut saw_subscribe = false;
+                let mut buf = [0u8; 2048];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    // Packet type is the high nibble of the first byte:
+                    // CONNECT 0x10, SUBSCRIBE 0x80.
+                    match buf[0] & 0xf0 {
+                        0x10 => {
+                            saw_connect = true;
+                            // CONNACK: type 0x20, remaining length 3.
+                            let _ = stream.write_all(&[0x20, 0x03, 0x00, 0x00, 0x00]);
+                            let _ = stream.flush();
+                        }
+                        0x80 if saw_connect => saw_subscribe = true,
+                        _ => {}
+                    }
+                    if saw_subscribe {
+                        break;
+                    }
+                }
+                sessions.lock().push((saw_connect, saw_subscribe));
+                drop(stream);
+            }
+        })
+    };
+
+    configure_relay(&h, port);
+    let worker = start_worker(&h, h.cmd());
+
+    // Two sessions: the first is dropped after SUBSCRIBE, the second is the
+    // reconnect that must subscribe again.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        let connected = sessions
+            .lock()
+            .iter()
+            .filter(|(saw_connect, _)| *saw_connect)
+            .count();
+        if connected >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a reconnect\n--- log ---\n{}",
+            read_log(&h)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stop.store(true, Ordering::Relaxed);
+    drop(worker);
+    let _ = accept_thread.join();
+
+    let seen = sessions.lock().clone();
+    // `relay new` probes the broker with a bare TCP connect first; only
+    // sessions that spoke MQTT count here.
+    let connected: Vec<(bool, bool)> =
+        seen.iter().filter(|(saw_connect, _)| *saw_connect).copied().collect();
+    assert!(
+        connected.len() >= 2,
+        "expected an initial and a reconnect session, saw {seen:?}"
+    );
+    for (i, (_saw_connect, saw_subscribe)) in connected.iter().enumerate() {
+        assert!(
+            *saw_subscribe,
+            "session {i} connected but never subscribed — deaf after reconnect: {connected:?}"
+        );
+    }
+}
+
 /// Shutdown arriving while the worker is in reconnect backoff exits the
 /// process promptly — the reconnect loop must not swallow SIGTERM or loop.
 #[cfg(unix)]
