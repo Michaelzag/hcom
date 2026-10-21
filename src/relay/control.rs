@@ -13,8 +13,8 @@ use crate::launcher::{self, LaunchParams};
 use crate::log;
 
 use super::{
-    control_topic, crypto, device_short_id_for_db, is_relay_enabled, load_psk, read_device_uuid,
-    safe_kv_get, safe_kv_set,
+    MAX_SEALED_PAYLOAD_BYTES, control_topic, crypto, device_short_id_for_db, is_relay_enabled,
+    load_psk, read_device_uuid, safe_kv_get, safe_kv_set,
 };
 
 /// Build a sealed RPC control envelope ready to publish. Returns the topic and
@@ -72,6 +72,20 @@ fn build_control_payload(
     let topic = control_topic(relay_id);
     let plaintext = serde_json::to_vec(&control_payload).ok()?;
     let sealed = crypto::seal(&psk, relay_id, &topic, &plaintext, now as u64).ok()?;
+    // The broker silently drops any publish over a subscriber's advertised
+    // max packet size. Refuse oversized requests here — loudly — instead of
+    // letting them vanish on the wire.
+    if sealed.len() > MAX_SEALED_PAYLOAD_BYTES {
+        log::log_warn(
+            "relay",
+            "relay.control_too_large",
+            &format!(
+                "action={action} sealed={} bytes exceeds the {MAX_SEALED_PAYLOAD_BYTES}-byte publish budget; not sent",
+                sealed.len()
+            ),
+        );
+        return None;
+    }
     Some((topic, sealed))
 }
 
@@ -643,6 +657,28 @@ fn ensure_remote_action_supported(
     unreachable!()
 }
 
+/// Reserved inside the answer budget for the rpc_result shell, the event and
+/// push envelopes around it, and id/timestamp variance in those wrappers.
+const RPC_RESULT_SHELL_RESERVE: usize = 1024;
+
+/// Plain-JSON byte budget for one RPC `result` value so the state push that
+/// carries it to the requester still seals under [`MAX_SEALED_PAYLOAD_BYTES`].
+/// The push caps the state snapshot at `MAX_STATE_PLAIN_BYTES`, so a
+/// full-budget answer and a full-budget state always fit in one publish.
+/// Derived from the sealed size — not a shaved constant — so envelope and
+/// AEAD overhead are accounted for.
+fn rpc_answer_plain_budget(db: &HcomDb) -> usize {
+    let uuid = read_device_uuid().unwrap_or_default();
+    let state_len = serde_json::to_string(&super::push::build_state(db, &uuid))
+        .map(|s| s.len())
+        .unwrap_or(0);
+    MAX_SEALED_PAYLOAD_BYTES
+        .saturating_sub(crypto::SEALED_OVERHEAD_BYTES)
+        .saturating_sub(RPC_RESULT_SHELL_RESERVE)
+        .saturating_sub(state_len.min(super::push::MAX_STATE_PLAIN_BYTES))
+        .max(1024)
+}
+
 fn emit_rpc_result(
     db: &HcomDb,
     request_id: &str,
@@ -650,13 +686,24 @@ fn emit_rpc_result(
     ok: bool,
     result: &serde_json::Value,
 ) {
-    let data = json!({
+    let mut event = json!({"type": "rpc_result", "data": json!({
         "request_id": request_id,
         "action": action,
         "ok": ok,
         "result": result,
-    });
-    let _ = db.log_event("rpc_result", "_rpc", &data);
+    })});
+    // Every RPC answer rides back inside our next state push. Cap it by the
+    // sealed-size budget at the source so one oversized answer (a huge
+    // transcript, a big config) can never wedge the publish carrying it: a
+    // cut answer becomes an explicit failure through shrink_event, never a
+    // silent drop on the wire.
+    let budget = rpc_answer_plain_budget(db);
+    while serde_json::to_string(&event["data"]).map(|s| s.len()).unwrap_or(0) > budget
+        && super::push::shrink_level(&event) < super::push::SHRINK_LAST_LEVEL
+    {
+        super::push::shrink_event(&mut event);
+    }
+    let _ = db.log_event("rpc_result", "_rpc", &event["data"]);
 }
 
 fn resolve_remote_cwd(requested: Option<&str>) -> Result<String, String> {
@@ -1040,8 +1087,10 @@ fn handle_remote_transcript(
 }
 
 const REMOTE_EVENTS_HARD_CAP: usize = 2000;
-// Cap RPC response below the rumqttc client's 128 KiB accept limit
-// (src/relay/client.rs), leaving room for envelope + AEAD overhead.
+// Default byte budget for callers that don't negotiate one. The real cap on
+// the wire is sealed-size derived (rpc_answer_plain_budget): the answer rides
+// to the requester inside our next state push and both must seal under the
+// advertised max packet size.
 const REMOTE_EVENTS_BYTE_CAP: usize = 98_304;
 
 fn handle_remote_events(
@@ -1058,9 +1107,10 @@ fn handle_remote_events(
     };
     let sql = optional_param(params, "sql").map(|s| s.to_string());
     // Callers whose answer must share a snapshot with other data (catch-up
-    // backfill) ask for a smaller byte budget; the hard cap still applies.
-    let byte_cap = usize_param(params, "max_bytes", REMOTE_EVENTS_BYTE_CAP)
-        .clamp(1024, REMOTE_EVENTS_BYTE_CAP);
+    // backfill) ask for a smaller byte budget; the hard cap is whatever still
+    // seals under the max packet size alongside our current state snapshot.
+    let hard_cap = rpc_answer_plain_budget(db).min(REMOTE_EVENTS_BYTE_CAP);
+    let byte_cap = usize_param(params, "max_bytes", REMOTE_EVENTS_BYTE_CAP).clamp(1024, hard_cap);
     let mut last_n = usize_param(params, "last", 20);
     if last_n == 0 {
         last_n = 20;
@@ -1132,7 +1182,7 @@ fn handle_remote_events(
     let mut serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
     while serialized_len > byte_cap && !events.is_empty() {
         if events.len() == 1
-            && byte_cap >= REMOTE_EVENTS_BYTE_CAP
+            && byte_cap >= hard_cap
             && super::push::shrink_level(&events[0]) < super::push::SHRINK_LAST_LEVEL
         {
             // The newest event alone is larger than the WIDEST budget, so no request can
@@ -1159,7 +1209,7 @@ fn handle_remote_events(
 /// name or a channel id: the caller's device knows only its mirror row, so the
 /// connector host does the resolving.
 fn handle_remote_buzz_read(
-    _db: &HcomDb,
+    db: &HcomDb,
     params: &Value,
     _initiated_by: &str,
     _config: &HcomConfig,
@@ -1182,8 +1232,8 @@ fn handle_remote_buzz_read(
     let thread = params.get("thread").and_then(Value::as_str);
     let before = params.get("before").and_then(Value::as_str);
     let limit = usize_param(params, "limit", 20).clamp(1, 2000);
-    let byte_cap = usize_param(params, "max_bytes", REMOTE_EVENTS_BYTE_CAP)
-        .clamp(1024, REMOTE_EVENTS_BYTE_CAP);
+    let hard_cap = rpc_answer_plain_budget(db).min(REMOTE_EVENTS_BYTE_CAP);
+    let byte_cap = usize_param(params, "max_bytes", REMOTE_EVENTS_BYTE_CAP).clamp(1024, hard_cap);
 
     let events = store
         .list_events(Some(&channel.id), thread, before, limit)
@@ -1206,7 +1256,7 @@ fn handle_remote_buzz_read(
             })
         })
         .collect();
-    let mut out = cap_buzz_read(rendered, byte_cap);
+    let mut out = cap_buzz_read(rendered, byte_cap, hard_cap);
     out["channel"] = json!(channel.slug);
     out["channel_id"] = json!(channel.id);
     Ok(out)
@@ -1216,7 +1266,7 @@ fn handle_remote_buzz_read(
 /// first, and when a single event is wider than the cap on its own, cut its
 /// text on a character boundary and mark it. Every pass shrinks the answer,
 /// so this always ends.
-fn cap_buzz_read(mut events: Vec<Value>, byte_cap: usize) -> Value {
+fn cap_buzz_read(mut events: Vec<Value>, byte_cap: usize, wide_cap: usize) -> Value {
     let build = |events: &Vec<Value>, truncated: bool, cut: bool| {
         let mut out = json!({"events": events, "count": events.len()});
         if truncated {
@@ -1236,7 +1286,7 @@ fn cap_buzz_read(mut events: Vec<Value>, byte_cap: usize) -> Value {
         truncated = true;
         let text = events[0]["text"].as_str().unwrap_or_default().to_string();
         let body = text.strip_suffix(BUZZ_CONTENT_CUT_MARKER).unwrap_or(&text);
-        if events.len() == 1 && byte_cap >= REMOTE_EVENTS_BYTE_CAP && !body.is_empty() {
+        if events.len() == 1 && byte_cap >= wide_cap && !body.is_empty() {
             // One event wider than the cap can never travel whole: cut it, by
             // at least the JSON overshoot (each raw byte is >= 1 JSON byte).
             let overshoot = len - byte_cap + BUZZ_CONTENT_CUT_MARKER.len();
@@ -2112,6 +2162,145 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "relay_psk is not remotely queryable");
+    }
+
+    /// The wire contract behind the incident class that silently loses every
+    /// peer's sync: whatever the requester asks for, the answer that rides
+    /// back inside our state push must seal under the advertised max packet
+    /// size (client.rs), envelope and AEAD overhead included.
+    #[test]
+    fn largest_events_answer_seals_under_the_max_packet_size() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        // A state snapshot near its full budget: fat instance rows.
+        for i in 0..3 {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, status, status_detail, created_at)
+                     VALUES (?1, 'running', ?2, 1.0)",
+                    rusqlite::params![format!("fat-{i}"), "x".repeat(17 * 1024)],
+                )
+                .unwrap();
+        }
+        // Fat history: an uncapped answer is far over any packet budget.
+        for i in 0..30 {
+            db.log_event(
+                "status",
+                "luna",
+                &json!({"detail": format!("{i} ").repeat(3_000)}),
+            )
+            .unwrap();
+        }
+        let state = crate::relay::push::build_state(&db, "");
+        let state_len = serde_json::to_string(&state).unwrap().len();
+        assert!(state_len > 40 * 1024, "state seeded too small: {state_len}");
+
+        // The widest request there is.
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": 2000, "max_bytes": 1024 * 1024}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+
+        // The answer travels as an rpc_result event inside the next push.
+        let payload = json!({
+            "state": state,
+            "events": [{
+                "id": 1,
+                "ts": "2026-10-20T00:00:00.000000+00:00",
+                "type": "rpc_result",
+                "instance": "_rpc",
+                "data": {"request_id": "req-1", "action": "events", "ok": true, "result": out},
+            }],
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let sealed = crypto::seal(&[0x42; 32], "relay-test", "relay-test/dev", &bytes, 1).unwrap();
+        assert!(
+            sealed.len() <= 128 * 1024,
+            "the largest events answer plus its state sealed at {} bytes — over the advertised max packet size",
+            sealed.len()
+        );
+    }
+
+    /// Every RPC answer is capped at the source by the same sealed-size
+    /// budget: one oversized answer (a huge transcript, a big config) can
+    /// never wedge the publish that carries it.
+    #[test]
+    fn oversized_rpc_result_is_cut_to_the_wire_budget() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        emit_rpc_result(
+            &db,
+            "req-big",
+            "transcript",
+            true,
+            &json!({"target": "luna", "content": "t".repeat(400 * 1024)}),
+        );
+        let row: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'rpc_result' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let payload = json!({
+            "state": Value::Null,
+            "events": [{
+                "id": 1,
+                "ts": "2026-10-20T00:00:00.000000+00:00",
+                "type": "rpc_result",
+                "instance": "_rpc",
+                "data": serde_json::from_str::<Value>(&row).unwrap(),
+            }],
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let sealed = crypto::seal(&[0x42; 32], "relay-test", "relay-test/dev", &bytes, 1).unwrap();
+        assert!(
+            sealed.len() <= 128 * 1024,
+            "a {}-byte rpc_result was stored — it could never seal under the max packet size",
+            sealed.len()
+        );
+    }
+
+    /// Oversized control requests are refused at the source, loudly, instead
+    /// of vanishing as a broker-side drop on the wire.
+    #[test]
+    fn oversized_control_request_is_refused_not_published() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let config = HcomConfig {
+            relay_id: "relay-1".to_string(),
+            relay_psk: super::super::encode_psk(&[0x33; 32]),
+            relay_enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            build_control_payload(
+                &db,
+                &config,
+                "term_inject",
+                "ABCD",
+                Some("req-1"),
+                &json!({"text": "hi"}),
+            )
+            .is_some(),
+            "a normal request still goes out"
+        );
+        assert!(
+            build_control_payload(
+                &db,
+                &config,
+                "term_inject",
+                "ABCD",
+                Some("req-2"),
+                &json!({"text": "x".repeat(200 * 1024)}),
+            )
+            .is_none(),
+            "an oversized request must be refused at the source"
+        );
     }
 
     fn seed_events(db: &HcomDb, count: usize) {

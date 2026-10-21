@@ -12,17 +12,89 @@ use crate::db::HcomDb;
 use crate::log;
 
 use super::crypto;
-use super::{device_short_id_for_db, safe_kv_get, safe_kv_set, set_relay_status, state_topic};
+use super::{
+    MAX_SEALED_PAYLOAD_BYTES, device_short_id_for_db, safe_kv_get, safe_kv_set, set_relay_status,
+    state_topic,
+};
 
 const RETAINED_EVENT_TAIL: i64 = 50;
 
-// MQTT clients advertise a 128 KiB maximum packet. Keep the encrypted application payload
-// comfortably below that so the topic and MQTT framing cannot push a QoS1 publish over the
-// broker limit and permanently occupy the in-flight window.
-const MAX_SEALED_PAYLOAD_BYTES: usize = 112 * 1024;
+// Every sealed publish must fit under the 128 KiB maximum packet we advertise
+// on CONNECT (MQTT_MAX_PACKET_BYTES): the broker silently drops bigger packets
+// addressed to a subscriber, wedging its sync. MAX_SEALED_PAYLOAD_BYTES leaves
+// room for the topic and MQTT framing on top of that.
+
+/// The state snapshot's own plaintext budget inside one publish: half of the
+/// envelope budget. The other half stays available for events (RPC answers in
+/// particular), so the two can always travel together in one publish.
+pub(crate) const MAX_STATE_PLAIN_BYTES: usize =
+    (MAX_SEALED_PAYLOAD_BYTES - crypto::SEALED_OVERHEAD_BYTES) / 2;
+
+/// Marker written on a state snapshot whose contents were trimmed to fit the
+/// wire budget. The pull side must not read a cut snapshot as "the origin
+/// stopped publishing these instances" and delete their mirrors.
+pub(crate) const STATE_CUT_MARKER: &str = "_relay_state_cut";
+
+/// Cut the state snapshot down to [`MAX_STATE_PLAIN_BYTES`]: first the long
+/// strings inside instance rows, then whole instances (fewest details lost
+/// first would need an ordering; name order is deterministic and re-derivable
+/// next push). A cut snapshot is marked with [`STATE_CUT_MARKER`] so the pull
+/// side keeps its mirrors instead of deleting rows the origin still has. The
+/// state is rebuilt on every push, so cutting it costs one snapshot, never an
+/// event.
+fn trim_state_to_budget(state: &mut Value) {
+    if serde_json::to_string(state)
+        .map(|s| s.len())
+        .unwrap_or(0)
+        <= MAX_STATE_PLAIN_BYTES
+    {
+        return;
+    }
+    // Level 1: cut long strings inside each instance row.
+    if let Some(instances) = state.get_mut("instances").and_then(|v| v.as_object_mut()) {
+        for inst in instances.values_mut() {
+            shrink_strings(inst);
+        }
+    }
+    if serde_json::to_string(state)
+        .map(|s| s.len())
+        .unwrap_or(0)
+        <= MAX_STATE_PLAIN_BYTES
+    {
+        return;
+    }
+    // Level 2: drop whole instances until the snapshot fits. The instance map
+    // is a BTreeMap, so name order is stable across pushes.
+    let original_bytes = serde_json::to_string(state).map(|s| s.len()).unwrap_or(0);
+    let mut dropped = 0u64;
+    // Marker first, so the final size (marker included) is what the loop
+    // fits the snapshot to.
+    state[STATE_CUT_MARKER] = json!({"dropped_instances": dropped, "original_bytes": original_bytes});
+    loop {
+        if serde_json::to_string(state).map(|s| s.len()).unwrap_or(0) <= MAX_STATE_PLAIN_BYTES {
+            break;
+        }
+        // serde_json::Map iteration is sorted-key order, so this drops
+        // deterministically and the next push re-derives the same cut.
+        let first_key = state
+            .get("instances")
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.keys().next().cloned());
+        match first_key {
+            Some(key) => {
+                if let Some(instances) = state.get_mut("instances").and_then(|v| v.as_object_mut()) {
+                    instances.remove(&key);
+                }
+                dropped += 1;
+                state[STATE_CUT_MARKER]["dropped_instances"] = json!(dropped);
+            }
+            None => break,
+        }
+    }
+}
 
 fn seal_bounded_payload(
-    state: &Value,
+    state: &mut Value,
     events: &mut Vec<Value>,
     last_push_id: i64,
     psk: &[u8; 32],
@@ -30,6 +102,9 @@ fn seal_bounded_payload(
     topic: &str,
     now_secs: u64,
 ) -> Result<Vec<u8>, String> {
+    // The state is regenerated every push: bound it up front so it can never
+    // push a publish over the wire budget or starve the events sharing it.
+    trim_state_to_budget(state);
     loop {
         let payload = json!({
             "state": state,
@@ -341,14 +416,16 @@ pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>,
         .conn()
         .prepare(
             "SELECT id, timestamp, type, instance, data FROM events
-             WHERE id > ? AND instance NOT LIKE '%:%'
+             WHERE id > ?1
+             AND (id > ?2 OR type != 'rpc_result')
+             AND instance NOT LIKE '%:%'
              AND instance != '_device'
              AND json_extract(data, '$._relay') IS NULL
              ORDER BY id LIMIT 101",
         )
         .ok()
         .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![tail_start_id], |row| {
+            stmt.query_map(rusqlite::params![tail_start_id, last_push_id], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -425,14 +502,14 @@ pub fn push(
     let last_push_id = safe_kv_get(db, "relay_last_push_id")
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
-    let (state, mut events, _unbounded_max_id, source_has_more) =
+    let (mut state, mut events, _unbounded_max_id, source_has_more) =
         build_push_payload(db, device_uuid);
     let source_new_events = new_event_count(&events, last_push_id);
 
     let topic = state_topic(relay_id, device_uuid);
     let now_secs = crate::shared::time::now_epoch_f64() as u64;
     let sealed = seal_bounded_payload(
-        &state,
+        &mut state,
         &mut events,
         last_push_id,
         psk,
@@ -454,8 +531,13 @@ pub fn push(
     // the message may sit in the internal buffer and be delivered on reconnect,
     // but we cannot guarantee it — so we only advance the cursor when
     // mqtt_connected is true.
+    //
+    // try_publish, never publish: a blocking send into a full request queue
+    // parks the worker's main loop on a stalled connection (the receive path
+    // and the heartbeat stop with it). A full queue fails this push; the
+    // cursor stays put and the next cycle retries.
     client
-        .publish(&topic, QoS::AtLeastOnce, true, sealed)
+        .try_publish(&topic, QoS::AtLeastOnce, true, sealed)
         .map_err(|e| format!("publish: {}", e))?;
 
     let publish_ms = t0.elapsed().as_millis();
@@ -547,13 +629,13 @@ mod tests {
 
     #[test]
     fn sealed_payload_is_byte_bounded_and_new_events_advance() {
-        let state = json!({"instances": {}});
+        let mut state = json!({"instances": {}});
         let last_push_id = 50;
         let mut events: Vec<Value> = (1..=100)
             .map(|id| json!({"id": id, "data": {"text": "x".repeat(4096)}}))
             .collect();
         let sealed = seal_bounded_payload(
-            &state,
+            &mut state,
             &mut events,
             last_push_id,
             &[0x42; 32],
@@ -579,7 +661,7 @@ mod tests {
         // Before the fix this event was popped, the payload went out with no
         // events, and every later push repeated that: the device never relayed
         // another event.
-        let state = json!({"instances": {}});
+        let mut state = json!({"instances": {}});
         let last_push_id = 70;
         let mut events = vec![
             json!({"id": 60, "data": {"text": "tail"}}),
@@ -588,7 +670,7 @@ mod tests {
             }}),
         ];
         let sealed = seal_bounded_payload(
-            &state,
+            &mut state,
             &mut events,
             last_push_id,
             &[0x42; 32],
@@ -618,7 +700,7 @@ mod tests {
         // An events RPC answer from an older peer: no single long string, but
         // too large overall. Level 2 keeps request_id so the waiter learns of
         // the failure instead of timing out.
-        let state = json!({"instances": {}});
+        let mut state = json!({"instances": {}});
         let rows: Vec<Value> = (0..4000)
             .map(|i| json!({"id": i, "data": {"text": format!("message {i} ").repeat(4)}}))
             .collect();
@@ -627,7 +709,7 @@ mod tests {
             "result": {"events": rows, "count": 4000}
         }})];
         seal_bounded_payload(
-            &state,
+            &mut state,
             &mut events,
             4,
             &[0x42; 32],
@@ -660,7 +742,7 @@ mod tests {
     fn many_small_fields_reach_a_last_level_that_always_fits() {
         // Thousands of top-level fields, each under the level-2 keep size: level 2 drops
         // nothing, so without a third level the relay stopped publishing for good.
-        let state = json!({"instances": {}});
+        let mut state = json!({"instances": {}});
         let mut data = serde_json::Map::new();
         data.insert("request_id".into(), json!("req-9"));
         data.insert("action".into(), json!("events"));
@@ -670,7 +752,7 @@ mod tests {
         }
         let mut events = vec![json!({"id": 9, "type": "rpc_result", "data": data})];
         let sealed = seal_bounded_payload(
-            &state,
+            &mut state,
             &mut events,
             8,
             &[0x42; 32],
@@ -760,11 +842,49 @@ mod tests {
     }
 
     #[test]
-    fn oversized_state_fails_instead_of_publishing_an_invalid_packet() {
-        let state = json!({"instances": {"oversized": "x".repeat(MAX_SEALED_PAYLOAD_BYTES)}});
+    fn push_never_blocks_on_a_full_request_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES ('2026-10-20T00:00:00.000000+00:00', 'message', 'luna', '{}')",
+                [],
+            )
+            .unwrap();
+        // Capacity 1 and nobody polling the connection: the queue fills on the
+        // first push, and a blocking send on the second would park the worker's
+        // main loop (receive path and heartbeat included) until the connection
+        // changed underneath it.
+        let (client, _conn) = Client::new(
+            rumqttc::v5::MqttOptions::new("hcom-test", "127.0.0.1", 1883),
+            1,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = push(&db, &client, "relay-test", "device-uuid", &[0x42; 32], false, false);
+            let second = push(&db, &client, "relay-test", "device-uuid", &[0x42; 32], false, false);
+            let _ = tx.send(second);
+        });
+        let done = rx.recv_timeout(std::time::Duration::from_secs(10));
+        assert!(
+            done.is_ok(),
+            "push must return promptly when the request queue is full, never block the worker loop"
+        );
+    }
+
+    #[test]
+    fn oversized_state_is_trimmed_and_published_under_the_packet_budget() {
+        // A state snapshot alone above the wire budget must still go out:
+        // nothing arriving at all is the outage this budget exists to prevent.
+        let mut instances = serde_json::Map::new();
+        for i in 0..300 {
+            instances.insert(format!("inst-{i:03}"), json!({"detail": "x".repeat(1024)}));
+        }
+        let mut state = json!({"instances": instances});
         let mut events = Vec::new();
-        let error = seal_bounded_payload(
-            &state,
+        let sealed = seal_bounded_payload(
+            &mut state,
             &mut events,
             0,
             &[0x42; 32],
@@ -772,8 +892,60 @@ mod tests {
             "relay-test/device-test",
             1_700_000_000,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("exceeds safe MQTT payload budget"));
+        assert!(sealed.len() <= MAX_SEALED_PAYLOAD_BYTES);
+        assert!(
+            serde_json::to_string(&state).unwrap().len() <= MAX_STATE_PLAIN_BYTES,
+            "the trimmed state must respect its own plaintext budget"
+        );
+        let marker = state
+            .get(STATE_CUT_MARKER)
+            .expect("a cut snapshot must be marked so the pull side keeps its mirrors");
+        assert!(
+            marker["dropped_instances"].as_u64().unwrap_or(0) > 0,
+            "the test state must be cut by dropping instances: {marker}"
+        );
+    }
+
+    #[test]
+    fn retained_tail_never_carries_rpc_result_answers() {
+        // Answers are rendezvous rows the requester consumes once. Re-sending
+        // them in every snapshot's retained tail lets a handful of big answers
+        // wedge a peer's publish for good (they accumulate in the tail).
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        for (id, etype) in [(5i64, "message"), (6, "rpc_result"), (7, "message"), (8, "rpc_result")]
+        {
+            db.conn()
+                .execute(
+                    "INSERT INTO events (id, timestamp, type, instance, data) VALUES (?1, '2026-10-20T00:00:00.000000+00:00', ?2, 'luna', '{}')",
+                    rusqlite::params![id, etype],
+                )
+                .unwrap();
+        }
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, timestamp, type, instance, data) VALUES (20, '2026-10-20T00:00:01.000000+00:00', 'message', 'luna', '{}')",
+                [],
+            )
+            .unwrap();
+        super::safe_kv_set(&db, "relay_last_push_id", Some("20"));
+
+        let (_state, events, _max_id, _more) = build_push_payload(&db, "device-uuid");
+        let tail_ids: Vec<i64> = events.iter().filter_map(|e| e["id"].as_i64()).collect();
+        assert!(
+            tail_ids.iter().all(|id| *id <= 20),
+            "the tail must still carry recent ordinary events: {tail_ids:?}"
+        );
+        let tail_types: Vec<&str> = events
+            .iter()
+            .filter(|e| e["id"].as_i64().is_some_and(|id| id <= 20))
+            .filter_map(|e| e["type"].as_str())
+            .collect();
+        assert!(
+            tail_types.iter().all(|t| *t != "rpc_result"),
+            "rpc_result answers must never ride the retained tail: {tail_types:?}"
+        );
     }
 }
