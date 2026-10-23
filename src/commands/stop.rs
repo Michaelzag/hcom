@@ -554,9 +554,9 @@ fn release_captured(
 }
 
 /// Release `name`'s row with no signal to anyone when it has no live root
-/// and its only live carriers are orphans — the release the daemon sweep
-/// performs on its own. None when there is no row, the row is not
-/// orphan-only, or a descendant child row cannot be proven orphan-only
+/// and any remaining live carriers are orphans (including none). This is
+/// the signal-free release used by resume for dead-pid rows too. None when
+/// there is no row or any reached row cannot be proven rootless
 /// (nothing was done, so a live row gets the caller's plain refusal);
 /// otherwise every row released that way (this one first, then
 /// any orphan-only children) with the orphans left running, or an error:
@@ -575,7 +575,12 @@ pub(crate) fn release_orphaned_row(
     let row = row?;
     // Classify first, read-only: a row with a live root never reaches the
     // capture, so its refusal stays the caller's plain one.
-    crate::proctruth::orphaned_row_carriers(db, &row, &binding_ids)?;
+    if !matches!(
+        crate::proctruth::classify_row_carriers(db, &row, &binding_ids),
+        crate::proctruth::CarrierVerdict::Orphaned(_)
+    ) {
+        return None;
+    }
     let (capture, orphans) = match capture_for_stop(db, &row, &binding_ids) {
         Ok(captured) => captured,
         Err(e) => return Some(Err(e)),

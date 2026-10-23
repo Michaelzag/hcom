@@ -1384,6 +1384,14 @@ impl PostCommit {
     }
 }
 
+// A kill has already stopped its processes. Keep trying the atomic teardown
+// beyond SQLite's 5s busy timeout, using the same bounded backoff as sends.
+// A final SQLite attempt can take another 5s (35s maximum in production).
+#[cfg(not(test))]
+const KILL_FINALIZE_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const KILL_FINALIZE_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Stop instance without the process-truth reap gate — the kill path's
 /// teardown, gated and atomic. The full [`stop_instance`] DB teardown
 /// (snapshot, children, `stopped` event, release) with no signals.
@@ -1414,31 +1422,44 @@ pub fn stop_instance_without_reap(
     reason: &str,
     unchanged: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<bool>,
 ) -> Result<bool, String> {
-    let queued = db
-        .with_immediate_transaction(|tx| -> Result<Option<PostCommit>> {
-            if !unchanged(tx)? {
-                return Ok(None);
-            }
-            let mut post = PostCommit::default();
-            match stop_instance_inner_scoped(
-                db,
-                instance_name,
-                initiated_by,
-                reason,
-                false,
-                0,
-                false,
-                Some(tx),
-                &mut post,
-                &[],
-                None,
-            ) {
-                StopOutcome::Stopped | StopOutcome::AlreadyStopped => {}
-                StopOutcome::RetryableError(e) => anyhow::bail!("{e}"),
-            }
-            Ok(Some(post))
-        })
-        .map_err(|e| e.to_string())?;
+    // Retry only lock acquisition: no signals or side effects are replayed,
+    // and the incarnation comparison still runs once, under the write lock.
+    let tx = crate::db::retry_on_busy(
+        || {
+            rusqlite::Transaction::new_unchecked(
+                db.conn(),
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .map_err(anyhow::Error::from)
+        },
+        KILL_FINALIZE_WRITE_BUDGET,
+    )
+    .map_err(|e| e.to_string())?;
+    let queued = (|| -> Result<Option<PostCommit>> {
+        if !unchanged(&tx)? {
+            return Ok(None);
+        }
+        let mut post = PostCommit::default();
+        match stop_instance_inner_scoped(
+            db,
+            instance_name,
+            initiated_by,
+            reason,
+            false,
+            0,
+            false,
+            Some(&tx),
+            &mut post,
+            &[],
+            None,
+        ) {
+            StopOutcome::Stopped | StopOutcome::AlreadyStopped => {}
+            StopOutcome::RetryableError(e) => anyhow::bail!("{e}"),
+        }
+        Ok(Some(post))
+    })()
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     match queued {
         Some(post) => {
             post.fire(db);

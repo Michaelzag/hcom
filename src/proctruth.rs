@@ -948,7 +948,7 @@ pub(crate) fn capture_reap_carriers(
 
 /// Stop's UnprovenOwnership path, recovered: `Ok` when this stop may release
 /// the row with no signal to anyone — the capture admitted no in-scope
-/// carrier, the row has no live root, and every live carrier is an orphan.
+/// carrier, the row has no live root, and any live carriers are orphans.
 /// The capture comes back signal-free with those orphans; this is the only
 /// way a capture becomes signal-free. `Err` hands the capture back unchanged
 /// for the ordinary stop. The F2 guard already ran in the capture and is
@@ -967,12 +967,12 @@ pub(crate) fn orphan_only_release(
         if !capture.carriers.is_empty() {
             return Err(capture);
         }
-        match orphaned_row_carriers(db, row, binding_ids) {
-            Some(orphans) => {
+        match classify_row_carriers(db, row, binding_ids) {
+            CarrierVerdict::Orphaned(orphans) => {
                 capture.signal_free = true;
                 Ok((capture, orphans))
             }
-            None => Err(capture),
+            _ => Err(capture),
         }
     }
     #[cfg(not(unix))]

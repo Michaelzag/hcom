@@ -1,5 +1,19 @@
 ## Unreleased
 
+Kill now retries a busy database while finalizing the stopped snapshot and
+releasing the row. The retry window is 30 seconds plus at most one final
+5-second SQLite wait. If it still can't write, the error distinguishes the
+dead process from the unfinalized row and gives `hcom kill <name>` as recovery.
+
+Resume releases a proven rootless local row before resuming its own session,
+including when no orphaned processes remain. A stale or busy local row, an
+active local seat, and an invalid local snapshot no longer turn into a
+misleading off-host identity hint.
+
+A successful terminal spawn stays a successful launch if later database
+bookkeeping fails. Those failures are warnings, not a false `0/1 launched`
+report or a reason to launch the same seat again.
+
 Terminal cleanup now requires a receipt from the instance's own launch.
 Manually started agents can't close another seat by inheriting its pane or
 systemd unit id.

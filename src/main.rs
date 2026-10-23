@@ -28,6 +28,8 @@ mod instance_names;
 mod instances;
 pub mod integration_spec;
 pub mod launcher;
+#[cfg(test)]
+mod lifecycle_db_contention_tests;
 mod log;
 pub mod messages;
 mod notify;

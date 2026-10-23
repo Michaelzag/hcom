@@ -379,7 +379,19 @@ fn kill_tracked_instance_with_self_pids(
     if let Err(survivors) = reap(name, &binding_ids, &[], capture) {
         return Err(survivors_error(name, &survivors));
     }
-    let teardown = teardown_if_incarnation_unchanged(db, name, initiator, &incarnation)?;
+    let teardown = teardown_if_incarnation_unchanged(db, name, initiator, &incarnation).map_err(
+        |error| {
+            let process_state = if pidtrack::is_alive(pid) {
+                "was signalled"
+            } else {
+                "is dead"
+            };
+            format!(
+                "Process {pid} {process_state}, but '{name}' row was not finalized: {error}. \
+                 Recovery: hcom kill {name}"
+            )
+        },
+    )?;
 
     Ok(KillTrackedResult {
         target: name.to_string(),
@@ -625,7 +637,14 @@ fn kill_self_tracked_instance(
     if let Err(survivors) = reap(name, binding_ids, excluded, capture) {
         return Err(survivors_error(name, &survivors));
     }
-    let teardown = teardown_if_incarnation_unchanged(db, name, initiator, incarnation)?;
+    let teardown = teardown_if_incarnation_unchanged(db, name, initiator, incarnation).map_err(
+        |error| {
+            format!(
+                "Non-self processes stopped, but '{name}' row was not finalized: {error}. \
+                 Recovery: hcom kill {name}"
+            )
+        },
+    )?;
     Ok(KillTrackedResult {
         target: name.to_string(),
         pid,
