@@ -13,7 +13,7 @@ the row or any child. Pid-less and unprovable empty-carrier rows stay held.
 
 Local busy/stale rows and invalid snapshots no longer turn into an off-host
 identity hint. Resume suggests kill-then-resume only for database contention
-on a verified dead-pid row that still passes the recovery checks. Ownership
+on a verified dead-pid row whose entire tree passes the recovery checks. Ownership
 refusals, read failures, and pid-less rows keep their real error without
 prescribing a destructive or unusable retry.
 

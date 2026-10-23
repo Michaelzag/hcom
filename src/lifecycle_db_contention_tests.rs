@@ -644,6 +644,146 @@ fn resume_keeps_the_whole_tree_when_an_empty_child_has_a_live_endpoint() {
     assert!(db.get_instance_full("child").unwrap().is_some());
 }
 
+#[test]
+#[serial]
+fn resume_busy_tree_guidance_refuses_an_endpoint_held_child() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+    let db = HcomDb::open().unwrap();
+    let dead = seed_dead_row(&db);
+    let executable = home.join("omp");
+    std::os::unix::fs::symlink("/bin/bash", &executable).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let fd = listener.as_raw_fd();
+    let port = listener.local_addr().unwrap().port();
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(["-c", "read -r -t 300"])
+        .env_remove("HCOM_INSTANCE_NAME")
+        .env_remove("HCOM_PROCESS_ID")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: only the fixture listener is inherited by this idle child.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let holder = EndpointHolder(command.spawn().unwrap());
+    drop(listener);
+    db.conn().execute(
+        "INSERT INTO instances(name, pid, status, created_at, tool, parent_name) VALUES('child', ?1, 'active', 1, 'omp', 'seat')",
+        [i64::from(dead)],
+    ).unwrap();
+    db.upsert_notify_endpoint("child", "plugin", port).unwrap();
+    db.conn().busy_timeout(Duration::ZERO).unwrap();
+    let writer = Writer::hold(
+        &db,
+        None,
+        "UPDATE instances SET current='writer' WHERE name='seat'",
+    );
+    let error = crate::commands::resume::prepare_resume_plan(
+        &db,
+        "seat",
+        false,
+        &[],
+        &GlobalFlags::default(),
+    )
+    .err()
+    .expect("the busy tree must refuse")
+    .to_string();
+    drop(writer);
+    assert!(
+        error.contains("locked"),
+        "the real DB failure must survive: {error}"
+    );
+    assert!(
+        !error.contains("hcom kill"),
+        "a held child must not receive destructive recovery advice: {error}"
+    );
+    assert!(db.get_instance_full("seat").unwrap().is_some());
+    assert!(db.get_instance_full("child").unwrap().is_some());
+    assert_eq!(stopped_events(&db), 0);
+    assert!(!crate::proctruth::process_gone(holder.0.id()));
+}
+
+#[test]
+#[serial]
+fn resume_busy_tree_guidance_keeps_usable_recovery_for_all_dead_rows() {
+    let _env = crate::hooks::test_helpers::isolated_test_env();
+    let db = HcomDb::open().unwrap();
+    let dead = seed_dead_row(&db);
+    db.conn().execute(
+        "INSERT INTO instances(name, pid, status, created_at, tool, parent_name) VALUES('child', ?1, 'active', 1, 'codex', 'seat')",
+        [i64::from(dead)],
+    ).unwrap();
+    db.conn().busy_timeout(Duration::ZERO).unwrap();
+    let writer = Writer::hold(
+        &db,
+        None,
+        "UPDATE instances SET current='writer' WHERE name='seat'",
+    );
+    let error = crate::commands::resume::prepare_resume_plan(
+        &db,
+        "seat",
+        false,
+        &[],
+        &GlobalFlags::default(),
+    )
+    .err()
+    .expect("the DB is busy")
+    .to_string();
+    drop(writer);
+    assert!(
+        error.contains("locked") && error.contains("hcom kill seat"),
+        "{error}"
+    );
+    kill_tracked_instance(&db, "seat", "test").unwrap();
+    assert!(db.get_instance_full("seat").unwrap().is_none());
+    assert!(db.get_instance_full("child").unwrap().is_none());
+    assert_eq!(stopped_events(&db), 1);
+}
+
+#[test]
+#[serial]
+fn resume_busy_tree_guidance_refuses_unknown_child_ownership() {
+    let _env = crate::hooks::test_helpers::isolated_test_env();
+    let db = HcomDb::open().unwrap();
+    seed_dead_row(&db);
+    db.conn().execute_batch(
+        "INSERT INTO instances(name, status, created_at, tool, parent_name) VALUES('child', 'active', 1, 'codex', 'seat')",
+    ).unwrap();
+    db.conn().busy_timeout(Duration::ZERO).unwrap();
+    let writer = Writer::hold(
+        &db,
+        None,
+        "UPDATE instances SET current='writer' WHERE name='seat'",
+    );
+    let error = crate::commands::resume::prepare_resume_plan(
+        &db,
+        "seat",
+        false,
+        &[],
+        &GlobalFlags::default(),
+    )
+    .err()
+    .expect("unknown child ownership must refuse")
+    .to_string();
+    drop(writer);
+    assert!(
+        !error.contains("hcom kill"),
+        "unknown child evidence must fail closed: {error}"
+    );
+    assert!(db.get_instance_full("seat").unwrap().is_some());
+    assert!(db.get_instance_full("child").unwrap().is_some());
+    assert_eq!(stopped_events(&db), 0);
+}
+
 struct TestProcess(PathBuf);
 impl Drop for TestProcess {
     fn drop(&mut self) {

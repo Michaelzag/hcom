@@ -566,7 +566,9 @@ fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
                                     && row.agent_id == inst.agent_id
                                     && crate::proctruth::empty_row_recovery_allowed(db, &row, &ids)
                             })
-                        });
+                        })
+                    && crate::hooks::common::signal_free_release_blocker(db, name, None, true)
+                        .is_none();
                 if recovery {
                     bail!(
                         "Cannot resume local row '{name}': stale-row finalization failed: {e}. \
