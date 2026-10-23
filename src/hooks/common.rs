@@ -1304,6 +1304,58 @@ pub(crate) fn stop_instance_with_capture_listing_orphans(
     reason: &str,
     capture: crate::proctruth::ReapCapture,
 ) -> (StopOutcome, crate::proctruth::OrphanReleases) {
+    if capture.recovering_empty_row() {
+        // A heartbeat, endpoint, binding, or replacement can appear while
+        // BEGIN waits on another writer. Recheck under that lock, before
+        // touching this row or any child, and commit the whole stop together.
+        let stopped = db.with_immediate_transaction(|tx| {
+            let mut post = PostCommit::default();
+            let (row, ids) = HcomDb::instance_with_bindings_in(tx, instance_name)?;
+            let Some(row) = row else {
+                return Ok((StopOutcome::AlreadyStopped, post));
+            };
+            let bound = BoundIncarnation::Captured(capture.incarnation().cloned());
+            if row_re_registered(tx, instance_name, &row, &bound)? {
+                return Ok((re_registered_outcome(instance_name), post));
+            }
+            if !crate::proctruth::empty_row_recovery_allowed(db, &row, &ids) {
+                anyhow::bail!("cannot prove '{instance_name}' is safe to release: activity or ownership changed");
+            }
+            if let Some(blocker) = signal_free_release_blocker(db, instance_name, Some(tx), true) {
+                anyhow::bail!("{blocker}");
+            }
+            let outcome = stop_instance_inner_scoped(
+                db,
+                instance_name,
+                initiated_by,
+                reason,
+                false,
+                0,
+                true,
+                Some(tx),
+                &mut post,
+                &[],
+                Some(capture),
+            );
+            if let StopOutcome::RetryableError(error) = outcome {
+                anyhow::bail!("{error}");
+            }
+            Ok((outcome, post))
+        });
+        return match stopped {
+            Ok((outcome, post)) => {
+                post.fire(db);
+                (outcome, post.orphan_releases)
+            }
+            Err(error) => (
+                StopOutcome::RetryableError(StopError::database(
+                    format!("could not finalize stop for {instance_name}: {error}"),
+                    &error,
+                )),
+                Vec::new(),
+            ),
+        };
+    }
     let mut post = PostCommit::default();
     let outcome = stop_instance_inner_scoped(
         db,
@@ -1323,9 +1375,9 @@ pub(crate) fn stop_instance_with_capture_listing_orphans(
 
 /// External side effects of a stop: subscription notifications, listener
 /// wakes, relay push. On the standalone path they fire inline, exactly as
-/// they always have. On the kill path the whole teardown shares one
-/// transaction, so they queue here and [`Self::fire`] runs them right after
-/// that single commit — never before the writes are durable.
+/// they always have. Kill and empty-carrier resume recovery share a single
+/// teardown transaction, so effects queue here and [`Self::fire`] runs them
+/// right after that commit — never before the writes are durable.
 ///
 /// This is also the single deferral mechanism for every write-txn site that
 /// fans out to TCP listeners: ALL DB reads/writes of the fan-out run in-txn
@@ -1487,11 +1539,13 @@ impl StopOutcome {
 
 /// Why a stop left the row in place. Displays as its message. Only the
 /// incarnation guard constructs the re-registration case, through
-/// [`StopError::re_registered`]; everything else converts from a message.
+/// [`StopError::re_registered`]. Database failures retain their busy category
+/// for recovery guidance; other errors convert from their original message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopError {
     message: String,
     re_registered: bool,
+    database_busy: bool,
 }
 
 impl StopError {
@@ -1499,7 +1553,20 @@ impl StopError {
         Self {
             message: "row re-registered during stop".to_string(),
             re_registered: true,
+            database_busy: false,
         }
+    }
+
+    fn database(message: String, error: &anyhow::Error) -> Self {
+        Self {
+            message,
+            re_registered: false,
+            database_busy: crate::db::is_busy_error(error),
+        }
+    }
+
+    pub(crate) fn is_database_busy(&self) -> bool {
+        self.database_busy
     }
 }
 
@@ -1508,6 +1575,7 @@ impl From<String> for StopError {
         Self {
             message,
             re_registered: false,
+            database_busy: false,
         }
     }
 }
@@ -1571,7 +1639,12 @@ pub(crate) fn child_instance_names(db: &HcomDb, column: &str, value: &str) -> Re
 /// caller refuses before any child stop, reap, or release below. A child
 /// row that vanished mid-walk is skipped: the recursion below treats it as
 /// already stopped.
-pub(crate) fn signal_free_release_blocker(db: &HcomDb, name: &str) -> Option<String> {
+pub(crate) fn signal_free_release_blocker(
+    db: &HcomDb,
+    name: &str,
+    tx: Option<&rusqlite::Transaction<'_>>,
+    require_sweep_holds: bool,
+) -> Option<String> {
     use crate::proctruth::CarrierVerdict;
     let mut seen = std::collections::HashSet::new();
     let mut queue = vec![name.to_string()];
@@ -1608,7 +1681,11 @@ pub(crate) fn signal_free_release_blocker(db: &HcomDb, name: &str) -> Option<Str
             if !seen.insert(child.clone()) {
                 continue;
             }
-            let (row, binding_ids) = match db.get_instance_with_bindings(&child) {
+            let read = tx.map_or_else(
+                || db.get_instance_with_bindings(&child),
+                |tx| HcomDb::instance_with_bindings_in(tx, &child),
+            );
+            let (row, binding_ids) = match read {
                 Ok((Some(row), binding_ids)) => (row, binding_ids),
                 Ok((None, _)) => continue,
                 Err(e) => {
@@ -1618,7 +1695,17 @@ pub(crate) fn signal_free_release_blocker(db: &HcomDb, name: &str) -> Option<Str
                 }
             };
             match crate::proctruth::classify_row_carriers(db, &row, &binding_ids) {
-                CarrierVerdict::Orphaned(_) => queue.push(child),
+                CarrierVerdict::Orphaned(orphans) => {
+                    if require_sweep_holds
+                        && orphans.is_empty()
+                        && !crate::proctruth::empty_row_recovery_allowed(db, &row, &binding_ids)
+                    {
+                        return Some(format!(
+                            "refusing the signal-free release of '{name}': child '{child}' remains held by activity or ownership evidence; nothing was released or signalled"
+                        ));
+                    }
+                    queue.push(child);
+                }
                 CarrierVerdict::Rooted { pid, via } => {
                     return Some(format!(
                         "refusing the signal-free release of '{name}': child '{child}' is still active (live root pid {pid} via {via}); nothing was released or signalled"
@@ -1850,7 +1937,10 @@ fn stop_instance_inner_scoped(
     // `orphans`: set when this is a child row released with no signal to
     // anyone (see below); reported once the release lands.
     let (row, pre_capture, orphans) = match pre_capture {
-        None if reap_gate => match db.get_instance_with_bindings(instance_name) {
+        None if reap_gate => match tx.map_or_else(
+            || db.get_instance_with_bindings(instance_name),
+            |tx| HcomDb::instance_with_bindings_in(tx, instance_name),
+        ) {
             Ok((row, ids)) => {
                 let owners = crate::proctruth::omp_owner_bindings(db, instance_name);
                 let (capture, orphans) = match row.as_ref() {
@@ -1958,7 +2048,7 @@ fn stop_instance_inner_scoped(
     // that cannot be proven dead, refuses the whole release before any
     // child stop, signal, reap, or row delete below.
     if (signal_free || orphans.is_some())
-        && let Some(blocker) = signal_free_release_blocker(db, instance_name)
+        && let Some(blocker) = signal_free_release_blocker(db, instance_name, tx, false)
     {
         return StopOutcome::RetryableError(blocker.into());
     }

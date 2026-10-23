@@ -554,9 +554,10 @@ fn release_captured(
 }
 
 /// Release `name`'s row with no signal to anyone when it has no live root
-/// and any remaining live carriers are orphans (including none). This is
-/// the signal-free release used by resume for dead-pid rows too. None when
-/// there is no row or any reached row cannot be proven rootless
+/// and any remaining live carriers are orphans. With no carriers, resume
+/// additionally requires a recorded dead pid and the sweep's remaining holds
+/// cleared, revalidated under the release transaction. None when there is no
+/// row or any reached row cannot be proven rootless
 /// (nothing was done, so a live row gets the caller's plain refusal);
 /// otherwise every row released that way (this one first, then
 /// any orphan-only children) with the orphans left running, or an error:
@@ -567,10 +568,10 @@ pub(crate) fn release_orphaned_row(
     name: &str,
     initiator: &str,
     reason: &str,
-) -> Option<Result<crate::proctruth::OrphanReleases, String>> {
+) -> Option<Result<crate::proctruth::OrphanReleases, crate::hooks::common::StopError>> {
     let (row, binding_ids) = match db.get_instance_with_bindings(name) {
         Ok(read) => read,
-        Err(e) => return Some(Err(format!("could not read instance {name}: {e}"))),
+        Err(e) => return Some(Err(format!("could not read instance {name}: {e}").into())),
     };
     let row = row?;
     // Classify first, read-only: a row with a live root never reaches the
@@ -583,7 +584,7 @@ pub(crate) fn release_orphaned_row(
     }
     let (capture, orphans) = match capture_for_stop(db, &row, &binding_ids, true) {
         Ok(captured) => captured,
-        Err(e) => return Some(Err(e)),
+        Err(e) => return Some(Err(e.into())),
     };
     // The carriers changed since the classification: not orphan-only now.
     if !capture.signal_free() {
@@ -592,7 +593,8 @@ pub(crate) fn release_orphaned_row(
     // A signal-free release takes every descendant child row with it: refuse
     // without changing anything when one cannot be proven orphan-only, so
     // the caller keeps its plain "still active" refusal.
-    if let Some(blocker) = crate::hooks::common::signal_free_release_blocker(db, name) {
+    if let Some(blocker) = crate::hooks::common::signal_free_release_blocker(db, name, None, false)
+    {
         log_info("lifecycle", "stop.orphan_release_refused", &blocker);
         return None;
     }
@@ -602,7 +604,7 @@ pub(crate) fn release_orphaned_row(
             | crate::hooks::common::StopOutcome::AlreadyStopped,
             released,
         ) => Some(Ok(released)),
-        (crate::hooks::common::StopOutcome::RetryableError(e), _) => Some(Err(e.to_string())),
+        (crate::hooks::common::StopOutcome::RetryableError(e), _) => Some(Err(e)),
     }
 }
 

@@ -5,10 +5,17 @@ releasing the row. The retry window is 30 seconds plus at most one final
 5-second SQLite wait. If it still can't write, the error distinguishes the
 dead process from the unfinalized row and gives `hcom kill <name>` as recovery.
 
-Resume releases a proven rootless local row before resuming its own session,
-including when no orphaned processes remain. A stale or busy local row, an
-active local seat, and an invalid local snapshot no longer turn into a
-misleading off-host identity hint.
+Resume's empty-carrier recovery requires a recorded, positively dead pid.
+It respects the daemon sweep's activity grace, live shell bindings, and
+seat-owned or undetermined notify endpoints. Those holds and the captured
+incarnation are checked again under the write transaction before releasing
+the row or any child. Pid-less and unprovable empty-carrier rows stay held.
+
+Local busy/stale rows and invalid snapshots no longer turn into an off-host
+identity hint. Resume suggests kill-then-resume only for database contention
+on a verified dead-pid row that still passes the recovery checks. Ownership
+refusals, read failures, and pid-less rows keep their real error without
+prescribing a destructive or unusable retry.
 
 A successful terminal spawn stays a successful launch if later database
 bookkeeping fails. Those failures are warnings, not a false `0/1 launched`

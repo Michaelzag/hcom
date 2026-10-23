@@ -530,13 +530,12 @@ fn prepare_resume_plan_preview(
 /// Both paths gate on the same name so a UUID resume never slips past the
 /// live check that a name resume would hit.
 ///
-/// A non-inactive row with no live root and no live carriers (or only
-/// orphans) is not live: on the executing path it is released here with no
-/// signal to anyone ([`crate::commands::stop::release_orphaned_row`]), and
-/// the resume goes on from the stopped snapshot that release writes. That
-/// is the same release the daemon sweep performs on its own. The preview
-/// path never releases: it only classifies
-/// ([`preview_resumable`]) and describes what `--go` will release.
+/// A row whose only live carriers are orphans can be released without
+/// signalling them. Empty-carrier recovery is narrower: it requires a
+/// recorded dead pid and the sweep's activity, binding, and endpoint holds
+/// cleared. That path rechecks the whole tree inside its release transaction.
+/// Resume then uses the snapshot that release writes. The preview only
+/// classifies ([`preview_resumable`]); it never releases a row.
 fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
     if !fork
         && let Some(inst) = db.get_instance_full(name)?
@@ -554,11 +553,29 @@ fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
                     "Released '{name}': no live process roots it, so its row was stale; resuming."
                 );
             }
-            Some(Err(e)) => bail!(
-                "Cannot resume local row '{name}': stale-row finalization failed: {e}. \
-                 Recovery: hcom kill {name}, then retry hcom r {name}"
-            ),
-            None => bail!("{}", still_active_message(name)),
+            Some(Err(e)) => {
+                let recovery = e.is_database_busy()
+                    && db
+                        .get_instance_with_bindings(name)
+                        .ok()
+                        .is_some_and(|(row, ids)| {
+                            row.is_some_and(|row| {
+                                row.created_at.to_bits() == inst.created_at.to_bits()
+                                    && row.pid == inst.pid
+                                    && row.session_id == inst.session_id
+                                    && row.agent_id == inst.agent_id
+                                    && crate::proctruth::empty_row_recovery_allowed(db, &row, &ids)
+                            })
+                        });
+                if recovery {
+                    bail!(
+                        "Cannot resume local row '{name}': stale-row finalization failed: {e}. \
+                         Recovery: hcom kill {name}, then retry hcom r {name}"
+                    );
+                }
+                bail!("Cannot resume local row '{name}': {e}");
+            }
+            None => bail!("{}", still_active_message(name, inst.pid)),
         }
     }
     // Process truth gates the spawn: even with the row stopped, a
@@ -588,15 +605,18 @@ fn preview_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<Option<Pendi
             .map_err(|e| anyhow::anyhow!("could not read instance {name}: {e}"))?;
         match row {
             Some(row) => match crate::proctruth::classify_row_carriers(db, &row, &binding_ids) {
-                crate::proctruth::CarrierVerdict::Orphaned(orphans) => {
+                crate::proctruth::CarrierVerdict::Orphaned(orphans)
+                    if !orphans.is_empty()
+                        || crate::proctruth::empty_row_recovery_allowed(db, &row, &binding_ids) =>
+                {
                     pending = Some(PendingOrphanRelease {
                         name: name.to_string(),
                         orphans,
                     });
                 }
-                _ => bail!("{}", still_active_message(name)),
+                _ => bail!("{}", still_active_message(name, row.pid)),
             },
-            None => bail!("{}", still_active_message(name)),
+            None => bail!("{}", still_active_message(name, None)),
         }
     }
     if !fork && let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name) {
@@ -606,8 +626,15 @@ fn preview_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<Option<Pendi
 }
 
 /// The refusal a live (or undeterminable) row gets on every resume path.
-fn still_active_message(name: &str) -> String {
-    format!("'{name}' is still active — run hcom kill {name} first")
+fn still_active_message(name: &str, pid: Option<i64>) -> String {
+    if pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .is_some_and(|pid| pid > 0 && !crate::proctruth::process_gone(pid))
+    {
+        format!("'{name}' is still active — run hcom kill {name} first")
+    } else {
+        format!("'{name}' is still active or its ownership is undetermined; resume refused")
+    }
 }
 
 /// `preview` is the AI-tool preview path (`hcom r` without `--go`): the plan

@@ -688,6 +688,9 @@ pub(crate) struct ReapCapture {
     /// releases the row and signals nobody (no headless group signal, no
     /// reap).
     signal_free: bool,
+    /// Empty-carrier resume recovery must recheck sweep holds under the
+    /// transaction that carries the entire stop, including child releases.
+    recovering_empty_row: bool,
 }
 
 impl ReapCapture {
@@ -697,6 +700,10 @@ impl ReapCapture {
 
     pub(crate) fn signal_free(&self) -> bool {
         self.signal_free
+    }
+
+    pub(crate) fn recovering_empty_row(&self) -> bool {
+        self.recovering_empty_row
     }
 }
 
@@ -766,6 +773,7 @@ fn capture_reap_carriers_unbound(
             carriers,
             incarnation: None,
             signal_free: false,
+            recovering_empty_row: false,
         })
     }
     #[cfg(not(unix))]
@@ -774,6 +782,7 @@ fn capture_reap_carriers_unbound(
         Ok(ReapCapture {
             incarnation: None,
             signal_free: false,
+            recovering_empty_row: false,
         })
     }
 }
@@ -971,8 +980,12 @@ pub(crate) fn orphan_only_release(
             return Err(capture);
         }
         match classify_row_carriers(db, row, binding_ids) {
-            CarrierVerdict::Orphaned(orphans) if allow_empty || !orphans.is_empty() => {
+            CarrierVerdict::Orphaned(orphans)
+                if !orphans.is_empty()
+                    || (allow_empty && empty_row_recovery_allowed(db, row, binding_ids)) =>
+            {
                 capture.signal_free = true;
+                capture.recovering_empty_row = orphans.is_empty();
                 Ok((capture, orphans))
             }
             _ => Err(capture),
@@ -2797,6 +2810,76 @@ fn is_orphan_carrier(start_epoch: f64, binding_updated_at: f64) -> bool {
 /// but a sweep tick landing mid-exit must not write `vanished` first.
 const SWEEP_FRESH_GRACE_SECS: i64 = 60;
 
+/// The sweep's activity and attributable-pid holds, also used by resume's
+/// narrower empty-carrier recovery. Unknown pid evidence holds the row.
+fn held_by_activity_or_pid(
+    inst: &crate::db::InstanceRow,
+    binding_ids: &[String],
+    now: i64,
+) -> bool {
+    if inst.last_seen > 0 && now - inst.last_seen < SWEEP_FRESH_GRACE_SECS {
+        return true;
+    }
+    let mut evidence_pids = inst
+        .pid
+        .filter(|pid| *pid > 0)
+        .map(|pid| pid as u32)
+        .into_iter()
+        .chain(
+            binding_ids
+                .iter()
+                .filter_map(|id| shell_pid_from_process_id(id)),
+        );
+    let Some(first) = evidence_pids.next() else {
+        crate::log::log(
+            "DEBUG",
+            "daemon",
+            "sweep.held",
+            &format!("name={} reason=no-pid-evidence", inst.name),
+        );
+        return true;
+    };
+    if !process_gone(first) || evidence_pids.any(|pid| !process_gone(pid)) {
+        crate::log::log(
+            "DEBUG",
+            "daemon",
+            "sweep.held",
+            &format!("name={} reason=pid-alive", inst.name),
+        );
+        return true;
+    }
+    false
+}
+
+/// Resume may recover an empty-carrier row only with a recorded, positively
+/// dead pid, no sweep hold, and a fresh proof that no live carrier roots it.
+/// Pid-less and unreadable ownership remain refusals, not evidence of death.
+pub(crate) fn empty_row_recovery_allowed(
+    db: &HcomDb,
+    row: &crate::db::InstanceRow,
+    binding_ids: &[String],
+) -> bool {
+    if row
+        .pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .is_none_or(|pid| pid == 0)
+    {
+        return false;
+    }
+    if row.status == crate::instance_names::PLACEHOLDER_STATUS
+        || row
+            .origin_device_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+        || crate::hosted::is_hosted_tool(&row.tool)
+        || held_by_activity_or_pid(row, binding_ids, crate::shared::time::now_epoch_i64())
+        || held_by_live_notify_endpoint(db, &row.name, row.session_id.as_deref())
+    {
+        return false;
+    }
+    matches!(classify_row_carriers(db, row, binding_ids), CarrierVerdict::Orphaned(orphans) if orphans.is_empty())
+}
+
 // Test seam: runs between the sweep's snapshot read and the release it
 // authorizes, so a test can land a rebind or replacement in that gap.
 #[cfg(test)]
@@ -2899,40 +2982,7 @@ pub fn sweep_vanished_instances(db: &HcomDb) -> Vec<String> {
         if inst.status == crate::shared::ST_INACTIVE {
             continue;
         }
-        if inst.last_seen > 0 && now - inst.last_seen < SWEEP_FRESH_GRACE_SECS {
-            continue;
-        }
-        // Positive-evidence pids: the recorded snapshot pid plus every shell
-        // pid parsed from a shell-shaped binding. Unparseable bindings (UUID
-        // harness ids, empty, malformed) contribute nothing — they are not
-        // evidence of life OR death.
-        let mut evidence_pids: Vec<u32> = inst
-            .pid
-            .filter(|pid| *pid > 0)
-            .map(|pid| pid as u32)
-            .into_iter()
-            .collect();
-        evidence_pids.extend(
-            binding_ids
-                .iter()
-                .filter_map(|id| shell_pid_from_process_id(id)),
-        );
-        if evidence_pids.is_empty() {
-            crate::log::log(
-                "DEBUG",
-                "daemon",
-                "sweep.held",
-                &format!("name={} reason=no-pid-evidence", inst.name),
-            );
-            continue;
-        }
-        if evidence_pids.iter().any(|pid| !process_gone(*pid)) {
-            crate::log::log(
-                "DEBUG",
-                "daemon",
-                "sweep.held",
-                &format!("name={} reason=pid-alive", inst.name),
-            );
+        if held_by_activity_or_pid(inst, binding_ids, now) {
             continue;
         }
         // Every attributable pid is dead. Still held while a live carrier
@@ -4497,6 +4547,7 @@ mod tests {
             carriers: Vec::new(),
             incarnation: None,
             signal_free: false,
+            recovering_empty_row: false,
         };
         assert!(
             reap_instance_tree_for_excluding_captured(
