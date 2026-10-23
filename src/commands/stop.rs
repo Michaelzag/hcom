@@ -509,7 +509,7 @@ fn stop_read_instance(
     crate::hooks::common::StopOutcome,
     crate::proctruth::OrphanReleases,
 ) {
-    match capture_for_stop(db, inst, binding_ids) {
+    match capture_for_stop(db, inst, binding_ids, false) {
         Ok((capture, orphans)) => {
             release_captured(db, &inst.name, initiator, reason, capture, orphans)
         }
@@ -581,7 +581,7 @@ pub(crate) fn release_orphaned_row(
     ) {
         return None;
     }
-    let (capture, orphans) = match capture_for_stop(db, &row, &binding_ids) {
+    let (capture, orphans) = match capture_for_stop(db, &row, &binding_ids, true) {
         Ok(captured) => captured,
         Err(e) => return Some(Err(e)),
     };
@@ -617,6 +617,7 @@ fn capture_for_stop(
     db: &HcomDb,
     inst: &crate::db::InstanceRow,
     binding_ids: &[String],
+    allow_empty: bool,
 ) -> Result<
     (
         crate::proctruth::ReapCapture,
@@ -634,7 +635,7 @@ fn capture_for_stop(
         &[],
     )
     .map_err(|e| e.to_string())?;
-    match crate::proctruth::orphan_only_release(db, inst, binding_ids, capture) {
+    match crate::proctruth::orphan_only_release(db, inst, binding_ids, capture, allow_empty) {
         Ok((capture, orphans)) => {
             log_info(
                 "lifecycle",

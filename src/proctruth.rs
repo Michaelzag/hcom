@@ -949,6 +949,8 @@ pub(crate) fn capture_reap_carriers(
 /// Stop's UnprovenOwnership path, recovered: `Ok` when this stop may release
 /// the row with no signal to anyone — the capture admitted no in-scope
 /// carrier, the row has no live root, and any live carriers are orphans.
+/// `allow_empty` is only for resume's rootless-row recovery. Ordinary stop
+/// keeps its existing child-by-child teardown when this row has no carriers.
 /// The capture comes back signal-free with those orphans; this is the only
 /// way a capture becomes signal-free. `Err` hands the capture back unchanged
 /// for the ordinary stop. The F2 guard already ran in the capture and is
@@ -961,6 +963,7 @@ pub(crate) fn orphan_only_release(
     row: &crate::db::InstanceRow,
     binding_ids: &[String],
     mut capture: ReapCapture,
+    allow_empty: bool,
 ) -> Result<(ReapCapture, Vec<OrphanCarrier>), ReapCapture> {
     #[cfg(unix)]
     {
@@ -968,7 +971,7 @@ pub(crate) fn orphan_only_release(
             return Err(capture);
         }
         match classify_row_carriers(db, row, binding_ids) {
-            CarrierVerdict::Orphaned(orphans) => {
+            CarrierVerdict::Orphaned(orphans) if allow_empty || !orphans.is_empty() => {
                 capture.signal_free = true;
                 Ok((capture, orphans))
             }
@@ -977,7 +980,7 @@ pub(crate) fn orphan_only_release(
     }
     #[cfg(not(unix))]
     {
-        let _ = (db, row, binding_ids, &mut capture);
+        let _ = (db, row, binding_ids, &mut capture, allow_empty);
         Err(capture)
     }
 }

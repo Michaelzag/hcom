@@ -1871,8 +1871,9 @@ fn stop_instance_inner_scoped(
                             // stop. A rooted or undetermined child keeps the
                             // ordinary capture, reap, and refusal.
                             Ok(capture) if depth > 0 => {
-                                match crate::proctruth::orphan_only_release(db, row, &ids, capture)
-                                {
+                                match crate::proctruth::orphan_only_release(
+                                    db, row, &ids, capture, false,
+                                ) {
                                     Ok((capture, orphans)) => {
                                         log::log_info(
                                             "hooks",
