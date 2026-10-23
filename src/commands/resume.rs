@@ -57,7 +57,7 @@ pub(crate) struct PreparedResume {
     /// `--restore-earlier`: the earlier snapshot appended as a corrective
     /// `life.stopped` event for the seat right before launch.
     restored_snapshot: Option<RestoredSnapshot>,
-    /// Preview only: a stale orphan-only row the plan read but must not
+    /// Preview only: a stale rootless row the plan read but must not
     /// release. The preview describes it; the executing path
     /// (`--go` / `execute_prepared_resume`) releases it via
     /// [`crate::commands::stop::release_orphaned_row`] before launching.
@@ -65,8 +65,8 @@ pub(crate) struct PreparedResume {
     pending_orphan_release: Option<PendingOrphanRelease>,
 }
 
-/// A stale orphan-only row a preview plan classified read-only
-/// ([`crate::proctruth::orphaned_row_carriers`]) but left in place.
+/// A stale rootless row a preview plan classified read-only
+/// ([`crate::proctruth::classify_row_carriers`]) but left in place.
 struct PendingOrphanRelease {
     name: String,
     orphans: Vec<crate::proctruth::OrphanCarrier>,
@@ -296,7 +296,7 @@ fn run_resume(
 
     // The preview path (`hcom r` without `--go` inside an AI tool) only
     // classifies and describes: the plan below must not release a stale
-    // orphan-only row. The release runs only on the executing path.
+    // rootless row. The release runs only on the executing path.
     let previewing = ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args);
     let (resolved, plan) = if restore_earlier {
         resolve_restore_earlier_plan(&db, &name, extra_args, flags, previewing)?
@@ -375,7 +375,7 @@ pub fn run_local_resume_result(
 /// Returns `(resolved_name_for_display, prepared_plan)`.
 ///
 /// `preview` is the AI-tool preview path (`hcom r` without `--go`): the plan
-/// only classifies and describes, and never releases a stale orphan-only row.
+/// only classifies and describes, and never releases a stale rootless row.
 fn resolve_name_to_plan(
     db: &HcomDb,
     name: &str,
@@ -420,7 +420,7 @@ fn resolve_name_to_plan(
         return Ok((current, plan));
     }
 
-    if matches!(db.get_instance_full(&current), Ok(None) | Err(_))
+    if db.get_instance_full(&current)?.is_none()
         && crate::relay::control::split_device_suffix(&current).is_none()
         && let Some(session_id) = resolve_thread_name(&current)?
     {
@@ -464,10 +464,19 @@ fn resolve_name_to_plan(
         preview,
     ) {
         Ok(plan) => plan,
-        // No local plan for a bare name: if its history lives on other devices,
-        // say where instead of the bare not-found error.
+        // Off-host history is a not-found hint, not a replacement for a
+        // local refusal (including a stale row whose release hit SQLITE_BUSY).
         Err(err) => {
-            if let Some(hint) = crate::identity::remote_history_hint(db, &current) {
+            if !crate::db::is_busy_error(&err)
+                && db.get_instance_full(&current)?.is_none()
+                && !db.conn().query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE type='life' AND instance=?1
+                     AND json_extract(data, '$.action')='stopped')",
+                    rusqlite::params![current],
+                    |row| row.get::<_, bool>(0),
+                )?
+                && let Some(hint) = crate::identity::remote_history_hint(db, &current)
+            {
                 bail!("{hint}");
             }
             return Err(err);
@@ -497,7 +506,7 @@ pub(crate) fn prepare_resume_plan(
 }
 
 /// [`prepare_resume_plan`] for the AI-tool preview path (`hcom r` without
-/// `--go`): classifies a stale orphan-only row read-only and describes what
+/// `--go`): classifies a stale rootless row read-only and describes what
 /// `--go` will release, without releasing anything.
 fn prepare_resume_plan_preview(
     db: &HcomDb,
@@ -521,16 +530,15 @@ fn prepare_resume_plan_preview(
 /// Both paths gate on the same name so a UUID resume never slips past the
 /// live check that a name resume would hit.
 ///
-/// A non-inactive row with no live root whose only live carriers are
-/// orphans is not live: on the executing path it is released here with no
-/// signal to anyone ([`crate::commands::stop::release_orphaned_row`]), and
-/// the resume goes on from the stopped snapshot that release writes. That
-/// is the same release the daemon sweep performs on its own. The preview
-/// path never releases: it only classifies
-/// ([`preview_resumable`]) and describes what `--go` will release.
+/// A row whose only live carriers are orphans can be released without
+/// signalling them. Empty-carrier recovery is narrower: it requires a
+/// recorded dead pid and the sweep's activity, binding, and endpoint holds
+/// cleared. That path rechecks the whole tree inside its release transaction.
+/// Resume then uses the snapshot that release writes. The preview only
+/// classifies ([`preview_resumable`]); it never releases a row.
 fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
     if !fork
-        && let Ok(Some(inst)) = db.get_instance_full(name)
+        && let Some(inst) = db.get_instance_full(name)?
         && inst.status != ST_INACTIVE
     {
         match crate::commands::stop::release_orphaned_row(db, name, "resume", "orphaned") {
@@ -545,8 +553,31 @@ fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
                     "Released '{name}': no live process roots it, so its row was stale; resuming."
                 );
             }
-            Some(Err(e)) => bail!("{e}"),
-            None => bail!("{}", still_active_message(name)),
+            Some(Err(e)) => {
+                let recovery = e.is_database_busy()
+                    && db
+                        .get_instance_with_bindings(name)
+                        .ok()
+                        .is_some_and(|(row, ids)| {
+                            row.is_some_and(|row| {
+                                row.created_at.to_bits() == inst.created_at.to_bits()
+                                    && row.pid == inst.pid
+                                    && row.session_id == inst.session_id
+                                    && row.agent_id == inst.agent_id
+                                    && crate::proctruth::empty_row_recovery_allowed(db, &row, &ids)
+                            })
+                        })
+                    && crate::hooks::common::signal_free_release_blocker(db, name, None, true)
+                        .is_none();
+                if recovery {
+                    bail!(
+                        "Cannot resume local row '{name}': stale-row finalization failed: {e}. \
+                         Recovery: hcom kill {name}, then retry hcom r {name}"
+                    );
+                }
+                bail!("Cannot resume local row '{name}': {e}");
+            }
+            None => bail!("{}", still_active_message(name, inst.pid)),
         }
     }
     // Process truth gates the spawn: even with the row stopped, a
@@ -561,30 +592,33 @@ fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
 }
 
 /// The preview half of [`ensure_resumable`]: read-only. A non-inactive row
-/// with no live root whose only live carriers are orphans comes back as a
+/// with no live root and no carriers (or only orphans) comes back as a
 /// pending release for the preview to describe; anything else live (or
 /// undeterminable) refuses exactly as the executing path would, but without
 /// releasing anything.
 fn preview_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<Option<PendingOrphanRelease>> {
     let mut pending = None;
     if !fork
-        && let Ok(Some(inst)) = db.get_instance_full(name)
+        && let Some(inst) = db.get_instance_full(name)?
         && inst.status != ST_INACTIVE
     {
         let (row, binding_ids) = db
             .get_instance_with_bindings(name)
             .map_err(|e| anyhow::anyhow!("could not read instance {name}: {e}"))?;
         match row {
-            Some(row) => match crate::proctruth::orphaned_row_carriers(db, &row, &binding_ids) {
-                Some(orphans) => {
+            Some(row) => match crate::proctruth::classify_row_carriers(db, &row, &binding_ids) {
+                crate::proctruth::CarrierVerdict::Orphaned(orphans)
+                    if !orphans.is_empty()
+                        || crate::proctruth::empty_row_recovery_allowed(db, &row, &binding_ids) =>
+                {
                     pending = Some(PendingOrphanRelease {
                         name: name.to_string(),
                         orphans,
                     });
                 }
-                None => bail!("{}", still_active_message(name)),
+                _ => bail!("{}", still_active_message(name, row.pid)),
             },
-            None => bail!("{}", still_active_message(name)),
+            None => bail!("{}", still_active_message(name, None)),
         }
     }
     if !fork && let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name) {
@@ -594,12 +628,19 @@ fn preview_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<Option<Pendi
 }
 
 /// The refusal a live (or undeterminable) row gets on every resume path.
-fn still_active_message(name: &str) -> String {
-    format!("'{name}' is still active — run hcom kill {name} first")
+fn still_active_message(name: &str, pid: Option<i64>) -> String {
+    if pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .is_some_and(|pid| pid > 0 && !crate::proctruth::process_gone(pid))
+    {
+        format!("'{name}' is still active — run hcom kill {name} first")
+    } else {
+        format!("'{name}' is still active or its ownership is undetermined; resume refused")
+    }
 }
 
 /// `preview` is the AI-tool preview path (`hcom r` without `--go`): the plan
-/// only classifies and describes, and never releases a stale orphan-only row
+/// only classifies and describes, and never releases a stale rootless row
 /// ([`preview_resumable`]). `false` is the executing path, which releases it
 /// ([`ensure_resumable`]).
 fn prepare_resume_plan_from_source(
@@ -1528,10 +1569,12 @@ fn print_resume_preview(
             "On --go, '{}' will be released: no live process roots it, so its row is stale; resuming from its session.",
             pending.name
         );
-        println!(
-            "{}",
-            crate::proctruth::describe_unsignalled_orphans(&pending.name, &pending.orphans)
-        );
+        if !pending.orphans.is_empty() {
+            println!(
+                "{}",
+                crate::proctruth::describe_unsignalled_orphans(&pending.name, &pending.orphans)
+            );
+        }
     }
 }
 
@@ -1705,7 +1748,7 @@ type LoadedInstanceData = (
 /// Load data from an active or stopped instance.
 fn load_instance_data(db: &HcomDb, name: &str) -> Result<LoadedInstanceData> {
     // Try active instance first
-    if let Ok(Some(inst)) = db.get_instance_full(name) {
+    if let Some(inst) = db.get_instance_full(name)? {
         return Ok((
             inst.tool.clone(),
             inst.session_id.as_deref().unwrap_or("").to_string(),

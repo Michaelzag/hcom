@@ -1348,13 +1348,26 @@ pub fn launch_pty(
         Some(tool),
     )?;
 
-    instance_binding::persist_terminal_launch_context(
-        &crate::db::HcomDb::open()?,
-        instance_name,
-        terminal,
-        &effective_preset,
-        env.get("HCOM_PROCESS_ID").map(|s| s.as_str()),
-    );
+    if matches!(
+        launch_result,
+        terminal::LaunchResult::Success | terminal::LaunchResult::Background(_, _)
+    ) {
+        let bookkeeping = HcomDb::open().and_then(|db| {
+            instance_binding::persist_terminal_launch_context(
+                &db,
+                instance_name,
+                terminal,
+                &effective_preset,
+                env.get("HCOM_PROCESS_ID").map(|s| s.as_str()),
+            )
+        });
+        if let Err(error) = bookkeeping {
+            eprintln!(
+                "Warning: '{instance_name}' launched, but terminal bookkeeping failed: {error}. \
+                 Don't launch it again; check hcom list."
+            );
+        }
+    }
 
     match launch_result {
         terminal::LaunchResult::Success => Ok(true),
@@ -1385,25 +1398,41 @@ fn finalize_background_launch(
     pid: u32,
     effective_preset: String,
 ) {
-    instance_binding::persist_terminal_launch_context(
+    if let Err(error) = instance_binding::persist_terminal_launch_context(
         ctx.db,
         ctx.instance_name,
         ctx.terminal_mode,
         &effective_preset,
         Some(ctx.process_id),
-    );
+    ) {
+        eprintln!(
+            "Warning: '{}' launched, but terminal bookkeeping failed: {error}. \
+             Don't launch it again; check hcom list.",
+            ctx.instance_name
+        );
+    }
     // terminal::launch_terminal waits briefly after spawning the runner.
     // The wrapper can record its own pid and then its tool's pid during that
     // wait; an unconditional launcher write here would replace the proof.
     // Non-PTY backgrounds have no wrapper writer, so they keep this pid.
     if let Err(e) = ctx.db.set_instance_pid_if_unset(ctx.instance_name, pid) {
         crate::log::log_error("launcher", "background.pid", &format!("{e}"));
+        eprintln!(
+            "Warning: '{}' launched, but recording its pid failed: {e}. \
+             Don't launch it again; check hcom list.",
+            ctx.instance_name
+        );
     }
-    instances::update_instance_position(
-        ctx.db,
+    if let Err(error) = ctx.db.update_instance_fields(
         ctx.instance_name,
         &serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]),
-    );
+    ) {
+        eprintln!(
+            "Warning: '{}' launched, but recording its log file failed: {error}. \
+             Don't launch it again; check hcom list.",
+            ctx.instance_name
+        );
+    }
     // Orphan filtering compares pidtrack entries with instances.pid. Record
     // the effective row pid: a PTY wrapper/tool may have won, or the NULL-only
     // launcher fill supplied the runner. A tool-pid write between this read
@@ -2370,13 +2399,18 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             inside_ai_tool,
                             Some("claude"),
                         )?;
-                        instance_binding::persist_terminal_launch_context(
+                        if let Err(error) = instance_binding::persist_terminal_launch_context(
                             db,
                             &instance_name,
                             terminal_mode,
                             &effective_preset,
                             Some(&process_id),
-                        );
+                        ) {
+                            eprintln!(
+                                "Warning: '{instance_name}' launched, but terminal bookkeeping failed: {error}. \
+                                 Don't launch it again; check hcom list."
+                            );
+                        }
 
                         match launch_result {
                             terminal::LaunchResult::Success => {
@@ -2705,7 +2739,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
 
     // Log batch launch event
-    db.log_event(
+    if let Err(error) = db.log_event(
         "life",
         &launcher_name,
         &json!({
@@ -2725,8 +2759,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 .filter_map(|h| h.get("instance_name").and_then(|v| v.as_str()))
                 .collect::<Vec<_>>(),
         }),
-    )
-    .ok();
+    ) {
+        eprintln!(
+            "Warning: {launched} instance(s) launched, but recording the batch failed: {error}"
+        );
+    }
 
     // Push launch event to relay (best-effort)
     crate::relay::spawn_background_push();

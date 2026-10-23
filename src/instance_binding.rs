@@ -27,11 +27,9 @@ pub fn persist_terminal_launch_context(
     requested_preset: Option<&str>,
     effective_preset: &str,
     process_id: Option<&str>,
-) {
+) -> anyhow::Result<()> {
     let mut ctx = db
-        .get_instance_full(instance_name)
-        .ok()
-        .flatten()
+        .get_instance_full(instance_name)?
         .and_then(|pos| pos.launch_context)
         .and_then(|json| {
             serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok()
@@ -76,7 +74,7 @@ pub fn persist_terminal_launch_context(
         "launch_context".into(),
         serde_json::json!(serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string())),
     );
-    update_instance_position(db, instance_name, &updates);
+    db.update_instance_fields(instance_name, &updates)
 }
 
 /// Capture environment context and store it for the instance.
@@ -1814,7 +1812,8 @@ mod tests {
             )
             .unwrap();
 
-        persist_terminal_launch_context(&db, "luna", Some("kitty"), "kitty-tab", Some("proc-1"));
+        persist_terminal_launch_context(&db, "luna", Some("kitty"), "kitty-tab", Some("proc-1"))
+            .unwrap();
 
         let row = db.get_instance_full("luna").unwrap().unwrap();
         let ctx: serde_json::Value =
