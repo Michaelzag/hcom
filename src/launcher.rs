@@ -2760,7 +2760,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 .collect::<Vec<_>>(),
         }),
     ) {
-        eprintln!("Warning: {launched} instance(s) launched, but recording the batch failed: {error}");
+        eprintln!(
+            "Warning: {launched} instance(s) launched, but recording the batch failed: {error}"
+        );
     }
 
     // Push launch event to relay (best-effort)
