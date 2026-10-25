@@ -1036,6 +1036,14 @@ fn descendant_explicit_start_cannot_reclaim_live_or_soft_stopped_owner() {
             .as_str()
             .expect("explicit owner name")
             .to_string();
+        if !launcher {
+            // A fresh plain mint now pins its actual owner. Seed the PID-less
+            // row plain mints left through 0.7.60, so the launcherless pass
+            // still covers that owner history.
+            db(&h)
+                .execute("UPDATE instances SET pid=NULL WHERE name=?1", [&name])
+                .unwrap();
+        }
         owner.run(&h, &format!("export HCOM_INSTANCE_NAME={}", quote(&name)));
         seed_message(
             &h,
@@ -2199,4 +2207,132 @@ fn genuine_inactive_owner_recovers_its_missing_binding_without_a_new_identity() 
         .unwrap();
     assert_eq!(count, 1, "genuine reentry left a replacement row");
     owner.assert_alive();
+}
+
+#[test]
+fn fresh_own_minted_plain_seat_below_an_owner_pins_its_own_actual_pid() {
+    let h = isolated_hcom();
+    let suffix = unique_suffix();
+    let name = format!("olderowner{suffix}");
+    let sid = format!("sid-older-owner-{suffix}");
+    let mut owner = HookProcess::spawn(&h, "older-owner", "omp", Some(&launcher_id()), false);
+    seed_launch(&h, &owner, &name);
+    let endpoint = probe();
+    let path = h.workspace.join(format!("{sid}.jsonl"));
+    owner
+        .run(&h, &start_command(&sid, &path, &h.workspace, &endpoint))
+        .ok();
+    assert_bound(&h, &owner, &name, &sid, &path, &h.workspace);
+    seed_message(
+        &h,
+        &name,
+        "fixture-sender",
+        "older owner's unread payload",
+        "mentions",
+        "",
+    );
+    let older_rows = || {
+        let conn = db(&h);
+        [
+            "SELECT * FROM instances WHERE name=?1",
+            "SELECT * FROM process_bindings WHERE instance_name=?1 ORDER BY process_id",
+            "SELECT * FROM session_bindings WHERE instance_name=?1 ORDER BY session_id",
+            "SELECT * FROM notify_endpoints WHERE instance=?1 ORDER BY kind",
+        ]
+        .map(|sql| {
+            let mut query = conn.prepare(sql).unwrap();
+            let columns = query.column_count();
+            query
+                .query_map([&name], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+    };
+    let older = older_rows();
+    // A real new seat below the older owner: its own OMP process presents
+    // its own minted ID, no inherited name, and a session nothing has bound.
+    let seat_sid = format!("sid-plain-seat-{suffix}");
+    let seat_cwd = h.root_path().join("plain-seat");
+    fs::create_dir_all(&seat_cwd).unwrap();
+    let seat_path = seat_cwd.join(format!("{seat_sid}.jsonl"));
+    let seat_endpoint = probe();
+    let seat_pid_file = h.root_path().join("plain-seat.pid");
+    let output = owner.descendant(
+        &h,
+        &format!(
+            "printf '%s' \"$$\" > {}; export HCOM_PROCESS_ID=omp-$$-5-6; {}",
+            quote(&seat_pid_file.to_string_lossy()),
+            start_command(&seat_sid, &seat_path, &seat_cwd, &seat_endpoint),
+        ),
+    );
+    let started = output.ok();
+    let seat_name = started["name"]
+        .as_str()
+        .expect("fresh plain seat name")
+        .to_string();
+    let seat_pid: u32 = fs::read_to_string(&seat_pid_file)
+        .unwrap()
+        .parse()
+        .expect("seat PID");
+    let seat_id = format!("omp-{seat_pid}-5-6");
+    // Capture as stored, NULL PID included; assert once the fixture is gone.
+    let conn = db(&h);
+    let row: (String, String, String, Option<i64>) = conn
+        .query_row(
+            "SELECT session_id, transcript_path, directory, pid FROM instances WHERE name = ?1",
+            [&seat_name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    let bindings: (Option<String>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT
+                (SELECT session_id FROM process_bindings WHERE process_id = ?1),
+                (SELECT instance_name FROM process_bindings WHERE process_id = ?1),
+                (SELECT instance_name FROM session_bindings WHERE session_id = ?2)",
+            rusqlite::params![seat_id, seat_sid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    drop(conn);
+    let older_after = older_rows();
+    let check = owner.run(&h, &format!("H omp-read --name {} --check", quote(&name)));
+    let older_mail = (check.code, check.stdout.trim().to_string());
+    owner.assert_alive();
+    // Release every fixture first: a failed pin then reports the captured
+    // evidence itself, not the host-wide diagnostics of a live fixture.
+    drop(owner);
+    drop(endpoint);
+    drop(seat_endpoint);
+    drop(h);
+    assert_ne!(seat_name, name, "the seat took the owner's identity");
+    assert_eq!(
+        row,
+        (
+            seat_sid.clone(),
+            seat_path.to_string_lossy().into_owned(),
+            seat_cwd.to_string_lossy().into_owned(),
+            Some(i64::from(seat_pid))
+        ),
+        "fresh plain seat did not pin its own actual OMP PID"
+    );
+    assert_eq!(
+        bindings,
+        (Some(seat_sid), Some(seat_name.clone()), Some(seat_name)),
+        "fresh plain seat did not bind its session and process"
+    );
+    assert_eq!(
+        older_after, older,
+        "the fresh seat changed the older owner's state"
+    );
+    assert_eq!(
+        older_mail,
+        (0, "true".to_string()),
+        "the older owner's unread mail did not survive"
+    );
 }

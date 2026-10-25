@@ -374,7 +374,7 @@ mod tests {
         // SAFETY: reads this thread's last-error value.
         assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_PARAMETER);
         // Far past any PID the kernel hands out.
-        assert_eq!(read(u32::MAX & !3), None);
+        assert_eq!(read(!3_u32), None);
     }
 
     #[test]

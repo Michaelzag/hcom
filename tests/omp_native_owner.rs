@@ -158,7 +158,6 @@ impl NativeOwner {
             "invalid runtime path: {executable:?}"
         );
         let mut command = if let Some(shim_name) = shim_name {
-            assert!(cfg!(windows), "cmd shims are native Windows fixtures only");
             let shim = fixture.join(shim_name);
             fs::write(
                 &shim,
@@ -385,7 +384,7 @@ fn interpreted_legacy_owner_can_first_read_stop_and_start_without_a_receipt() {
         );
         let mail = owner.run(&h, &["omp-read", "--name", &name], &name).ok();
         assert_eq!(mail[0]["event_id"], unread);
-        assert_eq!(mail[0]["text"], "native owner unread sentinel");
+        assert_eq!(mail[0]["message"], "native owner unread sentinel");
         owner
             .run(
                 &h,
@@ -647,6 +646,22 @@ fn descendant_and_shared_worker_cannot_borrow_an_older_native_omp_owner() {
         assert_eq!(
             child_pid, own.caller_pid,
             "new seat below worker did not pin its own actual runtime PID"
+        );
+        let own_id = format!("omp-{}-native-fixture", own.caller_pid);
+        let own_bindings: (Option<String>, Option<String>, Option<String>) = db(&h)
+            .query_row(
+                "SELECT
+                    (SELECT session_id FROM process_bindings WHERE process_id = ?1),
+                    (SELECT instance_name FROM process_bindings WHERE process_id = ?1),
+                    (SELECT instance_name FROM session_bindings WHERE session_id = ?2)",
+                rusqlite::params![own_id, own_sid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            own_bindings,
+            (Some(own_sid), Some(child_name.clone()), Some(child_name)),
+            "new seat below worker did not bind its own session and process"
         );
         assert_eq!(
             owner

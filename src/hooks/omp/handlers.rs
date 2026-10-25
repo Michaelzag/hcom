@@ -176,22 +176,17 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
             }
             Ok(None) => {
                 // Launcher-less first bind: no launcher-created row for this
-                // `HCOM_PROCESS_ID`. Mint an identity the same way
-                // Claude/Gemini/Kimi do for orphaned PTY sessions: generate a
-                // name, create the row, and bind session+process to it.
+                // `HCOM_PROCESS_ID`. The checked OMP creator commits the new
+                // row, both bindings and the actual-owner PID pin together,
+                // and refuses a mapping that appeared since the miss above.
                 // `ctx.is_launched` requires a proven launcher UUID whose
                 // recorded pid is an ancestor; inherited HCOM_LAUNCHED=1 or
                 // a provable OMP-minted id does not claim a launch. A plain
                 // session joins only with `[launch.omp].plain_sessions`.
                 let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
                 if ctx.is_launched || hcom_config.plain_sessions {
-                    match instance_binding::create_orphaned_pty_identity(
-                        db,
-                        &session_id,
-                        Some(&process_id),
-                        "omp",
-                    ) {
-                        Some(name) => {
+                    match instance_binding::create_omp_identity(db, &session_id, &process_id) {
+                        Ok(name) => {
                             log_info(
                                 "hooks",
                                 "omp-start.minted_identity",
@@ -202,7 +197,9 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
                             );
                             name
                         }
-                        None => {
+                        // A refused or failed creation (already logged)
+                        // binds nothing.
+                        Err(_) => {
                             log_error(
                                 "hooks",
                                 "omp-start.mint_failed",
