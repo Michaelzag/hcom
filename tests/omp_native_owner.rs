@@ -29,11 +29,50 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
+// These bounds apply only to failure context, never to the executed command.
+function boundedText(value, limit = 512) {
+    const text = String(value);
+    return { value: text.slice(0, limit), truncated: text.length > limit };
+}
+
+function boundedArgs(values, limit) {
+    return {
+        values: values.slice(0, limit).map(value => boundedText(value)),
+        truncated: values.length > limit,
+    };
+}
+
+const beforeRewrite = {
+    exec_path: boundedText(process.execPath, 1024),
+    argv: boundedArgs(process.argv, 8),
+    title: boundedText(process.title, 128),
+};
+
 if (process.versions.bun && process.argv[2] === '__omp_worker_daemon_broker') {
     process.title = 'omp daemon broker';
 }
+const hopFacts = {
+    pid: process.pid, ppid: process.ppid,
+    before_rewrite: beforeRewrite,
+    after_rewrite: {
+        exec_path: boundedText(process.execPath, 1024),
+        argv: boundedArgs(process.argv, 8),
+        title: boundedText(process.title, 128),
+    },
+};
 
 function execute(step) {
+    const diagnostics = {
+        runtime: boundedText(step.fixture.runtime, 32),
+        script_mode: boundedText(step.fixture.script_mode, 32),
+        resolved_exec: boundedText(step.fixture.resolved_exec, 1024),
+        launcher_shim: boundedText(step.fixture.launcher_shim || '', 64),
+        step: step.step,
+        route_original: boundedArgs(step.route, 4),
+        args: boundedArgs(step.args, 16),
+        hops: [{ ...hopFacts, route_remaining: boundedArgs(step.via || [], 4) }],
+        hops_truncated: false,
+    };
     if (step.via && step.via.length) {
         const [mode, ...rest] = step.via;
         const selectors = mode === 'worker' ? ['__omp_worker_daemon_broker'] : [];
@@ -41,22 +80,42 @@ function execute(step) {
             env: { ...process.env, TEST_OWNER_ONESHOT: JSON.stringify({ ...step, via: rest }) },
             encoding: 'utf8', timeout: 20000, windowsHide: true,
         });
-        if (child.error || child.status !== 0) {
-            throw new Error(`nested runtime fixture failed: ${child.error || child.stderr}`);
+        try {
+            if (child.error || child.status !== 0) {
+                throw new Error(`nested runtime fixture failed: ${child.error || `exit ${child.status}, signal ${child.signal}`}`);
+            }
+            const output = JSON.parse(child.stdout);
+            const hops = [diagnostics.hops[0], ...output.diagnostics.hops];
+            output.diagnostics.hops = hops.slice(0, 4);
+            output.diagnostics.hops_truncated ||= hops.length > 4;
+            return output;
+        } catch (error) {
+            diagnostics.fixture_error = boundedText(error.message, 2048);
+            return { code: -1, stdout: child.stdout || '', stderr: child.stderr || '',
+                     caller_pid: process.pid, diagnostics };
         }
-        return JSON.parse(child.stdout);
     }
     const env = { ...process.env, HCOM_LAUNCHED: '1', HCOM_TOOL: 'omp', ...step.env };
     if (step.own_id) {
         env.HCOM_PROCESS_ID = `omp-${process.pid}-native-fixture`;
         delete env.HCOM_INSTANCE_NAME;
     }
+    diagnostics.submitted_env = {
+        HCOM_PROCESS_ID: boundedText(env.HCOM_PROCESS_ID || '', 128),
+        HCOM_TOOL: boundedText(env.HCOM_TOOL, 32),
+        HCOM_LAUNCHED: boundedText(env.HCOM_LAUNCHED, 32),
+        instance_name_present: Object.prototype.hasOwnProperty.call(env, 'HCOM_INSTANCE_NAME'),
+    };
     const result = spawnSync(process.env.TEST_HCOM_BIN, step.args, {
         env, encoding: 'utf8', timeout: 15000, windowsHide: true,
     });
-    if (result.error) throw result.error;
-    return { code: result.status, stdout: result.stdout, stderr: result.stderr,
-             caller_pid: process.pid };
+    if (result.error || result.status === null) {
+        diagnostics.fixture_error = boundedText(
+            result.error ? result.error.message : `hook terminated by signal ${result.signal}`, 2048);
+    }
+    return { code: result.status === null ? -1 : result.status,
+             stdout: result.stdout || '', stderr: result.stderr || '',
+             caller_pid: process.pid, diagnostics };
 }
 
 if (process.env.TEST_OWNER_ONESHOT) {
@@ -93,30 +152,74 @@ struct HookOutput {
     stdout: String,
     stderr: String,
     caller_pid: u32,
+    diagnostics: Value,
 }
 
 impl HookOutput {
     fn json(&self) -> Value {
+        assert!(
+            self.diagnostics.get("fixture_error").is_none(),
+            "native fixture failed: {} {} diagnostics={}",
+            self.stdout,
+            self.stderr,
+            self.diagnostics
+        );
         serde_json::from_str(self.stdout.trim()).unwrap_or_else(|error| {
             panic!(
-                "hook JSON: {error}; stdout={} stderr={}",
-                self.stdout, self.stderr
+                "hook JSON: {error}; stdout={} stderr={} diagnostics={}",
+                self.stdout, self.stderr, self.diagnostics
             )
         })
     }
 
     fn ok(&self) -> Value {
-        assert_eq!(self.code, 0, "{} {}", self.stdout, self.stderr);
+        assert_eq!(
+            self.code, 0,
+            "{} {} diagnostics={}",
+            self.stdout, self.stderr, self.diagnostics
+        );
         let body = self.json();
-        assert!(body.get("error").is_none(), "{body}: {}", self.stderr);
+        assert!(
+            body.get("error").is_none(),
+            "{body}: {} diagnostics={}",
+            self.stderr,
+            self.diagnostics
+        );
         body
     }
 
     fn refused(&self) {
-        assert_eq!(self.code, 0, "{} {}", self.stdout, self.stderr);
+        assert_eq!(
+            self.code, 0,
+            "{} {} diagnostics={}",
+            self.stdout, self.stderr, self.diagnostics
+        );
         let body = self.json();
-        assert!(body.get("error").is_some(), "hook was admitted: {body}");
-        assert!(body.get("name").is_none(), "refusal bound a name: {body}");
+        assert!(
+            body.get("error").is_some(),
+            "hook was admitted: {body}; diagnostics={}",
+            self.diagnostics
+        );
+        assert!(
+            body.get("name").is_none(),
+            "refusal bound a name: {body}; diagnostics={}",
+            self.diagnostics
+        );
+    }
+
+    fn cli_refused(&self) {
+        assert!(
+            self.diagnostics.get("fixture_error").is_none(),
+            "native fixture failed: {} {} diagnostics={}",
+            self.stdout,
+            self.stderr,
+            self.diagnostics
+        );
+        assert_ne!(
+            self.code, 0,
+            "CLI was admitted: {} {} diagnostics={}",
+            self.stdout, self.stderr, self.diagnostics
+        );
     }
 }
 
@@ -126,6 +229,7 @@ struct NativeOwner {
     pid: u32,
     process_id: String,
     step: Cell<usize>,
+    fixture: Value,
 }
 
 impl NativeOwner {
@@ -214,6 +318,12 @@ impl NativeOwner {
             pid,
             process_id,
             step: Cell::new(0),
+            fixture: json!({
+                "runtime": runtime,
+                "script_mode": if script_basename { "bin/omp" } else { "package/cli.js" },
+                "resolved_exec": executable,
+                "launcher_shim": shim_name,
+            }),
         }
     }
 
@@ -228,6 +338,9 @@ impl NativeOwner {
         let step = self.step.get();
         self.step.set(step + 1);
         let request = json!({
+            "fixture": self.fixture,
+            "step": step,
+            "route": via,
             "args": args,
             "via": via,
             "own_id": own_id,
@@ -256,7 +369,8 @@ impl NativeOwner {
     fn assert_alive(&mut self) {
         assert!(
             self.child.try_wait().unwrap().is_none(),
-            "native owner exited"
+            "native owner exited: next_step={}",
+            self.step.get()
         );
     }
 }
@@ -410,21 +524,157 @@ fn interpreted_legacy_owner_can_first_read_stop_and_start_without_a_receipt() {
         let start = start_args(&sid, path.to_str().unwrap(), h.workspace.to_str().unwrap());
         assert_eq!(owner.run(&h, &start, &name).ok()["name"], name);
         assert_bound(&h, &owner, &name, &sid, &path);
-        owner
-            .run(
-                &h,
-                &["omp-stop", "--name", &name, "--reason", "shutdown"],
-                &name,
-            )
-            .ok();
-        let remaining: i64 = db(&h)
-            .query_row(
-                "SELECT COUNT(*) FROM instances WHERE name=?1",
+        let conn = db(&h);
+        let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        conn.execute(
+            "INSERT INTO notify_endpoints (instance,kind,port,updated_at) VALUES (?1,'plugin',?2,1234.5)",
+            rusqlite::params![name, endpoint.local_addr().unwrap().port()],
+        ).unwrap();
+        let identity = || -> (String, i64, String, f64, String, String, i64) {
+            conn.query_row(
+                "SELECT name,pid,session_id,created_at,transcript_path,directory,last_event_id FROM instances WHERE name=?1",
                 [&name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            ).unwrap()
+        };
+        let status = || -> (String, String) {
+            conn.query_row(
+                "SELECT status,status_context FROM instances WHERE name=?1",
+                [&name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let stopped_events = || -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE type='life' AND instance=?1 AND json_extract(data,'$.action')='stopped'",
+                [&name],
+                |row| row.get(0),
+            ).unwrap()
+        };
+        let before_identity = identity();
+        assert_eq!(before_identity.6, unread, "acknowledged cursor was lost");
+        assert_eq!(status(), ("listening".into(), "start".into()));
+        let stopped_before = stopped_events();
+        let before_hard = full_state(&h);
+        let hard_stop = owner.run(
+            &h,
+            &["omp-stop", "--name", &name, "--reason", "shutdown"],
+            &name,
+        );
+        hard_stop.ok();
+
+        // 0291a7b deliberately keeps an own off-Linux release as a soft stop:
+        // preserve the live owner's resume handle, not Linux's full deletion.
+        assert_eq!(
+            identity(),
+            before_identity,
+            "native soft fallback changed row identity/cursor: {}",
+            hard_stop.diagnostics
+        );
+        assert_eq!(
+            status(),
+            ("inactive".into(), "exit:shutdown".into()),
+            "native hard stop did not soft-stop the row: {}",
+            hard_stop.diagnostics
+        );
+        let bound_name: Option<String> = conn
+            .query_row(
+                "SELECT instance_name FROM process_bindings WHERE process_id=?1",
+                [&owner.process_id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(remaining, 0, "native legacy owner could not release itself");
+        // The resume authority is the UUID/name binding; don't pin its SID
+        // or update timestamp as part of the retained-binding contract.
+        assert_eq!(bound_name.as_deref(), Some(name.as_str()));
+        let cleared: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                (SELECT COUNT(*) FROM session_bindings WHERE instance_name=?1),
+                (SELECT COUNT(*) FROM notify_endpoints WHERE instance=?1)",
+                [&name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cleared, (0, 0), "soft fallback left live delivery bindings");
+        assert_eq!(
+            stopped_events(),
+            stopped_before + 1,
+            "hard self-stop must add exactly one stopped event: {}",
+            hard_stop.diagnostics
+        );
+        let stopped_data: String = conn.query_row(
+            "SELECT data FROM events WHERE type='life' AND instance=?1 AND json_extract(data,'$.action')='stopped' ORDER BY id DESC LIMIT 1",
+            [&name],
+            |row| row.get(0),
+        ).unwrap();
+        let stopped: Value = serde_json::from_str(&stopped_data).unwrap();
+        assert_eq!(stopped["reason"], "exit:shutdown");
+        assert_eq!(stopped["by"], "session");
+        assert_eq!(stopped.get("process_id"), Some(&Value::Null));
+        assert_eq!(stopped["snapshot"]["name"], name);
+        assert_eq!(stopped["snapshot"]["created_at"], before_identity.3);
+        assert_eq!(stopped["snapshot"]["last_event_id"], before_identity.6);
+        let after_hard = full_state(&h);
+        assert!(
+            after_hard["events"].starts_with(&before_hard["events"]),
+            "soft fallback rewrote existing event history: {}",
+            hard_stop.diagnostics
+        );
+        owner.assert_alive();
+
+        // 0291a7b also makes the already-inactive hard self-stop a no-op.
+        let repeat = owner.run(
+            &h,
+            &["omp-stop", "--name", &name, "--reason", "shutdown"],
+            &name,
+        );
+        repeat.ok();
+        assert_eq!(
+            full_state(&h),
+            after_hard,
+            "inactive self-stop changed full state: {}",
+            repeat.diagnostics
+        );
+        owner.assert_alive();
+
+        let reclaim = owner.request(&h, &["start", "--as", &name], &["seat"], Some(&name), false);
+        reclaim.cli_refused();
+        assert_ne!(
+            reclaim.caller_pid, owner.pid,
+            "reclaim must run in the real child seat"
+        );
+        assert_eq!(
+            full_state(&h),
+            after_hard,
+            "child reclaimed the stopped owner's UUID or added a claim: {}",
+            reclaim.diagnostics
+        );
+        owner.assert_alive();
+
+        let resumed_sid = format!("sid-resumed-{suffix}");
+        let resumed_path = transcript(&h, &resumed_sid);
+        let resumed_start = start_args(
+            &resumed_sid,
+            resumed_path.to_str().unwrap(),
+            h.workspace.to_str().unwrap(),
+        );
+        let resumed = owner.run(&h, &resumed_start, &name);
+        assert_eq!(resumed.ok()["name"], name);
+        assert_bound(&h, &owner, &name, &resumed_sid, &resumed_path);
+        assert_eq!(
+            status(),
+            ("listening".into(), "start".into()),
+            "same native owner did not resume listening: {}",
+            resumed.diagnostics
+        );
+        assert_eq!(
+            identity().6,
+            before_identity.6,
+            "same-owner resume reset the old cursor: {}",
+            resumed.diagnostics
+        );
         owner.assert_alive();
     }
 }
@@ -613,11 +863,7 @@ fn descendant_and_shared_worker_cannot_borrow_an_older_native_omp_owner() {
                 before,
                 "native descendant reclaimed explicit --as owner"
             );
-            assert_ne!(
-                explicit.code, 0,
-                "native descendant reclaimed owner: {}",
-                explicit.stdout
-            );
+            explicit.cli_refused();
         }
         // A real new seat below that worker can use its own minted PID, without
         // authenticating the older owner's UUID or crossing the worker barrier.
