@@ -1540,10 +1540,10 @@ fn launch_pty_or_background(
 ) -> Result<bool> {
     if params.background {
         // The runner can bind before launch_terminal returns. Retain the
-        // original NULL-PID UUID reservation; never refresh after spawn.
+        // original unbound UUID reservation; never refresh after spawn.
         let mut omp_launch_pid = if ctx.tool == "omp" {
             instance_binding::capture_omp_launch_pid(ctx.db, ctx.process_id, ctx.instance_name)?
-                .filter(|expected| expected.row.pid.is_none())
+                .filter(|expected| expected.row.pid.is_none() || expected.replaces_stale_pin)
         } else {
             None
         };
@@ -1793,7 +1793,22 @@ pub(crate) fn register_launch_instance(
     let post = db.with_immediate_transaction(|_tx| {
         let mut post = PostCommit::default();
         if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            let held_pin = instance_binding::prepare_own_omp_reservation_in_txn(
+                db,
+                instance_name,
+                sid,
+                tool,
+            )?;
             refuse_held_session(db, instance_name, sid)?;
+            if let Some(pin) = held_pin {
+                bail!(
+                    "'{instance_name}' has an unhooked OMP launch reservation whose recorded pid {} {}. \
+                     If that launch is hung or gone, run 'hcom stop {instance_name}' to release the \
+                     reservation (no process is signaled), then resume again.",
+                    pin.pid,
+                    pin.reason
+                );
+            }
         }
         if !instance_binding::initialize_instance_in_position_file_collected(
             db,

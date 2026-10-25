@@ -1362,6 +1362,124 @@ fn an_independent_omp_cannot_reclaim_a_live_released_owner_with_an_incarnation()
 }
 
 #[test]
+fn live_released_owner_with_incarnation_refuses_a_hook_recreation() {
+    let h = isolated_hcom();
+    let suffix = unique_suffix();
+    let name = format!("releasedhook{suffix}");
+    let sid = format!("sid-released-hook-{suffix}");
+    let mut owner = HookProcess::spawn(
+        &h,
+        "released-hook-owner",
+        "omp",
+        Some(&launcher_id()),
+        false,
+    );
+    seed_launch(&h, &owner, &name);
+    let endpoint = probe();
+    let foreign_endpoint = probe();
+    let path = h.workspace.join(format!("{sid}.jsonl"));
+    assert_eq!(
+        owner
+            .run(&h, &start_command(&sid, &path, &h.workspace, &endpoint))
+            .ok()["name"],
+        name
+    );
+    owner
+        .run(
+            &h,
+            &format!("H omp-stop --name {} --reason shutdown", quote(&name)),
+        )
+        .ok();
+    let stopped = assert_released_history(&h, &name, &owner.process_id);
+    assert_eq!(stopped["snapshot"]["pid"], owner.owner_pid);
+    assert!(stopped["snapshot"]["pid_start_time"].as_u64().is_some());
+    assert!(
+        stopped["snapshot"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty())
+    );
+    owner.assert_alive();
+    let mut foreign = HookProcess::spawn(&h, "released-hook-foreign", "omp", None, false);
+    discard_setup_wakes(&endpoint);
+    let before = full_state(&h);
+    let output = foreign.run(
+        &h,
+        &start_command(&sid, &path, &h.workspace, &foreign_endpoint),
+    );
+    assert_eq!(
+        full_state(&h),
+        before,
+        "independent hook recreated a live released owner: {} {}",
+        output.stdout,
+        output.stderr
+    );
+    output.refused();
+    assert_no_wake(&[&endpoint, &foreign_endpoint]);
+    owner.assert_alive();
+    foreign.assert_alive();
+}
+
+#[test]
+fn child_own_minted_identity_cannot_recreate_a_released_parent() {
+    let h = isolated_hcom();
+    let suffix = unique_suffix();
+    let name = format!("releasedparent{suffix}");
+    let sid = format!("sid-released-parent-{suffix}");
+    let mut parent = HookProcess::spawn(&h, "released-parent", "omp", Some(&launcher_id()), false);
+    seed_launch(&h, &parent, &name);
+    let parent_endpoint = probe();
+    let child_endpoint = probe();
+    let path = h.workspace.join(format!("{sid}.jsonl"));
+    assert_eq!(
+        parent
+            .run(
+                &h,
+                &start_command(&sid, &path, &h.workspace, &parent_endpoint),
+            )
+            .ok()["name"],
+        name
+    );
+    parent
+        .run(
+            &h,
+            &format!("H omp-stop --name {} --reason shutdown", quote(&name)),
+        )
+        .ok();
+    let stopped = assert_released_history(&h, &name, &parent.process_id);
+    assert_eq!(stopped["snapshot"]["pid"], parent.owner_pid);
+    assert!(stopped["snapshot"]["pid_start_time"].as_u64().is_some());
+    assert!(
+        stopped["snapshot"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty())
+    );
+    parent.assert_alive();
+    let child_cwd = h.root_path().join("released-parent-child");
+    fs::create_dir_all(&child_cwd).unwrap();
+    let child_path = child_cwd.join(format!("{sid}.jsonl"));
+    discard_setup_wakes(&parent_endpoint);
+    let before = full_state(&h);
+    let output = parent.descendant(
+        &h,
+        &format!(
+            "cd {} || exit 1; export HCOM_PROCESS_ID=omp-$$-7-8; {}",
+            quote(&child_cwd.to_string_lossy()),
+            start_command(&sid, &child_path, &child_cwd, &child_endpoint),
+        ),
+    );
+    assert_eq!(
+        full_state(&h),
+        before,
+        "child's valid new identity recreated its live released parent: {} {}",
+        output.stdout,
+        output.stderr
+    );
+    output.refused();
+    assert_no_wake(&[&parent_endpoint, &child_endpoint]);
+    parent.assert_alive();
+}
+
+#[test]
 fn historical_omp_reclaim_refuses_unknown_evidence_without_a_refused_id() {
     for evidence in [
         "missing-owner",

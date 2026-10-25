@@ -21,8 +21,8 @@ mod terminal_ownership_tests;
 
 /// Persist terminal launch metadata without clobbering other launch_context fields.
 ///
-/// The launcher owns the authoritative preset decision. launch_context is only
-/// for late-bound metadata such as pane_id, terminal_id, and env snapshot.
+/// The launcher owns the authoritative preset decision. Merge context under
+/// the writer lock so concurrent launch pins and other metadata stay intact.
 pub fn persist_terminal_launch_context(
     db: &HcomDb,
     instance_name: &str,
@@ -30,102 +30,129 @@ pub fn persist_terminal_launch_context(
     effective_preset: &str,
     process_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut ctx = db
-        .get_instance_full(instance_name)?
-        .and_then(|pos| pos.launch_context)
-        .and_then(|json| {
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok()
-        })
-        .unwrap_or_default();
+    let persist = || {
+        let mut ctx = db
+            .get_instance_full(instance_name)?
+            .and_then(|pos| pos.launch_context)
+            .and_then(|json| {
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok()
+            })
+            .unwrap_or_default();
 
-    if let Some(pid) = process_id.filter(|v| !v.is_empty()) {
-        ctx.insert("process_id".into(), serde_json::json!(pid));
-    }
-    if !effective_preset.is_empty() {
-        ctx.insert(
+        #[cfg(test)]
+        if let Some(hook) = PERSIST_TERMINAL_CONTEXT_GAP_HOOK.with(std::cell::Cell::take) {
+            hook(db, instance_name);
+        }
+
+        if let Some(pid) = process_id.filter(|v| !v.is_empty()) {
+            ctx.insert("process_id".into(), serde_json::json!(pid));
+        }
+        if !effective_preset.is_empty() {
+            ctx.insert(
+                "terminal_preset_effective".into(),
+                serde_json::json!(effective_preset),
+            );
+            // Legacy compatibility for older readers and migration logic.
+            ctx.insert(
+                "terminal_preset".into(),
+                serde_json::json!(effective_preset),
+            );
+        }
+        if let Some(requested) = requested_preset.filter(|v| !v.is_empty() && *v != "default") {
+            ctx.insert(
+                "terminal_preset_requested".into(),
+                serde_json::json!(requested),
+            );
+        }
+
+        let mut updates = serde_json::Map::new();
+        updates.insert(
+            "terminal_preset_requested".into(),
+            serde_json::json!(
+                requested_preset
+                    .filter(|v| !v.is_empty() && *v != "default")
+                    .unwrap_or("")
+            ),
+        );
+        updates.insert(
             "terminal_preset_effective".into(),
             serde_json::json!(effective_preset),
         );
-        // Legacy compatibility for older readers and migration logic.
-        ctx.insert(
-            "terminal_preset".into(),
-            serde_json::json!(effective_preset),
+        updates.insert(
+            "launch_context".into(),
+            serde_json::json!(serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string())),
         );
+        db.update_instance_fields(instance_name, &updates)
+    };
+    if db.conn().is_autocommit() {
+        db.with_immediate_transaction(|_tx| persist())
+    } else {
+        persist()
     }
-    if let Some(requested) = requested_preset.filter(|v| !v.is_empty() && *v != "default") {
-        ctx.insert(
-            "terminal_preset_requested".into(),
-            serde_json::json!(requested),
-        );
-    }
-
-    let mut updates = serde_json::Map::new();
-    updates.insert(
-        "terminal_preset_requested".into(),
-        serde_json::json!(
-            requested_preset
-                .filter(|v| !v.is_empty() && *v != "default")
-                .unwrap_or("")
-        ),
-    );
-    updates.insert(
-        "terminal_preset_effective".into(),
-        serde_json::json!(effective_preset),
-    );
-    updates.insert(
-        "launch_context".into(),
-        serde_json::json!(serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string())),
-    );
-    db.update_instance_fields(instance_name, &updates)
 }
 
 /// Capture environment context and store it for the instance.
 ///
 /// Captures git branch, terminal program, tty, and relevant env vars.
+/// Preserves terminal metadata and launch receipts under the writer lock.
 pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     let new_ctx = capture_context();
+    let store = || -> anyhow::Result<()> {
+        // Preserve fields from prior context that can't be recaptured in hook env.
+        let preserve_keys = [
+            "pane_id",
+            "terminal_id",
+            "kitty_listen_on",
+            "process_id",
+            "terminal_preset_effective",
+            "omp_launch_pid",
+        ];
+        let mut ctx = new_ctx;
 
-    // Preserve fields from prior context that can't be recaptured in hook env
-    let preserve_keys = [
-        "pane_id",
-        "terminal_id",
-        "kitty_listen_on",
-        "process_id",
-        "terminal_preset_effective",
-    ];
-    let mut ctx = new_ctx;
+        let missing: Vec<&str> = preserve_keys
+            .iter()
+            .filter(|k| launch_context_value_missing(ctx.get(**k)))
+            .copied()
+            .collect();
 
-    let missing: Vec<&str> = preserve_keys
-        .iter()
-        .filter(|k| launch_context_value_missing(ctx.get(**k)))
-        .copied()
-        .collect();
-
-    if !missing.is_empty()
-        && let Ok(Some(pos)) = db.get_instance_full(instance_name)
-        && let Some(old_json) = &pos.launch_context
-        && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
-    {
-        for k in &missing {
-            if let Some(val) = old_ctx.get(*k)
-                && !launch_context_value_missing(Some(val))
-            {
-                ctx.insert(k.to_string(), val.clone());
+        if !missing.is_empty()
+            && let Ok(Some(pos)) = db.get_instance_full(instance_name)
+            && let Some(old_json) = &pos.launch_context
+            && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
+        {
+            for k in &missing {
+                if let Some(val) = old_ctx.get(*k)
+                    && !launch_context_value_missing(Some(val))
+                {
+                    ctx.insert(k.to_string(), val.clone());
+                }
             }
         }
-    }
 
-    let json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
-    let mut updates = serde_json::Map::new();
-    updates.insert("launch_context".into(), serde_json::json!(json));
-    update_instance_position(db, instance_name, &updates);
+        let json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
+        let mut updates = serde_json::Map::new();
+        updates.insert("launch_context".into(), serde_json::json!(json));
+        update_instance_position(db, instance_name, &updates);
+        Ok(())
+    };
+    let result = if db.conn().is_autocommit() {
+        db.with_immediate_transaction(|_tx| store())
+    } else {
+        store()
+    };
+    if let Err(error) = result {
+        crate::log::log_error(
+            "core",
+            "db.error",
+            &format!("capture_and_store_launch_context: {instance_name} - {error}"),
+        );
+    }
 }
 
 /// "Missing" for the preserve-from-prior-context check. Treats absent, JSON
 /// null, and empty strings as missing. Non-string non-null values (numbers,
-/// objects, arrays) are considered present even though every preserved field
-/// is currently a string — this is intentionally conservative so a future
-/// non-string preserved field doesn't silently get clobbered by re-capture.
+/// objects, arrays) are considered present so structured metadata survives
+/// re-capture.
 fn launch_context_value_missing(value: Option<&serde_json::Value>) -> bool {
     match value {
         None | Some(serde_json::Value::Null) => true,
@@ -869,6 +896,9 @@ thread_local! {
     /// After the final actual-owner pin, before commit: observers still see
     /// the old binding, row PID and endpoints together (no minted row yet).
     static OMP_BIND_COMMIT_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
+    /// Between terminal context's read and write, while the writer lock is held.
+    static PERSIST_TERMINAL_CONTEXT_GAP_HOOK: crate::db::GapHook =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Whether `process_id` presents the process incarnation the `life.stopped`
@@ -1001,6 +1031,92 @@ fn same_row_incarnation(expected: Option<&InstanceRow>, current: Option<&Instanc
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OmpLaunchPidReceipt {
+    pid: u32,
+    identity: String,
+    process_id: String,
+    binding_updated_at_bits: String,
+    created_at_bits: String,
+}
+
+impl OmpLaunchPidReceipt {
+    fn raw(row: &InstanceRow) -> Option<serde_json::Value> {
+        let mut context =
+            serde_json::from_str::<serde_json::Value>(row.launch_context.as_deref()?).ok()?;
+        context.as_object_mut()?.remove("omp_launch_pid")
+    }
+
+    fn parse(db: &HcomDb, row: &InstanceRow) -> anyhow::Result<Option<Self>> {
+        let Some(receipt) =
+            Self::raw(row).and_then(|value| serde_json::from_value::<Self>(value).ok())
+        else {
+            return Ok(None);
+        };
+        if row.pid != Some(i64::from(receipt.pid))
+            || receipt.created_at_bits != format!("{:016x}", row.created_at.to_bits())
+        {
+            return Ok(None);
+        }
+        if let Some(binding) = process_binding_epoch(db, &receipt.process_id)?
+            && (binding.session_id.is_some()
+                || binding.instance_name != row.name
+                || receipt.binding_updated_at_bits != format!("{:016x}", binding.updated_at_bits))
+        {
+            return Ok(None);
+        }
+        Ok(Some(receipt))
+    }
+}
+
+enum OmpLaunchPin {
+    Unpinned,
+    Replaceable(&'static str),
+    Held { pid: i64, reason: &'static str },
+}
+
+/// Classify only the recorded launch pin, never a stopped identity's owner.
+fn omp_launch_pin_verdict(db: &HcomDb, row: &InstanceRow) -> anyhow::Result<OmpLaunchPin> {
+    let Some(pid) = row.pid else {
+        return Ok(OmpLaunchPin::Unpinned);
+    };
+    let Some(process_pid) = u32::try_from(pid).ok().filter(|&pid| pid > 0) else {
+        return Ok(OmpLaunchPin::Held {
+            pid,
+            reason: "is malformed",
+        });
+    };
+    if crate::sys::process::is_definitely_dead(process_pid) {
+        return Ok(OmpLaunchPin::Replaceable("exited"));
+    }
+    let receipt = OmpLaunchPidReceipt::parse(db, row)?;
+    match (receipt, crate::sys::process::identity(process_pid)) {
+        (Some(receipt), Some(current)) if current != receipt.identity => {
+            Ok(OmpLaunchPin::Replaceable("now belongs to another process"))
+        }
+        (Some(_), Some(_)) => Ok(OmpLaunchPin::Held {
+            pid,
+            reason: "is still the running launch process",
+        }),
+        (_, None) if crate::sys::process::is_definitely_dead(process_pid) => {
+            Ok(OmpLaunchPin::Replaceable("exited"))
+        }
+        (_, None) => Ok(OmpLaunchPin::Held {
+            pid,
+            reason: "cannot be read",
+        }),
+        (None, Some(_)) => Ok(OmpLaunchPin::Held {
+            pid,
+            reason: "is live and has no verifiable launch receipt",
+        }),
+    }
+}
+
+pub(crate) struct HeldPin {
+    pub(crate) pid: i64,
+    pub(crate) reason: &'static str,
+}
+
 /// A launch's original, still-unbound UUID tuple and row incarnation. Keep this
 /// across spawn; refreshing it after a failed write would authorize a new owner.
 #[derive(Debug, Clone)]
@@ -1008,6 +1124,8 @@ pub(crate) struct OmpLaunchPidSnapshot {
     pub(crate) row: InstanceRow,
     process_id: String,
     binding: ProcessBindingEpoch,
+    receipt: Option<serde_json::Value>,
+    pub(crate) replaces_stale_pin: bool,
 }
 
 /// Capture before spawn. A resumed row may already have its prior session ID;
@@ -1034,14 +1152,26 @@ pub(crate) fn capture_omp_launch_pid(
         if row.tool != "omp" {
             return Ok(None);
         }
-        if let Some(pid) = row.pid
-            && !u32::try_from(pid)
+        let replaces_stale_pin = if let Some(pid) = row.pid {
+            if u32::try_from(pid)
                 .ok()
                 .is_some_and(crate::proctruth::caller_is_pre_omp_launch_runner)
-        {
-            return Ok(None);
-        }
+            {
+                false
+            } else if matches!(
+                omp_launch_pin_verdict(db, &row)?,
+                OmpLaunchPin::Replaceable(_)
+            ) {
+                true
+            } else {
+                return Ok(None);
+            }
+        } else {
+            false
+        };
         Ok(Some(OmpLaunchPidSnapshot {
+            receipt: OmpLaunchPidReceipt::raw(&row),
+            replaces_stale_pin,
             row,
             process_id: process_id.to_owned(),
             binding,
@@ -1057,16 +1187,157 @@ pub(crate) fn record_omp_launch_pid(
     expected: &mut OmpLaunchPidSnapshot,
     new_pid: u32,
 ) -> anyhow::Result<bool> {
-    let changed = db.with_immediate_transaction(|tx| {
+    let (changed, receipt) = db.with_immediate_transaction(|tx| {
         if process_binding_epoch(db, &expected.process_id)?.as_ref() != Some(&expected.binding) {
-            return Ok(false);
+            return Ok((false, None));
         }
-        db.compare_and_set_instance_pid_in_txn(tx, &expected.row, new_pid)
+        let Some(current) = db.get_instance_full(&expected.row.name)? else {
+            return Ok((false, None));
+        };
+        if !same_row_incarnation(Some(&expected.row), Some(&current)) {
+            return Ok((false, None));
+        }
+        let current_context_text = current.launch_context.as_deref().unwrap_or("");
+        let context = if current_context_text.is_empty() {
+            Some(serde_json::Map::new())
+        } else {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(current_context_text)
+                .ok()
+        };
+        if context
+            .as_ref()
+            .and_then(|context| context.get("omp_launch_pid"))
+            != expected.receipt.as_ref()
+        {
+            return Ok((false, None));
+        }
+        let Some(mut context) = context else {
+            return Ok((
+                db.compare_and_set_instance_pid_in_txn(tx, &expected.row, new_pid)?,
+                None,
+            ));
+        };
+        let receipt = crate::sys::process::identity(new_pid)
+            .map(|identity| {
+                serde_json::to_value(OmpLaunchPidReceipt {
+                    pid: new_pid,
+                    identity,
+                    process_id: expected.process_id.clone(),
+                    binding_updated_at_bits: format!("{:016x}", expected.binding.updated_at_bits),
+                    created_at_bits: format!("{:016x}", current.created_at.to_bits()),
+                })
+            })
+            .transpose()?;
+        if let Some(receipt) = receipt {
+            context.insert("omp_launch_pid".into(), receipt);
+        } else {
+            context.remove("omp_launch_pid");
+        }
+        let new_context_text = serde_json::to_string(&context)?;
+        let changed = db.compare_and_set_omp_launch_pin_in_txn(
+            tx,
+            &expected.row,
+            current_context_text,
+            new_pid,
+            &new_context_text,
+        )?;
+        Ok((changed, context.remove("omp_launch_pid")))
     })?;
     if changed {
         expected.row.pid = Some(i64::from(new_pid));
+        expected.receipt = receipt;
     }
     Ok(changed)
+}
+
+/// Release a stale launch pin on this session's own unhooked reservation.
+/// The caller holds the immediate registration transaction.
+pub(crate) fn prepare_own_omp_reservation_in_txn(
+    db: &HcomDb,
+    name: &str,
+    session_id: &str,
+    tool: &str,
+) -> anyhow::Result<Option<HeldPin>> {
+    if tool != "omp" || session_id.is_empty() {
+        return Ok(None);
+    }
+    let Some(row) = db.get_instance_full(name)? else {
+        return Ok(None);
+    };
+    if row.tool != "omp"
+        || row.origin_device_id.is_some()
+        || (row.status != ST_INACTIVE && row.status != PLACEHOLDER_STATUS)
+        || row.status_context != PLACEHOLDER_CONTEXT
+        || row.session_id.as_deref() != Some(session_id)
+        || db.get_session_binding(session_id)?.is_some()
+    {
+        return Ok(None);
+    }
+    let bound_session: bool = db.conn().query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM process_bindings
+             WHERE instance_name = ?1 AND session_id IS NOT NULL
+         )",
+        [name],
+        |row| row.get(0),
+    )?;
+    if bound_session {
+        return Ok(None);
+    }
+    match omp_launch_pin_verdict(db, &row)? {
+        OmpLaunchPin::Unpinned => Ok(None),
+        OmpLaunchPin::Held { pid, reason } => Ok(Some(HeldPin { pid, reason })),
+        OmpLaunchPin::Replaceable(reason) => {
+            let receipt = OmpLaunchPidReceipt::parse(db, &row)?;
+            let changed = db.conn().execute(
+                "UPDATE instances SET pid = NULL,
+                    launch_context = CASE
+                        WHEN json_valid(launch_context)
+                             AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
+                        THEN json_remove(launch_context,'$.omp_launch_pid')
+                        ELSE launch_context END
+                 WHERE name = ?1 AND created_at = ?2 AND agent_id IS ?3
+                   AND pid IS ?4 AND session_id IS ?5
+                   AND tool = ?6 AND NULLIF(origin_device_id, '') IS ?7",
+                rusqlite::params![
+                    row.name,
+                    row.created_at,
+                    row.agent_id,
+                    row.pid,
+                    row.session_id,
+                    row.tool,
+                    row.origin_device_id,
+                ],
+            )?;
+            anyhow::ensure!(
+                changed == 1,
+                "OMP launch reservation changed before release"
+            );
+            if let Some(receipt) = receipt
+                && let Some(binding) = process_binding_epoch(db, &receipt.process_id)?
+                && binding.session_id.is_none()
+                && binding.instance_name == name
+                && receipt.binding_updated_at_bits == format!("{:016x}", binding.updated_at_bits)
+            {
+                db.conn().execute(
+                    "DELETE FROM process_bindings
+                     WHERE process_id = ?1 AND session_id IS NULL
+                       AND instance_name = ?2 AND updated_at = ?3",
+                    rusqlite::params![
+                        receipt.process_id,
+                        name,
+                        f64::from_bits(binding.updated_at_bits),
+                    ],
+                )?;
+            }
+            crate::log::log_info(
+                "launcher",
+                "omp_launch_pin.released",
+                &format!("instance={name} pid={} {reason}", row.pid.unwrap()),
+            );
+            Ok(None)
+        }
+    }
 }
 
 struct OmpBindingSnapshot {
@@ -1256,6 +1527,39 @@ fn bind_omp_session_to_process_checked(
                         );
                     }
                 }
+            }
+        }
+        if current.canonical.is_none()
+            && let Some(target) = current.target_name.as_deref()
+            && !current
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.instance_name == target)
+            && current.target_row.is_none()
+        {
+            let Some((stopped_name, event)) = db.find_stopped_event_by_session_id(session_id)?
+            else {
+                anyhow::bail!("stopped history changed before claim");
+            };
+            anyhow::ensure!(
+                stopped_name == target,
+                "stopped history changed before claim"
+            );
+            let caller_owns = |anchor| {
+                owner_under_anchor(anchor).is_some_and(|proof| {
+                    proof.owner_pid == anchor && proof.anchor_kind == AncestorProcess::Omp
+                })
+            };
+            if let Err(reason) = crate::proctruth::authorize_historical_omp_reclaim(
+                &event["snapshot"],
+                event["process_id"].as_str(),
+                &caller_owns,
+                &crate::sys::process::is_definitely_dead,
+                &crate::sys::process::procfs_start_identity,
+            ) {
+                anyhow::bail!(
+                    "released OMP identity '{target}' is not this caller's to restore: {reason}"
+                );
             }
         }
         let name =
@@ -4195,12 +4499,24 @@ mod tests {
                 db.rebind_session("sid-owner", "fano").unwrap();
             }
             "stopped" => {
+                #[cfg(unix)]
+                let mut child = std::process::Command::new("true").spawn().unwrap();
+                #[cfg(windows)]
+                let mut child = std::process::Command::new("cmd")
+                    .args(["/C", "exit 0"])
+                    .spawn()
+                    .unwrap();
+                let owner = child.id();
+                child.wait().unwrap();
+                drop(child);
                 db.log_life_event(
                     "fano",
                     "stopped",
                     "test",
                     "exit",
-                    Some(serde_json::json!({"tool": "omp", "session_id": "sid-owner"})),
+                    Some(serde_json::json!({
+                        "tool": "omp", "session_id": "sid-owner", "pid": owner
+                    })),
                     None,
                 )
                 .unwrap();
@@ -4226,11 +4542,188 @@ mod tests {
     thread_local! {
         static OMP_OBSERVED_STATE: std::cell::RefCell<Option<Vec<String>>> =
             const { std::cell::RefCell::new(None) };
+        static TERMINAL_CONTEXT_COMPETING_PIN:
+            std::cell::RefCell<Option<(OmpLaunchPidSnapshot, bool)>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     fn observe_omp_commit(db: &HcomDb, _name: &str) {
         let observer = HcomDb::open_raw(db.path()).unwrap();
         OMP_OBSERVED_STATE.set(Some(db_state(&observer)));
+    }
+
+    fn try_pin_during_terminal_context_write(db: &HcomDb, _name: &str) {
+        let competitor = HcomDb::open_raw(db.path()).unwrap();
+        competitor
+            .conn()
+            .busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+        TERMINAL_CONTEXT_COMPETING_PIN.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            let (launch, committed) = pending.as_mut().unwrap();
+            match record_omp_launch_pid(&competitor, launch, std::process::id()) {
+                Ok(recorded) => {
+                    assert!(
+                        recorded,
+                        "the competing pin must commit or encounter the writer lock"
+                    );
+                    *committed = true;
+                }
+                Err(error) => assert!(crate::db::is_busy_error(&error), "{error:#}"),
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn persist_terminal_context_never_drops_a_concurrent_launch_receipt() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for in_transaction in [false, true] {
+            let (db, path) = setup_test_db();
+            seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-prior"), None);
+            db.store_launch_context("luna", r#"{"pane_id":"kitty-42"}"#)
+                .unwrap();
+            let mut launch = capture_omp_launch_pid(&db, OMP_LAUNCH_ID, "luna")
+                .unwrap()
+                .unwrap();
+            #[cfg(unix)]
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            #[cfg(windows)]
+            let mut child = std::process::Command::new("cmd")
+                .args(["/C", "exit 0"])
+                .spawn()
+                .unwrap();
+            let predecessor = child.id();
+            child.wait().unwrap();
+            drop(child);
+            assert!(record_omp_launch_pid(&db, &mut launch, predecessor).unwrap());
+            assert!(launch.receipt.is_none());
+            TERMINAL_CONTEXT_COMPETING_PIN.set(Some((launch, false)));
+            PERSIST_TERMINAL_CONTEXT_GAP_HOOK
+                .with(|hook| hook.set(Some(try_pin_during_terminal_context_write)));
+            let persist = || {
+                persist_terminal_launch_context(
+                    &db,
+                    "luna",
+                    Some("kitty-requested"),
+                    "kitty-effective",
+                    Some(OMP_LAUNCH_ID),
+                )
+            };
+            if in_transaction {
+                db.with_immediate_transaction(|_tx| persist()).unwrap();
+            } else {
+                persist().unwrap();
+            }
+            let (mut launch, competing_pin_committed) =
+                TERMINAL_CONTEXT_COMPETING_PIN.take().unwrap();
+            if competing_pin_committed {
+                assert!(launch.receipt.is_some());
+                assert_eq!(
+                    OmpLaunchPidReceipt::raw(&db.get_instance_full("luna").unwrap().unwrap()),
+                    launch.receipt,
+                    "terminal metadata must not erase a committed competing pin"
+                );
+            }
+            assert!(record_omp_launch_pid(&db, &mut launch, std::process::id()).unwrap());
+            assert!(launch.receipt.is_some());
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            let context: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+            assert_eq!(row.pid, Some(i64::from(std::process::id())));
+            assert_eq!(context["pane_id"], "kitty-42");
+            assert_eq!(context["process_id"], OMP_LAUNCH_ID);
+            assert_eq!(context["terminal_preset_requested"], "kitty-requested");
+            assert_eq!(context["terminal_preset_effective"], "kitty-effective");
+            assert_eq!(context["terminal_preset"], "kitty-effective");
+            assert_eq!(context.get("omp_launch_pid"), launch.receipt.as_ref());
+            capture_and_store_launch_context(&db, "luna");
+            assert_eq!(
+                OmpLaunchPidReceipt::raw(&db.get_instance_full("luna").unwrap().unwrap()),
+                launch.receipt,
+                "hook-time context capture must preserve the launch receipt"
+            );
+            cleanup(path);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial]
+    fn omp_released_identity_restores_from_an_unreaped_zombie_owner() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let owner = child.id();
+        // SAFETY: waitid writes this buffer for our own child without reaping it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: P_PID selects this child; WNOWAIT leaves it as a zombie.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    owner as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR),
+                "waitid for the stopped owner"
+            );
+        }
+        let identity = crate::sys::process::procfs_start_identity(owner).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({
+                "tool": "omp",
+                "session_id": "sid-owner",
+                "pid": owner,
+                "pid_start_time": identity.0,
+                "boot_id": identity.1,
+            })),
+            None,
+        )
+        .unwrap();
+        let caller = std::process::id();
+        let id = format!("omp-{caller}-new-owner");
+        assert_eq!(
+            bind_omp_session_to_process_checked(&db, "sid-owner", &id, &|anchor| {
+                (anchor == caller).then_some(OmpOwnerProof {
+                    owner_pid: caller,
+                    anchor_kind: AncestorProcess::Omp,
+                })
+            })
+            .unwrap()
+            .as_deref(),
+            Some("fano")
+        );
+        assert_eq!(
+            db.get_instance_full("fano").unwrap().unwrap().pid,
+            Some(i64::from(caller))
+        );
+        assert_eq!(
+            db.get_session_binding("sid-owner").unwrap().as_deref(),
+            Some("fano")
+        );
+        assert_eq!(
+            db.get_process_binding_full(&id).unwrap(),
+            Some((Some("sid-owner".into()), "fano".into()))
+        );
+        assert_eq!(
+            crate::sys::process::procfs_start_identity(owner),
+            Some(identity),
+            "the old owner remains unreaped through the claim"
+        );
+        child.wait().unwrap();
+        cleanup(path);
     }
 
     #[test]

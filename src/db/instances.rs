@@ -217,7 +217,13 @@ impl HcomDb {
     /// Update instance PID after spawn
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
         self.conn.execute(
-            "UPDATE instances SET pid = ? WHERE name = ?",
+            "UPDATE instances SET pid = ?,
+                launch_context = CASE
+                    WHEN json_valid(launch_context)
+                         AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
+                    THEN json_remove(launch_context,'$.omp_launch_pid')
+                    ELSE launch_context END
+             WHERE name = ?",
             params![pid as i64, name],
         )?;
         Ok(())
@@ -227,7 +233,13 @@ impl HcomDb {
     /// it; an existing anchor (a PTY wrapper's, a launcher's) is never replaced.
     pub fn set_instance_pid_if_unset(&self, name: &str, pid: u32) -> Result<bool> {
         let changed = self.conn.execute(
-            "UPDATE instances SET pid = ?1 WHERE name = ?2 AND pid IS NULL",
+            "UPDATE instances SET pid = ?1,
+                launch_context = CASE
+                    WHEN json_valid(launch_context)
+                         AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
+                    THEN json_remove(launch_context,'$.omp_launch_pid')
+                    ELSE launch_context END
+             WHERE name = ?2 AND pid IS NULL",
             params![pid as i64, name],
         )?;
         Ok(changed > 0)
@@ -243,7 +255,12 @@ impl HcomDb {
         pid: u32,
     ) -> Result<bool> {
         let changed = tx.execute(
-            "UPDATE instances SET pid = ?1
+            "UPDATE instances SET pid = ?1,
+                launch_context = CASE
+                    WHEN json_valid(launch_context)
+                         AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
+                    THEN json_remove(launch_context,'$.omp_launch_pid')
+                    ELSE launch_context END
              WHERE name = ?2 AND created_at = ?3 AND agent_id IS ?4
                AND pid IS ?5 AND session_id IS ?6
                AND tool = ?7 AND NULLIF(origin_device_id, '') IS ?8",
@@ -256,6 +273,38 @@ impl HcomDb {
                 expected.session_id,
                 expected.tool,
                 expected.origin_device_id,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Pin one launch's PID and receipt atomically, preserving concurrent
+    /// context updates by matching both the row incarnation and context text.
+    pub(crate) fn compare_and_set_omp_launch_pin_in_txn(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        expected: &InstanceRow,
+        current_context_text: &str,
+        pid: u32,
+        new_context_text: &str,
+    ) -> Result<bool> {
+        let changed = tx.execute(
+            "UPDATE instances SET pid = ?1, launch_context = ?10
+             WHERE name = ?2 AND created_at = ?3 AND agent_id IS ?4
+               AND pid IS ?5 AND session_id IS ?6
+               AND tool = ?7 AND NULLIF(origin_device_id, '') IS ?8
+               AND COALESCE(launch_context, '') = ?9",
+            params![
+                i64::from(pid),
+                expected.name,
+                expected.created_at,
+                expected.agent_id,
+                expected.pid,
+                expected.session_id,
+                expected.tool,
+                expected.origin_device_id,
+                current_context_text,
+                new_context_text,
             ],
         )?;
         Ok(changed == 1)
