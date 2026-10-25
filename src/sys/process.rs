@@ -142,6 +142,153 @@ pub(crate) fn process_info_apple(pid: u32) -> Option<libc::proc_bsdinfo> {
     (read == size).then_some(info)
 }
 
+/// One positive PID's `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)` reply.
+/// Only `state` decides; test builds also keep the raw reply so a failed native
+/// fixture shows exactly what the kernel said.
+#[cfg(all(
+    target_os = "macos",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+struct AppleProcStateReply {
+    /// The requested PID.
+    #[cfg(test)]
+    pid: libc::pid_t,
+    /// The `sysctl` return code.
+    #[cfg(test)]
+    ret: libc::c_int,
+    /// Raw errno, read immediately and only when `ret` is nonzero.
+    #[cfg(test)]
+    errno: Option<i32>,
+    /// The length `sysctl` left in `oldlenp`.
+    #[cfg(test)]
+    returned_bytes: usize,
+    /// `kp_proc.p_pid`, decoded only from a successful reply of one whole record.
+    #[cfg(test)]
+    decoded_pid: Option<libc::pid_t>,
+    /// `kp_proc.p_stat`, kept only from a successful reply of one whole record
+    /// whose `p_pid` is the requested PID.
+    state: Option<libc::c_char>,
+}
+
+#[cfg(all(
+    target_os = "macos",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+impl AppleProcStateReply {
+    /// Positive exit evidence: the requested PID's own record says `SZOMB`.
+    fn is_zombie(&self) -> bool {
+        self.state == Some(libc::SZOMB as libc::c_char)
+    }
+}
+
+/// Read the BSD run state of a positive `pid` as zombie evidence.
+///
+/// [`process_info_apple`] cannot provide it: `proc_pidinfo(PROC_PIDTBSDINFO)`
+/// looks up zombies only when its argument is nonzero (xnu-11417.140.69
+/// bsd/kern/proc_info.c:2152-2163). The `kern.proc.pid` handler walks the
+/// zombie list as well (bsd/kern/kern_sysctl.c:912-913) and copies out
+/// `p_stat` and `p_pid` (kern_sysctl.c:1201-1202).
+///
+/// Only the leading fields of the record are declared; the rest stays opaque.
+/// `struct kinfo_proc` starts with `struct extern_proc kp_proc`
+/// (bsd/sys/sysctl.h:978-979), which starts with the `p_un` union of two
+/// pointers and a `timeval`, then `p_vmspace`, `p_sigacts`, `p_flag`,
+/// `p_stat`, and `p_pid` (bsd/sys/proc.h:102-117). The whole record is
+/// 0x288 = 648 bytes on both arm64 and x86_64: golang/sys f5cb0306ac0e
+/// generates `SizeofKinfoProc = C.sizeof_struct_kinfo_proc`
+/// (unix/types_darwin.go:359-367) as 0x288 in unix/ztypes_darwin_arm64.go:740
+/// and unix/ztypes_darwin_amd64.go:740. No other Apple ABI is verified, so
+/// other Apple targets get no reader and their zombies stay unknown.
+#[cfg(all(
+    target_os = "macos",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+fn process_state_apple(pid: libc::pid_t) -> AppleProcStateReply {
+    const KINFO_PROC_BYTES: usize = 648;
+
+    #[repr(C)]
+    union AppleProcStart {
+        links: [*mut libc::c_void; 2],
+        started: libc::timeval,
+    }
+
+    #[repr(C)]
+    struct AppleExternProcPrefix {
+        p_un: AppleProcStart,
+        p_vmspace: *mut libc::c_void,
+        p_sigacts: *mut libc::c_void,
+        p_flag: libc::c_int,
+        p_stat: libc::c_char,
+        p_pid: libc::pid_t,
+    }
+
+    #[repr(C)]
+    struct AppleKinfoProcBuffer {
+        kp_proc: AppleExternProcPrefix,
+        opaque: [u8; KINFO_PROC_BYTES - std::mem::size_of::<AppleExternProcPrefix>()],
+    }
+
+    const _: () = {
+        assert!(std::mem::size_of::<AppleProcStart>() == 16);
+        assert!(std::mem::size_of::<AppleExternProcPrefix>() == 48);
+        assert!(std::mem::align_of::<AppleExternProcPrefix>() == 8);
+        assert!(std::mem::size_of::<AppleKinfoProcBuffer>() == KINFO_PROC_BYTES);
+    };
+
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut record = std::mem::MaybeUninit::<AppleKinfoProcBuffer>::uninit();
+    let mut len = KINFO_PROC_BYTES;
+    // SAFETY: `mib` is a four-element read-only query, `record` is a writable
+    // stack buffer of exactly `len` bytes, and a null `newp` with a zero
+    // `newlen` sets nothing.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            record.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // Test builds keep errno for the fixture's diagnostic. Read it immediately,
+    // and only when the call failed.
+    #[cfg(test)]
+    let errno = if ret == 0 {
+        None
+    } else {
+        std::io::Error::last_os_error().raw_os_error()
+    };
+    let mut reply = AppleProcStateReply {
+        #[cfg(test)]
+        pid,
+        #[cfg(test)]
+        ret,
+        #[cfg(test)]
+        errno,
+        #[cfg(test)]
+        returned_bytes: len,
+        #[cfg(test)]
+        decoded_pid: None,
+        state: None,
+    };
+    // An error, an empty reply (no such PID), or any other length leaves the
+    // buffer unread. A buffer too small for a whole record fails with ENOMEM
+    // rather than receiving part of one (kern_sysctl.c:923-926).
+    if ret == 0 && len == KINFO_PROC_BYTES {
+        // SAFETY: XNU zeroes each whole record, fills it, and copies all of it
+        // out (kern_sysctl.c:804-829), so a successful reply of exactly one
+        // record initialized every byte of `record`.
+        let kp_proc = unsafe { &record.assume_init_ref().kp_proc };
+        #[cfg(test)]
+        {
+            reply.decoded_pid = Some(kp_proc.p_pid);
+        }
+        reply.state = (kp_proc.p_pid == pid).then_some(kp_proc.p_stat);
+    }
+    reply
+}
+
 #[cfg(windows)]
 fn process_identity_platform(pid: u32) -> Option<String> {
     creation_ticks_win(pid).map(|ticks| format!("windows:{ticks}"))
@@ -270,15 +417,20 @@ pub fn is_definitely_dead(pid: u32) -> bool {
                 .ok()
                 .is_some_and(|stat| proc_stat_is_zombie(&stat))
         }
-        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        #[cfg(all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ))]
         {
-            process_info_apple(pid as u32).is_some_and(|info| info.pbi_status == libc::SZOMB)
+            process_state_apple(pid).is_zombie()
         }
         #[cfg(not(any(
             target_os = "android",
             target_os = "linux",
-            target_os = "ios",
-            target_os = "macos"
+            all(
+                target_os = "macos",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            )
         )))]
         {
             false
@@ -1018,8 +1170,10 @@ mod tests {
     #[cfg(any(
         target_os = "android",
         target_os = "linux",
-        target_os = "ios",
-        target_os = "macos"
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
     ))]
     #[test]
     fn test_is_definitely_dead_observes_an_unreaped_fixture() {
@@ -1050,9 +1204,24 @@ mod tests {
         // SAFETY: signal zero only queries this fixture's positive PID.
         let kill_result = unsafe { libc::kill(pid as libc::pid_t, 0) };
         let dead_probe = is_definitely_dead(pid);
+        // Keep the kernel's raw reply while the zombie still exists.
+        #[cfg(target_os = "macos")]
+        let native_reply = process_state_apple(pid as libc::pid_t);
         // Reap before asserting so even a failed probe leaves no zombie behind.
         child.wait().unwrap();
         assert_eq!(kill_result, 0, "an unreaped fixture still exists for kill0");
+        #[cfg(target_os = "macos")]
+        assert!(
+            native_reply.is_zombie(),
+            "kern.proc.pid must read the unreaped fixture as SZOMB: \
+             pid={} ret={} errno={:?} returned_bytes={} decoded_pid={:?} state={:?}",
+            native_reply.pid,
+            native_reply.ret,
+            native_reply.errno,
+            native_reply.returned_bytes,
+            native_reply.decoded_pid,
+            native_reply.state
+        );
         assert!(dead_probe, "an unreaped zombie is positively dead");
     }
 
