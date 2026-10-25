@@ -1452,7 +1452,8 @@ fn argument_basename(path: &[u8], windows: bool) -> &[u8] {
 fn command_name_matches(path: &[u8], name: &str, windows: bool) -> bool {
     let base = argument_basename(path, windows);
     if !windows {
-        return base == name.as_bytes();
+        // npm's macOS Bun distribution uses this exact executable basename.
+        return base == name.as_bytes() || (name == "bun" && base == b"bun.exe");
     }
     base.eq_ignore_ascii_case(name.as_bytes())
         || base
@@ -5268,7 +5269,7 @@ mod tests {
     }
 
     #[test]
-    fn mac_owner_recognizes_interpreter_scripts_without_a_process_title() {
+    fn unix_npm_bun_owner_classification_preserves_script_positions_and_worker_barriers() {
         use AncestorProcess::{Omp, OmpWorker, Other, Unknown};
 
         for (comm, argv, expected) in [
@@ -5286,6 +5287,56 @@ mod tests {
                 b"bun\0".as_slice(),
                 b"/opt/bun\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0".as_slice(),
                 Omp,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0--headless\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0__omp_worker_daemon_broker\0--prompt\0seat\0".as_slice(),
+                OmpWorker,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0__omp_worker_lsp_mux\0".as_slice(),
+                OmpWorker,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0--prompt\0__omp_worker_daemon_broker\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0--print=__omp_worker_lsp_mux\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"omp daemon broke\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0--headless\0".as_slice(),
+                OmpWorker,
+            ),
+            (
+                b"omp lsp mux\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0--prompt\0seat\0".as_slice(),
+                OmpWorker,
+            ),
+            (
+                b"omp daemon brok\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0--headless\0".as_slice(),
+                OmpWorker,
             ),
             (
                 b"node\0".as_slice(),
@@ -5313,7 +5364,65 @@ mod tests {
                 b"/opt/node\0--eval\0omp\0".as_slice(),
                 Unknown,
             ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/other/dist/cli.js\0".as_slice(),
+                Other,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/node_modules/@oh-my-pi/pi-coding-agent/DIST/cli.js\0".as_slice(),
+                Other,
+            ),
+            (
+                b"BUN.EXE\0".as_slice(),
+                b"/opt/node_modules/bun/bin/BUN.EXE\0/opt/bin/omp\0".as_slice(),
+                Other,
+            ),
+            (
+                b"node.exe\0".as_slice(),
+                b"/opt/node.exe\0/opt/bin/omp\0".as_slice(),
+                Other,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0--eval\0omp\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0-e\0require('/opt/bin/omp')\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0-p\0'/opt/bin/omp'\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0--preload\0/opt/bin/omp\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0\0/opt/bin/omp\0".as_slice(),
+                Unknown,
+            ),
         ] {
+            // Linux/Android call this shared Unix classifier directly; macOS
+            // calls it after decoding the native fixed-width comm below.
+            let unix_comm = std::str::from_utf8(comm.strip_suffix(b"\0").unwrap()).unwrap();
+            assert_eq!(
+                omp_kind_from_facts(Some(unix_comm), Some(argv), false),
+                expected,
+                "Unix comm={comm:?}, argv={argv:?}",
+            );
             assert_eq!(
                 ancestor_process_kind_from_comm(Some(comm), Some(argv)),
                 expected,
