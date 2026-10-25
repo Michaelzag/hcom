@@ -79,6 +79,14 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
         .ok()
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn proc_stat_is_zombie(stat: &str) -> bool {
+    // comm may contain closing parentheses, so state starts after the final one.
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().next())
+        == Some("Z")
+}
+
 /// One incarnation of `pid` on this host: its boot-relative start time in
 /// clock ticks (`/proc/<pid>/stat` field 22) and the host boot id
 /// (`/proc/sys/kernel/random/boot_id`). A reused pid differs in the start
@@ -233,6 +241,73 @@ pub fn is_alive(pid: u32) -> bool {
             }
             GetLastError() == ERROR_ACCESS_DENIED
         }
+    }
+}
+
+/// Positive evidence that a PID has exited or no longer exists. Probe failures
+/// are unknown, not death; unlike `is_alive`, this is safe for releasing a
+/// persisted owner's identity.
+pub fn is_definitely_dead(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: a positive PID and signal zero query one process, never a
+        // process group, without delivering a signal.
+        let ret = unsafe { libc::kill(pid, 0) };
+        if ret != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        // kill(pid, 0) still succeeds for an exited, unreaped zombie. Only a
+        // readable native zombie status is additional positive death evidence.
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .is_some_and(|stat| proc_stat_is_zombie(&stat))
+        }
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        {
+            process_info_apple(pid as u32).is_some_and(|info| info.pbi_status == libc::SZOMB)
+        }
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "linux",
+            target_os = "ios",
+            target_os = "macos"
+        )))]
+        {
+            false
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: query-only access; an opened handle is closed exactly once,
+        // and GetExitCodeProcess receives a writable exit-code buffer.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return GetLastError() == ERROR_INVALID_PARAMETER;
+            }
+            let mut exit_code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut exit_code) != 0;
+            CloseHandle(handle);
+            ok && exit_code != STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
     }
 }
 
@@ -895,6 +970,90 @@ mod tests {
     #[test]
     fn test_is_alive_dead_process() {
         assert!(!is_alive(99_999_999));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_definitely_dead_rejects_group_and_unrepresentable_pids() {
+        assert!(!is_definitely_dead(0));
+        assert!(!is_definitely_dead(u32::MAX));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn test_is_definitely_dead_observes_only_an_exited_fixture() {
+        #[cfg(unix)]
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = spawn_long_lived_child();
+        let pid = child.id();
+        let live_probe = is_definitely_dead(pid);
+        #[cfg(unix)]
+        child.kill().unwrap();
+        #[cfg(windows)]
+        kill_child_group(&mut child);
+        child.wait().unwrap();
+        let exited_probe = is_definitely_dead(pid);
+        assert!(!live_probe, "a live fixture must not be declared dead");
+        assert!(exited_probe, "an exited fixture must be positively dead");
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn test_proc_stat_requires_an_exact_zombie_state() {
+        for (stat, zombie) in [
+            ("42 (fixture) Z 1 2 3", true),
+            ("42 (fixture ) Z inside) Z 1 2 3", true),
+            ("42 (fixture ) Z inside) S 1 2 3", false),
+            ("42 (fixture) R 1 2 3", false),
+            ("42 (fixture) Zz 1 2 3", false),
+            ("42 (fixture) ", false),
+            ("42 (fixture Z", false),
+            ("", false),
+        ] {
+            assert_eq!(proc_stat_is_zombie(stat), zombie, "{stat:?}");
+        }
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "ios",
+        target_os = "macos"
+    ))]
+    #[test]
+    fn test_is_definitely_dead_observes_an_unreaped_fixture() {
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        // SAFETY: waitid fills this writable siginfo buffer for our child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // WNOWAIT synchronizes exit without reaping, unlike Child::wait.
+            // SAFETY: P_PID selects only our fixture, and info is writable.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                child.wait().unwrap();
+                panic!("waitid for exited fixture: {error}");
+            }
+        }
+        // SAFETY: signal zero only queries this fixture's positive PID.
+        let kill_result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        let dead_probe = is_definitely_dead(pid);
+        // Reap before asserting so even a failed probe leaves no zombie behind.
+        child.wait().unwrap();
+        assert_eq!(kill_result, 0, "an unreaped fixture still exists for kill0");
+        assert!(dead_probe, "an unreaped zombie is positively dead");
     }
 
     #[test]

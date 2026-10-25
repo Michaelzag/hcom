@@ -233,6 +233,34 @@ impl HcomDb {
         Ok(changed > 0)
     }
 
+    /// Pin one captured row incarnation without overwriting a replacement or
+    /// a newer PID/session claim. The caller owns the immediate transaction.
+    /// Match InstanceRow's origin normalization: NULL and "" both mean local.
+    pub(crate) fn compare_and_set_instance_pid_in_txn(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        expected: &InstanceRow,
+        pid: u32,
+    ) -> Result<bool> {
+        let changed = tx.execute(
+            "UPDATE instances SET pid = ?1
+             WHERE name = ?2 AND created_at = ?3 AND agent_id IS ?4
+               AND pid IS ?5 AND session_id IS ?6
+               AND tool = ?7 AND NULLIF(origin_device_id, '') IS ?8",
+            params![
+                i64::from(pid),
+                expected.name,
+                expected.created_at,
+                expected.agent_id,
+                expected.pid,
+                expected.session_id,
+                expected.tool,
+                expected.origin_device_id,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Store launch_context JSON (terminal preset, pane_id, env snapshot).
     /// Merges incoming keys into existing JSON, only filling fields that are
     /// currently missing or empty so late-bound PTY metadata can be persisted

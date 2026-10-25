@@ -146,10 +146,10 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
         );
     }
 
-    let instance_name = match instance_binding::bind_session_to_process(
+    let instance_name = match instance_binding::bind_omp_session_to_process(
         db,
         &session_id,
-        Some(&process_id),
+        &process_id,
     ) {
         Ok(Some(name)) => name,
         // A failed bind (already logged) must not mint a replacement identity.
@@ -159,7 +159,7 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
                 r#"{"error":"No instance bound to this process"}"#.to_string(),
             );
         }
-        Ok(None) => match instance_name_from_env(ctx).and_then(|name| {
+        Ok(None) => match instance_name_from_env(ctx).map_or(Ok(None), |name| {
             instance_binding::recover_process_binding_for_instance(
                 db,
                 &name,
@@ -167,8 +167,14 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
                 &process_id,
             )
         }) {
-            Some(name) => name,
-            None => {
+            Ok(Some(name)) => name,
+            Err(_) => {
+                return (
+                    0,
+                    r#"{"error":"No instance bound to this process"}"#.to_string(),
+                );
+            }
+            Ok(None) => {
                 // Launcher-less first bind: no launcher-created row for this
                 // `HCOM_PROCESS_ID`. Mint an identity the same way
                 // Claude/Gemini/Kimi do for orphaned PTY sessions: generate a
@@ -447,6 +453,45 @@ pub(crate) fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
     }
 }
 
+/// A stripped inherited owner is not an invitation for the plugin to re-mint
+/// its identity. Preserve the legacy retry signal only for a truly unbound
+/// presenter; database failures have their own transient response.
+pub(crate) fn missing_omp_identity_error(
+    db: &HcomDb,
+    raw_process_id: Option<&str>,
+    raw_instance_name: Option<&str>,
+) -> Value {
+    if let Some(process_id) = raw_process_id.filter(|id| !id.is_empty()) {
+        match db.get_process_binding(process_id) {
+            Ok(Some(_)) => {
+                return serde_json::json!({"error": "HCOM_PROCESS_ID ownership refused"});
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("Process ownership lookup failed: {error}"),
+                    "transient": true,
+                });
+            }
+        }
+    }
+    if let Some(name) = raw_instance_name.filter(|name| !name.is_empty()) {
+        match db.get_instance_full(name) {
+            Ok(Some(_)) => {
+                return serde_json::json!({"error": "HCOM_PROCESS_ID ownership refused"});
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("Instance ownership lookup failed: {error}"),
+                    "transient": true,
+                });
+            }
+        }
+    }
+    serde_json::json!({"error": "HCOM_PROCESS_ID not set"})
+}
+
 pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
     let start = Instant::now();
     let mut ctx = HcomContext::from_os();
@@ -484,6 +529,77 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
     }
     if !common::hook_gate_check(&mut ctx, &db) && hook_name != "omp-start" {
         return (0, String::new());
+    }
+    // The common gate sanitizes identity, but deliberately proceeds for any
+    // non-empty database. Every recognized OMP hook can mutate state (even
+    // read/check/format may consume governed mail or mark tips), so none may
+    // reach its handler using a stripped or absent process identity.
+    if matches!(
+        hook_name,
+        "omp-start" | "omp-status" | "omp-read" | "omp-beforetool" | "omp-stop" | "omp-role"
+    ) {
+        let Some(process_id) = ctx.process_id.as_deref() else {
+            return (
+                0,
+                missing_omp_identity_error(
+                    &db,
+                    ctx.raw_env.get("HCOM_PROCESS_ID").map(String::as_str),
+                    ctx.raw_env.get("HCOM_INSTANCE_NAME").map(String::as_str),
+                )
+                .to_string(),
+            );
+        };
+        if hook_name != "omp-start"
+            && let Some(name) = parse_flag(&handler_argv, "--name")
+        {
+            let bound_name = match db.get_process_binding(process_id) {
+                Ok(name) => name,
+                Err(e) => {
+                    return (
+                        0,
+                        serde_json::json!({
+                            "error": format!("Process binding lookup failed: {}", e),
+                            "transient": true,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            if bound_name.as_deref() != Some(name.as_str()) {
+                if hook_name == "omp-stop" {
+                    match db.get_instance_full(&name) {
+                        // Preserve an already-stopped hook's idempotent
+                        // response without running any finalizer on its name.
+                        Ok(None) => {
+                            return (
+                                0,
+                                if has_flag(&handler_argv, "--soft") {
+                                    r#"{"ok":true,"soft":true}"#
+                                } else {
+                                    r#"{"ok":true}"#
+                                }
+                                .to_string(),
+                            );
+                        }
+                        Ok(Some(_)) => {}
+                        Err(e) => {
+                            return (
+                                0,
+                                serde_json::json!({
+                                    "error": format!("Instance lookup failed: {}", e),
+                                    "transient": true,
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                }
+                return (
+                    0,
+                    r#"{"error":"Process binding does not match --name"}"#.to_string(),
+                );
+            }
+        }
     }
     let hook_name_owned = hook_name.to_string();
     let handler_start = Instant::now();

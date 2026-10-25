@@ -463,9 +463,14 @@ fn security_external_script_names_still_deliver() {
 /// `ack`, `status` and `stop` naming a connector-hosted participant must all
 /// be refused before a handler runs — `read` would return the participant's
 /// private mail, `ack` would consume it, `status`/`stop` would mutate its
-/// row. The same hooks naming the agent's own identity must keep working.
+/// row. Ordinary names still work for legacy hooks; OMP requires owner proof.
 /// Kilo shares the opencode hook names and dispatcher.
-fn argv_hook_hosted_name_refusal_matrix(read: &str, status: &str, stop: &str) {
+fn argv_hook_hosted_name_refusal_matrix(
+    read: &str,
+    status: &str,
+    stop: &str,
+    requires_owner_proof: bool,
+) {
     let h = Hcom::new();
     let me = h.start();
     let other = h.start();
@@ -550,6 +555,59 @@ fn argv_hook_hosted_name_refusal_matrix(read: &str, status: &str, stop: &str) {
     assert_eq!(status_value, "listening");
     drop(db);
 
+    if requires_owner_proof {
+        let (code, stdout, stderr) = h.run(["send", &me, "--name", &other, "--", "own mail"]);
+        assert_eq!(code, 0, "{stdout} {stderr}");
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let event_id: i64 = db
+            .query_row(
+                "SELECT id FROM events WHERE type = 'message'
+                 AND json_extract(data, '$.text') = 'own mail'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("own private message must be queued");
+        drop(db);
+        let up_to = event_id.to_string();
+        let before = support::omp_owner::full_state(&h);
+        for args in [
+            vec![read, "--name", &me],
+            vec![read, "--name", &me, "--ack", "--up-to", &up_to],
+            vec![
+                status,
+                "--name",
+                &me,
+                "--status",
+                "active",
+                "--context",
+                "prompt",
+            ],
+            vec![stop, "--name", &me, "--reason", "done"],
+        ] {
+            let (code, stdout, stderr) = h.run(args.clone());
+            assert_eq!(code, 0, "RPC refusal {args:?}: {stdout} {stderr}");
+            let response: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("RPC refusal {args:?}: {error}: {stdout}"));
+            assert!(
+                response["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty()),
+                "missing RPC error for {args:?}: {stdout}"
+            );
+            assert!(
+                !stdout.contains("own mail") && !stderr.contains("own mail"),
+                "non-owner {args:?} leaked private mail: {stdout} {stderr}"
+            );
+            assert_eq!(
+                support::omp_owner::full_state(&h),
+                before,
+                "non-owner {args:?} must not mutate the row, cursor, message or other state"
+            );
+        }
+        return;
+    }
+
     // The agent's own identity works on the same hooks.
     let (code, stdout, stderr) = h.run([
         status,
@@ -575,17 +633,22 @@ fn argv_hook_hosted_name_refusal_matrix(read: &str, status: &str, stop: &str) {
 
 #[test]
 fn security_argv_hook_hosted_name_refused_omp() {
-    argv_hook_hosted_name_refusal_matrix("omp-read", "omp-status", "omp-stop");
+    argv_hook_hosted_name_refusal_matrix("omp-read", "omp-status", "omp-stop", true);
 }
 
 #[test]
 fn security_argv_hook_hosted_name_refused_pi() {
-    argv_hook_hosted_name_refusal_matrix("pi-read", "pi-status", "pi-stop");
+    argv_hook_hosted_name_refusal_matrix("pi-read", "pi-status", "pi-stop", false);
 }
 
 #[test]
 fn security_argv_hook_hosted_name_refused_opencode() {
-    argv_hook_hosted_name_refusal_matrix("opencode-read", "opencode-status", "opencode-stop");
+    argv_hook_hosted_name_refusal_matrix(
+        "opencode-read",
+        "opencode-status",
+        "opencode-stop",
+        false,
+    );
 }
 
 /// The reservation set used to live only in `hcom.db`, so `hcom reset` (or a

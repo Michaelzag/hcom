@@ -93,13 +93,45 @@ pub struct Proxy {
 impl Proxy {
     /// Spawn `command` under a ConPTY and prepare the proxy.
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
-        // Anchor the launcher UUID before its tool exists. The launcher
-        // cannot see this wrapper's pid in a foreground terminal, so record
-        // it here and replace it with the ConPTY child pid below.
+        // Preserve the original UUID reservation across spawn, including a
+        // resume row whose instance SID is already populated.
+        let is_omp = config.target.known_tool() == Some(crate::tool::Tool::Omp);
+        let omp_process_id = is_omp
+            .then(|| {
+                config
+                    .env_vars
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == "HCOM_PROCESS_ID")
+                    .map(|(_, value)| value.clone())
+                    .or_else(|| std::env::var("HCOM_PROCESS_ID").ok())
+            })
+            .flatten();
+        let mut omp_launch_pid = None;
         if let Some(instance_name) = &config.instance_name
             && let Ok(db) = HcomDb::open()
         {
-            let _ = db.update_instance_pid(instance_name, std::process::id());
+            if is_omp {
+                if let Some(process_id) = omp_process_id.as_deref()
+                    && let Ok(Some(mut expected)) = crate::instance_binding::capture_omp_launch_pid(
+                        &db,
+                        process_id,
+                        instance_name,
+                    )
+                    && matches!(
+                        crate::instance_binding::record_omp_launch_pid(
+                            &db,
+                            &mut expected,
+                            std::process::id(),
+                        ),
+                        Ok(true)
+                    )
+                {
+                    omp_launch_pid = Some(expected);
+                }
+            } else {
+                let _ = db.update_instance_pid(instance_name, std::process::id());
+            }
         }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
@@ -160,7 +192,13 @@ impl Proxy {
             && let Ok(db) = HcomDb::open()
             && let Some(pid) = child.process_id()
         {
-            let _ = db.update_instance_pid(instance_name, pid);
+            if is_omp {
+                if let Some(expected) = omp_launch_pid.as_mut() {
+                    let _ = crate::instance_binding::record_omp_launch_pid(&db, expected, pid);
+                }
+            } else {
+                let _ = db.update_instance_pid(instance_name, pid);
+            }
 
             // Capture minimal launch context early so kill can close the terminal pane.
             // The start hook may later overwrite with richer context (git_branch, tty, env).

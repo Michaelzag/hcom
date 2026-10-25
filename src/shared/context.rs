@@ -133,14 +133,16 @@ impl HcomContext {
     }
 
     /// Drop a process id this hook cannot prove, together with the derived
-    /// `is_launched` claim. OMP hooks require a proven launcher UUID or an
-    /// OMP-minted ancestor id; other tools retain synthetic-id carriage.
+    /// `is_launched` claim. OMP-minted ids and OMP-bound launcher UUIDs require
+    /// their nearest proven OMP owner even under another presenter. Non-OMP
+    /// identities retain synthetic-id carriage; OMP hooks reject those shapes.
     /// Idempotent — a cleared id is never re-refused.
     ///
     /// `HCOM_LAUNCHED=1` alone proves nothing. For OMP, only a trusted
-    /// launcher UUID backed by a recorded ancestor pid establishes a launch;
-    /// a proven OMP-minted id belongs to a plain or nested session. Other
-    /// tools keep their existing synthetic-id carriage and launch claims.
+    /// launcher UUID backed by an ancestor anchor with exactly one OMP on
+    /// the caller-to-anchor segment establishes a launch. A proven OMP-minted
+    /// id belongs to a plain or nested session. Stored session ids are not
+    /// ownership evidence. Other tools keep their non-OMP launch claims.
     pub fn trust_process_id(&mut self, db: &HcomDb) {
         let Some(id) = self.process_id.clone() else {
             self.is_launched = false;

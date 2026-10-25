@@ -24,29 +24,19 @@ mod support;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs as unix_fs;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, Stdio};
+use std::time::Duration;
 use support::{Hcom, unique_suffix};
 
 use serde_json::{Value, json};
 
-/// The same source file the binary embeds as `hcom::hooks::omp::PLUGIN_SOURCE`
-/// (`include_str!("../../omp_plugin/hcom.ts")` in `src/hooks/omp/plugin.rs`).
-/// A test-crate `include_str!` of the repo file is byte-identical to the
-/// binary's embed, which is the only way to byte-compare from out-of-crate.
-const PLUGIN_SOURCE: &str = include_str!("../src/omp_plugin/hcom.ts");
-
-fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("poll child") {
-            return Some(status);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    None
+fn relay_disabled_hcom() -> Hcom {
+    let h = Hcom::new();
+    fs::write(h.path().join("config.toml"), "[relay]\nenabled = false\n")
+        .expect("disable fixture relay");
+    h
 }
 
 /// SIGKILL the whole group `child` leads (spawned with `process_group(0)`),
@@ -199,7 +189,7 @@ fn run_leaked_hook(h: &Hcom, hook: &str, leaked_id: &str, payload: &Value) {
 fn enable_plain_sessions(h: &Hcom) {
     fs::write(
         h.path().join("config.toml"),
-        "[launch.omp]\nplain_sessions = true\n",
+        "[relay]\nenabled = false\n[launch.omp]\nplain_sessions = true\n",
     )
     .expect("write isolated config.toml");
 }
@@ -318,7 +308,7 @@ fn foreign_omp_id_does_not_attach() {
     // `HCOM_LAUNCHED=1` proves nothing on its own. The intruder's omp-start
     // must be refused: no row for its session, and the legitimate owner of
     // the leaked id keeps its bindings untouched.
-    let h = Hcom::new();
+    let h = relay_disabled_hcom();
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
 
@@ -360,7 +350,7 @@ fn leaked_omp_id_binds_nothing_through_claude_and_codex_hooks() {
     // codex `codex-sessionstart`, each with the leaked desktop env
     // (`HCOM_PROCESS_ID=omp-<dead pid>-1-1` + `HCOM_LAUNCHED=1`). Neither may
     // write a binding nor attach its session to the pre-existing row.
-    let h = Hcom::new();
+    let h = relay_disabled_hcom();
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
 
@@ -406,7 +396,7 @@ fn launcher_uuid_null_pid_row_refuses_leaked_claude_hook() {
     // The pre-spawn launcher row exists, but its pid is still NULL. The
     // presenting hook carries the UUID itself; carriage cannot replace the
     // missing ancestry anchor or attach to the owner's row.
-    let h = Hcom::new();
+    let h = relay_disabled_hcom();
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
     let suffix = unique_suffix();
@@ -431,7 +421,7 @@ fn launcher_uuid_null_pid_row_refuses_leaked_claude_hook() {
 
 #[test]
 fn inherited_synthetic_omp_id_does_not_join_without_plain_sessions() {
-    let h = Hcom::new();
+    let h = relay_disabled_hcom();
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
     let sid = format!("sid-inherited-{}", unique_suffix());
@@ -480,7 +470,7 @@ fn inherited_synthetic_omp_id_does_not_join_without_plain_sessions() {
 fn unproven_launcher_uuid_retries_as_plain_with_opt_in() {
     // Model the plugin's one retry: first present an inherited launcher UUID
     // without a row, then replace it with this OMP process's minted id.
-    let h = Hcom::new();
+    let h = relay_disabled_hcom();
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
     enable_plain_sessions(&h);
@@ -557,17 +547,15 @@ while :; do sleep 1; done
 }
 
 #[test]
-fn provable_omp_ancestor_is_trusted_and_reaped_as_carrier() {
+fn provable_omp_ancestor_is_trusted_but_external_hook_cannot_reap_it() {
     // Rule pinned (design §1, `omp-<pid>-...` row): a provable chain IS
     // honoured — the id's pid is a live ancestor whose comm is exactly "omp"
     // (a process exec'd from a file named `omp`), so the id survives
     // sanitization and binds. An untrusted id is sanitized to ABSENT before
     // the handler even with the config gate open ("HCOM_PROCESS_ID not
-    // set"), so the successful bind below is itself the trust proof. The
-    // follow-up external `omp-stop` reaping the ancestor proves the ancestor
-    // is enumerated as a carrier of the instance (its environ carries the
-    // binding id) — the same observable tests/omp_stop_release.rs uses.
-    let h = Hcom::new();
+    // set"), so the successful bind below is itself the trust proof. A
+    // subsequent hook outside this owner tree must not release or signal it.
+    let h = relay_disabled_hcom();
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
 
@@ -612,19 +600,19 @@ fn provable_omp_ancestor_is_trusted_and_reaped_as_carrier() {
     assert_eq!(bound_id, name);
     drop(db);
 
-    // External release: this caller carries no identity facts and the fake
-    // omp is not its ancestor, so the ancestor is in signal scope only
-    // through carrier enumeration.
+    // This external caller has neither a proven identity nor an OMP owner
+    // in its tree. Hook release is owner-only, unlike an operator CLI stop.
     let (stop_code, stop_out, stop_err) =
         h.run(["omp-stop", "--name", &name, "--reason", "carrier-proof"]);
     assert_eq!(stop_code, 0, "omp-stop failed: {stop_out} {stop_err}");
-    let Some(status) = wait_with_deadline(&mut session.child, Duration::from_secs(30)) else {
-        kill_group(&mut session.child);
-        panic!("the provable omp ancestor survived omp-stop: never reaped as a carrier");
-    };
+    let refusal: Value = serde_json::from_str(stop_out.trim()).expect("hook refusal JSON");
     assert!(
-        status.signal().is_some(),
-        "the provable omp ancestor was not signalled by the carrier reap: {status:?}"
+        refusal.get("error").is_some(),
+        "external hook was admitted: {refusal}"
+    );
+    assert!(
+        session.child.try_wait().expect("poll owner").is_none(),
+        "external hook signalled the proven OMP owner"
     );
 
     let db = open_db(&h);
@@ -634,9 +622,20 @@ fn provable_omp_ancestor_is_trusted_and_reaped_as_carrier() {
             "SELECT COUNT(*) FROM instances WHERE name = ?1",
             &[name.as_str()]
         ),
-        0,
-        "row not released after the carrier reap"
+        1,
+        "external hook released the owner's row"
     );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM process_bindings WHERE process_id = ?1 AND instance_name = ?2",
+            &[session.minted_id().as_str(), name.as_str()],
+        ),
+        1,
+        "external hook changed the owner's process binding"
+    );
+    drop(db);
+    kill_group(&mut session.child);
 }
 
 #[test]
@@ -647,7 +646,7 @@ fn plain_sessions_gate_controls_provable_chain_minting() {
     //   `plain_sessions` unset the session must NOT mint a row.
     // - With `[launch.omp] plain_sessions = true` the same provable chain
     //   mints, and two plain sessions produce two DISTINCT identities.
-    let h = Hcom::new();
+    let h = relay_disabled_hcom();
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
 
@@ -785,73 +784,4 @@ fn plain_sessions_gate_controls_provable_chain_minting() {
 
     kill_group(&mut session_b.child);
     kill_group(&mut session_c.child);
-}
-
-#[test]
-fn start_hook_replaces_stale_installed_plugin() {
-    // Rule pinned (design §4.2): `handle_start` refreshes a stale installed
-    // plugin first thing, so the next omp session loads the hcom.ts this
-    // binary embeds. The refresh runs before any identity logic, so driving
-    // the hook down its refusal path (no `HCOM_PROCESS_ID`) still exercises
-    // it — the gate only needs one instance row to exist.
-    let h = Hcom::new();
-    let (code, _, stderr) = h.run(["status", "--json"]);
-    assert_eq!(code, 0, "status failed: {stderr}");
-
-    let suffix = unique_suffix();
-    // Seed one row so `hook_gate_check`'s "any instance exists" fallback
-    // lets the hook through to `handle_start`.
-    seed_identity(
-        &h,
-        &format!("plugin{suffix}"),
-        &format!("sid-owner-{suffix}"),
-        &format!("omp-seed-{suffix}"),
-    );
-
-    // Resolved plugin path under the fixture env: `tool_config_root()` is the
-    // parent of `$HCOM_DIR` (`<root>/hcom-state` -> `<root>`), which differs
-    // from `$HOME` (`<root>/home`), so `omp_plugin_dir()` is
-    // `<root>/.omp/extensions` (src/hooks/omp/plugin.rs).
-    let plugin_path = h
-        .root_path()
-        .join(".omp")
-        .join("extensions")
-        .join("hcom.ts");
-    fs::create_dir_all(plugin_path.parent().expect("plugin dir")).expect("create plugin dir");
-    // A genuine stale install is hcom-owned (carries the bootstrap marker),
-    // which is what lets `install_omp_plugin` replace it instead of refusing.
-    let stale = "// stale hcom plugin body (test) — must be replaced\n\
-                 // customType: \"hcom-bootstrap\"\n";
-    fs::write(&plugin_path, stale).expect("write stale plugin");
-
-    let sid = format!("sid-plugin-{suffix}");
-    let (hook_code, stdout, stderr) = h.run([
-        "omp-start",
-        "--session-id",
-        &sid,
-        "--cwd",
-        &h.workspace.to_string_lossy(),
-    ]);
-    assert_eq!(hook_code, 0, "omp-start failed: {stderr}");
-    let response: Value =
-        serde_json::from_str(stdout.trim()).expect("omp-start returns JSON on the RPC contract");
-    assert!(
-        response.get("error").is_some(),
-        "expected the identity-less refusal after the plugin refresh: {response}"
-    );
-
-    let installed =
-        fs::read_to_string(&plugin_path).expect("plugin file present after the start hook");
-    assert!(
-        !installed.contains("must be replaced"),
-        "stale plugin body survived the start hook"
-    );
-    assert!(
-        installed.contains("customType: \"hcom-bootstrap\""),
-        "installed plugin is missing the hcom-owned bootstrap marker"
-    );
-    assert_eq!(
-        installed, PLUGIN_SOURCE,
-        "installed plugin does not byte-match the embedded PLUGIN_SOURCE"
-    );
 }
