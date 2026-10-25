@@ -702,6 +702,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_ensure_hcom_writable_adds_writable_root() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         // --full-auto is still recognized as a sandbox-active marker for
         // back-compat with user-provided args, even though hcom no longer emits it.
@@ -719,6 +720,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_ensure_hcom_writable_toml_escapes_backslashes() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let tokens = s(&["--sandbox", "workspace-write"]);
         let result = ensure_hcom_writable(&tokens);
@@ -735,6 +737,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_ensure_hcom_writable_treats_yolo_as_sandbox_active() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let tokens = s(&["--yolo"]);
         let result = ensure_hcom_writable(&tokens);
@@ -758,6 +761,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_ensure_hcom_writable_respects_explicit_add_dir() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
         let tokens = vec!["--full-auto".to_string(), "--add-dir".to_string(), hcom_dir];
@@ -768,6 +772,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_ensure_hcom_writable_respects_user_writable_roots() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let tokens = s(&[
             "--sandbox",
@@ -782,6 +787,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_ensure_codex_home_writable_probes_existing_dir() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
 
@@ -793,6 +799,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_ensure_codex_home_writable_skips_missing_explicit_home() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let codex_home = dir.path().join("missing-codex-home");
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy().as_ref());
@@ -806,6 +813,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_ensure_codex_home_writable_probes_parent_when_default_home_missing() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir(&home).unwrap();
@@ -828,6 +836,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_add_hook_trust_bypass_supported() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -847,6 +856,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_add_hook_trust_bypass_skips_when_hcom_hooks_trusted() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -861,6 +871,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_add_hook_trust_bypass_self_heals_version_mismatch() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -882,6 +893,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_add_hook_trust_bypass_self_heals_stale_trusted_hash() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -904,6 +916,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_add_hook_trust_bypass_falls_back_when_self_heal_fails() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let _hooks_guard = EnvGuard::set("HCOM_TEST_CODEX_HOOKS_LIST_JSON", "__fail__");
         let dir = tempfile::tempdir().unwrap();
@@ -923,6 +936,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_no_bypass_when_hooks_list_fails_but_trust_state_is_exact() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -941,6 +955,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_add_hook_trust_bypass_no_duplicate_when_user_supplied() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let workspace = clean_workspace();
         let args = s(&[BYPASS_HOOK_TRUST_FLAG, "-m", "o3"]);
@@ -957,6 +972,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_add_hook_trust_bypass_unsupported() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.130.0");
         let workspace = clean_workspace();
         let args = s(&["-m", "o3"]);
@@ -967,6 +983,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_add_hook_trust_bypass_keeps_resume_session_first() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -985,6 +1002,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_bypass_granted_when_only_hcom_hooks_are_untrusted() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1013,6 +1031,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_bypass_withheld_for_foreign_untrusted_hook_in_hcom_hooks_json() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1043,6 +1062,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_bypass_withheld_for_foreign_untrusted_project_hook() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1073,6 +1093,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_bypass_withheld_for_project_hook_impersonating_hcom_command() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1102,6 +1123,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_local_scan_bypass_suppresses_workspace_trust() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1125,6 +1147,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_local_scan_withholds_bypass_for_project_hook_definition() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1145,6 +1168,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_local_scan_withholds_bypass_for_impersonating_project_hook() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1166,6 +1190,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_local_scan_withholds_bypass_for_foreign_hook_in_hcom_hooks_json() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1196,6 +1221,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_local_scan_withholds_bypass_for_config_toml_hooks() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1222,6 +1248,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_local_scan_ignores_hook_state_table() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1247,6 +1274,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_local_scan_withholds_bypass_when_plugins_installed() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1268,6 +1296,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_local_scan_bypass_leaves_user_projects_override_alone() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1397,6 +1426,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_preprocess_codex_args_full_pipeline() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1418,6 +1448,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_preprocess_resume_keeps_session_before_hook_trust_bypass() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
@@ -1438,6 +1469,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_preprocess_user_sandbox_suppresses_hcom_policy_defaults() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let args = s(&["--sandbox", "read-only", "-m", "o3"]);
         let result = preprocess_codex_args(
@@ -1457,6 +1489,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_preprocess_yolo_suppresses_hcom_policy_defaults() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let args = s(&["--yolo", "-m", "o3"]);
         let result = preprocess_codex_args(
@@ -1476,6 +1509,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_preprocess_user_approval_suppresses_hcom_policy_defaults() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let args = s(&["-a", "on-request", "-m", "o3"]);
         let result = preprocess_codex_args(
@@ -1496,6 +1530,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_preprocess_bypass_suppresses_hcom_policy_defaults() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let args = s(&["--dangerously-bypass-approvals-and-sandbox", "-m", "o3"]);
         let result = preprocess_codex_args(
@@ -1521,6 +1556,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_preprocess_equals_policy_flags_suppress_hcom_defaults() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let args = s(&["--sandbox=read-only", "-a=on-request", "-m", "o3"]);
         let result = preprocess_codex_args(
@@ -1554,6 +1590,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_preprocess_strips_stale_on_resume() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let args = s(&[
             "resume",
@@ -1580,6 +1617,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_preprocess_preserves_user_instructions_on_fresh_launch() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         init_config();
         let args = s(&["-c", "developer_instructions=USER_NOTES", "-m", "o3"]);
         let result = preprocess_codex_args(
