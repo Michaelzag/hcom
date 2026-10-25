@@ -440,9 +440,35 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         &format!("name={instance_name} reason={reason} initiated_by={launcher}"),
     );
 
-    // The release reaps the whole tree first; on failure the name stays
-    // live and must not be reported as stopped.
-    let (outcome, released) = stop_read_instance(db, &position, &binding_ids, &launcher, reason);
+    let reservation_release = if is_external_stop {
+        crate::hooks::common::try_release_unhooked_omp_reservation(
+            db,
+            &position,
+            &binding_ids,
+            &launcher,
+        )
+    } else {
+        None
+    };
+    let (outcome, released) = match reservation_release {
+        Some(crate::hooks::common::StopOutcome::Stopped) => {
+            match position.pid {
+                Some(pid) => println!(
+                    "Released reservation for {display}; no process was signaled (recorded pid {pid})."
+                ),
+                None => println!(
+                    "Released reservation for {display}; no process was signaled (recorded pid none)."
+                ),
+            }
+            return 0;
+        }
+        Some(outcome) => (outcome, Vec::new()),
+        None => {
+            // The release reaps the whole tree first; on failure the name stays
+            // live and must not be reported as stopped.
+            stop_read_instance(db, &position, &binding_ids, &launcher, reason)
+        }
+    };
     match outcome {
         outcome if outcome.is_re_registered() => {
             eprintln!("{}", crate::hooks::common::skipped_stop_line(&display));
