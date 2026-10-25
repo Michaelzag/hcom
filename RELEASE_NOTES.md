@@ -40,3 +40,36 @@ Session adoption transfers receipt ownership to the canonical instance
 alongside its pid and launch context. After ownership is proven, the close
 id order stays `pane_id` (from `pane_id_env`), then `terminal_id`, then the
 opener's captured id. The per-seat unit-name guard applies to the chosen id.
+
+OMP ownership now follows the nearest actual OMP process. A nested or sibling
+OMP that inherits a seat's process id, instance name, or anchor pid no longer
+binds to that seat, reads its mail, or changes its state. Every OMP hook needs
+the actual owner, including `omp-read --check` and `--format`: even a read can
+consume governed mail, forward a message, or mark a thread tip.
+
+An OMP seat launched by 0.7.60 or earlier works on its first hook or read. A
+normal launcher or gnomeseat seat, a canonical resume, a headless seat, a
+PTY-only seat and a same-owner stop keep working, and a missing owner pin or
+launch receipt alone does not block the bind, so no relaunch and no database
+repair are needed. (The terminal-receipt note above still governs pane closing
+after kill or resume.) OMP started through npm's Bun package on Linux or macOS
+is recognized by its real `bun.exe` basename, a Bun-specific alias rather than
+a general `.exe` strip on Unix.
+
+Refusals leave state unchanged: a rare pre-guard row bound to a shared generic
+wrapper with no recorded OMP owner pid; a plain OMP that inherited an unproven
+launcher UUID, which is never adopted, even under `plain_sessions` (with the
+UUID and its session unbound, it mints a fresh identity instead); and a hook
+call from a caller that cannot prove it is the seat's owner. A dead owner's
+canonical session can still be adopted, a released identity can be reclaimed
+when its last owner is the caller or is positively dead (an observed zombie
+counts as dead), and a soft-stopped seat resumes normally for its owner. An
+owner whose liveness or incarnation cannot be read refuses. This covers
+accidental identity inheritance, not a process that can edit the same user's
+database, environment or argv.
+
+Separately from the terminal-receipt change above, OMP self-stop with caller
+exclusions on Windows and macOS remains an effective soft stop: the row goes
+inactive, its own process binding is kept, and the canonical session binding
+and notify endpoints are cleared, so the same owner resumes normally. Linux
+keeps the full release. There is no native reaper port.

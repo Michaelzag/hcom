@@ -243,6 +243,69 @@ hcom r <session_id>           # Resume a session started outside hcom
 hcom f <session_id>           # Fork a session in hcom
 ```
 
+#### Oh My Pi ownership
+
+An OMP seat belongs to the nearest actual OMP process, not to a name, a stored
+session id, or a process id it happened to inherit. A nested OMP process or
+extension instance (started by a task subagent, a shell, or a print probe) never
+borrows that seat's identity: the plugin stays inert for an inherited identity,
+and a raw `omp-*` hook call that cannot prove the actual owner is refused. Every
+OMP hook needs the actual owner even when it only reads: `omp-read --check` and
+`--format` can consume governed mail, forward a message, or mark a thread tip,
+so `omp-status`, `omp-read`, `omp-beforetool`, `omp-role` and `omp-stop` take
+the same proof.
+
+Hooks are the seat's own path. From a script, use `hcom list` and `hcom send
+--from LABEL`. Start a separate seat with `hcom omp` when a nested session needs
+its own identity, and resume with `hcom r <name>` for the seat's actual owner.
+
+A seat started by 0.7.60 or earlier is not asked for anything new. A normal
+launcher or gnomeseat seat, a canonical resume, a headless seat, a PTY-only
+seat, and a same-owner stop keep working on their first hook or read. A missing
+owner pin or launch receipt alone does not block the bind, so no relaunch and
+no database repair are needed.
+
+Three shapes refuse, each with a supported alternative:
+
+- Rarely, a row from an older hcom bound to a shared generic wrapper with no
+  recorded OMP owner pid. The row cannot say which OMP under that wrapper owns
+  it, and nothing in it can be repaired into proof. Start a fresh seat with
+  `hcom omp`.
+- A plain OMP that inherited a launcher UUID it cannot prove. That identity is
+  never adopted. When neither the UUID nor its session is bound to a row, the
+  plugin mints a fresh identity if `plain_sessions` is on (`hcom config
+  plain_sessions true`, `[launch.omp] plain_sessions`, or
+  `HCOM_PLAIN_SESSIONS`); with the opt-in off it stays unjoined, and a UUID
+  that already carries a binding is refused even with the opt-in on.
+- A raw `omp-*` hook call from a caller that cannot prove it is the seat's
+  owner: no process identity, only a recorded anchor pid, an inherited UUID
+  held by another OMP, or a name that belongs to a different seat. Use the
+  seat's plugin, or the CLI for outside scripts.
+
+A dead owner's canonical session can still be adopted, a released identity can
+be reclaimed when its last owner is the caller or is positively dead (an
+observed zombie counts as dead), and a soft-stopped seat resumes normally for
+its owner. Another caller cannot adopt or reclaim a live owner's row, and its
+hook calls cannot stop it. An owner whose liveness or incarnation cannot be
+read refuses and changes nothing.
+
+Owner detection follows the process. OMP started through npm's Bun package on
+Linux or macOS is recognized by its real `bun.exe` basename; that is a
+Bun-specific alias, not a general `.exe` strip on Unix.
+
+On Windows and macOS an OMP self-stop with caller exclusions remains an
+effective soft stop: the row goes inactive, its own process binding is kept,
+and the canonical session binding and notify endpoints are cleared, so the
+same owner resumes normally. Linux keeps the full release. There is no native
+reaper port.
+
+This guards against accidental identity inheritance: a nested, sibling, or
+wrapper process that happens to carry the same UUID, name, or anchor pid. It
+does not defend against a process that can edit hcom's database, environment,
+or argv as the same user. Don't answer a refusal by resetting the database,
+claiming a live seat's name, or killing and relaunching normal seats; a refused
+claim is not corruption.
+
 #### Claude Code headless and subagents
 
 Detached background processes in print mode stay alive. Manage through the TUI.
