@@ -1627,10 +1627,7 @@ pub(crate) fn registered_unclaimed_incarnation(
     let Some(row) = db.get_instance_full(name)? else {
         return Ok(None);
     };
-    let reserving = (row.status == crate::shared::ST_INACTIVE
-        || row.status == instance_names::PLACEHOLDER_STATUS)
-        && row.status_context == instance_names::PLACEHOLDER_CONTEXT;
-    if !reserving {
+    if !instance_binding::is_launch_reservation_shape(&row) {
         return Ok(None);
     }
     let Some(session_id) = row.session_id.filter(|s| !s.is_empty()) else {
@@ -1790,11 +1787,12 @@ pub(crate) fn register_launch_instance(
     // One PostCommit for the registration: the `life.created` fan-out runs
     // inline with wakes collected, and `fire` runs only after commit. A
     // rollback drops `post`, discarding wakes for the unwritten row.
-    let post = db.with_immediate_transaction(|_tx| {
+    let post = db.with_immediate_transaction(|tx| {
         let mut post = PostCommit::default();
         if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
             let held_pin = instance_binding::prepare_own_omp_reservation_in_txn(
                 db,
+                tx,
                 instance_name,
                 sid,
                 tool,

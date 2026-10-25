@@ -1213,7 +1213,7 @@ pub(crate) fn record_omp_launch_pid(
         }
         let Some(mut context) = context else {
             return Ok((
-                db.compare_and_set_instance_pid_in_txn(tx, &expected.row, new_pid)?,
+                db.compare_and_set_instance_pid_in_txn(tx, &expected.row, Some(new_pid))?,
                 None,
             ));
         };
@@ -1250,38 +1250,50 @@ pub(crate) fn record_omp_launch_pid(
     Ok(changed)
 }
 
-/// Release a stale launch pin on this session's own unhooked reservation.
-/// The caller holds the immediate registration transaction.
-pub(crate) fn prepare_own_omp_reservation_in_txn(
-    db: &HcomDb,
-    name: &str,
-    session_id: &str,
-    tool: &str,
-) -> anyhow::Result<Option<HeldPin>> {
-    if tool != "omp" || session_id.is_empty() {
-        return Ok(None);
-    }
-    let Some(row) = db.get_instance_full(name)? else {
-        return Ok(None);
-    };
+pub(crate) fn is_launch_reservation_shape(row: &InstanceRow) -> bool {
+    (row.status == ST_INACTIVE || row.status == PLACEHOLDER_STATUS)
+        && row.status_context == PLACEHOLDER_CONTEXT
+}
+
+pub(crate) fn is_unhooked_omp_reservation(db: &HcomDb, row: &InstanceRow) -> anyhow::Result<bool> {
     if row.tool != "omp"
-        || row.origin_device_id.is_some()
-        || (row.status != ST_INACTIVE && row.status != PLACEHOLDER_STATUS)
-        || row.status_context != PLACEHOLDER_CONTEXT
-        || row.session_id.as_deref() != Some(session_id)
-        || db.get_session_binding(session_id)?.is_some()
+        || !row.origin_device_id.as_deref().is_none_or(str::is_empty)
+        || !is_launch_reservation_shape(row)
     {
-        return Ok(None);
+        return Ok(false);
+    }
+    if let Some(session_id) = row.session_id.as_deref().filter(|sid| !sid.is_empty())
+        && db.get_session_binding(session_id)?.is_some()
+    {
+        return Ok(false);
     }
     let bound_session: bool = db.conn().query_row(
         "SELECT EXISTS(
              SELECT 1 FROM process_bindings
              WHERE instance_name = ?1 AND session_id IS NOT NULL
          )",
-        [name],
+        [&row.name],
         |row| row.get(0),
     )?;
-    if bound_session {
+    Ok(!bound_session)
+}
+
+/// Release a stale launch pin on this session's own unhooked reservation.
+/// The caller holds the immediate registration transaction.
+pub(crate) fn prepare_own_omp_reservation_in_txn(
+    db: &HcomDb,
+    tx: &rusqlite::Transaction<'_>,
+    name: &str,
+    session_id: &str,
+    tool: &str,
+) -> anyhow::Result<Option<HeldPin>> {
+    if tool != "omp" {
+        return Ok(None);
+    }
+    let Some(row) = db.get_instance_full(name)? else {
+        return Ok(None);
+    };
+    if row.session_id.as_deref() != Some(session_id) || !is_unhooked_omp_reservation(db, &row)? {
         return Ok(None);
     }
     match omp_launch_pin_verdict(db, &row)? {
@@ -1289,45 +1301,19 @@ pub(crate) fn prepare_own_omp_reservation_in_txn(
         OmpLaunchPin::Held { pid, reason } => Ok(Some(HeldPin { pid, reason })),
         OmpLaunchPin::Replaceable(reason) => {
             let receipt = OmpLaunchPidReceipt::parse(db, &row)?;
-            let changed = db.conn().execute(
-                "UPDATE instances SET pid = NULL,
-                    launch_context = CASE
-                        WHEN json_valid(launch_context)
-                             AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
-                        THEN json_remove(launch_context,'$.omp_launch_pid')
-                        ELSE launch_context END
-                 WHERE name = ?1 AND created_at = ?2 AND agent_id IS ?3
-                   AND pid IS ?4 AND session_id IS ?5
-                   AND tool = ?6 AND NULLIF(origin_device_id, '') IS ?7",
-                rusqlite::params![
-                    row.name,
-                    row.created_at,
-                    row.agent_id,
-                    row.pid,
-                    row.session_id,
-                    row.tool,
-                    row.origin_device_id,
-                ],
-            )?;
             anyhow::ensure!(
-                changed == 1,
+                db.compare_and_set_instance_pid_in_txn(tx, &row, None)?,
                 "OMP launch reservation changed before release"
             );
             if let Some(receipt) = receipt
-                && let Some(binding) = process_binding_epoch(db, &receipt.process_id)?
-                && binding.session_id.is_none()
-                && binding.instance_name == name
-                && receipt.binding_updated_at_bits == format!("{:016x}", binding.updated_at_bits)
+                && let Ok(updated_at_bits) =
+                    u64::from_str_radix(&receipt.binding_updated_at_bits, 16)
             {
                 db.conn().execute(
                     "DELETE FROM process_bindings
                      WHERE process_id = ?1 AND session_id IS NULL
                        AND instance_name = ?2 AND updated_at = ?3",
-                    rusqlite::params![
-                        receipt.process_id,
-                        name,
-                        f64::from_bits(binding.updated_at_bits),
-                    ],
+                    rusqlite::params![receipt.process_id, name, f64::from_bits(updated_at_bits),],
                 )?;
             }
             crate::log::log_info(
@@ -1595,7 +1581,7 @@ fn bind_omp_session_to_process_checked(
             // Runtime migration may have copied the old wrapper PID. The actual
             // owner pin is LAST, in the same commit as both bindings.
             anyhow::ensure!(
-                db.compare_and_set_instance_pid_in_txn(tx, &final_row, owner)?,
+                db.compare_and_set_instance_pid_in_txn(tx, &final_row, Some(owner))?,
                 "OMP owner pin lost its row incarnation"
             );
             #[cfg(test)]
@@ -2063,7 +2049,7 @@ fn recover_process_binding_for_instance_checked(
         let mut pinned = expected;
         pinned.session_id = Some(session_id.to_owned());
         anyhow::ensure!(
-            db.compare_and_set_instance_pid_in_txn(tx, &pinned, owner)?,
+            db.compare_and_set_instance_pid_in_txn(tx, &pinned, Some(owner))?,
             "OMP recovery lost its row incarnation"
         );
         Ok(Some(instance_name.to_owned()))
@@ -2533,7 +2519,7 @@ fn create_omp_identity_checked(
         );
         // The actual-owner pin is LAST, in the same commit as both bindings.
         anyhow::ensure!(
-            db.compare_and_set_instance_pid_in_txn(tx, &final_row, owner)?,
+            db.compare_and_set_instance_pid_in_txn(tx, &final_row, Some(owner))?,
             "OMP owner pin lost its row incarnation"
         );
         #[cfg(test)]

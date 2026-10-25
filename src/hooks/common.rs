@@ -1293,12 +1293,7 @@ pub(crate) fn try_release_unhooked_omp_reservation(
     initiated_by: &str,
 ) -> Option<StopOutcome> {
     let eligible = |row: &InstanceRow| -> Result<bool> {
-        if row.tool != "omp"
-            || instances::is_remote_instance(row)
-            || (row.status != ST_INACTIVE
-                && row.status != crate::instance_names::PLACEHOLDER_STATUS)
-            || row.status_context != crate::instance_names::PLACEHOLDER_CONTEXT
-            || crate::hosted::is_hosted_tool(&row.tool)
+        if !crate::instance_binding::is_unhooked_omp_reservation(db, row)?
             || instances::is_subagent_instance(row)
             || identity::validate_protected_identity(db, &row.name).is_err()
         {
@@ -1306,11 +1301,6 @@ pub(crate) fn try_release_unhooked_omp_reservation(
         }
         Ok(db.conn().query_row(
             "SELECT NOT EXISTS (
-                SELECT 1 FROM session_bindings WHERE session_id = ?2
-                UNION ALL
-                SELECT 1 FROM process_bindings
-                WHERE instance_name = ?1 AND session_id IS NOT NULL
-                UNION ALL
                 SELECT 1 FROM instances
                 WHERE parent_name = ?1 OR parent_session_id = ?2
              )",

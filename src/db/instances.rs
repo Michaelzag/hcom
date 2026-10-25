@@ -245,14 +245,14 @@ impl HcomDb {
         Ok(changed > 0)
     }
 
-    /// Pin one captured row incarnation without overwriting a replacement or
-    /// a newer PID/session claim. The caller owns the immediate transaction.
+    /// Set or clear one captured row incarnation without overwriting a replacement
+    /// or a newer PID/session claim. The caller owns the immediate transaction.
     /// Match InstanceRow's origin normalization: NULL and "" both mean local.
     pub(crate) fn compare_and_set_instance_pid_in_txn(
         &self,
         tx: &rusqlite::Transaction<'_>,
         expected: &InstanceRow,
-        pid: u32,
+        pid: Option<u32>,
     ) -> Result<bool> {
         let changed = tx.execute(
             "UPDATE instances SET pid = ?1,
@@ -265,7 +265,7 @@ impl HcomDb {
                AND pid IS ?5 AND session_id IS ?6
                AND tool = ?7 AND NULLIF(origin_device_id, '') IS ?8",
             params![
-                i64::from(pid),
+                pid.map(i64::from),
                 expected.name,
                 expected.created_at,
                 expected.agent_id,
