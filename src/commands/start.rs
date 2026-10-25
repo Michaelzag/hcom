@@ -2649,6 +2649,7 @@ mod tests {
         target: &str,
         event_id: i64,
         result: Result<i32>,
+        why: &str,
     ) {
         assert_eq!(result.unwrap(), 0);
         let row = db
@@ -2661,6 +2662,8 @@ mod tests {
         let record = reclaim_anchor_record(db, target);
         assert_eq!(record["restored"], false);
         assert_eq!(record["snapshot_event_id"], event_id);
+        let reason = record["reason"].as_str().unwrap();
+        assert!(reason.contains(why), "reason {reason:?} lacks {why:?}");
     }
 
     /// Non-OMP tools retain generic incarnation-checked ancestor restoration.
@@ -2908,7 +2911,7 @@ mod tests {
             stop_snapshot_for("claude", anchor, start_time + 1, &boot_id),
         );
 
-        assert_reclaimed_without_anchor(&db, &target, event_id, code);
+        assert_reclaimed_without_anchor(&db, &target, event_id, code, "start time");
     }
 
     /// A start time recorded on another boot says nothing about this one.
@@ -2933,7 +2936,7 @@ mod tests {
             ),
         );
 
-        assert_reclaimed_without_anchor(&db, &target, event_id, code);
+        assert_reclaimed_without_anchor(&db, &target, event_id, code, "boot id");
     }
 
     /// A live process with the exact recorded identity that is not above the
@@ -2960,7 +2963,7 @@ mod tests {
         sibling.kill().ok();
         sibling.wait().ok();
 
-        assert_reclaimed_without_anchor(&db, &target, event_id, code);
+        assert_reclaimed_without_anchor(&db, &target, event_id, code, "not a live ancestor");
     }
 
     /// A snapshot written before stops recorded the anchor's incarnation
@@ -2984,7 +2987,7 @@ mod tests {
             }),
         );
 
-        assert_reclaimed_without_anchor(&db, &target, event_id, code);
+        assert_reclaimed_without_anchor(&db, &target, event_id, code, "predates");
     }
 
     /// The rename stop records the renamed-away row's anchor incarnation.
@@ -3105,7 +3108,34 @@ mod tests {
         let target = format!("valo_third_{}", std::process::id());
         let third = format!("meme_third_{}", std::process::id());
         let process_id = format!("omp-third-{}", std::process::id());
-        log_stopped_snapshot(&db, &target, "omp", "/tmp/project", "sess-third", 3);
+        // The target's last owner has exited and been reaped: the released
+        // OMP history authorizes a reclaim, so the third-seat guard decides.
+        let dead_owner_pid = {
+            let mut old_owner = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--list")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = old_owner.id();
+            assert!(old_owner.wait().unwrap().success());
+            pid
+        };
+        db.log_life_event(
+            &target,
+            "stopped",
+            "cli",
+            "vanished",
+            Some(json!({
+                "tool": "omp",
+                "directory": "/tmp/project",
+                "session_id": "sess-third",
+                "last_event_id": 3,
+                "pid": dead_owner_pid,
+            })),
+            None,
+        )
+        .unwrap();
         // A plain seat binds its process with no session id, so nothing in the
         // reclaim resolves to the third seat as the caller's own identity.
         db.conn()
@@ -3122,8 +3152,12 @@ mod tests {
             &[("OMPCODE", "1"), ("HCOM_PROCESS_ID", &process_id)],
             "/tmp/project",
         );
-        start_rebind(&db, &target, &ctx, None, None)
+        let err = start_rebind(&db, &target, &ctx, None, None)
             .expect_err("a process bound to another live seat is not the caller's to rebind");
+        assert!(
+            err.to_string().contains(&third),
+            "the refusal names the seat that holds the process: {err}"
+        );
 
         assert_eq!(
             db.get_process_binding(&process_id).unwrap().as_deref(),
