@@ -12,15 +12,16 @@ mod support;
 
 use std::cell::Cell;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::net::TcpListener;
 use std::os::unix::fs as unix_fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use support::omp_owner::{CONFIG, db, full_state, isolated_hcom};
 use support::{Hcom, unique_suffix};
 
@@ -260,13 +261,76 @@ fn discard_setup_wakes(listener: &TcpListener) {
     }
 }
 
+#[track_caller]
 fn assert_no_wake(listeners: &[&TcpListener]) {
     let deadline = Instant::now() + Duration::from_millis(75);
     loop {
         for listener in listeners {
             match listener.accept() {
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                other => panic!("rejected hook woke a fixture endpoint: {other:?}"),
+                mut other => {
+                    // Acceptance is already a violation. This single bounded read
+                    // diagnoses it; it cannot turn it into a passing observation.
+                    let caller = std::panic::Location::caller();
+                    let receiver_pid = std::process::id();
+                    let receiver_tid = unsafe { libc::syscall(libc::SYS_gettid) };
+                    let thread = std::thread::current();
+                    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH);
+                    let local_addr = listener.local_addr();
+                    let accepted_peer = other.as_ref().ok().map(|(_, peer)| *peer);
+                    let observation = match &mut other {
+                        Ok((stream, _)) => {
+                            if let Err(error) = stream.set_nonblocking(false) {
+                                format!("read setup error (blocking mode): {error}")
+                            } else if let Err(error) =
+                                stream.set_read_timeout(Some(Duration::from_millis(20)))
+                            {
+                                format!("read setup error (20ms timeout): {error}")
+                            } else {
+                                let mut prefix = [0_u8; 64];
+                                match stream.read(&mut prefix) {
+                                    Ok(length) => {
+                                        let status =
+                                            if length == 0 { "EOF" } else { "data-prefix" };
+                                        let digest = Sha256::digest(&prefix[..length]);
+                                        let mut digest_hex = String::with_capacity(64);
+                                        for byte in digest.iter() {
+                                            use std::fmt::Write as _;
+                                            write!(&mut digest_hex, "{byte:02x}")
+                                                .expect("writing to a String cannot fail");
+                                        }
+                                        format!(
+                                            "{status} length_read={length} prefix_limit=64 sha256={digest_hex}"
+                                        )
+                                    }
+                                    Err(error)
+                                        if matches!(
+                                            error.kind(),
+                                            ErrorKind::WouldBlock | ErrorKind::TimedOut
+                                        ) =>
+                                    {
+                                        format!(
+                                            "timeout read_timeout_ms=20 prefix_limit=64: {error}"
+                                        )
+                                    }
+                                    Err(error) => format!("read error prefix_limit=64: {error}"),
+                                }
+                            }
+                        }
+                        Err(error) => format!("accept error (no stream to read): {error}"),
+                    };
+                    panic!(
+                        "rejected hook woke a fixture endpoint: receiver_pid={receiver_pid} \
+                         receiver_linux_tid={receiver_tid} thread_name={:?} caller={}:{} \
+                         unix_timestamp={timestamp:?} listener_local_addr={local_addr:?} \
+                         accepted_peer_addr={accepted_peer:?} \
+                         accept_result_type=Result<(TcpStream,SocketAddr),std::io::Error> \
+                         accept_result={other:?} bounded_read={observation}",
+                        thread.name(),
+                        caller.file(),
+                        caller.line(),
+                    );
+                }
             }
         }
         if Instant::now() >= deadline {
