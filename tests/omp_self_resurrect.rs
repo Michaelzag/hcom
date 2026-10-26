@@ -51,7 +51,9 @@ bound_name() { sed -n 's/.*"name":"\([^"]*\)".*/\1/p' start.json; }
 rejoin_as() {
     local name
     name=$(bound_name)
-    (cd "$TEST_CWD" && H start --as "$name")
+    (cd "$TEST_CWD" &&
+        HCOM_PROCESS_ID="omp-$$-1-1" HCOM_LAUNCHED=1 HCOM_TOOL=omp \
+        exec "$TEST_BIN" start --as "$name")
 }
 on_term() {
     step exit-stop H omp-stop --name "$(bound_name)" --reason shutdown

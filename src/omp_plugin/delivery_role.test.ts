@@ -34,7 +34,16 @@ const cmd = args[0];
 if (cmd === "config") {
 	process.stdout.write(JSON.stringify({ HCOM_PLAIN_SESSIONS: "1" }));
 } else if (cmd === "omp-start") {
-	process.stdout.write(JSON.stringify({ name: "kimi", session_id: "sid-1" }));
+	const file = path.join(stateDir, "start_replies.json");
+	let reply = { code: 0, stdout: JSON.stringify({ name: "kimi", session_id: "sid-1" }), stderr: "" };
+	if (fs.existsSync(file)) {
+		const queue = JSON.parse(fs.readFileSync(file, "utf8"));
+		reply = queue.length > 1 ? queue.shift() : queue[0];
+		fs.writeFileSync(file, JSON.stringify(queue));
+	}
+	process.stdout.write(reply.stdout ?? "");
+	process.stderr.write(reply.stderr ?? "");
+	process.exitCode = reply.code ?? 0;
 } else if (cmd === "omp-role") {
 	const file = path.join(stateDir, "role_replies.json");
 	let reply = { code: 0, stdout: JSON.stringify({ ok: true, role: "conductor" }), stderr: "" };
@@ -225,3 +234,93 @@ test("transient failures give up after five attempts", async () => {
 	assert.equal(roleCalls().length, 5);
 	await stopSeat(pi);
 });
+
+for (const scenario of [
+	{
+		id: "security",
+		name: "a borrowed launcher UUID refusal stays inert without minting or retrying",
+		replies: [{ error: "HCOM_PROCESS_ID ownership refused" }],
+		binds: false,
+	},
+	{
+		id: "transient",
+		name: "a transient ownership verification error keeps the UUID without retrying under a new identity",
+		replies: [{ error: "Process ownership lookup failed: database is locked", transient: true }],
+		binds: false,
+	},
+	{
+		id: "transient-missing",
+		name: "a transient missing-ID response cannot enter the plain-session fallback",
+		replies: [{ error: "HCOM_PROCESS_ID not set", transient: true }],
+		binds: false,
+	},
+	{
+		id: "unbound",
+		name: "a genuinely unbound launcher UUID retains the plain-session initialization fallback",
+		replies: [
+			{ error: "HCOM_PROCESS_ID not set" },
+			{ name: "kimi", session_id: "sid-1" },
+		],
+		binds: true,
+	},
+]) {
+	test(scenario.name, async () => {
+		const inheritedId = "550e8400-e29b-41d4-a716-446655440000";
+		const savedEnv: Record<string, string | undefined> = {
+			HCOM_PROCESS_ID: process.env.HCOM_PROCESS_ID,
+			HCOM_LAUNCHED: process.env.HCOM_LAUNCHED,
+			HCOM_INSTANCE_NAME: process.env.HCOM_INSTANCE_NAME,
+			HCOM_OMP_IDENTITY_OWNER: process.env.HCOM_OMP_IDENTITY_OWNER,
+		};
+		let pi: StubPi | undefined;
+		try {
+			clearIdentityRegistry();
+			process.env.HCOM_PROCESS_ID = inheritedId;
+			process.env.HCOM_LAUNCHED = "1";
+			writeFileSync(join(FAKE_STATE, "calls.jsonl"), "");
+			rmSync(join(FAKE_STATE, "role_replies.json"), { force: true });
+			writeFileSync(
+				join(FAKE_STATE, "start_replies.json"),
+				JSON.stringify(scenario.replies.map((reply) => ({ code: 0, stdout: JSON.stringify(reply) }))),
+			);
+			// Static import would reuse an identity resolved before this case.
+			// Exercise the module-load boundary with this case's launcher UUID.
+			const { default: extension } = await import(
+				new URL(`./hcom.ts?launcher-identity=${scenario.id}`, import.meta.url).href
+			);
+			pi = new StubPi();
+			pi.entries = [MARKER];
+			extension(pi as unknown as ExtensionAPI);
+			await pi.emit("session_start");
+			await stopSeat(pi);
+			pi = undefined;
+
+			const startCalls = calls().filter((args) => args[0] === "omp-start");
+			if (scenario.binds) {
+				assert.equal(startCalls.length, 2, "the unbound opt-in retries once");
+				assert.notEqual(process.env.HCOM_PROCESS_ID, inheritedId);
+				assert.match(process.env.HCOM_PROCESS_ID ?? "", new RegExp(`^omp-${process.pid}-`));
+				assert.deepEqual(roleCalls(), [ROLE_ARGV], "the new owner completes initialization");
+			} else {
+				assert.equal(startCalls.length, 1, "a refused identity is not retried");
+				assert.equal(process.env.HCOM_PROCESS_ID, inheritedId);
+				assert.deepEqual(
+					calls().filter((args) => args[0].startsWith("omp-") && args[0] !== "omp-start"),
+					[],
+					"refused startup and shutdown issue no named hook operations",
+				);
+			}
+		} finally {
+			try {
+				if (pi) await stopSeat(pi);
+			} finally {
+				rmSync(join(FAKE_STATE, "start_replies.json"), { force: true });
+				clearIdentityRegistry();
+				for (const [key, value] of Object.entries(savedEnv)) {
+					if (value === undefined) delete process.env[key];
+					else process.env[key] = value;
+				}
+			}
+		}
+	});
+}

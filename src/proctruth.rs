@@ -1379,7 +1379,6 @@ pub(crate) const fn tool_names_are_provable() -> bool {
 /// a plain `node script.js` install has the same shape. The list is exactly
 /// the runtimes those paths can exec, deliberately not "any argv position":
 /// a free-for-all match would read a tool's ARGUMENTS as its identity.
-#[cfg(any(target_os = "linux", target_os = "android"))]
 const TOOL_INTERPRETERS: &[&str] = &["node", "bun", "deno", "python", "python3"];
 
 /// Whether `pid` is running the launched TOOL, by the name the launcher
@@ -1390,34 +1389,143 @@ const TOOL_INTERPRETERS: &[&str] = &["node", "bun", "deno", "python", "python3"]
 /// launcher exec'd, and either one can be the only name available. When
 /// argv[0] is one of [`TOOL_INTERPRETERS`] the tool path sits in argv[1]
 /// instead — the interpreter-override launch shape — so that basename is
-/// matched too. A zombie counts as not running it — a dead tool is a dead
-/// launch.
+/// matched too. OMP's installed package entry point also has a fixed script
+/// suffix. A zombie counts as not running it — a dead tool is a dead launch.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn process_is_tool(pid: u32, tool_names: &[&str]) -> bool {
     if tool_names.is_empty() || process_gone(pid) {
         return false;
     }
-    let comm_matches = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .is_ok_and(|comm| tool_names.contains(&comm.trim_end_matches('\n')));
-    comm_matches
-        || std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
-            let mut argv = cmdline.split(|b| *b == 0);
-            let argv0 = argv.next().unwrap_or_default();
-            let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or_default();
-            if tool_names.iter().any(|name| name.as_bytes() == base) {
-                return true;
-            }
-            // The interpreter-override shape: argv[0] names the runtime
-            // hcom exec'd through, argv[1] the tool. Anything else must not
-            // match — argv[1] of a plain invocation is a tool ARGUMENT.
-            TOOL_INTERPRETERS
-                .iter()
-                .any(|interp| interp.as_bytes() == base)
-                && argv.next().is_some_and(|argv1| {
-                    let arg_base = argv1.rsplit(|b| *b == b'/').next().unwrap_or_default();
-                    tool_names.iter().any(|name| name.as_bytes() == arg_base)
-                })
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
+    tool_match_from_facts(comm.as_deref(), tool_names, || {
+        std::fs::read(format!("/proc/{pid}/cmdline")).ok()
+    })
+}
+
+/// The same bounded argv view serves liveness and strict owner classification.
+/// Only a known interpreter's argv[1] can identify an installed script.
+struct ToolCommandLine<'a> {
+    argv0: &'a [u8],
+    script: Option<&'a [u8]>,
+    first_script_arg: Option<&'a [u8]>,
+}
+
+impl<'a> ToolCommandLine<'a> {
+    fn parse(cmdline: &'a [u8], windows: bool) -> Option<Self> {
+        if cmdline.len() > 1024 * 1024 || cmdline.last() != Some(&0) {
+            return None;
+        }
+        let mut argv = cmdline[..cmdline.len() - 1].split(|&byte| byte == 0);
+        let argv0 = argv.next().filter(|arg| !arg.is_empty())?;
+        let interpreter = TOOL_INTERPRETERS
+            .iter()
+            .any(|name| command_name_matches(argv0, name, windows));
+        let script = if interpreter { argv.next() } else { None };
+        Some(Self {
+            argv0,
+            script,
+            first_script_arg: argv.next(),
         })
+    }
+
+    fn matches(&self, comm: Option<&str>, name: &str, windows: bool) -> bool {
+        comm.is_some_and(|comm| command_name_matches(comm.as_bytes(), name, windows))
+            || command_name_matches(self.argv0, name, windows)
+            || self.script.is_some_and(|script| {
+                command_name_matches(script, name, windows)
+                    || (name == "omp" && is_omp_package_script(script, windows))
+            })
+    }
+
+    fn is_omp_worker(&self) -> bool {
+        self.first_script_arg
+            .is_some_and(|arg| arg.starts_with(b"__omp_worker_"))
+    }
+}
+
+fn argument_basename(path: &[u8], windows: bool) -> &[u8] {
+    path.rsplit(|&byte| byte == b'/' || (windows && byte == b'\\'))
+        .next()
+        .unwrap_or_default()
+}
+
+fn command_name_matches(path: &[u8], name: &str, windows: bool) -> bool {
+    let base = argument_basename(path, windows);
+    if !windows {
+        // npm's macOS Bun distribution uses this exact executable basename.
+        return base == name.as_bytes() || (name == "bun" && base == b"bun.exe");
+    }
+    base.eq_ignore_ascii_case(name.as_bytes())
+        || base
+            .get(..base.len().saturating_sub(4))
+            .zip(base.get(base.len().saturating_sub(4)..))
+            .is_some_and(|(stem, extension)| {
+                stem.eq_ignore_ascii_case(name.as_bytes())
+                    && extension.eq_ignore_ascii_case(b".exe")
+            })
+}
+
+fn is_omp_package_script(script: &[u8], windows: bool) -> bool {
+    let mut components = script.rsplit(|&byte| byte == b'/' || (windows && byte == b'\\'));
+    [
+        b"cli.js".as_slice(),
+        b"dist",
+        b"pi-coding-agent",
+        b"@oh-my-pi",
+    ]
+    .into_iter()
+    .all(|expected| {
+        components.next().is_some_and(|component| {
+            if windows {
+                component.eq_ignore_ascii_case(expected)
+            } else {
+                component == expected
+            }
+        })
+    })
+}
+
+/// Fixed worker titles in OMP's installed entrypoint. The broker's 17-byte
+/// title can occupy a 15-byte Linux comm or 16-byte macOS BSD comm. These exact
+/// reserved names only deny session authority; template prefixes never qualify.
+fn is_omp_worker_title(name: &[u8]) -> bool {
+    matches!(name, b"omp daemon broker" | b"omp lsp mux")
+}
+
+fn is_omp_worker_comm(comm: &[u8]) -> bool {
+    is_omp_worker_title(comm) || matches!(comm, b"omp daemon brok" | b"omp daemon broke")
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn tool_match_from_facts<B: AsRef<[u8]>>(
+    comm: Option<&str>,
+    tool_names: &[&str],
+    read_cmdline: impl FnOnce() -> Option<B>,
+) -> bool {
+    let comm = comm
+        .map(|comm| comm.trim_end_matches('\n'))
+        .filter(|comm| !comm.is_empty());
+    if comm.is_some_and(|comm| comm != "omp" && tool_names.contains(&comm)) {
+        return true;
+    }
+    let Some(cmdline) = read_cmdline() else {
+        return false;
+    };
+    let cmdline = cmdline.as_ref();
+    if tool_names.contains(&"omp")
+        && omp_kind_from_facts(comm, Some(cmdline), false) == AncestorProcess::Omp
+    {
+        return true;
+    }
+    if tool_names.iter().all(|&name| name == "omp") {
+        return false;
+    }
+    let Some(argv) = ToolCommandLine::parse(cmdline, false) else {
+        return false;
+    };
+    tool_names
+        .iter()
+        .any(|&name| name != "omp" && argv.matches(comm, name, false))
 }
 
 /// No `comm`, no `cmdline`, no answer.
@@ -1666,10 +1774,15 @@ fn mac_ancestor_pids(lookup: &MacProcessLookup) -> Vec<u32> {
 /// Which program an ancestor pid is running, as far as the platform will say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AncestorProcess {
-    /// Linux/Android `/proc/<pid>/comm` is `omp`, macOS `pbi_comm` is
-    /// `omp`, or Windows ToolHelp `szExeFile` is `omp.exe`.
+    /// Kernel image/comm and readable argv identify an actual OMP seat.
     Omp,
-    /// A readable process name that does not name OMP.
+    /// An OMP reserved worker entrypoint, never a session or a pass-through
+    /// wrapper. Ownership cannot cross a shared worker to an older OMP.
+    OmpWorker,
+    /// Exact Windows cmd.exe [/d] /c <omp.cmd|omp.bat> direct launch.
+    /// Not actual OMP; one actual seat below it can own a legacy shim row.
+    OmpLauncherShim,
+    /// Readable process evidence that excludes OMP.
     #[cfg_attr(
         not(any(
             target_os = "linux",
@@ -1680,8 +1793,16 @@ pub(crate) enum AncestorProcess {
         allow(dead_code)
     )]
     Other,
-    /// Unreadable process name. Never satisfies the `Omp` clause.
+    /// Insufficient process evidence. Never satisfies the `Omp` clause.
     Unknown,
+}
+
+/// One kernel ancestry walk proves both the actual seat and the role of the
+/// requested anchor. Callers apply row/placeholder policy to these same facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OmpOwnerProof {
+    pub(crate) owner_pid: u32,
+    pub(crate) anchor_kind: AncestorProcess,
 }
 
 /// `omp-<pid>-<rest>` → Some(pid), where `<rest>` must be non-empty. Agent-minted
@@ -1700,31 +1821,106 @@ pub(crate) fn omp_minted_pid(id: &str) -> Option<u32> {
     head.parse::<u32>().ok()
 }
 
-/// What `pid` is running: `Omp` only when `/proc/<pid>/comm` is `omp`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn ancestor_process_kind(pid: u32) -> AncestorProcess {
-    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-        Ok(comm) => {
-            if comm.trim() == "omp" {
-                AncestorProcess::Omp
-            } else {
-                AncestorProcess::Other
-            }
-        }
-        Err(_) => AncestorProcess::Unknown,
+/// Strict authentication retains workers as barriers instead of collapsing
+/// them into the liveness matcher's ordinary negative result.
+fn omp_kind_from_facts(
+    comm: Option<&str>,
+    cmdline: Option<&[u8]>,
+    windows: bool,
+) -> AncestorProcess {
+    let comm = comm
+        .map(|comm| comm.trim_end_matches('\n'))
+        .filter(|comm| !comm.is_empty());
+    if comm.is_some_and(|comm| is_omp_worker_comm(comm.as_bytes())) {
+        return AncestorProcess::OmpWorker;
+    }
+    let Some((cmdline, argv)) =
+        cmdline.and_then(|bytes| Some((bytes, ToolCommandLine::parse(bytes, windows)?)))
+    else {
+        return AncestorProcess::Unknown;
+    };
+    if is_omp_worker_title(argv.argv0) {
+        return AncestorProcess::OmpWorker;
+    }
+    if argv.matches(comm, "omp", windows) {
+        return if argv.is_omp_worker() {
+            AncestorProcess::OmpWorker
+        } else {
+            AncestorProcess::Omp
+        };
+    }
+    if windows && windows_omp_launcher_shim(comm, cmdline) {
+        return AncestorProcess::OmpLauncherShim;
+    }
+    // Unsupported interpreter flag/eval modes can hide a script. They do not
+    // prove a non-OMP link in an authentication segment.
+    if TOOL_INTERPRETERS
+        .iter()
+        .any(|name| command_name_matches(argv.argv0, name, windows))
+        && argv
+            .script
+            .is_none_or(|script| script.is_empty() || script.starts_with(b"-"))
+    {
+        return AncestorProcess::Unknown;
+    }
+    if comm.is_some() {
+        AncestorProcess::Other
+    } else {
+        AncestorProcess::Unknown
     }
 }
 
-/// Windows ToolHelp executable names identify OMP even when the installed
-/// binary's path differs. Verified by windows-build compile only: there is no
-/// Windows OMP real-tool job.
-#[cfg(any(windows, test))]
-fn ancestor_process_kind_from_name(name: Option<&str>) -> AncestorProcess {
-    match name {
-        Some(name) if name.eq_ignore_ascii_case("omp.exe") => AncestorProcess::Omp,
-        Some(_) => AncestorProcess::Other,
-        None => AncestorProcess::Unknown,
+fn windows_omp_launcher_shim(image: Option<&str>, cmdline: &[u8]) -> bool {
+    if !image.is_some_and(|image| image.eq_ignore_ascii_case("cmd.exe")) {
+        return false;
     }
+    let mut argv = cmdline[..cmdline.len() - 1].split(|&byte| byte == 0);
+    if !argv
+        .next()
+        .is_some_and(|arg| argument_basename(arg, true).eq_ignore_ascii_case(b"cmd.exe"))
+    {
+        return false;
+    }
+    let mut switch = argv.next();
+    if switch.is_some_and(|arg| arg.eq_ignore_ascii_case(b"/d")) {
+        switch = argv.next();
+    }
+    if !switch.is_some_and(|arg| arg.eq_ignore_ascii_case(b"/c")) {
+        return false;
+    }
+    let Some(script) = argv.next() else {
+        return false;
+    };
+    let base = argument_basename(script, true);
+    if !base.eq_ignore_ascii_case(b"omp.cmd") && !base.eq_ignore_ascii_case(b"omp.bat") {
+        return false;
+    }
+    // CommandLineToArgvW is not a cmd shell parser. Admit only direct tokens
+    // without expansion, redirection, grouping, escaping, or command chaining.
+    let direct = |arg: &[u8]| {
+        !arg.iter().any(|byte| {
+            matches!(
+                byte,
+                b'&' | b'|' | b'<' | b'>' | b'^' | b'%' | b'!' | b'(' | b')' | b'"' | b'\r' | b'\n'
+            )
+        })
+    };
+    direct(script) && argv.all(direct)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn ancestor_process_kind(pid: u32) -> AncestorProcess {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok();
+    omp_kind_from_facts(comm.as_deref(), cmdline.as_deref(), false)
+}
+
+#[cfg(any(windows, test))]
+fn ancestor_process_kind_from_name(name: Option<&str>, cmdline: Option<&[u8]>) -> AncestorProcess {
+    let Some(name) = name.filter(|name| !name.is_empty()) else {
+        return AncestorProcess::Unknown;
+    };
+    omp_kind_from_facts(Some(name), cmdline, true)
 }
 
 #[cfg(windows)]
@@ -1736,12 +1932,13 @@ fn ancestor_process_kind(
         snapshot
             .get(&pid)
             .and_then(|entry| entry.exe_name.as_deref()),
+        crate::sys::process_args::command_line(pid).as_deref(),
     )
 }
 
-/// The macOS BSD comm is MAXCOMLEN bytes including its NUL terminator.
+/// The macOS BSD comm occupies at most MAXCOMLEN bytes.
 #[cfg(any(target_os = "macos", test))]
-fn ancestor_process_kind_from_comm(comm: Option<&[u8]>) -> AncestorProcess {
+fn ancestor_process_kind_from_comm(comm: Option<&[u8]>, cmdline: Option<&[u8]>) -> AncestorProcess {
     let Some(comm) = comm else {
         return AncestorProcess::Unknown;
     };
@@ -1749,11 +1946,13 @@ fn ancestor_process_kind_from_comm(comm: Option<&[u8]>) -> AncestorProcess {
         .iter()
         .position(|&byte| byte == 0)
         .unwrap_or(comm.len());
-    if comm[..end].trim_ascii() == b"omp" {
-        AncestorProcess::Omp
-    } else {
-        AncestorProcess::Other
-    }
+    let Some(comm) = std::str::from_utf8(&comm[..end])
+        .ok()
+        .filter(|comm| !comm.is_empty())
+    else {
+        return AncestorProcess::Unknown;
+    };
+    omp_kind_from_facts(Some(comm), cmdline, false)
 }
 
 /// True when `pid` carries exactly `HCOM_PROCESS_ID=<id>` in its environ —
@@ -1859,15 +2058,83 @@ pub(crate) fn verify_reclaim_anchor(
     Ok(pid)
 }
 
+/// Authorize a fresh reclaim of a historical OMP identity, independently of
+/// whether its old anchor can be restored. Only the stored owner is evidence:
+/// a caller-supplied id must never select the PID whose death is checked.
+pub(crate) fn authorize_historical_omp_reclaim(
+    snapshot: &serde_json::Value,
+    stored_process_id: Option<&str>,
+    caller_owns: &dyn Fn(u32) -> bool,
+    definitely_dead: &dyn Fn(u32) -> bool,
+    live_identity: &dyn Fn(u32) -> Option<(u64, String)>,
+) -> Result<(), &'static str> {
+    let candidate = match snapshot.get("pid") {
+        None | Some(serde_json::Value::Null) => stored_process_id.and_then(omp_minted_pid),
+        Some(pid) => pid.as_u64().and_then(|pid| u32::try_from(pid).ok()),
+    };
+    let Some(pid) = candidate.filter(|&pid| pid > 0) else {
+        return Err("stopped OMP owner pid is missing or malformed");
+    };
+    #[cfg(unix)]
+    if i32::try_from(pid).is_err() {
+        return Err("stopped OMP owner pid is not representable");
+    }
+
+    match (snapshot.get("pid_start_time"), snapshot.get("boot_id")) {
+        (None, None) => {
+            if caller_owns(pid) || definitely_dead(pid) {
+                Ok(())
+            } else {
+                Err("stopped OMP owner is not this caller and is not positively dead")
+            }
+        }
+        (Some(start_time), Some(boot_id)) => {
+            let stored = start_time
+                .as_u64()
+                .zip(boot_id.as_str().filter(|boot| !boot.trim().is_empty()));
+            if let Some((start_time, boot_id)) = stored {
+                if let Some((live_start_time, live_boot_id)) = live_identity(pid) {
+                    if live_start_time != start_time || live_boot_id != boot_id {
+                        return Ok(());
+                    }
+                    if caller_owns(pid) {
+                        return Ok(());
+                    }
+                    if definitely_dead(pid) {
+                        return Ok(());
+                    }
+                    return Err("stopped OMP owner is live and belongs to another caller");
+                }
+                if definitely_dead(pid) {
+                    return Ok(());
+                }
+                return Err("stopped OMP owner incarnation is unreadable");
+            }
+            if definitely_dead(pid) {
+                Ok(())
+            } else {
+                Err("stopped OMP owner incarnation is malformed")
+            }
+        }
+        _ => {
+            if definitely_dead(pid) {
+                Ok(())
+            } else {
+                Err("stopped OMP owner incarnation is incomplete")
+            }
+        }
+    }
+}
+
 /// Pure decision core for process-identity trust — NO io. `ancestors` is
 /// self-inclusive ([`caller_ancestor_pids`]); `binding_row_pid` is `None`
 /// for no binding row and `Some(None)` for a row whose bound instance
 /// records no pid. The trust table, in order:
 ///
 /// - empty id → refused;
-/// - `omp-<pid>-…` → trusted iff `<pid>` is in `ancestors` AND that
-///   ancestor runs OMP ([`AncestorProcess::Omp`]); a shell ancestor
-///   carrying a leaked id is not proof;
+/// - `omp-<pid>-…` → trusted iff `<pid>` is the sole OMP between the caller
+///   and that pid, with no unknown process on the segment. A shell anchor
+///   or a descendant OMP carrying an inherited id is not proof;
 /// - launcher UUID → trusted iff a binding row records an ancestor pid.
 ///   A missing row OR a row with NULL pid is refused even when an ancestor
 ///   carries the id. The PTY wrapper records its own pid on entry before
@@ -1883,10 +2150,14 @@ pub(crate) fn verify_reclaim_anchor(
 /// an inherited synthetic id. Non-OMP tools keep the pre-0.7.30 basis;
 /// OMP only trusts proven launcher UUIDs or proven OMP-minted ids.
 ///
+/// OMP presenters additionally require exactly one recognized OMP from the
+/// caller through the anchor, inclusive, with no unknown process on that
+/// segment. A UUID may initially anchor a non-OMP wrapper above its one OMP;
+/// a minted id must anchor that OMP itself. Stored session ids are not proof.
+///
 /// Linux/Android prove `/proc` ancestry, Windows uses ToolHelp plus creation
 /// ticks, and macOS uses proc_pidinfo BSD parent/start/comm facts. Other
 /// unshipped targets fail closed until they have an ancestry mechanism.
-/// [`AncestorProcess::Unknown`] never satisfies the OMP clause.
 pub(crate) fn process_id_trusted(
     id: &str,
     ancestors: &[u32],
@@ -1901,7 +2172,57 @@ pub(crate) fn process_id_trusted(
         binding_row_pid,
         ancestor_carries_id,
         false,
+        false,
     )
+}
+
+/// The sole OMP between the caller and `anchor`, inclusive. Missing anchors,
+/// unknown processes and nested OMPs cannot prove ownership of that anchor.
+fn nearest_omp_owner(
+    ancestors: &[u32],
+    anchor: u32,
+    ancestor_kind: &dyn Fn(u32) -> AncestorProcess,
+) -> Option<OmpOwnerProof> {
+    let anchor_index = ancestors.iter().position(|&pid| pid == anchor)?;
+    let mut owner = None;
+    let mut anchor_kind = AncestorProcess::Unknown;
+    for &pid in &ancestors[..=anchor_index] {
+        let kind = ancestor_kind(pid);
+        if pid == anchor {
+            anchor_kind = kind;
+        }
+        match kind {
+            AncestorProcess::Omp => {
+                if owner.is_some() {
+                    return None;
+                }
+                owner = Some(pid);
+            }
+            AncestorProcess::Other | AncestorProcess::OmpLauncherShim => {}
+            AncestorProcess::Unknown | AncestorProcess::OmpWorker => return None,
+        }
+    }
+    Some(OmpOwnerProof {
+        owner_pid: owner?,
+        anchor_kind,
+    })
+}
+
+/// A launch runner can hand off only before any OMP exists on its segment.
+fn pre_omp_launch_runner(
+    ancestors: &[u32],
+    anchor: u32,
+    ancestor_kind: &dyn Fn(u32) -> AncestorProcess,
+) -> bool {
+    let Some(anchor_index) = ancestors.iter().position(|&pid| pid == anchor) else {
+        return false;
+    };
+    ancestors[..=anchor_index].iter().all(|&pid| {
+        matches!(
+            ancestor_kind(pid),
+            AncestorProcess::Other | AncestorProcess::OmpLauncherShim
+        )
+    })
 }
 
 fn process_id_trusted_for_presenter(
@@ -1910,17 +2231,28 @@ fn process_id_trusted_for_presenter(
     ancestor_kind: &dyn Fn(u32) -> AncestorProcess,
     binding_row_pid: Option<Option<u32>>,
     ancestor_carries_id: &dyn Fn(&str) -> bool,
+    true_launch_placeholder: bool,
     presenter_is_omp: bool,
 ) -> bool {
     if id.is_empty() {
         return false;
     }
     if let Some(pid) = omp_minted_pid(id) {
-        return ancestors.contains(&pid) && ancestor_kind(pid) == AncestorProcess::Omp;
+        return nearest_omp_owner(ancestors, pid, ancestor_kind).is_some_and(|proof| {
+            proof.owner_pid == pid && proof.anchor_kind == AncestorProcess::Omp
+        });
     }
     let launcher_id = is_launcher_process_id(id);
-    if presenter_is_omp && !launcher_id {
-        return false;
+    if presenter_is_omp {
+        return launcher_id
+            && binding_row_pid.flatten().is_some_and(|anchor| {
+                nearest_omp_owner(ancestors, anchor, ancestor_kind).is_some_and(|proof| {
+                    matches!(
+                        proof.anchor_kind,
+                        AncestorProcess::Omp | AncestorProcess::OmpLauncherShim
+                    ) || (proof.anchor_kind == AncestorProcess::Other && true_launch_placeholder)
+                })
+            });
     }
     match binding_row_pid {
         None => !launcher_id && ancestor_carries_id(id),
@@ -1936,6 +2268,7 @@ pub(crate) fn process_id_trusted_for_omp(
     ancestor_kind: &dyn Fn(u32) -> AncestorProcess,
     binding_row_pid: Option<Option<u32>>,
     ancestor_carries_id: &dyn Fn(&str) -> bool,
+    true_launch_placeholder: bool,
 ) -> bool {
     process_id_trusted_for_presenter(
         id,
@@ -1943,13 +2276,18 @@ pub(crate) fn process_id_trusted_for_omp(
         ancestor_kind,
         binding_row_pid,
         ancestor_carries_id,
+        true_launch_placeholder,
         true,
     )
 }
 
 /// IO wrapper for [`process_id_trusted`]: reads caller ancestry and the
-/// binding row (`get_process_binding` → `get_instance_full`). A DB read error,
-/// dangling binding or invalid recorded pid reads as "no row" (fail closed).
+/// binding row (`get_process_binding` → `get_instance_full`). OMP-bound rows
+/// require nearest-owner proof regardless of the presenter's tool claim.
+/// An actual OMP anchor needs no extra metadata; a UUID wrapper anchor is
+/// accepted only for a true launch placeholder, never an ambiguous bound row.
+/// A DB read error, dangling binding or invalid recorded pid reads as
+/// "no row" (fail closed).
 pub fn trusted_process_id(db: &HcomDb, id: &str) -> bool {
     trusted_process_id_for_presenter(db, id, false)
 }
@@ -1957,6 +2295,78 @@ pub fn trusted_process_id(db: &HcomDb, id: &str) -> bool {
 /// OMP hooks accept only a proven launcher UUID or a proven OMP-minted id.
 pub(crate) fn trusted_process_id_for_omp(db: &HcomDb, id: &str) -> bool {
     trusted_process_id_for_presenter(db, id, true)
+}
+
+/// Whether `anchor` itself is the caller's nearest proven OMP owner,
+/// independently of any live binding or stored session id. Historical
+/// reclaim cannot use a non-OMP wrapper or a transcript holder as its owner.
+pub(crate) fn caller_owns_omp_anchor(anchor: u32) -> bool {
+    caller_omp_owner_under_anchor(anchor)
+        .is_some_and(|proof| proof.owner_pid == anchor && proof.anchor_kind == AncestorProcess::Omp)
+}
+
+/// The caller's sole proven OMP and anchor role through `anchor`, inclusive.
+/// This proves process facts only; callers apply row/placeholder policy.
+pub(crate) fn caller_omp_owner_under_anchor(anchor: u32) -> Option<OmpOwnerProof> {
+    with_caller_process_ancestry(|ancestors, ancestor_kind| {
+        nearest_omp_owner(ancestors, anchor, ancestor_kind)
+    })
+}
+
+/// Whether an ancestor runner is still entirely before OMP startup. Unknown
+/// process facts or any OMP through the runner forbid replacing its anchor.
+pub(crate) fn caller_is_pre_omp_launch_runner(anchor: u32) -> bool {
+    with_caller_process_ancestry(|ancestors, ancestor_kind| {
+        pre_omp_launch_runner(ancestors, anchor, ancestor_kind)
+    })
+}
+
+/// Collect each platform's process facts once for the proof being evaluated.
+fn with_caller_process_ancestry<R>(
+    decide: impl FnOnce(&[u32], &dyn Fn(u32) -> AncestorProcess) -> R,
+) -> R {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let ancestors = caller_ancestor_pids();
+        decide(&ancestors, &ancestor_process_kind)
+    }
+    #[cfg(windows)]
+    {
+        let snapshot = crate::sys::process::snapshot_parents(true);
+        let ancestors = walk_ancestor_links(
+            std::process::id(),
+            |pid| snapshot.as_ref()?.get(&pid).map(|entry| entry.parent_pid),
+            crate::sys::process::creation_ticks_win,
+        );
+        decide(&ancestors, &|pid| {
+            snapshot
+                .as_ref()
+                .map_or(AncestorProcess::Unknown, |entries| {
+                    ancestor_process_kind(pid, entries)
+                })
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let lookup = MacProcessLookup::default();
+        let ancestors = mac_ancestor_pids(&lookup);
+        decide(&ancestors, &|pid| {
+            let facts = lookup.get(pid);
+            ancestor_process_kind_from_comm(
+                facts.as_ref().map(|facts| facts.comm.as_slice()),
+                crate::sys::process_args::command_line(pid).as_deref(),
+            )
+        })
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
+    {
+        decide(&[], &|_| AncestorProcess::Unknown)
+    }
 }
 
 fn trusted_process_id_for_presenter(db: &HcomDb, id: &str, presenter_is_omp: bool) -> bool {
@@ -1982,71 +2392,36 @@ fn trusted_process_id_for_presenter(db: &HcomDb, id: &str, presenter_is_omp: boo
         if id.is_empty() {
             return false;
         }
-        let binding_row_pid = match db.get_process_binding(id) {
-            Ok(Some(instance_name)) => match db.get_instance_full(&instance_name) {
-                Ok(Some(row)) => Some(row.pid.and_then(|p| u32::try_from(p).ok())),
-                _ => None,
-            },
-            _ => None,
+        let (binding_row, binding_unbound) = match db.get_process_binding_full(id) {
+            Ok(Some((session_id, instance_name))) => (
+                db.get_instance_full(&instance_name).ok().flatten(),
+                session_id.is_none(),
+            ),
+            _ => (None, false),
         };
-        let decide = if presenter_is_omp {
-            process_id_trusted_for_omp
-        } else {
-            process_id_trusted
-        };
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            let ancestors = caller_ancestor_pids();
-            decide(
-                id,
-                &ancestors,
-                &ancestor_process_kind,
-                binding_row_pid,
-                &|want| ancestors.iter().any(|&pid| carries_process_id(pid, want)),
-            )
-        }
-        #[cfg(windows)]
-        {
-            // One ToolHelp snapshot supplies both parent links and exe names.
-            let snapshot = crate::sys::process::snapshot_parents(true);
-            let ancestors = walk_ancestor_links(
-                std::process::id(),
-                |pid| snapshot.as_ref()?.get(&pid).map(|entry| entry.parent_pid),
-                crate::sys::process::creation_ticks_win,
-            );
-            decide(
-                id,
-                &ancestors,
-                &|pid| {
-                    snapshot
-                        .as_ref()
-                        .map_or(AncestorProcess::Unknown, |entries| {
-                            ancestor_process_kind(pid, entries)
-                        })
-                },
-                binding_row_pid,
-                &|want| ancestors.iter().any(|&pid| carries_process_id(pid, want)),
-            )
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let lookup = MacProcessLookup::default();
-            let ancestors = mac_ancestor_pids(&lookup);
-            decide(
-                id,
-                &ancestors,
-                &|pid| {
-                    let facts = lookup.get(pid);
-                    ancestor_process_kind_from_comm(
-                        facts.as_ref().map(|facts| facts.comm.as_slice()),
-                    )
-                },
-                binding_row_pid,
-                // Self-carriage retains the non-OMP synthetic-id basis;
-                // Darwin has no shipped reader for other pids' environ.
-                &|want| ancestors.iter().any(|&pid| carries_process_id(pid, want)),
-            )
-        }
+        let binding_row_pid = binding_row
+            .as_ref()
+            .map(|row| row.pid.and_then(|p| u32::try_from(p).ok()));
+        let strict_omp =
+            presenter_is_omp || binding_row.as_ref().is_some_and(|row| row.tool == "omp");
+        let true_launch_placeholder = binding_unbound
+            && crate::instance_binding::is_true_launch_placeholder(binding_row.as_ref());
+        with_caller_process_ancestry(|ancestors, ancestor_kind| {
+            let carries_id =
+                |want: &str| ancestors.iter().any(|&pid| carries_process_id(pid, want));
+            if strict_omp {
+                process_id_trusted_for_omp(
+                    id,
+                    ancestors,
+                    ancestor_kind,
+                    binding_row_pid,
+                    &carries_id,
+                    true_launch_placeholder,
+                )
+            } else {
+                process_id_trusted(id, ancestors, ancestor_kind, binding_row_pid, &carries_id)
+            }
+        })
     }
 }
 
@@ -3838,6 +4213,193 @@ pub(crate) mod orphan_fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_history_requires_the_recorded_owner_or_positive_death() {
+        for snapshot in [json!({"pid": 42}), json!({"pid": null}), json!({})] {
+            for (owned, dead, allowed) in [
+                (true, false, true),
+                (false, false, false),
+                (false, true, true),
+            ] {
+                let result = authorize_historical_omp_reclaim(
+                    &snapshot,
+                    Some("omp-42-1-1"),
+                    &|pid| {
+                        assert_eq!(pid, 42);
+                        owned
+                    },
+                    &|pid| {
+                        assert_eq!(pid, 42);
+                        dead
+                    },
+                    &|_| None,
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    allowed,
+                    "snapshot={snapshot}, owned={owned}, dead={dead}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_pid_takes_precedence_over_the_stored_minted_pid() {
+        let result = authorize_historical_omp_reclaim(
+            &json!({"pid": 43}),
+            Some("omp-42-1-1"),
+            &|pid| pid == 43,
+            &|_| false,
+            &|_| None,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let foreign = authorize_historical_omp_reclaim(
+            &json!({"pid": 43}),
+            Some("omp-42-1-1"),
+            &|pid| pid == 42,
+            &|_| false,
+            &|_| None,
+        );
+        assert!(
+            foreign.is_err(),
+            "the stored id cannot override a foreign snapshot pid"
+        );
+    }
+
+    #[test]
+    fn a_matching_incarnation_requires_ownership_or_positive_death() {
+        let snapshot = json!({"pid": 42, "pid_start_time": 7, "boot_id": "boot-a"});
+        for (owned, dead, allowed) in [
+            (true, false, true),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let result =
+                authorize_historical_omp_reclaim(&snapshot, None, &|_| owned, &|_| dead, &|_| {
+                    Some((7, "boot-a".into()))
+                });
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "owned={owned}, dead={dead}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reused_pid_permits_fresh_reclaim_but_never_anchor_restoration() {
+        let snapshot = json!({"pid": 42, "pid_start_time": 7, "boot_id": "boot-a"});
+        for (start_time, boot_id) in [(8, "boot-a"), (7, "boot-b"), (8, "boot-b")] {
+            let live = |_: u32| Some((start_time, boot_id.to_string()));
+            let result =
+                authorize_historical_omp_reclaim(&snapshot, None, &|_| false, &|_| false, &live);
+            assert!(result.is_ok(), "{result:?}");
+            assert!(
+                verify_reclaim_anchor(&snapshot, &[42], &live).is_err(),
+                "a reused pid must never be restored"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_incarnation_requires_positive_death_even_for_an_ancestor() {
+        let snapshot = json!({"pid": 42, "pid_start_time": 7, "boot_id": "boot-a"});
+        for (owned, dead, allowed) in [
+            (true, false, false),
+            (false, false, false),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let result =
+                authorize_historical_omp_reclaim(&snapshot, None, &|_| owned, &|_| dead, &|_| None);
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "owned={owned}, dead={dead}: {result:?}"
+            );
+        }
+        assert!(verify_reclaim_anchor(&snapshot, &[42], &|_| None).is_err());
+    }
+
+    #[test]
+    fn partial_or_malformed_incarnations_require_positive_death() {
+        for snapshot in [
+            json!({"pid": 42, "pid_start_time": 7}),
+            json!({"pid": 42, "boot_id": "boot-a"}),
+            json!({"pid": 42, "pid_start_time": null, "boot_id": null}),
+            json!({"pid": 42, "pid_start_time": "7", "boot_id": "boot-a"}),
+            json!({"pid": 42, "pid_start_time": -1, "boot_id": "boot-a"}),
+            json!({"pid": 42, "pid_start_time": 7, "boot_id": 8}),
+            json!({"pid": 42, "pid_start_time": 7, "boot_id": ""}),
+            json!({"pid": 42, "pid_start_time": 7, "boot_id": "  "}),
+        ] {
+            for (owned, dead, allowed) in [
+                (true, false, false),
+                (false, false, false),
+                (false, true, true),
+            ] {
+                let result = authorize_historical_omp_reclaim(
+                    &snapshot,
+                    None,
+                    &|_| owned,
+                    &|_| dead,
+                    &|_| None,
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    allowed,
+                    "snapshot={snapshot}, owned={owned}, dead={dead}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_pids_never_authorize_or_probe_a_process_group() {
+        for (snapshot, stored_id) in [
+            (json!({}), None),
+            (json!({"pid": null}), None),
+            (json!({}), Some("launcher-uuid")),
+            (json!({}), Some("omp-42")),
+            (json!({}), Some("omp-42-")),
+            (json!({}), Some("omp-0-1-1")),
+            (json!({}), Some("omp-4294967296-1-1")),
+            (json!({"pid": 0}), Some("omp-42-1-1")),
+            (json!({"pid": -1}), Some("omp-42-1-1")),
+            (json!({"pid": "42"}), Some("omp-42-1-1")),
+            (json!({"pid": 4294967296u64}), Some("omp-42-1-1")),
+            (json!({"pid": u64::MAX}), Some("omp-42-1-1")),
+        ] {
+            let result = authorize_historical_omp_reclaim(
+                &snapshot,
+                stored_id,
+                &|_| panic!("an invalid candidate cannot prove ownership"),
+                &|_| panic!("an invalid candidate must not reach kill(pid, 0)"),
+                &|_| panic!("an invalid candidate has no live incarnation"),
+            );
+            assert!(
+                result.is_err(),
+                "snapshot={snapshot}, stored_id={stored_id:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsigned_pids_that_would_become_process_group_probes_are_refused() {
+        for snapshot in [json!({"pid": u32::MAX}), json!({})] {
+            let result = authorize_historical_omp_reclaim(
+                &snapshot,
+                Some("omp-4294967295-1-1"),
+                &|_| panic!("an unrepresentable pid cannot prove ownership"),
+                &|_| panic!("an unrepresentable pid must not be probed"),
+                &|_| panic!("an unrepresentable pid cannot be read"),
+            );
+            assert!(result.is_err(), "{result:?}");
+        }
+    }
 
     // NOTE: these tests spawn real `sleep` processes carrying fake instance
     // names. Names embed the test-runner pid so parallel tests (and any real
@@ -4653,22 +5215,29 @@ mod tests {
     }
 
     #[test]
-    fn windows_ancestor_kind_uses_executable_name() {
+    fn windows_owner_recognizes_native_and_interpreted_seats() {
+        use AncestorProcess::{Omp, OmpWorker, Other, Unknown};
+
+        for (image, argv, expected) in [
+            ("OMP.EXE", b"C:\\tools\\OMP.EXE\0--headless\0".as_slice(), Omp),
+            ("bun.exe", b"C:\\tools\\bun.exe\0C:\\tools\\omp\0".as_slice(), Omp),
+            ("NODE.EXE", b"C:\\Program Files\\nodejs\\NODE.EXE\0C:\\tools\\OMP.EXE\0".as_slice(), Omp),
+            ("node.exe", b"C:\\node.exe\0C:\\node_modules\\@OH-MY-PI\\PI-CODING-AGENT\\DIST\\CLI.JS\0".as_slice(), Omp),
+            ("node.exe", b"C:/node.exe\0C:/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0__omp_worker_daemon_broker\0".as_slice(), OmpWorker),
+            ("node.exe", b"C:\\node.exe\0C:\\tools\\omp\0--prompt\0__omp_worker_daemon_broker\0".as_slice(), Omp),
+            ("node.exe", b"C:\\node.exe\0C:\\other\\dist\\cli.js\0".as_slice(), Other),
+            ("node.exe", b"C:\\node.exe\0--flag\0C:\\tools\\omp\0".as_slice(), Unknown),
+            ("sleep.exe", b"C:\\sleep.exe\0C:\\tools\\omp\0".as_slice(), Other),
+        ] {
+            assert_eq!(
+                ancestor_process_kind_from_name(Some(image), Some(argv)),
+                expected,
+                "image={image}, argv={argv:?}",
+            );
+        }
         assert_eq!(
-            ancestor_process_kind_from_name(Some("OMP.EXE")),
-            AncestorProcess::Omp
-        );
-        assert_eq!(
-            ancestor_process_kind_from_name(Some("omp.exe")),
-            AncestorProcess::Omp
-        );
-        assert_eq!(
-            ancestor_process_kind_from_name(Some("cmd.exe")),
-            AncestorProcess::Other
-        );
-        assert_eq!(
-            ancestor_process_kind_from_name(None),
-            AncestorProcess::Unknown
+            ancestor_process_kind_from_name(None, Some(b"omp.exe\0")),
+            Unknown
         );
     }
 
@@ -4700,22 +5269,334 @@ mod tests {
     }
 
     #[test]
-    fn mac_ancestor_kind_requires_exact_trimmed_comm() {
+    fn unix_npm_bun_owner_classification_preserves_script_positions_and_worker_barriers() {
+        use AncestorProcess::{Omp, OmpWorker, Other, Unknown};
+
+        for (comm, argv, expected) in [
+            (
+                b"omp\0".as_slice(),
+                b"/opt/tool\0--headless\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"node\0".as_slice(),
+                b"/opt/node\0/opt/bin/omp\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"bun\0".as_slice(),
+                b"/opt/bun\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0--headless\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0__omp_worker_daemon_broker\0--prompt\0seat\0".as_slice(),
+                OmpWorker,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0__omp_worker_lsp_mux\0".as_slice(),
+                OmpWorker,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0--prompt\0__omp_worker_daemon_broker\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0--print=__omp_worker_lsp_mux\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"omp daemon broke\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0--headless\0".as_slice(),
+                OmpWorker,
+            ),
+            (
+                b"omp lsp mux\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0--prompt\0seat\0".as_slice(),
+                OmpWorker,
+            ),
+            (
+                b"omp daemon brok\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0--headless\0".as_slice(),
+                OmpWorker,
+            ),
+            (
+                b"node\0".as_slice(),
+                b"/opt/node\0/opt/bin/omp\0__omp_worker_daemon\0".as_slice(),
+                OmpWorker,
+            ),
+            (
+                b"node\0".as_slice(),
+                b"/opt/node\0/opt/bin/omp\0--prompt\0__omp_worker_daemon\0".as_slice(),
+                Omp,
+            ),
+            (
+                b"node\0".as_slice(),
+                b"/opt/node\0/opt/bin/omp\0--print=__omp_worker_daemon\0".as_slice(),
+                Omp,
+            ),
+            (b"OMP\0".as_slice(), b"/opt/tool\0".as_slice(), Other),
+            (
+                b"node\0".as_slice(),
+                b"/opt/node\0/opt/other/dist/cli.js\0".as_slice(),
+                Other,
+            ),
+            (
+                b"node\0".as_slice(),
+                b"/opt/node\0--eval\0omp\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/other/dist/cli.js\0".as_slice(),
+                Other,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0/opt/node_modules/@oh-my-pi/pi-coding-agent/DIST/cli.js\0".as_slice(),
+                Other,
+            ),
+            (
+                b"BUN.EXE\0".as_slice(),
+                b"/opt/node_modules/bun/bin/BUN.EXE\0/opt/bin/omp\0".as_slice(),
+                Other,
+            ),
+            (
+                b"node.exe\0".as_slice(),
+                b"/opt/node.exe\0/opt/bin/omp\0".as_slice(),
+                Other,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0--eval\0omp\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0-e\0require('/opt/bin/omp')\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0-p\0'/opt/bin/omp'\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0--preload\0/opt/bin/omp\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0".as_slice(),
+                Unknown,
+            ),
+            (
+                b"bun.exe\0".as_slice(),
+                b"/opt/node_modules/bun/bin/bun.exe\0\0/opt/bin/omp\0".as_slice(),
+                Unknown,
+            ),
+        ] {
+            // Linux/Android call this shared Unix classifier directly; macOS
+            // calls it after decoding the native fixed-width comm below.
+            let unix_comm = std::str::from_utf8(comm.strip_suffix(b"\0").unwrap()).unwrap();
+            assert_eq!(
+                omp_kind_from_facts(Some(unix_comm), Some(argv), false),
+                expected,
+                "Unix comm={comm:?}, argv={argv:?}",
+            );
+            assert_eq!(
+                ancestor_process_kind_from_comm(Some(comm), Some(argv)),
+                expected,
+                "comm={comm:?}, argv={argv:?}",
+            );
+        }
         assert_eq!(
-            ancestor_process_kind_from_comm(Some(b" omp \0ignored")),
-            AncestorProcess::Omp
+            ancestor_process_kind_from_comm(None, Some(b"/opt/omp\0")),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn owner_classification_requires_complete_bounded_argv() {
+        use AncestorProcess::Unknown;
+
+        for argv in [None, Some(b"".as_slice()), Some(b"\0"), Some(b"/opt/omp")] {
+            assert_eq!(omp_kind_from_facts(Some("omp"), argv, false), Unknown);
+            assert_eq!(
+                ancestor_process_kind_from_name(Some("omp.exe"), argv),
+                Unknown
+            );
+            assert_eq!(
+                ancestor_process_kind_from_name(Some("node.exe"), argv),
+                Unknown
+            );
+            assert_eq!(
+                ancestor_process_kind_from_comm(Some(b"node\0"), argv),
+                Unknown
+            );
+        }
+        let oversized = vec![0; 1024 * 1024 + 1];
+        assert_eq!(
+            omp_kind_from_facts(Some("omp"), Some(&oversized), false),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn exact_reserved_worker_titles_survive_argv_rewrite_without_borrowing_authority() {
+        use AncestorProcess::{Omp, OmpWorker, Other, Unknown};
+
+        for (title, argv0_kind) in [
+            ("omp daemon broker", OmpWorker),
+            ("omp daemon brok", Other),
+            ("omp daemon broke", Other),
+            ("omp lsp mux", OmpWorker),
+        ] {
+            assert_eq!(omp_kind_from_facts(Some(title), None, false), OmpWorker);
+            let rewritten = format!("{title}\0");
+            assert_eq!(
+                ancestor_process_kind_from_name(Some("bun.exe"), Some(rewritten.as_bytes())),
+                argv0_kind,
+            );
+        }
+        for title in [
+            "omp daemon",
+            "omp daemon bro",
+            "omp ida anything",
+            "omp tiny anything",
+        ] {
+            assert_eq!(omp_kind_from_facts(Some(title), None, false), Unknown);
+            assert_eq!(
+                omp_kind_from_facts(Some(title), Some(b"/opt/other\0"), false),
+                Other
+            );
+        }
+        assert_eq!(
+            omp_kind_from_facts(
+                Some("node"),
+                Some(b"node\0/opt/bin/omp\0--prompt\0omp daemon broker\0"),
+                false
+            ),
+            Omp,
         );
         assert_eq!(
-            ancestor_process_kind_from_comm(Some(b"OMP\0")),
-            AncestorProcess::Other
+            omp_kind_from_facts(
+                Some("node"),
+                Some(b"node\0/opt/other.js\0omp lsp mux\0"),
+                false
+            ),
+            Other,
         );
+    }
+
+    #[test]
+    fn worker_selector_is_a_shared_owner_and_liveness_barrier() {
+        use AncestorProcess::{Omp, OmpWorker};
+
+        for comm in [
+            Some("omp\n"),
+            Some("omp daemon brok\n"),
+            Some("renamed\n"),
+            None,
+        ] {
+            for cmdline in [
+                b"/usr/bin/omp\0__omp_worker_daemon_broker\0".as_slice(),
+                b"/usr/bin/bun\0/opt/bin/omp\0__omp_worker_daemon_broker\0".as_slice(),
+                b"/usr/bin/bun\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0__omp_worker_daemon_broker\0".as_slice(),
+                b"/usr/bin/bun\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0__omp_worker_daemon\0".as_slice(),
+                b"/usr/bin/bun\0/opt/bin/omp\0__omp_worker_future\0".as_slice(),
+            ] {
+                assert_eq!(
+                    omp_kind_from_facts(comm, Some(cmdline), false),
+                    OmpWorker,
+                    "comm={comm:?} cmdline={cmdline:?}",
+                );
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                assert!(!tool_match_from_facts(comm, &["omp"], || Some(cmdline)));
+            }
+        }
+        let unrelated = b"/usr/bin/bun\0/opt/unrelated/cli.js\0".as_slice();
         assert_eq!(
-            ancestor_process_kind_from_comm(Some(b"bash\0")),
-            AncestorProcess::Other
+            omp_kind_from_facts(Some("omp daemon brok\n"), Some(unrelated), false),
+            OmpWorker
         );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(!tool_match_from_facts(
+            Some("omp daemon brok\n"),
+            &["omp"],
+            || { Some(unrelated) }
+        ));
+
+        for cmdline in [
+            b"/usr/bin/omp\0--print\0__omp_worker_daemon_broker\0".as_slice(),
+            b"/usr/bin/bun\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0--print\0__omp_worker_daemon_broker\0".as_slice(),
+            b"/usr/bin/bun\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0--print=__omp_worker_daemon_broker\0".as_slice(),
+            b"/usr/bin/bun\0/opt/bin/omp\0__omp_workers_broker\0".as_slice(),
+        ] {
+            assert_eq!(
+                omp_kind_from_facts(Some("omp\n"), Some(cmdline), false),
+                Omp,
+                "{cmdline:?}",
+            );
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            assert!(tool_match_from_facts(Some("omp\n"), &["omp"], || Some(cmdline)));
+        }
+    }
+
+    #[test]
+    fn windows_owner_shim_requires_a_direct_exact_omp_command() {
+        use AncestorProcess::{OmpLauncherShim, Other};
+
+        for argv in [
+            b"cmd.exe\0/c\0C:\\bin\\omp.cmd\0".as_slice(),
+            b"C:\\Windows\\System32\\CMD.EXE\0/D\0/C\0C:\\space dir\\OMP.BAT\0--resume\0sid\0"
+                .as_slice(),
+        ] {
+            assert_eq!(
+                ancestor_process_kind_from_name(Some("cmd.exe"), Some(argv)),
+                OmpLauncherShim,
+                "{argv:?}",
+            );
+        }
+        for argv in [
+            b"cmd.exe\0/c\0other.cmd\0omp.cmd\0".as_slice(),
+            b"cmd.exe\0/c\0echo omp.cmd\0".as_slice(),
+            b"cmd.exe\0/c\0omp.cmd & other.cmd\0".as_slice(),
+            b"cmd.exe\0/c\0omp.cmd\0&&\0other.cmd\0".as_slice(),
+            b"cmd.exe\0/c\0omp.cmd\0>%TEMP%\\out\0".as_slice(),
+            b"cmd.exe\0/c\0omp.cmd.extra\0".as_slice(),
+            b"cmd.exe\0/k\0omp.cmd\0".as_slice(),
+            b"cmd.exe\0/s\0/c\0omp.cmd\0".as_slice(),
+            b"cmd.exe\0/c\0cmd.exe\0/c\0omp.cmd\0".as_slice(),
+        ] {
+            assert_eq!(
+                ancestor_process_kind_from_name(Some("cmd.exe"), Some(argv)),
+                Other,
+                "{argv:?}",
+            );
+        }
         assert_eq!(
-            ancestor_process_kind_from_comm(None),
-            AncestorProcess::Unknown
+            ancestor_process_kind_from_name(Some("other.exe"), Some(b"cmd.exe\0/c\0omp.cmd\0")),
+            Other,
         );
     }
 
@@ -6180,8 +7061,8 @@ mod tests {
 
     #[test]
     fn process_id_trusted_omp_id_omp_ancestor_trusted() {
-        // Nested omp: the minting pid is an ancestor running `omp`. No binding
-        // row needed — rule 1 judges purely by ancestry and comm.
+        // The minting pid is this tree's only OMP through that anchor.
+        // No binding row is needed — ownership is a process-table fact.
         assert!(process_id_trusted(
             "omp-3-1-2",
             &[7, 3],
@@ -6300,6 +7181,7 @@ mod tests {
             &|_| AncestorProcess::Omp,
             None,
             &|want| want == id,
+            false,
         ));
         assert!(process_id_trusted(
             id,
@@ -6311,14 +7193,435 @@ mod tests {
     }
 
     #[test]
-    fn process_id_trusted_omp_strict_accepts_proven_launcher() {
-        assert!(process_id_trusted_for_omp(
+    fn process_id_trusted_omp_strict_uuid_requires_nearest_owner() {
+        use AncestorProcess::{Omp, OmpLauncherShim, OmpWorker, Other, Unknown};
+
+        let ancestors = [9, 7, 5, 3, 1];
+        for (case, kinds, anchor, placeholder, expected) in [
+            (
+                "own OMP ignores outer OMP and unknown",
+                [Other, Omp, Unknown, Omp, Other],
+                Some(Some(7)),
+                false,
+                true,
+            ),
+            (
+                "bound non-OMP wrapper",
+                [Other, Omp, Other, Other, Omp],
+                Some(Some(3)),
+                false,
+                false,
+            ),
+            (
+                "true unbound launch wrapper",
+                [Other, Omp, Other, Other, Omp],
+                Some(Some(3)),
+                true,
+                true,
+            ),
+            (
+                "bound native OMP launch shim",
+                [Other, Omp, Other, OmpLauncherShim, Omp],
+                Some(Some(3)),
+                false,
+                true,
+            ),
+            (
+                "worker below native launch shim",
+                [Other, Omp, OmpWorker, OmpLauncherShim, Other],
+                Some(Some(3)),
+                true,
+                false,
+            ),
+            (
+                "nested OMP borrowing owner anchor",
+                [Other, Omp, Other, Omp, Other],
+                Some(Some(3)),
+                true,
+                false,
+            ),
+            (
+                "nested OMP borrowing wrapper anchor",
+                [Other, Omp, Omp, Other, Other],
+                Some(Some(3)),
+                true,
+                false,
+            ),
+            ("no OMP", [Other; 5], Some(Some(3)), true, false),
+            (
+                "OMP only above anchor",
+                [Other, Other, Omp, Other, Other],
+                Some(Some(7)),
+                true,
+                false,
+            ),
+            (
+                "unknown before owner",
+                [Unknown, Omp, Other, Other, Other],
+                Some(Some(3)),
+                true,
+                false,
+            ),
+            (
+                "unknown between owner and wrapper",
+                [Other, Omp, Unknown, Other, Other],
+                Some(Some(3)),
+                true,
+                false,
+            ),
+            (
+                "unknown anchor",
+                [Other, Omp, Other, Unknown, Other],
+                Some(Some(3)),
+                true,
+                false,
+            ),
+            (
+                "missing binding row",
+                [Other, Omp, Other, Other, Other],
+                None,
+                true,
+                false,
+            ),
+            (
+                "null anchor",
+                [Other, Omp, Other, Other, Other],
+                Some(None),
+                true,
+                false,
+            ),
+            (
+                "nonancestor anchor",
+                [Other, Omp, Other, Other, Other],
+                Some(Some(99)),
+                true,
+                false,
+            ),
+            (
+                "self-inclusive owner anchor",
+                [Omp, Other, Other, Other, Other],
+                Some(Some(9)),
+                false,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                process_id_trusted_for_omp(
+                    "550e8400-e29b-41d4-a716-446655440000",
+                    &ancestors,
+                    &|pid| kinds[ancestors.iter().position(|&p| p == pid).unwrap()],
+                    anchor,
+                    &|_| true,
+                    placeholder,
+                ),
+                expected,
+                "{case}",
+            );
+        }
+        assert!(!process_id_trusted_for_omp(
             "550e8400-e29b-41d4-a716-446655440000",
-            &[7, 3],
-            &|_| AncestorProcess::Other,
-            Some(Some(3)),
-            &|_| false,
+            &[],
+            &|_| Omp,
+            Some(Some(7)),
+            &|_| true,
+            true,
         ));
+    }
+
+    #[test]
+    fn pre_omp_launch_runner_requires_only_known_non_omp_through_anchor() {
+        use AncestorProcess::{Omp, Other, Unknown};
+
+        let ancestors = [9, 7, 5, 3, 1];
+        for (case, kinds, anchor, expected) in [
+            ("ancestor runner", [Other; 5], 3, true),
+            ("self runner", [Other, Unknown, Omp, Other, Other], 9, true),
+            (
+                "outer OMP is outside segment",
+                [Other, Other, Other, Omp, Unknown],
+                5,
+                true,
+            ),
+            (
+                "OMP below runner",
+                [Other, Omp, Other, Other, Other],
+                3,
+                false,
+            ),
+            ("OMP anchor", [Other, Other, Other, Omp, Other], 3, false),
+            (
+                "unknown below runner",
+                [Unknown, Other, Other, Other, Other],
+                3,
+                false,
+            ),
+            (
+                "unknown anchor",
+                [Other, Other, Other, Unknown, Other],
+                3,
+                false,
+            ),
+            ("missing anchor", [Other; 5], 99, false),
+        ] {
+            assert_eq!(
+                pre_omp_launch_runner(&ancestors, anchor, &|pid| kinds
+                    [ancestors.iter().position(|&p| p == pid).unwrap()],),
+                expected,
+                "{case}",
+            );
+        }
+        assert!(!pre_omp_launch_runner(&[], 9, &|_| Other));
+    }
+
+    #[test]
+    fn worker_is_an_authentication_barrier_not_a_non_omp_wrapper() {
+        use AncestorProcess::{Omp, OmpWorker, Other};
+
+        let ancestors = [9, 7, 5, 3, 1];
+        for kinds in [
+            [Other, OmpWorker, Other, Omp, Other],
+            [Other, Omp, OmpWorker, Omp, Other],
+            [OmpWorker, Other, Other, Omp, Other],
+        ] {
+            let kind = |pid| kinds[ancestors.iter().position(|&p| p == pid).unwrap()];
+            assert_eq!(nearest_omp_owner(&ancestors, 3, &kind), None);
+            assert!(!pre_omp_launch_runner(&ancestors, 3, &kind));
+            assert!(!process_id_trusted_for_omp(
+                "550e8400-e29b-41d4-a716-446655440000",
+                &ancestors,
+                &kind,
+                Some(Some(3)),
+                &|_| true,
+                true,
+            ));
+            assert!(!process_id_trusted(
+                "omp-3-older-seat",
+                &ancestors,
+                &kind,
+                Some(Some(3)),
+                &|_| true,
+            ));
+        }
+        let kinds = [Other, Omp, OmpWorker, Omp, Other];
+        let kind = |pid| kinds[ancestors.iter().position(|&p| p == pid).unwrap()];
+        assert_eq!(
+            nearest_omp_owner(&ancestors, 7, &kind),
+            Some(OmpOwnerProof {
+                owner_pid: 7,
+                anchor_kind: Omp,
+            })
+        );
+        assert!(process_id_trusted_for_omp(
+            "omp-7-new-seat",
+            &ancestors,
+            &kind,
+            None,
+            &|_| false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn native_launch_shim_proof_requires_one_actual_seat_without_barriers() {
+        use AncestorProcess::{Omp, OmpLauncherShim, OmpWorker, Other, Unknown};
+
+        let ancestors = [9, 7, 5, 3, 1];
+        for (kinds, expected) in [
+            (
+                [Other, Omp, Other, OmpLauncherShim, Omp],
+                Some((7, OmpLauncherShim)),
+            ),
+            ([Other, Omp, Other, Other, Omp], Some((7, Other))),
+            ([Other, Other, Other, OmpLauncherShim, Omp], None),
+            ([Other, Omp, Omp, OmpLauncherShim, Other], None),
+            ([Other, Omp, Unknown, OmpLauncherShim, Other], None),
+            ([Other, Omp, OmpWorker, OmpLauncherShim, Other], None),
+            ([Other, OmpWorker, Other, OmpLauncherShim, Omp], None),
+            ([Other, Omp, Other, Unknown, Other], None),
+            ([Other, Omp, Other, OmpWorker, Other], None),
+        ] {
+            let kind = |pid| kinds[ancestors.iter().position(|&p| p == pid).unwrap()];
+            assert_eq!(
+                nearest_omp_owner(&ancestors, 3, &kind)
+                    .map(|proof| (proof.owner_pid, proof.anchor_kind)),
+                expected
+            );
+        }
+        assert!(!pre_omp_launch_runner(&ancestors, 3, &|pid| {
+            if pid == 7 { OmpWorker } else { OmpLauncherShim }
+        }));
+        assert!(pre_omp_launch_runner(&ancestors, 3, &|_| OmpLauncherShim));
+    }
+
+    #[test]
+    fn owner_proof_captures_the_anchor_role_in_one_process_walk() {
+        use AncestorProcess::{Omp, OmpLauncherShim, Other};
+
+        let ancestors = [9, 7, 5, 3, 1];
+        for anchor_kind in [OmpLauncherShim, Other] {
+            let reads = std::cell::RefCell::new(std::collections::HashSet::new());
+            let proof = nearest_omp_owner(&ancestors, 3, &|pid| {
+                assert!(reads.borrow_mut().insert(pid), "process {pid} was re-read");
+                match pid {
+                    7 => Omp,
+                    3 => anchor_kind,
+                    _ => Other,
+                }
+            });
+            assert_eq!(
+                proof,
+                Some(OmpOwnerProof {
+                    owner_pid: 7,
+                    anchor_kind,
+                })
+            );
+            assert_eq!(reads.borrow().len(), 4, "only the proven segment is read");
+        }
+    }
+
+    #[test]
+    fn process_id_trusted_omp_strict_minted_requires_its_nearest_owner() {
+        use AncestorProcess::{Omp, Other, Unknown};
+
+        let ancestors = [9, 7, 5, 3, 1];
+        for (case, id, kinds, expected) in [
+            (
+                "own OMP under another OMP",
+                "omp-7-1-2",
+                [Other, Omp, Unknown, Omp, Other],
+                true,
+            ),
+            (
+                "inherited ancestor OMP",
+                "omp-3-1-2",
+                [Other, Omp, Other, Omp, Other],
+                false,
+            ),
+            (
+                "non-OMP anchor above one OMP",
+                "omp-3-1-2",
+                [Other, Omp, Other, Other, Other],
+                false,
+            ),
+            ("no OMP", "omp-7-1-2", [Other; 5], false),
+            (
+                "unknown before owner",
+                "omp-7-1-2",
+                [Unknown, Omp, Other, Other, Other],
+                false,
+            ),
+            (
+                "unknown anchor",
+                "omp-7-1-2",
+                [Other, Unknown, Other, Other, Other],
+                false,
+            ),
+            (
+                "nonancestor minted pid",
+                "omp-99-1-2",
+                [Other, Omp, Other, Other, Other],
+                false,
+            ),
+            (
+                "self-inclusive minted owner",
+                "omp-9-1-2",
+                [Omp, Unknown, Other, Other, Other],
+                true,
+            ),
+        ] {
+            for presenter_is_omp in [false, true] {
+                assert_eq!(
+                    process_id_trusted_for_presenter(
+                        id,
+                        &ancestors,
+                        &|pid| kinds[ancestors.iter().position(|&p| p == pid).unwrap()],
+                        None,
+                        &|_| true,
+                        false,
+                        presenter_is_omp,
+                    ),
+                    expected,
+                    "{case}, presenter_is_omp={presenter_is_omp}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn tool_match_recognizes_omp_comm_or_argv0() {
+        assert!(tool_match_from_facts(Some("omp\n"), &["omp"], || {
+            Some(b"/usr/bin/bun\0/opt/cli.js\0--headless\0".as_slice())
+        }));
+        assert!(tool_match_from_facts(Some("renamed\n"), &["omp"], || {
+            Some(b"/opt/bin/omp\0--headless\0".as_slice())
+        }));
+        assert!(tool_match_from_facts(None, &["omp"], || {
+            Some(b"/opt/bin/omp\0".as_slice())
+        }));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn tool_match_recognizes_only_interpreter_argv1_as_tool() {
+        for interpreter in TOOL_INTERPRETERS {
+            let cmdline = format!("/usr/bin/{interpreter}\0/opt/bin/omp\0--headless\0");
+            assert!(
+                tool_match_from_facts(Some("renamed\n"), &["omp"], || Some(cmdline.as_bytes())),
+                "{interpreter}",
+            );
+        }
+        assert!(!tool_match_from_facts(Some("sleep\n"), &["omp"], || {
+            Some(b"/usr/bin/sleep\0/opt/bin/omp\0".as_slice())
+        }));
+        assert!(!tool_match_from_facts(Some("bun\n"), &["omp"], || {
+            Some(b"/usr/bin/bun\0--flag\0/opt/bin/omp\0".as_slice())
+        }));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn tool_match_recognizes_only_omp_package_entrypoint_suffix() {
+        assert!(tool_match_from_facts(Some("renamed\n"), &["omp"], || {
+            Some(
+                b"/usr/bin/bun\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0"
+                    .as_slice(),
+            )
+        }));
+        for cmdline in [
+            b"/usr/bin/bun\0/opt/unrelated/dist/cli.js\0".as_slice(),
+            b"/usr/bin/bun\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js-extra\0"
+                .as_slice(),
+            b"/usr/bin/sleep\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0".as_slice(),
+            b"/usr/bin/bun\0--flag\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0"
+                .as_slice(),
+        ] {
+            assert!(
+                !tool_match_from_facts(Some("renamed\n"), &["omp"], || Some(cmdline)),
+                "{cmdline:?}",
+            );
+        }
+        assert!(!tool_match_from_facts(
+            Some("renamed\n"),
+            &["other-tool"],
+            || {
+                Some(
+                    b"/usr/bin/bun\0/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js\0"
+                        .as_slice(),
+                )
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn tool_match_keeps_non_omp_positive_name_policy() {
+        assert!(tool_match_from_facts(Some("node\n"), &["node"], || None::<
+            &[u8],
+        >));
+        assert!(tool_match_from_facts(Some("renamed\n"), &["bun"], || {
+            Some(b"/usr/bin/bun\0/opt/bin/omp\0__omp_worker_daemon_broker\0".as_slice())
+        }));
     }
 
     #[test]

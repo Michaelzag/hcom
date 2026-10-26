@@ -1397,6 +1397,7 @@ fn finalize_background_launch(
     log_file: String,
     pid: u32,
     effective_preset: String,
+    omp_launch_pid: Option<&mut instance_binding::OmpLaunchPidSnapshot>,
 ) {
     if let Err(error) = instance_binding::persist_terminal_launch_context(
         ctx.db,
@@ -1415,7 +1416,15 @@ fn finalize_background_launch(
     // The wrapper can record its own pid and then its tool's pid during that
     // wait; an unconditional launcher write here would replace the proof.
     // Non-PTY backgrounds have no wrapper writer, so they keep this pid.
-    if let Err(e) = ctx.db.set_instance_pid_if_unset(ctx.instance_name, pid) {
+    let recorded = if ctx.tool == "omp" {
+        match omp_launch_pid {
+            Some(expected) => instance_binding::record_omp_launch_pid(ctx.db, expected, pid),
+            None => Ok(false),
+        }
+    } else {
+        ctx.db.set_instance_pid_if_unset(ctx.instance_name, pid)
+    };
+    if let Err(e) = recorded {
         crate::log::log_error("launcher", "background.pid", &format!("{e}"));
         eprintln!(
             "Warning: '{}' launched, but recording its pid failed: {e}. \
@@ -1530,6 +1539,14 @@ fn launch_pty_or_background(
     inside_ai_tool: bool,
 ) -> Result<bool> {
     if params.background {
+        // The runner can bind before launch_terminal returns. Retain the
+        // original unbound UUID reservation; never refresh after spawn.
+        let mut omp_launch_pid = if ctx.tool == "omp" {
+            instance_binding::capture_omp_launch_pid(ctx.db, ctx.process_id, ctx.instance_name)?
+                .filter(|expected| expected.row.pid.is_none() || expected.replaces_stale_pin)
+        } else {
+            None
+        };
         let (log_file, pid, effective_preset) = launch_background_runner(
             ctx.tool,
             ctx.working_dir,
@@ -1540,7 +1557,13 @@ fn launch_pty_or_background(
             inside_ai_tool,
             params.answer_omp_reroot_prompt,
         )?;
-        finalize_background_launch(ctx, log_file, pid, effective_preset);
+        finalize_background_launch(
+            ctx,
+            log_file,
+            pid,
+            effective_preset,
+            omp_launch_pid.as_mut(),
+        );
         Ok(true)
     } else {
         let effective_run_here = will_run_in_current_terminal(
@@ -1604,10 +1627,7 @@ pub(crate) fn registered_unclaimed_incarnation(
     let Some(row) = db.get_instance_full(name)? else {
         return Ok(None);
     };
-    let reserving = (row.status == crate::shared::ST_INACTIVE
-        || row.status == instance_names::PLACEHOLDER_STATUS)
-        && row.status_context == instance_names::PLACEHOLDER_CONTEXT;
-    if !reserving {
+    if !instance_binding::is_launch_reservation_shape(&row) {
         return Ok(None);
     }
     let Some(session_id) = row.session_id.filter(|s| !s.is_empty()) else {
@@ -1767,10 +1787,26 @@ pub(crate) fn register_launch_instance(
     // One PostCommit for the registration: the `life.created` fan-out runs
     // inline with wakes collected, and `fire` runs only after commit. A
     // rollback drops `post`, discarding wakes for the unwritten row.
-    let post = db.with_immediate_transaction(|_tx| {
+    let post = db.with_immediate_transaction(|tx| {
         let mut post = PostCommit::default();
         if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            let held_pin = instance_binding::prepare_own_omp_reservation_in_txn(
+                db,
+                tx,
+                instance_name,
+                sid,
+                tool,
+            )?;
             refuse_held_session(db, instance_name, sid)?;
+            if let Some(pin) = held_pin {
+                bail!(
+                    "'{instance_name}' has an unhooked OMP launch reservation whose recorded pid {} {}. \
+                     If that launch is hung or gone, run 'hcom stop {instance_name}' to release the \
+                     reservation (no process is signaled), then resume again.",
+                    pin.pid,
+                    pin.reason
+                );
+            }
         }
         if !instance_binding::initialize_instance_in_position_file_collected(
             db,
@@ -2367,6 +2403,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                     log_file,
                                     pid,
                                     effective_preset,
+                                    None,
                                 );
                                 Ok(true)
                             }

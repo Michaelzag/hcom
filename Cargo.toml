@@ -76,6 +76,7 @@ signal-hook = "0.4.4"
 # Windows-only: process/job-object control, winsock select, file locking.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",
@@ -85,6 +86,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_Storage_FileSystem",
     "Win32_Networking_WinSock",
+    "Win32_UI_Shell",
 ] }
 # ConPTY-backed pseudoterminal for the Windows PTY wrapper.
 portable-pty = "0.9"

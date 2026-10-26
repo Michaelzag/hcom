@@ -41,7 +41,15 @@ pub fn run(args: &[String]) -> i32 {
         log_info("launch_anchor", "refused", "process id has no binding");
         return 1;
     };
-    match db.set_instance_pid_if_unset(&instance, parent) {
+    let recorded =
+        match crate::instance_binding::capture_omp_launch_pid(&db, &process_id, &instance) {
+            Ok(Some(mut expected)) if expected.row.pid.is_none() => {
+                crate::instance_binding::record_omp_launch_pid(&db, &mut expected, parent)
+            }
+            Ok(_) => db.set_instance_pid_if_unset(&instance, parent),
+            Err(error) => Err(error),
+        };
+    match recorded {
         Ok(true) => {
             log_info(
                 "launch_anchor",

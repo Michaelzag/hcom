@@ -1377,16 +1377,27 @@ fn run_pty_test_plugin_family(tool: &str, read_hook: &str) {
     //
     // Two co-conditions for true quiescence:
     //   1. Latest event is status=listening (agent is idle right now).
-    //   2. `hcom <read-hook> --check` is "false" (cursor caught up; plugin
-    //      won't re-trigger another piggyback). Listening alone is correlative
-    //      — if pendingAckId or deliveryInFlight ever got stuck, listening
-    //      could appear stable while the cursor was still behind.
+    //   2. No unread mail remains (cursor caught up; plugin won't re-trigger
+    //      another piggyback). OMP hook reads are owner-authenticated and can
+    //      consume governed mail, so the outside observer uses list's pure
+    //      unread_count instead. Listening alone could mask a stuck ack.
     poll_until(
         || {
             let evs = get_events(&base_name, 1, false);
             let last = evs.last()?;
             if last["data"]["status"].as_str() != Some("listening") {
                 return None;
+            }
+            if tool == "omp" {
+                let out = hcom("list --json");
+                if !out.status.success() {
+                    return None;
+                }
+                let rows: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
+                let row = rows
+                    .iter()
+                    .find(|row| row["base_name"].as_str() == Some(base_name.as_str()))?;
+                return (row["unread_count"].as_i64() == Some(0)).then_some(());
             }
             let out = hcom(&format!("{read_hook} --name {base_name} --check"));
             if !out.status.success() {

@@ -13,6 +13,7 @@
 pub mod claude_mock;
 pub mod codex_mock;
 pub mod mock_http;
+pub mod omp_owner;
 pub mod real_tool;
 
 use rusqlite::OptionalExtension;
