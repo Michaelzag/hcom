@@ -502,6 +502,24 @@ printf '%s' "$?" > "$TEST_OUT_DIR/anchor.code"
 wait "$!"
 "#;
 
+    /// A launcher with no hcom identity: it starts the OMP with one, then
+    /// `exec`s into an idle process that never reaps it.
+    const IDLE_LAUNCHER: &str = r#"
+HCOM_PROCESS_ID="$TEST_PROCESS_ID" "$TEST_OMP" "$TEST_RUNNER" &
+exec sleep 300
+"#;
+
+    /// How the stand-in OMP starts.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Launch {
+        /// This test's direct child, leading its own process group.
+        Leader,
+        /// Below [`LAUNCHER`], which leads the group and anchors the launch.
+        Launcher,
+        /// Below [`IDLE_LAUNCHER`], which leads the group and never reaps it.
+        IdleLauncher,
+    }
+
     struct HookOwner {
         proc: Owned,
         pid: u32,
@@ -512,37 +530,50 @@ wait "$!"
 
     impl HookOwner {
         fn spawn(h: &Hcom, label: &str) -> Self {
-            Self::start(h, label, &uuid::Uuid::new_v4().to_string(), false)
+            Self::start(h, label, &uuid::Uuid::new_v4().to_string(), Launch::Leader)
         }
 
         /// The stand-in OMP below a launcher that leads the process group, as
         /// an hcom launch runs it. `process_id`'s reservation must already
         /// exist: the launcher anchors it before it starts the OMP.
         fn spawn_launched(h: &Hcom, label: &str, process_id: &str) -> Self {
-            Self::start(h, label, process_id, true)
+            Self::start(h, label, process_id, Launch::Launcher)
         }
 
-        fn start(h: &Hcom, label: &str, process_id: &str, launcher: bool) -> Self {
+        fn start(h: &Hcom, label: &str, process_id: &str, launch: Launch) -> Self {
             let omp = fakebin(h).join("omp");
             let out_dir = h.root_path().join(format!("owner-{label}"));
             fs::create_dir_all(&out_dir).expect("create owner directory");
             let runner = out_dir.join("steps.sh");
             fs::write(&runner, STEP_RUNNER).expect("write step runner");
-            let mut command = if launcher {
-                let mut command = h.external_cmd("/bin/bash");
-                command
-                    .arg("-c")
-                    .arg(LAUNCHER)
-                    .env("TEST_OMP", &omp)
-                    .env("TEST_RUNNER", &runner);
-                command
-            } else {
-                let mut command = h.external_cmd(&omp);
-                command.arg(&runner);
-                command
+            let mut command = match launch {
+                Launch::Leader => {
+                    let mut command = h.external_cmd(&omp);
+                    command.arg(&runner).env("HCOM_PROCESS_ID", process_id);
+                    command
+                }
+                Launch::Launcher => {
+                    let mut command = h.external_cmd("/bin/bash");
+                    command
+                        .arg("-c")
+                        .arg(LAUNCHER)
+                        .env("TEST_OMP", &omp)
+                        .env("TEST_RUNNER", &runner)
+                        .env("HCOM_PROCESS_ID", process_id);
+                    command
+                }
+                Launch::IdleLauncher => {
+                    let mut command = h.external_cmd("/bin/bash");
+                    command
+                        .arg("-c")
+                        .arg(IDLE_LAUNCHER)
+                        .env("TEST_OMP", &omp)
+                        .env("TEST_RUNNER", &runner)
+                        .env("TEST_PROCESS_ID", process_id);
+                    command
+                }
             };
             command
-                .env("HCOM_PROCESS_ID", process_id)
                 .env("TEST_OUT_DIR", &out_dir)
                 .env("TEST_CWD", &h.workspace)
                 .env("TEST_BIN", env!("CARGO_BIN_EXE_hcom"))
@@ -558,14 +589,14 @@ wait "$!"
             });
             let mut lines = ready.lines();
             let pid: u32 = lines.next().unwrap().parse().expect("fixture OMP PID");
-            if launcher {
+            if launch == Launch::Leader {
+                assert_eq!(pid, proc.pid(), "fixture OMP is not the direct child");
+            } else {
                 assert_ne!(
                     pid,
                     proc.pid(),
                     "fixture OMP must be its launcher's child, not exec'd"
                 );
-            } else {
-                assert_eq!(pid, proc.pid(), "fixture OMP is not the direct child");
             }
             assert_eq!(lines.next(), Some(process_id));
             Self {
@@ -636,12 +667,42 @@ wait "$!"
             pid
         }
 
-        /// A bystander in the owner's process group with no hcom identity:
-        /// the owner's child with a cleared environment and without the
-        /// owner's open session transcript, recording any signal it receives
-        /// and keeping a heartbeat.
-        fn spawn_group_bystander(&self, h: &Hcom) -> Bystander {
-            let dir = h.root_path().join("bystander");
+        /// The OMP alone dies by SIGKILL, with no cleanup, and stays an
+        /// unreaped zombie: its parent is this test, which only peeks at it,
+        /// or an idle launcher, which never reaps.
+        fn die_unreaped(&self) {
+            if self.pid == self.proc.pid() {
+                assert_eq!(
+                    self.proc.die_unreaped().as_deref(),
+                    Some("signal 9"),
+                    "fixture OMP did not die by SIGKILL"
+                );
+            } else {
+                // Not this test's child, but alive in this fixture's group up
+                // to the signal, and its idle parent never reaps it, so the
+                // PID cannot pass to anyone else.
+                assert!(
+                    member_alive(self.pid, self.pgid()),
+                    "fixture OMP exited early"
+                );
+                unsafe {
+                    libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            let zombie = Some(('Z', i64::from(self.pgid())));
+            assert!(
+                wait_until(Duration::from_secs(10), || proc_state(self.pid) == zombie),
+                "precondition: the dead OMP must stay an unreaped zombie in group {}",
+                self.pgid()
+            );
+        }
+
+        /// A leftover child of N's group: the owner's own child, started with
+        /// a cleared environment and without the owner's open session
+        /// transcript, so it carries no hcom identity. It records any signal
+        /// it receives and keeps a heartbeat.
+        fn spawn_leftover_child(&self, h: &Hcom) -> Leftover {
+            let dir = h.root_path().join("leftover");
             let (code, stdout, stderr) = self.run(
                 h,
                 &format!(
@@ -650,22 +711,21 @@ wait "$!"
                     quote(&dir.to_string_lossy()),
                 ),
             );
-            assert_eq!(code, 0, "spawn group bystander: {stdout} {stderr}");
-            let bystander = Bystander {
-                pid: stdout.trim().parse().expect("bystander PID"),
+            assert_eq!(code, 0, "spawn leftover child: {stdout} {stderr}");
+            let leftover = Leftover {
+                pid: stdout.trim().parse().expect("leftover PID"),
                 pgid: self.pgid(),
                 dir,
             };
-            h.eventually("group bystander ready", Duration::from_secs(30), || {
-                Ok((fs::read_to_string(bystander.dir.join("ready")).ok()
-                    == Some(bystander.pid.to_string())
-                    && beats(&bystander.dir) > 0
-                    && member_alive(bystander.pid, bystander.pgid)
-                    && caught_signals(bystander.pid) & mask(&CHILD_SIGNALS)
-                        == mask(&CHILD_SIGNALS))
+            h.eventually("leftover child ready", Duration::from_secs(30), || {
+                Ok((fs::read_to_string(leftover.dir.join("ready")).ok()
+                    == Some(leftover.pid.to_string())
+                    && leftover.beats() > 0
+                    && member_alive(leftover.pid, leftover.pgid)
+                    && caught_signals(leftover.pid) & mask(&CHILD_SIGNALS) == mask(&CHILD_SIGNALS))
                 .then_some(()))
             });
-            bystander
+            leftover
         }
     }
 
@@ -673,7 +733,18 @@ wait "$!"
     /// a pending reservation, `hcom launch-anchor` run from the owner (which
     /// records its PID and native identity receipt), then `omp-start`.
     fn hooked_owner(h: &Hcom, label: &str, name: &str, endpoint: &TcpListener) -> HookOwner {
-        let owner = HookOwner::spawn(h, label);
+        self_anchored_owner(h, label, name, endpoint, Launch::Leader)
+    }
+
+    /// [`hooked_owner`] for an OMP started as `launch`.
+    fn self_anchored_owner(
+        h: &Hcom,
+        label: &str,
+        name: &str,
+        endpoint: &TcpListener,
+        launch: Launch,
+    ) -> HookOwner {
+        let owner = HookOwner::start(h, label, &uuid::Uuid::new_v4().to_string(), launch);
         launch_row(h, name, &owner.process_id);
         let anchor = owner.run(h, "H launch-anchor");
         assert_receipt(h, name, owner.pid(), &anchor);
@@ -1000,19 +1071,23 @@ while True:
     /// A member of a fixture process group that is not this test's child. It
     /// counts as alive only while it exists unreaped in that group, so a
     /// later PID reuser never reads as it.
-    struct Bystander {
+    struct Leftover {
         pid: u32,
         pgid: u32,
         dir: PathBuf,
     }
 
-    impl Bystander {
+    impl Leftover {
+        fn beats(&self) -> u64 {
+            beats(&self.dir)
+        }
+
         /// Wait (bounded) for two more heartbeats, which proves any signal
-        /// already sent had its trap run, or for the bystander to be gone.
+        /// already sent had its trap run, or for the leftover to be gone.
         fn observe(&self, before: u64) -> Value {
             let mut progressed = false;
             wait_until(Duration::from_secs(5), || {
-                progressed = beats(&self.dir) >= before + 2;
+                progressed = self.beats() >= before + 2;
                 progressed || !member_alive(self.pid, self.pgid)
             });
             json!({
@@ -1025,6 +1100,71 @@ while True:
         fn spared() -> Value {
             json!({"alive": true, "heartbeat_progressed": true, "signals": ""})
         }
+    }
+
+    /// Live (non-zombie) members of a process group, sorted.
+    fn live_members(pgid: u32) -> Vec<u32> {
+        let mut members: Vec<u32> = fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|&pid| member_alive(pid, pgid))
+            .collect();
+        members.sort_unstable();
+        members
+    }
+
+    /// Precondition: wait (bounded) until `pgid`'s live members are exactly
+    /// `expected`. The stand-in's own short-lived helpers exit on their own.
+    #[track_caller]
+    fn assert_live_members(pgid: u32, expected: &[u32]) {
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        let mut members = Vec::new();
+        let settled = wait_until(Duration::from_secs(10), || {
+            members = live_members(pgid);
+            members == expected
+        });
+        assert!(
+            settled,
+            "precondition: process group {pgid} must hold exactly {expected:?} alive, found \
+             {members:?}"
+        );
+    }
+
+    fn receipt_pid(h: &Hcom, name: &str) -> Option<i64> {
+        db(h)
+            .query_row(
+                "SELECT CASE WHEN json_valid(launch_context)
+                             THEN json_extract(launch_context,'$.omp_launch_pid.pid') END
+                   FROM instances WHERE name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn says(output: &str, phrase: &str) -> bool {
+        output.to_lowercase().contains(phrase)
+    }
+
+    /// `output` says "<n> <word>…", with no digit right before `n`.
+    fn says_count(output: &str, n: usize, word: &str) -> bool {
+        let output = output.to_lowercase();
+        let needle = format!("{n} {word}");
+        output.match_indices(&needle).any(|(at, _)| {
+            !output[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+    }
+
+    /// `output` says something was not signalled, in either spelling.
+    fn says_not_signalled(output: &str) -> bool {
+        ["not signal", "n't signal", "unsignal"]
+            .iter()
+            .any(|phrase| says(output, phrase))
     }
 
     #[track_caller]
@@ -1202,59 +1342,202 @@ while True:
     }
 
     // -----------------------------------------------------------------------
-    // Row 4, zombie: the genuine owner exited but is still unreaped. Its PID
-    // stays in the process table (state Z) with the start time its receipt
-    // names, and it still leads its process group, which lives on through a
-    // bystander with no hcom identity. No live process owns the seat.
+    // Row 4, zombie: the owner exited but is still unreaped. While it is, its
+    // PID and its process-group id cannot pass to anyone else, so the live
+    // members of its group are N's own leftovers; here the leftover is the
+    // owner's child with a cleared environment, so it carries no hcom
+    // identity. A zombie's environment cannot be read, so only a receipt can
+    // verify it. An outsider that was never in the group is never signalled.
     // -----------------------------------------------------------------------
 
+    /// An unrelated live process in its own process group.
+    fn spawn_outsider(h: &Hcom) -> Sentinel {
+        Sentinel::bash(h, "outsider", Path::new("/bin/bash"), &[], false)
+    }
+
+    #[track_caller]
+    fn assert_outsider_spared(outsider: &Sentinel, before: Beats, name: &str, output: &str) {
+        assert_eq!(
+            outsider.observe(before),
+            outsider.spared(),
+            "SAFETY: `hcom kill {name}` signalled outsider {}, which was never in the zombie's \
+             process group:\n{output}",
+            outsider.pid()
+        );
+    }
+
+    /// (a) The zombie leads its group and its receipt verifies it: the group
+    /// is signalled, so the leftover gets TERM; normal cleanup runs.
     #[test]
-    fn kill_with_zombie_owner_signals_nothing_and_cleans_up() {
+    fn kill_zombie_leader_with_a_receipt_terminates_its_groups_leftovers() {
         let h = Scene::new();
         let endpoint = TcpListener::bind("127.0.0.1:0").expect("bind fixture endpoint");
-        let name = format!("zombie{}", unique_suffix());
-        let owner = hooked_owner(&h, "zombie", &name, &endpoint);
-        let bystander = owner.spawn_group_bystander(&h);
+        let name = format!("zombieleader{}", unique_suffix());
+        let owner = hooked_owner(&h, "zombie-leader", &name, &endpoint);
+        let leftover = owner.spawn_leftover_child(&h);
+        let outsider = spawn_outsider(&h);
         let before_death = row_facts(&h, &name);
-        assert_eq!(
-            owner.proc.die_unreaped().as_deref(),
-            Some("signal 9"),
-            "fixture OMP did not die by SIGKILL"
-        );
-        let zombie = Some(('Z', i64::from(owner.pid())));
-        assert_eq!(
-            proc_state(owner.pid()),
-            zombie,
-            "precondition: the dead owner must be an unreaped zombie leading its group"
-        );
+        owner.die_unreaped();
         assert_eq!(
             row_facts(&h, &name),
             before_death,
             "the death alone changed {name}'s bookkeeping"
         );
-
-        let before = beats(&bystander.dir);
-        let (code, output) = kill(&h, &[&name]);
-        let observed = bystander.observe(before);
+        assert_live_members(owner.pgid(), &[leftover.pid]);
         assert_eq!(
-            observed,
-            Bystander::spared(),
-            "SAFETY: `hcom kill {name}` signalled bystander {} in zombie owner {}'s process \
-             group:\n{output}",
-            bystander.pid,
+            receipt_pid(&h, &name),
+            Some(i64::from(owner.pid())),
+            "precondition: {name}'s receipt must name the zombie owner"
+        );
+
+        let before = (leftover.beats(), outsider.beats());
+        let (code, output) = kill(&h, &[&name]);
+        let seen = leftover.observe(before.0);
+        assert_outsider_spared(&outsider, before.1, &name, &output);
+        assert_eq!(
+            (&seen["alive"], &seen["signals"]),
+            (&json!(false), &json!("TERM\n")),
+            "`hcom kill {name}` did not terminate leftover child {} of zombie leader {} with \
+             TERM:\n{output}",
+            leftover.pid,
             owner.pid()
         );
         assert_eq!(
             proc_state(owner.pid()),
-            zombie,
-            "precondition: the owner must stay an unreaped zombie through the kill"
+            Some(('Z', i64::from(owner.pgid()))),
+            "the zombie owner must stay an unreaped zombie"
+        );
+        assert!(
+            says(&output, "already exited")
+                && says_count(&output, 1, "leftover")
+                && says(&output, "terminated"),
+            "kill did not say {name}'s owner had already exited and 1 leftover process was \
+             terminated:\n{output}"
+        );
+        assert_eq!(
+            code, 0,
+            "kill of a verified zombie leader failed:\n{output}"
+        );
+        assert_torn_down(&h, &name);
+    }
+
+    /// (b) A legacy row: no receipt, and a zombie's environment cannot be
+    /// read. Nothing is signalled; the leftovers are listed, with the
+    /// `hcom stop` pointer, and the kill is not reported clean.
+    #[test]
+    fn kill_zombie_without_a_receipt_signals_nothing_and_lists_its_leftovers() {
+        let h = Scene::new();
+        let name = format!("zombielegacy{}", unique_suffix());
+        let owner = HookOwner::spawn(&h, "zombie-legacy");
+        seed_legacy_row(&h, &name, &owner.process_id, Some(owner.pid()));
+        let leftover = owner.spawn_leftover_child(&h);
+        let outsider = spawn_outsider(&h);
+        owner.die_unreaped();
+        assert_eq!(
+            receipt_pid(&h, &name),
+            None,
+            "precondition: a legacy row carries no receipt"
+        );
+        assert!(
+            fs::read(format!("/proc/{}/environ", owner.pid()))
+                .map(|environ| environ.is_empty())
+                .unwrap_or(true),
+            "precondition: a zombie's environment cannot be read"
+        );
+        assert_live_members(owner.pgid(), &[leftover.pid]);
+
+        let before = (leftover.beats(), outsider.beats());
+        let (code, output) = kill(&h, &[&name]);
+        let seen = leftover.observe(before.0);
+        assert_outsider_spared(&outsider, before.1, &name, &output);
+        assert_eq!(
+            seen,
+            Leftover::spared(),
+            "SAFETY: `hcom kill {name}` signalled leftover child {} although nothing verifies \
+             zombie owner {}:\n{output}",
+            leftover.pid,
+            owner.pid()
+        );
+        assert_eq!(
+            proc_state(owner.pid()),
+            Some(('Z', i64::from(owner.pgid()))),
+            "the zombie owner must stay an unreaped zombie"
+        );
+        assert!(
+            names_pid(&output, leftover.pid) && says_not_signalled(&output),
+            "kill did not list leftover {} as not signalled:\n{output}",
+            leftover.pid
+        );
+        assert!(
+            output.contains(&format!("hcom stop {name}")),
+            "kill did not point at `hcom stop {name}`:\n{output}"
         );
         assert!(
             !output.contains("Sent SIG"),
-            "kill reported a signal to zombie owner {}:\n{output}",
+            "kill reported a signal for an unverifiable zombie:\n{output}"
+        );
+        assert_ne!(
+            code, 0,
+            "kill claimed a clean kill of an unverifiable zombie:\n{output}"
+        );
+        assert_row_kept(&h, &name, owner.pid());
+    }
+
+    /// (c) The zombie is verified by its receipt but does not lead its group:
+    /// the idle launcher above it does. No group is signalled; normal cleanup
+    /// runs.
+    #[test]
+    fn kill_zombie_that_does_not_lead_its_group_signals_no_group() {
+        let h = Scene::new();
+        let endpoint = TcpListener::bind("127.0.0.1:0").expect("bind fixture endpoint");
+        let name = format!("zombiemember{}", unique_suffix());
+        let owner =
+            self_anchored_owner(&h, "zombie-member", &name, &endpoint, Launch::IdleLauncher);
+        let leftover = owner.spawn_leftover_child(&h);
+        let outsider = spawn_outsider(&h);
+        let before_death = row_facts(&h, &name);
+        owner.die_unreaped();
+        assert_eq!(
+            row_facts(&h, &name),
+            before_death,
+            "the death alone changed {name}'s bookkeeping"
+        );
+        assert_live_members(owner.pgid(), &[owner.pgid(), leftover.pid]);
+        assert_eq!(
+            receipt_pid(&h, &name),
+            Some(i64::from(owner.pid())),
+            "precondition: {name}'s receipt must name the zombie owner"
+        );
+
+        let before = (leftover.beats(), outsider.beats());
+        let (code, output) = kill(&h, &[&name]);
+        let seen = leftover.observe(before.0);
+        assert_outsider_spared(&outsider, before.1, &name, &output);
+        assert_eq!(
+            seen,
+            Leftover::spared(),
+            "`hcom kill {name}` signalled leftover child {} in launcher {}'s group, which zombie \
+             owner {} does not lead:\n{output}",
+            leftover.pid,
+            owner.pgid(),
             owner.pid()
         );
-        assert_eq!(code, 0, "kill of a zombie owner failed:\n{output}");
+        assert_eq!(
+            owner.proc.peek_exit(),
+            None,
+            "`hcom kill {name}` signalled launcher {}, which leads the zombie's group:\n{output}",
+            owner.pgid()
+        );
+        assert_eq!(
+            proc_state(owner.pid()),
+            Some(('Z', i64::from(owner.pgid()))),
+            "the zombie owner must stay an unreaped zombie"
+        );
+        assert!(
+            !output.contains("Sent SIG"),
+            "kill reported a group signal for a zombie that does not lead its group:\n{output}"
+        );
+        assert_eq!(code, 0, "kill of a verified zombie failed:\n{output}");
         assert_torn_down(&h, &name);
     }
 
