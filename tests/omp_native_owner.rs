@@ -1957,7 +1957,7 @@ fn wait_for_tool(
     launch: &mut PrivateCommand,
     previous: Option<i64>,
 ) -> Option<Tool> {
-    let observed = wait_until(PROCESS_WAIT, || {
+    wait_until(PROCESS_WAIT, || {
         #[cfg(windows)]
         if let Some(owner) = &mut launch.background {
             owner.observe(h);
@@ -2013,8 +2013,7 @@ fn wait_for_tool(
             }
         }
     })
-    .flatten();
-    observed
+    .flatten()
 }
 
 /// The pin a settled pre-hook launch must hold. On macOS the PTY child execs

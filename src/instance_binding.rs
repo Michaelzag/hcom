@@ -6056,14 +6056,24 @@ mod tests {
                 "windows:{}",
                 ticks.checked_add(1).expect("distinct creation tick")
             ));
-            db.store_launch_context("luna", &context.to_string())
+            db.conn()
+                .execute(
+                    "UPDATE instances SET launch_context=?1 WHERE name='luna'",
+                    rusqlite::params![context.to_string()],
+                )
                 .unwrap();
             let mismatched = db.get_instance_full("luna").unwrap().unwrap();
-            assert!(
-                OmpLaunchPidReceipt::parse(&db, &mismatched)
-                    .unwrap()
-                    .is_some()
+            let receipt = OmpLaunchPidReceipt::parse(&db, &mismatched)
+                .unwrap()
+                .expect("mismatched fixture must retain a correlated receipt");
+            assert_eq!(
+                receipt.identity,
+                format!(
+                    "windows:{}",
+                    ticks.checked_add(1).expect("distinct creation tick")
+                )
             );
+            assert_ne!(receipt.identity, identity);
             assert_releases_only_own_pin(&db, "now belongs to another process", || {
                 child.assert_running(&identity);
             });
