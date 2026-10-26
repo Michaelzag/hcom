@@ -1118,9 +1118,7 @@ fn omp_launch_pin_verdict_checked(
             pid,
             reason: "is still the running launch process",
         }),
-        (_, None) if definitely_dead(process_pid) => {
-            Ok(OmpLaunchPin::Replaceable("exited"))
-        }
+        (_, None) if definitely_dead(process_pid) => Ok(OmpLaunchPin::Replaceable("exited")),
         (_, None) => Ok(OmpLaunchPin::Held {
             pid,
             reason: "cannot be read",
@@ -1565,8 +1563,7 @@ fn bind_omp_session_to_process_checked(
                 .is_some_and(|binding| binding.instance_name == target)
             && current.target_row.is_none()
         {
-            let Some((stopped_name, _)) = db.find_stopped_event_by_session_id(session_id)?
-            else {
+            let Some((stopped_name, _)) = db.find_stopped_event_by_session_id(session_id)? else {
                 anyhow::bail!("stopped history changed before claim");
             };
             anyhow::ensure!(
@@ -5709,12 +5706,9 @@ mod tests {
     fn omp_launch_pin_matching_live_receipt_is_held() {
         let (db, path) = setup_test_db();
         let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
-        let verdict = omp_launch_pin_verdict_checked(
-            &db,
-            &row,
-            &|_| false,
-            &|pid| (pid == LAUNCH_PIN_PID).then_some(LAUNCH_PIN_IDENTITY.to_string()),
-        )
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| false, &|pid| {
+            (pid == LAUNCH_PIN_PID).then_some(LAUNCH_PIN_IDENTITY.to_string())
+        })
         .unwrap();
         assert_launch_pin_held(verdict, "is still the running launch process");
         cleanup(path);
@@ -5724,12 +5718,9 @@ mod tests {
     fn omp_launch_pin_receiptless_live_process_is_held() {
         let (db, path) = setup_test_db();
         let row = seed_omp_launch_reservation(&db, None);
-        let verdict = omp_launch_pin_verdict_checked(
-            &db,
-            &row,
-            &|_| false,
-            &|pid| (pid == LAUNCH_PIN_PID).then_some("some-live-birth".to_string()),
-        )
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| false, &|pid| {
+            (pid == LAUNCH_PIN_PID).then_some("some-live-birth".to_string())
+        })
         .unwrap();
         assert_launch_pin_held(verdict, "is live and has no verifiable launch receipt");
         cleanup(path);
@@ -5742,8 +5733,7 @@ mod tests {
     fn omp_launch_pin_unreadable_live_process_is_held_not_mismatched() {
         let (db, path) = setup_test_db();
         let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
-        let verdict =
-            omp_launch_pin_verdict_checked(&db, &row, &|_| false, &|_| None).unwrap();
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| false, &|_| None).unwrap();
         assert_launch_pin_held(verdict, "cannot be read");
         cleanup(path);
     }
@@ -5752,12 +5742,9 @@ mod tests {
     fn omp_launch_pin_mismatched_correlated_receipt_is_replaceable() {
         let (db, path) = setup_test_db();
         let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
-        let verdict = omp_launch_pin_verdict_checked(
-            &db,
-            &row,
-            &|_| false,
-            &|pid| (pid == LAUNCH_PIN_PID).then_some("launch-pin-birth-b".to_string()),
-        )
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| false, &|pid| {
+            (pid == LAUNCH_PIN_PID).then_some("launch-pin-birth-b".to_string())
+        })
         .unwrap();
         assert_launch_pin_replaceable(verdict, "now belongs to another process");
         cleanup(path);
@@ -5767,8 +5754,7 @@ mod tests {
     fn omp_launch_pin_gone_process_is_replaceable() {
         let (db, path) = setup_test_db();
         let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
-        let verdict =
-            omp_launch_pin_verdict_checked(&db, &row, &|_| true, &|_| None).unwrap();
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| true, &|_| None).unwrap();
         assert_launch_pin_replaceable(verdict, "exited");
         cleanup(path);
     }
@@ -5783,15 +5769,10 @@ mod tests {
         let (db, path) = setup_test_db();
         let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
         let identity_reads = std::cell::Cell::new(0u32);
-        let verdict = omp_launch_pin_verdict_checked(
-            &db,
-            &row,
-            &|_| true,
-            &|pid| {
-                identity_reads.set(identity_reads.get() + 1);
-                (pid == LAUNCH_PIN_PID).then_some(LAUNCH_PIN_IDENTITY.to_string())
-            },
-        )
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| true, &|pid| {
+            identity_reads.set(identity_reads.get() + 1);
+            (pid == LAUNCH_PIN_PID).then_some(LAUNCH_PIN_IDENTITY.to_string())
+        })
         .unwrap();
         assert_launch_pin_replaceable(verdict, "exited");
         assert_eq!(
@@ -5854,7 +5835,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_process_binding("proc-other-seat", "", "fano").unwrap();
+        db.set_process_binding("proc-other-seat", "", "fano")
+            .unwrap();
         let other_before = db.get_instance_full("fano").unwrap().unwrap();
         let other_binding_before = process_binding_epoch(&db, "proc-other-seat").unwrap();
         let released = db
@@ -5889,4 +5871,184 @@ mod tests {
         cleanup(path);
     }
 
+    #[cfg(windows)]
+    mod native_windows {
+        use super::*;
+        use std::process::{Child, Command, Stdio};
+
+        struct OwnedChild(Child);
+
+        impl OwnedChild {
+            fn spawn() -> Self {
+                let system_root = std::env::var_os("SystemRoot").expect("Windows system root");
+                Self(
+                    Command::new(PathBuf::from(&system_root).join("System32/cmd.exe"))
+                        .args(["/d", "/s", "/c", "set /p HCOM101_IDLE="])
+                        .env_clear()
+                        .env("SystemRoot", system_root)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .expect("spawn owned native child"),
+                )
+            }
+
+            fn kill_and_wait(&mut self) {
+                self.0.kill().expect("kill owned native child");
+                self.0.wait().expect("reap owned native child");
+            }
+        }
+
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn record_child(db: &HcomDb, child: &OwnedChild) -> InstanceRow {
+            seed_omp_claim(db, OMP_LAUNCH_ID, Some("sid-owner"), None);
+            db.store_launch_context("luna", r#"{"pane_id":"kitty-42"}"#)
+                .unwrap();
+            let mut launch = capture_omp_launch_pid(db, OMP_LAUNCH_ID, "luna")
+                .unwrap()
+                .expect("unbound launcher UUID reservation");
+            assert!(record_omp_launch_pid(db, &mut launch, child.0.id()).unwrap());
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            let receipt = OmpLaunchPidReceipt::parse(db, &row)
+                .unwrap()
+                .expect("real recording must produce a correlated receipt");
+            let actual = crate::sys::process::identity(child.0.id())
+                .expect("read native child creation FILETIME");
+            let ticks: u64 = actual
+                .strip_prefix("windows:")
+                .expect("native Windows identity")
+                .parse()
+                .expect("creation FILETIME ticks");
+            assert!(ticks > 0);
+            assert_eq!(receipt.identity, actual);
+            assert_eq!(receipt.pid, child.0.id());
+            assert_eq!(receipt.process_id, OMP_LAUNCH_ID);
+            row
+        }
+
+        fn assert_releases_only_own_pin(db: &HcomDb, reason: &str) {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances
+                     (name,tool,created_at,session_id,pid,status,status_context,last_event_id)
+                     VALUES ('fano','omp',2.25,'sid-other',777,'inactive','new',11)",
+                    [],
+                )
+                .unwrap();
+            db.set_process_binding("proc-other-seat", "", "fano")
+                .unwrap();
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            assert_launch_pin_replaceable(omp_launch_pin_verdict(db, &row).unwrap(), reason);
+            let binding = process_binding_epoch(db, OMP_LAUNCH_ID).unwrap().unwrap();
+            let before = db_state(db);
+            let released = db
+                .with_immediate_transaction(|tx| {
+                    prepare_own_omp_reservation_in_txn(db, tx, "luna", "sid-owner", "omp")
+                })
+                .unwrap();
+            assert!(released.is_none(), "replaceable pin must not report Held");
+            let cleared = db.get_instance_full("luna").unwrap().unwrap();
+            assert_eq!(cleared.pid, None);
+            assert_eq!(cleared.session_id.as_deref(), Some("sid-owner"));
+            assert_eq!(OmpLaunchPidReceipt::raw(&cleared), None);
+            let context: serde_json::Value =
+                serde_json::from_str(cleared.launch_context.as_deref().unwrap()).unwrap();
+            assert_eq!(context, serde_json::json!({"pane_id": "kitty-42"}));
+            assert_eq!(process_binding_epoch(db, OMP_LAUNCH_ID).unwrap(), None);
+
+            // Restore just the three authorized changes in this private DB.
+            // Equality across every table proves all other columns, bindings
+            // and events stayed untouched, including the other seat's pin.
+            db.conn()
+                .execute(
+                    "UPDATE instances SET pid=?1,launch_context=?2 WHERE name='luna'",
+                    rusqlite::params![row.pid, row.launch_context],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO process_bindings
+                     (process_id,session_id,instance_name,updated_at) VALUES (?1,NULL,'luna',?2)",
+                    rusqlite::params![OMP_LAUNCH_ID, f64::from_bits(binding.updated_at_bits)],
+                )
+                .unwrap();
+            assert_eq!(db_state(db), before);
+        }
+
+        #[test]
+        #[serial]
+        fn native_windows_launch_pin_matching_child_is_held() {
+            let _env = crate::hooks::test_helpers::isolated_test_env();
+            let (db, path) = setup_test_db();
+            let mut child = OwnedChild::spawn();
+            let row = record_child(&db, &child);
+            let before = db_state(&db);
+            match omp_launch_pin_verdict(&db, &row).unwrap() {
+                OmpLaunchPin::Held { pid, reason } => {
+                    assert_eq!(pid, i64::from(child.0.id()));
+                    assert_eq!(reason, "is still the running launch process");
+                }
+                _ => panic!("native matching child must hold the launch pin"),
+            }
+            let held = db
+                .with_immediate_transaction(|tx| {
+                    prepare_own_omp_reservation_in_txn(&db, tx, "luna", "sid-owner", "omp")
+                })
+                .unwrap()
+                .expect("native matching child must hold its own reservation");
+            assert_eq!(held.pid, i64::from(child.0.id()));
+            assert_eq!(held.reason, "is still the running launch process");
+            assert_eq!(db_state(&db), before);
+            assert!(child.0.try_wait().unwrap().is_none());
+            cleanup(path);
+        }
+
+        #[test]
+        #[serial]
+        fn native_windows_launch_pin_mismatched_child_is_replaceable() {
+            let _env = crate::hooks::test_helpers::isolated_test_env();
+            let (db, path) = setup_test_db();
+            let mut child = OwnedChild::spawn();
+            let row = record_child(&db, &child);
+            let mut context: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+            let identity = context["omp_launch_pid"]["identity"].as_str().unwrap();
+            let ticks: u64 = identity.strip_prefix("windows:").unwrap().parse().unwrap();
+            context["omp_launch_pid"]["identity"] = serde_json::json!(format!(
+                "windows:{}",
+                ticks.checked_add(1).expect("distinct creation tick")
+            ));
+            db.store_launch_context("luna", &context.to_string())
+                .unwrap();
+            let mismatched = db.get_instance_full("luna").unwrap().unwrap();
+            assert!(
+                OmpLaunchPidReceipt::parse(&db, &mismatched)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_releases_only_own_pin(&db, "now belongs to another process");
+            assert!(child.0.try_wait().unwrap().is_none());
+            cleanup(path);
+        }
+
+        #[test]
+        #[serial]
+        fn native_windows_launch_pin_gone_child_is_replaceable() {
+            let _env = crate::hooks::test_helpers::isolated_test_env();
+            let (db, path) = setup_test_db();
+            let mut child = OwnedChild::spawn();
+            record_child(&db, &child);
+            child.kill_and_wait();
+            assert!(crate::sys::process::is_definitely_dead(child.0.id()));
+            assert_releases_only_own_pin(&db, "exited");
+            cleanup(path);
+        }
+    }
 }

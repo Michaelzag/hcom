@@ -96,6 +96,8 @@ jobs:
       - run: npm install --global bun@1.4.4
       - if: runner.os == 'macOS'
         run: cargo test --locked --bin hcom sys::process -- --nocapture --test-threads=1
+      - if: runner.os == 'Windows'
+        run: cargo test --locked --bin hcom native_windows_launch_pin_ -- --nocapture --test-threads=1
       - run: cargo test --locked --test omp_native_owner -- --nocapture --test-threads=1
 
   typecheck:
