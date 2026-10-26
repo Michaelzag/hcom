@@ -1220,6 +1220,9 @@ fn kill_without_a_claim_reports_the_session_exit_hook_as_self_stop() {
     }
 }
 
+/// This covers command CAS/teardown ordering; the callback precedes native capture.
+/// The exact post-capture rescan proof lives in `sys::kill_tree_linux::tests`:
+/// `forks_made_during_the_kill_are_absorbed_and_confirmed_gone`.
 #[test]
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[serial]
