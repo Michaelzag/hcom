@@ -111,7 +111,7 @@ fn terminal_ownership_case(
     }
     let row = db.get_instance_full(target).unwrap().unwrap();
     let owner = crate::proctruth::verify_kill_owner(2_000_000_000, None, &[]).unwrap();
-    let (_, pane_closed, _, _, _) = kill_instance(&db, target, &owner, &row, false).unwrap();
+    let (_, pane_closed, _, _, _) = kill_instance(&db, target, &owner, &row, false, &[]).unwrap();
     (
         pane_closed,
         std::fs::read_to_string(closed).unwrap_or_default(),
@@ -661,9 +661,7 @@ fn kill_self_path_reaps_before_release_and_spares_self() {
             &kill_name,
             "test",
             &self_set,
-            |n, b, e, capture| {
-                crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture)
-            },
+            |_, _, _| Ok(()),
         )
     });
 
@@ -746,9 +744,8 @@ fn kill_self_path_reaps_before_release_and_spares_self() {
 /// bindings stay completely untouched — no stopped event, no release.
 /// The survivor is a bound carrier born after the verified, excluded
 /// owner, outside that owner's native tree. It is forced through the
-/// reap seam (`kill_self_tracked_instance`'s injectable reap): no same-uid
-/// process can outlive SIGTERM+SIGKILL, so a real carrier cannot outlive
-/// the real budget.
+/// termination seam: no same-uid process can outlive SIGTERM+SIGKILL,
+/// so a real carrier cannot outlive the real budget.
 #[test]
 #[cfg(unix)]
 #[serial]
@@ -763,8 +760,7 @@ fn kill_self_path_fails_closed_on_non_self_survivors() {
 
     let mut owner = seed_bound_row_with_sleeper(&db, &name, "proc-kill-fc", "sess-kill-fc");
     let owner_pid = owner.id();
-    let (row, binding_ids) = db.get_instance_with_bindings(&name).unwrap();
-    let incarnation = capture_incarnation(&db, &name);
+    let binding_ids = db.process_binding_ids(&name).unwrap();
 
     // An eligible bound carrier that outlives the signal budget — reported
     // as a survivor by the injected reap (it is never signalled here).
@@ -773,24 +769,12 @@ fn kill_self_path_fails_closed_on_non_self_survivors() {
     wait_for_enumerated(&name, survivor_pid);
 
     let excluded = vec![std::process::id(), owner_pid];
-    let err = kill_self_tracked_instance(
+    let err = kill_tracked_instance_with_self_pids(
         &db,
         &name,
         "test",
-        owner_pid,
-        &binding_ids,
         &excluded,
-        &incarnation,
-        crate::proctruth::capture_reap_carriers(
-            &db,
-            &name,
-            row.as_ref(),
-            &binding_ids,
-            &[],
-            &excluded,
-        )
-        .unwrap(),
-        |_, _, _, _capture| Err(crate::proctruth::ReapError::Survivors(vec![survivor_pid])),
+        |_, _, _| Err(crate::proctruth::ReapError::Survivors(vec![survivor_pid])),
     )
     .err()
     .expect("a non-self survivor must fail the kill");
@@ -864,9 +848,7 @@ fn kill_foreign_path_reaps_tree_before_release() {
 
     let self_set = vec![std::process::id()];
     let result =
-        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, b, e, capture| {
-            crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture)
-        })
+        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |_, _, _| Ok(()))
         .unwrap_or_else(|e| panic!("foreign kill must succeed: {e}"));
     assert_eq!(result.self_excluded, 0, "no self overlap, no self report");
     sleeper.wait().ok();
@@ -886,9 +868,8 @@ fn kill_foreign_path_reaps_tree_before_release() {
 /// window the spawn gate can fill) replaces the row's bindings. The kill
 /// reaps the OLD incarnation's processes but must not tear down the
 /// rebound row — the fresh incarnation is left intact, reported plainly,
-/// exit 0. The rebind is injected through the reap seam right after the
-/// (real) reap verifies clean: the latest possible moment before the
-/// teardown write.
+/// exit 0. The rebind is injected after owner/incarnation verification,
+/// before native termination and the final teardown write.
 #[test]
 #[cfg(unix)]
 #[serial]
@@ -913,38 +894,23 @@ fn kill_skips_teardown_when_row_rebound_mid_kill() {
             .unwrap();
     db.set_process_binding("proc-kill-rb-old", "sess-kill-rb", &name)
         .unwrap();
-    let (row, binding_ids) = db.get_instance_with_bindings(&name).unwrap();
 
-    // The old incarnation's live tree; the real reap below must take it
-    // even though the row is rebound before the teardown.
-    let mut old_sleeper = spawn_named_sleeper(&name, "proc-kill-rb-tree");
+    // The old incarnation's verified owner; native termination must take
+    // it even though the row is rebound before the teardown.
+    let mut old_sleeper = spawn_named_sleeper(&name, "proc-kill-rb-old");
     let old_pid = old_sleeper.id();
+    db.update_instance_pid(&name, old_pid).unwrap();
     wait_for_enumerated(&name, old_pid);
 
-    let incarnation = capture_incarnation(&db, &name);
     let excluded = vec![std::process::id()];
-    let result = kill_self_tracked_instance(
+    let result = kill_tracked_instance_with_self_pids(
         &db,
         &name,
         "test",
-        recorded_pid as u32,
-        &binding_ids,
         &excluded,
-        &incarnation,
-        crate::proctruth::capture_reap_carriers(
-            &db,
-            &name,
-            row.as_ref(),
-            &binding_ids,
-            &[],
-            &excluded,
-        )
-        .unwrap(),
-        |n, b, e, capture| {
-            // The real reap, then the mid-kill rebind: same name, new
-            // binding epoch (the `start --as` shape).
-            let out =
-                crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture);
+        |n, _, _| {
+            // Rebind after owner verification: same name, new binding
+            // epoch (the `start --as` shape).
             db.conn()
                 .execute(
                     "DELETE FROM process_bindings WHERE instance_name = ?1",
@@ -953,7 +919,7 @@ fn kill_skips_teardown_when_row_rebound_mid_kill() {
                 .unwrap();
             db.set_process_binding("proc-kill-rb-new", "sess-kill-rb-new", n)
                 .unwrap();
-            out
+            Ok(())
         },
     )
     .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
@@ -1053,7 +1019,7 @@ fn kill_skips_teardown_when_session_rebinds_without_bindings() {
 
     let self_set = vec![std::process::id()];
     let result =
-        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _, _capture| {
+        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
             // The name-only rebind: bindings stay empty, the session
             // changes.
             db.conn()
@@ -1135,12 +1101,10 @@ fn kill_owns_teardown_when_harness_soft_finalizes_mid_kill() {
 
     let self_set = vec![std::process::id()];
     let result =
-        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, b, e, capture| {
-            // The real reap, then the harness's own shutdown hook.
-            let out =
-                crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture);
+        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
+            // The harness's own shutdown hook runs while the kill holds its claim.
             crate::hooks::common::soft_finalize_session(&db, n, "shutdown", None, false);
-            out
+            Ok(())
         })
         .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
 
@@ -1169,15 +1133,13 @@ fn kill_owns_teardown_when_harness_finalizes_row_mid_kill() {
 
     let self_set = vec![std::process::id()];
     let result =
-        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, b, e, capture| {
-            // The real reap, then the harness's own SessionEnd.
-            let out =
-                crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture);
+        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
+            // The harness's own SessionEnd runs while the kill holds its claim.
             assert_eq!(
                 crate::hooks::common::finalize_session(&db, n, "shutdown", None),
                 StopOutcome::AlreadyStopped
             );
-            out
+            Ok(())
         })
         .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
 
@@ -1212,10 +1174,7 @@ fn kill_without_a_claim_reports_the_session_exit_hook_as_self_stop() {
             &name,
             "test",
             &[std::process::id()],
-            |n, b, e, capture| {
-                let out = crate::proctruth::reap_instance_tree_for_excluding_captured(
-                    &db, n, b, e, capture,
-                );
+            |n, _, _| {
                 // The kill holds no claim, the state a 0.7.29 relay
                 // worker's kill leaves.
                 db.kv_set(&format!("teardown_claim:{n}"), None).unwrap();
@@ -1227,7 +1186,7 @@ fn kill_without_a_claim_reports_the_session_exit_hook_as_self_stop() {
                         StopOutcome::Stopped
                     );
                 }
-                out
+                Ok(())
             },
         )
         .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
@@ -1283,13 +1242,11 @@ fn kill_reaps_late_child_after_excluded_only_capture() {
         &name,
         "test",
         &[std::process::id(), owner.id()],
-        |n, bindings, excluded, capture| {
+        |n, _, _| {
             let child = spawn_named_sleeper(n, "proc-empty-capture");
             wait_for_enumerated(n, child.id());
             late = Some(child);
-            crate::proctruth::reap_instance_tree_for_excluding_captured(
-                &db, n, bindings, excluded, capture,
-            )
+            Ok(())
         },
     );
     let mut late = late.expect("reap callback ran");
@@ -1331,7 +1288,7 @@ fn kill_failure_after_session_yield_keeps_exit_state_and_bindings() {
             &name,
             "test",
             &[std::process::id()],
-            |n, _, _, _| {
+            |n, _, _| {
                 let updates = serde_json::json!({"transcript_path": "/ended/transcript"});
                 if soft {
                     crate::hooks::common::soft_finalize_session(
@@ -1394,9 +1351,7 @@ fn kill_reports_re_registration_when_row_rebinds_after_session_self_stop() {
 
     let self_set = vec![std::process::id()];
     let result =
-        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, b, e, capture| {
-            let out =
-                crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture);
+        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
             db.log_life_event(
                 n,
                 "stopped",
@@ -1414,7 +1369,7 @@ fn kill_reports_re_registration_when_row_rebinds_after_session_self_stop() {
                 .unwrap();
             db.set_process_binding("proc-kill-sr-new", "sess-kill-sr", n)
                 .unwrap();
-            out
+            Ok(())
         })
         .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
 
@@ -1428,10 +1383,10 @@ fn kill_reports_re_registration_when_row_rebinds_after_session_self_stop() {
     let _ = _guard;
 }
 
-/// Kill a bound row whose PTY wrapper exits mid-kill: the real reap,
-/// then `exit` runs on a second connection (the wrapper is another
-/// process) — typically the wrapper's own exit cleanup. Returns the
-/// kill's teardown outcome.
+/// Kill a bound row whose PTY wrapper exits mid-kill: `exit` runs on a
+/// second connection (the wrapper is another process), after owner
+/// verification but before native termination. Returns the kill's
+/// teardown outcome.
 #[cfg(unix)]
 fn kill_mid_pty_exit(
     db_path: &std::path::Path,
@@ -1445,11 +1400,9 @@ fn kill_mid_pty_exit(
     let mut wrapper_db = crate::db::HcomDb::open_raw(db_path).unwrap();
     let self_set = vec![std::process::id()];
     let result =
-        kill_tracked_instance_with_self_pids(&db, name, "test", &self_set, |n, b, e, capture| {
-            let out =
-                crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture);
+        kill_tracked_instance_with_self_pids(&db, name, "test", &self_set, |n, _, _| {
             exit(&mut wrapper_db, n);
-            out
+            Ok(())
         })
         .unwrap_or_else(|e| panic!("a PTY exit is not a kill failure: {e}"));
     sleeper.wait().ok();
@@ -1540,8 +1493,7 @@ fn kill_mid_daemon_sweep(
     let spid = sleeper.id();
     let result = kill_tracked_instance_with_self_pids(
             &db, name, "test", &[std::process::id()],
-            |n, b, e, capture| {
-                let out = crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture);
+            |n, _, _| {
                 let snapshot = event_bits.map(|bits| {
                     serde_json::json!({ "created_at_bits": bits, "session_id": "sess-kill-vanished" })
                 });
@@ -1553,7 +1505,7 @@ fn kill_mid_daemon_sweep(
                         rusqlite::params![n],
                     ).unwrap();
                 }
-                out
+                Ok(())
             },
         ).unwrap();
     sleeper.wait().ok();
@@ -1634,9 +1586,7 @@ fn kill_reports_pty_self_stop_committed_right_after_its_read() {
         &name,
         "test",
         &[std::process::id()],
-        |n, b, e, capture| {
-            crate::proctruth::reap_instance_tree_for_excluding_captured(&db, n, b, e, capture)
-        },
+        |_, _, _| Ok(()),
     )
     .unwrap();
     sleeper.wait().ok();
@@ -1794,10 +1744,7 @@ fn kill_recognizes_bindingless_pty_stop_for_resolved_incarnation() {
         &name,
         "test",
         &[std::process::id()],
-        |n, bindings, excluded, capture| {
-            crate::proctruth::reap_instance_tree_for_excluding_captured(
-                &db, n, bindings, excluded, capture,
-            )?;
+        |n, _, _| {
             let snapshot = db.get_instance_snapshot(n).unwrap().map(|mut snapshot| {
                 if let Some(created_at) = snapshot
                     .get("created_at")
@@ -1944,11 +1891,7 @@ fn rows_written_by_the_0_7_29_writer_release_through_close_kill_and_sweep() {
         &kill_name,
         "test",
         &[std::process::id()],
-        |n, bindings, excluded, capture| {
-            crate::proctruth::reap_instance_tree_for_excluding_captured(
-                &db, n, bindings, excluded, capture,
-            )
-        },
+        |_, _, _| Ok(()),
     )
     .unwrap_or_else(|e| panic!("a release through kill is not a kill failure: {e}"));
     assert_eq!(killed.teardown, TeardownOutcome::Completed);
@@ -2444,8 +2387,8 @@ fn kill_teardown_skips_when_rebind_commits_in_the_former_check_use_gap() {
         &name,
         "test",
         &self_set,
-        move |_n, _b, _e, _capture| {
-            // Trigger the concurrent rebind from inside the reap seam
+        move |_n, _b, _e| {
+            // Trigger the concurrent rebind from inside the termination seam
             // and wait until it HOLDS the write lock: it now owns the
             // write path until well past where the old comparison ran.
             locked_rx.recv().unwrap();
