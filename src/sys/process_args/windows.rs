@@ -1,4 +1,4 @@
-//! Native argv of another Windows process.
+//! Native argv and environment of another Windows process.
 //!
 //! `NtQueryInformationProcess(ProcessCommandLineInformation)` (Windows 8.1+)
 //! has the kernel copy the target's command line into a caller buffer as a
@@ -7,43 +7,64 @@
 //! `CommandLineToArgvW` then splits that text with the OS quoting rules, the
 //! ones the MSVC CRT and Rust's std `Command` use, so argv matches what the
 //! process itself parsed.
+//!
+//! Environment reads separately walk the same-bitness PEB using a read-only
+//! process handle. Every remote read must complete before a value is trusted.
 
+use super::EnvRead;
+
+#[cfg(windows)]
 use windows_sys::Wdk::System::Threading::{
-    NtQueryInformationProcess, ProcessCommandLineInformation,
+    NtQueryInformationProcess, ProcessBasicInformation, ProcessCommandLineInformation,
 };
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, LocalFree, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
     STATUS_INFO_LENGTH_MISMATCH, UNICODE_STRING,
 };
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, IsWow64Process, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+};
+#[cfg(windows)]
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+#[cfg(windows)]
 use windows_sys::core::PWSTR;
 
 /// Cap on both the kernel query buffer and the returned argv bytes.
 const MAX_BYTES: usize = 1 << 20;
+#[cfg(windows)]
 const HEADER: usize = size_of::<UNICODE_STRING>();
 
 /// NUL-delimited UTF-8 argv of `pid`, one NUL after every argument, or `None`
 /// when the process can't be opened or queried, or the reply is malformed or
 /// over [`MAX_BYTES`]. Unpaired UTF-16 surrogates become U+FFFD.
+#[cfg(windows)]
 pub(super) fn read(pid: u32) -> Option<Vec<u8>> {
     let (buf, written) = query_command_line(&Process::open(pid)?)?;
     argv_from(&buf, written)
 }
 
 /// Query handle closed on drop.
+#[cfg(windows)]
 struct Process(HANDLE);
 
+#[cfg(windows)]
 impl Process {
     fn open(pid: u32) -> Option<Self> {
-        // SAFETY: plain FFI call with a query-only access mask; a null
+        Self::open_with_access(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+    }
+
+    fn open_with_access(pid: u32, access: u32) -> Option<Self> {
+        // SAFETY: plain FFI call with read-only query/VM access; a null
         // result means no handle was opened.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        let handle = unsafe { OpenProcess(access, 0, pid) };
         // Lazy: a guard built from NULL would CloseHandle(NULL) on drop.
         (!handle.is_null()).then(|| Process(handle))
     }
 }
 
+#[cfg(windows)]
 impl Drop for Process {
     fn drop(&mut self) {
         // SAFETY: `open` wraps only a non-null OpenProcess handle, and it is
@@ -54,9 +75,184 @@ impl Drop for Process {
     }
 }
 
+// Windows NT's native PEB and Vista+ RTL_USER_PROCESS_PARAMETERS layouts,
+// as declared in System Informer's phnt ntpebteb.h / ntrtl.h. Pointer-sized
+// fields use the caller's width only after IsWow64Process agrees for both.
+#[cfg(all(windows, target_pointer_width = "64"))]
+const PEB_PROCESS_PARAMETERS: usize = 0x20;
+#[cfg(all(windows, target_pointer_width = "32"))]
+const PEB_PROCESS_PARAMETERS: usize = 0x10;
+#[cfg(all(windows, target_pointer_width = "64"))]
+const PARAMETERS_ENVIRONMENT: usize = 0x80;
+#[cfg(all(windows, target_pointer_width = "32"))]
+const PARAMETERS_ENVIRONMENT: usize = 0x48;
+#[cfg(all(windows, target_pointer_width = "64"))]
+const PARAMETERS_ENVIRONMENT_SIZE: usize = 0x3f0;
+#[cfg(all(windows, target_pointer_width = "32"))]
+const PARAMETERS_ENVIRONMENT_SIZE: usize = 0x290;
+
+/// The public winternl.h PROCESS_BASIC_INFORMATION, all fields pointer-sized.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct BasicInformation {
+    reserved1: usize,
+    peb_base_address: usize,
+    reserved2: [usize; 2],
+    unique_process_id: usize,
+    reserved3: usize,
+}
+
+// The crate's existing windows-sys features don't expose Diagnostics::Debug.
+// Keep this single read-only import local instead of changing dependencies.
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "ReadProcessMemory"]
+    fn read_process_memory(
+        process: HANDLE,
+        base: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+pub(super) fn read_env_var(pid: u32, key: &str) -> EnvRead {
+    match read_environment(pid) {
+        Some(buffer) => parse_env(&buffer, buffer.len() * size_of::<u16>(), key),
+        None => EnvRead::Unreadable,
+    }
+}
+
+#[cfg(windows)]
+fn read_environment(pid: u32) -> Option<Vec<u16>> {
+    let process =
+        Process::open_with_access(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
+    let mut current_wow64 = 0;
+    let mut target_wow64 = 0;
+    // SAFETY: both handles are valid and each output is a writable BOOL.
+    if unsafe { IsWow64Process(GetCurrentProcess(), &mut current_wow64) } == 0
+        || unsafe { IsWow64Process(process.0, &mut target_wow64) } == 0
+        || current_wow64 != target_wow64
+    {
+        return None;
+    }
+    let mut basic = BasicInformation::default();
+    let mut written = 0;
+    // SAFETY: the native-width output buffer matches PROCESS_BASIC_INFORMATION;
+    // its size and reported write count are checked before using its PEB.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process.0,
+            ProcessBasicInformation,
+            (&mut basic as *mut BasicInformation).cast(),
+            size_of::<BasicInformation>() as u32,
+            &mut written,
+        )
+    };
+    if status < 0
+        || written as usize != size_of::<BasicInformation>()
+        || basic.peb_base_address == 0
+        || !basic.peb_base_address.is_multiple_of(align_of::<usize>())
+    {
+        return None;
+    }
+    let parameters = read_pointer(
+        &process,
+        basic.peb_base_address.checked_add(PEB_PROCESS_PARAMETERS)?,
+    )?;
+    if parameters == 0 || !parameters.is_multiple_of(align_of::<usize>()) {
+        return None;
+    }
+    let environment = read_pointer(&process, parameters.checked_add(PARAMETERS_ENVIRONMENT)?)?;
+    let size = read_pointer(&process, parameters.checked_add(PARAMETERS_ENVIRONMENT_SIZE)?)?;
+    if environment == 0 || !environment.is_multiple_of(size_of::<u16>()) {
+        return None;
+    }
+    if size == 0 {
+        return read_environment_chunks(&process, environment);
+    }
+    if !(4..=MAX_BYTES).contains(&size) || !size.is_multiple_of(size_of::<u16>()) {
+        return None;
+    }
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(size / size_of::<u16>()).ok()?;
+    buffer.resize(size / size_of::<u16>(), 0);
+    read_units(&process, environment, &mut buffer)?;
+    Some(buffer)
+}
+
+#[cfg(windows)]
+fn read_pointer(process: &Process, address: usize) -> Option<usize> {
+    let mut bytes = [0; size_of::<usize>()];
+    read_memory(process, address, &mut bytes)?;
+    Some(usize::from_ne_bytes(bytes))
+}
+
+#[cfg(windows)]
+fn read_memory(process: &Process, address: usize, buffer: &mut [u8]) -> Option<()> {
+    if address == 0 {
+        return None;
+    }
+    address.checked_add(buffer.len())?;
+    let mut read = 0;
+    // SAFETY: the remote address is never dereferenced locally. The writable
+    // buffer covers exactly the requested size and stays live through the call.
+    let result = unsafe {
+        read_process_memory(
+            process.0,
+            address as *const std::ffi::c_void,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut read,
+        )
+    };
+    (result != 0 && read == buffer.len()).then_some(())
+}
+
+#[cfg(windows)]
+fn read_units(process: &Process, address: usize, buffer: &mut [u16]) -> Option<()> {
+    // SAFETY: a mutable byte view covers the same initialized u16 storage,
+    // and every resulting bit pattern remains a valid u16.
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast(), size_of_val(buffer))
+    };
+    read_memory(process, address, bytes)
+}
+
+#[cfg(windows)]
+fn read_environment_chunks(process: &Process, environment: usize) -> Option<Vec<u16>> {
+    // Align each small read so it cannot straddle Windows' page boundaries.
+    // A short or failed chunk is still unreadable, even if it held a match.
+    const CHUNK_BYTES: usize = 256;
+    let mut buffer = Vec::new();
+    while buffer.len() * size_of::<u16>() < MAX_BYTES {
+        let read_bytes = buffer.len() * size_of::<u16>();
+        let address = environment.checked_add(read_bytes)?;
+        let count = (CHUNK_BYTES - address % CHUNK_BYTES).min(MAX_BYTES - read_bytes)
+            / size_of::<u16>();
+        let start = buffer.len();
+        buffer.try_reserve(count).ok()?;
+        buffer.resize(start + count, 0);
+        read_units(process, address, &mut buffer[start..])?;
+        if let Some(end) = buffer[start.saturating_sub(1)..]
+            .windows(2)
+            .position(|pair| pair == [0, 0])
+        {
+            buffer.truncate(start.saturating_sub(1) + end + 2);
+            return Some(buffer);
+        }
+    }
+    None
+}
+
 /// `CommandLineToArgvW` block released with `LocalFree` on drop.
+#[cfg(windows)]
 struct LocalArgv(*mut PWSTR);
 
+#[cfg(windows)]
 impl Drop for LocalArgv {
     fn drop(&mut self) {
         // SAFETY: the pointer came from CommandLineToArgvW, which documents
@@ -70,6 +266,7 @@ impl Drop for LocalArgv {
 /// Two-phase kernel query: size probe, then one read into an 8-aligned,
 /// zero-initialized buffer of exactly that size. A command line that grew
 /// between the calls fails the second call and yields `None`.
+#[cfg(windows)]
 fn query_command_line(process: &Process) -> Option<(Vec<u64>, usize)> {
     let mut needed = 0u32;
     // SAFETY: zero-length probe with a null buffer; the kernel writes only
@@ -118,6 +315,7 @@ fn query_command_line(process: &Process) -> Option<(Vec<u64>, usize)> {
 
 /// The query buffer as UTF-16 units, so the command line is reached by
 /// bounds-checked indexing rather than through the header's raw pointer.
+#[cfg(windows)]
 fn units(buf: &[u64]) -> &[u16] {
     // SAFETY: the u64 storage is initialized, at least u16-aligned, every bit
     // pattern is a valid u16, and the length covers exactly the same bytes
@@ -126,6 +324,7 @@ fn units(buf: &[u64]) -> &[u16] {
 }
 
 /// Validated location of the command line inside the query buffer.
+#[cfg(windows)]
 #[derive(Debug, PartialEq)]
 struct CommandLine {
     /// Text range in UTF-16 units of [`units`], NUL excluded.
@@ -140,6 +339,7 @@ struct CommandLine {
 /// `Length` bytes of text inside `written`; `Length` must be even, non-zero,
 /// no more than `MaximumLength`, and the text must hold no NUL (it would cut
 /// `CommandLineToArgvW` short and drop arguments).
+#[cfg(windows)]
 fn command_line(buf: &[u64], written: usize) -> Option<CommandLine> {
     if written < HEADER || written > buf.len().checked_mul(size_of::<u64>())? {
         return None;
@@ -172,6 +372,7 @@ fn command_line(buf: &[u64], written: usize) -> Option<CommandLine> {
 
 /// Validate the kernel reply and split it into argv, NUL-terminating a copy
 /// only when the kernel didn't leave a terminator in place.
+#[cfg(windows)]
 fn argv_from(buf: &[u64], written: usize) -> Option<Vec<u8>> {
     let line = command_line(buf, written)?;
     let units = units(buf);
@@ -189,6 +390,7 @@ fn argv_from(buf: &[u64], written: usize) -> Option<Vec<u8>> {
 /// Split a NUL-terminated, non-empty command line with `CommandLineToArgvW`.
 /// Callers never pass empty text: for an empty string the OS substitutes the
 /// CURRENT process's executable path.
+#[cfg(windows)]
 fn split(cmd: &[u16]) -> Option<Vec<u8>> {
     let (&0, text) = cmd.split_last()? else {
         return None;
@@ -230,6 +432,7 @@ fn split(cmd: &[u16]) -> Option<Vec<u8>> {
 
 /// Append one argument as UTF-8 plus its NUL, refusing to grow `out` past
 /// [`MAX_BYTES`].
+#[cfg(windows)]
 fn push_arg(out: &mut Vec<u8>, arg: &[u16]) -> Option<()> {
     for ch in char::decode_utf16(arg.iter().copied()) {
         let ch = ch.unwrap_or(char::REPLACEMENT_CHARACTER);
@@ -246,13 +449,92 @@ fn push_arg(out: &mut Vec<u8>, arg: &[u16]) -> Option<()> {
     Some(())
 }
 
-#[cfg(test)]
+/// Check the claimed byte count, complete UTF-16 entries and the double NUL.
+/// Keep only the first matching slice until the rest of the block is trusted.
+fn parse_env(block: &[u16], claimed_bytes: usize, key: &str) -> EnvRead {
+    if !(4..=MAX_BYTES).contains(&claimed_bytes)
+        || !claimed_bytes.is_multiple_of(size_of::<u16>())
+        || claimed_bytes / size_of::<u16>() > block.len()
+    {
+        return EnvRead::Unreadable;
+    }
+    let block = &block[..claimed_bytes / size_of::<u16>()];
+    let Some(end) = block.windows(2).position(|pair| pair == [0, 0]) else {
+        return EnvRead::Unreadable;
+    };
+    let mut value = None;
+    if end != 0 {
+        for entry in block[..end].split(|unit| *unit == 0) {
+            if entry.is_empty() {
+                return EnvRead::Unreadable;
+            }
+            if value.is_none()
+                && let Some(separator) = entry.iter().position(|unit| *unit == u16::from(b'='))
+                && env_key_matches(&entry[..separator], key)
+            {
+                value = Some(&entry[separator + 1..]);
+            } else if char::decode_utf16(entry.iter().copied()).any(|character| character.is_err()) {
+                return EnvRead::Unreadable;
+            }
+        }
+    }
+    match value {
+        Some(value) => match String::from_utf16(value) {
+            Ok(value) => EnvRead::Present(value),
+            Err(_) => EnvRead::Unreadable,
+        },
+        None => EnvRead::Absent,
+    }
+}
+
+fn env_key_matches(name: &[u16], key: &str) -> bool {
+    let lowercase = |unit| {
+        if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
+            unit + u16::from(b'a' - b'A')
+        } else {
+            unit
+        }
+    };
+    name.iter()
+        .copied()
+        .map(lowercase)
+        .eq(key.encode_utf16().map(lowercase))
+}
+
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
     const FIXTURE_ENV: &str = "HCOM_TEST_ARGV_FIXTURE";
+
+    #[test]
+    fn native_environment_layout_uses_the_callers_pointer_width() {
+        let pointer = size_of::<usize>();
+        assert_eq!(size_of::<BasicInformation>(), 6 * pointer);
+        assert_eq!(
+            std::mem::offset_of!(BasicInformation, peb_base_address),
+            pointer
+        );
+        assert_eq!(
+            std::mem::offset_of!(BasicInformation, unique_process_id),
+            4 * pointer
+        );
+        let expected = if pointer == 8 {
+            (0x20, 0x80, 0x3f0)
+        } else {
+            (0x10, 0x48, 0x290)
+        };
+        assert_eq!(
+            (
+                PEB_PROCESS_PARAMETERS,
+                PARAMETERS_ENVIRONMENT,
+                PARAMETERS_ENVIRONMENT_SIZE
+            ),
+            expected
+        );
+    }
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().collect()
@@ -523,5 +805,109 @@ mod tests {
 
         let mut out = Vec::new();
         assert_eq!(push_arg(&mut out, &vec![u16::from(b'a'); MAX_BYTES]), None);
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    fn parse(text: &str, key: &str) -> EnvRead {
+        let block: Vec<u16> = text.encode_utf16().collect();
+        parse_env(&block, block.len() * size_of::<u16>(), key)
+    }
+
+    #[test]
+    fn environment_parser_reads_values_and_keeps_the_first_match() {
+        assert_eq!(
+            parse(
+                "=C:=C:\\fixture\0OTHER=unrelated\0HCOM_PROCESS_ID=owner=雪 𝄞\0HCOM_PROCESS_ID=later\0\0",
+                "HCOM_PROCESS_ID"
+            ),
+            EnvRead::Present("owner=雪 𝄞".into())
+        );
+    }
+
+    #[test]
+    fn environment_parser_reports_absence_and_rejects_key_prefixes() {
+        assert_eq!(
+            parse(
+                "HCOM_PROCESS_ID_X=prefix\0OTHER=unrelated\0\0",
+                "HCOM_PROCESS_ID"
+            ),
+            EnvRead::Absent
+        );
+        assert_eq!(parse("\0\0", "HCOM_PROCESS_ID"), EnvRead::Absent);
+    }
+
+    #[test]
+    fn environment_parser_compares_ascii_case_insensitively() {
+        assert_eq!(
+            parse(
+                "hCoM_pRoCeSs_Id=first\0HCOM_PROCESS_ID=second\0\0",
+                "HCOM_PROCESS_ID"
+            ),
+            EnvRead::Present("first".into())
+        );
+        assert_eq!(parse("KEY_Ä=value\0\0", "key_ä"), EnvRead::Absent);
+    }
+
+    #[test]
+    fn environment_parser_accepts_empty_values() {
+        assert_eq!(
+            parse("HCOM_PROCESS_ID=\0\0", "HCOM_PROCESS_ID"),
+            EnvRead::Present(String::new())
+        );
+    }
+
+    #[test]
+    fn environment_parser_rejects_truncation_even_after_a_match() {
+        for text in [
+            "HCOM_PROCESS_ID=truncated",
+            "HCOM_PROCESS_ID=owner\0TAIL=truncated",
+            "HCOM_PROCESS_ID=owner\0",
+            "\0",
+            "",
+        ] {
+            assert_eq!(parse(text, "HCOM_PROCESS_ID"), EnvRead::Unreadable);
+        }
+        let block: Vec<u16> = "HCOM_PROCESS_ID=owner\0\0".encode_utf16().collect();
+        assert_eq!(
+            parse_env(&block, (block.len() + 1) * size_of::<u16>(), "HCOM_PROCESS_ID"),
+            EnvRead::Unreadable
+        );
+        assert_eq!(
+            parse_env(&block, (block.len() - 1) * size_of::<u16>(), "HCOM_PROCESS_ID"),
+            EnvRead::Unreadable
+        );
+    }
+
+    #[test]
+    fn environment_parser_rejects_invalid_utf16_anywhere_before_the_end() {
+        for invalid in [0xd800, 0xdc00] {
+            let mut block: Vec<u16> = "HCOM_PROCESS_ID=owner\0TAIL=".encode_utf16().collect();
+            block.extend([invalid, 0, 0]);
+            assert_eq!(
+                parse_env(&block, block.len() * size_of::<u16>(), "HCOM_PROCESS_ID"),
+                EnvRead::Unreadable
+            );
+            let mut block: Vec<u16> = "HCOM_PROCESS_ID=".encode_utf16().collect();
+            block.extend([invalid, 0, 0]);
+            assert_eq!(
+                parse_env(&block, block.len() * size_of::<u16>(), "HCOM_PROCESS_ID"),
+                EnvRead::Unreadable
+            );
+        }
+    }
+
+    #[test]
+    fn environment_parser_rejects_oversize_and_misaligned_claims() {
+        let block: Vec<u16> = "HCOM_PROCESS_ID=owner\0\0".encode_utf16().collect();
+        for claim in [MAX_BYTES + 2, usize::MAX, 0, 2, block.len() * 2 - 1] {
+            assert_eq!(
+                parse_env(&block, claim, "HCOM_PROCESS_ID"),
+                EnvRead::Unreadable
+            );
+        }
     }
 }

@@ -1,8 +1,10 @@
-//! Read-only macOS argv discovery through `KERN_PROCARGS2`.
+//! Read-only macOS argv and environment discovery through `KERN_PROCARGS2`.
 //!
 //! LP64 Darwin returns a native-endian `int` argc, an executable path with
 //! eight-byte alignment padding, then argc NUL-terminated arguments followed
-//! by the environment. Only the counted argv range is exposed.
+//! by the environment. Both readers share the counted argv boundary.
+
+use super::EnvRead;
 
 const MAX_ARGS_BYTES: usize = 1024 * 1024;
 const ARGC_BYTES: usize = std::mem::size_of::<i32>();
@@ -14,6 +16,19 @@ const PROC_FLAG_LP64: u32 = 0x10;
 
 #[cfg(target_os = "macos")]
 pub(super) fn read(pid: u32) -> Option<Vec<u8>> {
+    parse(read_buffer(pid)?)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn read_env_var(pid: u32, key: &str) -> EnvRead {
+    match read_buffer(pid) {
+        Some(buffer) => parse_env(&buffer, key),
+        None => EnvRead::Unreadable,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_buffer(pid: u32) -> Option<Vec<u8>> {
     let native_pid = libc::c_int::try_from(pid).ok().filter(|pid| *pid > 0)?;
     let info = crate::sys::process::process_info_apple(pid)?;
     if info.pbi_flags & PROC_FLAG_LP64 == 0 {
@@ -45,7 +60,7 @@ pub(super) fn read(pid: u32) -> Option<Vec<u8>> {
     }
     // SAFETY: a successful sysctl initialized exactly the checked byte count.
     unsafe { buffer.set_len(length) };
-    parse(buffer)
+    Some(buffer)
 }
 
 #[cfg(target_os = "macos")]
@@ -83,7 +98,7 @@ fn argument_capacity() -> Option<usize> {
     Some(capacity)
 }
 
-fn parse(mut buffer: Vec<u8>) -> Option<Vec<u8>> {
+fn argv_range(buffer: &[u8]) -> Option<std::ops::Range<usize>> {
     if buffer.len() > MAX_ARGS_BYTES {
         return None;
     }
@@ -123,11 +138,48 @@ fn parse(mut buffer: Vec<u8>) -> Option<Vec<u8>> {
         let length = buffer.get(end..)?.iter().position(|byte| *byte == 0)?;
         end = end.checked_add(length)?.checked_add(1)?;
     }
+    Some(start..end)
+}
+
+fn parse(mut buffer: Vec<u8>) -> Option<Vec<u8>> {
+    let std::ops::Range { start, end } = argv_range(&buffer)?;
     // Compact in place instead of allocating/copying into a second argv Vec.
     // Truncation discards the header, padding and the entire unexamined env tail.
     buffer.copy_within(start..end, 0);
     buffer.truncate(end.checked_sub(start)?);
     Some(buffer)
+}
+
+/// Validate the complete environment before exposing even an earlier match.
+fn parse_env(buffer: &[u8], key: &str) -> EnvRead {
+    let Some(argv) = argv_range(buffer) else {
+        return EnvRead::Unreadable;
+    };
+    let environment = &buffer[argv.end..];
+    if environment.last() != Some(&0) {
+        return EnvRead::Unreadable;
+    }
+    let Ok(environment) = std::str::from_utf8(environment) else {
+        return EnvRead::Unreadable;
+    };
+    let mut value = None;
+    let mut terminated = false;
+    for entry in environment.split_terminator('\0') {
+        if entry.is_empty() {
+            terminated = true;
+        } else if terminated {
+            return EnvRead::Unreadable;
+        } else if value.is_none()
+            && let Some((name, candidate)) = entry.split_once('=')
+            && name == key
+        {
+            value = Some(candidate);
+        }
+    }
+    match value {
+        Some(value) => EnvRead::Present(value.to_owned()),
+        None => EnvRead::Absent,
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +325,76 @@ mod tests {
         let mut buffer = native_buffer(1, b"/bin/node\0\0\0\0\0\0\0node\0ENV=fixture\0");
         buffer.resize(MAX_ARGS_BYTES, 0);
         assert_eq!(parse(buffer), Some(b"node\0".to_vec()));
+    }
+
+    #[test]
+    fn environment_parser_matches_exact_keys_and_keeps_first_value() {
+        let buffer = native_buffer(
+            2,
+            b"/bin/sh\0sh\0HCOM_PROCESS_ID=argv-is-not-env\0HCOM_PROCESS_ID_X=prefix\0hcom_process_id=lowercase\0HCOM_PROCESS_ID=owner=with=equals\0HCOM_PROCESS_ID=later\0\0",
+        );
+        assert_eq!(
+            parse_env(&buffer, "HCOM_PROCESS_ID"),
+            EnvRead::Present("owner=with=equals".into())
+        );
+        assert_eq!(parse_env(&buffer, "MISSING"), EnvRead::Absent);
+        assert_eq!(
+            parse_env(&buffer, "hcom_process_id"),
+            EnvRead::Present("lowercase".into())
+        );
+    }
+
+    #[test]
+    fn environment_parser_accepts_empty_value_and_empty_environment() {
+        let buffer = native_buffer(1, b"/bin/sh\0sh\0HCOM_PROCESS_ID=\0");
+        assert_eq!(
+            parse_env(&buffer, "HCOM_PROCESS_ID"),
+            EnvRead::Present(String::new())
+        );
+        assert_eq!(
+            parse_env(&native_buffer(1, b"/bin/sh\0sh\0\0"), "HCOM_PROCESS_ID"),
+            EnvRead::Absent
+        );
+    }
+
+    #[test]
+    fn environment_parser_does_not_match_a_prefix_or_case_variant() {
+        let buffer = native_buffer(
+            1,
+            b"/bin/sh\0sh\0HCOM_PROCESS_ID_X=prefix\0hcom_process_id=lowercase\0",
+        );
+        assert_eq!(parse_env(&buffer, "HCOM_PROCESS_ID"), EnvRead::Absent);
+    }
+
+    #[test]
+    fn environment_parser_rejects_truncation_and_invalid_utf8_after_a_match() {
+        for body in [
+            b"/bin/sh\0sh\0HCOM_PROCESS_ID=trunc".as_slice(),
+            b"/bin/sh\0sh\0HCOM_PROCESS_ID=owner\0TAIL=missing-nul",
+            b"/bin/sh\0sh\0HCOM_PROCESS_ID=owner\0TAIL=\xff\0",
+            b"/bin/sh\0sh\0HCOM_PROCESS_ID=\xff\0",
+            b"/bin/sh\0sh\0HCOM_PROCESS_ID=owner\0\0TAIL=after-end\0",
+            b"/bin/sh\0sh\0",
+        ] {
+            assert_eq!(
+                parse_env(&native_buffer(1, body), "HCOM_PROCESS_ID"),
+                EnvRead::Unreadable
+            );
+        }
+    }
+
+    #[test]
+    fn environment_parser_rejects_oversize_and_impossible_argument_count() {
+        let mut buffer = native_buffer(1, b"/bin/sh\0sh\0HCOM_PROCESS_ID=owner\0");
+        buffer.resize(MAX_ARGS_BYTES + 1, 0);
+        assert_eq!(parse_env(&buffer, "HCOM_PROCESS_ID"), EnvRead::Unreadable);
+        assert_eq!(
+            parse_env(
+                &native_buffer(i32::MAX, b"/bin/sh\0sh\0HCOM_PROCESS_ID=owner\0"),
+                "HCOM_PROCESS_ID"
+            ),
+            EnvRead::Unreadable
+        );
     }
 
     #[cfg(target_os = "macos")]
