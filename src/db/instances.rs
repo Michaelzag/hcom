@@ -244,19 +244,20 @@ impl HcomDb {
     }
 
     /// Move an existing anchor without certifying whichever process happens
-    /// to hold its PID now. The source receipt, including its absence, follows
-    /// the copied PID in the same write.
+    /// to hold its PID now. The source receipt and launch root, including
+    /// their absence, follow the copied PID in the same write.
     pub(crate) fn copy_instance_pid(&self, name: &str, source: &InstanceRow) -> Result<()> {
         self.conn.execute(
             "UPDATE instances SET pid = ?1,
                 launch_context = json_patch(
                     CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
-                    json_object('omp_launch_pid', json(?3)))
+                    json_object('omp_launch_pid', json(?3), 'omp_launch_root', json(?4)))
              WHERE name = ?2",
             params![
                 source.pid,
                 name,
-                crate::instance_binding::copied_pid_identity_receipt(source)
+                crate::instance_binding::copied_pid_identity_receipt(source),
+                crate::instance_binding::copied_omp_launch_root(source),
             ],
         )?;
         Ok(())
@@ -265,6 +266,9 @@ impl HcomDb {
     /// Set or clear one captured row incarnation without overwriting a replacement
     /// or a newer PID/session claim. The caller owns the immediate transaction.
     /// Match InstanceRow's origin normalization: NULL and "" both mean local.
+    /// A new owner replaces only the receipt: the launch root stays, and this
+    /// never mints one. Clearing the PID releases the reservation, so its
+    /// receipt and launch root go with it.
     pub(crate) fn compare_and_set_instance_pid_in_txn(
         &self,
         tx: &rusqlite::Transaction<'_>,
@@ -276,7 +280,9 @@ impl HcomDb {
             "UPDATE instances SET pid = ?1,
                 launch_context = json_patch(
                     CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
-                    json_object('omp_launch_pid', json(?9)))
+                    CASE WHEN ?1 IS NULL
+                        THEN json_object('omp_launch_pid', NULL, 'omp_launch_root', NULL)
+                        ELSE json_object('omp_launch_pid', json(?9)) END)
              WHERE name = ?2 AND created_at = ?3 AND agent_id IS ?4
                AND pid IS ?5 AND session_id IS ?6
                AND tool = ?7 AND NULLIF(origin_device_id, '') IS ?8",
@@ -1268,26 +1274,38 @@ impl HcomDb {
     }
 
     /// Generic field writers must carry the same identity invariant as the
-    /// dedicated PID setters. Called under their writer transaction.
+    /// dedicated PID setters: a fresh receipt for the new PID and the row's
+    /// launch root unchanged. A caller's whole context never adds, moves or
+    /// drops a root, and a brand-new row starts with none. Called under their
+    /// writer transaction.
     fn pid_identity_context(
         &self,
         name: Option<&str>,
         pid: &serde_json::Value,
         context: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let existing = match (context, name) {
-            (Some(value), _) => value.as_str().map(str::to_owned),
-            (None, Some(name)) => self
-                .get_instance_full(name)?
-                .and_then(|row| row.launch_context),
-            (None, None) => None,
+        let parse = |text: &str| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).ok()
         };
-        let mut context = existing
-            .as_deref()
-            .and_then(|text| {
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).ok()
-            })
-            .unwrap_or_default();
+        let row_context = match name {
+            Some(name) => self
+                .get_instance_full(name)?
+                .and_then(|row| row.launch_context)
+                .as_deref()
+                .and_then(parse),
+            None => None,
+        };
+        let mut context = match context {
+            Some(value) => {
+                let mut supplied = value.as_str().and_then(parse).unwrap_or_default();
+                match row_context.and_then(|mut row| row.remove("omp_launch_root")) {
+                    Some(root) => supplied.insert("omp_launch_root".into(), root),
+                    None => supplied.remove("omp_launch_root"),
+                };
+                supplied
+            }
+            None => row_context.unwrap_or_default(),
+        };
         context.remove("omp_launch_pid");
         if let Some(receipt) = pid
             .as_u64()

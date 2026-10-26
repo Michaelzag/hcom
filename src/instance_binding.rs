@@ -1061,6 +1061,11 @@ pub(crate) fn copied_pid_identity_receipt(row: &InstanceRow) -> Option<String> {
     OmpLaunchPidReceipt::raw(row).map(|receipt| receipt.to_string())
 }
 
+/// The row's `omp_launch_root`, verbatim, for a migration that moves its PID.
+pub(crate) fn copied_omp_launch_root(row: &InstanceRow) -> Option<String> {
+    launch_context_value(row, "omp_launch_root").map(|root| root.to_string())
+}
+
 /// One raw `launch_context` entry; `None` when the key or the JSON object is absent.
 fn launch_context_value(row: &InstanceRow, key: &str) -> Option<serde_json::Value> {
     let mut context =
