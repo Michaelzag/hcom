@@ -525,9 +525,9 @@ fn capture_incarnation(db: &crate::db::HcomDb, name: &str) -> ResolvedIncarnatio
     ResolvedIncarnation::new(&row.expect("row"), &binding_ids, event_watermark)
 }
 
-/// A: kill reaps the whole name tree — even processes outside the
-/// recorded pid — and only then deletes the row. A different-named
-/// sleeper must survive.
+/// A: kill reaps the authorized tree — even bound carriers outside the
+/// recorded pid — and only then deletes the row. Unbound same-name and
+/// different-named sleepers must survive.
 #[test]
 #[cfg(unix)]
 #[serial]
@@ -557,9 +557,11 @@ fn kill_reaps_name_tree_outside_recorded_pid() {
     let mut owner = spawn_named_sleeper(&name, "proc-kill-cur");
     db.update_instance_pid(&name, owner.id()).unwrap();
 
-    let mut sleeper = spawn_named_sleeper(&name, "proc-kill-old");
+    let mut sleeper = spawn_named_sleeper(&name, "proc-kill-cur");
     let spid = sleeper.id();
     wait_for_enumerated(&name, spid);
+    let mut unbound = spawn_named_sleeper(&name, "proc-kill-old");
+    wait_for_enumerated(&name, unbound.id());
     let mut bystander = spawn_named_sleeper(&other, "proc-other");
     let bpid = bystander.id();
     wait_for_enumerated(&other, bpid);
@@ -571,7 +573,7 @@ fn kill_reaps_name_tree_outside_recorded_pid() {
     owner.wait().unwrap();
     assert!(
         !crate::sys::process::is_alive(spid),
-        "name-carrying sleeper outside the recorded pid is reaped"
+        "bound sleeper outside the recorded pid is reaped"
     );
     assert!(
         db.get_instance_full(&name).unwrap().is_none(),
@@ -581,8 +583,15 @@ fn kill_reaps_name_tree_outside_recorded_pid() {
         crate::sys::process::is_alive(bpid),
         "different-named sleeper survives"
     );
+    let unbound_alive = unbound.try_wait().expect("try_wait unbound carrier").is_none();
+    unbound.kill().ok();
+    unbound.wait().ok();
     bystander.kill().ok();
     bystander.wait().ok();
+    assert!(
+        unbound_alive,
+        "unbound same-name sleeper is never signalled"
+    );
     let _ = _guard;
 }
 
@@ -633,12 +642,12 @@ fn kill_self_path_reaps_before_release_and_spares_self() {
     db.set_process_binding("proc-kill-self", "sess-kill-self", &name)
         .unwrap();
 
-    // "Self": a carrier standing in for the caller's own session tree.
-    let mut self_sleeper = spawn_named_sleeper(&name, "proc-kill-self-tree");
+    // "Self": the verified, bound root standing in for the caller's own seat.
+    let mut self_sleeper = spawn_named_sleeper(&name, "proc-kill-self");
     let self_pid = self_sleeper.id();
     db.update_instance_pid(&name, self_pid).unwrap();
     wait_for_enumerated(&name, self_pid);
-    let mut foreign_sleeper = spawn_named_sleeper(&name, "proc-kill-self-foreign");
+    let mut foreign_sleeper = spawn_named_sleeper(&name, "proc-kill-self");
     let foreign_pid = foreign_sleeper.id();
     wait_for_enumerated(&name, foreign_pid);
 
@@ -735,12 +744,11 @@ fn kill_self_path_reaps_before_release_and_spares_self() {
 /// survivors after the signal budget, the kill bails with the foreign
 /// path's error (survivors listed, `run hcom kill` hint) and the row and
 /// bindings stay completely untouched — no stopped event, no release.
-/// The survivor is a name-only late fork — in scope under the epoch rule
-/// (no process id of its own), so a real one surviving the budget would
-/// be reported here. It is forced through the reap seam
-/// (`kill_self_tracked_instance`'s injectable reap): no same-uid process
-/// can outlive SIGTERM+SIGKILL, so a real carrier cannot outlive the
-/// real budget.
+/// The survivor is a bound carrier born after the verified, excluded
+/// owner, outside that owner's native tree. It is forced through the
+/// reap seam (`kill_self_tracked_instance`'s injectable reap): no same-uid
+/// process can outlive SIGTERM+SIGKILL, so a real carrier cannot outlive
+/// the real budget.
 #[test]
 #[cfg(unix)]
 #[serial]
@@ -753,33 +761,23 @@ fn kill_self_path_fails_closed_on_non_self_survivors() {
     let tag = format!("{}-fc", std::process::id());
     let name = format!("hcom-kill-{tag}");
 
-    let mut recorded = std::process::Command::new("true").spawn().unwrap();
-    let recorded_pid = recorded.id() as i64;
-    recorded.wait().unwrap();
-    let now = crate::shared::time::now_epoch_f64();
-    db.conn()
-            .execute(
-                "INSERT INTO instances (name, status, created_at, tool, pid) VALUES (?1, 'active', ?2, 'codex', ?3)",
-                rusqlite::params![name, now, recorded_pid],
-            )
-            .unwrap();
-    db.set_process_binding("proc-kill-fc", "sess-kill-fc", &name)
-        .unwrap();
+    let mut owner = seed_bound_row_with_sleeper(&db, &name, "proc-kill-fc", "sess-kill-fc");
+    let owner_pid = owner.id();
     let (row, binding_ids) = db.get_instance_with_bindings(&name).unwrap();
     let incarnation = capture_incarnation(&db, &name);
 
-    // A name-only carrier that outlives the signal budget — reported as
-    // a survivor by the injected reap (it is never signalled here).
-    let mut survivor = spawn_named_sleeper(&name, "");
+    // An eligible bound carrier that outlives the signal budget — reported
+    // as a survivor by the injected reap (it is never signalled here).
+    let mut survivor = spawn_named_sleeper(&name, "proc-kill-fc");
     let survivor_pid = survivor.id();
     wait_for_enumerated(&name, survivor_pid);
 
-    let excluded = vec![std::process::id()];
+    let excluded = vec![std::process::id(), owner_pid];
     let err = kill_self_tracked_instance(
         &db,
         &name,
         "test",
-        recorded_pid as u32,
+        owner_pid,
         &binding_ids,
         &excluded,
         &incarnation,
@@ -820,8 +818,14 @@ fn kill_self_path_fails_closed_on_non_self_survivors() {
         crate::sys::process::is_alive(survivor_pid),
         "survivor left alone"
     );
+    assert!(
+        crate::sys::process::is_alive(owner_pid),
+        "verified self root is never signalled"
+    );
     survivor.kill().ok();
     survivor.wait().ok();
+    owner.kill().ok();
+    owner.wait().ok();
     let _ = _guard;
 }
 
@@ -1280,7 +1284,7 @@ fn kill_reaps_late_child_after_excluded_only_capture() {
         "test",
         &[std::process::id(), owner.id()],
         |n, bindings, excluded, capture| {
-            let child = spawn_named_sleeper(n, "");
+            let child = spawn_named_sleeper(n, "proc-empty-capture");
             wait_for_enumerated(n, child.id());
             late = Some(child);
             crate::proctruth::reap_instance_tree_for_excluding_captured(
