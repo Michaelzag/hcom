@@ -141,8 +141,11 @@ fn capture_members<'a>(
         by_pid.insert(target.fact.pid, index);
     }
     for member in group_members {
-        if member.pid <= 1 || member.pgid != root {
+        if member.pid <= 1 {
             continue;
+        }
+        if member.pgid != root {
+            return Err("captured group member changed process groups");
         }
         if let Some(&index) = by_pid.get(&member.pid) {
             let target = &mut targets[index];
@@ -297,8 +300,9 @@ fn group_snapshot(root: u32) -> Result<Vec<ProcFact>, String> {
     let mut facts = Vec::with_capacity(pids.len());
     for pid in pids {
         match process_fact(pid) {
-            Some(fact) if fact.pgid == root => facts.push(fact),
-            Some(_) => {}
+            // Preserve group departures for the pure capture check. Silently
+            // omitting one could claim success while a real member survives.
+            Some(fact) => facts.push(fact),
             None if is_definitely_dead(pid) => {}
             None => return Err(format!("could not authenticate process-group member {pid}")),
         }
@@ -604,7 +608,6 @@ mod tests {
             root,
             child,
             reparented,
-            fact(21, 1, 21),
             ProcFact {
                 pgid: 10,
                 ..fact(1, 10, 11)
@@ -724,6 +727,21 @@ mod tests {
                 }
             }),
             Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn kill_tree_capture_refuses_ambiguous_group_departure() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 5, 10)
+        };
+        // The PID-only group scan saw this member, but its identity query now
+        // reports another group. It might have escaped, not exited/reused.
+        let departed = fact(20, 1, 20);
+        assert_eq!(
+            capture_members(&[root], 10, root.start_time, 10, &[departed]).unwrap_err(),
+            "captured group member changed process groups"
         );
     }
 }
