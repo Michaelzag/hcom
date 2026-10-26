@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use super::{
     kill_group,
-    process::{GroupSignal, KILL_WAIT, POLL_STEP, TERM_WAIT, is_definitely_dead, process_info_apple},
+    process::{
+        GroupSignal, KILL_WAIT, POLL_STEP, TERM_WAIT, is_definitely_dead, process_info_apple,
+    },
 };
 
 type StartTime = (u64, u64);
@@ -125,7 +127,10 @@ fn capture_members<'a>(
     group_members: &'a [ProcFact],
 ) -> Result<Vec<Target<'a>>, &'static str> {
     let mut targets = kill_tree(snapshot, root, expected_start)?;
-    if targets.last().is_none_or(|target| target.fact.pgid != root_group) {
+    if targets
+        .last()
+        .is_none_or(|target| target.fact.pgid != root_group)
+    {
         return Err("owner process group changed during capture");
     }
     if root_group != root {
@@ -184,10 +189,7 @@ enum Observation {
 
 /// Query failures are survivors, not evidence of exit. A different creation
 /// time proves the captured incarnation has gone without authorizing its PID.
-fn survivors(
-    captured: &[Target<'_>],
-    mut observe: impl FnMut(u32) -> Observation,
-) -> Vec<u32> {
+fn survivors(captured: &[Target<'_>], mut observe: impl FnMut(u32) -> Observation) -> Vec<u32> {
     let mut pids = Vec::new();
     for target in captured {
         match observe(target.fact.pid) {
@@ -246,7 +248,8 @@ pub(crate) fn terminate(root: u32, expected: &str) -> Result<GroupSignal, String
     if leader {
         // SAFETY: current_root has a positive representable PID, matching
         // creation time, and PGID == PID. This is never a shared parent group.
-        outcome = signal_result(unsafe { libc::killpg(current_root.pid as libc::pid_t, libc::SIGTERM) });
+        outcome =
+            signal_result(unsafe { libc::killpg(current_root.pid as libc::pid_t, libc::SIGTERM) });
     }
     for target in &targets {
         if leader && target.in_group {
@@ -273,7 +276,9 @@ pub(crate) fn terminate(root: u32, expected: &str) -> Result<GroupSignal, String
     if remaining.is_empty() {
         Ok(outcome)
     } else {
-        Err(format!("captured processes survived termination: {remaining:?}"))
+        Err(format!(
+            "captured processes survived termination: {remaining:?}"
+        ))
     }
 }
 
@@ -652,8 +657,7 @@ mod tests {
             ..child
         };
         assert_eq!(
-            capture_members(&[root, child], 10, root.start_time, 10, &[replacement])
-                .unwrap_err(),
+            capture_members(&[root, child], 10, root.start_time, 10, &[replacement]).unwrap_err(),
             "captured PID identity changed between process snapshots"
         );
     }
@@ -696,12 +700,7 @@ mod tests {
     #[test]
     fn kill_tree_survivors_require_positive_exit_or_reuse_evidence() {
         let root = fact(10, 5, 10);
-        let snapshot = [
-            root,
-            fact(11, 10, 11),
-            fact(12, 10, 12),
-            fact(13, 10, 13),
-        ];
+        let snapshot = [root, fact(11, 10, 11), fact(12, 10, 12), fact(13, 10, 13)];
         let captured = capture_members(&snapshot, 10, root.start_time, 5, &[]).unwrap();
         let remaining = survivors(&captured, |pid| match pid {
             10 => Observation::Present(root.start_time),
