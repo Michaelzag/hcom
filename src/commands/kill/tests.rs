@@ -111,7 +111,7 @@ fn terminal_ownership_case(
     }
     let row = db.get_instance_full(target).unwrap().unwrap();
     let owner = crate::proctruth::verify_kill_owner(2_000_000_000, None, &[]).unwrap();
-    let (_, pane_closed, _, _, _) = kill_instance(&db, target, &owner, &row, false, &[]).unwrap();
+    let (_, pane_closed, _, _, _) = kill_instance(&db, target, &owner, &row, false, &[], &[]).unwrap();
     (
         pane_closed,
         std::fs::read_to_string(closed).unwrap_or_default(),
@@ -771,7 +771,8 @@ fn kill_self_path_fails_closed_on_non_self_survivors() {
         |_, _, _| Err(crate::proctruth::ReapError::Survivors(vec![survivor_pid])),
     )
     .err()
-    .expect("a non-self survivor must fail the kill");
+    .expect("a non-self survivor must fail the kill")
+    .to_string();
     assert!(
         err.contains(&survivor_pid.to_string()),
         "error lists the survivors: {err}"
@@ -1312,7 +1313,7 @@ fn kill_failure_after_session_yield_keeps_exit_state_and_bindings() {
         survivor.kill().ok();
         survivor.wait().ok();
 
-        let error = result.err().expect("survivors fail the kill");
+        let error = result.err().expect("survivors fail the kill").to_string();
         assert!(error.contains(&pid.to_string()), "{error}");
         assert!(alive, "the injected reap leaves its survivor alone");
         let row = db.get_instance_full(&name).unwrap().expect("row retained");
