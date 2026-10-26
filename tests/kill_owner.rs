@@ -4,17 +4,18 @@
 //! and an `hcom stop` pointer, and nothing in the reuser's tree signalled. A
 //! genuine owner, and its tree, is still killed.
 //!
-//! Every process here is a fixture child of this test: a stand-in OMP that
-//! registers through hcom's own `launch-anchor` (which writes the native
-//! identity receipt) and binds through `omp-start`, or a sentinel that records
-//! any signal it receives and keeps a heartbeat. PID reuse is simulated in the
-//! private DB only: the reuser's PID replaces the crashed owner's number in
-//! the owner's row and bindings, nothing else changes.
+//! Every process here is a fixture child of this test, or a descendant of
+//! one: a stand-in OMP that registers through hcom's own `launch-anchor`
+//! (which writes the native identity receipt) and binds through `omp-start`,
+//! sometimes below a launcher that leads its process group, or a sentinel that
+//! records any signal it receives and keeps a heartbeat. PID reuse is
+//! simulated in the private DB only: the reuser's PID replaces the crashed
+//! owner's number in the owner's row and bindings, nothing else changes.
 //!
-//! Linux cases (`mod linux`) also cover legacy rows without a receipt, whose
-//! evidence is the live process's HCOM_PROCESS_ID in /proc environ. Windows and
-//! macOS (`mod native`) have no such fallback: kill trusts the receipt only,
-//! so they prove a genuine receipt still kills and a reused PID is refused.
+//! Legacy rows carry no receipt; their evidence is the live process's own
+//! HCOM_PROCESS_ID. Linux (`mod linux`) reads it from /proc and also covers
+//! zombies and unreadable evidence; Windows and macOS (`mod native`) read it
+//! natively.
 
 #![cfg(any(target_os = "linux", target_os = "macos", windows))]
 
@@ -54,11 +55,23 @@ impl std::ops::Deref for Scene {
 impl Drop for Scene {
     fn drop(&mut self) {
         // Runs after every process wrapper declared later in the test has been
-        // dropped, and before `Hcom::drop`. Only this private DB is touched.
+        // dropped, so every fixture process is already reaped, and before
+        // `Hcom::drop`, whose `kill all` would otherwise signal whatever now
+        // holds a PID this test recorded: a row PID, a launch receipt, or
+        // hcom's own record of the processes it signalled. Only this private
+        // state is touched.
         if let Ok(conn) = rusqlite::Connection::open(self.h.path().join("hcom.db")) {
             let _ = conn.busy_timeout(Duration::from_secs(5));
-            let _ = conn.execute("UPDATE instances SET pid=NULL", []);
+            let _ = conn.execute(
+                "UPDATE instances
+                    SET pid=NULL,
+                        launch_context=CASE WHEN json_valid(launch_context)
+                            THEN json_remove(launch_context,'$.omp_launch_pid')
+                            ELSE launch_context END",
+                [],
+            );
         }
+        let _ = std::fs::remove_file(self.h.path().join(".tmp/launched_pids.json"));
     }
 }
 
@@ -96,6 +109,31 @@ fn launch_row(h: &Hcom, name: &str, process_id: &str) {
         rusqlite::params![process_id, name],
     )
     .expect("seed launch process binding");
+}
+
+/// A legacy bound row, as written before any identity record existed: row,
+/// process binding and session binding, recorded PID `pid`, and no launch
+/// receipt.
+fn seed_legacy_row(h: &Hcom, name: &str, process_id: &str, pid: Option<u32>) {
+    let conn = db(h);
+    let sid = format!("sid-{name}");
+    conn.execute(
+        "INSERT INTO instances (name, tool, session_id, status, status_context, status_time, created_at, last_event_id, pid)
+         VALUES (?1, 'omp', ?2, 'listening', 'start', 0, 0, 0, ?3)",
+        rusqlite::params![name, sid, pid],
+    )
+    .expect("seed legacy row");
+    conn.execute(
+        "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+         VALUES (?1, ?2, ?3, 0)",
+        rusqlite::params![process_id, sid, name],
+    )
+    .expect("seed legacy process binding");
+    conn.execute(
+        "INSERT INTO session_bindings (session_id, instance_name, created_at) VALUES (?1, ?2, 0)",
+        rusqlite::params![sid, name],
+    )
+    .expect("seed legacy session binding");
 }
 
 /// Precondition: `launch-anchor` recorded `pid` and a native identity receipt
@@ -360,6 +398,15 @@ mod linux {
             self.reaped = true;
             status.signal()
         }
+
+        /// The leader alone dies by SIGKILL, with no cleanup, and is left
+        /// unreaped: a zombie that still holds its PID and leads its group.
+        fn die_unreaped(&self) -> Option<String> {
+            unsafe {
+                libc::kill(self.pid() as libc::pid_t, libc::SIGKILL);
+            }
+            self.wait_exit(Duration::from_secs(10))
+        }
     }
 
     impl Drop for Owned {
@@ -446,8 +493,18 @@ while :; do
 done
 "#;
 
+    /// An hcom launch script's shape: it anchors the launch first, then runs
+    /// the tool as a child it waits on, not exec'd.
+    const LAUNCHER: &str = r#"
+HCOM_LAUNCHED=1 HCOM_TOOL=omp "$TEST_BIN" launch-anchor > "$TEST_OUT_DIR/anchor.stdout" 2> "$TEST_OUT_DIR/anchor.stderr"
+printf '%s' "$?" > "$TEST_OUT_DIR/anchor.code"
+"$TEST_OMP" "$TEST_RUNNER" &
+wait "$!"
+"#;
+
     struct HookOwner {
         proc: Owned,
+        pid: u32,
         out_dir: PathBuf,
         process_id: String,
         next_step: Cell<usize>,
@@ -455,16 +512,37 @@ done
 
     impl HookOwner {
         fn spawn(h: &Hcom, label: &str) -> Self {
+            Self::start(h, label, &uuid::Uuid::new_v4().to_string(), false)
+        }
+
+        /// The stand-in OMP below a launcher that leads the process group, as
+        /// an hcom launch runs it. `process_id`'s reservation must already
+        /// exist: the launcher anchors it before it starts the OMP.
+        fn spawn_launched(h: &Hcom, label: &str, process_id: &str) -> Self {
+            Self::start(h, label, process_id, true)
+        }
+
+        fn start(h: &Hcom, label: &str, process_id: &str, launcher: bool) -> Self {
             let omp = fakebin(h).join("omp");
             let out_dir = h.root_path().join(format!("owner-{label}"));
             fs::create_dir_all(&out_dir).expect("create owner directory");
             let runner = out_dir.join("steps.sh");
             fs::write(&runner, STEP_RUNNER).expect("write step runner");
-            let process_id = uuid::Uuid::new_v4().to_string();
-            let mut command = h.external_cmd(&omp);
+            let mut command = if launcher {
+                let mut command = h.external_cmd("/bin/bash");
+                command
+                    .arg("-c")
+                    .arg(LAUNCHER)
+                    .env("TEST_OMP", &omp)
+                    .env("TEST_RUNNER", &runner);
+                command
+            } else {
+                let mut command = h.external_cmd(&omp);
+                command.arg(&runner);
+                command
+            };
             command
-                .arg(&runner)
-                .env("HCOM_PROCESS_ID", &process_id)
+                .env("HCOM_PROCESS_ID", process_id)
                 .env("TEST_OUT_DIR", &out_dir)
                 .env("TEST_CWD", &h.workspace)
                 .env("TEST_BIN", env!("CARGO_BIN_EXE_hcom"))
@@ -479,22 +557,49 @@ done
                     .filter(|text| text.lines().count() == 2))
             });
             let mut lines = ready.lines();
-            assert_eq!(
-                lines.next().unwrap().parse::<u32>().ok(),
-                Some(proc.pid()),
-                "fixture OMP is not the direct child"
-            );
-            assert_eq!(lines.next(), Some(process_id.as_str()));
+            let pid: u32 = lines.next().unwrap().parse().expect("fixture OMP PID");
+            if launcher {
+                assert_ne!(
+                    pid,
+                    proc.pid(),
+                    "fixture OMP must be its launcher's child, not exec'd"
+                );
+            } else {
+                assert_eq!(pid, proc.pid(), "fixture OMP is not the direct child");
+            }
+            assert_eq!(lines.next(), Some(process_id));
             Self {
                 proc,
+                pid,
                 out_dir,
-                process_id,
+                process_id: process_id.to_string(),
                 next_step: Cell::new(0),
             }
         }
 
+        /// The OMP's own PID: the direct child, or the launcher's child.
         fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        /// The direct child leads the process group: the OMP or its launcher.
+        fn pgid(&self) -> u32 {
             self.proc.pid()
+        }
+
+        /// The launcher's own `hcom launch-anchor` run.
+        fn launcher_anchor(&self, h: &Hcom) -> (i32, String, String) {
+            let code = h.eventually("launcher anchor finished", Duration::from_secs(30), || {
+                Ok(fs::read_to_string(self.out_dir.join("anchor.code"))
+                    .ok()
+                    .filter(|text| !text.is_empty()))
+            });
+            let read = |file: &str| fs::read_to_string(self.out_dir.join(file)).unwrap_or_default();
+            (
+                code.trim().parse().expect("anchor exit code"),
+                read("anchor.stdout"),
+                read("anchor.stderr"),
+            )
         }
 
         fn run(&self, h: &Hcom, script: &str) -> (i32, String, String) {
@@ -526,9 +631,41 @@ done
             assert_eq!(code, 0, "spawn owner tree child: {stdout} {stderr}");
             let pid: u32 = stdout.trim().parse().expect("owner tree child PID");
             h.eventually("owner tree child running", Duration::from_secs(10), || {
-                Ok(member_alive(pid, self.pid()).then_some(()))
+                Ok(member_alive(pid, self.pgid()).then_some(()))
             });
             pid
+        }
+
+        /// A bystander in the owner's process group with no hcom identity:
+        /// the owner's child with a cleared environment and without the
+        /// owner's open session transcript, recording any signal it receives
+        /// and keeping a heartbeat.
+        fn spawn_group_bystander(&self, h: &Hcom) -> Bystander {
+            let dir = h.root_path().join("bystander");
+            let (code, stdout, stderr) = self.run(
+                h,
+                &format!(
+                    "env -i PATH=/usr/bin:/bin /bin/bash {} {} 'HUP TERM USR1 USR2 CONT' < /dev/null > /dev/null 2>&1 9<&- & printf '%s' \"$!\"",
+                    quote(&sentinel_script(h).to_string_lossy()),
+                    quote(&dir.to_string_lossy()),
+                ),
+            );
+            assert_eq!(code, 0, "spawn group bystander: {stdout} {stderr}");
+            let bystander = Bystander {
+                pid: stdout.trim().parse().expect("bystander PID"),
+                pgid: self.pgid(),
+                dir,
+            };
+            h.eventually("group bystander ready", Duration::from_secs(30), || {
+                Ok((fs::read_to_string(bystander.dir.join("ready")).ok()
+                    == Some(bystander.pid.to_string())
+                    && beats(&bystander.dir) > 0
+                    && member_alive(bystander.pid, bystander.pgid)
+                    && caught_signals(bystander.pid) & mask(&CHILD_SIGNALS)
+                        == mask(&CHILD_SIGNALS))
+                .then_some(()))
+            });
+            bystander
         }
     }
 
@@ -540,6 +677,26 @@ done
         launch_row(h, name, &owner.process_id);
         let anchor = owner.run(h, "H launch-anchor");
         assert_receipt(h, name, owner.pid(), &anchor);
+        start_session(h, &owner, label, name, endpoint);
+        owner
+    }
+
+    /// The launched shape: the launcher anchors the reservation (its own PID
+    /// and receipt), then the OMP below it binds through `omp-start`, which
+    /// must re-pin the row to the OMP.
+    fn launched_owner(h: &Hcom, label: &str, name: &str, endpoint: &TcpListener) -> HookOwner {
+        let process_id = uuid::Uuid::new_v4().to_string();
+        launch_row(h, name, &process_id);
+        let owner = HookOwner::spawn_launched(h, label, &process_id);
+        let anchor = owner.launcher_anchor(h);
+        assert_receipt(h, name, owner.pgid(), &anchor);
+        start_session(h, &owner, label, name, endpoint);
+        owner
+    }
+
+    /// `omp-start` from the owner, which keeps its session transcript open;
+    /// the row must end up bound to the owner's own PID.
+    fn start_session(h: &Hcom, owner: &HookOwner, label: &str, name: &str, endpoint: &TcpListener) {
         let sid = uuid::Uuid::new_v4().to_string();
         let transcript = h
             .home
@@ -566,7 +723,6 @@ done
             ),
         );
         assert_bound(h, name, owner.pid(), &start);
-        owner
     }
 
     /// The owner dies by SIGKILL, with no stop and no cleanup.
@@ -583,30 +739,6 @@ done
             before,
             "the crash alone changed {name}'s bookkeeping"
         );
-    }
-
-    /// A legacy bound row, as written before any identity record existed:
-    /// row, process binding and session binding, recorded PID `pid`.
-    fn seed_legacy_row(h: &Hcom, name: &str, process_id: &str, pid: Option<u32>) {
-        let conn = db(h);
-        let sid = format!("sid-{name}");
-        conn.execute(
-            "INSERT INTO instances (name, tool, session_id, status, status_context, status_time, created_at, last_event_id, pid)
-             VALUES (?1, 'omp', ?2, 'listening', 'start', 0, 0, 0, ?3)",
-            rusqlite::params![name, sid, pid],
-        )
-        .expect("seed legacy row");
-        conn.execute(
-            "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
-             VALUES (?1, ?2, ?3, 0)",
-            rusqlite::params![process_id, sid, name],
-        )
-        .expect("seed legacy process binding");
-        conn.execute(
-            "INSERT INTO session_bindings (session_id, instance_name, created_at) VALUES (?1, ?2, 0)",
-            rusqlite::params![sid, name],
-        )
-        .expect("seed legacy session binding");
     }
 
     fn set_tag(h: &Hcom, name: &str, tag: &str) {
@@ -701,10 +833,7 @@ while True:
         /// `env`.
         fn bash(h: &Hcom, label: &str, exe: &Path, env: &[(&str, &str)], with_child: bool) -> Self {
             let dir = h.root_path().join(format!("sentinel-{label}"));
-            let script = h.root_path().join("sentinel.sh");
-            if !script.exists() {
-                fs::write(&script, SENTINEL_BASH).expect("write sentinel script");
-            }
+            let script = sentinel_script(h);
             let mut command = Command::new(exe);
             command
                 .arg(&script)
@@ -858,6 +987,44 @@ while True:
         fs::metadata(dir.join("heartbeat"))
             .map(|stat| stat.len())
             .unwrap_or(0)
+    }
+
+    fn sentinel_script(h: &Hcom) -> PathBuf {
+        let script = h.root_path().join("sentinel.sh");
+        if !script.exists() {
+            fs::write(&script, SENTINEL_BASH).expect("write sentinel script");
+        }
+        script
+    }
+
+    /// A member of a fixture process group that is not this test's child. It
+    /// counts as alive only while it exists unreaped in that group, so a
+    /// later PID reuser never reads as it.
+    struct Bystander {
+        pid: u32,
+        pgid: u32,
+        dir: PathBuf,
+    }
+
+    impl Bystander {
+        /// Wait (bounded) for two more heartbeats, which proves any signal
+        /// already sent had its trap run, or for the bystander to be gone.
+        fn observe(&self, before: u64) -> Value {
+            let mut progressed = false;
+            wait_until(Duration::from_secs(5), || {
+                progressed = beats(&self.dir) >= before + 2;
+                progressed || !member_alive(self.pid, self.pgid)
+            });
+            json!({
+                "alive": member_alive(self.pid, self.pgid),
+                "heartbeat_progressed": progressed,
+                "signals": fs::read_to_string(self.dir.join("signals")).unwrap_or_default(),
+            })
+        }
+
+        fn spared() -> Value {
+            json!({"alive": true, "heartbeat_progressed": true, "signals": ""})
+        }
     }
 
     #[track_caller]
@@ -1035,6 +1202,103 @@ while True:
     }
 
     // -----------------------------------------------------------------------
+    // Row 4, zombie: the genuine owner exited but is still unreaped. Its PID
+    // stays in the process table (state Z) with the start time its receipt
+    // names, and it still leads its process group, which lives on through a
+    // bystander with no hcom identity. No live process owns the seat.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn kill_with_zombie_owner_signals_nothing_and_cleans_up() {
+        let h = Scene::new();
+        let endpoint = TcpListener::bind("127.0.0.1:0").expect("bind fixture endpoint");
+        let name = format!("zombie{}", unique_suffix());
+        let owner = hooked_owner(&h, "zombie", &name, &endpoint);
+        let bystander = owner.spawn_group_bystander(&h);
+        let before_death = row_facts(&h, &name);
+        assert_eq!(
+            owner.proc.die_unreaped().as_deref(),
+            Some("signal 9"),
+            "fixture OMP did not die by SIGKILL"
+        );
+        let zombie = Some(('Z', i64::from(owner.pid())));
+        assert_eq!(
+            proc_state(owner.pid()),
+            zombie,
+            "precondition: the dead owner must be an unreaped zombie leading its group"
+        );
+        assert_eq!(
+            row_facts(&h, &name),
+            before_death,
+            "the death alone changed {name}'s bookkeeping"
+        );
+
+        let before = beats(&bystander.dir);
+        let (code, output) = kill(&h, &[&name]);
+        let observed = bystander.observe(before);
+        assert_eq!(
+            observed,
+            Bystander::spared(),
+            "SAFETY: `hcom kill {name}` signalled bystander {} in zombie owner {}'s process \
+             group:\n{output}",
+            bystander.pid,
+            owner.pid()
+        );
+        assert_eq!(
+            proc_state(owner.pid()),
+            zombie,
+            "precondition: the owner must stay an unreaped zombie through the kill"
+        );
+        assert!(
+            !output.contains("Sent SIG"),
+            "kill reported a signal to zombie owner {}:\n{output}",
+            owner.pid()
+        );
+        assert_eq!(code, 0, "kill of a zombie owner failed:\n{output}");
+        assert_torn_down(&h, &name);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rows 2 + 7, launched shape: a launcher leads the process group and
+    // anchors the launch; the OMP is its child, and the OMP's first hook
+    // re-pins the row to it. The verified owner is not its group leader.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn kill_terminates_launched_owner_that_does_not_lead_its_group() {
+        let h = Scene::new();
+        let endpoint = TcpListener::bind("127.0.0.1:0").expect("bind fixture endpoint");
+        let name = format!("launched{}", unique_suffix());
+        let owner = launched_owner(&h, "launched", &name, &endpoint);
+        assert_eq!(
+            proc_state(owner.pid()).map(|(_, pgrp)| pgrp),
+            Some(i64::from(owner.pgid())),
+            "precondition: the OMP must be in its launcher's process group"
+        );
+        let tree_child = owner.spawn_tree_child(&h);
+
+        let (code, output) = kill(&h, &[&name]);
+        assert!(
+            wait_until(Duration::from_secs(10), || !member_alive(
+                owner.pid(),
+                owner.pgid()
+            )),
+            "launched owner {} below launcher {} survived `hcom kill {name}`:\n{output}",
+            owner.pid(),
+            owner.pgid()
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || !member_alive(
+                tree_child,
+                owner.pgid()
+            )),
+            "the launched owner's child {tree_child} survived the kill:\n{output}"
+        );
+        assert_eq!(code, 0, "kill of the launched owner failed:\n{output}");
+        assert_torn_down(&h, &name);
+    }
+
+    // -----------------------------------------------------------------------
     // Row 5: unreadable or mismatched identity evidence signals nothing.
     // -----------------------------------------------------------------------
 
@@ -1168,11 +1432,11 @@ while True:
 }
 
 // ===========================================================================
-// Windows and macOS: the receipt is the only evidence. A Node process running
-// a supported OMP script path is the owner (as tests/omp_native_owner.rs
-// does); sentinels are Node processes that record any catchable signal and
-// keep a heartbeat. Windows has no POSIX signals, so there the evidence is
-// liveness and heartbeat alone.
+// Windows and macOS. A Node process running a supported OMP script path is
+// the owner (as tests/omp_native_owner.rs does), verified by its receipt or,
+// for a legacy row, by its native HCOM_PROCESS_ID. Sentinels are Node
+// processes that record any catchable signal and keep a heartbeat. Windows
+// has no POSIX signals, so there the evidence is liveness and heartbeat alone.
 // ===========================================================================
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -1207,6 +1471,7 @@ fs.renameSync(path.join(dir, 'ready.tmp'), path.join(dir, 'ready'));
 const born = Date.now();
 setInterval(() => {
     if (fs.existsSync(path.join(dir, 'stop')) || Date.now() - born > 300000) process.exit(0);
+    fs.appendFileSync(path.join(dir, 'heartbeat'), 'x');
     for (const entry of fs.readdirSync(dir)) {
         if (!/^step-\d+\.json$/.test(entry) || fs.existsSync(path.join(dir, `${entry}.out`))) continue;
         const step = JSON.parse(fs.readFileSync(path.join(dir, entry), 'utf8'));
@@ -1260,6 +1525,38 @@ setInterval(() => {
 }, 50);
 fs.writeFileSync(path.join(dir, 'ready'), String(process.pid));
 "#;
+
+    /// The launcher of a launch: it anchors the reservation first, then runs
+    /// the Node interpreter as a child it waits on, not exec'd.
+    #[cfg(unix)]
+    const LAUNCHER_SH: &str = r#"
+HCOM_LAUNCHED=1 HCOM_TOOL=omp "$TEST_HCOM_BIN" launch-anchor > "$TEST_OWNER_DIR/anchor.stdout" 2> "$TEST_OWNER_DIR/anchor.stderr"
+printf '%s' "$?" > "$TEST_OWNER_DIR/anchor.code"
+"$TEST_OWNER_RUNTIME" "$TEST_OWNER_SCRIPT" &
+wait "$!"
+"#;
+
+    /// Windows: the same launcher as npm's `omp.cmd` shape, run by cmd.exe.
+    #[cfg(windows)]
+    const LAUNCHER_CMD: &str = "@echo off\r\nsetlocal\r\nset HCOM_LAUNCHED=1\r\nset HCOM_TOOL=omp\r\n\"%TEST_HCOM_BIN%\" launch-anchor > \"%TEST_OWNER_DIR%\\anchor.stdout\" 2> \"%TEST_OWNER_DIR%\\anchor.stderr\"\r\n> \"%TEST_OWNER_DIR%\\anchor.code\" echo %ERRORLEVEL%\r\nendlocal\r\n\"%TEST_OWNER_RUNTIME%\" \"%TEST_OWNER_SCRIPT%\"\r\n";
+
+    /// A process-group leader running [`LAUNCHER_SH`].
+    #[cfg(unix)]
+    fn launcher_command(h: &Hcom, _root: &Path) -> Command {
+        let mut command = h.external_cmd("/bin/sh");
+        command.arg("-c").arg(LAUNCHER_SH);
+        command
+    }
+
+    /// cmd.exe running [`LAUNCHER_CMD`] as `omp.cmd`.
+    #[cfg(windows)]
+    fn launcher_command(h: &Hcom, root: &Path) -> Command {
+        let shim = root.join("omp.cmd");
+        fs::write(&shim, LAUNCHER_CMD).unwrap();
+        let mut command = h.external_cmd("cmd.exe");
+        command.args(["/d", "/c"]).arg(&shim);
+        command
+    }
 
     fn beats(dir: &Path) -> u64 {
         fs::metadata(dir.join("heartbeat"))
@@ -1398,17 +1695,31 @@ fs.writeFileSync(path.join(dir, 'ready'), String(process.pid));
 
     impl NativeOwner {
         fn spawn(h: &Hcom, label: &str) -> Self {
+            Self::start(h, label, &uuid::Uuid::new_v4().to_string(), false)
+        }
+
+        /// `launcher`: the interpreter runs below a launcher (see
+        /// [`launcher_command`]); `process_id`'s reservation must already
+        /// exist, because the launcher anchors it before it starts Node.
+        fn start(h: &Hcom, label: &str, process_id: &str, launcher: bool) -> Self {
             let root = h.root_path().join(format!("owner-{label}"));
             let script = root.join("node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js");
             fs::create_dir_all(script.parent().unwrap()).unwrap();
             fs::write(&script, OWNER_RUNNER).unwrap();
             let dir = root.join("steps");
             fs::create_dir_all(&dir).unwrap();
-            let process_id = uuid::Uuid::new_v4().to_string();
-            let mut command = h.external_cmd(node(h));
+            let node = node(h);
+            let mut command = if launcher {
+                launcher_command(h, &root)
+            } else {
+                let mut command = h.external_cmd(&node);
+                command.arg(&script);
+                command
+            };
             command
-                .arg(&script)
-                .env("HCOM_PROCESS_ID", &process_id)
+                .env("TEST_OWNER_RUNTIME", &node)
+                .env("TEST_OWNER_SCRIPT", &script)
+                .env("HCOM_PROCESS_ID", process_id)
                 .env("TEST_OWNER_DIR", &dir)
                 .env("TEST_HCOM_BIN", env!("CARGO_BIN_EXE_hcom"));
             let proc = Proc::spawn(command, dir.clone(), "native OMP owner");
@@ -1419,11 +1730,19 @@ fs.writeFileSync(path.join(dir, 'ready'), String(process.pid));
             });
             assert_eq!(ready["process_id"], process_id);
             let pid = u32::try_from(ready["pid"].as_u64().unwrap()).unwrap();
-            assert_eq!(pid, proc.pid(), "fixture must be the actual Node process");
+            if launcher {
+                assert_ne!(
+                    pid,
+                    proc.pid(),
+                    "the Node interpreter must be its launcher's child, not exec'd"
+                );
+            } else {
+                assert_eq!(pid, proc.pid(), "fixture must be the actual Node process");
+            }
             Self {
                 proc,
                 pid,
-                process_id,
+                process_id: process_id.to_string(),
                 step: Cell::new(0),
                 root,
             }
@@ -1450,6 +1769,22 @@ fs.writeFileSync(path.join(dir, 'ready'), String(process.pid));
                 i32::try_from(out["code"].as_i64().unwrap()).unwrap(),
                 out["stdout"].as_str().unwrap().to_string(),
                 out["stderr"].as_str().unwrap().to_string(),
+            )
+        }
+
+        /// The launcher's own `hcom launch-anchor` run.
+        fn launcher_anchor(&self, h: &Hcom) -> (i32, String, String) {
+            let code = h.eventually("launcher anchor finished", Duration::from_secs(30), || {
+                Ok(fs::read_to_string(self.proc.dir.join("anchor.code"))
+                    .ok()
+                    .filter(|text| !text.trim().is_empty()))
+            });
+            let read =
+                |file: &str| fs::read_to_string(self.proc.dir.join(file)).unwrap_or_default();
+            (
+                code.trim().parse().expect("anchor exit code"),
+                read("anchor.stdout"),
+                read("anchor.stderr"),
             )
         }
 
@@ -1480,6 +1815,26 @@ fs.writeFileSync(path.join(dir, 'ready'), String(process.pid));
         launch_row(h, name, &owner.process_id);
         let anchor = owner.run(h, &["launch-anchor"], None);
         assert_receipt(h, name, owner.pid, &anchor);
+        start_session(h, &owner, name);
+        owner
+    }
+
+    /// The launched shape: the launcher anchors the reservation (its own PID
+    /// and receipt); the interpreter below it binds through `omp-start`,
+    /// which must re-pin the row to the interpreter.
+    fn launched_owner(h: &Hcom, label: &str, name: &str) -> NativeOwner {
+        let process_id = uuid::Uuid::new_v4().to_string();
+        launch_row(h, name, &process_id);
+        let owner = NativeOwner::start(h, label, &process_id, true);
+        let anchor = owner.launcher_anchor(h);
+        assert_receipt(h, name, owner.proc.pid(), &anchor);
+        start_session(h, &owner, name);
+        owner
+    }
+
+    /// `omp-start` from the interpreter; the row must end up bound to the
+    /// interpreter's own PID.
+    fn start_session(h: &Hcom, owner: &NativeOwner, name: &str) {
         let sid = uuid::Uuid::new_v4().to_string();
         let transcript = owner.root.join(format!("{sid}.jsonl"));
         let start = owner.run(
@@ -1496,7 +1851,6 @@ fs.writeFileSync(path.join(dir, 'ready'), String(process.pid));
             Some(name),
         );
         assert_bound(h, name, owner.pid, &start);
-        owner
     }
 
     struct Sentinel {
@@ -1504,13 +1858,23 @@ fs.writeFileSync(path.join(dir, 'ready'), String(process.pid));
     }
 
     impl Sentinel {
-        fn spawn(h: &Hcom, label: &str) -> Self {
-            let script = h.root_path().join("sentinel.js");
+        /// A Node sentinel with a cleared environment, plus `HCOM_PROCESS_ID`
+        /// when given. `omp` runs it from a supported OMP script path, so
+        /// native discovery sees an OMP process; its child runs the same
+        /// script and inherits the same environment.
+        fn spawn(h: &Hcom, label: &str, omp: bool, process_id: Option<&str>) -> Self {
+            let script = if omp {
+                h.root_path()
+                    .join(format!("omp-{label}"))
+                    .join("node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js")
+            } else {
+                h.root_path().join("sentinel.js")
+            };
             if !script.exists() {
+                fs::create_dir_all(script.parent().unwrap()).unwrap();
                 fs::write(&script, SENTINEL_JS).unwrap();
             }
             let dir = h.root_path().join(format!("sentinel-{label}"));
-            // Cleared environment: no HCOM identity of any kind.
             let mut command = Command::new(node(h));
             command.arg(&script).arg(&dir).arg("with-child").env_clear();
             #[cfg(windows)]
@@ -1518,6 +1882,9 @@ fs.writeFileSync(path.join(dir, 'ready'), String(process.pid));
                 if let Some(value) = std::env::var_os(key) {
                     command.env(key, value);
                 }
+            }
+            if let Some(process_id) = process_id {
+                command.env("HCOM_PROCESS_ID", process_id);
             }
             let mut sentinel = Self {
                 proc: Proc::spawn(command, dir, "native sentinel"),
@@ -1610,7 +1977,7 @@ fs.writeFileSync(path.join(dir, 'ready'), String(process.pid));
             before_crash,
             "the crash alone changed {name}'s bookkeeping"
         );
-        let mut sentinel = Sentinel::spawn(&h, "reused");
+        let mut sentinel = Sentinel::spawn(&h, "reused", false, None);
         reuse_pid(&h, &name, old, sentinel.pid());
 
         let before = sentinel.beats();
@@ -1626,5 +1993,106 @@ fs.writeFileSync(path.join(dir, 'ready'), String(process.pid));
         assert_ne!(code, 0, "refused kill exited 0:\n{output}");
         assert_refusal_reported(&output, &name, sentinel.pid());
         assert_row_kept(&h, &name, sentinel.pid());
+    }
+
+    // -----------------------------------------------------------------------
+    // Launched shape: a launcher anchors the launch and the interpreter below
+    // it re-pins the row on its first hook, so the verified owner is not the
+    // launched process, and on macOS not its group leader. The launcher may
+    // survive or exit on its own; only the interpreter and its tree must go.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn native_kill_terminates_launched_owner_below_its_launcher() {
+        let h = Scene::new();
+        let name = format!("nativelaunched{}", unique_suffix());
+        let owner = launched_owner(&h, "launched", &name);
+        #[cfg(unix)]
+        assert_eq!(
+            unsafe { libc::getpgid(owner.pid as libc::pid_t) },
+            owner.proc.pid() as libc::pid_t,
+            "precondition: the interpreter must be in its launcher's process group"
+        );
+        let tree = owner.spawn_tree_child(&h);
+
+        let (code, output) = kill(&h, &[&name]);
+        assert!(
+            heartbeat_stops(&owner.proc.dir, Duration::from_secs(10)),
+            "launched native owner {} below launcher {} survived `hcom kill {name}`:\n{output}",
+            owner.pid,
+            owner.proc.pid()
+        );
+        assert!(
+            heartbeat_stops(&tree, Duration::from_secs(10)),
+            "the launched native owner's tree child survived the kill:\n{output}"
+        );
+        assert_eq!(
+            code, 0,
+            "kill of the launched native owner failed:\n{output}"
+        );
+        assert_torn_down(&h, &name);
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy rows: no receipt, so the live process's own HCOM_PROCESS_ID,
+    // read natively, is the only evidence. Every process runs from the OMP
+    // script path; only the carried id differs.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn native_kill_legacy_row_kills_process_carrying_the_bound_process_id() {
+        let h = Scene::new();
+        let name = format!("nativelegacyok{}", unique_suffix());
+        let process_id = uuid::Uuid::new_v4().to_string();
+        let mut owner = Sentinel::spawn(&h, "legacy-owner", true, Some(&process_id));
+        seed_legacy_row(&h, &name, &process_id, Some(owner.pid()));
+
+        let (code, output) = kill(&h, &[&name]);
+        let exit = owner.proc.wait_exit(Duration::from_secs(10));
+        assert!(
+            exit.is_some(),
+            "legacy native owner {} carrying {name}'s bound HCOM_PROCESS_ID survived the \
+             kill:\n{output}",
+            owner.pid()
+        );
+        assert!(
+            heartbeat_stops(&owner.proc.dir.join("child"), Duration::from_secs(10)),
+            "the legacy native owner's tree child survived the kill:\n{output}"
+        );
+        assert_eq!(code, 0, "kill of the legacy native owner failed:\n{output}");
+        assert_torn_down(&h, &name);
+    }
+
+    fn native_legacy_row_refused(case: &str, carried: Option<&str>) {
+        let h = Scene::new();
+        let name = format!("nativelegacyno{}", unique_suffix());
+        let process_id = uuid::Uuid::new_v4().to_string();
+        let mut sentinel = Sentinel::spawn(&h, case, true, carried);
+        seed_legacy_row(&h, &name, &process_id, Some(sentinel.pid()));
+
+        let before = sentinel.beats();
+        let (code, output) = kill(&h, &[&name]);
+        let observed = sentinel.observe(before);
+        assert_eq!(
+            observed,
+            Sentinel::spared(),
+            "SAFETY [{case}]: `hcom kill {name}` terminated or signalled PID {} (or its child), \
+             which does not carry {name}'s bound HCOM_PROCESS_ID:\n{output}",
+            sentinel.pid()
+        );
+        assert_ne!(code, 0, "[{case}] refused kill exited 0:\n{output}");
+        assert_refusal_reported(&output, &name, sentinel.pid());
+        assert_row_kept(&h, &name, sentinel.pid());
+    }
+
+    #[test]
+    fn native_kill_legacy_row_refuses_process_without_a_process_id() {
+        native_legacy_row_refused("no-process-id", None);
+    }
+
+    #[test]
+    fn native_kill_legacy_row_refuses_process_carrying_another_process_id() {
+        let other = uuid::Uuid::new_v4().to_string();
+        native_legacy_row_refused("other-process-id", Some(&other));
     }
 }
