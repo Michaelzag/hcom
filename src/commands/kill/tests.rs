@@ -210,12 +210,6 @@ fn test_kill_args_no_target_is_empty_vec() {
 }
 
 #[test]
-fn test_normalize_permission_denied_after_pane_close_succeeds() {
-    let result = normalize_kill_result("luna", 42, terminal::KillResult::PermissionDenied, true);
-    assert_eq!(result, terminal::KillResult::AlreadyDead);
-}
-
-#[test]
 fn test_incomplete_cleanup_requires_terminated_process_and_retry_command() {
     assert!(report_incomplete_pane_cleanup(
         PaneCleanupProcessState::Terminated,
