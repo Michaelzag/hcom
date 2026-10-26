@@ -4,18 +4,28 @@
 //! and an `hcom stop` pointer, and nothing in the reuser's tree signalled. A
 //! genuine owner, and its tree, is still killed.
 //!
-//! Every process here is a fixture child of this test, or a descendant of
+//! The kill root is the recorded pre-hook launch root, the last pin before the
+//! hook re-pinned the row to the interpreter: what `hcom pty` launched (the
+//! PTY child), or the launcher that ran `hcom launch-anchor`. Kill retires
+//! that root's tree and never signals anything above it, `hcom pty`
+//! included, even when it carries the seat's HCOM_PROCESS_ID.
+//!
+//! Most processes here are fixture children of this test or descendants of
 //! one: a stand-in OMP that registers through hcom's own `launch-anchor`
 //! (which writes the native identity receipt) and binds through `omp-start`,
 //! sometimes below a launcher that leads its process group, or a sentinel that
-//! records any signal it receives and keeps a heartbeat. PID reuse is
-//! simulated in the private DB only: the reuser's PID replaces the crashed
-//! owner's number in the owner's row and bindings, nothing else changes.
+//! records any signal it receives and keeps a heartbeat. `mod real` instead
+//! resumes seats through hcom's own launch paths and `hcom pty`, with
+//! fixture-private tools first on PATH. PID reuse is simulated in the private
+//! DB only: the reuser's PID replaces the crashed owner's number in the
+//! owner's row and bindings, nothing else changes.
 //!
-//! Legacy rows carry no receipt; their evidence is the live process's own
-//! HCOM_PROCESS_ID. Linux (`mod linux`) reads it from /proc and also covers
-//! zombies and unreadable evidence; Windows and macOS (`mod native`) read it
-//! natively.
+//! Legacy rows carry no receipt and no recorded launch root; their evidence is
+//! the live process's own HCOM_PROCESS_ID. Linux (`mod linux`) reads it from
+//! /proc and also covers zombies and unreadable evidence; Windows and macOS
+//! (`mod native`) read it natively. A legacy OMP row whose launcher is not
+//! `hcom pty` loses only its owner tree, and the kill says the launcher was
+//! not verified; a non-OMP row's verified PID is its root.
 
 #![cfg(any(target_os = "linux", target_os = "macos", windows))]
 
@@ -66,7 +76,7 @@ impl Drop for Scene {
                 "UPDATE instances
                     SET pid=NULL,
                         launch_context=CASE WHEN json_valid(launch_context)
-                            THEN json_remove(launch_context,'$.omp_launch_pid')
+                            THEN json_remove(launch_context,'$.omp_launch_pid','$.omp_launch_root')
                             ELSE launch_context END",
                 [],
             );
@@ -113,27 +123,223 @@ fn launch_row(h: &Hcom, name: &str, process_id: &str) {
 
 /// A legacy bound row, as written before any identity record existed: row,
 /// process binding and session binding, recorded PID `pid`, and no launch
-/// receipt.
+/// receipt or recorded launch root.
 fn seed_legacy_row(h: &Hcom, name: &str, process_id: &str, pid: Option<u32>) {
+    seed_bound_row(h, "omp", name, process_id, pid);
+}
+
+/// A bound `tool` row with no launch context: row, process binding and
+/// session binding, recorded PID `pid`.
+fn seed_bound_row(h: &Hcom, tool: &str, name: &str, process_id: &str, pid: Option<u32>) {
     let conn = db(h);
     let sid = format!("sid-{name}");
     conn.execute(
         "INSERT INTO instances (name, tool, session_id, status, status_context, status_time, created_at, last_event_id, pid)
-         VALUES (?1, 'omp', ?2, 'listening', 'start', 0, 0, 0, ?3)",
-        rusqlite::params![name, sid, pid],
+         VALUES (?1, ?2, ?3, 'listening', 'start', 0, 0, 0, ?4)",
+        rusqlite::params![name, tool, sid, pid],
     )
-    .expect("seed legacy row");
+    .expect("seed bound row");
     conn.execute(
         "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
          VALUES (?1, ?2, ?3, 0)",
         rusqlite::params![process_id, sid, name],
     )
-    .expect("seed legacy process binding");
+    .expect("seed process binding");
     conn.execute(
         "INSERT INTO session_bindings (session_id, instance_name, created_at) VALUES (?1, ?2, 0)",
         rusqlite::params![sid, name],
     )
-    .expect("seed legacy session binding");
+    .expect("seed session binding");
+}
+
+/// Make `name` a legacy row: drop its recorded launch root, keep the rest.
+#[cfg(unix)]
+fn strip_launch_root(h: &Hcom, name: &str) {
+    db(h)
+        .execute(
+            "UPDATE instances
+                SET launch_context=json_remove(launch_context,'$.omp_launch_root')
+              WHERE name=?1 AND json_valid(launch_context)",
+            [name],
+        )
+        .expect("strip the recorded launch root");
+}
+
+/// A stopped OMP seat that `hcom r` can resume: its row, its session file, and
+/// a stop event whose snapshot holds the launch mode. The stopped owner really
+/// existed and was reaped.
+fn seed_stopped_omp(h: &Hcom, name: &str, background: bool) -> (String, std::path::PathBuf) {
+    let sid = uuid::Uuid::new_v4().to_string();
+    let transcript = h
+        .home
+        .join(".omp/agent/sessions/real")
+        .join(format!("2026-10-01T00-00-00-000Z_{sid}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).expect("create session directory");
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            json!({"type": "session", "id": sid, "cwd": h.workspace})
+        ),
+    )
+    .expect("write session file");
+    let mut command = h.external_cmd(if cfg!(windows) {
+        "cmd.exe"
+    } else {
+        "/bin/bash"
+    });
+    if cfg!(windows) {
+        command.args(["/d", "/c", "exit 0"]);
+    } else {
+        command.args(["-c", "exec -a omp /bin/bash -c 'exit 0'"]);
+    }
+    let mut prior = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the stopped seat's owner");
+    let prior_pid = prior.id();
+    prior.wait().expect("reap the stopped seat's owner");
+    let conn = db(h);
+    conn.execute(
+        "INSERT INTO instances (name,tool,session_id,status,status_context,status_time,created_at,directory,transcript_path,last_event_id,background)
+         VALUES (?1,'omp',?2,'inactive','exit:0',0,CAST(strftime('%s','now') AS REAL),?3,?4,0,?5)",
+        rusqlite::params![
+            name,
+            sid,
+            h.workspace.to_string_lossy(),
+            transcript.to_string_lossy(),
+            i64::from(background)
+        ],
+    )
+    .expect("seed the stopped row");
+    conn.execute(
+        "INSERT INTO events (timestamp,type,instance,data) VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'),'life',?1,?2)",
+        rusqlite::params![
+            name,
+            json!({
+                "action": "stopped", "by": "session", "reason": "exit:normal",
+                "process_id": format!("omp-{prior_pid}-5-6"),
+                "snapshot": {
+                    "name": name, "tool": "omp", "session_id": sid, "pid": prior_pid,
+                    "directory": h.workspace, "transcript_path": transcript,
+                    "background": i64::from(background), "launch_args": "", "last_event_id": 0,
+                },
+            })
+            .to_string()
+        ],
+    )
+    .expect("seed the stop event");
+    (sid, transcript)
+}
+
+/// Put the fixture tools in `fakebin` first on every PATH a launch uses, and
+/// keep the launched tool's roots inside the fixture. The launch resolves its
+/// tool from hcom's own PATH and rebuilds the tool's env from a clean shell
+/// plus the fixture passthrough, which hcom's own CLI env takes too. A real
+/// `omp` elsewhere on PATH must never run.
+fn use_fixture_tools(h: &Hcom, fakebin: &std::path::Path) {
+    let inherited = |key: &str| {
+        h.cmd()
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    let mut paths = vec![fakebin.to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &inherited("PATH").expect("fixture PATH"),
+    ));
+    h.set_launch_env(
+        "PATH",
+        std::env::join_paths(paths)
+            .expect("join the launch PATH")
+            .to_str()
+            .unwrap(),
+    );
+    for key in [
+        "HOME",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "CODEX_HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+    ] {
+        if let Some(value) = inherited(key) {
+            h.set_launch_env(key, value.to_str().unwrap());
+        }
+    }
+    h.set_launch_env("PI_CONFIG_DIR", h.home.join(".omp").to_str().unwrap());
+    h.set_launch_env(
+        "PI_CODING_AGENT_DIR",
+        h.home.join(".omp/agent").to_str().unwrap(),
+    );
+    let path = inherited("PATH").expect("launch PATH");
+    let first = std::env::split_paths(&path).find(|dir| {
+        ["omp", "omp.exe", "omp.cmd", "omp.bat", "omp.com"]
+            .iter()
+            .any(|tool| dir.join(tool).is_file())
+    });
+    assert_eq!(
+        first.as_deref(),
+        Some(fakebin),
+        "safety: the launch PATH must reach the stand-in omp before any real one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hooked stand-in OMP on Unix: a step runner that runs hcom commands from
+// inside its own process, so hcom anchors and binds the name to this live PID
+// through the real launch-anchor and hook paths.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+const STEP_RUNNER: &str = r#"
+cd "$TEST_CWD" || exit 1
+H() { HCOM_LAUNCHED=1 HCOM_TOOL=omp "$TEST_BIN" "$@"; }
+printf '%s\n%s' "$$" "$HCOM_PROCESS_ID" > "$TEST_OUT_DIR/ready"
+while :; do
+    for go in "$TEST_OUT_DIR"/go-*; do
+        [ -e "$go" ] || continue
+        step=${go##*/go-}
+        [ ! -e "$TEST_OUT_DIR/$step.code" ] || continue
+        . "$TEST_OUT_DIR/$step.sh" > "$TEST_OUT_DIR/$step.stdout" 2> "$TEST_OUT_DIR/$step.stderr"
+        printf '%s' "$?" > "$TEST_OUT_DIR/$step.code"
+    done
+    sleep 0.05 & wait $!
+done
+"#;
+
+/// Run `script` as step `step` inside the step runner writing to `out_dir`.
+#[cfg(unix)]
+fn run_step(
+    h: &Hcom,
+    out_dir: &std::path::Path,
+    step: usize,
+    script: &str,
+) -> (i32, String, String) {
+    std::fs::write(out_dir.join(format!("{step}.sh")), script).expect("write hook step");
+    std::fs::write(out_dir.join(format!("go-{step}")), "").expect("trigger hook step");
+    let code = h.eventually("hook step finished", Duration::from_secs(30), || {
+        Ok(
+            std::fs::read_to_string(out_dir.join(format!("{step}.code")))
+                .ok()
+                .filter(|text| !text.is_empty()),
+        )
+    });
+    let read = |file: String| std::fs::read_to_string(out_dir.join(file)).unwrap_or_default();
+    (
+        code.parse().expect("hook step exit code"),
+        read(format!("{step}.stdout")),
+        read(format!("{step}.stderr")),
+    )
 }
 
 /// Precondition: `launch-anchor` recorded `pid` and a native identity receipt
@@ -304,6 +510,59 @@ fn assert_torn_down(h: &Hcom, name: &str) {
     );
 }
 
+/// A successful kill: exit 0, the seat named, and no refusal or
+/// unverified-launcher report. A real PTY seat may report the plain kill, or
+/// that its session shut itself down during the kill: `hcom pty` exits once
+/// the root's tree is gone and races the kill's own teardown.
+#[track_caller]
+fn assert_kill_succeeded(code: i32, output: &str, name: &str) {
+    assert!(
+        !output.contains(&format!("hcom stop {name}")) && !mentions_unverified_launcher(output),
+        "kill of {name} reported a refusal instead of success:\n{output}"
+    );
+    assert!(
+        output.contains(name),
+        "kill output does not name {name}:\n{output}"
+    );
+    assert_eq!(code, 0, "kill of {name} failed:\n{output}");
+}
+
+/// The kill could not verify the seat's launcher: it says so, exits nonzero,
+/// and never prints the success (resume) hint.
+#[track_caller]
+fn assert_unverified_launcher(code: i32, output: &str, name: &str) {
+    assert!(
+        mentions_unverified_launcher(output),
+        "kill of {name} did not say its launcher was not verified:\n{output}"
+    );
+    assert!(
+        !output.contains(&format!("hcom r {name}")),
+        "kill of {name} printed the success resume hint although its launcher was not \
+         verified:\n{output}"
+    );
+    assert_ne!(
+        code, 0,
+        "kill of {name} exited 0 although its launcher was not verified:\n{output}"
+    );
+}
+
+fn mentions_unverified_launcher(output: &str) -> bool {
+    let output = output.to_lowercase();
+    output.contains("launcher")
+        && [
+            "not verified",
+            "n't verified",
+            "unverified",
+            "not be verified",
+            "could not verify",
+            "couldn't verify",
+            "cannot verify",
+            "can't verify",
+        ]
+        .iter()
+        .any(|phrase| output.contains(phrase))
+}
+
 // ===========================================================================
 // Linux: bash stand-in OMP, trap-recording sentinels, legacy environ evidence.
 // ===========================================================================
@@ -471,28 +730,6 @@ mod linux {
         dir
     }
 
-    // -----------------------------------------------------------------------
-    // Hooked stand-in OMP: a step runner that runs hcom commands from inside
-    // its own process, so hcom anchors and binds the name to this live PID
-    // through the real launch-anchor and hook paths.
-    // -----------------------------------------------------------------------
-
-    const STEP_RUNNER: &str = r#"
-cd "$TEST_CWD" || exit 1
-H() { HCOM_LAUNCHED=1 HCOM_TOOL=omp "$TEST_BIN" "$@"; }
-printf '%s\n%s' "$$" "$HCOM_PROCESS_ID" > "$TEST_OUT_DIR/ready"
-while :; do
-    for go in "$TEST_OUT_DIR"/go-*; do
-        [ -e "$go" ] || continue
-        step=${go##*/go-}
-        [ ! -e "$TEST_OUT_DIR/$step.code" ] || continue
-        . "$TEST_OUT_DIR/$step.sh" > "$TEST_OUT_DIR/$step.stdout" 2> "$TEST_OUT_DIR/$step.stderr"
-        printf '%s' "$?" > "$TEST_OUT_DIR/$step.code"
-    done
-    sleep 0.05 & wait $!
-done
-"#;
-
     /// An hcom launch script's shape: it anchors the launch first, then runs
     /// the tool as a child it waits on, not exec'd.
     const LAUNCHER: &str = r#"
@@ -636,20 +873,7 @@ exec sleep 300
         fn run(&self, h: &Hcom, script: &str) -> (i32, String, String) {
             let step = self.next_step.get();
             self.next_step.set(step + 1);
-            fs::write(self.out_dir.join(format!("{step}.sh")), script).expect("write hook step");
-            fs::write(self.out_dir.join(format!("go-{step}")), "").expect("trigger hook step");
-            let code = h.eventually("hook step finished", Duration::from_secs(30), || {
-                Ok(
-                    fs::read_to_string(self.out_dir.join(format!("{step}.code")))
-                        .ok()
-                        .filter(|text| !text.is_empty()),
-                )
-            });
-            (
-                code.parse().expect("hook step exit code"),
-                fs::read_to_string(self.out_dir.join(format!("{step}.stdout"))).unwrap_or_default(),
-                fs::read_to_string(self.out_dir.join(format!("{step}.stderr"))).unwrap_or_default(),
-            )
+            run_step(h, &self.out_dir, step, script)
         }
 
         /// Start a long-lived child in the owner's own tree and process
@@ -1225,7 +1449,12 @@ while True:
     }
 
     // -----------------------------------------------------------------------
-    // Rows 2 + 7: the genuine live owner and its tree are still killed.
+    // Rows 2 + 7: the genuine live owner and its tree are still killed. With
+    // no `hcom pty` above it the seat has no recorded launch root, so this is
+    // a legacy OMP row whose launcher is not verified (rule 3): the owner
+    // tree goes and the row is torn down, but the kill exits nonzero and
+    // says the launcher was not verified. Real `hcom pty` launches (`mod
+    // real`) cover the plain success.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1245,12 +1474,13 @@ while True:
             )),
             "the genuine owner's child {tree_child} survived the kill:\n{output}"
         );
-        assert_eq!(code, 0, "kill of the genuine owner failed:\n{output}");
+        assert_unverified_launcher(code, &output, &name);
         assert_torn_down(&h, &name);
     }
 
     // -----------------------------------------------------------------------
-    // Row 3: mixed multi-target kills signal only the genuine owner.
+    // Row 3: mixed multi-target kills signal only the genuine owner. Its row
+    // is legacy too (rule 3), so neither target reports success.
     // -----------------------------------------------------------------------
 
     fn mixed_targets(target: &str) {
@@ -1278,7 +1508,7 @@ while True:
             other => unreachable!("{other}"),
         };
         let before = sentinel.beats();
-        let (_code, output) = kill(&h, &args[..]);
+        let (code, output) = kill(&h, &args[..]);
         let observed = sentinel.observe(before);
         assert_eq!(
             observed,
@@ -1290,8 +1520,21 @@ while True:
         );
         assert_owner_killed(&genuine, &output);
         assert_torn_down(&h, &genuine_name);
+        assert!(
+            mentions_unverified_launcher(&output)
+                && !output.contains(&format!("hcom r {genuine_name}")),
+            "`hcom kill {}` did not report {genuine_name}'s launcher as not verified, or \
+             printed its success hint:\n{output}",
+            args.join(" ")
+        );
         assert_refusal_reported(&output, &reused_name, sentinel.pid());
         assert_row_kept(&h, &reused_name, sentinel.pid());
+        assert_ne!(
+            code,
+            0,
+            "`hcom kill {}` exited 0 with no target killed cleanly:\n{output}",
+            args.join(" ")
+        );
     }
 
     #[test]
@@ -1544,7 +1787,8 @@ while True:
     // -----------------------------------------------------------------------
     // Rows 2 + 7, launched shape: a launcher leads the process group and
     // anchors the launch; the OMP is its child, and the OMP's first hook
-    // re-pins the row to it. The verified owner is not its group leader.
+    // re-pins the row to it. The verified owner is not its group leader. The
+    // launcher is not `hcom pty`, so rule 3 applies as above.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1577,7 +1821,7 @@ while True:
             )),
             "the launched owner's child {tree_child} survived the kill:\n{output}"
         );
-        assert_eq!(code, 0, "kill of the launched owner failed:\n{output}");
+        assert_unverified_launcher(code, &output, &name);
         assert_torn_down(&h, &name);
     }
 
@@ -1660,7 +1904,9 @@ while True:
     // -----------------------------------------------------------------------
     // Row 6: legacy rows (no persisted identity record) on Linux decide by
     // the live process's HCOM_PROCESS_ID. Both processes have comm `omp`;
-    // only the carried id differs.
+    // only the carried id differs. With no recorded launch root and a
+    // launcher (this test) that is not `hcom pty`, the owner tree still goes
+    // but the kill must say the launcher was not verified.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1685,7 +1931,42 @@ while True:
             "legacy owner {} carrying {name}'s bound HCOM_PROCESS_ID survived the kill:\n{output}",
             owner.pid()
         );
-        assert_eq!(code, 0, "kill of the legacy owner failed:\n{output}");
+        assert_unverified_launcher(code, &output, &name);
+        assert_torn_down(&h, &name);
+    }
+
+    /// A non-OMP row has no launch root to record: its verified PID is the
+    /// root, and the kill retires that process's tree as a plain success.
+    #[test]
+    fn kill_non_omp_row_retires_the_verified_process_tree() {
+        let h = Scene::new();
+        let name = format!("nonomp{}", unique_suffix());
+        let process_id = uuid::Uuid::new_v4().to_string();
+        let owner = Sentinel::bash(
+            &h,
+            "non-omp-owner",
+            Path::new("/bin/bash"),
+            &[("HCOM_PROCESS_ID", process_id.as_str())],
+            true,
+        );
+        let child = owner.child.expect("non-OMP owner child");
+        seed_bound_row(&h, "claude", &name, &process_id, Some(owner.pid()));
+
+        let (code, output) = kill(&h, &[&name]);
+        let exit = owner.proc.wait_exit(Duration::from_secs(10));
+        assert!(
+            exit.is_some(),
+            "the verified non-OMP owner {} survived `hcom kill {name}`:\n{output}",
+            owner.pid()
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || !member_alive(
+                child,
+                owner.pid()
+            )),
+            "the non-OMP owner's child {child} survived the kill:\n{output}"
+        );
+        assert_kill_succeeded(code, &output, &name);
         assert_torn_down(&h, &name);
     }
 
@@ -1748,7 +2029,7 @@ function answer(entry, value) {
     fs.renameSync(`${out}.tmp`, out);
 }
 fs.writeFileSync(path.join(dir, 'ready.tmp'), JSON.stringify({
-    pid: process.pid, process_id: process.env.HCOM_PROCESS_ID,
+    pid: process.pid, ppid: process.ppid, process_id: process.env.HCOM_PROCESS_ID,
 }));
 fs.renameSync(path.join(dir, 'ready.tmp'), path.join(dir, 'ready'));
 const born = Date.now();
@@ -2034,16 +2315,7 @@ wait "$!"
         fn request(&self, h: &Hcom, request: Value) -> Value {
             let step = self.step.get();
             self.step.set(step + 1);
-            let input = self.proc.dir.join(format!("step-{step}.json"));
-            fs::write(input.with_extension("tmp"), request.to_string()).unwrap();
-            fs::rename(input.with_extension("tmp"), &input).unwrap();
-            h.eventually("native owner step", Duration::from_secs(30), || {
-                Ok(
-                    fs::read_to_string(self.proc.dir.join(format!("step-{step}.json.out")))
-                        .ok()
-                        .and_then(|text| serde_json::from_str(&text).ok()),
-                )
-            })
+            native_request(h, &self.proc.dir, step, request)
         }
 
         fn run(&self, h: &Hcom, args: &[&str], name: Option<&str>) -> (i32, String, String) {
@@ -2222,6 +2494,11 @@ wait "$!"
         }
     }
 
+    /// With no `hcom pty` above it this seat has no recorded launch root: a
+    /// legacy OMP row whose launcher is not verified (rule 3). The owner tree
+    /// goes and the row is torn down, but the kill exits nonzero and says
+    /// so. Real launches (`mod real`, and the Windows omp.cmd launch below)
+    /// cover the plain success.
     #[test]
     fn native_kill_terminates_genuine_registered_owner_and_its_tree() {
         let h = Scene::new();
@@ -2240,10 +2517,7 @@ wait "$!"
             heartbeat_stops(&tree, Duration::from_secs(10)),
             "the genuine native owner's tree child survived the kill:\n{output}"
         );
-        assert_eq!(
-            code, 0,
-            "kill of the genuine native owner failed:\n{output}"
-        );
+        assert_unverified_launcher(code, &output, &name);
         assert_torn_down(&h, &name);
     }
 
@@ -2281,8 +2555,9 @@ wait "$!"
     // -----------------------------------------------------------------------
     // Launched shape: a launcher anchors the launch and the interpreter below
     // it re-pins the row on its first hook, so the verified owner is not the
-    // launched process, and on macOS not its group leader. The launcher may
-    // survive or exit on its own; only the interpreter and its tree must go.
+    // launched process, and on macOS not its group leader. The launcher is
+    // not `hcom pty`: rule 3 applies, and only the interpreter and its tree
+    // must go.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2309,17 +2584,16 @@ wait "$!"
             heartbeat_stops(&tree, Duration::from_secs(10)),
             "the launched native owner's tree child survived the kill:\n{output}"
         );
-        assert_eq!(
-            code, 0,
-            "kill of the launched native owner failed:\n{output}"
-        );
+        assert_unverified_launcher(code, &output, &name);
         assert_torn_down(&h, &name);
     }
 
     // -----------------------------------------------------------------------
     // Legacy rows: no receipt, so the live process's own HCOM_PROCESS_ID,
     // read natively, is the only evidence. Every process runs from the OMP
-    // script path; only the carried id differs.
+    // script path; only the carried id differs. With no recorded launch root
+    // and a launcher (this test) that is not `hcom pty`, the owner tree still
+    // goes but the kill must say the launcher was not verified.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2342,7 +2616,32 @@ wait "$!"
             heartbeat_stops(&owner.proc.dir.join("child"), Duration::from_secs(10)),
             "the legacy native owner's tree child survived the kill:\n{output}"
         );
-        assert_eq!(code, 0, "kill of the legacy native owner failed:\n{output}");
+        assert_unverified_launcher(code, &output, &name);
+        assert_torn_down(&h, &name);
+    }
+
+    /// A non-OMP row has no launch root to record: its verified PID is the
+    /// root, and the kill retires that process's tree as a plain success.
+    #[test]
+    fn native_kill_non_omp_row_retires_the_verified_process_tree() {
+        let h = Scene::new();
+        let name = format!("nativenonomp{}", unique_suffix());
+        let process_id = uuid::Uuid::new_v4().to_string();
+        let mut owner = Sentinel::spawn(&h, "non-omp-owner", false, Some(&process_id));
+        seed_bound_row(&h, "claude", &name, &process_id, Some(owner.pid()));
+
+        let (code, output) = kill(&h, &[&name]);
+        let exit = owner.proc.wait_exit(Duration::from_secs(10));
+        assert!(
+            exit.is_some(),
+            "the verified non-OMP owner {} survived `hcom kill {name}`:\n{output}",
+            owner.pid()
+        );
+        assert!(
+            heartbeat_stops(&owner.proc.dir.join("child"), Duration::from_secs(10)),
+            "the non-OMP owner's child survived the kill:\n{output}"
+        );
+        assert_kill_succeeded(code, &output, &name);
         assert_torn_down(&h, &name);
     }
 
@@ -2377,5 +2676,1026 @@ wait "$!"
     fn native_kill_legacy_row_refuses_process_carrying_another_process_id() {
         let other = uuid::Uuid::new_v4().to_string();
         native_legacy_row_refused("other-process-id", Some(&other));
+    }
+
+    /// Run `request` as step `step` of the Node runner watching `dir`.
+    fn native_request(h: &Hcom, dir: &Path, step: usize, request: Value) -> Value {
+        let input = dir.join(format!("step-{step}.json"));
+        fs::write(input.with_extension("tmp"), request.to_string()).unwrap();
+        fs::rename(input.with_extension("tmp"), &input).unwrap();
+        h.eventually("native owner step", Duration::from_secs(30), || {
+            Ok(
+                fs::read_to_string(dir.join(format!("step-{step}.json.out")))
+                    .ok()
+                    .and_then(|text| serde_json::from_str(&text).ok()),
+            )
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Windows real launch: background `hcom r` of a seat whose `omp` is an
+    // npm-style `omp.cmd`. `hcom pty` launches cmd.exe (the PTY child and
+    // launch root), which runs the Node interpreter the hook re-pins to and
+    // then waits on its console. The kill retires cmd.exe's tree; `hcom pty`
+    // above it only exits.
+    // -----------------------------------------------------------------------
+
+    /// A process this test did not spawn, held by a handle so its PID cannot
+    /// be reused while the test watches it.
+    #[cfg(windows)]
+    struct Held {
+        role: &'static str,
+        pid: u32,
+        handle: windows_sys::Win32::Foundation::HANDLE,
+        created: u64,
+    }
+
+    // Base Cargo has no WDK feature: declare only this stable query ABI.
+    #[cfg(windows)]
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        #[link_name = "NtQueryInformationProcess"]
+        fn query_process(
+            handle: windows_sys::Win32::Foundation::HANDLE,
+            information_class: i32,
+            information: *mut std::ffi::c_void,
+            information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    #[cfg(windows)]
+    impl Held {
+        /// Hold `pid`, then prove it is still the expected live process: the
+        /// child of `parent`, created after it, when given.
+        fn open(role: &'static str, pid: u32, parent: Option<&Held>) -> Self {
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_TERMINATE,
+            };
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_INFORMATION
+                        | PROCESS_QUERY_LIMITED_INFORMATION
+                        | PROCESS_TERMINATE,
+                    0,
+                    pid,
+                )
+            };
+            assert!(
+                !handle.is_null(),
+                "hold the {role} {pid}: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut held = Self {
+                role,
+                pid,
+                handle,
+                created: 0,
+            };
+            held.created = held.creation();
+            assert!(held.alive(), "the {role} {pid} exited before it was held");
+            if let Some(parent) = parent {
+                held.assert_child_of(parent);
+            }
+            held
+        }
+
+        /// Hold this process's parent, proven older than this process.
+        fn parent_of(role: &'static str, child: &Held) -> Self {
+            let parent = Self::open(
+                role,
+                child
+                    .parent()
+                    .unwrap_or_else(|| panic!("the {} has no parent", child.role)),
+                None,
+            );
+            child.assert_child_of(&parent);
+            parent
+        }
+
+        #[track_caller]
+        fn assert_child_of(&self, parent: &Held) {
+            assert!(
+                self.parent() == Some(parent.pid) && self.created >= parent.created,
+                "the {} {} is not the child of the {} {}",
+                self.role,
+                self.pid,
+                parent.role,
+                parent.pid
+            );
+        }
+
+        fn creation(&self) -> u64 {
+            use windows_sys::Win32::Foundation::FILETIME;
+            use windows_sys::Win32::System::Threading::GetProcessTimes;
+            let mut created: FILETIME = unsafe { std::mem::zeroed() };
+            let mut exited: FILETIME = unsafe { std::mem::zeroed() };
+            let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+            let mut user: FILETIME = unsafe { std::mem::zeroed() };
+            let read = unsafe {
+                GetProcessTimes(
+                    self.handle,
+                    &mut created,
+                    &mut exited,
+                    &mut kernel,
+                    &mut user,
+                )
+            };
+            assert!(read != 0, "creation time of the {} {}", self.role, self.pid);
+            (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)
+        }
+
+        fn alive(&self) -> bool {
+            use windows_sys::Win32::Foundation::STILL_ACTIVE;
+            use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+            let mut code = 0u32;
+            let read = unsafe { GetExitCodeProcess(self.handle, &mut code) };
+            read != 0 && code == STILL_ACTIVE as u32
+        }
+
+        /// The parent PID the kernel recorded at this process's creation.
+        fn parent(&self) -> Option<u32> {
+            #[repr(C)]
+            struct BasicInformation {
+                _exit_status: i32,
+                _peb: *mut std::ffi::c_void,
+                _affinity: usize,
+                _base_priority: i32,
+                pid: usize,
+                parent_pid: usize,
+            }
+            let mut info: BasicInformation = unsafe { std::mem::zeroed() };
+            let mut written = 0u32;
+            // ProcessBasicInformation = 0.
+            let status = unsafe {
+                query_process(
+                    self.handle,
+                    0,
+                    (&mut info as *mut BasicInformation).cast(),
+                    std::mem::size_of::<BasicInformation>() as u32,
+                    &mut written,
+                )
+            };
+            (status >= 0 && info.pid == self.pid as usize).then_some(info.parent_pid as u32)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Held {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Threading::TerminateProcess;
+            if self.alive() {
+                unsafe { TerminateProcess(self.handle, 1) };
+            }
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+        }
+    }
+
+    /// The `hcom r` process, killed at drop if it is still running.
+    #[cfg(windows)]
+    struct Resume(Child);
+
+    #[cfg(windows)]
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_background_kill_retires_the_omp_cmd_launch_tree() {
+        let h = Scene::new();
+        let name = format!("winseat{}", unique_suffix());
+        let root = h.root_path().join("winseat");
+        let steps = root.join("steps");
+        let leaf_dir = root.join("leaf");
+        let fakebin = root.join("fakebin");
+        let script = root.join("node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js");
+        for dir in [&steps, &fakebin, &script.parent().unwrap().to_path_buf()] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(&script, OWNER_RUNNER).unwrap();
+        let sentinel = root.join("sentinel.js");
+        fs::write(&sentinel, SENTINEL_JS).unwrap();
+        fs::write(
+            fakebin.join("omp.cmd"),
+            format!(
+                "@echo off\r\n\
+                 if \"%~1\"==\"--version\" (\r\n\
+                 echo 1.0.0\r\n\
+                 exit /b 0\r\n\
+                 )\r\n\
+                 set \"TEST_OWNER_DIR={steps}\"\r\n\
+                 set \"TEST_HCOM_BIN={bin}\"\r\n\
+                 \"{node}\" \"{script}\" %*\r\n\
+                 pause >nul\r\n",
+                steps = steps.display(),
+                bin = env!("CARGO_BIN_EXE_hcom"),
+                node = node(&h).display(),
+                script = script.display(),
+            ),
+        )
+        .unwrap();
+        use_fixture_tools(&h, &fakebin);
+        let (sid, transcript) = seed_stopped_omp(&h, &name, true);
+
+        let stdout = root.join("resume.stdout");
+        let stderr = root.join("resume.stderr");
+        let _resume = Resume(
+            h.cmd()
+                .args(["r", name.as_str(), "--go"])
+                .current_dir(&h.workspace)
+                .stdin(Stdio::null())
+                .stdout(fs::File::create(&stdout).unwrap())
+                .stderr(fs::File::create(&stderr).unwrap())
+                .spawn()
+                .expect("spawn hcom r"),
+        );
+        let resume_output = || {
+            format!(
+                "{}\n{}",
+                fs::read_to_string(&stdout).unwrap_or_default(),
+                fs::read_to_string(&stderr).unwrap_or_default()
+            )
+        };
+        // Windows CI starts two nested PowerShells before `hcom pty`, and the
+        // interpreter cold-starts behind cmd.exe.
+        let mut ready = Value::Null;
+        assert!(
+            wait_until(Duration::from_secs(120), || {
+                ready = fs::read_to_string(steps.join("ready"))
+                    .ok()
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or(Value::Null);
+                !ready.is_null()
+            }),
+            "the launched Node interpreter never started:\n{}",
+            resume_output()
+        );
+        let pid = |value: &Value| u32::try_from(value.as_u64().unwrap()).unwrap();
+        let interpreter = Held::open("interpreter", pid(&ready["pid"]), None);
+        let launch_root = Held::parent_of("launch root", &interpreter);
+        let pty = Held::parent_of("hcom pty", &launch_root);
+        let _runner = Held::parent_of("launch runner", &pty);
+        // Precondition: the pre-hook pin settled on cmd.exe, the process
+        // `hcom pty` launched.
+        assert!(
+            wait_until(Duration::from_secs(30), || row_facts(&h, &name)["pid"]
+                == json!(launch_root.pid)),
+            "the pre-hook pin never settled on the PTY child {}: {}",
+            launch_root.pid,
+            row_facts(&h, &name)
+        );
+        let spawned = native_request(
+            &h,
+            &steps,
+            0,
+            json!({"kind": "child", "script": sentinel, "dir": leaf_dir}),
+        );
+        assert!(
+            wait_until(Duration::from_secs(30), || leaf_dir.join("ready").exists()
+                && beats(&leaf_dir) > 0),
+            "the interpreter's leaf never became ready"
+        );
+        let leaf = Held::open("leaf", pid(&spawned["pid"]), Some(&interpreter));
+        let hook = native_request(
+            &h,
+            &steps,
+            1,
+            json!({"kind": "hook", "name": null, "args": [
+                "omp-start", "--session-id", sid, "--transcript-path", transcript,
+                "--cwd", h.workspace,
+            ]}),
+        );
+        let start = (
+            i32::try_from(hook["code"].as_i64().unwrap()).unwrap(),
+            hook["stdout"].as_str().unwrap().to_string(),
+            hook["stderr"].as_str().unwrap().to_string(),
+        );
+        assert_bound(&h, &name, interpreter.pid, &start);
+
+        let (code, output) = kill(&h, &[&name]);
+        let tree = [&launch_root, &interpreter, &leaf];
+        assert!(
+            wait_until(Duration::from_secs(30), || tree
+                .iter()
+                .all(|held| !held.alive())),
+            "`hcom kill {name}` left launched-tree member(s) alive: {:?}:\n{output}",
+            tree.iter()
+                .filter(|held| held.alive())
+                .map(|held| (held.role, held.pid))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            wait_until(Duration::from_secs(30), || !pty.alive()),
+            "hcom pty {} outlived its launched tree:\n{output}",
+            pty.pid
+        );
+        assert_kill_succeeded(code, &output, &name);
+        let _ = fs::write(steps.join("stop"), "");
+        let _ = fs::write(leaf_dir.join("stop"), "");
+    }
+}
+
+// ===========================================================================
+// Real launches, Linux and macOS: `hcom r` resumes a stopped seat through
+// hcom's own launch script and `hcom pty`, with fixture-private `bash` and
+// `omp` first on PATH. The stand-in `omp` execs into the interpreter, as a
+// real install's `omp` does, so the launch root (the PTY child, the last
+// pre-hook pin) is the interpreter itself: a non-exec shell shim between
+// `hcom pty` and the interpreter is refused at the hook. `hcom pty` and
+// everything above the root carry the seat's HCOM_PROCESS_ID; kill never
+// signals them, and `hcom pty` exits once its child is gone.
+// ===========================================================================
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod real {
+    use super::*;
+
+    use std::cell::Cell;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Stdio};
+
+    const LAUNCH_WAIT: Duration = Duration::from_secs(60);
+    const GONE_WAIT: Duration = Duration::from_secs(15);
+
+    /// The interpreter's step that starts its leaf: a long-lived child, in its
+    /// own session where `setsid` exists, as an MCP server runs.
+    const LEAF: &str = "if command -v setsid > /dev/null 2>&1; then \
+        setsid sleep 300 < /dev/null > /dev/null 2>&1 & \
+        else sleep 300 < /dev/null > /dev/null 2>&1 & fi; printf '%s' \"$!\"";
+
+    fn quote(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    }
+
+    fn executable(path: &Path, text: &str) {
+        fs::write(path, text).expect("write fixture tool");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .expect("make fixture tool executable");
+    }
+
+    // -----------------------------------------------------------------------
+    // A launched process this test did not spawn, held so that a later reuse
+    // of its PID can never read as it or receive its signals.
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    struct Tracked {
+        role: &'static str,
+        pid: u32,
+        fd: std::os::fd::OwnedFd,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Tracked {
+        /// Pin `pid` with a pidfd, then prove it is still the expected live
+        /// process: the child of `parent`, when given.
+        fn adopt(role: &'static str, pid: u32, parent: Option<u32>) -> Self {
+            use std::os::fd::FromRawFd;
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+            assert!(
+                raw >= 0,
+                "pidfd_open({pid}) for the {role}: {}",
+                std::io::Error::last_os_error()
+            );
+            let tracked = Self {
+                role,
+                pid,
+                fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as libc::c_int) },
+            };
+            let ppid = tracked.ppid();
+            assert!(
+                tracked.alive() && parent.is_none_or(|parent| ppid == Some(parent)),
+                "the {role} {pid} is not the expected live process (parent {ppid:?}, \
+                 expected {parent:?})"
+            );
+            tracked
+        }
+
+        fn send(&self, signal: libc::c_int) -> bool {
+            use std::os::fd::AsRawFd;
+            let sent = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.fd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            sent == 0
+        }
+
+        /// /proc/<pid>/stat after the comm, read before the pidfd confirms
+        /// its task still exists, so a reused PID never reads as this one.
+        fn fields(&self) -> Option<Vec<String>> {
+            let stat = fs::read_to_string(format!("/proc/{}/stat", self.pid));
+            if !self.send(0) {
+                return None;
+            }
+            let stat = stat.ok()?;
+            let rest = &stat[stat.rfind(')')? + 2..];
+            Some(rest.split_whitespace().map(str::to_string).collect())
+        }
+
+        fn alive(&self) -> bool {
+            self.fields().is_some_and(|fields| fields[0] != "Z")
+        }
+
+        fn ppid(&self) -> Option<u32> {
+            self.fields()?.get(1)?.parse().ok()
+        }
+
+        /// This process's wait status while it is an unreaped zombie (stat
+        /// field 52).
+        fn zombie_status(&self) -> Option<i64> {
+            let fields = self.fields()?;
+            if fields[0] != "Z" {
+                return None;
+            }
+            fields.get(49)?.parse().ok()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct Tracked {
+        role: &'static str,
+        pid: u32,
+        birth: (u64, u64),
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        (read == size && info.pbi_pid == pid).then_some(info)
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Tracked {
+        /// Record `pid` with its start time, then prove it is still the
+        /// expected live process: the child of `parent`, when given.
+        fn adopt(role: &'static str, pid: u32, parent: Option<u32>) -> Self {
+            let info = bsd_info(pid)
+                .unwrap_or_else(|| panic!("the {role} {pid} exited before it was adopted"));
+            assert!(
+                info.pbi_status != 5 && parent.is_none_or(|parent| info.pbi_ppid == parent),
+                "the {role} {pid} is not the expected live process (parent {}, expected \
+                 {parent:?})",
+                info.pbi_ppid
+            );
+            Self {
+                role,
+                pid,
+                birth: (info.pbi_start_tvsec, info.pbi_start_tvusec),
+            }
+        }
+
+        fn current(&self) -> Option<libc::proc_bsdinfo> {
+            bsd_info(self.pid)
+                .filter(|info| (info.pbi_start_tvsec, info.pbi_start_tvusec) == self.birth)
+        }
+
+        /// Live and not a zombie (SZOMB = 5 in Darwin's sys/proc.h).
+        fn alive(&self) -> bool {
+            self.current().is_some_and(|info| info.pbi_status != 5)
+        }
+
+        fn ppid(&self) -> Option<u32> {
+            self.current().map(|info| info.pbi_ppid)
+        }
+
+        fn send(&self, signal: libc::c_int) -> bool {
+            self.alive() && unsafe { libc::kill(self.pid as libc::pid_t, signal) } == 0
+        }
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            if self.alive() {
+                self.send(libc::SIGKILL);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The fixture: one stopped seat, the fake tools, and `hcom r`.
+    // -----------------------------------------------------------------------
+
+    /// Fixture-private launch tools. `bash` turns the post-tool login shell
+    /// (`bash -l`) into an exit and passes everything else to the real bash.
+    /// `omp` is the stand-in OMP: it execs into the step runner as `omp`, so
+    /// the real classifier sees argv[0] `omp`.
+    fn install_tools(h: &Hcom, root: &Path, fakebin: &Path) {
+        executable(
+            &fakebin.join("bash"),
+            "#!/bin/bash\nif [ \"$#\" -eq 1 ] && [ \"$1\" = -l ]; then exit 0; fi\nexec /bin/bash \"$@\"\n",
+        );
+        let runner = root.join("steps.sh");
+        fs::write(&runner, STEP_RUNNER).expect("write step runner");
+        executable(
+            &fakebin.join("omp"),
+            &format!(
+                r#"#!/bin/bash
+if [ "${{1:-}}" = --version ]; then printf '1.0.0\n'; exit 0; fi
+out={root}/interpreter-$$
+mkdir -p "$out"
+export TEST_OUT_DIR="$out" TEST_CWD={cwd} TEST_BIN={bin}
+exec -a omp /bin/bash {runner}
+"#,
+                root = quote(root),
+                cwd = quote(&h.workspace),
+                bin = quote(Path::new(env!("CARGO_BIN_EXE_hcom"))),
+                runner = quote(&runner),
+            ),
+        );
+    }
+
+    /// One stopped OMP seat that `hcom r` resumes for real.
+    struct Real {
+        scene: Scene,
+        _workspace: tempfile::TempDir,
+        root: PathBuf,
+        name: String,
+        sid: String,
+        transcript: PathBuf,
+    }
+
+    /// The `hcom r` process, leading its own process group, with output in
+    /// files no launched grandchild can hold open. It is never reaped before
+    /// its drop, so its group is this launch's until then.
+    struct Resume {
+        child: Child,
+        stdout: PathBuf,
+        stderr: PathBuf,
+    }
+
+    impl Resume {
+        fn output(&self) -> String {
+            format!(
+                "{}\n{}",
+                fs::read_to_string(&self.stdout).unwrap_or_default(),
+                fs::read_to_string(&self.stderr).unwrap_or_default()
+            )
+        }
+    }
+
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            unsafe {
+                libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The launched seat: the interpreter the hook bound (the PTY child and
+    /// launch root) and its leaf, with `hcom pty` and the launch script above
+    /// the root.
+    struct Seat {
+        interpreter: Tracked,
+        leaf: Tracked,
+        pty: Tracked,
+        script: Tracked,
+    }
+
+    impl Seat {
+        #[track_caller]
+        fn assert_tree_gone(&self, output: &str) {
+            let tree = [&self.interpreter, &self.leaf];
+            assert!(
+                wait_until(GONE_WAIT, || tree.iter().all(|member| !member.alive())),
+                "`hcom kill` left launched-tree member(s) alive: {:?}:\n{output}",
+                tree.iter()
+                    .filter(|member| member.alive())
+                    .map(|member| (member.role, member.pid))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[track_caller]
+        fn assert_pty_exited(&self, output: &str) {
+            assert!(
+                wait_until(GONE_WAIT, || !self.pty.alive()),
+                "hcom pty {} outlived its launched tree:\n{output}",
+                self.pty.pid
+            );
+        }
+    }
+
+    impl Real {
+        fn new(label: &str, background: bool) -> Self {
+            let mut h = isolated_hcom();
+            // OMP refuses a cwd under /tmp, and resume redirects a /tmp
+            // snapshot directory to a seat path outside the fixture.
+            let workspace = tempfile::Builder::new()
+                .prefix("hcom-kill-real-")
+                .tempdir_in("/var/tmp")
+                .expect("create a private workspace outside /tmp");
+            h.workspace = workspace.path().to_path_buf();
+            let root = h.root_path().join(format!("real-{label}"));
+            let fakebin = root.join("fakebin");
+            fs::create_dir_all(&fakebin).expect("create fakebin");
+            install_tools(&h, &root, &fakebin);
+            use_fixture_tools(&h, &fakebin);
+            let name = format!("{label}{}", unique_suffix());
+            let (sid, transcript) = seed_stopped_omp(&h, &name, background);
+            Self {
+                scene: Scene { h },
+                _workspace: workspace,
+                root,
+                name,
+                sid,
+                transcript,
+            }
+        }
+
+        fn resume(&self, args: &[&str]) -> Resume {
+            let stdout = self.root.join("resume.stdout");
+            let stderr = self.root.join("resume.stderr");
+            let child = self
+                .scene
+                .cmd()
+                .args(args)
+                .current_dir(&self.scene.workspace)
+                .stdin(Stdio::null())
+                .stdout(fs::File::create(&stdout).expect("create resume stdout"))
+                .stderr(fs::File::create(&stderr).expect("create resume stderr"))
+                .process_group(0)
+                .spawn()
+                .expect("spawn hcom r");
+            Resume {
+                child,
+                stdout,
+                stderr,
+            }
+        }
+
+        /// Find the launched chain, wait for the pre-hook pin to settle on
+        /// the PTY child, start the interpreter's leaf, and bind the seat
+        /// through the interpreter's real `omp-start`.
+        fn seat(&self, resume: &Resume) -> Seat {
+            let h: &Hcom = &self.scene;
+            let mut found = None;
+            let started = wait_until(LAUNCH_WAIT, || {
+                found = fs::read_dir(&self.root)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .find_map(|entry| {
+                        entry.file_name().to_str()?.strip_prefix("interpreter-")?;
+                        let text = fs::read_to_string(entry.path().join("ready")).ok()?;
+                        let mut lines = text.lines();
+                        let pid: u32 = lines.next()?.parse().ok()?;
+                        let process_id = lines.next()?.to_string();
+                        Some((pid, process_id, entry.path()))
+                    });
+                found.is_some()
+            });
+            assert!(
+                started,
+                "the launched stand-in OMP never started:\n{}",
+                resume.output()
+            );
+            let (pid, process_id, steps) = found.unwrap();
+            let interpreter = Tracked::adopt("interpreter", pid, None);
+            let pty = Tracked::adopt(
+                "hcom pty",
+                interpreter.ppid().expect("interpreter parent"),
+                None,
+            );
+            #[cfg(target_os = "linux")]
+            {
+                let argv = fs::read(format!("/proc/{}/cmdline", pty.pid)).unwrap_or_default();
+                let mut argv = argv.split(|byte| *byte == 0);
+                let program = argv.next().unwrap_or_default();
+                assert!(
+                    program.ends_with(b"hcom") && argv.next() == Some(b"pty".as_slice()),
+                    "the interpreter's parent {} is not hcom pty: {:?}",
+                    pty.pid,
+                    String::from_utf8_lossy(program)
+                );
+            }
+            let script =
+                Tracked::adopt("launch script", pty.ppid().expect("hcom pty parent"), None);
+            assert!(
+                wait_until(LAUNCH_WAIT, || row_facts(h, &self.name)["pid"]
+                    == json!(interpreter.pid)),
+                "precondition: the pre-hook pin never settled on the PTY child {}: {}",
+                interpreter.pid,
+                row_facts(h, &self.name)
+            );
+            let next = Cell::new(0);
+            let run = |script: &str| {
+                let step = next.get();
+                next.set(step + 1);
+                run_step(h, &steps, step, script)
+            };
+            let (code, stdout, stderr) = run(LEAF);
+            assert_eq!(code, 0, "start the interpreter's leaf: {stdout} {stderr}");
+            let leaf = Tracked::adopt(
+                "leaf",
+                stdout.trim().parse().expect("leaf PID"),
+                Some(interpreter.pid),
+            );
+            let start = run(&format!(
+                "H omp-start --session-id {} --transcript-path {} --cwd {}",
+                quote(Path::new(&self.sid)),
+                quote(&self.transcript),
+                quote(&h.workspace),
+            ));
+            assert_bound(h, &self.name, interpreter.pid, &start);
+            let bound: i64 = db(h)
+                .query_row(
+                    "SELECT COUNT(*) FROM process_bindings WHERE process_id=?1 AND instance_name=?2",
+                    rusqlite::params![process_id, self.name],
+                    |row| row.get(0),
+                )
+                .expect("read the seat's process binding");
+            assert_eq!(
+                bound, 1,
+                "precondition: the interpreter's HCOM_PROCESS_ID {process_id} must be {}'s binding",
+                self.name
+            );
+            Seat {
+                interpreter,
+                leaf,
+                pty,
+                script,
+            }
+        }
+
+        fn kill(&self) -> (i32, String) {
+            kill(&self.scene, &[&self.name])
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // An id-carrying terminal above the launch script: hcom runs the custom
+    // terminal command `env HCOM_PROCESS_ID={process_id} <terminal>
+    // {script}`, and the terminal runs the launch script below it.
+    // -----------------------------------------------------------------------
+
+    struct Terminal {
+        tracked: Tracked,
+        dir: PathBuf,
+    }
+
+    impl Terminal {
+        fn install(real: &Real) -> PathBuf {
+            let path = real.root.join("terminal.sh");
+            executable(
+                &path,
+                &format!(
+                    r#"#!/bin/bash
+dir={dir}
+mkdir -p "$dir"
+: > "$dir/signals"
+for s in HUP INT QUIT TERM USR1 USR2 CONT; do
+    trap "printf '%s\n' $s >> \"$dir/signals\"; exit 0" "$s"
+done
+( /bin/bash "$1"; printf '%s' "$?" > "$dir/script.status" ) < /dev/null > "$dir/script.out" 2>&1 &
+printf '%s' "$$" > "$dir/ready"
+while :; do
+    printf x >> "$dir/heartbeat"
+    sleep 0.05
+done
+"#,
+                    dir = quote(&real.root.join("terminal")),
+                ),
+            );
+            path
+        }
+
+        fn find(real: &Real, resume: &Resume, seat: &Seat) -> Self {
+            let dir = real.root.join("terminal");
+            let mut pid = None;
+            assert!(
+                wait_until(LAUNCH_WAIT, || {
+                    pid = fs::read_to_string(dir.join("ready"))
+                        .ok()
+                        .and_then(|text| text.parse::<u32>().ok());
+                    pid.is_some() && beats(&dir) > 0
+                }),
+                "the terminal never started:\n{}",
+                resume.output()
+            );
+            let tracked = Tracked::adopt("terminal", pid.unwrap(), Some(resume.child.id()));
+            // Precondition: the launch script runs below the terminal.
+            let subshell = seat.script.ppid().expect("launch script parent");
+            assert_eq!(
+                parent_pid(subshell),
+                Some(tracked.pid),
+                "precondition: the launch script {} must run below the terminal {}",
+                seat.script.pid,
+                tracked.pid
+            );
+            #[cfg(target_os = "linux")]
+            {
+                let bound: String = db(&real.scene)
+                    .query_row(
+                        "SELECT process_id FROM process_bindings WHERE instance_name=?1",
+                        [&real.name],
+                        |row| row.get(0),
+                    )
+                    .expect("read the seat's process binding");
+                let environ =
+                    fs::read(format!("/proc/{}/environ", tracked.pid)).unwrap_or_default();
+                let carried = environ
+                    .split(|byte| *byte == 0)
+                    .find_map(|entry| entry.strip_prefix(b"HCOM_PROCESS_ID="))
+                    .map(|value| String::from_utf8_lossy(value).into_owned());
+                assert_eq!(
+                    carried.as_deref(),
+                    Some(bound.as_str()),
+                    "precondition: the terminal must carry the seat's HCOM_PROCESS_ID"
+                );
+                let handled = [
+                    libc::SIGHUP,
+                    libc::SIGINT,
+                    libc::SIGQUIT,
+                    libc::SIGTERM,
+                    libc::SIGUSR1,
+                    libc::SIGUSR2,
+                    libc::SIGCONT,
+                ]
+                .iter()
+                .fold(0_u64, |mask, signal| mask | 1_u64 << (signal - 1));
+                assert!(
+                    wait_until(LAUNCH_WAIT, || caught(tracked.pid) & handled == handled),
+                    "the terminal never installed its signal traps"
+                );
+            }
+            Self { tracked, dir }
+        }
+
+        fn beats(&self) -> u64 {
+            beats(&self.dir)
+        }
+
+        /// Wait (bounded) for two more heartbeats, which proves any signal
+        /// already sent had its trap run, then report what it went through.
+        fn observe(&self, before: u64) -> Value {
+            let mut progressed = false;
+            wait_until(GONE_WAIT, || {
+                progressed = self.beats() >= before + 2;
+                progressed || !self.tracked.alive()
+            });
+            json!({
+                "alive": self.tracked.alive(),
+                "heartbeat_progressed": progressed,
+                "signals": fs::read_to_string(self.dir.join("signals")).unwrap_or_default(),
+            })
+        }
+    }
+
+    fn beats(dir: &Path) -> u64 {
+        fs::metadata(dir.join("heartbeat"))
+            .map(|stat| stat.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn caught(pid: u32) -> u64 {
+        fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|status| {
+                let mask = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SigCgt:"))?;
+                u64::from_str_radix(mask.trim(), 16).ok()
+            })
+            .unwrap_or(0)
+    }
+
+    /// A live process's parent, read without holding it: only for a process
+    /// that is known to be alive, such as one waiting on a tracked child.
+    #[cfg(target_os = "linux")]
+    fn parent_pid(pid: u32) -> Option<u32> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat[stat.rfind(')')? + 2..]
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn parent_pid(pid: u32) -> Option<u32> {
+        bsd_info(pid).map(|info| info.pbi_ppid)
+    }
+
+    // -----------------------------------------------------------------------
+    // Rule 1: a genuine kill retires the launched tree and nothing above it.
+    // -----------------------------------------------------------------------
+
+    /// A PTY launch in an id-carrying terminal. On Linux the launch script is
+    /// stopped across the kill so `hcom pty`'s exit status survives as a
+    /// zombie's: it must have exited, not died by a signal. `hcom pty`
+    /// catches SIGTERM, SIGHUP and SIGINT and then exits normally, so this
+    /// proves no fatal signal (SIGKILL or any uncaught one) reached it, not
+    /// that none was sent.
+    #[test]
+    fn pty_kill_retires_the_launched_tree_and_spares_every_ancestor() {
+        let real = Real::new("terminal", false);
+        let terminal = Terminal::install(&real);
+        let command = format!(
+            "env HCOM_PROCESS_ID={{process_id}} {} {{script}}",
+            terminal.display()
+        );
+        // A lone foreground resume runs in the current terminal unless told
+        // otherwise; `--no-run-here` sends it through the custom terminal.
+        let resume = real.resume(&[
+            "r",
+            &real.name,
+            "--terminal",
+            &command,
+            "--no-run-here",
+            "--go",
+        ]);
+        let seat = real.seat(&resume);
+        let terminal = Terminal::find(&real, &resume, &seat);
+        #[cfg(target_os = "linux")]
+        assert!(seat.script.send(libc::SIGSTOP), "stop the launch script");
+        let before = terminal.beats();
+
+        let (code, output) = real.kill();
+        seat.assert_tree_gone(&output);
+        seat.assert_pty_exited(&output);
+        #[cfg(target_os = "linux")]
+        {
+            let status = seat.pty.zombie_status();
+            assert!(
+                status.is_some_and(|status| status & 0x7f == 0),
+                "SAFETY: hcom pty {} died by a signal (wait status {status:?}) instead of \
+                 exiting once its child was gone:\n{output}",
+                seat.pty.pid
+            );
+            assert!(seat.script.send(libc::SIGCONT), "resume the launch script");
+        }
+        assert_eq!(
+            terminal.observe(before),
+            json!({"alive": true, "heartbeat_progressed": true, "signals": ""}),
+            "SAFETY: `hcom kill` signalled the id-carrying terminal {} above the \
+             launch:\n{output}",
+            terminal.tracked.pid
+        );
+        let status = terminal.dir.join("script.status");
+        assert!(
+            wait_until(GONE_WAIT, || status.exists()),
+            "the launch script never finished:\n{output}"
+        );
+        assert_eq!(
+            fs::read_to_string(&status).unwrap(),
+            "0",
+            "SAFETY: the launch script above hcom pty did not exit 0 (128+n means signal \
+             n):\n{output}"
+        );
+        assert_kill_succeeded(code, &output, &real.name);
+    }
+
+    /// A background launch (`hcom r N --go`).
+    #[test]
+    fn background_kill_retires_the_launched_tree() {
+        let real = Real::new("background", true);
+        let resume = real.resume(&["r", &real.name, "--go"]);
+        let seat = real.seat(&resume);
+
+        let (code, output) = real.kill();
+        seat.assert_tree_gone(&output);
+        seat.assert_pty_exited(&output);
+        assert_kill_succeeded(code, &output, &real.name);
+    }
+
+    /// A legacy row (no recorded launch root) whose launcher is `hcom pty`
+    /// itself: the interpreter is the PTY child, so its root is verified
+    /// without a record.
+    #[test]
+    fn legacy_kill_under_hcom_pty_retires_the_launched_tree() {
+        let real = Real::new("legacypty", true);
+        let resume = real.resume(&["r", &real.name, "--go"]);
+        let seat = real.seat(&resume);
+        strip_launch_root(&real.scene, &real.name);
+
+        let (code, output) = real.kill();
+        seat.assert_tree_gone(&output);
+        seat.assert_pty_exited(&output);
+        assert_kill_succeeded(code, &output, &real.name);
     }
 }
