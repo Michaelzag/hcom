@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::kill_group::live_members;
 use super::process::{
-    GroupSignal, KILL_WAIT, POLL_STEP, TERM_WAIT, has_identity, proc_stat_group_id,
+    GroupSignal, KILL_WAIT, KillError, POLL_STEP, TERM_WAIT, has_identity, proc_stat_group_id,
     proc_stat_is_dead,
 };
 use super::process_args::EnvRead;
@@ -403,11 +403,6 @@ fn absorb(
     Ok(found)
 }
 
-fn survivor_list(left: &[u32]) -> String {
-    let pids: Vec<String> = left.iter().map(u32::to_string).collect();
-    format!("survivors: {}", pids.join(" "))
-}
-
 /// The capture-time facts and injected carrier proofs a kill reuses for
 /// every per-PID signal and every rescan.
 struct Sweep<'a, P, E> {
@@ -473,16 +468,18 @@ impl<P: FnMut(u32) -> EnvRead, E: FnMut(u32) -> bool> Sweep<'_, P, E> {
         members: &mut Vec<Member>,
         budget: Duration,
         signal: libc::c_int,
-    ) -> Result<Vec<u32>, String> {
+    ) -> Result<Vec<u32>, KillError> {
         let end = Instant::now() + budget;
         loop {
             let fresh = match snapshot(self.proc_root)
                 .and_then(|snapshot| self.absorb(&snapshot, members))
             {
                 Ok(fresh) => fresh,
-                Err(error) => {
-                    let left = self.survivors(members);
-                    return Err(format!("{error}; {}", survivor_list(&left)));
+                Err(reason) => {
+                    return Err(KillError::Unconfirmed {
+                        reason: reason.to_string(),
+                        survivors: self.survivors(members),
+                    });
                 }
             };
             for member in &fresh {
@@ -549,7 +546,7 @@ pub(crate) fn terminate(
     excluded: &[u32],
     process_id_of: impl FnMut(u32) -> EnvRead,
     eligible: impl FnMut(u32) -> bool,
-) -> Result<GroupSignal, String> {
+) -> Result<GroupSignal, KillError> {
     let expected_start = expected
         .strip_prefix("linux:")
         .and_then(|identity| identity.rsplit_once(':'))
@@ -596,9 +593,26 @@ pub(crate) fn terminate(
             // The boot id half of the identity is checked here too: this gate
             // runs immediately before the root's (or group's) signal.
             if !has_identity(root, expected) {
-                return Err(
-                    "seat root identity changed or became unreadable before its signal".into(),
-                );
+                // A root that waited on the descendants just signaled can
+                // exit, and be reaped, on its own. That is the outcome asked
+                // for; only a live mismatch or an unreadable root refuses.
+                if observe(proc_root, root) != Seen::Gone {
+                    return Err(
+                        "seat root identity changed or became unreadable before its signal".into(),
+                    );
+                }
+                root_signal = Some(GroupSignal::NotFound);
+                if group_signal {
+                    // Its group outlives it but gets no killpg from here, so
+                    // the members the loop skipped get their own signals.
+                    for grouped in members.iter().filter(|m| m.in_group && m.pid != root) {
+                        if sweep.proven(grouped) {
+                            // SAFETY: one positive captured PID, just re-proven.
+                            unsafe { libc::kill(grouped.pid as libc::pid_t, libc::SIGTERM) };
+                        }
+                    }
+                }
+                continue;
             }
             root_signal = Some(if group_signal {
                 // SAFETY: killpg receives the verified leader's positive PGID.
@@ -638,7 +652,7 @@ pub(crate) fn terminate(
     if left.is_empty() {
         return Ok(root_signal);
     }
-    Err(survivor_list(&left))
+    Err(KillError::Survivors(left))
 }
 
 fn signal_result(result: libc::c_int) -> GroupSignal {
@@ -1228,7 +1242,7 @@ mod tests {
         assert_eq!(survivors(&[member], |_| live), vec![30]);
     }
 
-    fn terminate_tree(root: u32, expected: &str) -> Result<GroupSignal, String> {
+    fn terminate_tree(root: u32, expected: &str) -> Result<GroupSignal, KillError> {
         terminate(root, expected, &[], &[], |_| EnvRead::Absent, |_| true)
     }
 
@@ -1508,6 +1522,33 @@ mod tests {
         assert!(root_tree.iter().all(|member| !running(member)));
         assert_eq!(start_of(group), Some(anchor_start), "ancestor was signaled");
         drop(fixture);
+    }
+
+    #[test]
+    fn a_root_that_exits_and_is_reaped_once_its_tree_is_signaled_is_success() {
+        // The root shell exits as soon as its sleeper dies, and its own
+        // parent reaps it at once: the root can vanish between its child's
+        // signal and its own. Repeat to make that narrow window likely.
+        for _ in 0..40 {
+            let anchor = spawn("sh -c 'sleep 30 & wait' & wait", 0);
+            let group = anchor.id();
+            let fixture = Fixture {
+                group,
+                children: vec![anchor],
+            };
+            let tree = captured(group, 3);
+            let root = tree
+                .iter()
+                .find(|member| member.depth == 1)
+                .expect("root shell")
+                .pid;
+            let result = terminate_tree(root, &identity(root).unwrap());
+            assert!(
+                matches!(result, Ok(GroupSignal::Sent | GroupSignal::NotFound)),
+                "{result:?}"
+            );
+            drop(fixture);
+        }
     }
 
     #[test]
