@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use super::{
     kill_group,
     process::{
-        GroupSignal, KILL_WAIT, POLL_STEP, TERM_WAIT, is_definitely_dead, process_info_apple,
+        GroupSignal, KILL_WAIT, KillError, POLL_STEP, TERM_WAIT, is_definitely_dead,
+        process_info_apple,
     },
 };
 
@@ -116,6 +117,35 @@ fn kill_tree(
     Ok(targets)
 }
 
+/// A complete root lineage is required before using its process group. Both
+/// the capture snapshot and the final native preflight use the same proof.
+fn ancestry(
+    root: ProcFact,
+    mut read: impl FnMut(u32) -> Option<ProcFact>,
+) -> Result<HashSet<u32>, &'static str> {
+    let mut ancestors = HashSet::new();
+    let mut child = root;
+    while child.ppid > 1 {
+        if ancestors.len() == MAX_TREE_DEPTH {
+            return Err("root ancestry exceeds the depth limit");
+        }
+        let parent = read(child.ppid)
+            .filter(|parent| parent.pid == child.ppid)
+            .ok_or("root ancestry is unreadable")?;
+        if parent.pid == root.pid || !ancestors.insert(parent.pid) {
+            return Err("cycle in the root ancestry");
+        }
+        if parent.start_time > child.start_time {
+            return Err("root ancestor identity changed during capture");
+        }
+        if parent.pgid == root.pid {
+            return Err("refusing to signal a root ancestor");
+        }
+        child = parent;
+    }
+    Ok(ancestors)
+}
+
 /// Add every authenticated live group member when the root owns that group.
 /// Group members need not remain descendants: shells can reparent them, and
 /// descendants can leave the group. Neither observation invalidates capture.
@@ -127,10 +157,11 @@ fn capture_members<'a>(
     group_members: &'a [ProcFact],
 ) -> Result<Vec<Target<'a>>, &'static str> {
     let mut targets = kill_tree(snapshot, root, expected_start)?;
-    if targets
+    let root_fact = targets
         .last()
-        .is_none_or(|target| target.fact.pgid != root_group)
-    {
+        .ok_or("verified owner is missing from the capture")?
+        .fact;
+    if root_fact.pgid != root_group {
         return Err("owner process group changed during capture");
     }
     if root_group != root {
@@ -140,6 +171,10 @@ fn capture_members<'a>(
     if group_members.len() > MAX_SNAPSHOT_PROCESSES {
         return Err("process group snapshot exceeds the safety limit");
     }
+    let ancestors = {
+        let facts_by_pid: HashMap<_, _> = snapshot.iter().map(|fact| (fact.pid, fact)).collect();
+        ancestry(*root_fact, |pid| facts_by_pid.get(&pid).map(|fact| **fact))?
+    };
     let mut by_pid = HashMap::with_capacity(targets.len());
     for (index, target) in targets.iter_mut().enumerate() {
         target.in_group = target.fact.pgid == root;
@@ -148,6 +183,9 @@ fn capture_members<'a>(
     for member in group_members {
         if member.pid <= 1 {
             continue;
+        }
+        if ancestors.contains(&member.pid) {
+            return Err("refusing to signal a root ancestor");
         }
         if member.pgid != root {
             return Err("captured group member changed process groups");
@@ -180,6 +218,23 @@ fn capture_members<'a>(
     Ok(targets)
 }
 
+/// Apply self-exclusion only after traversal, so an excluded root or intermediate
+/// parent still authenticates descendants. Any excluded group member forbids
+/// killpg; the remaining members must then be signaled individually.
+fn apply_exclusions(captured: &mut Vec<Target<'_>>, excluded: &[u32]) -> bool {
+    let excluded: HashSet<_> = excluded.iter().copied().collect();
+    let mut blocks_group = false;
+    captured.retain(|target| {
+        if excluded.contains(&target.fact.pid) {
+            blocks_group |= target.in_group;
+            false
+        } else {
+            true
+        }
+    });
+    blocks_group
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observation {
     Gone,
@@ -203,10 +258,15 @@ fn survivors(captured: &[Target<'_>], mut observe: impl FnMut(u32) -> Observatio
 }
 
 /// `expected` is the native `apple:seconds:microseconds` seat-root identity.
-/// Return success only after every captured incarnation has exited or its PID
-/// has been reused. Unknown state remains a survivor through both deadlines.
+/// Return success only after every non-excluded captured incarnation has exited
+/// or its PID has been reused. An excluded root remains a traversal anchor, not
+/// a signal target or a claimed death. Unknown state remains a survivor.
 #[cfg(target_os = "macos")]
-pub(crate) fn terminate(root: u32, expected: &str) -> Result<GroupSignal, String> {
+pub(crate) fn terminate(
+    root: u32,
+    expected: &str,
+    excluded: &[u32],
+) -> Result<GroupSignal, KillError> {
     let (seconds, micros) = expected
         .strip_prefix("apple:")
         .and_then(|identity| identity.split_once(':'))
@@ -232,7 +292,7 @@ pub(crate) fn terminate(root: u32, expected: &str) -> Result<GroupSignal, String
     } else {
         Vec::new()
     };
-    let targets = capture_members(
+    let mut targets = capture_members(
         &snapshot,
         root,
         expected_start,
@@ -240,23 +300,54 @@ pub(crate) fn terminate(root: u32, expected: &str) -> Result<GroupSignal, String
         &group_members,
     )?;
     let leader = verified_root.pgid == root;
+    let blocks_group = apply_exclusions(&mut targets, excluded);
+    let mut signal_group = leader && !blocks_group;
     let current_root = process_fact(root)
         .filter(|fact| fact.start_time == expected_start && (!leader || fact.pgid == root))
         .ok_or("owner identity or process group changed before tree termination")?;
 
     let mut outcome = GroupSignal::NotFound;
-    if leader {
-        // SAFETY: current_root has a positive representable PID, matching
-        // creation time, and PGID == PID. This is never a shared parent group.
-        outcome =
-            signal_result(unsafe { libc::killpg(current_root.pid as libc::pid_t, libc::SIGTERM) });
+    if signal_group {
+        let members = kill_group::live_members(root)?;
+        if excluded
+            .iter()
+            .any(|pid| members.binary_search(pid).is_ok())
+        {
+            // A previously escaped excluded process may have joined since
+            // capture. Fall back to the remaining authenticated PID targets.
+            signal_group = false;
+        } else {
+            let current_ancestors = ancestry(current_root, process_fact)?;
+            if targets
+                .iter()
+                .any(|target| current_ancestors.contains(&target.fact.pid))
+                || current_ancestors
+                    .iter()
+                    .any(|pid| members.binary_search(pid).is_ok())
+            {
+                return Err("refusing to signal a root ancestor".into());
+            }
+            let checked_root = process_fact(root)
+                .filter(|fact| {
+                    fact.start_time == expected_start
+                        && fact.pgid == root
+                        && fact.ppid == current_root.ppid
+                })
+                .ok_or("owner identity or ancestry changed before the group signal")?;
+            // SAFETY: checked_root is a positive PID with matching creation
+            // time and PGID == PID. Its complete ancestry was rechecked and
+            // the fresh group snapshot contains no excluded process.
+            outcome = signal_result(unsafe {
+                libc::killpg(checked_root.pid as libc::pid_t, libc::SIGTERM)
+            });
+        }
     }
     for target in &targets {
-        if leader && target.in_group {
+        if signal_group && target.in_group {
             continue;
         }
         if let Some(result) = signal_one(target, libc::SIGTERM)
-            && target.fact.pid == root
+            && (result == GroupSignal::Sent || outcome != GroupSignal::Sent)
         {
             outcome = result;
         }
@@ -268,17 +359,18 @@ pub(crate) fn terminate(root: u32, expected: &str) -> Result<GroupSignal, String
     // Only captured, still-matching incarnations authorize escalation. The
     // root may already have exited, so never repeat a bare process-group kill.
     for target in &targets {
-        if remaining.binary_search(&target.fact.pid).is_ok() {
-            let _ = signal_one(target, libc::SIGKILL);
+        if remaining.binary_search(&target.fact.pid).is_ok()
+            && let Some(result) = signal_one(target, libc::SIGKILL)
+            && (result == GroupSignal::Sent || outcome != GroupSignal::Sent)
+        {
+            outcome = result;
         }
     }
     let remaining = wait_for_exit(&targets, KILL_WAIT);
     if remaining.is_empty() {
         Ok(outcome)
     } else {
-        Err(format!(
-            "captured processes survived termination: {remaining:?}"
-        ))
+        Err(KillError::Survivors(remaining))
     }
 }
 
@@ -608,7 +700,14 @@ mod tests {
             pgid: 10,
             ..fact(20, 1, 9)
         };
-        let snapshot = [root, escaped, child, fact(5, 2, 1), fact(6, 5, 2)];
+        let snapshot = [
+            root,
+            escaped,
+            child,
+            fact(5, 2, 1),
+            fact(6, 5, 2),
+            fact(2, 1, 0),
+        ];
         let members = [
             root,
             child,
@@ -646,7 +745,7 @@ mod tests {
     fn kill_tree_capture_rejects_an_identity_change_between_snapshots() {
         let root = ProcFact {
             pgid: 10,
-            ..fact(10, 5, 10)
+            ..fact(10, 1, 10)
         };
         let child = ProcFact {
             pgid: 10,
@@ -675,7 +774,7 @@ mod tests {
     fn kill_tree_capture_bounds_additional_group_members() {
         let root = ProcFact {
             pgid: 10,
-            ..fact(10, 5, 0)
+            ..fact(10, 1, 0)
         };
         let snapshot = [root];
         let mut members: Vec<_> = (0..MAX_TREE_PROCESSES - 1)
@@ -733,7 +832,7 @@ mod tests {
     fn kill_tree_capture_refuses_ambiguous_group_departure() {
         let root = ProcFact {
             pgid: 10,
-            ..fact(10, 5, 10)
+            ..fact(10, 1, 10)
         };
         // The PID-only group scan saw this member, but its identity query now
         // reports another group. It might have escaped, not exited/reused.
@@ -742,5 +841,215 @@ mod tests {
             capture_members(&[root], 10, root.start_time, 10, &[departed]).unwrap_err(),
             "captured group member changed process groups"
         );
+    }
+
+    #[test]
+    fn kill_tree_capture_refuses_an_ancestor_in_the_owned_group() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 5, 10)
+        };
+        let parent = ProcFact {
+            pgid: 10,
+            ..fact(5, 1, 5)
+        };
+        let snapshot = [root, parent, fact(11, 10, 11)];
+        assert_eq!(
+            capture_members(&snapshot, 10, root.start_time, 10, &[root, parent]).unwrap_err(),
+            "refusing to signal a root ancestor"
+        );
+    }
+
+    #[test]
+    fn kill_tree_capture_refuses_a_grandparent_in_the_owned_group() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 5, 10)
+        };
+        let parent = fact(5, 2, 5);
+        let grandparent = ProcFact {
+            pgid: 10,
+            ..fact(2, 1, 2)
+        };
+        let snapshot = [root, parent, grandparent];
+        assert_eq!(
+            capture_members(&snapshot, 10, root.start_time, 10, &[root, grandparent]).unwrap_err(),
+            "refusing to signal a root ancestor"
+        );
+    }
+
+    #[test]
+    fn kill_tree_capture_refuses_an_ancestor_that_joined_after_the_snapshot() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 5, 10)
+        };
+        let parent = fact(5, 1, 5);
+        let joined = ProcFact { pgid: 10, ..parent };
+        assert_eq!(
+            capture_members(&[root, parent], 10, root.start_time, 10, &[joined]).unwrap_err(),
+            "refusing to signal a root ancestor"
+        );
+    }
+
+    #[test]
+    fn kill_tree_capture_requires_complete_ancestry_only_for_group_signals() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 5, 10)
+        };
+        assert_eq!(
+            capture_members(&[root], 10, root.start_time, 10, &[root]).unwrap_err(),
+            "root ancestry is unreadable"
+        );
+        let nonleader = ProcFact { pgid: 5, ..root };
+        let snapshot = [nonleader, fact(11, 10, 11)];
+        let captured = capture_members(&snapshot, 10, root.start_time, 5, &[]).unwrap();
+        let pids: Vec<_> = captured.iter().map(|target| target.fact.pid).collect();
+        assert_eq!(pids, [11, 10]);
+    }
+
+    #[test]
+    fn kill_tree_ancestry_rejects_cycles_and_reused_parent_ids() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 5, 10)
+        };
+        let cycle = [fact(5, 2, 10), fact(2, 5, 10)];
+        assert_eq!(
+            ancestry(root, |pid| cycle
+                .iter()
+                .find(|fact| fact.pid == pid)
+                .copied())
+            .unwrap_err(),
+            "cycle in the root ancestry"
+        );
+        assert_eq!(
+            ancestry(root, |_| Some(fact(5, 1, 11))).unwrap_err(),
+            "root ancestor identity changed during capture"
+        );
+    }
+
+    #[test]
+    fn kill_tree_ancestry_enforces_the_depth_boundary() {
+        let root = ProcFact {
+            pgid: 1_000,
+            ..fact(1_000, 999, 1_000)
+        };
+        let mut snapshot: Vec<_> = (0..MAX_TREE_DEPTH)
+            .map(|index| {
+                let pid = 999 - index as u32;
+                let ppid = if index + 1 == MAX_TREE_DEPTH {
+                    1
+                } else {
+                    pid - 1
+                };
+                fact(pid, ppid, pid as u64)
+            })
+            .collect();
+        let ancestors = ancestry(root, |pid| {
+            snapshot.iter().find(|fact| fact.pid == pid).copied()
+        })
+        .unwrap();
+        assert_eq!(ancestors.len(), MAX_TREE_DEPTH);
+        let next = snapshot.last().unwrap().pid - 1;
+        snapshot.last_mut().unwrap().ppid = next;
+        snapshot.push(fact(next, 1, next as u64));
+        assert_eq!(
+            ancestry(root, |pid| {
+                snapshot.iter().find(|fact| fact.pid == pid).copied()
+            })
+            .unwrap_err(),
+            "root ancestry exceeds the depth limit"
+        );
+    }
+
+    #[test]
+    fn kill_tree_exclusions_keep_nonleader_anchors_but_never_require_their_exit() {
+        let root = fact(10, 5, 10);
+        let snapshot = [root, fact(11, 10, 11), fact(12, 11, 12), fact(13, 10, 13)];
+        let mut captured = capture_members(&snapshot, 10, root.start_time, 5, &[]).unwrap();
+        assert!(!apply_exclusions(&mut captured, &[10, 11]));
+        let pids: Vec<_> = captured.iter().map(|target| target.fact.pid).collect();
+        assert_eq!(pids, [12, 13]);
+        assert_eq!(
+            survivors(&captured, |pid| {
+                match pid {
+                    12 => Observation::Present((100, 12)),
+                    13 => Observation::Present((100, 13)),
+                    _ => panic!("excluded caller chain must never be observed"),
+                }
+            }),
+            [12, 13]
+        );
+    }
+
+    #[test]
+    fn kill_tree_excluded_group_member_forces_remaining_members_to_use_pids() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 1, 10)
+        };
+        let child = ProcFact {
+            pgid: 10,
+            ..fact(11, 10, 11)
+        };
+        let escaped = ProcFact {
+            pgid: 99,
+            ..fact(12, 11, 12)
+        };
+        let excluded = ProcFact {
+            pgid: 10,
+            ..fact(20, 1, 20)
+        };
+        let snapshot = [root, child, escaped];
+        let members = [root, child, excluded];
+        let mut captured = capture_members(&snapshot, 10, root.start_time, 10, &members).unwrap();
+        assert!(apply_exclusions(&mut captured, &[20]));
+        let pids: Vec<_> = captured.iter().map(|target| target.fact.pid).collect();
+        assert_eq!(pids, [12, 11, 10]);
+    }
+
+    #[test]
+    fn kill_tree_excluded_leader_still_authenticates_nonexcluded_descendants() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 1, 10)
+        };
+        let child = ProcFact {
+            pgid: 10,
+            ..fact(11, 10, 11)
+        };
+        let leaf = ProcFact {
+            pgid: 10,
+            ..fact(12, 11, 12)
+        };
+        let snapshot = [root, child, leaf];
+        let mut captured = capture_members(&snapshot, 10, root.start_time, 10, &snapshot).unwrap();
+        assert!(apply_exclusions(&mut captured, &[10, 11]));
+        let pids: Vec<_> = captured.iter().map(|target| target.fact.pid).collect();
+        assert_eq!(pids, [12]);
+        assert_eq!(
+            survivors(&captured, |pid| {
+                assert_eq!(pid, 12, "excluded roots are not survivor probes");
+                Observation::Gone
+            }),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn kill_tree_excluding_an_escaped_member_does_not_block_the_owned_group() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 1, 10)
+        };
+        let escaped = fact(11, 10, 11);
+        let snapshot = [root, escaped];
+        let members = [root];
+        let mut captured = capture_members(&snapshot, 10, root.start_time, 10, &members).unwrap();
+        assert!(!apply_exclusions(&mut captured, &[11]));
+        let pids: Vec<_> = captured.iter().map(|target| target.fact.pid).collect();
+        assert_eq!(pids, [10]);
     }
 }
