@@ -214,17 +214,16 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Update instance PID after spawn
+    /// Update the PID and its native identity together after spawn.
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
+        let receipt = crate::instance_binding::pid_identity_receipt(pid);
         self.conn.execute(
-            "UPDATE instances SET pid = ?,
-                launch_context = CASE
-                    WHEN json_valid(launch_context)
-                         AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
-                    THEN json_remove(launch_context,'$.omp_launch_pid')
-                    ELSE launch_context END
-             WHERE name = ?",
-            params![pid as i64, name],
+            "UPDATE instances SET pid = ?1,
+                launch_context = json_patch(
+                    CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
+                    json_object('omp_launch_pid', json(?3)))
+             WHERE name = ?2",
+            params![i64::from(pid), name, receipt],
         )?;
         Ok(())
     }
@@ -232,17 +231,35 @@ impl HcomDb {
     /// Record `pid` only while the row has none. Returns whether this call set
     /// it; an existing anchor (a PTY wrapper's, a launcher's) is never replaced.
     pub fn set_instance_pid_if_unset(&self, name: &str, pid: u32) -> Result<bool> {
+        let receipt = crate::instance_binding::pid_identity_receipt(pid);
         let changed = self.conn.execute(
             "UPDATE instances SET pid = ?1,
-                launch_context = CASE
-                    WHEN json_valid(launch_context)
-                         AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
-                    THEN json_remove(launch_context,'$.omp_launch_pid')
-                    ELSE launch_context END
+                launch_context = json_patch(
+                    CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
+                    json_object('omp_launch_pid', json(?3)))
              WHERE name = ?2 AND pid IS NULL",
-            params![pid as i64, name],
+            params![i64::from(pid), name, receipt],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Move an existing anchor without certifying whichever process happens
+    /// to hold its PID now. The source receipt, including its absence, follows
+    /// the copied PID in the same write.
+    pub(crate) fn copy_instance_pid(&self, name: &str, source: &InstanceRow) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET pid = ?1,
+                launch_context = json_patch(
+                    CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
+                    json_object('omp_launch_pid', json(?3)))
+             WHERE name = ?2",
+            params![
+                source.pid,
+                name,
+                crate::instance_binding::copied_pid_identity_receipt(source)
+            ],
+        )?;
+        Ok(())
     }
 
     /// Set or clear one captured row incarnation without overwriting a replacement
@@ -254,13 +271,12 @@ impl HcomDb {
         expected: &InstanceRow,
         pid: Option<u32>,
     ) -> Result<bool> {
+        let receipt = pid.and_then(crate::instance_binding::pid_identity_receipt);
         let changed = tx.execute(
             "UPDATE instances SET pid = ?1,
-                launch_context = CASE
-                    WHEN json_valid(launch_context)
-                         AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
-                    THEN json_remove(launch_context,'$.omp_launch_pid')
-                    ELSE launch_context END
+                launch_context = json_patch(
+                    CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
+                    json_object('omp_launch_pid', json(?9)))
              WHERE name = ?2 AND created_at = ?3 AND agent_id IS ?4
                AND pid IS ?5 AND session_id IS ?6
                AND tool = ?7 AND NULLIF(origin_device_id, '') IS ?8",
@@ -273,6 +289,7 @@ impl HcomDb {
                 expected.session_id,
                 expected.tool,
                 expected.origin_device_id,
+                receipt,
             ],
         )?;
         Ok(changed == 1)
@@ -451,7 +468,7 @@ impl HcomDb {
             "SELECT transcript_path, session_id, tool, directory, parent_name, tag,
                     wait_timeout, subagent_timeout, hints, pid, created_at, background,
                     agent_id, launch_args, origin_device_id, background_log_file, last_event_id,
-                    purpose, current
+                    purpose, current, launch_context
              FROM instances WHERE name = ?",
         )?;
 
@@ -467,6 +484,7 @@ impl HcomDb {
                 "subagent_timeout": row.get::<_, Option<i64>>(7).unwrap_or(None),
                 "hints": row.get::<_, String>(8).unwrap_or_default(),
                 "pid": row.get::<_, Option<i64>>(9).unwrap_or(None),
+                "launch_context": row.get::<_, String>(19).unwrap_or_default(),
                 "created_at": row.get::<_, f64>(10).unwrap_or(0.0),
                 "background": row.get::<_, i64>(11).unwrap_or(0),
                 "agent_id": row.get::<_, String>(12).unwrap_or_default(),
@@ -881,6 +899,18 @@ impl HcomDb {
         if data.is_empty() {
             return Ok(false);
         }
+        if data.contains_key("pid") && self.conn.is_autocommit() {
+            return self.with_immediate_transaction(|_| self.save_instance(data));
+        }
+        let mut data = std::borrow::Cow::Borrowed(data);
+        if let Some(pid) = data.get("pid") {
+            let context = self.pid_identity_context(
+                data.get("name").and_then(serde_json::Value::as_str),
+                pid,
+                data.get("launch_context"),
+            )?;
+            data.to_mut().insert("launch_context".into(), context);
+        }
 
         let columns: Vec<&str> = data.keys().map(|k| k.as_str()).collect();
         for col in &columns {
@@ -936,6 +966,15 @@ impl HcomDb {
     ) -> Result<bool> {
         if updates.is_empty() {
             return Ok(true);
+        }
+        if updates.contains_key("pid") && self.conn.is_autocommit() {
+            return self.with_immediate_transaction(|_| self.update_instance(name, updates));
+        }
+        let mut updates = std::borrow::Cow::Borrowed(updates);
+        if let Some(pid) = updates.get("pid") {
+            let context =
+                self.pid_identity_context(Some(name), pid, updates.get("launch_context"))?;
+            updates.to_mut().insert("launch_context".into(), context);
         }
 
         let entries: Vec<(&String, &serde_json::Value)> = updates.iter().collect();
@@ -1057,33 +1096,37 @@ impl HcomDb {
     /// [`Self::get_instance_with_bindings`]): a bulk operation resolves each
     /// row against this read instead of re-reading it per name.
     pub fn iter_instances_with_bindings(&self) -> Result<Vec<(InstanceRow, Vec<String>)>> {
-        self.with_read_snapshot(|tx| {
-            let rows: Vec<InstanceRow> = tx
-                .prepare_cached("SELECT * FROM instances ORDER BY created_at DESC")?
-                .query_map([], InstanceRow::from_row)?
-                .filter_map(|r| r.ok())
-                .collect();
-            let mut bindings: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            let mut stmt = tx.prepare_cached(
-                "SELECT instance_name, process_id FROM process_bindings \
-                 WHERE instance_name IS NOT NULL ORDER BY updated_at DESC",
-            )?;
-            let pairs = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            for pair in pairs {
-                let (name, id) = pair?;
-                bindings.entry(name).or_default().push(id);
-            }
-            Ok(rows
-                .into_iter()
-                .map(|row| {
-                    let ids = bindings.remove(&row.name).unwrap_or_default();
-                    (row, ids)
-                })
-                .collect())
-        })
+        self.with_read_snapshot(Self::instances_with_bindings_in)
+    }
+
+    pub(crate) fn instances_with_bindings_in(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<Vec<(InstanceRow, Vec<String>)>> {
+        let rows: Vec<InstanceRow> = tx
+            .prepare_cached("SELECT * FROM instances ORDER BY created_at DESC")?
+            .query_map([], InstanceRow::from_row)?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut bindings: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut stmt = tx.prepare_cached(
+            "SELECT instance_name, process_id FROM process_bindings \
+             WHERE instance_name IS NOT NULL ORDER BY updated_at DESC",
+        )?;
+        let pairs = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for pair in pairs {
+            let (name, id) = pair?;
+            bindings.entry(name).or_default().push(id);
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let ids = bindings.remove(&row.name).unwrap_or_default();
+                (row, ids)
+            })
+            .collect())
     }
 
     /// Save (INSERT OR REPLACE) an instance row.
@@ -1093,12 +1136,20 @@ impl HcomDb {
         name: &str,
         data: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<bool> {
+        if data.contains_key("pid") && self.conn.is_autocommit() {
+            return self.with_immediate_transaction(|_| self.save_instance_named(name, data));
+        }
+        let mut data = std::borrow::Cow::Borrowed(data);
+        if let Some(pid) = data.get("pid") {
+            let context = self.pid_identity_context(None, pid, data.get("launch_context"))?;
+            data.to_mut().insert("launch_context".into(), context);
+        }
         // Build column list and values dynamically
         let mut cols = vec!["name"];
         let mut placeholders = vec!["?"];
         let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(name.to_string())];
 
-        for (key, val) in data {
+        for (key, val) in data.iter() {
             if key == "name" {
                 continue;
             }
@@ -1125,11 +1176,19 @@ impl HcomDb {
         name: &str,
         data: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<bool> {
+        if data.contains_key("pid") && self.conn.is_autocommit() {
+            return self.with_immediate_transaction(|_| self.save_instance_reservation(name, data));
+        }
+        let mut data = std::borrow::Cow::Borrowed(data);
+        if let Some(pid) = data.get("pid") {
+            let context = self.pid_identity_context(None, pid, data.get("launch_context"))?;
+            data.to_mut().insert("launch_context".into(), context);
+        }
         let mut cols = vec!["name"];
         let mut placeholders = vec!["?"];
         let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(name.to_string())];
 
-        for (key, val) in data {
+        for (key, val) in data.iter() {
             if key == "name" {
                 continue;
             }
@@ -1159,11 +1218,20 @@ impl HcomDb {
         if updates.is_empty() {
             return Ok(());
         }
+        if updates.contains_key("pid") && self.conn.is_autocommit() {
+            return self.with_immediate_transaction(|_| self.update_instance_fields(name, updates));
+        }
+        let mut updates = std::borrow::Cow::Borrowed(updates);
+        if let Some(pid) = updates.get("pid") {
+            let context =
+                self.pid_identity_context(Some(name), pid, updates.get("launch_context"))?;
+            updates.to_mut().insert("launch_context".into(), context);
+        }
 
         let mut set_parts = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        for (key, val) in updates {
+        for (key, val) in updates.iter() {
             set_parts.push(format!("{} = ?", Self::validate_column(key)?));
             values.push(Self::json_value_to_sql(val));
         }
@@ -1178,6 +1246,38 @@ impl HcomDb {
         let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|b| b.as_ref()).collect();
         self.conn.execute(&sql, refs.as_slice())?;
         Ok(())
+    }
+
+    /// Generic field writers must carry the same identity invariant as the
+    /// dedicated PID setters. Called under their writer transaction.
+    fn pid_identity_context(
+        &self,
+        name: Option<&str>,
+        pid: &serde_json::Value,
+        context: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let existing = match (context, name) {
+            (Some(value), _) => value.as_str().map(str::to_owned),
+            (None, Some(name)) => self
+                .get_instance_full(name)?
+                .and_then(|row| row.launch_context),
+            (None, None) => None,
+        };
+        let mut context = existing
+            .as_deref()
+            .and_then(|text| {
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).ok()
+            })
+            .unwrap_or_default();
+        context.remove("omp_launch_pid");
+        if let Some(receipt) = pid
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .and_then(crate::instance_binding::pid_identity_receipt)
+        {
+            context.insert("omp_launch_pid".into(), serde_json::from_str(&receipt)?);
+        }
+        Ok(serde_json::Value::String(serde_json::to_string(&context)?))
     }
 
     /// Validate column name against SQL injection (whitelist of known columns).

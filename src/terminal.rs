@@ -2644,12 +2644,14 @@ fn zellij_terminal_pane_exists(session_name: &str, pane_id: &str) -> Option<bool
     }))
 }
 
-/// Close terminal pane (if applicable) then SIGTERM the process group.
-pub fn kill_process(
-    pid: u32,
+/// Close the owned pane, then signal only the verified PID incarnation's group.
+pub(crate) fn kill_process(
+    owner: &crate::proctruth::KillOwner,
     instance_names: &[String],
     info: &TerminalInfo,
-) -> (KillResult, bool, Option<String>) {
+) -> Result<(KillResult, bool, Option<String>), &'static str> {
+    let pid = owner.pid();
+    let live = owner.recheck()?;
     let TerminalInfo {
         preset_name,
         pane_id,
@@ -2687,18 +2689,26 @@ pub fn kill_process(
         }
     };
 
-    // SIGTERM the process group
     use crate::sys::process::GroupSignal;
-    let kill_result = match crate::sys::process::terminate_group(pid) {
-        GroupSignal::Sent => KillResult::Sent,
-        #[cfg(unix)]
-        GroupSignal::PermissionDenied => KillResult::PermissionDenied,
-        GroupSignal::NotFound => KillResult::AlreadyDead,
-        #[cfg(unix)]
-        GroupSignal::Other => KillResult::AlreadyDead,
+    let kill_result = if live && owner.recheck()? {
+        match crate::sys::process::terminate_group_verified(
+            pid,
+            owner
+                .identity()
+                .ok_or("process ownership was not verified")?,
+        )? {
+            GroupSignal::Sent => KillResult::Sent,
+            #[cfg(unix)]
+            GroupSignal::PermissionDenied => KillResult::PermissionDenied,
+            GroupSignal::NotFound => KillResult::AlreadyDead,
+            #[cfg(unix)]
+            GroupSignal::Other => KillResult::AlreadyDead,
+        }
+    } else {
+        KillResult::AlreadyDead
     };
 
-    (kill_result, pane_close.closed, pane_close.retry_command)
+    Ok((kill_result, pane_close.closed, pane_close.retry_command))
 }
 
 /// A run-here launch owns only a single, identified pane, never the enclosing
@@ -3204,7 +3214,8 @@ mod tests {
                 process_id: "run-here-nonce".into(),
                 ..Default::default()
             };
-            let (_, closed, _) = kill_process(2_000_000_000, &["bura".into()], &info);
+            let owner = crate::proctruth::verify_kill_owner(2_000_000_000, None, &[]).unwrap();
+            let (_, closed, _) = kill_process(&owner, &["bura".into()], &info).unwrap();
             assert_eq!(
                 closed,
                 should_close,

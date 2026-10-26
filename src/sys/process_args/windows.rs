@@ -24,7 +24,8 @@ use windows_sys::Win32::Foundation::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, IsWow64Process, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    GetCurrentProcess, IsWow64Process, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_VM_READ,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
@@ -167,7 +168,10 @@ fn read_environment(pid: u32) -> Option<Vec<u16>> {
         return None;
     }
     let environment = read_pointer(&process, parameters.checked_add(PARAMETERS_ENVIRONMENT)?)?;
-    let size = read_pointer(&process, parameters.checked_add(PARAMETERS_ENVIRONMENT_SIZE)?)?;
+    let size = read_pointer(
+        &process,
+        parameters.checked_add(PARAMETERS_ENVIRONMENT_SIZE)?,
+    )?;
     if environment == 0 || !environment.is_multiple_of(size_of::<u16>()) {
         return None;
     }
@@ -216,9 +220,8 @@ fn read_memory(process: &Process, address: usize, buffer: &mut [u8]) -> Option<(
 fn read_units(process: &Process, address: usize, buffer: &mut [u16]) -> Option<()> {
     // SAFETY: a mutable byte view covers the same initialized u16 storage,
     // and every resulting bit pattern remains a valid u16.
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast(), size_of_val(buffer))
-    };
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast(), size_of_val(buffer)) };
     read_memory(process, address, bytes)
 }
 
@@ -231,8 +234,8 @@ fn read_environment_chunks(process: &Process, environment: usize) -> Option<Vec<
     while buffer.len() * size_of::<u16>() < MAX_BYTES {
         let read_bytes = buffer.len() * size_of::<u16>();
         let address = environment.checked_add(read_bytes)?;
-        let count = (CHUNK_BYTES - address % CHUNK_BYTES).min(MAX_BYTES - read_bytes)
-            / size_of::<u16>();
+        let count =
+            (CHUNK_BYTES - address % CHUNK_BYTES).min(MAX_BYTES - read_bytes) / size_of::<u16>();
         let start = buffer.len();
         buffer.try_reserve(count).ok()?;
         buffer.resize(start + count, 0);
@@ -473,7 +476,8 @@ fn parse_env(block: &[u16], claimed_bytes: usize, key: &str) -> EnvRead {
                 && env_key_matches(&entry[..separator], key)
             {
                 value = Some(&entry[separator + 1..]);
-            } else if char::decode_utf16(entry.iter().copied()).any(|character| character.is_err()) {
+            } else if char::decode_utf16(entry.iter().copied()).any(|character| character.is_err())
+            {
                 return EnvRead::Unreadable;
             }
         }
@@ -873,11 +877,19 @@ mod env_tests {
         }
         let block: Vec<u16> = "HCOM_PROCESS_ID=owner\0\0".encode_utf16().collect();
         assert_eq!(
-            parse_env(&block, (block.len() + 1) * size_of::<u16>(), "HCOM_PROCESS_ID"),
+            parse_env(
+                &block,
+                (block.len() + 1) * size_of::<u16>(),
+                "HCOM_PROCESS_ID"
+            ),
             EnvRead::Unreadable
         );
         assert_eq!(
-            parse_env(&block, (block.len() - 1) * size_of::<u16>(), "HCOM_PROCESS_ID"),
+            parse_env(
+                &block,
+                (block.len() - 1) * size_of::<u16>(),
+                "HCOM_PROCESS_ID"
+            ),
             EnvRead::Unreadable
         );
     }

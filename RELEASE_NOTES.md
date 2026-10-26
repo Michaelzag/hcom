@@ -1,5 +1,24 @@
 ## Unreleased
 
+`hcom kill` no longer signals an unrelated process that reused a crashed
+seat's PID (#106). Every target form, including multiple names, tags, all,
+and stopped-process targets, now requires positive owner proof before pane,
+process-group, or Windows tree teardown. The same `omp_launch_pid` receipt
+now records the native birth identity atomically with every PID update,
+including the hook's interpreter re-pin. A mismatched or unreadable identity
+refuses with the PID, reason, nonzero exit and `hcom stop N` recovery pointer;
+gone and zombie owners get signal-free bookkeeping cleanup. Bulk kills
+continue handling verified owners while reporting refusals.
+
+Legacy rows on Linux, macOS and Windows can prove ownership through the live
+process's bound `HCOM_PROCESS_ID`, read through the native process API. This
+keeps a pre-upgrade or hung owner killable without waiting for another hook.
+The next successful `omp-start` writes the native owner receipt. Missing,
+unreadable, malformed or mismatched evidence refuses without signalling;
+`hcom stop N` only clears bookkeeping.
+Windows tree termination checks the captured creation time through the same
+handle it terminates and will not follow a reused parent's numeric PID.
+
 Kill now retries a busy database while finalizing the stopped snapshot and
 releasing the row. The retry window is 30 seconds plus at most one final
 5-second SQLite wait. If it still can't write, the error distinguishes the

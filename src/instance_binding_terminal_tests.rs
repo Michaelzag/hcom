@@ -115,8 +115,9 @@ fn review_custom_case(
         row.terminal_preset_effective.as_deref(),
         row.launch_context.as_deref(),
     );
+    let owner = crate::proctruth::verify_kill_owner(2_000_000_000, None, &[]).unwrap();
     let (_, pane_closed, _) =
-        terminal::kill_process(2_000_000_000, std::slice::from_ref(&row.name), &info);
+        terminal::kill_process(&owner, std::slice::from_ref(&row.name), &info).unwrap();
     (
         pane_closed,
         std::fs::read_to_string(closed).unwrap_or_default(),

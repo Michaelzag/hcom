@@ -295,12 +295,14 @@ applies the same owner-or-positively-dead rule as `hcom start --as`. The owner
 itself, a dead or zombie owner's successor, `hcom r N`, and a canonical resume
 after a normal stop still bind on the first hook.
 
-The launch receipt behind that pin lives in the existing `launch_context` JSON
-under the `omp_launch_pid` key, and `hcom list --json` shows it inside
-`launch_context`. There is no schema change. An older hcom binary reads the key
-as unknown and ignores it; its hook-time context rewrite may drop it, which
-only puts that pin back on the legacy rules — held while its process is live,
-with `hcom stop N` available.
+The PID receipt lives in the existing `launch_context` JSON under
+`omp_launch_pid`; `hcom list --json` shows it there. Launch reservations
+include their binding epoch. Every PID update, including the first `omp-start`
+owner pin, atomically refreshes the same receipt with the native process
+identity. Copying an anchor preserves its original receipt instead of
+certifying whatever now holds its PID. There is no schema change. An older
+hcom binary ignores the key and may drop it during a hook context rewrite,
+leaving that pin on the legacy rules with `hcom stop N` available.
 
 Five shapes refuse, each with a supported alternative:
 
@@ -381,6 +383,31 @@ hcom r <name|session_id>                # resume agent
 hcom f <name|session_id>                # fork session
 hcom kill <name|tag:T|all>              # kill + close terminal pane
 ```
+
+`hcom kill` verifies ownership before closing a pane, signalling a process
+group, or terminating a Windows tree. The recorded PID must have the same
+native birth identity as its `omp_launch_pid` receipt: start ticks plus boot
+ID on Linux, process start time on macOS, or process creation time on Windows.
+A mismatched or unreadable receipt refuses the kill. For a legacy row with
+no receipt, Linux, macOS and Windows can instead verify the live process's
+own `HCOM_PROCESS_ID` against the row's bindings through their native process
+readers. A name or bare live PID is not proof. A refusal leaves bookkeeping
+intact, reports the PID and reason, exits
+nonzero, and points at `hcom stop N` to clear the bookkeeping without
+signalling that process. Gone or zombie owners get bookkeeping cleanup
+without a group or tree signal.
+
+The same rule covers multiple names, `tag:T`, `all`, and stopped-process
+targets. Bulk kills continue past refused rows, handle verified owners, and
+still exit nonzero if any row was refused. Windows rechecks each descendant's
+creation identity through the handle it terminates; a dead or reused parent
+PID cannot authorize a newly discovered tree.
+
+Live pre-upgrade seats retain kill support through that bound process-ID
+proof, including a hung owner that cannot run another hook. A successful
+`omp-start` hook records its native birth receipt for later kills. Missing,
+unreadable, malformed or mismatched environment evidence never authorizes a
+signal; `hcom stop N` remains the signal-free bookkeeping recovery.
 
 hcom launch flags:
 

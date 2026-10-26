@@ -97,6 +97,7 @@ jobs:
       - if: runner.os == 'macOS'
         run: cargo test --locked --bin hcom sys::process -- --nocapture --test-threads=1
       - run: cargo test --locked --test omp_native_owner -- --nocapture --test-threads=1
+      - run: cargo test --locked --test kill_owner -- --nocapture --test-threads=1
 
   typecheck:
     runs-on: ubuntu-latest

@@ -707,6 +707,29 @@ impl ReapCapture {
     }
 }
 
+/// A kill of a positively dead leader performs bookkeeping only. Neither a
+/// surviving group nor inherited carriers authorize a signal through its PID.
+pub(crate) fn gone_kill_capture(
+    row: &crate::db::InstanceRow,
+    binding_ids: &[String],
+) -> ReapCapture {
+    ReapCapture {
+        #[cfg(unix)]
+        scope: carrier_tree_scope(None, &[], &[]),
+        #[cfg(unix)]
+        carriers: Vec::new(),
+        incarnation: Some(CapturedIncarnation {
+            created_at: row.created_at,
+            pid: row.pid,
+            session_id: row.session_id.clone(),
+            agent_id: row.agent_id.clone(),
+            binding_ids: binding_ids.to_vec(),
+        }),
+        signal_free: true,
+        recovering_empty_row: false,
+    }
+}
+
 #[cfg(unix)]
 fn carrier_tree_scope(
     row_pid: Option<i64>,
@@ -1966,6 +1989,118 @@ pub(crate) fn carries_process_id(pid: u32, id: &str) -> bool {
     !id.is_empty()
         && identity_facts_of(pid, "") // name fact unused; only the process id matters
             .is_some_and(|(_, process_id)| process_id == id)
+}
+
+/// A kill capability for one verified PID incarnation, not merely a live PID.
+/// `None` identity means positively gone/zombie and never permits a signal.
+pub(crate) struct KillOwner {
+    pid: u32,
+    identity: Option<String>,
+}
+
+impl KillOwner {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    /// Revalidate before both pane teardown and the group/tree signal. Death
+    /// needs no signal; a different or unreadable incarnation is a refusal.
+    pub(crate) fn recheck(&self) -> Result<bool, &'static str> {
+        if crate::sys::process::is_definitely_dead(self.pid) {
+            return Ok(false);
+        }
+        match (&self.identity, crate::sys::process::identity(self.pid)) {
+            (Some(expected), Some(current)) if *expected == current => Ok(true),
+            (_, None) => Err("live process identity is unreadable"),
+            _ => Err("PID now belongs to a different process"),
+        }
+    }
+}
+
+/// The one owner gate for every kill target, before any group/tree/pane
+/// teardown or carrier reap. A receipt mismatch never falls back to env.
+/// Legacy rows can instead prove the live process's own bound HCOM id;
+/// a name, executable, numeric PID or registration time alone proves nothing.
+pub(crate) fn verify_kill_owner(
+    pid: u32,
+    launch_context: Option<&str>,
+    binding_ids: &[String],
+) -> Result<KillOwner, &'static str> {
+    if pid == 0 || i32::try_from(pid).is_err() {
+        return Err("recorded PID is invalid");
+    }
+    if crate::sys::process::is_definitely_dead(pid) {
+        return Ok(KillOwner {
+            pid,
+            identity: None,
+        });
+    }
+    let identity =
+        crate::sys::process::identity(pid).ok_or("live process identity is unreadable")?;
+    let context = launch_context
+        .filter(|context| !context.is_empty())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(|_| "recorded identity receipt is unreadable")?;
+    if let Some(receipt) = context
+        .as_ref()
+        .and_then(|context| context.get("omp_launch_pid"))
+    {
+        if receipt.get("pid").and_then(serde_json::Value::as_u64) != Some(u64::from(pid)) {
+            return Err("identity receipt does not name the recorded PID");
+        }
+        let expected = receipt
+            .get("identity")
+            .and_then(serde_json::Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .ok_or("recorded identity receipt is unreadable")?;
+        if expected != identity {
+            return Err("PID now belongs to a different process (native identity mismatch)");
+        }
+    } else {
+        use crate::sys::process_args::EnvRead;
+        let evidence = crate::sys::process_args::read_process_env_var(pid, "HCOM_PROCESS_ID");
+        // The native API is unsupported on Linux/Android; retain the existing
+        // proctruth reader there rather than adding a second /proc reader.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let evidence = match evidence {
+            EnvRead::Unreadable => match identity_facts_of(pid, "") {
+                Some((_, id)) if id.is_empty() => EnvRead::Absent,
+                Some((_, id)) => EnvRead::Present(id),
+                None => EnvRead::Unreadable,
+            },
+            evidence => evidence,
+        };
+        let process_id = match evidence {
+            EnvRead::Present(id) => id,
+            EnvRead::Absent => {
+                return Err("live HCOM_PROCESS_ID is absent and no identity receipt was recorded");
+            }
+            EnvRead::Unreadable => {
+                return Err("live HCOM identity is unreadable and no identity receipt was recorded");
+            }
+        };
+        if process_id.is_empty() {
+            return Err(
+                "live HCOM_PROCESS_ID is absent or empty and no identity receipt was recorded",
+            );
+        }
+        if !is_bound_process_id(&process_id, binding_ids) {
+            return Err(
+                "live HCOM_PROCESS_ID does not match a bound process id and no identity receipt was recorded",
+            );
+        }
+    }
+    let owner = KillOwner {
+        pid,
+        identity: Some(identity),
+    };
+    owner.recheck()?;
+    Ok(owner)
 }
 
 /// True for the launcher's own id shape ([`launcher::generate_process_id`]):

@@ -1414,6 +1414,7 @@ fn stop_snapshot(instance_data: &InstanceRow) -> Value {
         "subagent_timeout": instance_data.subagent_timeout,
         "hints": instance_data.hints,
         "pid": instance_data.pid,
+        "launch_context": instance_data.launch_context.as_deref().unwrap_or_default(),
         "created_at": instance_data.created_at,
         "created_at_bits": instance_data.created_at.to_bits(),
         "last_seen": instance_data.last_seen,
@@ -1429,6 +1430,7 @@ fn stop_snapshot(instance_data: &InstanceRow) -> Value {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn stop_instance_with_capture(
     db: &HcomDb,
     instance_name: &str,
@@ -1439,9 +1441,8 @@ pub(crate) fn stop_instance_with_capture(
     stop_instance_with_capture_listing_orphans(db, instance_name, initiated_by, reason, capture).0
 }
 
-/// [`stop_instance_with_capture`], also returning every child row this stop
-/// released with no signal to anyone (no live root, only orphan carriers),
-/// each with the orphans it left running, for the caller to list.
+/// Stop with a captured incarnation, also returning every child row released
+/// without signalling its orphan carriers, for the caller to list.
 pub(crate) fn stop_instance_with_capture_listing_orphans(
     db: &HcomDb,
     instance_name: &str,

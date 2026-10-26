@@ -302,10 +302,8 @@ fn process_identity_platform(pid: u32) -> Option<String> {
 /// in [`kill_tree_win_checked`].
 #[cfg(windows)]
 pub(crate) fn creation_ticks_win(pid: u32) -> Option<u64> {
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
-    use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     // SAFETY: the handle is opened query-only, every FILETIME pointer is
     // valid, and the handle is closed before returning.
@@ -314,14 +312,23 @@ pub(crate) fn creation_ticks_win(pid: u32) -> Option<u64> {
         if handle.is_null() {
             return None;
         }
-        let mut created: FILETIME = std::mem::zeroed();
-        let mut exited: FILETIME = std::mem::zeroed();
-        let mut kernel: FILETIME = std::mem::zeroed();
-        let mut user: FILETIME = std::mem::zeroed();
-        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        let ticks = creation_ticks_from_handle(handle);
         CloseHandle(handle);
-        ok.then_some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+        ticks
     }
+}
+
+#[cfg(windows)]
+fn creation_ticks_from_handle(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    let mut created: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exited: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    // SAFETY: the output buffers are valid; Windows validates the handle.
+    let ok = unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
+    (ok != 0).then_some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
 }
 
 #[cfg(all(
@@ -526,6 +533,60 @@ pub fn terminate_group(pid: u32) -> GroupSignal {
     #[cfg(windows)]
     {
         kill_tree_win(pid)
+    }
+}
+
+/// Kill's signal primitive: a PID incarnation, not a bare PID, authorizes
+/// the group/tree. Other lifecycle callers keep their existing primitives.
+pub(crate) fn terminate_group_verified(
+    pid: u32,
+    expected: &str,
+) -> Result<GroupSignal, &'static str> {
+    if is_definitely_dead(pid) {
+        return Ok(GroupSignal::NotFound);
+    }
+    if !has_identity(pid, expected) {
+        return Err("PID identity changed or became unreadable before the group/tree signal");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        super::kill_tree_apple::terminate(pid, expected)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let result = signal_group_unix(pid, libc::SIGTERM);
+        if result != GroupSignal::NotFound || is_definitely_dead(pid) {
+            return Ok(result);
+        }
+        // Hook re-pinning can name the interpreter, not its group's leader.
+        // ESRCH from killpg is harmless, but does not mean that PID is dead.
+        if !has_identity(pid, expected) {
+            return Err("PID identity changed or became unreadable before the owner signal");
+        }
+        // SAFETY: a verified positive PID targets one process, not its parent
+        // or a shared launcher group. Carrier reap handles its captured tree.
+        if unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0 {
+            return Ok(GroupSignal::Sent);
+        }
+        Ok(match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => GroupSignal::NotFound,
+            Some(libc::EPERM) => GroupSignal::PermissionDenied,
+            _ => GroupSignal::Other,
+        })
+    }
+    #[cfg(windows)]
+    {
+        let ticks = expected
+            .strip_prefix("windows:")
+            .and_then(|ticks| ticks.parse::<u64>().ok())
+            .ok_or("recorded Windows process creation time is unreadable")?;
+        let (result, root_terminated) = kill_tree_win_with_identity(pid, Some(ticks));
+        if !root_terminated && !is_definitely_dead(pid) {
+            return Err(
+                "verified owner could not be terminated: its identity changed, became unreadable, or access was denied",
+            );
+        }
+        Ok(result)
     }
 }
 
@@ -756,12 +817,30 @@ fn request_shutdown_win(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn terminate_win(pid: u32) -> bool {
+    terminate_win_matching(pid, None)
+}
+
+#[cfg(windows)]
+fn terminate_win_matching(pid: u32, expected: Option<u64>) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-    // SAFETY: opens a terminate-only handle, closes it before returning.
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+    };
+    // Query and terminate through ONE handle: even a PID reused between the
+    // OpenProcess and TerminateProcess calls cannot redirect the termination.
+    let access = PROCESS_TERMINATE
+        | if expected.is_some() {
+            PROCESS_QUERY_LIMITED_INFORMATION
+        } else {
+            0
+        };
     unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        let handle = OpenProcess(access, 0, pid);
         if handle.is_null() {
+            return false;
+        }
+        if expected.is_some_and(|ticks| creation_ticks_from_handle(handle) != Some(ticks)) {
+            CloseHandle(handle);
             return false;
         }
         // Exit code 130 (128 + SIGINT) is the hcom sentinel for "externally
@@ -978,6 +1057,14 @@ fn kill_tree_win(root: u32) -> GroupSignal {
 /// snapshot can still escape.
 #[cfg(windows)]
 fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
+    kill_tree_win_with_identity(root, None)
+}
+
+#[cfg(windows)]
+fn kill_tree_win_with_identity(root: u32, expected: Option<u64>) -> (GroupSignal, bool) {
+    if expected.is_some_and(|ticks| creation_ticks_win(root) != Some(ticks)) {
+        return (GroupSignal::NotFound, false);
+    }
     let Some(parents) = snapshot_parents(false) else {
         // Still can't enumerate descendants; kill only the root. Any
         // surviving descendants will be reaped when the job object
@@ -997,7 +1084,7 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
                  descendants may be left running until the job object reaps them"
             ),
         );
-        let ok = terminate_win(root);
+        let ok = terminate_win_matching(root, expected);
         return (
             if ok {
                 GroupSignal::Sent
@@ -1021,6 +1108,9 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
     // as read while that member was still alive, so a candidate is always
     // compared against the incarnation this walk actually decided to kill.
     let mut ticks: std::collections::HashMap<u32, Option<u64>> = std::collections::HashMap::new();
+    if let Some(expected) = expected {
+        ticks.insert(root, Some(expected));
+    }
     let mut tree = vec![root];
     let mut i = 0;
     while i < tree.len() {
@@ -1034,18 +1124,36 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
                 continue;
             }
             let child_ticks = *ticks.entry(pid).or_insert_with(|| creation_ticks_win(pid));
+            if expected.is_some()
+                && (parent_ticks.is_none()
+                    || child_ticks.is_none()
+                    || creation_ticks_win(current) != parent_ticks)
+            {
+                continue;
+            }
             if child_link_is_plausible(parent_ticks, child_ticks) {
                 tree.push(pid);
             }
         }
         i += 1;
     }
+    if expected.is_some_and(|ticks| creation_ticks_win(root) != Some(ticks)) {
+        return (GroupSignal::NotFound, false);
+    }
 
     // Terminate children before parents (deepest first) so a parent can't spawn
     // a new child after we've passed it.
     let mut root_terminated = false;
     for &pid in tree.iter().rev() {
-        let ok = terminate_win(pid);
+        let ok = if expected.is_some() {
+            ticks
+                .get(&pid)
+                .copied()
+                .flatten()
+                .is_some_and(|ticks| terminate_win_matching(pid, Some(ticks)))
+        } else {
+            terminate_win(pid)
+        };
         if pid == root {
             root_terminated = ok;
         }
@@ -1090,6 +1198,16 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
                     .entry(ppid)
                     .or_insert_with(|| creation_ticks_win(ppid));
                 let child_ticks = *ticks.entry(pid).or_insert_with(|| creation_ticks_win(pid));
+                // A newly observed child cannot be attributed through a dead
+                // or reused parent PID. The wrapper's kernel job object still
+                // owns genuine children independently of these numeric links.
+                if expected.is_some()
+                    && (parent_ticks.is_none()
+                        || child_ticks.is_none()
+                        || creation_ticks_win(ppid) != parent_ticks)
+                {
+                    continue;
+                }
                 if child_link_is_plausible(parent_ticks, child_ticks) {
                     tree.push(pid);
                 }
@@ -1103,7 +1221,13 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
         // to the known tree, but iterating in reverse discovery order costs
         // nothing and keeps the same "children before parents" spirit).
         for &pid in tree[before..].iter().rev() {
-            terminate_win(pid);
+            if expected.is_some() {
+                if let Some(ticks) = ticks.get(&pid).copied().flatten() {
+                    terminate_win_matching(pid, Some(ticks));
+                }
+            } else {
+                terminate_win(pid);
+            }
         }
     }
 

@@ -52,6 +52,9 @@ pub(crate) fn command_line(pid: u32) -> Option<Vec<u8>> {
 #[test]
 fn unsupported_environment_reader_fails_closed_for_live_and_missing_processes() {
     for pid in [std::process::id(), u32::MAX] {
-        assert_eq!(read_process_env_var(pid, "HCOM_PROCESS_ID"), EnvRead::Unreadable);
+        assert_eq!(
+            read_process_env_var(pid, "HCOM_PROCESS_ID"),
+            EnvRead::Unreadable
+        );
     }
 }

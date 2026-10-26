@@ -9,6 +9,8 @@
 
 pub mod fs;
 pub mod io;
+#[cfg(any(target_os = "macos", test))]
+mod kill_tree_apple;
 pub mod net;
 pub mod process;
 pub(crate) mod process_args;

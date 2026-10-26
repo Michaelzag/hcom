@@ -386,9 +386,8 @@ fn migrate_placeholder_runtime_state(
     let Some(ph) = placeholder_data else {
         return;
     };
-    if let Some(pid) = ph.pid
-        && let Ok(pid_u32) = u32::try_from(pid)
-        && let Err(e) = db.update_instance_pid(canonical_name, pid_u32)
+    if ph.pid.is_some_and(|pid| u32::try_from(pid).is_ok())
+        && let Err(e) = db.copy_instance_pid(canonical_name, ph)
     {
         crate::log::log_error("binding", "placeholder.migrate_pid", &format!("{e}"));
     }
@@ -416,10 +415,8 @@ fn migrate_placeholder_runtime_state_in_txn(
     let Some(ph) = placeholder_data else {
         return Ok(());
     };
-    if let Some(pid) = ph.pid
-        && let Ok(pid_u32) = u32::try_from(pid)
-    {
-        db.update_instance_pid(canonical_name, pid_u32)?;
+    if ph.pid.is_some_and(|pid| u32::try_from(pid).is_ok()) {
+        db.copy_instance_pid(canonical_name, ph)?;
     }
     if let Some(ctx) = &ph.launch_context {
         db.store_launch_context_in_txn(tx, canonical_name, ctx)?;
@@ -1035,9 +1032,31 @@ fn same_row_incarnation(expected: Option<&InstanceRow>, current: Option<&Instanc
 struct OmpLaunchPidReceipt {
     pid: u32,
     identity: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     process_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     binding_updated_at_bits: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     created_at_bits: String,
+}
+
+/// The same native PID receipt serves both launch reservations and hooked
+/// owners. Launches add their binding/incarnation token; every other fresh
+/// PID write records only the native identity, never a second receipt.
+pub(crate) fn pid_identity_receipt(pid: u32) -> Option<String> {
+    let identity = crate::sys::process::identity(pid)?;
+    serde_json::to_string(&OmpLaunchPidReceipt {
+        pid,
+        identity,
+        process_id: String::new(),
+        binding_updated_at_bits: String::new(),
+        created_at_bits: String::new(),
+    })
+    .ok()
+}
+
+pub(crate) fn copied_pid_identity_receipt(row: &InstanceRow) -> Option<String> {
+    OmpLaunchPidReceipt::raw(row).map(|receipt| receipt.to_string())
 }
 
 impl OmpLaunchPidReceipt {
@@ -1054,11 +1073,13 @@ impl OmpLaunchPidReceipt {
             return Ok(None);
         };
         if row.pid != Some(i64::from(receipt.pid))
-            || receipt.created_at_bits != format!("{:016x}", row.created_at.to_bits())
+            || (!receipt.created_at_bits.is_empty()
+                && receipt.created_at_bits != format!("{:016x}", row.created_at.to_bits()))
         {
             return Ok(None);
         }
-        if let Some(binding) = process_binding_epoch(db, &receipt.process_id)?
+        if !receipt.process_id.is_empty()
+            && let Some(binding) = process_binding_epoch(db, &receipt.process_id)?
             && (binding.session_id.is_some()
                 || binding.instance_name != row.name
                 || receipt.binding_updated_at_bits != format!("{:016x}", binding.updated_at_bits))
@@ -1212,10 +1233,16 @@ pub(crate) fn record_omp_launch_pid(
             return Ok((false, None));
         }
         let Some(mut context) = context else {
-            return Ok((
-                db.compare_and_set_instance_pid_in_txn(tx, &expected.row, Some(new_pid))?,
-                None,
-            ));
+            let changed =
+                db.compare_and_set_instance_pid_in_txn(tx, &expected.row, Some(new_pid))?;
+            let receipt = if changed {
+                db.get_instance_full(&expected.row.name)?
+                    .as_ref()
+                    .and_then(OmpLaunchPidReceipt::raw)
+            } else {
+                None
+            };
+            return Ok((changed, receipt));
         };
         let receipt = crate::sys::process::identity(new_pid)
             .map(|identity| {
