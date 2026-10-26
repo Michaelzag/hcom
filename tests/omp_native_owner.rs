@@ -938,3 +938,1831 @@ fn arbitrary_already_bound_cmd_wrapper_is_not_a_native_omp_shim() {
     );
     result.refused();
 }
+
+#[cfg(windows)]
+mod windows_reservation_stop {
+    use super::*;
+
+    const SENTINEL_RUNNER: &str = r#"
+const fs = require('node:fs');
+fs.writeFileSync(process.env.FIXTURE_SIGNALS, '');
+for (const name of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(name, () => fs.appendFileSync(process.env.FIXTURE_SIGNALS, `${name}\n`));
+}
+const timer = setInterval(() => fs.appendFileSync(process.env.FIXTURE_HEARTBEAT, 'x'), 25);
+setTimeout(() => clearInterval(timer), 90000);
+"#;
+
+    struct Sentinel<'a> {
+        child: Child,
+        h: &'a Hcom,
+        name: String,
+        heartbeat: PathBuf,
+        signals: PathBuf,
+    }
+
+    impl<'a> Sentinel<'a> {
+        fn spawn(h: &'a Hcom, name: &str) -> Self {
+            let heartbeat = h.root_path().join("unrelated-heartbeat");
+            let signals = h.root_path().join("unrelated-signals");
+            // A direct unrelated Node child, not an OMP script, launcher,
+            // PowerShell host or hcom resume. external_cmd clears ambient env.
+            let child = h
+                .external_cmd("node")
+                .args(["-e", SENTINEL_RUNNER])
+                .env("FIXTURE_HEARTBEAT", &heartbeat)
+                .env("FIXTURE_SIGNALS", &signals)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn owned unrelated sentinel");
+            Self {
+                child,
+                h,
+                name: name.to_owned(),
+                heartbeat,
+                signals,
+            }
+        }
+
+        fn beats(&self) -> u64 {
+            fs::metadata(&self.heartbeat).map_or(0, |stat| stat.len())
+        }
+
+        fn assert_untouched(&mut self, before: u64) {
+            self.h.eventually(
+                "unrelated sentinel heartbeat progresses",
+                Duration::from_secs(10),
+                || Ok((self.beats() > before && self.signals.exists()).then_some(())),
+            );
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "bookkeeping-only stop terminated the unrelated native child"
+            );
+            assert_eq!(fs::read_to_string(&self.signals).unwrap(), "");
+        }
+    }
+
+    impl Drop for Sentinel<'_> {
+        fn drop(&mut self) {
+            // Hcom::Drop must never reopen a numeric PID from this row and
+            // signal the unrelated sentinel, including on assertion unwind.
+            // Clear only our private fixture's exact PID after observations;
+            // cleanup itself always uses the original owned Child handle.
+            let _ = db(self.h).execute(
+                "UPDATE instances SET pid=NULL WHERE name=?1 AND pid=?2",
+                rusqlite::params![self.name, self.child.id()],
+            );
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn native_windows_stop_releases_unhooked_reservation_without_signaling() {
+        let h = isolated_hcom();
+        let suffix = unique_suffix();
+        let name = format!("directstop{suffix}");
+        let sid = uuid::Uuid::new_v4().to_string();
+        let process_id = uuid::Uuid::new_v4().to_string();
+        let mut sentinel = Sentinel::spawn(&h, &name);
+        sentinel.assert_untouched(0);
+        let conn = db(&h);
+        conn.execute(
+            "INSERT INTO instances
+             (name,tool,session_id,pid,status,status_context,created_at,last_event_id,launch_context)
+             VALUES (?1,'omp',?2,?3,'inactive','new',1234.5,0,'{}')",
+            rusqlite::params![name, sid, sentinel.child.id()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO process_bindings
+             (process_id,session_id,instance_name,updated_at) VALUES (?1,NULL,?2,1234.5)",
+            rusqlite::params![process_id, name],
+        )
+        .unwrap();
+        let reservation: (String, String, String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT status,status_context,session_id,
+                    json_type(launch_context,'$.omp_launch_pid') IS NULL,
+                    (SELECT COUNT(*) FROM process_bindings WHERE process_id=?2
+                        AND instance_name=?1 AND session_id IS NULL),
+                    (SELECT COUNT(*) FROM session_bindings WHERE session_id=?3 OR instance_name=?1)
+                 FROM instances WHERE name=?1",
+                rusqlite::params![name, process_id, sid],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            reservation,
+            ("inactive".into(), "new".into(), sid.clone(), 1, 1, 0),
+            "direct stop fixture must be eligible and never hooked"
+        );
+        let before = sentinel.beats();
+        let (code, stdout, stderr) = h.run(["stop", &name]);
+        assert_eq!(code, 0, "{stdout} {stderr}");
+        let output = format!("{stdout}{stderr}")
+            .to_ascii_lowercase()
+            .replace("signalled", "signaled");
+        assert!(
+            output.contains("no process signaled") || output.contains("no process was signaled"),
+            "stop must explicitly report bookkeeping-only release: {stdout} {stderr}"
+        );
+        let cleared: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM instances WHERE name=?1),
+                    (SELECT COUNT(*) FROM process_bindings WHERE instance_name=?1 OR process_id=?2),
+                    (SELECT COUNT(*) FROM session_bindings WHERE instance_name=?1 OR session_id=?3),
+                    (SELECT COUNT(*) FROM notify_endpoints WHERE instance=?1)",
+                rusqlite::params![name, process_id, sid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(cleared, (0, 0, 0, 0), "reservation bookkeeping survived");
+        sentinel.assert_untouched(before);
+        // No resume/C2 assertion: this is deliberately a direct stop proof.
+    }
+}
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::process::ExitStatus;
+
+// ---------------------------------------------------------------------------
+// Real resume launches whose OMP process has not reached its first hook.
+//
+// Native port of the three consumer cases in tests/omp_launch_pid_reuse.rs
+// (Linux). The launched tool is an actual Node/Bun interpreter running the
+// package-script fixture below, discovered through a fixture-owned fakebin
+// and started by the real `hcom r` launcher/PTY wrapper. It only waits on
+// file gates and calls the real omp-start hook: no model application, no
+// network, no installed OMP, no process outside the fixture's owned trees.
+// ---------------------------------------------------------------------------
+
+// hcom#107 measured Windows background READY at 26–83 s on both base and
+// head. Only startup gets 180 s; macOS and other lifecycle waits keep 30 s.
+const PROCESS_WAIT: Duration = Duration::from_secs(if cfg!(windows) { 180 } else { 30 });
+const LIFECYCLE_WAIT: Duration = Duration::from_secs(30);
+
+// Counterpart of the Linux runner.sh: announce `<pid>.started`, wait for the
+// `<pid>.hook` gate, run the real omp-start once with the inherited launch
+// env, record its output, then wait for `<pid>.exit`. Bounded at 90 s.
+const LAUNCH_RUNNER: &str = r#"
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+
+function samePath(actual, expected) {
+    const norm = (value) => String(value || '').replace(/\\/g, '/');
+    return process.platform === 'win32'
+        ? norm(actual).toLowerCase() === norm(expected).toLowerCase()
+        : norm(actual) === norm(expected);
+}
+
+if (process.argv[2] === '--version') {
+    process.stdout.write('1.0.0\n');
+} else {
+    const out = process.env.TEST_LAUNCH_DIR;
+    if (!samePath(process.env.HOME, process.env.TEST_LAUNCH_HOME)
+        || !samePath(process.env.HCOM_DIR, process.env.TEST_LAUNCH_HCOM_DIR)) {
+        fs.writeFileSync(
+            path.join(out, 'environment-error'),
+            `fixture environment escaped: HOME=${process.env.HOME} HCOM_DIR=${process.env.HCOM_DIR}\n`,
+        );
+        process.exit(97);
+    }
+    const started = path.join(out, `${process.pid}.started`);
+    fs.writeFileSync(`${started}.tmp`, JSON.stringify({
+        pid: process.pid,
+        ppid: process.ppid,
+        process_id: process.env.HCOM_PROCESS_ID || '',
+        home: process.env.HOME || '',
+        hcom_dir: process.env.HCOM_DIR || '',
+    }));
+    fs.renameSync(`${started}.tmp`, started);
+    const deadline = Date.now() + 90000;
+    let hooked = false;
+    const timer = setInterval(() => {
+        if (Date.now() >= deadline || fs.existsSync(path.join(out, `${process.pid}.exit`))) {
+            clearInterval(timer);
+            return;
+        }
+        if (!hooked && fs.existsSync(path.join(out, `${process.pid}.hook`))) {
+            hooked = true;
+            fs.writeFileSync(path.join(out, `${process.pid}.hook-called`), '');
+            const result = spawnSync(process.env.TEST_HCOM_BIN, [
+                'omp-start',
+                '--session-id', process.env.TEST_LAUNCH_SID,
+                '--transcript-path', process.env.TEST_LAUNCH_TRANSCRIPT,
+                '--cwd', process.env.TEST_LAUNCH_CWD,
+            ], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+            fs.writeFileSync(path.join(out, `${process.pid}.stdout`), result.stdout || '');
+            fs.writeFileSync(
+                path.join(out, `${process.pid}.stderr`),
+                result.stderr || (result.error ? String(result.error) : ''),
+            );
+            fs.writeFileSync(
+                path.join(out, `${process.pid}.code`),
+                String(result.status === null ? -1 : result.status),
+            );
+        }
+    }, 15);
+}
+"#;
+
+// Unrelated native process for the unverifiable-PID reservation: heartbeats
+// to a file and records every catchable signal instead of dying from it.
+const SENTINEL_RUNNER: &str = r#"
+const fs = require('node:fs');
+fs.writeFileSync(process.env.FIXTURE_SIGNALS, '');
+const names = process.platform === 'win32'
+    ? ['SIGINT', 'SIGTERM', 'SIGHUP']
+    : ['SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGTERM', 'SIGUSR1', 'SIGUSR2', 'SIGCONT'];
+for (const name of names) {
+    try {
+        process.on(name, () => fs.appendFileSync(process.env.FIXTURE_SIGNALS, `${name}\n`));
+    } catch {}
+}
+setInterval(() => fs.appendFileSync(process.env.FIXTURE_HEARTBEAT, 'x'), 25);
+"#;
+
+fn wait_until<T>(timeout: Duration, mut poll: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = poll() {
+            return Some(value);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn alive(pid: i64) -> bool {
+    #[cfg(unix)]
+    {
+        pid > 1
+            && (unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+    }
+    #[cfg(windows)]
+    {
+        support::process_group_alive(pid)
+    }
+}
+
+/// Kill one fixture-owned pid (never a scan, never a foreign tree walk).
+#[cfg(unix)]
+fn kill_pid(h: &Hcom, pid: i64) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = h;
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+fn row_pid(h: &Hcom, name: &str) -> Option<i64> {
+    db(h)
+        .query_row("SELECT pid FROM instances WHERE name=?1", [name], |row| {
+            row.get(0)
+        })
+        .ok()
+        .flatten()
+}
+
+/// The persisted `omp_launch_pid` receipt, tolerating a missing or
+/// half-written launch_context while a launch is still settling.
+fn launch_receipt(h: &Hcom, name: &str) -> Option<Value> {
+    let text: Option<String> = db(h)
+        .query_row(
+            "SELECT launch_context FROM instances WHERE name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    let context: Value = serde_json::from_str(text.as_deref()?).ok()?;
+    context
+        .get("omp_launch_pid")
+        .cloned()
+        .filter(Value::is_object)
+}
+
+/// Test age fixture: move `name`'s NULL-session launch bindings `secs` into
+/// the past so a resume is judged beyond the 120 s placeholder window and
+/// reaches the launch-pin verdict. A surviving `omp_launch_pid` receipt is
+/// re-correlated to its own aged binding epoch in the same transaction;
+/// every other receipt field stays as written. Returns the aged bindings.
+fn age_launch_bindings(h: &Hcom, name: &str, secs: f64) -> Vec<(String, f64)> {
+    let mut conn = db(h);
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let bindings: Vec<(String, f64)> = tx
+        .prepare(
+            "SELECT process_id,updated_at FROM process_bindings WHERE instance_name=?1 AND session_id IS NULL",
+        )
+        .unwrap()
+        .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let aged: Vec<(String, f64)> = bindings
+        .into_iter()
+        .map(|(process_id, updated_at)| {
+            let aged_at = updated_at - secs;
+            assert_eq!(
+                tx.execute(
+                    "UPDATE process_bindings SET updated_at=?4 WHERE process_id=?1 AND instance_name=?2 AND updated_at=?3 AND session_id IS NULL",
+                    rusqlite::params![process_id, name, updated_at, aged_at],
+                )
+                .unwrap(),
+                1,
+                "launch binding {process_id} of {name} changed while aging"
+            );
+            (process_id, aged_at)
+        })
+        .collect();
+    let receipt_process: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(launch_context,'$.omp_launch_pid.process_id') FROM instances WHERE name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if let Some(process_id) = receipt_process {
+        let (_, aged_at) = aged
+            .iter()
+            .find(|(id, _)| *id == process_id)
+            .unwrap_or_else(|| {
+                panic!("receipt binding {process_id} is not a NULL-session binding of {name}")
+            });
+        assert_eq!(
+            tx.execute(
+                "UPDATE instances SET launch_context=json_set(launch_context,'$.omp_launch_pid.binding_updated_at_bits',?2) WHERE name=?1",
+                rusqlite::params![name, format!("{:016x}", aged_at.to_bits())],
+            )
+            .unwrap(),
+            1
+        );
+    }
+    tx.commit().unwrap();
+    aged
+}
+
+fn identity_prefix() -> &'static str {
+    if cfg!(windows) { "windows:" } else { "apple:" }
+}
+
+/// Same runtime resolution as `NativeOwner::spawn`: ask the isolated runtime
+/// for its real executable (npm's Windows Bun entrypoint, and macOS Bun's
+/// `bun.exe`, may sit behind a shim), then use that path directly.
+fn resolved_runtime(h: &Hcom, runtime: &str) -> PathBuf {
+    let resolved = h
+        .external_cmd(runtime)
+        .args(["--print", "process.execPath"])
+        .output()
+        .unwrap_or_else(|error| panic!("{runtime} is required; CI installs it: {error}"));
+    assert!(
+        resolved.status.success(),
+        "{runtime} executable resolution failed: {}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    let executable = PathBuf::from(String::from_utf8(resolved.stdout).unwrap().trim());
+    assert!(
+        executable.is_absolute() && executable.is_file(),
+        "invalid runtime path: {executable:?}"
+    );
+    executable
+}
+
+/// /var/tmp avoids OMP's /tmp cwd redirect on macOS without touching a seat
+/// build directory. HOME, HCOM_DIR and all tool/config files still belong to
+/// this Hcom fixture; Windows has no /tmp guard and keeps the default root.
+fn launch_fixture() -> (Hcom, tempfile::TempDir) {
+    #[cfg(unix)]
+    let workspace = tempfile::Builder::new()
+        .prefix("hcom-omp-launch-")
+        .tempdir_in("/var/tmp")
+        .expect("create private non-/tmp OMP workspace");
+    #[cfg(windows)]
+    let workspace = tempfile::Builder::new()
+        .prefix("hcom-omp-launch-")
+        .tempdir()
+        .expect("create private OMP workspace");
+    let mut h = isolated_hcom();
+    h.workspace = workspace.path().to_path_buf();
+    (h, workspace)
+}
+
+#[cfg(unix)]
+fn quote(value: &Path) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn executable_file(path: &Path, script: &str) {
+    fs::write(path, script).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn install_fake_omp(h: &Hcom, runtime: &str, sid: &str, transcript: &Path) -> PathBuf {
+    let fakebin = h.root_path().join("fakebin");
+    let out = h.root_path().join("omp-launch");
+    fs::create_dir_all(&fakebin).unwrap();
+    fs::create_dir_all(&out).unwrap();
+    // The exact package script the native argv readers classify as OMP.
+    let script = h
+        .root_path()
+        .join("omp-package/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    fs::write(&script, LAUNCH_RUNNER).unwrap();
+    let runtime_exe = resolved_runtime(h, runtime);
+    #[cfg(unix)]
+    {
+        // Fixture-private only. The actual `bash {script}` invocation is
+        // passed straight through; only the generated post-tool login shell
+        // exits, so a finished launch never leaves an interactive shell.
+        executable_file(
+            &fakebin.join("bash"),
+            "#!/bin/bash\nif [ \"$#\" -eq 1 ] && [ \"$1\" = -l ]; then exit 0; fi\nexec /bin/bash \"$@\"\n",
+        );
+        // exec preserves the PTY child's pid while replacing its image with
+        // the actual interpreter running the package script.
+        executable_file(
+            &fakebin.join("omp"),
+            &format!(
+                "#!/bin/sh\nexec {} {} \"$@\"\n",
+                quote(&runtime_exe),
+                quote(&script)
+            ),
+        );
+    }
+    #[cfg(windows)]
+    {
+        let cmd = "@echo off\n\
+                   \"%TEST_OWNER_RUNTIME%\" \"%TEST_OWNER_SCRIPT%\" %*\n\
+                   exit /b %ERRORLEVEL%\n"
+            .replace('\n', "\r\n");
+        fs::write(fakebin.join("omp.cmd"), cmd).unwrap();
+    }
+    // CI rebuilds the child env from a clean shell. Persist fixture roots and
+    // PATH through the existing fixture passthrough, not just the parent CLI.
+    let command = h.cmd();
+    let inherited = command
+        .get_envs()
+        .find(|(key, _)| *key == "PATH")
+        .and_then(|(_, value)| value)
+        .unwrap();
+    let mut paths = vec![fakebin];
+    paths.extend(std::env::split_paths(inherited));
+    h.set_launch_env(
+        "PATH",
+        std::env::join_paths(paths).unwrap().to_str().unwrap(),
+    );
+    for key in [
+        "HOME",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "CODEX_HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+    ] {
+        if let Some((_, Some(value))) = command.get_envs().find(|(name, _)| *name == key) {
+            h.set_launch_env(key, value.to_str().unwrap());
+        }
+    }
+    h.set_launch_env("PI_CONFIG_DIR", h.home.join(".omp").to_str().unwrap());
+    h.set_launch_env(
+        "PI_CODING_AGENT_DIR",
+        h.home.join(".omp/agent").to_str().unwrap(),
+    );
+    h.set_launch_env("TEST_OWNER_RUNTIME", runtime_exe.to_str().unwrap());
+    h.set_launch_env("TEST_OWNER_SCRIPT", script.to_str().unwrap());
+    h.set_launch_env("TEST_LAUNCH_DIR", out.to_str().unwrap());
+    h.set_launch_env("TEST_HCOM_BIN", env!("CARGO_BIN_EXE_hcom"));
+    h.set_launch_env("TEST_LAUNCH_SID", sid);
+    h.set_launch_env("TEST_LAUNCH_TRANSCRIPT", transcript.to_str().unwrap());
+    h.set_launch_env("TEST_LAUNCH_CWD", h.workspace.to_str().unwrap());
+    h.set_launch_env("TEST_LAUNCH_HOME", h.home.to_str().unwrap());
+    h.set_launch_env("TEST_LAUNCH_HCOM_DIR", h.path().to_str().unwrap());
+    out
+}
+
+fn seed_stopped_omp(h: &Hcom, runtime: &str, name: &str) -> (String, PathBuf) {
+    let sid = uuid::Uuid::new_v4().to_string();
+    let transcript = h
+        .home
+        .join(".omp")
+        .join("agent")
+        .join("sessions")
+        .join("pre-hook")
+        .join(format!("2026-10-01T00-00-00-000Z_{sid}.jsonl"));
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            json!({"type":"session", "id":sid, "cwd":h.workspace})
+        ),
+    )
+    .unwrap();
+    // The historical owner really existed and was reaped. Its old snapshot
+    // cannot provide birth evidence for either of the new pre-hook launches.
+    let mut prior = h
+        .external_cmd(resolved_runtime(h, runtime))
+        .args(["--print", "process.pid"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let prior_pid = i64::from(prior.id());
+    #[cfg(not(windows))]
+    h.track_cleanup_pid(prior_pid);
+    prior.wait().unwrap();
+    assert!(!alive(prior_pid), "historical fixture owner did not exit");
+    let background = i64::from(cfg!(windows));
+    let conn = db(h);
+    conn.execute(
+        "INSERT INTO instances (name,tool,session_id,status,status_context,status_time,created_at,directory,transcript_path,last_event_id,background)
+         VALUES (?1,'omp',?2,'inactive','exit:0',0,CAST(strftime('%s','now') AS REAL),?3,?4,0,?5)",
+        rusqlite::params![name,sid,h.workspace.to_string_lossy(),transcript.to_string_lossy(),background],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO events (timestamp,type,instance,data) VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'),'life',?1,?2)",
+        rusqlite::params![name,json!({
+            "action":"stopped", "by":"session", "reason":"exit:normal",
+            "process_id":format!("omp-{prior_pid}-5-6"),
+            "snapshot":{"name":name, "tool":"omp", "session_id":sid, "pid":prior_pid,
+                "directory":h.workspace, "transcript_path":transcript, "background":background,
+                "launch_args":"", "last_event_id":0}
+        }).to_string()],
+    ).unwrap();
+    (sid, transcript)
+}
+
+#[derive(Debug)]
+struct CommandOutput {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// File-backed CLI output is independent of the tool lifetime. macOS owns
+/// the foreground process group; Windows retains birth-checked handles to
+/// each observed background wrapper, CMD host and interpreter separately.
+struct PrivateCommand {
+    child: Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+    deadline: Instant,
+    cli_status: Option<ExitStatus>,
+    #[cfg(windows)]
+    background: Option<BackgroundOwner>,
+}
+
+#[cfg(windows)]
+struct BackgroundOwner {
+    name: String,
+    prior_bindings: Vec<String>,
+    launch_id: Option<String>,
+    processes: Vec<WindowsOwnedProcess>,
+}
+
+/// An open handle keeps this exact process incarnation available for
+/// cleanup. Never terminate a fresh handle obtained from a stale numeric PID.
+#[cfg(windows)]
+struct WindowsOwnedProcess {
+    pid: i64,
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    identity: String,
+    created_ticks: u64,
+}
+
+#[cfg(windows)]
+impl WindowsOwnedProcess {
+    fn open(pid: i64) -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        };
+        let pid32 = u32::try_from(pid).ok().filter(|pid| *pid > 1)?;
+        // SAFETY: all output pointers are valid, and every successful handle
+        // is closed either on this error path or by Drop.
+        unsafe {
+            let handle = OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                pid32,
+            );
+            if handle.is_null() {
+                return None;
+            }
+            let mut created: FILETIME = std::mem::zeroed();
+            let mut exited: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) == 0 {
+                CloseHandle(handle);
+                return None;
+            }
+            let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+            Some(Self {
+                pid,
+                handle,
+                identity: format!("windows:{ticks}"),
+                created_ticks: ticks,
+            })
+        }
+    }
+
+    fn alive(&self) -> bool {
+        use windows_sys::Win32::Foundation::STILL_ACTIVE;
+        use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+        let mut code = 0;
+        // SAFETY: this handle remains open for the lifetime of self.
+        unsafe { GetExitCodeProcess(self.handle, &mut code) != 0 && code == STILL_ACTIVE as u32 }
+    }
+
+    fn is_child_of(&self, parent: &Self) -> bool {
+        use windows_sys::Wdk::System::Threading::{
+            NtQueryInformationProcess, ProcessBasicInformation,
+        };
+        // Same documented PROCESS_BASIC_INFORMATION ABI, declared locally
+        // because windows-sys gates that type on an otherwise unused feature.
+        #[repr(C)]
+        struct BasicInformation {
+            exit_status: i32,
+            peb: *mut std::ffi::c_void,
+            affinity: usize,
+            base_priority: i32,
+            pid: usize,
+            parent_pid: usize,
+        }
+        let mut info: BasicInformation = unsafe { std::mem::zeroed() };
+        let mut written = 0;
+        // SAFETY: one targeted query of our retained handle, not a host
+        // process snapshot. The kernel writes at most the provided struct.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                self.handle,
+                ProcessBasicInformation,
+                (&mut info as *mut BasicInformation).cast(),
+                size_of::<BasicInformation>() as u32,
+                &mut written,
+            )
+        };
+        status >= 0
+            && written as usize == size_of::<BasicInformation>()
+            && info.pid == self.pid as usize
+            && info.parent_pid == parent.pid as usize
+            && self.created_ticks >= parent.created_ticks
+            && self.alive()
+            && parent.alive()
+    }
+
+    fn terminate(&self) {
+        if self.alive() {
+            // SAFETY: targets only this retained, positively owned handle.
+            unsafe {
+                windows_sys::Win32::System::Threading::TerminateProcess(self.handle, 1);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsOwnedProcess {
+    fn drop(&mut self) {
+        // SAFETY: self exclusively owns this handle.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl BackgroundOwner {
+    fn observe(&mut self, h: &Hcom) {
+        let conn = db(h);
+        type LaunchRow = (Option<i64>, Option<String>, f64);
+        let row: Option<LaunchRow> = conn
+            .query_row(
+                "SELECT pid,launch_context,created_at FROM instances WHERE name=?1",
+                [&self.name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+        let Some((pid, context, created_at)) = row else {
+            return;
+        };
+        let Some(receipt) = context
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|context| context.get("omp_launch_pid").cloned())
+        else {
+            return;
+        };
+        let Some(process_id) = receipt["process_id"].as_str() else {
+            return;
+        };
+        // A held resume must not claim C1, or the unrelated legacy sentinel.
+        // Only a fresh binding registered by this invocation can confer ownership.
+        if self.prior_bindings.iter().any(|prior| prior == process_id)
+            || receipt["pid"].as_i64() != pid
+            || receipt["created_at_bits"].as_str()
+                != Some(format!("{:016x}", created_at.to_bits()).as_str())
+        {
+            return;
+        }
+        let epoch: Option<f64> = conn
+            .query_row(
+                "SELECT updated_at FROM process_bindings WHERE process_id=?1 AND instance_name=?2 AND session_id IS NULL",
+                rusqlite::params![process_id, self.name],
+                |row| row.get(0),
+            )
+            .ok();
+        if !epoch.is_some_and(|epoch| {
+            receipt["binding_updated_at_bits"].as_str()
+                == Some(format!("{:016x}", epoch.to_bits()).as_str())
+        }) {
+            return;
+        }
+        if self.processes.iter().any(|owned| {
+            Some(owned.pid) == pid
+                && receipt["identity"].as_str() == Some(owned.identity.as_str())
+                && owned.alive()
+        }) {
+            return;
+        }
+        let Some(process) = pid.and_then(WindowsOwnedProcess::open) else {
+            return;
+        };
+        if receipt["identity"].as_str() != Some(process.identity.as_str()) || !process.alive() {
+            return;
+        }
+        self.launch_id = Some(process_id.to_string());
+        if !self
+            .processes
+            .iter()
+            .any(|owned| owned.identity == process.identity && owned.pid == process.pid)
+        {
+            self.processes.push(process);
+        }
+    }
+
+    fn observe_tool(&mut self, h: &Hcom, tool: &Tool) -> bool {
+        if self.launch_id.as_deref() != Some(tool.launcher_id.as_str())
+            || Path::new(&tool.home) != h.home
+            || Path::new(&tool.hcom_dir) != h.path()
+        {
+            return false;
+        }
+        let Some(receipt) = launch_receipt(h, &self.name) else {
+            return false;
+        };
+        if row_pid(h, &self.name) != Some(tool.parent)
+            || receipt["pid"].as_i64() != Some(tool.parent)
+            || !self.processes.iter().any(|owned| {
+                owned.pid == tool.parent
+                    && Some(owned.identity.as_str()) == receipt["identity"].as_str()
+                    && owned.alive()
+            })
+        {
+            return false;
+        }
+        if !self
+            .processes
+            .iter()
+            .any(|owned| owned.pid == tool.pid && owned.alive())
+        {
+            let Some(process) =
+                WindowsOwnedProcess::open(tool.pid).filter(|process| process.alive())
+            else {
+                return false;
+            };
+            if !self.processes.iter().any(|parent| {
+                parent.pid == tool.parent
+                    && receipt["identity"].as_str() == Some(parent.identity.as_str())
+                    && process.is_child_of(parent)
+            }) {
+                return false;
+            }
+            // The private runtime marker identifies the actual interpreter
+            // and its receipt-owned CMD parent, not the exited launcher CLI.
+            self.processes.push(process);
+        }
+        true
+    }
+
+    fn all_gone(&self) -> bool {
+        // Observer-only census of retained, birth-correlated handles. An outer
+        // wrapper can hand off before observation; this isn't a host-wide census.
+        self.processes.iter().all(|process| !process.alive())
+    }
+}
+
+impl PrivateCommand {
+    fn start(h: &Hcom, label: &str, args: &[&str]) -> Self {
+        let stdout = h.root_path().join(format!("{label}.stdout"));
+        let stderr = h.root_path().join(format!("{label}.stderr"));
+        let mut command = h.cmd();
+        command
+            .args(args)
+            .current_dir(&h.workspace)
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap());
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn().unwrap();
+        #[cfg(not(windows))]
+        h.track_cleanup_pid(i64::from(child.id()));
+        Self {
+            child,
+            stdout,
+            stderr,
+            deadline: Instant::now() + Duration::from_secs(90),
+            cli_status: None,
+            #[cfg(windows)]
+            background: None,
+        }
+    }
+
+    fn resume(h: &Hcom, label: &str, name: &str) -> Self {
+        #[cfg(windows)]
+        {
+            let conn = db(h);
+            let prior_bindings = conn
+                .prepare("SELECT process_id FROM process_bindings WHERE instance_name=?1")
+                .unwrap()
+                .query_map([name], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<String>, _>>()
+                .unwrap();
+            // The stopped snapshot selects the supported background backend.
+            // No terminal adapter or literal OMP --headless flag is involved.
+            let mut command = Self::start(h, label, &["r", name, "--go"]);
+            command.background = Some(BackgroundOwner {
+                name: name.to_string(),
+                prior_bindings,
+                launch_id: None,
+                processes: Vec::new(),
+            });
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            Self::start(
+                h,
+                label,
+                &["r", name, "--terminal", "bash {script}", "--go"],
+            )
+        }
+    }
+
+    fn poll_cli(&mut self) -> Option<ExitStatus> {
+        if self.cli_status.is_none() {
+            self.cli_status = self.child.try_wait().unwrap();
+        }
+        self.cli_status
+    }
+
+    fn backend_ready(&mut self, tool: Option<&Tool>) -> bool {
+        #[cfg(windows)]
+        {
+            self.poll_cli().is_some_and(|status| status.success())
+                && tool.is_some_and(|tool| {
+                    self.background.as_ref().is_some_and(|owner| {
+                        [tool.pid, tool.parent].into_iter().all(|pid| {
+                            owner
+                                .processes
+                                .iter()
+                                .any(|process| process.pid == pid && process.alive())
+                        })
+                    })
+                })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = tool;
+            self.poll_cli().is_none()
+        }
+    }
+
+    fn kill_owned(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(owner) = &self.background {
+            for process in &owner.processes {
+                process.terminate();
+            }
+            if owner.processes.is_empty() && self.cli_status.is_some_and(|status| status.success())
+            {
+                eprintln!(
+                    "fixture has no birth-correlated background owner for {}; refusing numeric-PID cleanup",
+                    owner.name
+                );
+            }
+        }
+        let _ = self.child.kill();
+    }
+
+    fn finish(&mut self, h: &Hcom) -> CommandOutput {
+        #[cfg(not(windows))]
+        let _ = h;
+        let status = loop {
+            #[cfg(windows)]
+            if let Some(owner) = &mut self.background {
+                // Negative probes also need owned cleanup if a regression
+                // incorrectly starts a background process before refusing.
+                owner.observe(h);
+            }
+            if let Some(status) = self.poll_cli() {
+                break Some(status);
+            }
+            if Instant::now() >= self.deadline {
+                self.kill_owned();
+                let _ = self.child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        #[cfg(windows)]
+        if let Some(owner) = &mut self.background {
+            owner.observe(h);
+        }
+        CommandOutput {
+            code: status.and_then(|status| status.code()).unwrap_or(-1),
+            stdout: fs::read_to_string(&self.stdout).unwrap_or_default(),
+            stderr: format!(
+                "{}{}",
+                fs::read_to_string(&self.stderr).unwrap_or_default(),
+                if status.is_none() {
+                    "\nfixture command deadline exceeded"
+                } else {
+                    ""
+                }
+            ),
+        }
+    }
+}
+
+impl Drop for PrivateCommand {
+    fn drop(&mut self) {
+        self.kill_owned();
+        #[cfg(windows)]
+        if let Some(owner) = &self.background
+            && wait_until(Duration::from_secs(5), || owner.all_gone().then_some(())).is_none()
+        {
+            eprintln!("fixture background owner did not exit: {}", owner.name);
+        }
+        let _ = self.child.wait();
+    }
+}
+
+#[derive(Debug)]
+struct Tool {
+    pid: i64,
+    parent: i64,
+    launcher_id: String,
+    home: String,
+    hcom_dir: String,
+}
+
+fn wait_for_tool(
+    h: &Hcom,
+    out: &Path,
+    launch: &mut PrivateCommand,
+    previous: Option<i64>,
+) -> Option<Tool> {
+    let observed = wait_until(PROCESS_WAIT, || {
+        #[cfg(windows)]
+        if let Some(owner) = &mut launch.background {
+            owner.observe(h);
+        }
+        let cli_status = launch.poll_cli();
+        #[cfg(windows)]
+        if cli_status.is_some_and(|status| !status.success()) {
+            return Some(None);
+        }
+        let tool = fs::read_dir(out).ok()?.flatten().find_map(|entry| {
+            let path = entry.path();
+            if path.extension()?.to_str()? != "started" {
+                return None;
+            }
+            let text = fs::read_to_string(path).ok()?;
+            let started: Value = serde_json::from_str(&text).ok()?;
+            let pid = started["pid"].as_i64()?;
+            if Some(pid) == previous {
+                return None;
+            }
+            let tool = Tool {
+                pid,
+                parent: started["ppid"].as_i64()?,
+                launcher_id: started["process_id"].as_str()?.to_string(),
+                home: started["home"].as_str()?.to_string(),
+                hcom_dir: started["hcom_dir"].as_str()?.to_string(),
+            };
+            #[cfg(not(windows))]
+            {
+                h.track_cleanup_pid(pid);
+                h.track_cleanup_pid(tool.parent);
+            }
+            Some(tool)
+        });
+        #[cfg(windows)]
+        {
+            let settled = tool.as_ref().is_some_and(|tool| {
+                launch
+                    .background
+                    .as_mut()
+                    .is_some_and(|owner| owner.observe_tool(h, tool))
+            });
+            // A background CLI normally exits 0 before the tool is ready.
+            // Continue the same bounded poll until both lifetimes are proven.
+            (settled && cli_status.is_some_and(|status| status.success())).then_some(tool)
+        }
+        #[cfg(not(windows))]
+        {
+            if tool.is_some() || cli_status.is_some() {
+                Some(tool)
+            } else {
+                None
+            }
+        }
+    })
+    .flatten();
+    observed
+}
+
+/// The pin a settled pre-hook launch must hold. On macOS the PTY child execs
+/// the interpreter, so the pin is the interpreter's own pid. On Windows the
+/// ConPTY child is the cmd.exe host of `omp.cmd` and the interpreter is its
+/// direct child, so the pin is the tool's parent; the hook later re-pins
+/// the actual interpreter when it binds (as the cmd-shim tests above prove).
+fn expected_pin(tool: &Tool) -> i64 {
+    if cfg!(windows) { tool.parent } else { tool.pid }
+}
+
+fn first_tool(h: &Hcom, name: &str, out: &Path, launch: &mut PrivateCommand) -> (Tool, i64) {
+    let tool = wait_for_tool(h, out, launch, None);
+    // The wrapper pins itself before its child, so the tool's marker can
+    // appear while the row still names the wrapper or the PTY proxy. Wait
+    // for the row pid AND its receipt to settle on the actual launched
+    // child before any receipt/death snapshot is taken.
+    let pin = tool.as_ref().and_then(|tool| {
+        let expected = expected_pin(tool);
+        wait_until(PROCESS_WAIT, || {
+            (row_pid(h, name) == Some(expected)
+                && launch_receipt(h, name).and_then(|receipt| receipt["pid"].as_i64())
+                    == Some(expected))
+            .then_some(expected)
+        })
+    });
+    let backend_ready = !cfg!(windows) || launch.backend_ready(tool.as_ref());
+    match (tool, pin) {
+        (Some(tool), Some(pin)) if backend_ready => {
+            #[cfg(not(windows))]
+            h.track_cleanup_pid(pin);
+            (tool, pin)
+        }
+        (tool, pin) => {
+            let state = h.diagnostics();
+            launch.kill_owned();
+            let result = launch.finish(h);
+            #[cfg(windows)]
+            clear_failed_background_pid(h, name);
+            panic!(
+                "fixture OMP did not start with a settled launch pin and receipt: \
+                 tool={tool:?}, pin={pin:?}, {result:?}\n{state}"
+            );
+        }
+    }
+}
+
+fn kill_first_tool(
+    h: &Hcom,
+    tool: &Tool,
+    pin: i64,
+    launch: &mut PrivateCommand,
+) -> (CommandOutput, bool) {
+    #[cfg(not(windows))]
+    kill_pid(h, tool.pid);
+    #[cfg(windows)]
+    {
+        let _ = (h, tool, pin);
+        // C1 never opens its hook gate, so only the retained CMD and
+        // interpreter processes exist. Terminate each exact incarnation.
+        launch.kill_owned();
+    }
+    launch.deadline = Instant::now() + LIFECYCLE_WAIT;
+    let result = launch.finish(h);
+    let gone = wait_until(LIFECYCLE_WAIT, || {
+        #[cfg(windows)]
+        {
+            launch
+                .background
+                .as_ref()
+                .is_some_and(BackgroundOwner::all_gone)
+                .then_some(())
+        }
+        #[cfg(not(windows))]
+        {
+            (!alive(tool.pid) && !alive(pin)).then_some(())
+        }
+    })
+    .is_some();
+    #[cfg(windows)]
+    let gone = if gone {
+        true
+    } else {
+        launch.kill_owned();
+        wait_until(Duration::from_secs(5), || {
+            launch
+                .background
+                .as_ref()
+                .is_some_and(BackgroundOwner::all_gone)
+                .then_some(())
+        })
+        .is_some()
+    };
+    (result, gone)
+}
+
+#[derive(Debug)]
+struct Binding {
+    row_sid: Option<String>,
+    row_pid: Option<i64>,
+    process_sid: Option<String>,
+    process_name: Option<String>,
+    session_name: Option<String>,
+    instances: i64,
+    tool_alive: bool,
+    hook: Option<Value>,
+    hook_code: Option<i32>,
+    hook_stderr: String,
+    #[cfg(windows)]
+    post_hook_receipt: Option<Value>,
+    #[cfg(windows)]
+    tool_identity: Option<String>,
+}
+
+fn bind_second(
+    h: &Hcom,
+    name: &str,
+    sid: &str,
+    out: &Path,
+    tool: Option<&Tool>,
+    launch: &PrivateCommand,
+) -> Binding {
+    #[cfg(not(windows))]
+    let _ = launch;
+    if let Some(tool) = tool {
+        fs::write(out.join(format!("{}.hook", tool.pid)), "").unwrap();
+        wait_until(LIFECYCLE_WAIT, || {
+            out.join(format!("{}.code", tool.pid))
+                .exists()
+                .then_some(())
+        });
+    }
+    let conn = db(h);
+    let row_sid = conn
+        .query_row(
+            "SELECT session_id FROM instances WHERE name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    let launcher_id = tool.map(|tool| tool.launcher_id.as_str()).unwrap_or("");
+    let (process_sid, process_name, session_name) = conn
+        .query_row(
+            "SELECT (SELECT session_id FROM process_bindings WHERE process_id=?1),
+                (SELECT instance_name FROM process_bindings WHERE process_id=?1),
+                (SELECT instance_name FROM session_bindings WHERE session_id=?2)",
+            rusqlite::params![launcher_id, sid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let (hook, hook_code, hook_stderr) = tool
+        .map(|tool| {
+            (
+                fs::read_to_string(out.join(format!("{}.stdout", tool.pid)))
+                    .ok()
+                    .and_then(|text| serde_json::from_str(&text).ok()),
+                fs::read_to_string(out.join(format!("{}.code", tool.pid)))
+                    .ok()
+                    .and_then(|text| text.parse().ok()),
+                fs::read_to_string(out.join(format!("{}.stderr", tool.pid))).unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default();
+    Binding {
+        row_sid,
+        row_pid: row_pid(h, name),
+        process_sid,
+        process_name,
+        session_name,
+        instances: conn
+            .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
+            .unwrap(),
+        tool_alive: tool.is_some_and(|tool| alive(tool.pid)),
+        hook,
+        hook_code,
+        hook_stderr,
+        #[cfg(windows)]
+        post_hook_receipt: {
+            // Don't let the readiness helper's object filter turn a malformed
+            // retained receipt into an apparently absent post-hook receipt.
+            let context: Option<String> = conn
+                .query_row(
+                    "SELECT launch_context FROM instances WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            context.and_then(|text| {
+                let context: Value =
+                    serde_json::from_str(&text).expect("post-hook launch_context must be JSON");
+                context.get("omp_launch_pid").cloned()
+            })
+        },
+        #[cfg(windows)]
+        tool_identity: tool.and_then(|tool| {
+            launch
+                .background
+                .as_ref()?
+                .processes
+                .iter()
+                .find(|process| process.pid == tool.pid && process.alive())
+                .map(|process| process.identity.clone())
+        }),
+    }
+}
+
+fn cleanup_launch(
+    h: &Hcom,
+    out: &Path,
+    tool: Option<&Tool>,
+    launch: &mut PrivateCommand,
+) -> CommandOutput {
+    #[cfg(not(windows))]
+    let _ = h;
+    // The hook and live owner have already been observed. Exit the owned
+    // tool through its gate so the wrapper chain ends on its own; the
+    // command deadline still bounds a wedged launch. Cleanup exit status
+    // is not launch-success proof.
+    if let Some(tool) = tool {
+        let _ = fs::write(out.join(format!("{}.exit", tool.pid)), "");
+    }
+    launch.deadline = Instant::now() + LIFECYCLE_WAIT;
+    let result = launch.finish(h);
+    #[cfg(windows)]
+    if tool.is_none() {
+        // All consumer observations are already captured. Remove an unproven
+        // teardown PID that Hcom::Drop would otherwise reopen and signal
+        // without a native birth check.
+        if let Some(owner) = &launch.background {
+            clear_failed_background_pid(h, &owner.name);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let gone = wait_until(LIFECYCLE_WAIT, || {
+            launch
+                .background
+                .as_ref()
+                .is_some_and(BackgroundOwner::all_gone)
+                .then_some(())
+        })
+        .is_some();
+        if !gone {
+            launch.kill_owned();
+        }
+        assert!(
+            gone || wait_until(Duration::from_secs(5), || {
+                launch
+                    .background
+                    .as_ref()
+                    .is_some_and(BackgroundOwner::all_gone)
+                    .then_some(())
+            })
+            .is_some(),
+            "fixture-owned background wrapper/tool did not exit: {result:?}"
+        );
+    }
+    result
+}
+
+#[cfg(windows)]
+fn clear_failed_background_pid(h: &Hcom, name: &str) {
+    // Isolated fixture teardown ONLY, after diagnostics and observations.
+    // Never used to authorize a resume or obtain a successful assertion.
+    db(h).execute(
+        "UPDATE instances SET pid=NULL,launch_context=json_remove(launch_context,'$.omp_launch_pid') WHERE name=?1",
+        [name],
+    ).unwrap();
+}
+
+fn assert_binding(
+    binding: &Binding,
+    tool: Option<&Tool>,
+    name: &str,
+    sid: &str,
+    launch: &CommandOutput,
+) {
+    assert_eq!(
+        binding.session_name.as_deref(),
+        Some(name),
+        "second resume did not bind {name}: {binding:?}; CLI={launch:?}"
+    );
+    let tool = tool.expect("second resume did not start OMP");
+    assert_eq!(
+        binding.hook_code,
+        Some(0),
+        "{} {binding:?}",
+        binding.hook_stderr
+    );
+    let hook = binding
+        .hook
+        .as_ref()
+        .expect("real omp-start produced no JSON");
+    assert_eq!(hook["name"], name, "{binding:?}");
+    assert!(hook.get("error").is_none(), "{binding:?}");
+    assert_eq!(binding.row_sid.as_deref(), Some(sid), "{binding:?}");
+    assert_eq!(binding.process_sid.as_deref(), Some(sid), "{binding:?}");
+    assert_eq!(binding.process_name.as_deref(), Some(name), "{binding:?}");
+    assert_eq!(
+        binding.row_pid,
+        Some(tool.pid),
+        "second hook did not pin its actual interpreter pid: {binding:?}"
+    );
+    #[cfg(windows)]
+    if let Some(receipt) = &binding.post_hook_receipt {
+        // The real hook can retire the pre-hook receipt. If it retains one,
+        // it must describe the actual interpreter, never the old CMD host.
+        assert_eq!(receipt["pid"].as_i64(), Some(tool.pid), "{binding:?}");
+        assert!(binding.tool_identity.is_some(), "{binding:?}");
+        assert_eq!(
+            receipt["identity"].as_str(),
+            binding.tool_identity.as_deref(),
+            "post-hook receipt kept a stale CMD birth identity: {binding:?}"
+        );
+    }
+    assert!(
+        binding.tool_alive,
+        "second OMP was not live when observed: {binding:?}"
+    );
+    assert_eq!(
+        binding.instances, 1,
+        "resume minted a duplicate name: {binding:?}"
+    );
+}
+
+struct Sentinel {
+    child: Child,
+    heartbeat: PathBuf,
+    signals: PathBuf,
+}
+
+impl Sentinel {
+    fn spawn(h: &Hcom, runtime: &str) -> Self {
+        let out = h
+            .root_path()
+            .join(format!("sentinel-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&out).unwrap();
+        let heartbeat = out.join("heartbeat");
+        let signals = out.join("signals");
+        let script = out.join("sentinel.js");
+        fs::write(&script, SENTINEL_RUNNER).unwrap();
+        let mut command = h.external_cmd(resolved_runtime(h, runtime));
+        command
+            .arg(&script)
+            .env_remove("HCOM_PROCESS_ID")
+            .env_remove("HCOM_INSTANCE_NAME")
+            .env_remove("HCOM_TOOL")
+            .env_remove("HCOM_LAUNCHED")
+            .env("FIXTURE_HEARTBEAT", &heartbeat)
+            .env("FIXTURE_SIGNALS", &signals)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn().unwrap();
+        h.track_cleanup_pid(i64::from(child.id()));
+        let sentinel = Self {
+            child,
+            heartbeat,
+            signals,
+        };
+        wait_until(LIFECYCLE_WAIT, || {
+            (sentinel.beats() > 0 && sentinel.signals.exists()).then_some(())
+        })
+        .expect("owned sentinel did not start");
+        sentinel
+    }
+
+    fn pid(&self) -> i64 {
+        i64::from(self.child.id())
+    }
+
+    fn beats(&self) -> u64 {
+        fs::metadata(&self.heartbeat)
+            .map(|stat| stat.len())
+            .unwrap_or(0)
+    }
+
+    fn observation(&mut self, before: u64) -> (bool, bool, String) {
+        let progressed = wait_until(Duration::from_secs(2), || {
+            (self.beats() > before).then_some(())
+        })
+        .is_some();
+        (
+            self.child.try_wait().unwrap().is_none(),
+            progressed,
+            fs::read_to_string(&self.signals).unwrap(),
+        )
+    }
+}
+
+impl Drop for Sentinel {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn native_pre_hook_dead_pin_can_resume_and_bind() {
+    for runtime in ["node", "bun"] {
+        // Keep native/Child handles alive through Hcom's generic teardown,
+        // including unwinding, so its numeric cleanup PIDs cannot recycle.
+        #[cfg(windows)]
+        let mut first: PrivateCommand;
+        #[cfg(windows)]
+        let mut second: PrivateCommand;
+        let (h, workspace) = launch_fixture();
+        let suffix = unique_suffix();
+        let name = format!("prehookdead{suffix}");
+        let (sid, transcript) = seed_stopped_omp(&h, runtime, &name);
+        let out = install_fake_omp(&h, runtime, &sid, &transcript);
+        #[cfg(not(windows))]
+        let mut first: PrivateCommand;
+        first = PrivateCommand::resume(&h, "first", &name);
+        let (c1, pin) = first_tool(&h, &name, &out, &mut first);
+        let receipt = launch_receipt(&h, &name);
+        let first_was_live = alive(pin) && alive(c1.pid);
+        let no_first_hook = !out.join(format!("{}.hook-called", c1.pid)).exists();
+        let (first_result, first_exited) = kill_first_tool(&h, &c1, pin, &mut first);
+        let dead_pin = row_pid(&h, &name);
+        let no_hook_after_death = !out.join(format!("{}.hook-called", c1.pid)).exists();
+        let first_bound: bool = db(&h)
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_bindings WHERE instance_name=?1)",
+                [&name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        #[cfg(not(windows))]
+        let mut second: PrivateCommand;
+        second = PrivateCommand::resume(&h, "second", &name);
+        let c2 = wait_for_tool(&h, &out, &mut second, Some(c1.pid));
+        let binding = bind_second(&h, &name, &sid, &out, c2.as_ref(), &second);
+        let second_backend_ready = second.backend_ready(c2.as_ref());
+        let second_result = cleanup_launch(&h, &out, c2.as_ref(), &mut second);
+        #[cfg(windows)]
+        drop(h);
+        drop(second);
+        drop(first);
+        #[cfg(not(windows))]
+        drop(h);
+        drop(workspace);
+        let receipt = receipt.unwrap_or_else(|| {
+            panic!("runtime={runtime}: real launch persisted no omp_launch_pid receipt")
+        });
+        assert_eq!(
+            receipt["pid"].as_i64(),
+            Some(pin),
+            "runtime={runtime}: receipt was not correlated to the settled launch pin: {receipt}"
+        );
+        assert!(
+            receipt["identity"]
+                .as_str()
+                .is_some_and(|identity| identity.starts_with(identity_prefix())),
+            "runtime={runtime}: receipt lost its native birth identity: {receipt}"
+        );
+        assert!(
+            first_was_live,
+            "runtime={runtime}: first real resume did not pin a live launch child above its tool: {c1:?}"
+        );
+        assert!(
+            no_first_hook && no_hook_after_death && !first_bound,
+            "runtime={runtime}: first OMP bound before its hook gate"
+        );
+        assert!(
+            first_exited,
+            "runtime={runtime}: owned first wrapper/tool did not exit: {first_result:?}"
+        );
+        assert_eq!(
+            dead_pin,
+            Some(pin),
+            "runtime={runtime}: pre-hook death removed the PID needed for this regression"
+        );
+        assert_binding(&binding, c2.as_ref(), &name, &sid, &second_result);
+        assert!(
+            second_backend_ready,
+            "runtime={runtime}: C2 backend invariant failed (Windows: CLI exit 0 and owned CMD/tool live; macOS: CLI live): {second_result:?}"
+        );
+        assert_ne!(
+            c2.as_ref().unwrap().pid,
+            c1.pid,
+            "runtime={runtime}: second launch reused the first fixture process"
+        );
+        assert_eq!(c2.as_ref().unwrap().home, c1.home);
+        assert_eq!(c2.as_ref().unwrap().hcom_dir, c1.hcom_dir);
+    }
+}
+
+#[test]
+fn native_pre_hook_live_matching_pin_is_held() {
+    for runtime in ["node", "bun"] {
+        #[cfg(windows)]
+        let mut first: PrivateCommand;
+        #[cfg(windows)]
+        let mut second: PrivateCommand;
+        let (h, workspace) = launch_fixture();
+        let suffix = unique_suffix();
+        let name = format!("prehooklive{suffix}");
+        let (sid, transcript) = seed_stopped_omp(&h, runtime, &name);
+        let out = install_fake_omp(&h, runtime, &sid, &transcript);
+        #[cfg(not(windows))]
+        let mut first: PrivateCommand;
+        first = PrivateCommand::resume(&h, "first", &name);
+        let (c1, pin) = first_tool(&h, &name, &out, &mut first);
+        let receipt = launch_receipt(&h, &name);
+        // Past the placeholder window, so only the launch-pin verdict can hold.
+        let aged = age_launch_bindings(&h, &name, 3600.0);
+        let aged_receipt = launch_receipt(&h, &name);
+        let before = full_state(&h);
+        #[cfg(not(windows))]
+        let mut second: PrivateCommand;
+        second = PrivateCommand::resume(&h, "second", &name);
+        let refused = second.finish(&h);
+        let after = full_state(&h);
+        let c1_live = alive(pin) && alive(c1.pid);
+        let no_hook = !out.join(format!("{}.hook-called", c1.pid)).exists();
+        let (_, first_exited) = kill_first_tool(&h, &c1, pin, &mut first);
+        #[cfg(windows)]
+        if let Some(pid) = row_pid(&h, &name) {
+            let retained = [&first, &second].into_iter().any(|launch| {
+                launch
+                    .background
+                    .as_ref()
+                    .is_some_and(|owner| owner.processes.iter().any(|process| process.pid == pid))
+            });
+            if !retained {
+                clear_failed_background_pid(&h, &name);
+            }
+        }
+        #[cfg(windows)]
+        drop(h);
+        drop(second);
+        drop(first);
+        #[cfg(not(windows))]
+        drop(h);
+        drop(workspace);
+        let receipt = receipt.unwrap_or_else(|| {
+            panic!("runtime={runtime}: real launch did not persist its birth receipt")
+        });
+        assert_eq!(
+            receipt["pid"].as_i64(),
+            Some(pin),
+            "runtime={runtime}: receipt was not correlated to the settled launch pin: {receipt}"
+        );
+        assert!(
+            receipt["identity"]
+                .as_str()
+                .is_some_and(|identity| identity.starts_with(identity_prefix())),
+            "runtime={runtime}: receipt lost its native birth identity: {receipt}"
+        );
+        let aged_epoch = receipt["process_id"]
+            .as_str()
+            .and_then(|id| aged.iter().find(|(process_id, _)| process_id == id));
+        assert!(
+            aged_epoch.is_some(),
+            "runtime={runtime}: receipt binding was not aged past the placeholder window: {receipt} {aged:?}"
+        );
+        let mut expected_receipt = receipt.clone();
+        expected_receipt["binding_updated_at_bits"] =
+            json!(format!("{:016x}", aged_epoch.unwrap().1.to_bits()));
+        assert_eq!(
+            aged_receipt.as_ref(),
+            Some(&expected_receipt),
+            "runtime={runtime}: aged receipt is not coherent with its aged binding epoch"
+        );
+        assert!(
+            refused.code > 0,
+            "runtime={runtime}: live matching owner was stolen or the command failed to refuse: {refused:?}"
+        );
+        assert!(
+            refused.stderr.contains("unhooked OMP launch reservation")
+                && refused
+                    .stderr
+                    .contains("is still the running launch process"),
+            "runtime={runtime}: refusal did not come from the held launch-pin verdict: {refused:?}"
+        );
+        assert_eq!(
+            after, before,
+            "runtime={runtime}: refused resume changed the row, UUID or session bindings: {refused:?}"
+        );
+        assert!(
+            c1_live && no_hook,
+            "runtime={runtime}: first pre-hook owner did not stay alive and unbound"
+        );
+        assert!(
+            first_exited,
+            "runtime={runtime}: owned first wrapper/tool did not exit"
+        );
+    }
+}
+
+#[test]
+fn native_stop_releases_unhooked_reservation_without_signaling_then_resume_binds() {
+    for runtime in ["node", "bun"] {
+        #[cfg(windows)]
+        let mut first: PrivateCommand;
+        #[cfg(windows)]
+        let mut held: PrivateCommand;
+        #[cfg(windows)]
+        let mut stop: PrivateCommand;
+        #[cfg(windows)]
+        let mut second: PrivateCommand;
+        #[cfg(windows)]
+        let mut sentinel: Sentinel;
+        let (h, workspace) = launch_fixture();
+        let suffix = unique_suffix();
+        let name = format!("prehookstop{suffix}");
+        let (sid, transcript) = seed_stopped_omp(&h, runtime, &name);
+        let out = install_fake_omp(&h, runtime, &sid, &transcript);
+        #[cfg(not(windows))]
+        let mut first: PrivateCommand;
+        first = PrivateCommand::resume(&h, "first", &name);
+        let (c1, pin) = first_tool(&h, &name, &out, &mut first);
+        let (_, first_exited) = kill_first_tool(&h, &c1, pin, &mut first);
+        #[cfg(not(windows))]
+        let mut sentinel: Sentinel;
+        sentinel = Sentinel::spawn(&h, runtime);
+        // An older whole-context rewrite drops the unknown receipt. A live
+        // PID without it is legacy/unverifiable, never a matching or
+        // mismatched birth. Only this fixture's private key is removed.
+        db(&h).execute(
+            "UPDATE instances SET pid=?2, launch_context=json_remove(launch_context,'$.omp_launch_pid') WHERE name=?1",
+            rusqlite::params![name,sentinel.pid()],
+        ).unwrap();
+        // Past the placeholder window, so only the launch-pin verdict can hold.
+        let aged = age_launch_bindings(&h, &name, 3600.0);
+        let reservation: (String, String, String, i64) = db(&h).query_row(
+            "SELECT status,status_context,session_id,(SELECT COUNT(*) FROM session_bindings WHERE instance_name=?1) FROM instances WHERE name=?1",
+            [&name], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+        let missing = launch_receipt(&h, &name).is_none();
+        let before = full_state(&h);
+        let beats = sentinel.beats();
+        #[cfg(not(windows))]
+        let mut held: PrivateCommand;
+        held = PrivateCommand::resume(&h, "held", &name);
+        let refused = held.finish(&h);
+        let after = full_state(&h);
+        let held_untouched = sentinel.observation(beats);
+        let beats = sentinel.beats();
+        #[cfg(not(windows))]
+        let mut stop: PrivateCommand;
+        stop = PrivateCommand::start(&h, "stop", &["stop", &name]);
+        let stopped = stop.finish(&h);
+        let cleared: (i64, i64, i64, i64) = db(&h)
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM instances WHERE name=?1),
+                (SELECT COUNT(*) FROM process_bindings WHERE instance_name=?1),
+                (SELECT COUNT(*) FROM session_bindings WHERE instance_name=?1),
+                (SELECT COUNT(*) FROM notify_endpoints WHERE instance=?1)",
+                [&name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let stop_untouched = sentinel.observation(beats);
+        #[cfg(not(windows))]
+        let mut second: PrivateCommand;
+        second = PrivateCommand::resume(&h, "second", &name);
+        let c2 = wait_for_tool(&h, &out, &mut second, Some(c1.pid));
+        let binding = bind_second(&h, &name, &sid, &out, c2.as_ref(), &second);
+        let second_backend_ready = second.backend_ready(c2.as_ref());
+        let final_beats = sentinel.beats();
+        let final_untouched = sentinel.observation(final_beats);
+        let second_result = cleanup_launch(&h, &out, c2.as_ref(), &mut second);
+        #[cfg(windows)]
+        drop(h);
+        drop(second);
+        drop(stop);
+        drop(held);
+        drop(first);
+        drop(sentinel);
+        #[cfg(not(windows))]
+        drop(h);
+        drop(workspace);
+        assert!(
+            first_exited,
+            "runtime={runtime}: owned first wrapper/tool did not exit"
+        );
+        assert_eq!(
+            reservation,
+            ("inactive".into(), "new".into(), sid.clone(), 0),
+            "runtime={runtime}: fixture was not an unbound pre-hook reservation"
+        );
+        assert!(
+            missing,
+            "runtime={runtime}: fixture did not drop its launch receipt"
+        );
+        assert!(
+            !aged.is_empty(),
+            "runtime={runtime}: fixture had no NULL-session launch binding to age"
+        );
+        assert!(
+            refused.code > 0,
+            "runtime={runtime}: missing receipt authorized another resume or failed to refuse: {refused:?}"
+        );
+        assert!(
+            refused.stderr.contains("unhooked OMP launch reservation")
+                && refused
+                    .stderr
+                    .contains("is live and has no verifiable launch receipt"),
+            "runtime={runtime}: refusal did not come from the held launch-pin verdict: {refused:?}"
+        );
+        assert_eq!(
+            after, before,
+            "runtime={runtime}: held legacy resume changed state: {refused:?}"
+        );
+        assert_eq!(
+            held_untouched,
+            (true, true, String::new()),
+            "runtime={runtime}: held resume disturbed the unverifiable PID"
+        );
+        assert_eq!(
+            stopped.code, 0,
+            "runtime={runtime}: bookkeeping-only stop refused: {stopped:?}"
+        );
+        let output = format!("{}{}", stopped.stdout, stopped.stderr)
+            .to_ascii_lowercase()
+            .replace("signalled", "signaled");
+        assert!(
+            output.contains("no process signaled") || output.contains("no process was signaled"),
+            "runtime={runtime}: stop did not explicitly report that no process was signaled: {stopped:?}"
+        );
+        assert_eq!(
+            cleared,
+            (0, 0, 0, 0),
+            "runtime={runtime}: stop retained reservation bookkeeping"
+        );
+        assert_eq!(
+            stop_untouched,
+            (true, true, String::new()),
+            "runtime={runtime}: bookkeeping-only stop disturbed the unrelated PID"
+        );
+        assert_binding(&binding, c2.as_ref(), &name, &sid, &second_result);
+        assert!(
+            second_backend_ready,
+            "runtime={runtime}: C2 backend invariant failed (Windows: CLI exit 0 and owned CMD/tool live; macOS: CLI live): {second_result:?}"
+        );
+        assert_eq!(
+            final_untouched,
+            (true, true, String::new()),
+            "runtime={runtime}: post-stop resume disturbed the unrelated PID"
+        );
+    }
+}

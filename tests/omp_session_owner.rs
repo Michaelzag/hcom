@@ -15,11 +15,13 @@ use std::fs;
 use std::io::{ErrorKind, Read};
 use std::net::TcpListener;
 use std::os::unix::fs as unix_fs;
-use std::os::unix::process::CommandExt;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::omp_owner::{CONFIG, db, full_state, isolated_hcom};
@@ -1420,6 +1422,377 @@ fn live_released_owner_with_incarnation_refuses_a_hook_recreation() {
 }
 
 #[test]
+fn older_session_hook_cannot_reclaim_name_released_by_a_newer_live_owner() {
+    let h = isolated_hcom();
+    let suffix = unique_suffix();
+    let name = format!("newestlive{suffix}");
+    let first_sid = format!("sid-older-live-{suffix}");
+    let second_sid = format!("sid-newer-live-{suffix}");
+    let first_path = h.workspace.join(format!("{first_sid}.jsonl"));
+    let second_path = h.workspace.join(format!("{second_sid}.jsonl"));
+    let first_endpoint = probe();
+    let second_endpoint = probe();
+    let incoming_endpoint = probe();
+
+    let mut first = HookProcess::spawn(&h, "older-live-first", "omp", Some(&launcher_id()), false);
+    seed_launch(&h, &first, &name);
+    assert_eq!(
+        first
+            .run(
+                &h,
+                &start_command(&first_sid, &first_path, &h.workspace, &first_endpoint),
+            )
+            .ok()["name"],
+        name
+    );
+    assert_bound(&h, &first, &name, &first_sid, &first_path, &h.workspace);
+    first
+        .run(
+            &h,
+            &format!("H omp-stop --name {} --reason shutdown", quote(&name)),
+        )
+        .ok();
+    let first_stop = assert_released_history(&h, &name, &first.process_id);
+    assert_eq!(first_stop["snapshot"]["session_id"], first_sid);
+    assert_eq!(first_stop["snapshot"]["pid"], first.owner_pid);
+    assert!(first_stop["snapshot"]["pid_start_time"].as_u64().is_some());
+    assert!(
+        first_stop["snapshot"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty())
+    );
+    let first_event_id: i64 = db(&h)
+        .query_row(
+            "SELECT id FROM events WHERE type='life' AND instance=?1
+               AND json_extract(data,'$.action')='stopped' ORDER BY id DESC LIMIT 1",
+            [&name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let first_pid = first.owner_pid;
+    trigger_step(&first.out_dir, first.next_step.get(), "exit 0");
+    let first_exit = h.eventually("older owner exited", Duration::from_secs(30), || {
+        Ok(first.child.try_wait().expect("reap older owner"))
+    });
+    assert!(first_exit.success(), "older owner did not exit normally");
+    assert!(!Path::new(&format!("/proc/{first_pid}")).exists());
+    drop(first);
+
+    let mut second = HookProcess::spawn(&h, "older-live-second", "omp", None, false);
+    let initial = second
+        .run(
+            &h,
+            &start_command(&second_sid, &second_path, &h.workspace, &second_endpoint),
+        )
+        .ok();
+    let initial_name = initial["name"].as_str().unwrap();
+    assert_ne!(initial_name, name);
+    assert_bound(
+        &h,
+        &second,
+        initial_name,
+        &second_sid,
+        &second_path,
+        &h.workspace,
+    );
+    // The existing process binding supplies S2 to --as; the following
+    // ordinary hook pins its new name to P2 rather than P1's dead anchor.
+    let reclaim = second.run(&h, &format!("H start --as {}", quote(&name)));
+    assert_eq!(
+        reclaim.code, 0,
+        "newer owner could not reclaim the dead owner's name: {} {}",
+        reclaim.stdout, reclaim.stderr
+    );
+    let reclaimed: (String, String, String) = db(&h)
+        .query_row(
+            "SELECT i.session_id,p.instance_name,s.instance_name FROM instances i
+               JOIN process_bindings p ON p.instance_name=i.name AND p.session_id=i.session_id
+               JOIN session_bindings s ON s.session_id=i.session_id
+               WHERE i.name=?1 AND p.process_id=?2",
+            rusqlite::params![name, second.process_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        reclaimed,
+        (second_sid.clone(), name.clone(), name.clone()),
+        "--as did not transfer P2's existing session and bindings to N"
+    );
+    assert_eq!(
+        second
+            .run(
+                &h,
+                &start_command(&second_sid, &second_path, &h.workspace, &second_endpoint),
+            )
+            .ok()["name"],
+        name
+    );
+    assert_bound(&h, &second, &name, &second_sid, &second_path, &h.workspace);
+    second
+        .run(
+            &h,
+            &format!("H omp-stop --name {} --reason shutdown", quote(&name)),
+        )
+        .ok();
+    let second_stop = assert_released_history(&h, &name, &second.process_id);
+    assert_eq!(second_stop["snapshot"]["session_id"], second_sid);
+    assert_eq!(second_stop["snapshot"]["pid"], second.owner_pid);
+    assert!(second_stop["snapshot"]["pid_start_time"].as_u64().is_some());
+    assert!(
+        second_stop["snapshot"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty())
+    );
+    let latest_by_name: (i64, String, String) = db(&h)
+        .query_row(
+            "SELECT id,instance,data FROM events WHERE type='life' AND instance=?1
+               AND json_extract(data,'$.action')='stopped' ORDER BY id DESC LIMIT 1",
+            [&name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(latest_by_name.0 > first_event_id);
+    assert_eq!(latest_by_name.1, name);
+    assert_eq!(
+        serde_json::from_str::<Value>(&latest_by_name.2).unwrap(),
+        second_stop
+    );
+    let latest_by_first_session: (i64, String, String) = db(&h)
+        .query_row(
+            "SELECT id,instance,data FROM events WHERE type='life'
+               AND json_extract(data,'$.action')='stopped'
+               AND json_extract(data,'$.snapshot.session_id')=?1 ORDER BY id DESC LIMIT 1",
+            [&first_sid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(latest_by_first_session.0, first_event_id);
+    assert_eq!(latest_by_first_session.1, name);
+    assert_eq!(
+        serde_json::from_str::<Value>(&latest_by_first_session.2).unwrap(),
+        first_stop
+    );
+    second.assert_alive();
+
+    let caller = HookProcess::spawn(&h, "older-live-caller", "omp", None, false);
+    assert_eq!(caller.process_id, format!("omp-{}-1-1", caller.owner_pid));
+    discard_setup_wakes(&first_endpoint);
+    discard_setup_wakes(&second_endpoint);
+    let before = full_state(&h);
+    let output = caller.run(
+        &h,
+        &start_command(&first_sid, &first_path, &h.workspace, &incoming_endpoint),
+    );
+    let after = full_state(&h);
+    let second_still_alive = second
+        .child
+        .try_wait()
+        .expect("poll newer released owner")
+        .is_none()
+        && Path::new(&format!("/proc/{}", second.owner_pid)).exists();
+    // Reap both private fixtures before the intentionally failing base
+    // assertion; retain the post-hook state and liveness observation.
+    drop(caller);
+    drop(second);
+    assert_eq!(
+        after, before,
+        "older session's dead history stole a newer live owner's released name: {} {}",
+        output.stdout, output.stderr
+    );
+    output.refused();
+    assert_no_wake(&[&first_endpoint, &second_endpoint, &incoming_endpoint]);
+    assert!(
+        second_still_alive,
+        "newer released owner exited during the hook"
+    );
+}
+
+#[test]
+fn older_session_hook_can_resume_after_the_newest_released_owner_exits() {
+    let h = isolated_hcom();
+    let suffix = unique_suffix();
+    let name = format!("newestdead{suffix}");
+    let first_sid = format!("sid-older-dead-{suffix}");
+    let second_sid = format!("sid-newer-dead-{suffix}");
+    let first_path = h.workspace.join(format!("{first_sid}.jsonl"));
+    let second_path = h.workspace.join(format!("{second_sid}.jsonl"));
+    let first_endpoint = probe();
+    let second_endpoint = probe();
+    let incoming_endpoint = probe();
+
+    let mut first = HookProcess::spawn(&h, "older-dead-first", "omp", Some(&launcher_id()), false);
+    seed_launch(&h, &first, &name);
+    assert_eq!(
+        first
+            .run(
+                &h,
+                &start_command(&first_sid, &first_path, &h.workspace, &first_endpoint),
+            )
+            .ok()["name"],
+        name
+    );
+    assert_bound(&h, &first, &name, &first_sid, &first_path, &h.workspace);
+    first
+        .run(
+            &h,
+            &format!("H omp-stop --name {} --reason shutdown", quote(&name)),
+        )
+        .ok();
+    let first_stop = assert_released_history(&h, &name, &first.process_id);
+    assert_eq!(first_stop["snapshot"]["session_id"], first_sid);
+    assert_eq!(first_stop["snapshot"]["pid"], first.owner_pid);
+    assert!(first_stop["snapshot"]["pid_start_time"].as_u64().is_some());
+    assert!(
+        first_stop["snapshot"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty())
+    );
+    let first_event_id: i64 = db(&h)
+        .query_row(
+            "SELECT id FROM events WHERE type='life' AND instance=?1
+               AND json_extract(data,'$.action')='stopped' ORDER BY id DESC LIMIT 1",
+            [&name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let first_pid = first.owner_pid;
+    trigger_step(&first.out_dir, first.next_step.get(), "exit 0");
+    let first_exit = h.eventually("older owner exited", Duration::from_secs(30), || {
+        Ok(first.child.try_wait().expect("reap older owner"))
+    });
+    assert!(first_exit.success(), "older owner did not exit normally");
+    assert!(!Path::new(&format!("/proc/{first_pid}")).exists());
+    drop(first);
+
+    let mut second = HookProcess::spawn(&h, "older-dead-second", "omp", None, false);
+    let initial = second
+        .run(
+            &h,
+            &start_command(&second_sid, &second_path, &h.workspace, &second_endpoint),
+        )
+        .ok();
+    let initial_name = initial["name"].as_str().unwrap();
+    assert_ne!(initial_name, name);
+    assert_bound(
+        &h,
+        &second,
+        initial_name,
+        &second_sid,
+        &second_path,
+        &h.workspace,
+    );
+    let reclaim = second.run(&h, &format!("H start --as {}", quote(&name)));
+    assert_eq!(
+        reclaim.code, 0,
+        "newer owner could not reclaim the dead owner's name: {} {}",
+        reclaim.stdout, reclaim.stderr
+    );
+    let reclaimed: (String, String, String) = db(&h)
+        .query_row(
+            "SELECT i.session_id,p.instance_name,s.instance_name FROM instances i
+               JOIN process_bindings p ON p.instance_name=i.name AND p.session_id=i.session_id
+               JOIN session_bindings s ON s.session_id=i.session_id
+               WHERE i.name=?1 AND p.process_id=?2",
+            rusqlite::params![name, second.process_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        reclaimed,
+        (second_sid.clone(), name.clone(), name.clone()),
+        "--as did not transfer P2's existing session and bindings to N"
+    );
+    assert_eq!(
+        second
+            .run(
+                &h,
+                &start_command(&second_sid, &second_path, &h.workspace, &second_endpoint),
+            )
+            .ok()["name"],
+        name
+    );
+    assert_bound(&h, &second, &name, &second_sid, &second_path, &h.workspace);
+    second
+        .run(
+            &h,
+            &format!("H omp-stop --name {} --reason shutdown", quote(&name)),
+        )
+        .ok();
+    let second_stop = assert_released_history(&h, &name, &second.process_id);
+    assert_eq!(second_stop["snapshot"]["session_id"], second_sid);
+    assert_eq!(second_stop["snapshot"]["pid"], second.owner_pid);
+    assert!(second_stop["snapshot"]["pid_start_time"].as_u64().is_some());
+    assert!(
+        second_stop["snapshot"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty())
+    );
+    let latest_by_name: (i64, String, String) = db(&h)
+        .query_row(
+            "SELECT id,instance,data FROM events WHERE type='life' AND instance=?1
+               AND json_extract(data,'$.action')='stopped' ORDER BY id DESC LIMIT 1",
+            [&name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(latest_by_name.0 > first_event_id);
+    assert_eq!(latest_by_name.1, name);
+    assert_eq!(
+        serde_json::from_str::<Value>(&latest_by_name.2).unwrap(),
+        second_stop
+    );
+    let latest_by_first_session: (i64, String, String) = db(&h)
+        .query_row(
+            "SELECT id,instance,data FROM events WHERE type='life'
+               AND json_extract(data,'$.action')='stopped'
+               AND json_extract(data,'$.snapshot.session_id')=?1 ORDER BY id DESC LIMIT 1",
+            [&first_sid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(latest_by_first_session.0, first_event_id);
+    assert_eq!(latest_by_first_session.1, name);
+    assert_eq!(
+        serde_json::from_str::<Value>(&latest_by_first_session.2).unwrap(),
+        first_stop
+    );
+    let second_pid = second.owner_pid;
+    trigger_step(&second.out_dir, second.next_step.get(), "exit 0");
+    let second_exit = h.eventually("newer owner exited", Duration::from_secs(30), || {
+        Ok(second.child.try_wait().expect("reap newer owner"))
+    });
+    assert!(second_exit.success(), "newer owner did not exit normally");
+    assert!(!Path::new(&format!("/proc/{second_pid}")).exists());
+    drop(second);
+
+    let caller = HookProcess::spawn(&h, "older-dead-caller", "omp", None, false);
+    assert_eq!(caller.process_id, format!("omp-{}-1-1", caller.owner_pid));
+    let restored = caller
+        .run(
+            &h,
+            &start_command(&first_sid, &first_path, &h.workspace, &incoming_endpoint),
+        )
+        .ok();
+    assert_eq!(restored["name"], name);
+    assert_bound(&h, &caller, &name, &first_sid, &first_path, &h.workspace);
+    let counts: (i64, i64, i64) = db(&h)
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM instances),
+                (SELECT COUNT(*) FROM process_bindings),
+                (SELECT COUNT(*) FROM session_bindings)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        counts,
+        (1, 1, 1),
+        "resume duplicated or retained an old owner"
+    );
+}
+
+#[test]
 fn child_own_minted_identity_cannot_recreate_a_released_parent() {
     let h = isolated_hcom();
     let suffix = unique_suffix();
@@ -2516,5 +2889,527 @@ fn fresh_own_minted_plain_seat_below_an_owner_pins_its_own_actual_pid() {
         older_mail,
         (0, "true".to_string()),
         "the older owner's unread mail did not survive"
+    );
+}
+
+/// Bounded command text for the comparable outcome line.
+fn bounded(text: &str) -> String {
+    const LIMIT: usize = 2000;
+    match text.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}...[{} bytes total]", &text[..cut], text.len()),
+        None => text.to_string(),
+    }
+}
+
+/// Every stored fact of one hooked OMP owner: its row (including a parsed
+/// launch receipt), its SID-bound process binding, its canonical session
+/// binding and its stop history.
+fn hooked_facts(h: &Hcom, name: &str, process_id: &str, sid: &str) -> Value {
+    let conn = db(h);
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: Option<Row> = conn
+        .query_row(
+            "SELECT status, status_context, pid, session_id, directory, transcript_path,
+                    CASE WHEN json_valid(launch_context)
+                         THEN launch_context -> '$.omp_launch_pid' END
+               FROM instances WHERE name=?1",
+            [name],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .unwrap();
+    let row = row.map(
+        |(status, context, pid, row_sid, directory, transcript, receipt)| {
+            let receipt = receipt.map(|receipt| {
+                serde_json::from_str::<Value>(&receipt).expect("launch receipt JSON")
+            });
+            json!({
+                "status": status,
+                "context": context,
+                "pid": pid,
+                "sid": row_sid,
+                "directory": directory,
+                "transcript": transcript,
+                "receipt": receipt,
+            })
+        },
+    );
+    let process_binding: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT instance_name, session_id FROM process_bindings WHERE process_id=?1",
+            [process_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .unwrap();
+    let session_binding = conn
+        .query_row(
+            "SELECT instance_name FROM session_bindings WHERE session_id=?1",
+            [sid],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap();
+    let stopped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE type='life' AND instance=?1
+               AND json_extract(data,'$.action')='stopped'",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    json!({
+        "row": row,
+        "process_binding": process_binding,
+        "session_binding": session_binding,
+        "stopped_events": stopped,
+    })
+}
+
+/// Private launch PATH: an `omp` that only records its invocation and exits,
+/// and a post-tool login shell that exits at once. A resume that passes every
+/// guard reaches only these, never an installed OMP or a terminal
+/// application. CI rebuilds the child env, so the fixture roots are persisted
+/// through the same passthrough the real launch tests use.
+fn inert_launch_path(h: &Hcom) -> PathBuf {
+    let bin = h.root_path().join("inert-launch-bin");
+    fs::create_dir_all(&bin).expect("create inert launch directory");
+    let launches = h.root_path().join("inert-launches");
+    for (tool, script) in [
+        (
+            "omp",
+            format!(
+                "#!/bin/bash\nif [ \"${{1:-}}\" = --version ]; then printf '1.0.0\\n'; exit 0; fi\nprintf '%s\\n' \"$$\" >> {}\n",
+                quote(&launches.to_string_lossy())
+            ),
+        ),
+        (
+            "bash",
+            "#!/bin/bash\nif [ \"$#\" -eq 1 ] && [ \"$1\" = -l ]; then exit 0; fi\nexec /bin/bash \"$@\"\n"
+                .to_string(),
+        ),
+    ] {
+        let path = bin.join(tool);
+        fs::write(&path, script).expect("write inert launch tool");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("make inert launch tool executable");
+    }
+    let command = h.cmd();
+    let inherited = |key: &str| {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &inherited("PATH").expect("fixture PATH"),
+    ));
+    h.set_launch_env(
+        "PATH",
+        std::env::join_paths(paths).unwrap().to_str().unwrap(),
+    );
+    for key in [
+        "HOME",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "CODEX_HOME",
+    ] {
+        if let Some(value) = inherited(key) {
+            h.set_launch_env(key, value.to_str().unwrap());
+        }
+    }
+    h.set_launch_env("PI_CONFIG_DIR", h.home.join(".omp").to_str().unwrap());
+    h.set_launch_env(
+        "PI_CODING_AGENT_DIR",
+        h.home.join(".omp/agent").to_str().unwrap(),
+    );
+    launches
+}
+
+/// Every catchable signal the unrelated process traps, records and exits on.
+const UNRELATED_HANDLED_SIGNALS: [libc::c_int; 7] = [
+    libc::SIGHUP,
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGTERM,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+    libc::SIGCONT,
+];
+
+/// Owned live process with no hcom identity: a cleared environment, its own
+/// process group, a heartbeat, and a handler for every catchable signal that
+/// records the signal and exits. SIGKILL shows as death, SIGSTOP as a stalled
+/// heartbeat. It is never registered for raw-PID cleanup; its drop detaches
+/// the private row from its PID before reaping it, so neither `Hcom::drop`'s
+/// `kill all` nor its row-PID sweep can signal it or a later PID reuser.
+struct UnrelatedProcess<'a> {
+    h: &'a Hcom,
+    row: String,
+    child: Child,
+    heartbeat: PathBuf,
+    signals: PathBuf,
+}
+
+impl<'a> UnrelatedProcess<'a> {
+    fn spawn(h: &'a Hcom, row: &str) -> Self {
+        let out = h.root_path().join("unrelated-process");
+        fs::create_dir_all(&out).expect("create unrelated process directory");
+        let heartbeat = out.join("heartbeat");
+        let signals = out.join("signals");
+        let script = r#"
+: > "$FIXTURE_SIGNALS"
+for signal in HUP INT QUIT TERM USR1 USR2 CONT; do
+    trap "printf '%s\\n' $signal >> \"\$FIXTURE_SIGNALS\"; exit 0" "$signal"
+done
+while :; do
+    printf x >> "$FIXTURE_HEARTBEAT"
+    read -r -t 0.05 || true
+done
+"#;
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(["-c", script])
+            .env_clear()
+            .env("FIXTURE_HEARTBEAT", &heartbeat)
+            .env("FIXTURE_SIGNALS", &signals)
+            .current_dir(&out)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        // Bash cannot trap a signal ignored at entry; never inherit an ignore.
+        unsafe {
+            command.pre_exec(|| {
+                for signal in UNRELATED_HANDLED_SIGNALS {
+                    libc::signal(signal, libc::SIG_DFL);
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn unrelated process");
+        let unrelated = Self {
+            h,
+            row: row.to_string(),
+            child,
+            heartbeat,
+            signals,
+        };
+        let handled = UNRELATED_HANDLED_SIGNALS
+            .iter()
+            .fold(0_u64, |mask, signal| mask | 1_u64 << (signal - 1));
+        h.eventually(
+            "unrelated process heartbeat with every handler installed",
+            Duration::from_secs(30),
+            || {
+                Ok((unrelated.beats() > 0
+                    && unrelated.signals.exists()
+                    && (unrelated.caught_signals() & handled) == handled)
+                    .then_some(()))
+            },
+        );
+        unrelated
+    }
+
+    /// The kernel's caught-signal mask, so readiness proves every trap is live.
+    fn caught_signals(&self) -> u64 {
+        fs::read_to_string(format!("/proc/{}/status", self.child.id()))
+            .ok()
+            .and_then(|status| {
+                let mask = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SigCgt:"))?;
+                u64::from_str_radix(mask.trim(), 16).ok()
+            })
+            .unwrap_or(0)
+    }
+
+    fn pid(&self) -> i64 {
+        i64::from(self.child.id())
+    }
+
+    fn beats(&self) -> u64 {
+        fs::metadata(&self.heartbeat)
+            .map(|stat| stat.len())
+            .unwrap_or(0)
+    }
+
+    fn observe(&mut self, before: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let progressed = loop {
+            if self.beats() > before {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let exit = self.child.try_wait().expect("poll unrelated process");
+        json!({
+            "alive": exit.is_none(),
+            "exit": exit.map(|status| status.to_string()),
+            "heartbeat_progressed": progressed,
+            "signals": fs::read_to_string(&self.signals).unwrap_or_default(),
+        })
+    }
+
+    /// Clear only the private row's PID, and only while it still names this
+    /// process. A resume may already have released or replaced the row.
+    fn clear_row_pid(&self) -> rusqlite::Result<usize> {
+        let conn = rusqlite::Connection::open(self.h.path().join("hcom.db"))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute(
+            "UPDATE instances SET pid=NULL WHERE name=?1 AND pid=?2",
+            rusqlite::params![self.row, self.pid()],
+        )
+    }
+}
+
+impl Drop for UnrelatedProcess<'_> {
+    fn drop(&mut self) {
+        // Unwind path too: never hand Hcom::drop a row PID naming this process.
+        let _ = self.clear_row_pid();
+        // Not yet reaped, so this PID is still exactly our own child.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One fresh scenario per command: a real hooked OMP owner dies by SIGKILL
+/// without any cleanup, an unrelated live process takes its numeric PID, then
+/// one real bounded CLI command addresses the name. The labeled outcome line
+/// is emitted before any assertion or teardown, for base comparison.
+fn crashed_hooked_owner_reused_pid(command: &str) -> Value {
+    let h = isolated_hcom();
+    let suffix = unique_suffix();
+    let name = format!("crashed{suffix}");
+    let sid = uuid::Uuid::new_v4().to_string();
+    // Launcher identity is a UUID, as hcom launches mint it; it encodes no PID.
+    let mut owner = HookProcess::spawn(&h, "crashed-owner", "omp", Some(&launcher_id()), false);
+    seed_launch(&h, &owner, &name);
+    let endpoint = probe();
+    let transcript = h
+        .home
+        .join(".omp/agent/sessions/crashed")
+        .join(format!("2026-10-01T00-00-00-000Z_{sid}.jsonl"));
+    fs::create_dir_all(transcript.parent().unwrap()).expect("create private session directory");
+    fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            json!({"type": "session", "id": sid, "cwd": h.workspace})
+        ),
+    )
+    .expect("write private session file");
+    let start = owner.run(
+        &h,
+        &format!(
+            "exec 9< {}; {}",
+            quote(&transcript.to_string_lossy()),
+            start_command(&sid, &transcript, &h.workspace, &endpoint)
+        ),
+    );
+    let bound = hooked_facts(&h, &name, &owner.process_id, &sid);
+
+    // Abrupt death of the OMP alone: no omp-stop, no PTY proxy or launcher
+    // cleanup. Reaping it makes its PID genuinely free.
+    owner.child.kill().expect("SIGKILL the fixture OMP");
+    let crash = owner.child.wait().expect("reap the fixture OMP");
+    let crashed = hooked_facts(&h, &name, &owner.process_id, &sid);
+
+    let mut unrelated = UnrelatedProcess::spawn(&h, &name);
+    // PID reuse, simulated in this private DB only: the kernel cannot be made
+    // to hand the dead OMP's PID to the unrelated process, so the stored PID
+    // facts move to it instead. `instances.pid` is the only column holding the
+    // OMP's number: the UUID launcher identity encodes none, and the canonical
+    // and SID-bound bindings carry no PID. Renumbering it, plus a surviving
+    // launch receipt's `pid` only if that names the OMP, leaves exactly what a
+    // real reuse would: every PID fact names a live process with no hcom
+    // identity. No receipt is minted, no stop snapshot written, no env faked.
+    let renumbered = db(&h)
+        .execute(
+            "UPDATE instances
+                SET pid=?2,
+                    launch_context=CASE WHEN json_valid(launch_context) THEN
+                        CASE WHEN json_extract(launch_context,'$.omp_launch_pid.pid')=?3
+                             THEN json_set(launch_context,'$.omp_launch_pid.pid',?2)
+                             ELSE launch_context END
+                        ELSE launch_context END
+              WHERE name=?1 AND pid=?3",
+            rusqlite::params![name, unrelated.pid(), i64::from(owner.owner_pid)],
+        )
+        .unwrap();
+    let reused = hooked_facts(&h, &name, &owner.process_id, &sid);
+
+    let launches = inert_launch_path(&h);
+    let args: Vec<&str> = if command == "r" {
+        vec!["r", name.as_str(), "--terminal", "bash {script}", "--go"]
+    } else {
+        vec![command, name.as_str()]
+    };
+    let before = unrelated.beats();
+    let (code, stdout, stderr) = h.run(&args);
+    let spared = unrelated.observe(before);
+    let after = hooked_facts(&h, &name, &owner.process_id, &sid);
+    let outcome = json!({
+        "command": command,
+        "args": args,
+        "name": name,
+        "sid": sid,
+        "cwd": h.workspace,
+        "transcript": transcript,
+        "process_id": owner.process_id,
+        "owner_pid": owner.owner_pid,
+        "owner_child_pid": owner.child.id(),
+        "start": {
+            "code": start.code,
+            "stdout": bounded(&start.stdout),
+            "stderr": bounded(&start.stderr),
+        },
+        "bound": bound,
+        "crash": {"signal": crash.signal(), "status": crash.to_string()},
+        "crashed": crashed,
+        "unrelated_pid": unrelated.pid(),
+        "renumbered_rows": renumbered,
+        "reused": reused,
+        "result": {"code": code, "stdout": bounded(&stdout), "stderr": bounded(&stderr)},
+        "after": after,
+        "unrelated": spared,
+        "inert_omp_invocations": fs::read_to_string(&launches)
+            .map(|text| text.lines().count())
+            .unwrap_or(0),
+    });
+    eprintln!("HOOKED_PID_REUSE_OUTCOME {outcome}");
+    unrelated
+        .clear_row_pid()
+        .expect("detach the private row from the unrelated PID before teardown");
+    outcome
+}
+
+#[track_caller]
+fn assert_unrelated_reused_pid_spared(outcome: &Value) {
+    let command = outcome["command"].as_str().unwrap_or_default();
+    // The consumer-visible invariant, checked first and never softened.
+    assert_eq!(
+        outcome["unrelated"],
+        json!({"alive": true, "exit": null, "heartbeat_progressed": true, "signals": ""}),
+        "SAFETY: `hcom {command}` signaled, killed or stalled an unrelated live process \
+         holding the crashed OMP's former PID: {outcome}"
+    );
+    // Preconditions: without them the spared observation would be vacuous.
+    let owner = &outcome["owner_pid"];
+    assert_eq!(
+        *owner, outcome["owner_child_pid"],
+        "fixture OMP was not the owned direct child: {outcome}"
+    );
+    let bound = &outcome["bound"];
+    let receipt = &bound["row"]["receipt"];
+    assert!(
+        receipt.is_null() || receipt["pid"] == *owner,
+        "launch receipt names another process: {outcome}"
+    );
+    assert_eq!(
+        *bound,
+        json!({
+            "row": {
+                "status": "listening",
+                "context": "start",
+                "pid": owner,
+                "sid": outcome["sid"],
+                "directory": outcome["cwd"],
+                "transcript": outcome["transcript"],
+                "receipt": receipt,
+            },
+            "process_binding": [outcome["name"], outcome["sid"]],
+            "session_binding": outcome["name"],
+            "stopped_events": 0,
+        }),
+        "fixture OMP did not reach the fully bound hooked state: {outcome}"
+    );
+    assert_eq!(
+        outcome["crash"]["signal"],
+        libc::SIGKILL,
+        "fixture OMP did not die by SIGKILL: {outcome}"
+    );
+    assert_eq!(
+        outcome["crashed"], *bound,
+        "the crash alone changed the hooked owner's state or recorded a stop: {outcome}"
+    );
+    let mut expected = bound.clone();
+    expected["row"]["pid"] = outcome["unrelated_pid"].clone();
+    if !receipt.is_null() {
+        expected["row"]["receipt"]["pid"] = outcome["unrelated_pid"].clone();
+    }
+    assert_eq!(
+        outcome["renumbered_rows"], 1,
+        "PID-reuse fixture did not renumber the owner row: {outcome}"
+    );
+    assert_eq!(
+        outcome["reused"], expected,
+        "PID-reuse fixture changed more than the crashed OMP's numeric PID: {outcome}"
+    );
+}
+
+#[test]
+fn crashed_hooked_owner_reused_pid_resume_spares_unrelated_process() {
+    let outcome = crashed_hooked_owner_reused_pid("r");
+    assert_unrelated_reused_pid_spared(&outcome);
+    // A live recorded PID still roots the hooked row, so resume must refuse
+    // before any launch and leave the row and both bindings exactly as found.
+    assert_ne!(
+        outcome["result"]["code"], 0,
+        "resume did not refuse the live-rooted hooked row: {outcome}"
+    );
+    assert_eq!(
+        outcome["after"], outcome["reused"],
+        "refused resume changed the hooked row or its bindings: {outcome}"
+    );
+    assert_eq!(
+        outcome["inert_omp_invocations"], 0,
+        "refused resume still launched OMP: {outcome}"
+    );
+}
+
+#[test]
+fn crashed_hooked_owner_reused_pid_stop_spares_unrelated_process() {
+    let outcome = crashed_hooked_owner_reused_pid("stop");
+    assert_unrelated_reused_pid_spared(&outcome);
+    assert_eq!(
+        outcome["result"]["code"], 0,
+        "stop of the crashed hooked row failed: {outcome}"
+    );
+    let after = &outcome["after"];
+    assert_eq!(
+        (
+            &after["row"],
+            &after["process_binding"],
+            &after["session_binding"]
+        ),
+        (&Value::Null, &Value::Null, &Value::Null),
+        "stop retained the crashed owner's bookkeeping: {outcome}"
     );
 }

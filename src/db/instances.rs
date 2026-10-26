@@ -805,6 +805,25 @@ impl HcomDb {
             .transpose()
     }
 
+    /// Return the event ID and raw data of `name`'s newest `life.stopped`.
+    /// The name's newest stop is reclaim authority even when resuming an older
+    /// session. Do not parse the data or filter malformed snapshots away:
+    /// callers must see that newest stop rather than an older valid one.
+    pub fn find_latest_stopped_event_by_name(&self, name: &str) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, data FROM events
+                 WHERE type='life'
+                   AND instance=?
+                   AND json_extract(data, '$.action') = 'stopped'
+                 ORDER BY id DESC LIMIT 1",
+                params![name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?)
+    }
+
     /// The `snapshot` of `name`'s newest `life.stopped` event whose snapshot
     /// is an object: the facts the instance's last stop recorded (its pid
     /// with that pid's incarnation, its session id), for a caller that has

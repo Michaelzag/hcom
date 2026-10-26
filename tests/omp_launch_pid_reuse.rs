@@ -610,6 +610,16 @@ fn a_second_resume_binds_after_the_first_omp_dies_before_its_hook() {
     assert_eq!(c2.as_ref().unwrap().hcom_dir, c1.hcom_dir);
 }
 
+// Full-CLI no-steal proof only: a real C1 carrier is visible to the early
+// spawn guards (`check_spawn_allowed`'s live-holder refusal, the fresh
+// launch-binding guard), so this second resume may be refused before the
+// launch-pin verdict is ever reached. Its refusal therefore does not by
+// itself prove `OmpLaunchPin::Held` for a matching live pin; that proof is
+// the direct core coverage in `instance_binding::tests`:
+// `omp_launch_pin_matching_live_receipt_is_held` and
+// `prepare_own_omp_reservation_matching_live_pin_is_held_and_leaves_state_untouched`.
+// What this case pins is the end-to-end contract through every guard: no
+// steal, and no state change.
 #[test]
 fn a_live_matching_pre_hook_owner_cannot_be_stolen_by_another_resume() {
     let (h, workspace) = fixture();
@@ -842,6 +852,17 @@ fn stop_clears_a_live_unverifiable_pre_hook_reservation_without_signaling_then_r
         "UPDATE instances SET pid=?2, launch_context=json_remove(launch_context,'$.omp_launch_pid') WHERE name=?1",
         rusqlite::params![name,sentinel.pid()],
     ).unwrap();
+    // Age this launch's private (NULL-session) process binding far past the
+    // placeholder window, before the baseline snapshot. Inside that window
+    // the fresh-binding guard refuses a second resume with its own error
+    // before the Held bail can surface; this receipt-less legacy pin has no
+    // correlated receipt epoch to keep in step, and the sentinel carries no
+    // hcom env for `check_spawn_allowed` to refuse on, so the refusal below
+    // can only be the launch-pin Held verdict asserted on its stderr.
+    let aged_bindings = db(&h).execute(
+        "UPDATE process_bindings SET updated_at = updated_at - 3600.0 WHERE instance_name=?1 AND session_id IS NULL",
+        rusqlite::params![name],
+    ).unwrap();
     let reservation: (String,String,String,i64) = db(&h).query_row(
         "SELECT status,status_context,session_id,(SELECT COUNT(*) FROM session_bindings WHERE instance_name=?1) FROM instances WHERE name=?1",
         [name], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
@@ -890,6 +911,17 @@ fn stop_clears_a_live_unverifiable_pre_hook_reservation_without_signaling_then_r
     assert!(
         refused.code > 0,
         "missing receipt authorized another resume or failed to refuse: {refused:?}"
+    );
+    assert!(
+        aged_bindings >= 1,
+        "fixture aged no private NULL-session launch binding"
+    );
+    assert!(
+        refused.stderr.contains("unhooked OMP launch reservation")
+            && refused
+                .stderr
+                .contains("is live and has no verifiable launch receipt"),
+        "aged receipt-less resume was refused by an earlier guard, not the launch-pin Held verdict: {refused:?}"
     );
     assert_eq!(
         after, before,
