@@ -19,6 +19,10 @@ use crate::shared::{ST_INACTIVE, ST_LISTENING};
 #[path = "instance_binding_terminal_tests.rs"]
 mod terminal_ownership_tests;
 
+#[cfg(all(test, unix))]
+#[path = "instance_binding_launch_root_tests.rs"]
+mod launch_root_tests;
+
 /// Persist terminal launch metadata without clobbering other launch_context fields.
 ///
 /// The launcher owns the authoritative preset decision. Merge context under
