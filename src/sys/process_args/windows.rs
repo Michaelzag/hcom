@@ -24,8 +24,7 @@ use windows_sys::Win32::Foundation::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, IsWow64Process, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_VM_READ,
+    GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
 };
 #[cfg(windows)]
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
@@ -36,6 +35,32 @@ use windows_sys::core::PWSTR;
 const MAX_BYTES: usize = 1 << 20;
 #[cfg(windows)]
 const HEADER: usize = size_of::<UNICODE_STRING>();
+
+// PE/COFF machine IDs reported by IsWow64Process2.
+const MACHINE_UNKNOWN: u16 = 0;
+const MACHINE_I386: u16 = 0x014c;
+const MACHINE_AMD64: u16 = 0x8664;
+const MACHINE_ARMNT: u16 = 0x01c4;
+const MACHINE_ARM64: u16 = 0xaa64;
+
+#[cfg(all(windows, target_arch = "x86"))]
+const COMPILED_MACHINE: u16 = MACHINE_I386;
+#[cfg(all(windows, target_arch = "x86_64"))]
+const COMPILED_MACHINE: u16 = MACHINE_AMD64;
+#[cfg(all(windows, target_arch = "arm"))]
+const COMPILED_MACHINE: u16 = MACHINE_ARMNT;
+#[cfg(all(windows, target_arch = "aarch64"))]
+const COMPILED_MACHINE: u16 = MACHINE_ARM64;
+#[cfg(all(
+    windows,
+    not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64"
+    ))
+))]
+const COMPILED_MACHINE: u16 = MACHINE_UNKNOWN;
 
 /// NUL-delimited UTF-8 argv of `pid`, one NUL after every argument, or `None`
 /// when the process can't be opened or queried, or the reply is malformed or
@@ -78,7 +103,7 @@ impl Drop for Process {
 
 // Windows NT's native PEB and Vista+ RTL_USER_PROCESS_PARAMETERS layouts,
 // as declared in System Informer's phnt ntpebteb.h / ntrtl.h. Pointer-sized
-// fields use the caller's width only after IsWow64Process agrees for both.
+// fields use the caller's width only after both effective machines match it.
 #[cfg(all(windows, target_pointer_width = "64"))]
 const PEB_PROCESS_PARAMETERS: usize = 0x20;
 #[cfg(all(windows, target_pointer_width = "32"))]
@@ -104,8 +129,11 @@ struct BasicInformation {
     reserved3: usize,
 }
 
-// The crate's existing windows-sys features don't expose Diagnostics::Debug.
-// Keep this single read-only import local instead of changing dependencies.
+#[cfg(windows)]
+type QueryProcessMachines = unsafe extern "system" fn(HANDLE, *mut u16, *mut u16) -> i32;
+
+// Existing windows-sys features don't expose Diagnostics::Debug or LibraryLoader.
+// Keep these read-only imports local to this reader.
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -117,6 +145,79 @@ unsafe extern "system" {
         size: usize,
         read: *mut usize,
     ) -> i32;
+    #[link_name = "GetModuleHandleA"]
+    fn get_module_handle(name: *const u8) -> HANDLE;
+    #[link_name = "GetProcAddress"]
+    fn get_proc_address(
+        module: HANDLE,
+        name: *const u8,
+    ) -> Option<unsafe extern "system" fn() -> isize>;
+}
+
+#[cfg(windows)]
+fn process_machine_matches(process: &Process) -> bool {
+    // SAFETY: both names are static NUL-terminated ASCII. kernel32 is already
+    // loaded by this executable; GetModuleHandle doesn't transfer ownership.
+    let module = unsafe { get_module_handle(c"kernel32.dll".as_ptr().cast()) };
+    if module.is_null() {
+        return false;
+    }
+    // SAFETY: `module` is a live module and the export name is NUL-terminated.
+    let Some(query) = (unsafe { get_proc_address(module, c"IsWow64Process2".as_ptr().cast()) }) else {
+        // Older Windows without this export cannot prove the target's machine.
+        return false;
+    };
+    // SAFETY: this named kernel32 export has the IsWow64Process2 ABI.
+    let query = unsafe {
+        std::mem::transmute::<unsafe extern "system" fn() -> isize, QueryProcessMachines>(query)
+    };
+    // SAFETY: GetCurrentProcess returns this process's valid pseudo-handle.
+    let current = unsafe { GetCurrentProcess() };
+    machine_layout_matches(
+        query_process_machines(query, current),
+        query_process_machines(query, process.0),
+        COMPILED_MACHINE,
+    )
+}
+
+#[cfg(windows)]
+fn query_process_machines(query: QueryProcessMachines, process: HANDLE) -> Option<(u16, u16)> {
+    let mut machine = MACHINE_UNKNOWN;
+    let mut native = MACHINE_UNKNOWN;
+    // SAFETY: the function pointer was resolved by its exact export name;
+    // both outputs are writable USHORTs and `process` is a live handle.
+    (unsafe { query(process, &mut machine, &mut native) } != 0).then_some((machine, native))
+}
+
+fn machine_layout_matches(
+    current: Option<(u16, u16)>,
+    target: Option<(u16, u16)>,
+    compiled: u16,
+) -> bool {
+    if !matches!(
+        compiled,
+        MACHINE_I386 | MACHINE_AMD64 | MACHINE_ARMNT | MACHINE_ARM64
+    ) {
+        return false;
+    }
+    let effective = |query: Option<(u16, u16)>| {
+        let (process, native) = query?;
+        if !matches!(
+            native,
+            MACHINE_I386 | MACHINE_AMD64 | MACHINE_ARMNT | MACHINE_ARM64
+        ) {
+            return None;
+        }
+        Some(if process == MACHINE_UNKNOWN {
+            native
+        } else {
+            process
+        })
+    };
+    matches!(
+        (effective(current), effective(target)),
+        (Some(current), Some(target)) if current == target && current == compiled
+    )
 }
 
 #[cfg(windows)]
@@ -131,13 +232,7 @@ pub(super) fn read_env_var(pid: u32, key: &str) -> EnvRead {
 fn read_environment(pid: u32) -> Option<Vec<u16>> {
     let process =
         Process::open_with_access(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
-    let mut current_wow64 = 0;
-    let mut target_wow64 = 0;
-    // SAFETY: both handles are valid and each output is a writable BOOL.
-    if unsafe { IsWow64Process(GetCurrentProcess(), &mut current_wow64) } == 0
-        || unsafe { IsWow64Process(process.0, &mut target_wow64) } == 0
-        || current_wow64 != target_wow64
-    {
+    if !process_machine_matches(&process) {
         return None;
     }
     let mut basic = BasicInformation::default();
@@ -921,5 +1016,55 @@ mod env_tests {
                 EnvRead::Unreadable
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::*;
+
+    #[test]
+    fn equal_native_machines_match_the_compiled_layout() {
+        for machine in [MACHINE_I386, MACHINE_AMD64, MACHINE_ARMNT, MACHINE_ARM64] {
+            let native = Some((MACHINE_UNKNOWN, machine));
+            assert!(machine_layout_matches(native, native, machine));
+        }
+    }
+
+    #[test]
+    fn wow64_pairs_must_match_each_other_and_the_compiled_machine() {
+        let native = Some((MACHINE_UNKNOWN, MACHINE_AMD64));
+        let wow64 = Some((MACHINE_I386, MACHINE_AMD64));
+        assert!(machine_layout_matches(wow64, wow64, MACHINE_I386));
+        assert!(!machine_layout_matches(native, wow64, MACHINE_AMD64));
+        assert!(!machine_layout_matches(wow64, native, MACHINE_I386));
+        assert!(!machine_layout_matches(wow64, wow64, MACHINE_AMD64));
+    }
+
+    #[test]
+    fn arm_emulation_cannot_confuse_equal_wow64_bools_with_equal_machines() {
+        let native = Some((MACHINE_UNKNOWN, MACHINE_ARM64));
+        for machine in [MACHINE_I386, MACHINE_ARMNT, MACHINE_AMD64] {
+            let emulated = Some((machine, MACHINE_ARM64));
+            assert!(!machine_layout_matches(native, emulated, MACHINE_ARM64));
+            assert!(!machine_layout_matches(emulated, native, machine));
+            assert!(machine_layout_matches(emulated, emulated, machine));
+        }
+    }
+
+    #[test]
+    fn unknown_or_failed_machine_queries_refuse_the_layout() {
+        let native = Some((MACHINE_UNKNOWN, MACHINE_AMD64));
+        for unknown in [
+            None,
+            Some((MACHINE_UNKNOWN, MACHINE_UNKNOWN)),
+            Some((MACHINE_I386, MACHINE_UNKNOWN)),
+            Some((0xffff, MACHINE_AMD64)),
+            Some((MACHINE_UNKNOWN, 0xffff)),
+        ] {
+            assert!(!machine_layout_matches(native, unknown, MACHINE_AMD64));
+            assert!(!machine_layout_matches(unknown, native, MACHINE_AMD64));
+        }
+        assert!(!machine_layout_matches(native, native, MACHINE_UNKNOWN));
     }
 }
