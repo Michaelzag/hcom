@@ -121,7 +121,8 @@ fn has_bound_id(env_id: EnvRead, bound_ids: &[String]) -> bool {
     matches!(env_id, EnvRead::Present(id) if !id.is_empty() && bound_ids.iter().any(|bound| bound == &id))
 }
 
-fn is_wrapper(argv: &[u8]) -> bool {
+/// Recognize only exact, NUL-delimited `hcom pty` or `hcom.exe pty` argv.
+pub(crate) fn is_wrapper(argv: &[u8]) -> bool {
     if argv.last() != Some(&0) {
         return false;
     }
