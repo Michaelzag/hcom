@@ -192,7 +192,11 @@ mod tests {
         descends_from(
             owner,
             root,
-            |pid| processes.get(&pid).map_or(Read::Absent, |p| p.parent.clone()),
+            |pid| {
+                processes
+                    .get(&pid)
+                    .map_or(Read::Absent, |p| p.parent.clone())
+            },
             |pid| {
                 processes
                     .get(&pid)
@@ -205,7 +209,11 @@ mod tests {
         legacy_pty_child_root(
             owner,
             &[ID.to_string(), "other-bound-id".to_string()],
-            |pid| processes.get(&pid).map_or(Read::Absent, |p| p.parent.clone()),
+            |pid| {
+                processes
+                    .get(&pid)
+                    .map_or(Read::Absent, |p| p.parent.clone())
+            },
             |pid| {
                 processes
                     .get(&pid)
