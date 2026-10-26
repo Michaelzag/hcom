@@ -5874,6 +5874,7 @@ mod tests {
     #[cfg(windows)]
     mod native_windows {
         use super::*;
+        use std::os::windows::process::CommandExt;
         use std::process::{Child, Command, Stdio};
 
         struct OwnedChild(Child);
@@ -5882,16 +5883,33 @@ mod tests {
             fn spawn() -> Self {
                 let system_root = std::env::var_os("SystemRoot").expect("Windows system root");
                 Self(
-                    Command::new(PathBuf::from(&system_root).join("System32/cmd.exe"))
+                    Command::new(PathBuf::from(&system_root).join("System32").join("cmd.exe"))
                         .args(["/d", "/s", "/c", "set /p HCOM101_IDLE="])
+                        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
                         .env_clear()
                         .env("SystemRoot", system_root)
+                        // Child retains the write end so the built-in read blocks until killed.
                         .stdin(Stdio::piped())
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .spawn()
                         .expect("spawn owned native child"),
                 )
+            }
+
+            fn assert_running(&mut self, identity: &str) {
+                assert_eq!(self.0.try_wait().unwrap(), None, "owned child exited");
+                assert_eq!(
+                    crate::sys::process::identity(self.0.id()).as_deref(),
+                    Some(identity),
+                    "owned child must retain its native birth identity"
+                );
+                assert!(!crate::sys::process::is_definitely_dead(self.0.id()));
+            }
+
+            fn assert_dead(&mut self) {
+                assert!(self.0.try_wait().unwrap().is_some());
+                assert!(crate::sys::process::is_definitely_dead(self.0.id()));
             }
 
             fn kill_and_wait(&mut self) {
@@ -5907,7 +5925,7 @@ mod tests {
             }
         }
 
-        fn record_child(db: &HcomDb, child: &OwnedChild) -> InstanceRow {
+        fn record_child(db: &HcomDb, child: &mut OwnedChild) -> (InstanceRow, String) {
             seed_omp_claim(db, OMP_LAUNCH_ID, Some("sid-owner"), None);
             db.store_launch_context("luna", r#"{"pane_id":"kitty-42"}"#)
                 .unwrap();
@@ -5930,10 +5948,15 @@ mod tests {
             assert_eq!(receipt.identity, actual);
             assert_eq!(receipt.pid, child.0.id());
             assert_eq!(receipt.process_id, OMP_LAUNCH_ID);
-            row
+            child.assert_running(&actual);
+            (row, actual)
         }
 
-        fn assert_releases_only_own_pin(db: &HcomDb, reason: &str) {
+        fn assert_releases_only_own_pin(
+            db: &HcomDb,
+            reason: &str,
+            mut assert_child_state: impl FnMut(),
+        ) {
             db.conn()
                 .execute(
                     "INSERT INTO instances
@@ -5945,14 +5968,19 @@ mod tests {
             db.set_process_binding("proc-other-seat", "", "fano")
                 .unwrap();
             let row = db.get_instance_full("luna").unwrap().unwrap();
-            assert_launch_pin_replaceable(omp_launch_pin_verdict(db, &row).unwrap(), reason);
+            assert_child_state();
+            let verdict = omp_launch_pin_verdict(db, &row).unwrap();
+            assert_child_state();
+            assert_launch_pin_replaceable(verdict, reason);
             let binding = process_binding_epoch(db, OMP_LAUNCH_ID).unwrap().unwrap();
             let before = db_state(db);
+            assert_child_state();
             let released = db
                 .with_immediate_transaction(|tx| {
                     prepare_own_omp_reservation_in_txn(db, tx, "luna", "sid-owner", "omp")
                 })
                 .unwrap();
+            assert_child_state();
             assert!(released.is_none(), "replaceable pin must not report Held");
             let cleared = db.get_instance_full("luna").unwrap().unwrap();
             assert_eq!(cleared.pid, None);
@@ -5988,25 +6016,29 @@ mod tests {
             let _env = crate::hooks::test_helpers::isolated_test_env();
             let (db, path) = setup_test_db();
             let mut child = OwnedChild::spawn();
-            let row = record_child(&db, &child);
+            let (row, identity) = record_child(&db, &mut child);
             let before = db_state(&db);
-            match omp_launch_pin_verdict(&db, &row).unwrap() {
+            child.assert_running(&identity);
+            let verdict = omp_launch_pin_verdict(&db, &row).unwrap();
+            child.assert_running(&identity);
+            match verdict {
                 OmpLaunchPin::Held { pid, reason } => {
                     assert_eq!(pid, i64::from(child.0.id()));
                     assert_eq!(reason, "is still the running launch process");
                 }
                 _ => panic!("native matching child must hold the launch pin"),
             }
+            child.assert_running(&identity);
             let held = db
                 .with_immediate_transaction(|tx| {
                     prepare_own_omp_reservation_in_txn(&db, tx, "luna", "sid-owner", "omp")
                 })
-                .unwrap()
-                .expect("native matching child must hold its own reservation");
+                .unwrap();
+            child.assert_running(&identity);
+            let held = held.expect("native matching child must hold its own reservation");
             assert_eq!(held.pid, i64::from(child.0.id()));
             assert_eq!(held.reason, "is still the running launch process");
             assert_eq!(db_state(&db), before);
-            assert!(child.0.try_wait().unwrap().is_none());
             cleanup(path);
         }
 
@@ -6016,10 +6048,9 @@ mod tests {
             let _env = crate::hooks::test_helpers::isolated_test_env();
             let (db, path) = setup_test_db();
             let mut child = OwnedChild::spawn();
-            let row = record_child(&db, &child);
+            let (row, identity) = record_child(&db, &mut child);
             let mut context: serde_json::Value =
                 serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
-            let identity = context["omp_launch_pid"]["identity"].as_str().unwrap();
             let ticks: u64 = identity.strip_prefix("windows:").unwrap().parse().unwrap();
             context["omp_launch_pid"]["identity"] = serde_json::json!(format!(
                 "windows:{}",
@@ -6033,8 +6064,9 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
-            assert_releases_only_own_pin(&db, "now belongs to another process");
-            assert!(child.0.try_wait().unwrap().is_none());
+            assert_releases_only_own_pin(&db, "now belongs to another process", || {
+                child.assert_running(&identity);
+            });
             cleanup(path);
         }
 
@@ -6044,10 +6076,10 @@ mod tests {
             let _env = crate::hooks::test_helpers::isolated_test_env();
             let (db, path) = setup_test_db();
             let mut child = OwnedChild::spawn();
-            record_child(&db, &child);
+            record_child(&db, &mut child);
             child.kill_and_wait();
-            assert!(crate::sys::process::is_definitely_dead(child.0.id()));
-            assert_releases_only_own_pin(&db, "exited");
+            child.assert_dead();
+            assert_releases_only_own_pin(&db, "exited", || child.assert_dead());
             cleanup(path);
         }
     }
