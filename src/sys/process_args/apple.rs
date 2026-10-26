@@ -7,6 +7,7 @@
 use super::EnvRead;
 
 const MAX_ARGS_BYTES: usize = 1024 * 1024;
+const MAX_ENV_VALUE_BYTES: usize = 256;
 const ARGC_BYTES: usize = std::mem::size_of::<i32>();
 const LP64_ALIGNMENT: usize = 8;
 
@@ -150,36 +151,44 @@ fn parse(mut buffer: Vec<u8>) -> Option<Vec<u8>> {
     Some(buffer)
 }
 
-/// Validate the complete environment before exposing even an earlier match.
+/// Find only the requested key; the tail is not exclusively environment data.
 fn parse_env(buffer: &[u8], key: &str) -> EnvRead {
     let Some(argv) = argv_range(buffer) else {
         return EnvRead::Unreadable;
     };
-    let environment = &buffer[argv.end..];
-    if environment.last() != Some(&0) {
+    let mut remaining = &buffer[argv.end..];
+    if remaining.is_empty() {
         return EnvRead::Unreadable;
     }
-    let Ok(environment) = std::str::from_utf8(environment) else {
-        return EnvRead::Unreadable;
-    };
-    let mut value = None;
-    let mut terminated = false;
-    for entry in environment.split_terminator('\0') {
+    // XNU xnu-11215.81.4 kern_exec.c:6074-6086 aligns envv before applev,
+    // possibly without any NUL padding. Applev uses kernel-defined keys
+    // (6104-6164; formatted at 6240-6246,6276-6295,6309-6316), none of which
+    // is HCOM_PROCESS_ID. Env precedes applev, so its first exact match wins.
+    // Do not decode unrelated applev strings or scan past an empty separator.
+    while !remaining.is_empty() {
+        let terminator = remaining.iter().position(|byte| *byte == 0);
+        let entry = &remaining[..terminator.unwrap_or(remaining.len())];
         if entry.is_empty() {
-            terminated = true;
-        } else if terminated {
-            return EnvRead::Unreadable;
-        } else if value.is_none()
-            && let Some((name, candidate)) = entry.split_once('=')
-            && name == key
-        {
-            value = Some(candidate);
+            break;
         }
+        if let Some(value) = entry
+            .strip_prefix(key.as_bytes())
+            .and_then(|suffix| suffix.strip_prefix(b"="))
+        {
+            if terminator.is_none() || value.len() > MAX_ENV_VALUE_BYTES {
+                return EnvRead::Unreadable;
+            }
+            return match std::str::from_utf8(value) {
+                Ok(value) => EnvRead::Present(value.to_owned()),
+                Err(_) => EnvRead::Unreadable,
+            };
+        }
+        let Some(terminator) = terminator else {
+            break;
+        };
+        remaining = &remaining[terminator + 1..];
     }
-    match value {
-        Some(value) => EnvRead::Present(value.to_owned()),
-        None => EnvRead::Absent,
-    }
+    EnvRead::Absent
 }
 
 #[cfg(test)]
@@ -345,6 +354,43 @@ mod tests {
     }
 
     #[test]
+    fn environment_parser_handles_apple_strings_with_or_without_a_separator() {
+        // XNU may need no alignment padding between envv and applev.
+        const APPLE_STRINGS: &[u8] =
+            b"pfz=0xffff\0stack_guard=\0\xff\xfe\0malloc_entropy=\xff\xf0\0ptr_munge=0x1234\0main_stack=0x1000\0\0\0";
+        for separator in [b"".as_slice(), b"\0"] {
+            // The strings before applev occupy exactly 64 bytes after argc.
+            let mut buffer = native_buffer(
+                2,
+                b"/bin/node\0\0\0\0\0\0\0node\0script.js\0HCOM_PROCESS_ID=owner\0OTHER=abcd\0",
+            );
+            buffer.extend_from_slice(separator);
+            buffer.extend_from_slice(APPLE_STRINGS);
+            assert_eq!(
+                parse_env(&buffer, "HCOM_PROCESS_ID"),
+                EnvRead::Present("owner".into())
+            );
+
+            let mut buffer = native_buffer(
+                2,
+                b"/bin/node\0\0\0\0\0\0\0node\0script.js\0HCOM_PROCESS_ID_X=owner\0OTHER=ab\0",
+            );
+            buffer.extend_from_slice(separator);
+            buffer.extend_from_slice(APPLE_STRINGS);
+            assert_eq!(parse_env(&buffer, "HCOM_PROCESS_ID"), EnvRead::Absent);
+        }
+    }
+
+    #[test]
+    fn environment_parser_does_not_scan_past_an_empty_string() {
+        let buffer = native_buffer(
+            1,
+            b"/bin/sh\0sh\0OTHER=value\0\0HCOM_PROCESS_ID=not-an-env-entry\0\xff\0\0",
+        );
+        assert_eq!(parse_env(&buffer, "HCOM_PROCESS_ID"), EnvRead::Absent);
+    }
+
+    #[test]
     fn environment_parser_accepts_empty_value_and_empty_environment() {
         let buffer = native_buffer(1, b"/bin/sh\0sh\0HCOM_PROCESS_ID=\0");
         assert_eq!(
@@ -367,19 +413,66 @@ mod tests {
     }
 
     #[test]
-    fn environment_parser_rejects_truncation_and_invalid_utf8_after_a_match() {
+    fn environment_parser_rejects_truncated_or_invalid_matching_entries() {
         for body in [
             b"/bin/sh\0sh\0HCOM_PROCESS_ID=trunc".as_slice(),
-            b"/bin/sh\0sh\0HCOM_PROCESS_ID=owner\0TAIL=missing-nul",
-            b"/bin/sh\0sh\0HCOM_PROCESS_ID=owner\0TAIL=\xff\0",
             b"/bin/sh\0sh\0HCOM_PROCESS_ID=\xff\0",
-            b"/bin/sh\0sh\0HCOM_PROCESS_ID=owner\0\0TAIL=after-end\0",
             b"/bin/sh\0sh\0",
         ] {
             assert_eq!(
                 parse_env(&native_buffer(1, body), "HCOM_PROCESS_ID"),
                 EnvRead::Unreadable
             );
+        }
+    }
+
+    #[test]
+    fn environment_parser_skips_unrelated_non_utf8_and_non_environment_strings() {
+        let buffer = native_buffer(
+            1,
+            b"/bin/sh\0sh\0\xff\0not-an-assignment\0HCOM_PROCESS_ID=owner\0",
+        );
+        assert_eq!(
+            parse_env(&buffer, "HCOM_PROCESS_ID"),
+            EnvRead::Present("owner".into())
+        );
+        for tail in [
+            b"TAIL=missing-nul".as_slice(),
+            b"TAIL=\xff\0",
+            b"\0TAIL=after-end\0",
+        ] {
+            let mut buffer = native_buffer(1, b"/bin/sh\0sh\0HCOM_PROCESS_ID=owner\0");
+            buffer.extend_from_slice(tail);
+            assert_eq!(
+                parse_env(&buffer, "HCOM_PROCESS_ID"),
+                EnvRead::Present("owner".into())
+            );
+        }
+        assert_eq!(
+            parse_env(
+                &native_buffer(1, b"/bin/sh\0sh\0not-an-assignment\0\xff"),
+                "HCOM_PROCESS_ID"
+            ),
+            EnvRead::Absent
+        );
+    }
+
+    #[test]
+    fn environment_parser_bounds_the_matching_value_in_bytes() {
+        for (value, expected) in [
+            ("x".repeat(MAX_ENV_VALUE_BYTES), true),
+            ("x".repeat(MAX_ENV_VALUE_BYTES + 1), false),
+            ("雪".repeat(MAX_ENV_VALUE_BYTES / 3 + 1), false),
+        ] {
+            let mut buffer = native_buffer(1, b"/bin/sh\0sh\0HCOM_PROCESS_ID=");
+            buffer.extend_from_slice(value.as_bytes());
+            buffer.push(0);
+            let actual = parse_env(&buffer, "HCOM_PROCESS_ID");
+            if expected {
+                assert_eq!(actual, EnvRead::Present(value));
+            } else {
+                assert_eq!(actual, EnvRead::Unreadable);
+            }
         }
     }
 
@@ -470,6 +563,42 @@ mod tests {
             expected.push(0);
         }
         assert_eq!(actual, Some(expected));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_read_own_child_environment_handles_every_tail_alignment() {
+        use std::process::{Command, Stdio};
+
+        let root = tempfile::tempdir().expect("create isolated environment fixture");
+        for padding in 0..LP64_ALIGNMENT {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "IFS= read -r fixture"])
+                .env_clear()
+                .env("HOME", root.path())
+                .env("TMPDIR", root.path())
+                .env("HCOM_PROCESS_ID", "native-bound-process")
+                .env("HCOM_TEST_EMPTY", "")
+                .env("HCOM_ENV_PADDING", "x".repeat(padding))
+                .current_dir(root.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn isolated environment fixture");
+            let present = read_env_var(child.id(), "HCOM_PROCESS_ID");
+            let empty = read_env_var(child.id(), "HCOM_TEST_EMPTY");
+            let absent = read_env_var(child.id(), "hcom_process_id");
+            let _ = child.kill();
+            let _ = child.wait();
+            assert_eq!(
+                present,
+                EnvRead::Present("native-bound-process".into()),
+                "environment padding {padding}"
+            );
+            assert_eq!(empty, EnvRead::Present(String::new()));
+            assert_eq!(absent, EnvRead::Absent);
+        }
     }
 
     #[cfg(target_os = "macos")]
