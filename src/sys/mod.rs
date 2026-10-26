@@ -9,9 +9,13 @@
 
 pub mod fs;
 pub mod io;
+pub(crate) mod kill_group;
 #[cfg(any(target_os = "macos", test))]
 mod kill_tree_apple;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod kill_tree_linux;
 pub mod net;
 pub mod process;
 pub(crate) mod process_args;
+pub(crate) mod seat_root;
 pub mod signal;

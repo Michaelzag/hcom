@@ -108,15 +108,8 @@ impl std::fmt::Display for SpawnRefusal {
 /// between the DB timestamp and /proc starttime arithmetic.
 const ORPHAN_GRACE_SECS: f64 = 30.0;
 
-/// How long reap waits after SIGTERM before escalating to SIGKILL.
 #[cfg(unix)]
-const TERM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Poll step while waiting for exits.
-#[cfg(unix)]
-const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
-/// How long reap waits after SIGKILL before declaring survivors.
-#[cfg(unix)]
-const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+use crate::sys::process::{KILL_WAIT, POLL_STEP, TERM_WAIT};
 
 /// Enumerate live processes holding an instance: environ contains exactly
 /// `HCOM_INSTANCE_NAME=<name>` as one NUL-delimited entry, or exactly
@@ -1421,7 +1414,7 @@ pub(crate) fn process_is_tool(pid: u32, tool_names: &[&str]) -> bool {
     }
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
     tool_match_from_facts(comm.as_deref(), tool_names, || {
-        std::fs::read(format!("/proc/{pid}/cmdline")).ok()
+        crate::sys::process_args::command_line(pid)
     })
 }
 
@@ -1585,10 +1578,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
 #[cfg(target_os = "linux")]
 fn process_group_id(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
-    let _state = fields.next()?;
-    let _ppid = fields.next()?;
-    fields.next()?.parse().ok()
+    crate::sys::process::proc_stat_group_id(&stat)
 }
 
 /// `pid` plus its /proc ppid-ancestor chain, youngest first, ending at init
@@ -1934,7 +1924,7 @@ fn windows_omp_launcher_shim(image: Option<&str>, cmdline: &[u8]) -> bool {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn ancestor_process_kind(pid: u32) -> AncestorProcess {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok();
+    let cmdline = crate::sys::process_args::command_line(pid);
     omp_kind_from_facts(comm.as_deref(), cmdline.as_deref(), false)
 }
 
@@ -1989,6 +1979,22 @@ pub(crate) fn carries_process_id(pid: u32, id: &str) -> bool {
     !id.is_empty()
         && identity_facts_of(pid, "") // name fact unused; only the process id matters
             .is_some_and(|(_, process_id)| process_id == id)
+}
+
+/// One HCOM process-ID reader for the kill gate and its ancestor proof.
+pub(crate) fn process_id_of(pid: u32) -> crate::sys::process_args::EnvRead {
+    use crate::sys::process_args::EnvRead;
+    let evidence = crate::sys::process_args::read_process_env_var(pid, "HCOM_PROCESS_ID");
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let evidence = match evidence {
+        EnvRead::Unreadable => match identity_facts_of(pid, "") {
+            Some((_, id)) if id.is_empty() => EnvRead::Absent,
+            Some((_, id)) => EnvRead::Present(id),
+            None => EnvRead::Unreadable,
+        },
+        evidence => evidence,
+    };
+    evidence
 }
 
 /// A kill capability for one verified PID incarnation, not merely a live PID.
@@ -2063,25 +2069,16 @@ pub(crate) fn verify_kill_owner(
         }
     } else {
         use crate::sys::process_args::EnvRead;
-        let evidence = crate::sys::process_args::read_process_env_var(pid, "HCOM_PROCESS_ID");
-        // The native API is unsupported on Linux/Android; retain the existing
-        // proctruth reader there rather than adding a second /proc reader.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let evidence = match evidence {
-            EnvRead::Unreadable => match identity_facts_of(pid, "") {
-                Some((_, id)) if id.is_empty() => EnvRead::Absent,
-                Some((_, id)) => EnvRead::Present(id),
-                None => EnvRead::Unreadable,
-            },
-            evidence => evidence,
-        };
+        let evidence = process_id_of(pid);
         let process_id = match evidence {
             EnvRead::Present(id) => id,
             EnvRead::Absent => {
                 return Err("live HCOM_PROCESS_ID is absent and no identity receipt was recorded");
             }
             EnvRead::Unreadable => {
-                return Err("live HCOM identity is unreadable and no identity receipt was recorded");
+                return Err(
+                    "live HCOM identity is unreadable and no identity receipt was recorded",
+                );
             }
         };
         if process_id.is_empty() {
@@ -3945,7 +3942,7 @@ fn is_omp_or_hcom_process(pid: u32) -> bool {
     let comm_matches = std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .is_ok_and(|comm| NAMES.contains(&comm.trim_end_matches('\n')));
     comm_matches
-        || std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+        || crate::sys::process_args::command_line(pid).is_some_and(|cmdline| {
             let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or_default();
             let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or_default();
             NAMES.iter().any(|name| name.as_bytes() == base)
@@ -8733,7 +8730,7 @@ mod tests {
         // The premise, read from the process itself: argv[0]'s basename is
         // `node` and argv[1] is the tool. The matcher can only be right about
         // this shape if the fixture really produced it.
-        let cmdline = std::fs::read(format!("/proc/{tool}/cmdline")).expect("tool cmdline");
+        let cmdline = crate::sys::process_args::command_line(tool).expect("tool cmdline");
         let argv: Vec<String> = cmdline
             .split(|b| *b == 0)
             .map(|arg| String::from_utf8_lossy(arg).into_owned())

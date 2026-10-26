@@ -2649,7 +2649,7 @@ pub(crate) fn kill_process(
     owner: &crate::proctruth::KillOwner,
     instance_names: &[String],
     info: &TerminalInfo,
-) -> Result<(KillResult, bool, Option<String>), &'static str> {
+) -> Result<(KillResult, bool, Option<String>), String> {
     let pid = owner.pid();
     let live = owner.recheck()?;
     let TerminalInfo {

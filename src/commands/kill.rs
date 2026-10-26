@@ -1183,7 +1183,7 @@ fn kill_selected(
                 Err(reason) => {
                     eprintln!(
                         "{}",
-                        unverified_owner_error(&orphan.names.join(", "), orphan.pid, reason)
+                        unverified_owner_error(&orphan.names.join(", "), orphan.pid, &reason)
                     );
                     failed += 1;
                     continue;
@@ -1262,7 +1262,7 @@ fn kill_single(
                 let (result, pane_closed, pane_retry_command) =
                     terminal::kill_process(&owner, &orphan.names, &orphan_terminal_info(orphan))
                         .map_err(|reason| {
-                            anyhow::Error::msg(unverified_owner_error(target, orphan.pid, reason))
+                            anyhow::Error::msg(unverified_owner_error(target, orphan.pid, &reason))
                         })?;
                 let result = normalize_kill_result(target, orphan.pid, result, pane_closed);
                 let pane_info =
@@ -1453,7 +1453,7 @@ fn kill_instance(
     if is_headless {
         let (result, pane_closed, pane_retry_command) =
             terminal::kill_process(owner, &[], &terminal::TerminalInfo::default())
-                .map_err(|reason| unverified_owner_error(name, pid, reason))?;
+                .map_err(|reason| unverified_owner_error(name, pid, &reason))?;
         let result = normalize_kill_result(name, pid, result, pane_closed);
         log_info(
             "kill",
@@ -1479,7 +1479,7 @@ fn kill_instance(
 
     let (result, pane_closed, pane_retry_command) =
         terminal::kill_process(owner, std::slice::from_ref(&instance.name), &ti)
-            .map_err(|reason| unverified_owner_error(name, pid, reason))?;
+            .map_err(|reason| unverified_owner_error(name, pid, &reason))?;
     let result = normalize_kill_result(name, pid, result, pane_closed);
 
     log_info(

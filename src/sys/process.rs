@@ -5,6 +5,80 @@
 
 use std::process::Command;
 
+pub(crate) const TERM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn identity_start(identity: &str) -> Option<(&str, u128)> {
+    if let Some(value) = identity.strip_prefix("linux:") {
+        let (boot, ticks) = value.split_once(':')?;
+        if boot.is_empty() || ticks.contains(':') {
+            return None;
+        }
+        let ticks = ticks.parse::<u64>().ok()?;
+        return Some((&identity[..identity.rfind(':')?], u128::from(ticks)));
+    }
+    if let Some(value) = identity.strip_prefix("apple:") {
+        let (seconds, micros) = value.split_once(':')?;
+        let seconds = seconds.parse::<u64>().ok()?;
+        let micros = micros.parse::<u64>().ok().filter(|&value| value < 1_000_000)?;
+        return Some(("apple", u128::from(seconds) * 1_000_000 + u128::from(micros)));
+    }
+    let ticks = identity.strip_prefix("windows:")?.parse::<u64>().ok()?;
+    Some(("windows", u128::from(ticks)))
+}
+
+pub(crate) fn identity_precedes(parent: &str, child: &str) -> bool {
+    match (identity_start(parent), identity_start(child)) {
+        (Some((parent_domain, parent)), Some((child_domain, child))) => {
+            parent_domain == child_domain && parent <= child
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn creation_time(pid: u32) -> Option<u128> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        process_start_ticks(pid).map(u128::from)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let info = process_info_apple(pid)?;
+        (info.pbi_start_tvusec < 1_000_000).then_some(
+            u128::from(info.pbi_start_tvsec) * 1_000_000 + u128::from(info.pbi_start_tvusec),
+        )
+    }
+    #[cfg(windows)]
+    {
+        creation_ticks_win(pid).map(u128::from)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, mut fields) = proc_stat_fields(&stat)?;
+        fields.next()?.parse::<u32>().ok().filter(|&pid| pid > 0)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        process_info_apple(pid).map(|info| info.pbi_ppid).filter(|&pid| pid > 0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Stable identity for one PID incarnation.
 ///
 /// PIDs are reusable, so liveness checks for persisted ownership records must
@@ -80,11 +154,32 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
-fn proc_stat_is_zombie(stat: &str) -> bool {
-    // comm may contain closing parentheses, so state starts after the final one.
-    stat.rsplit_once(") ")
-        .and_then(|(_, fields)| fields.split_whitespace().next())
-        == Some("Z")
+fn proc_stat_fields(stat: &str) -> Option<(u8, std::str::SplitWhitespace<'_>)> {
+    let (head, fields) = stat.rsplit_once(") ")?;
+    let (pid, _) = head.split_once(" (")?;
+    if pid.parse::<u32>().ok()? == 0 {
+        return None;
+    }
+    let mut fields = fields.split_whitespace();
+    let state = fields.next()?.as_bytes();
+    (state.len() == 1 && state[0].is_ascii_alphabetic()).then(|| (state[0], fields))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub(crate) fn proc_stat_is_zombie(stat: &str) -> bool {
+    proc_stat_fields(stat).is_some_and(|(state, _)| state == b'Z')
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub(crate) fn proc_stat_is_dead(stat: &str) -> bool {
+    proc_stat_fields(stat).is_some_and(|(state, _)| matches!(state, b'Z' | b'X' | b'x'))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub(crate) fn proc_stat_group_id(stat: &str) -> Option<u32> {
+    let (_, mut fields) = proc_stat_fields(stat)?;
+    fields.next()?.parse::<u32>().ok()?;
+    fields.next()?.parse::<u32>().ok().filter(|&group| group != 0)
 }
 
 /// One incarnation of `pid` on this host: its boot-relative start time in
@@ -422,7 +517,7 @@ pub fn is_definitely_dead(pid: u32) -> bool {
         {
             std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
-                .is_some_and(|stat| proc_stat_is_zombie(&stat))
+                .is_some_and(|stat| proc_stat_is_dead(&stat))
         }
         #[cfg(all(
             target_os = "macos",
@@ -464,9 +559,70 @@ pub fn is_definitely_dead(pid: u32) -> bool {
             ok && exit_code != STILL_ACTIVE as u32
         }
     }
+
     #[cfg(not(any(unix, windows)))]
     {
         false
+    }
+}
+/// Whether the native state positively identifies an unreaped zombie.
+pub(crate) fn is_zombie(pid: u32) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .is_some_and(|stat| proc_stat_is_zombie(&stat))
+    }
+    #[cfg(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        i32::try_from(pid).ok().is_some_and(|pid| process_state_apple(pid).is_zombie())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64"))
+    )))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+pub(crate) fn group_id(pid: u32) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        let pid = i32::try_from(pid).ok().filter(|&pid| pid > 0)?;
+        // SAFETY: getpgid queries one positive PID and sends no signal.
+        u32::try_from(unsafe { libc::getpgid(pid) }).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+pub(crate) fn is_zombie_group_leader(pid: u32) -> bool {
+    is_zombie(pid) && group_id(pid) == Some(pid)
+}
+
+/// Only a receipt-matching unreaped leader can authorize its leftover PGID.
+pub(crate) fn signal_zombie_group(
+    pid: u32,
+    expected: &str,
+    force: bool,
+) -> Result<GroupSignal, &'static str> {
+    if !is_zombie_group_leader(pid) || !has_identity(pid, expected) {
+        return Err("zombie group leader identity changed or became unreadable");
+    }
+    #[cfg(unix)]
+    {
+        Ok(signal_group_unix(pid, if force { libc::SIGKILL } else { libc::SIGTERM }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = force;
+        Err("process groups are unsupported on this platform")
     }
 }
 
@@ -541,12 +697,12 @@ pub fn terminate_group(pid: u32) -> GroupSignal {
 pub(crate) fn terminate_group_verified(
     pid: u32,
     expected: &str,
-) -> Result<GroupSignal, &'static str> {
+) -> Result<GroupSignal, String> {
     if is_definitely_dead(pid) {
         return Ok(GroupSignal::NotFound);
     }
     if !has_identity(pid, expected) {
-        return Err("PID identity changed or became unreadable before the group/tree signal");
+        return Err("PID identity changed or became unreadable before the group/tree signal".into());
     }
     #[cfg(target_os = "macos")]
     {
@@ -561,7 +717,7 @@ pub(crate) fn terminate_group_verified(
         // Hook re-pinning can name the interpreter, not its group's leader.
         // ESRCH from killpg is harmless, but does not mean that PID is dead.
         if !has_identity(pid, expected) {
-            return Err("PID identity changed or became unreadable before the owner signal");
+            return Err("PID identity changed or became unreadable before the owner signal".into());
         }
         // SAFETY: a verified positive PID targets one process, not its parent
         // or a shared launcher group. Carrier reap handles its captured tree.
@@ -583,7 +739,7 @@ pub(crate) fn terminate_group_verified(
         let (result, root_terminated) = kill_tree_win_with_identity(pid, Some(ticks));
         if !root_terminated && !is_definitely_dead(pid) {
             return Err(
-                "verified owner could not be terminated: its identity changed, became unreadable, or access was denied",
+                "verified owner could not be terminated: its identity changed, became unreadable, or access was denied".into(),
             );
         }
         Ok(result)
