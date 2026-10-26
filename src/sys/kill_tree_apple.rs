@@ -1,13 +1,19 @@
-//! Terminate one verified macOS owner and its descendants, never its process group.
+//! Terminate a verified macOS seat root and confirm its captured processes exit.
 //!
-//! Parent PIDs alone aren't ownership: a child older than its reported parent
-//! belongs to an earlier incarnation of that PID. Plan the complete tree before
-//! sending anything, and recheck each process's creation time before its signal.
+//! A verified group leader owns its group; other roots authorize only their
+//! creation-time-verified descendants. Capture before signaling, reject reused
+//! parent links, and never escalate against a different PID incarnation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(target_os = "macos")]
-use super::process::{GroupSignal, process_info_apple};
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "macos")]
+use super::{
+    kill_group,
+    process::{GroupSignal, KILL_WAIT, POLL_STEP, TERM_WAIT, is_definitely_dead, process_info_apple},
+};
 
 type StartTime = (u64, u64);
 
@@ -19,6 +25,7 @@ const MAX_TREE_DEPTH: usize = 128;
 struct ProcFact {
     pid: u32,
     ppid: u32,
+    pgid: u32,
     // Seconds and microseconds, without floating-point rounding or overflow.
     start_time: StartTime,
 }
@@ -27,6 +34,7 @@ struct ProcFact {
 struct Target<'a> {
     fact: &'a ProcFact,
     depth: usize,
+    in_group: bool,
 }
 
 /// Authenticate the root and every parent edge before returning a deepest-first
@@ -67,6 +75,7 @@ fn kill_tree(
     let mut pending = vec![Target {
         fact: root_fact,
         depth: 0,
+        in_group: false,
     }];
     let mut targets = Vec::new();
     while let Some(target) = pending.pop() {
@@ -88,7 +97,11 @@ fn kill_tree(
             if targets.len() + pending.len() + 1 >= MAX_TREE_PROCESSES {
                 return Err("verified owner's process tree exceeds the size limit");
             }
-            pending.push(Target { fact: child, depth });
+            pending.push(Target {
+                fact: child,
+                depth,
+                in_group: false,
+            });
         }
         targets.push(target);
     }
@@ -101,11 +114,94 @@ fn kill_tree(
     Ok(targets)
 }
 
-/// `expected` is the native `apple:seconds:microseconds` ownership identity.
-/// The outcome describes the owner's signal, as with the other GroupSignal
-/// primitives; inaccessible or exited descendants don't authorize other PIDs.
+/// Add every authenticated live group member when the root owns that group.
+/// Group members need not remain descendants: shells can reparent them, and
+/// descendants can leave the group. Neither observation invalidates capture.
+fn capture_members<'a>(
+    snapshot: &'a [ProcFact],
+    root: u32,
+    expected_start: StartTime,
+    root_group: u32,
+    group_members: &'a [ProcFact],
+) -> Result<Vec<Target<'a>>, &'static str> {
+    let mut targets = kill_tree(snapshot, root, expected_start)?;
+    if targets.last().is_none_or(|target| target.fact.pgid != root_group) {
+        return Err("owner process group changed during capture");
+    }
+    if root_group != root {
+        // A member of the user's shell group doesn't own its parent/siblings.
+        return Ok(targets);
+    }
+    if group_members.len() > MAX_SNAPSHOT_PROCESSES {
+        return Err("process group snapshot exceeds the safety limit");
+    }
+    let mut by_pid = HashMap::with_capacity(targets.len());
+    for (index, target) in targets.iter_mut().enumerate() {
+        target.in_group = target.fact.pgid == root;
+        by_pid.insert(target.fact.pid, index);
+    }
+    for member in group_members {
+        if member.pid <= 1 || member.pgid != root {
+            continue;
+        }
+        if let Some(&index) = by_pid.get(&member.pid) {
+            let target = &mut targets[index];
+            if target.fact.start_time != member.start_time {
+                return Err("captured PID identity changed between process snapshots");
+            }
+            target.fact = member;
+            target.in_group = true;
+            continue;
+        }
+        if targets.len() == MAX_TREE_PROCESSES {
+            return Err("captured process set exceeds the size limit");
+        }
+        by_pid.insert(member.pid, targets.len());
+        targets.push(Target {
+            fact: member,
+            depth: 1,
+            in_group: true,
+        });
+    }
+    targets.sort_unstable_by(|left, right| {
+        right
+            .depth
+            .cmp(&left.depth)
+            .then_with(|| left.fact.pid.cmp(&right.fact.pid))
+    });
+    Ok(targets)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Observation {
+    Gone,
+    Present(StartTime),
+    Unknown,
+}
+
+/// Query failures are survivors, not evidence of exit. A different creation
+/// time proves the captured incarnation has gone without authorizing its PID.
+fn survivors(
+    captured: &[Target<'_>],
+    mut observe: impl FnMut(u32) -> Observation,
+) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for target in captured {
+        match observe(target.fact.pid) {
+            Observation::Gone => {}
+            Observation::Present(start) if start != target.fact.start_time => {}
+            Observation::Present(_) | Observation::Unknown => pids.push(target.fact.pid),
+        }
+    }
+    pids.sort_unstable();
+    pids
+}
+
+/// `expected` is the native `apple:seconds:microseconds` seat-root identity.
+/// Return success only after every captured incarnation has exited or its PID
+/// has been reused. Unknown state remains a survivor through both deadlines.
 #[cfg(target_os = "macos")]
-pub(crate) fn terminate(root: u32, expected: &str) -> Result<GroupSignal, &'static str> {
+pub(crate) fn terminate(root: u32, expected: &str) -> Result<GroupSignal, String> {
     let (seconds, micros) = expected
         .strip_prefix("apple:")
         .and_then(|identity| identity.split_once(':'))
@@ -120,41 +216,62 @@ pub(crate) fn terminate(root: u32, expected: &str) -> Result<GroupSignal, &'stat
             .filter(|micros| *micros < 1_000_000)
             .ok_or("recorded Apple process creation time is unreadable")?,
     );
+    // Authenticate before any enumeration or signal, not just at the last
+    // moment. A stale receipt never authorizes capture from a recycled root.
+    let verified_root = process_fact(root)
+        .filter(|fact| fact.start_time == expected_start)
+        .ok_or("owner identity changed or became unreadable before tree capture")?;
     let snapshot = snapshot()?;
-    let targets = kill_tree(&snapshot, root, expected_start)?;
+    let group_members = if verified_root.pgid == root {
+        group_snapshot(root)?
+    } else {
+        Vec::new()
+    };
+    let targets = capture_members(
+        &snapshot,
+        root,
+        expected_start,
+        verified_root.pgid,
+        &group_members,
+    )?;
+    let leader = verified_root.pgid == root;
+    let current_root = process_fact(root)
+        .filter(|fact| fact.start_time == expected_start && (!leader || fact.pgid == root))
+        .ok_or("owner identity or process group changed before tree termination")?;
 
-    // This gate runs before *any* signal, not just before the root's (last)
-    // signal. A reused or unreadable owner invalidates the entire plan.
-    if process_fact(root).map(|fact| fact.start_time) != Some(expected_start) {
-        return Err("owner identity changed or became unreadable before tree termination");
+    let mut outcome = GroupSignal::NotFound;
+    if leader {
+        // SAFETY: current_root has a positive representable PID, matching
+        // creation time, and PGID == PID. This is never a shared parent group.
+        outcome = signal_result(unsafe { libc::killpg(current_root.pid as libc::pid_t, libc::SIGTERM) });
     }
-    for target in targets {
-        let pid = target.fact.pid;
-        if process_fact(pid).map(|fact| fact.start_time) != Some(target.fact.start_time) {
-            if pid == root {
-                // Earlier descendants may already have received SIGTERM, but
-                // never signal a new incarnation of the owner itself.
-                return Err("owner identity changed or became unreadable during tree termination");
-            }
+    for target in &targets {
+        if leader && target.in_group {
             continue;
         }
-        // process_fact rejects reserved and unrepresentable PIDs, so this is
-        // always one positive PID, never kill(0), kill(-1), or a group signal.
-        // SAFETY: kill receives a checked process ID and a valid signal.
-        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        if pid == root {
-            return Ok(if result == 0 {
-                GroupSignal::Sent
-            } else {
-                match std::io::Error::last_os_error().raw_os_error() {
-                    Some(libc::ESRCH) => GroupSignal::NotFound,
-                    Some(libc::EPERM) => GroupSignal::PermissionDenied,
-                    _ => GroupSignal::Other,
-                }
-            });
+        if let Some(result) = signal_one(target, libc::SIGTERM)
+            && target.fact.pid == root
+        {
+            outcome = result;
         }
     }
-    Err("verified owner is missing from the termination plan")
+    let remaining = wait_for_exit(&targets, TERM_WAIT);
+    if remaining.is_empty() {
+        return Ok(outcome);
+    }
+    // Only captured, still-matching incarnations authorize escalation. The
+    // root may already have exited, so never repeat a bare process-group kill.
+    for target in &targets {
+        if remaining.binary_search(&target.fact.pid).is_ok() {
+            let _ = signal_one(target, libc::SIGKILL);
+        }
+    }
+    let remaining = wait_for_exit(&targets, KILL_WAIT);
+    if remaining.is_empty() {
+        Ok(outcome)
+    } else {
+        Err(format!("captured processes survived termination: {remaining:?}"))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -169,8 +286,73 @@ fn process_fact(pid: u32) -> Option<ProcFact> {
     Some(ProcFact {
         pid,
         ppid: info.pbi_ppid,
+        pgid: info.pbi_pgid,
         start_time: (info.pbi_start_tvsec, info.pbi_start_tvusec),
     })
+}
+
+#[cfg(target_os = "macos")]
+fn group_snapshot(root: u32) -> Result<Vec<ProcFact>, String> {
+    let pids = kill_group::live_members(root)?;
+    let mut facts = Vec::with_capacity(pids.len());
+    for pid in pids {
+        match process_fact(pid) {
+            Some(fact) if fact.pgid == root => facts.push(fact),
+            Some(_) => {}
+            None if is_definitely_dead(pid) => {}
+            None => return Err(format!("could not authenticate process-group member {pid}")),
+        }
+    }
+    Ok(facts)
+}
+
+#[cfg(target_os = "macos")]
+fn observe(pid: u32) -> Observation {
+    if is_definitely_dead(pid) {
+        Observation::Gone
+    } else if let Some(fact) = process_fact(pid) {
+        Observation::Present(fact.start_time)
+    } else {
+        Observation::Unknown
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn signal_one(target: &Target<'_>, signal: libc::c_int) -> Option<GroupSignal> {
+    if observe(target.fact.pid) != Observation::Present(target.fact.start_time) {
+        return None;
+    }
+    // SAFETY: observe authenticated one positive, representable PID's exact
+    // incarnation. The caller supplies only SIGTERM or SIGKILL.
+    Some(signal_result(unsafe {
+        libc::kill(target.fact.pid as libc::pid_t, signal)
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn signal_result(result: libc::c_int) -> GroupSignal {
+    if result == 0 {
+        GroupSignal::Sent
+    } else {
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => GroupSignal::NotFound,
+            Some(libc::EPERM) => GroupSignal::PermissionDenied,
+            _ => GroupSignal::Other,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_exit(captured: &[Target<'_>], grace: Duration) -> Vec<u32> {
+    let deadline = Instant::now() + grace;
+    loop {
+        let remaining = survivors(captured, observe);
+        let now = Instant::now();
+        if remaining.is_empty() || now >= deadline {
+            return remaining;
+        }
+        std::thread::sleep(POLL_STEP.min(deadline.saturating_duration_since(now)));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -221,6 +403,7 @@ mod tests {
         ProcFact {
             pid,
             ppid,
+            pgid: 5,
             start_time: (100, micros),
         }
     }
@@ -395,6 +578,152 @@ mod tests {
         assert_eq!(
             kill_tree(&snapshot, root.pid, root.start_time).unwrap_err(),
             "process snapshot exceeds the safety limit"
+        );
+    }
+
+    #[test]
+    fn kill_tree_capture_includes_the_owned_group_and_escaped_descendants() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 5, 10)
+        };
+        let escaped = ProcFact {
+            pgid: 99,
+            ..fact(11, 10, 11)
+        };
+        let child = ProcFact {
+            pgid: 10,
+            ..fact(12, 10, 12)
+        };
+        let reparented = ProcFact {
+            pgid: 10,
+            ..fact(20, 1, 9)
+        };
+        let snapshot = [root, escaped, child, fact(5, 2, 1), fact(6, 5, 2)];
+        let members = [
+            root,
+            child,
+            reparented,
+            fact(21, 1, 21),
+            ProcFact {
+                pgid: 10,
+                ..fact(1, 10, 11)
+            },
+        ];
+        let captured = capture_members(&snapshot, 10, root.start_time, 10, &members).unwrap();
+        let mut pids: Vec<_> = captured.iter().map(|target| target.fact.pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, [10, 11, 12, 20]);
+        for target in &captured {
+            assert_eq!(target.in_group, target.fact.pid != 11);
+        }
+        assert_eq!(captured.last().unwrap().fact.pid, 10);
+    }
+
+    #[test]
+    fn kill_tree_capture_never_adopts_a_nonleaders_shared_group() {
+        let root = fact(10, 5, 10);
+        let parent = fact(5, 2, 1);
+        let sibling = fact(6, 5, 2);
+        let child = fact(11, 10, 11);
+        let snapshot = [root, parent, sibling, child];
+        let members = [root, parent, sibling, child];
+        let captured = capture_members(&snapshot, 10, root.start_time, 5, &members).unwrap();
+        let pids: Vec<_> = captured.iter().map(|target| target.fact.pid).collect();
+        assert_eq!(pids, [11, 10]);
+        assert!(captured.iter().all(|target| !target.in_group));
+    }
+
+    #[test]
+    fn kill_tree_capture_rejects_an_identity_change_between_snapshots() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 5, 10)
+        };
+        let child = ProcFact {
+            pgid: 10,
+            ..fact(11, 10, 11)
+        };
+        let replacement = ProcFact {
+            start_time: (100, 12),
+            ..child
+        };
+        assert_eq!(
+            capture_members(&[root, child], 10, root.start_time, 10, &[replacement])
+                .unwrap_err(),
+            "captured PID identity changed between process snapshots"
+        );
+    }
+
+    #[test]
+    fn kill_tree_capture_rejects_a_changed_root_group() {
+        let root = fact(10, 5, 10);
+        assert_eq!(
+            capture_members(&[root], 10, root.start_time, 10, &[]).unwrap_err(),
+            "owner process group changed during capture"
+        );
+    }
+
+    #[test]
+    fn kill_tree_capture_bounds_additional_group_members() {
+        let root = ProcFact {
+            pgid: 10,
+            ..fact(10, 5, 0)
+        };
+        let snapshot = [root];
+        let mut members: Vec<_> = (0..MAX_TREE_PROCESSES - 1)
+            .map(|index| ProcFact {
+                pgid: 10,
+                ..fact(20 + index as u32, 1, index as u64)
+            })
+            .collect();
+        let captured = capture_members(&snapshot, 10, root.start_time, 10, &members).unwrap();
+        assert_eq!(captured.len(), MAX_TREE_PROCESSES);
+        assert_eq!(captured.last().unwrap().fact.pid, 10);
+        members.push(ProcFact {
+            pgid: 10,
+            ..fact(20 + MAX_TREE_PROCESSES as u32, 1, 9_000)
+        });
+        assert_eq!(
+            capture_members(&snapshot, 10, root.start_time, 10, &members).unwrap_err(),
+            "captured process set exceeds the size limit"
+        );
+    }
+
+    #[test]
+    fn kill_tree_survivors_require_positive_exit_or_reuse_evidence() {
+        let root = fact(10, 5, 10);
+        let snapshot = [
+            root,
+            fact(11, 10, 11),
+            fact(12, 10, 12),
+            fact(13, 10, 13),
+        ];
+        let captured = capture_members(&snapshot, 10, root.start_time, 5, &[]).unwrap();
+        let remaining = survivors(&captured, |pid| match pid {
+            10 => Observation::Present(root.start_time),
+            11 => Observation::Gone,
+            12 => Observation::Present((100, 14)),
+            13 => Observation::Unknown,
+            _ => panic!("unexpected captured PID"),
+        });
+        assert_eq!(remaining, [10, 13]);
+    }
+
+    #[test]
+    fn kill_tree_survivors_accept_gone_or_reused_roots_and_children() {
+        let root = fact(10, 5, 10);
+        let snapshot = [root, fact(11, 10, 11)];
+        let captured = capture_members(&snapshot, 10, root.start_time, 5, &[]).unwrap();
+        assert_eq!(
+            survivors(&captured, |pid| {
+                if pid == 10 {
+                    Observation::Present((101, 0))
+                } else {
+                    Observation::Gone
+                }
+            }),
+            Vec::<u32>::new()
         );
     }
 }
