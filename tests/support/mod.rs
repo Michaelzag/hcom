@@ -343,6 +343,8 @@ impl Hcom {
             fs::create_dir_all(dir)
                 .unwrap_or_else(|e| panic!("create isolated directory {}: {e}", dir.display()));
         }
+        fs::write(hcom_dir.join("config.toml"), "[relay]\nenabled = false\n")
+            .expect("disable relay in the isolated fixture");
 
         // Prime the update-check cache at its production path
         // (`$HCOM_DIR/.tmp/flags/update_check`, see `flag_path()` in

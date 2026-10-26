@@ -188,9 +188,11 @@ pub mod test_helpers {
         let test_home = dir.path().to_path_buf();
         let hcom_dir = test_home.join(".hcom");
         std::fs::create_dir_all(&hcom_dir).unwrap();
-        if let Some(config) = config {
-            std::fs::write(hcom_dir.join("config.toml"), config).unwrap();
-        }
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            config.unwrap_or("[relay]\nenabled = false\n"),
+        )
+        .unwrap();
         // Claim this tempdir as a disposable root so Config trusts it (temp-tree
         // geography alone is not enough — see paths::test_roots).
         crate::paths::test_roots::register(&test_home);
