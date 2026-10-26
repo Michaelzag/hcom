@@ -1741,30 +1741,118 @@ mod tests {
     }
 
     #[test]
-    fn a_root_that_exits_and_is_reaped_once_its_tree_is_signaled_is_success() {
-        // The root shell exits as soon as its sleeper dies, and its own
-        // parent reaps it at once: the root can vanish between its child's
-        // signal and its own. Repeat to make that narrow window likely.
-        for _ in 0..40 {
-            let anchor = spawn("sh -c 'sleep 30 & wait' & wait", 0);
-            let group = anchor.id();
-            let fixture = Fixture {
-                group,
-                children: vec![anchor],
-            };
-            let tree = captured(group, 3);
-            let root = tree
-                .iter()
-                .find(|member| member.depth == 1)
-                .expect("root shell")
-                .pid;
-            let result = terminate_tree(root, &identity(root).unwrap());
-            assert!(
-                matches!(result, Ok(GroupSignal::Sent | GroupSignal::NotFound)),
-                "{result:?}"
-            );
-            drop(fixture);
+    fn a_root_that_exits_and_is_reaped_before_its_own_signal_is_success() {
+        // Anchor -> root shell -> sleeper. The anchor reaps the root at once.
+        let anchor = spawn("sh -c 'sleep 30 & wait' & wait; exec sleep 30", 0);
+        let group = anchor.id();
+        let fixture = Fixture {
+            group,
+            children: vec![anchor],
+        };
+        let tree = captured(group, 3);
+        let root = tree
+            .iter()
+            .find(|member| member.depth == 1)
+            .expect("root shell")
+            .pid;
+        // `authorize` runs after the capture and before any signal: end and
+        // reap the root there, the way a root that waited on its signaled
+        // descendants exits on its own, so it is gone at its own signal.
+        let mut ended = false;
+        let result = terminate(
+            root,
+            &identity(root).unwrap(),
+            &[],
+            &[],
+            |_| EnvRead::Absent,
+            |_| true,
+            |pid| {
+                if pid == root && !ended {
+                    ended = true;
+                    // SAFETY: the root shell this test spawned, still live.
+                    unsafe { libc::kill(root as libc::pid_t, libc::SIGKILL) };
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    // Reaped, not merely a zombie: a zombie keeps its
+                    // identity and can still take a signal.
+                    while Path::new(&format!("/proc/{root}")).exists() {
+                        assert!(Instant::now() < deadline, "root was never reaped");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(GroupSignal::NotFound));
+        assert!(
+            tree.iter()
+                .filter(|member| member.pid != group)
+                .all(|member| !running(member))
+        );
+        drop(fixture);
+    }
+
+    #[test]
+    fn a_leader_root_reaped_before_its_signal_still_gets_its_group_signaled() {
+        // Anchor -> root (setsid: its own session and group) -> sleeper in
+        // the root's group. The anchor reaps the root at once.
+        let anchor = spawn("setsid sh -c 'sleep 30 & wait' & wait; exec sleep 30", 0);
+        let group = anchor.id();
+        let fixture = Fixture {
+            group,
+            children: vec![anchor],
+        };
+        let tree = captured(group, 3);
+        let root = tree
+            .iter()
+            .find(|member| member.depth == 1)
+            .expect("root shell")
+            .pid;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(observe(Path::new("/proc"), root), Seen::Live(fact) if fact.pgrp == root) {
+            assert!(Instant::now() < deadline, "root never led its own group");
+            std::thread::sleep(Duration::from_millis(5));
         }
+        // The sleeper left the anchor's group with the root, so the fixture
+        // can't reach it; this kills it only while it is that incarnation.
+        let sleeper = tree
+            .iter()
+            .find(|member| member.depth == 2)
+            .expect("sleeper");
+        let stray = Stray {
+            pid: sleeper.pid,
+            start: sleeper.start,
+        };
+
+        let mut ended = false;
+        let began = Instant::now();
+        let result = terminate(
+            root,
+            &identity(root).unwrap(),
+            &[],
+            &[],
+            |_| EnvRead::Absent,
+            |_| true,
+            |pid| {
+                if pid == root && !ended {
+                    ended = true;
+                    // SAFETY: the root shell this test spawned, still live.
+                    unsafe { libc::kill(root as libc::pid_t, libc::SIGKILL) };
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while Path::new(&format!("/proc/{root}")).exists() {
+                        assert!(Instant::now() < deadline, "root was never reaped");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(GroupSignal::NotFound));
+        assert!(!running(sleeper));
+        // The group got per-PID SIGTERMs at once, not SIGKILL after the
+        // whole TERM budget.
+        assert!(began.elapsed() < TERM_WAIT, "{:?}", began.elapsed());
+        drop(stray);
+        drop(fixture);
     }
 
     #[test]
