@@ -148,7 +148,7 @@ fn recent_launch_failures(db: &HcomDb, limit: usize) -> Vec<(String, String)> {
     rows.filter_map(Result::ok).collect()
 }
 
-fn finalize_timed_out_launches(db: &HcomDb) {
+pub(crate) fn finalize_timed_out_launches(db: &HcomDb) {
     if let Ok(instances) = db.iter_instances_full() {
         for instance in instances {
             if crate::instances::is_launching_placeholder(&instance) {
