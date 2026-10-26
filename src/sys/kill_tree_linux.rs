@@ -499,35 +499,26 @@ impl<P: FnMut(u32) -> EnvRead, E: FnMut(u32) -> bool> Sweep<'_, P, E> {
     }
 }
 
-/// The root's ancestors (its launch wrapper and everything above) are never
-/// signaled. Refuse, before any signal, a capture that holds one, and a
-/// group signal that could reach one: an ancestor in the root's group, or an
-/// ancestry too broken to rule that out.
-fn spares_ancestry(
+/// Whether the leader's killpg may run: only when it can reach nothing the
+/// kill must spare. An ancestor or excluded PID in the root's group (the root
+/// itself included), or an ancestry too broken to rule an ancestor out,
+/// sends every captured member its own signal instead; nothing is refused.
+fn group_signal_allowed(
     snapshot: &[ProcFact],
     root: u32,
-    group_signal: bool,
+    leader: bool,
     lineage: &Lineage,
     members: &[Member],
-) -> Result<(), &'static str> {
-    if members
-        .iter()
-        .any(|member| lineage.ancestors.contains(&member.pid))
-    {
-        return Err("a root ancestor is in the captured set");
-    }
-    if group_signal {
-        if !lineage.complete {
-            return Err("root ancestry is unreadable, so its group signal could reach an ancestor");
-        }
-        if snapshot
+) -> bool {
+    let spared = |pid: u32| lineage.ancestors.contains(&pid) || lineage.spares(pid);
+    leader
+        && lineage.complete
+        && !snapshot
             .iter()
-            .any(|fact| fact.pgrp == root && lineage.ancestors.contains(&fact.pid))
-        {
-            return Err("a root ancestor shares the root's process group");
-        }
-    }
-    Ok(())
+            .any(|fact| fact.pgrp == root && spared(fact.pid))
+        && !members
+            .iter()
+            .any(|member| member.in_group && spared(member.pid))
 }
 
 /// `expected` is the native `linux:<boot_id>:<start_ticks>` identity of the
@@ -565,13 +556,11 @@ pub(crate) fn terminate(
         verify_group(proc_root, root, &mut members)?;
     }
     let lineage = Lineage::of(&snapshot, root).excluding(excluded);
-    // killpg can't skip a PID: any excluded group member, the root included,
-    // means every captured member gets its own per-PID signal instead.
-    let group_signal = leader
-        && !members
-            .iter()
-            .any(|member| member.in_group && lineage.spares(member.pid));
-    spares_ancestry(&snapshot, root, group_signal, &lineage, &members)?;
+    let group_signal = group_signal_allowed(&snapshot, root, leader, &lineage, &members);
+    // The root's ancestors (its launch wrapper and everything above) are
+    // never signaled, confirmed or walked through, even when they share its
+    // group; excluded PIDs stay as anchors and are skipped at each signal.
+    members.retain(|member| !lineage.ancestors.contains(&member.pid));
     let mut sweep = Sweep {
         proc_root,
         root_start: expected_start,
@@ -1130,46 +1119,47 @@ mod tests {
     }
 
     #[test]
-    fn no_capture_or_group_signal_may_reach_a_root_ancestor() {
+    fn a_group_signal_runs_only_when_it_can_reach_nothing_spared() {
         let snapshot = carrier_snapshot();
         let lineage = Lineage::of(&snapshot, 10);
         let members = capture(&snapshot, 10, 100).unwrap();
-        assert_eq!(
-            spares_ancestry(&snapshot, 10, true, &lineage, &members),
-            Ok(())
-        );
-
-        // The same-tick ancestor 5 captured as a member.
-        let mut holding = members.clone();
-        holding.push(Member {
-            pid: 5,
-            start: 100,
-            depth: 1,
-            in_group: false,
-            carrier: false,
-        });
-        assert!(spares_ancestry(&snapshot, 10, false, &lineage, &holding).is_err());
+        assert!(group_signal_allowed(
+            &snapshot, 10, true, &lineage, &members
+        ));
+        assert!(!group_signal_allowed(
+            &snapshot, 10, false, &lineage, &members
+        ));
 
         // Ancestor 3 moved into the root's group: killpg would reach it.
         let joined: Vec<ProcFact> = snapshot
             .iter()
             .map(|f| if f.pid == 3 { fact(3, 1, 10, 50) } else { *f })
             .collect();
-        assert!(spares_ancestry(&joined, 10, true, &lineage, &members).is_err());
-        // A non-leader root sends no group signal, so that can't happen.
-        assert_eq!(
-            spares_ancestry(&joined, 10, false, &lineage, &members),
-            Ok(())
-        );
+        assert!(!group_signal_allowed(&joined, 10, true, &lineage, &members));
+
+        // An excluded group member, or an excluded root.
+        for spared in [[20], [10]] {
+            let excluding = Lineage::of(&snapshot, 10).excluding(&spared);
+            assert!(!group_signal_allowed(
+                &snapshot, 10, true, &excluding, &members
+            ));
+        }
+        // An excluded PID outside the group doesn't matter to killpg.
+        let outside = Lineage::of(&snapshot, 10).excluding(&[30]);
+        assert!(group_signal_allowed(
+            &snapshot, 10, true, &outside, &members
+        ));
 
         // A broken ancestry can't rule out an ancestor in the group.
         let broken: Vec<ProcFact> = snapshot.iter().copied().filter(|f| f.pid != 3).collect();
         let broken_lineage = Lineage::of(&broken, 10);
-        assert!(spares_ancestry(&broken, 10, true, &broken_lineage, &members).is_err());
-        assert_eq!(
-            spares_ancestry(&broken, 10, false, &broken_lineage, &members),
-            Ok(())
-        );
+        assert!(!group_signal_allowed(
+            &broken,
+            10,
+            true,
+            &broken_lineage,
+            &members
+        ));
     }
 
     #[test]
@@ -1668,5 +1658,82 @@ mod tests {
             "excluded root was signaled"
         );
         drop(fixture);
+    }
+
+    /// SIGKILLs and reaps one process this test forked.
+    struct Forked(libc::pid_t);
+
+    impl Drop for Forked {
+        fn drop(&mut self) {
+            // SAFETY: our own forked child; waitpid reaps it after the kill.
+            unsafe {
+                libc::kill(self.0, libc::SIGKILL);
+                libc::waitpid(self.0, std::ptr::null_mut(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_leader_root_sharing_its_group_with_its_parent_spares_the_parent() {
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .expect("a sleep binary");
+        let path = std::ffi::CString::new(sleep).unwrap();
+        let (arg0, arg1) = (c"sleep", c"30");
+        let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
+        // The parent forks the root, makes it lead its own group, then joins
+        // that group itself: a leader root whose group holds its ancestor.
+        // SAFETY: between fork and exec the children call only fork, setpgid,
+        // execv and _exit, all async-signal-safe; argv was built beforehand.
+        let parent = unsafe { libc::fork() };
+        assert!(parent >= 0, "fork failed");
+        if parent == 0 {
+            unsafe {
+                let root = libc::fork();
+                if root == 0 {
+                    libc::setpgid(0, 0);
+                    libc::execv(path.as_ptr(), argv.as_ptr());
+                    libc::_exit(127);
+                }
+                if root > 0 {
+                    libc::setpgid(root, root);
+                    libc::setpgid(0, root);
+                    libc::execv(path.as_ptr(), argv.as_ptr());
+                }
+                libc::_exit(127);
+            }
+        }
+        let parent_guard = Forked(parent);
+        let parent = parent as u32;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let root = loop {
+            let snapshot = snapshot(Path::new("/proc")).unwrap();
+            let child = snapshot.iter().find(|fact| fact.ppid == parent).copied();
+            let parent_fact = snapshot.iter().find(|fact| fact.pid == parent).copied();
+            if let (Some(child), Some(parent_fact)) = (child, parent_fact)
+                && child.pgrp == child.pid
+                && parent_fact.pgrp == child.pid
+            {
+                break child.pid;
+            }
+            assert!(Instant::now() < deadline, "fixture group never formed");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        wait_for_sleep(root);
+        wait_for_sleep(parent);
+        let root_stray = Stray {
+            pid: root,
+            start: start_of(root).unwrap(),
+        };
+        let parent_start = start_of(parent).unwrap();
+
+        let result = terminate_tree(root, &identity(root).unwrap());
+        assert_eq!(result, Ok(GroupSignal::Sent));
+        assert_ne!(start_of(root), Some(root_stray.start), "root survived");
+        assert_eq!(start_of(parent), Some(parent_start), "parent was signaled");
+        drop(root_stray);
+        drop(parent_guard);
     }
 }
