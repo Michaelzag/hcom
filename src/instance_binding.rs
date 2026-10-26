@@ -1253,8 +1253,10 @@ pub(crate) fn record_omp_launch_pid(
 /// Record the PTY child, this launch's last pre-hook pin, and with it the
 /// launch's `omp_launch_root` `{pid, identity}`: the tree `hcom kill` must
 /// reach after the first hook re-pins the owner to the interpreter. One
-/// identity read fills the root and the receipt, in the pin's transaction and
-/// CAS. Only this writer creates a root; later owner pins carry it unchanged.
+/// identity read fills the root and the receipt. A won pin writes both in one
+/// CAS; a pin lost to the first hook still records the root for the same
+/// reservation ([`record_late_omp_launch_root`]). A root is written only while
+/// absent and never overwritten; an unreadable identity writes none.
 pub(crate) fn record_omp_launch_root(
     db: &HcomDb,
     expected: &mut OmpLaunchPidSnapshot,
@@ -1269,15 +1271,26 @@ fn record_omp_launch_pin(
     new_pid: u32,
     records_root: bool,
 ) -> anyhow::Result<bool> {
+    let identity = crate::sys::process::identity(new_pid);
+    let root = identity
+        .as_ref()
+        .filter(|_| records_root)
+        .map(|identity| serde_json::json!({"pid": new_pid, "identity": identity}));
     let (changed, receipt) = db.with_immediate_transaction(|tx| {
+        let lost = || -> anyhow::Result<(bool, Option<serde_json::Value>)> {
+            if let Some(root) = &root {
+                record_late_omp_launch_root(db, tx, expected, root)?;
+            }
+            Ok((false, None))
+        };
         if process_binding_epoch(db, &expected.process_id)?.as_ref() != Some(&expected.binding) {
-            return Ok((false, None));
+            return lost();
         }
         let Some(current) = db.get_instance_full(&expected.row.name)? else {
-            return Ok((false, None));
+            return lost();
         };
         if !same_row_incarnation(Some(&expected.row), Some(&current)) {
-            return Ok((false, None));
+            return lost();
         }
         let current_context_text = current.launch_context.as_deref().unwrap_or("");
         let context = if current_context_text.is_empty() {
@@ -1291,7 +1304,7 @@ fn record_omp_launch_pin(
             .and_then(|context| context.get("omp_launch_pid"))
             != expected.receipt.as_ref()
         {
-            return Ok((false, None));
+            return lost();
         }
         // A context that is no JSON object takes the generic owner CAS, which
         // never writes a root.
@@ -1307,17 +1320,13 @@ fn record_omp_launch_pin(
             };
             return Ok((changed, receipt));
         };
-        let identity = crate::sys::process::identity(new_pid);
-        if records_root {
-            match &identity {
-                Some(identity) => context.insert(
-                    "omp_launch_root".into(),
-                    serde_json::json!({"pid": new_pid, "identity": identity}),
-                ),
-                None => context.remove("omp_launch_root"),
-            };
-        } else if expected.starts_reservation {
+        if expected.starts_reservation {
             context.remove("omp_launch_root");
+        }
+        if let Some(root) = &root
+            && !context.contains_key("omp_launch_root")
+        {
+            context.insert("omp_launch_root".into(), root.clone());
         }
         let receipt = identity
             .map(|identity| {
@@ -1343,7 +1352,10 @@ fn record_omp_launch_pin(
             new_pid,
             &new_context_text,
         )?;
-        Ok((changed, context.remove("omp_launch_pid")))
+        if !changed {
+            return lost();
+        }
+        Ok((true, context.remove("omp_launch_pid")))
     })?;
     if changed {
         expected.row.pid = Some(i64::from(new_pid));
@@ -1351,6 +1363,52 @@ fn record_omp_launch_pin(
         expected.starts_reservation = false;
     }
     Ok(changed)
+}
+
+/// The PTY child's pin lost its CAS, usually to the first hook, which already
+/// bound this launch and re-pinned its owner. The root is still this launch's
+/// PTY child: record it only while absent, on the row this launch's UUID maps
+/// to, and leave the owner PID and receipt alone. The same reservation is the
+/// same row incarnation, bound by this launch's own hook or still on its own
+/// epoch and pin, or the canonical row its own hook moved the launch to.
+fn record_late_omp_launch_root(
+    db: &HcomDb,
+    tx: &rusqlite::Transaction<'_>,
+    expected: &OmpLaunchPidSnapshot,
+    root: &serde_json::Value,
+) -> anyhow::Result<bool> {
+    let Some(binding) = process_binding_epoch(db, &expected.process_id)? else {
+        return Ok(false);
+    };
+    let Some(row) = db.get_instance_full(&binding.instance_name)? else {
+        return Ok(false);
+    };
+    let hooked = binding.session_id.is_some();
+    let same_reservation = if row.name == expected.row.name {
+        row.created_at.to_bits() == expected.row.created_at.to_bits()
+            && row.agent_id == expected.row.agent_id
+            && (hooked || (binding == expected.binding && row.pid == expected.row.pid))
+    } else {
+        hooked
+    };
+    if !same_reservation
+        || row.tool != "omp"
+        || !row.origin_device_id.as_deref().is_none_or(str::is_empty)
+    {
+        return Ok(false);
+    }
+    let text = row.launch_context.as_deref().unwrap_or("");
+    let context = if text.is_empty() {
+        Some(serde_json::Map::new())
+    } else {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).ok()
+    };
+    let Some(mut context) = context.filter(|context| !context.contains_key("omp_launch_root"))
+    else {
+        return Ok(false);
+    };
+    context.insert("omp_launch_root".into(), root.clone());
+    db.compare_and_set_launch_context_in_txn(tx, &row, text, &serde_json::to_string(&context)?)
 }
 
 pub(crate) fn is_launch_reservation_shape(row: &InstanceRow) -> bool {

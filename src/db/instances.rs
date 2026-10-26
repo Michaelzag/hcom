@@ -333,6 +333,31 @@ impl HcomDb {
         Ok(changed == 1)
     }
 
+    /// Replace one row's launch_context while its incarnation and context
+    /// text are unchanged. PID and the other columns are untouched. The
+    /// caller owns the immediate transaction.
+    pub(crate) fn compare_and_set_launch_context_in_txn(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        expected: &InstanceRow,
+        current_context_text: &str,
+        new_context_text: &str,
+    ) -> Result<bool> {
+        let changed = tx.execute(
+            "UPDATE instances SET launch_context = ?5
+             WHERE name = ?1 AND created_at = ?2 AND agent_id IS ?3
+               AND COALESCE(launch_context, '') = ?4",
+            params![
+                expected.name,
+                expected.created_at,
+                expected.agent_id,
+                current_context_text,
+                new_context_text,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Store launch_context JSON (terminal preset, pane_id, env snapshot).
     /// Merges incoming keys into existing JSON, only filling fields that are
     /// currently missing or empty so late-bound PTY metadata can be persisted

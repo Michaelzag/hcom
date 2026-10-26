@@ -84,11 +84,12 @@ fn pin_launch(db: &HcomDb, process_id: &str, runner: u32, pty: u32, child: u32) 
     assert!(record_omp_launch_root(db, &mut launch, child).unwrap());
 }
 
-/// The first hook: the PTY child started the interpreter, the nearest actual
-/// OMP below it, and the bind re-pins the owner there.
-fn hook_repin(db: &HcomDb, child: u32, interpreter: u32) -> Option<String> {
-    let owner = |anchor: u32| {
-        (anchor == child).then_some(OmpOwnerProof {
+/// The first hook: the row's pin (the PTY child, or `hcom pty` itself when
+/// the hook wins the race) is a non-OMP launcher, and the interpreter is the
+/// nearest actual OMP below it, so the bind re-pins the owner there.
+fn hook_repin(db: &HcomDb, anchor: u32, interpreter: u32) -> Option<String> {
+    let owner = |pid: u32| {
+        (pid == anchor).then_some(OmpOwnerProof {
             owner_pid: interpreter,
             anchor_kind: AncestorProcess::Other,
         })
@@ -536,15 +537,51 @@ fn a_resume_bind_moves_the_root_to_the_canonical_row_across_the_repin() {
 
 #[test]
 #[serial]
-fn a_lost_or_failed_root_pin_writes_no_root() {
+fn the_root_still_lands_when_the_first_hook_wins_the_race() {
+    let env = crate::hooks::test_helpers::isolated_test_env();
+    let db = open_db(&env.0, "hook_first");
+    seed_reservation(&db, None);
+    let (pty, child, interpreter) = (Live::spawn(), Live::spawn(), Live::spawn());
+    let mut launch = capture_omp_launch_pid(&db, LAUNCH_ID, "luna")
+        .unwrap()
+        .unwrap();
+    assert!(record_omp_launch_pid(&db, &mut launch, pty.pid()).unwrap());
+    // A fast OMP hooks before `hcom pty` writes its child pin.
+    assert_eq!(
+        hook_repin(&db, pty.pid(), interpreter.pid()).as_deref(),
+        Some("luna")
+    );
+    let hooked = row(&db, "luna");
+    let hooked_receipt = receipt(&db, "luna");
+    assert!(
+        !record_omp_launch_root(&db, &mut launch, child.pid()).unwrap(),
+        "the child pin must lose to the hook's owner pin"
+    );
+    assert_eq!(root(&db, "luna"), Some(root_of(child.pid())));
+    assert_eq!(row(&db, "luna").pid, hooked.pid, "the owner PID moved");
+    assert_eq!(
+        receipt(&db, "luna"),
+        hooked_receipt,
+        "the owner receipt moved"
+    );
+    // Never overwritten, not even by this launch's own later capture.
+    let again = Live::spawn();
+    assert!(!record_omp_launch_root(&db, &mut launch, again.pid()).unwrap());
+    assert_eq!(root(&db, "luna"), Some(root_of(child.pid())));
+}
+
+#[test]
+#[serial]
+fn a_lost_child_pin_records_the_root_only_for_its_own_reservation() {
     let env = crate::hooks::test_helpers::isolated_test_env();
     let (pty, child, other) = (Live::spawn(), Live::spawn(), Live::spawn());
-    for race in [
-        "launch bound first",
-        "pin moved",
-        "receipt rewritten",
-        "row replaced",
-        "write aborted",
+    // Each race and whether the child's root may still land.
+    for (race, roots) in [
+        ("receipt rewritten under the same pin", true),
+        ("pin moved by another writer", false),
+        ("launch binding released", false),
+        ("row recreated", false),
+        ("pin write aborted", false),
     ] {
         let db = open_db(&env.0, &race.replace(' ', "_"));
         seed_reservation(&db, None);
@@ -552,51 +589,112 @@ fn a_lost_or_failed_root_pin_writes_no_root() {
             .unwrap()
             .unwrap();
         assert!(record_omp_launch_pid(&db, &mut launch, pty.pid()).unwrap());
-        match race {
-            "launch bound first" => db
-                .set_process_binding(LAUNCH_ID, "sid-owner", "luna")
-                .unwrap(),
-            "pin moved" => db.update_instance_pid("luna", other.pid()).unwrap(),
-            "receipt rewritten" => {
-                db.conn()
-                    .execute(
-                        "UPDATE instances SET launch_context = json_set(launch_context,
-                             '$.omp_launch_pid.identity', 'rewritten') WHERE name = 'luna'",
-                        [],
-                    )
-                    .unwrap();
+        let sql = match race {
+            "receipt rewritten under the same pin" => {
+                "UPDATE instances SET launch_context = json_set(launch_context,
+                     '$.omp_launch_pid.identity', 'rewritten') WHERE name = 'luna'"
             }
-            "row replaced" => {
-                db.conn()
-                    .execute(
-                        "UPDATE instances SET created_at = 9.5 WHERE name = 'luna'",
-                        [],
-                    )
-                    .unwrap();
-            }
-            "write aborted" => {
-                db.conn()
-                    .execute_batch(
-                        "CREATE TRIGGER refuse_pin BEFORE UPDATE OF pid ON instances
-                         BEGIN SELECT RAISE(ABORT, 'pin refused'); END;",
-                    )
-                    .unwrap();
+            "pin moved by another writer" => "",
+            "launch binding released" => "DELETE FROM process_bindings",
+            "row recreated" => "UPDATE instances SET created_at = 9.5 WHERE name = 'luna'",
+            "pin write aborted" => {
+                "CREATE TRIGGER refuse_pin BEFORE UPDATE OF pid ON instances
+                 BEGIN SELECT RAISE(ABORT, 'pin refused'); END"
             }
             _ => unreachable!(),
+        };
+        if sql.is_empty() {
+            db.update_instance_pid("luna", other.pid()).unwrap();
+        } else {
+            db.conn().execute_batch(sql).unwrap();
         }
         let before = row(&db, "luna");
+        let before_receipt = receipt(&db, "luna");
         let recorded = record_omp_launch_root(&db, &mut launch, child.pid());
-        if race == "write aborted" {
+        if race == "pin write aborted" {
             assert!(recorded.is_err(), "{race}");
         } else {
             assert!(!recorded.unwrap(), "{race}");
         }
+        assert_eq!(row(&db, "luna").pid, before.pid, "{race}: owner PID moved");
+        assert_eq!(
+            receipt(&db, "luna"),
+            before_receipt,
+            "{race}: receipt moved"
+        );
+        assert_eq!(
+            root(&db, "luna"),
+            roots.then(|| root_of(child.pid())),
+            "{race}"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_late_capture_never_writes_into_a_replacement_reservation() {
+    let env = crate::hooks::test_helpers::isolated_test_env();
+    for replacement in ["row recreated", "pin released in place"] {
+        let db = open_db(&env.0, &replacement.replace(' ', "_"));
+        seed_reservation(&db, Some("sid-prior"));
+        let (first_pty, first_child) = (Live::spawn(), Live::spawn());
+        let mut first = capture_omp_launch_pid(&db, LAUNCH_ID, "luna")
+            .unwrap()
+            .unwrap();
+        assert!(record_omp_launch_pid(&db, &mut first, first_pty.pid()).unwrap());
+        if replacement == "row recreated" {
+            let expected = row(&db, "luna");
+            let bindings = db.process_binding_ids("luna").unwrap();
+            assert_eq!(
+                crate::hooks::common::try_release_unhooked_omp_reservation(
+                    &db, &expected, &bindings, "test"
+                ),
+                Some(crate::hooks::common::StopOutcome::Stopped)
+            );
+            db.conn()
+                .execute(
+                    "INSERT INTO instances
+                     (name, tool, created_at, agent_id, session_id, status, status_context,
+                      last_event_id)
+                     VALUES ('luna', 'omp', 3.75, 'next-agent', 'sid-prior', 'inactive', 'new', 0)",
+                    [],
+                )
+                .unwrap();
+        } else {
+            let first_pin = first_pty.pid();
+            drop(first_pty);
+            assert!(!std::path::Path::new(&format!("/proc/{first_pin}")).exists());
+            assert!(
+                db.with_immediate_transaction(|tx| {
+                    prepare_own_omp_reservation_in_txn(&db, tx, "luna", "sid-prior", "omp")
+                })
+                .unwrap()
+                .is_none()
+            );
+        }
+        db.set_process_binding(NEXT_LAUNCH_ID, "", "luna").unwrap();
+        let next_pty = Live::spawn();
+        let mut next = capture_omp_launch_pid(&db, NEXT_LAUNCH_ID, "luna")
+            .unwrap()
+            .unwrap();
+        assert!(record_omp_launch_pid(&db, &mut next, next_pty.pid()).unwrap());
+        let replaced = row(&db, "luna");
+        assert!(
+            !record_omp_launch_root(&db, &mut first, first_child.pid()).unwrap(),
+            "{replacement}"
+        );
         let after = row(&db, "luna");
         assert_eq!(
             (after.pid, after.launch_context),
-            (before.pid, before.launch_context),
-            "{race}"
+            (replaced.pid, replaced.launch_context),
+            "{replacement}: the old launch wrote into its replacement"
         );
-        assert_eq!(root(&db, "luna"), None, "{race}");
+        let next_child = Live::spawn();
+        assert!(record_omp_launch_root(&db, &mut next, next_child.pid()).unwrap());
+        assert_eq!(
+            root(&db, "luna"),
+            Some(root_of(next_child.pid())),
+            "{replacement}"
+        );
     }
 }
