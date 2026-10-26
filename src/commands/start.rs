@@ -1010,19 +1010,7 @@ struct AnchorMiss {
 /// pid must be a live ancestor of this process, still the incarnation the
 /// snapshot recorded (start time, boot id).
 fn match_reclaim_anchor(db: &HcomDb, name: &str) -> Result<ReclaimAnchor, AnchorMiss> {
-    use rusqlite::OptionalExtension;
-    let newest = db
-        .conn()
-        .query_row(
-            "SELECT id, data FROM events
-             WHERE type='life'
-               AND instance=?
-               AND json_extract(data, '$.action') = 'stopped'
-             ORDER BY id DESC LIMIT 1",
-            rusqlite::params![name],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional();
+    let newest = db.find_latest_stopped_event_by_name(name);
     let (event_id, data) = match newest {
         Ok(Some(newest)) => newest,
         Ok(None) => {

@@ -1077,6 +1077,26 @@ enum OmpLaunchPin {
 
 /// Classify only the recorded launch pin, never a stopped identity's owner.
 fn omp_launch_pin_verdict(db: &HcomDb, row: &InstanceRow) -> anyhow::Result<OmpLaunchPin> {
+    omp_launch_pin_verdict_checked(
+        db,
+        row,
+        &crate::sys::process::is_definitely_dead,
+        &crate::sys::process::identity,
+    )
+}
+
+/// [`omp_launch_pin_verdict`] with the two native process facts supplied by
+/// the caller. Fact precedence is the policy: a positive `definitely_dead`
+/// proof (gone or zombie) is consulted before any identity read, and an
+/// unreadable identity (`None`) is never read as a mismatch. The launch
+/// receipt is still parsed and correlated against the DB here, so supplying
+/// facts cannot bypass receipt correlation.
+fn omp_launch_pin_verdict_checked(
+    db: &HcomDb,
+    row: &InstanceRow,
+    definitely_dead: &dyn Fn(u32) -> bool,
+    identity: &dyn Fn(u32) -> Option<String>,
+) -> anyhow::Result<OmpLaunchPin> {
     let Some(pid) = row.pid else {
         return Ok(OmpLaunchPin::Unpinned);
     };
@@ -1086,11 +1106,11 @@ fn omp_launch_pin_verdict(db: &HcomDb, row: &InstanceRow) -> anyhow::Result<OmpL
             reason: "is malformed",
         });
     };
-    if crate::sys::process::is_definitely_dead(process_pid) {
+    if definitely_dead(process_pid) {
         return Ok(OmpLaunchPin::Replaceable("exited"));
     }
     let receipt = OmpLaunchPidReceipt::parse(db, row)?;
-    match (receipt, crate::sys::process::identity(process_pid)) {
+    match (receipt, identity(process_pid)) {
         (Some(receipt), Some(current)) if current != receipt.identity => {
             Ok(OmpLaunchPin::Replaceable("now belongs to another process"))
         }
@@ -1098,7 +1118,7 @@ fn omp_launch_pin_verdict(db: &HcomDb, row: &InstanceRow) -> anyhow::Result<OmpL
             pid,
             reason: "is still the running launch process",
         }),
-        (_, None) if crate::sys::process::is_definitely_dead(process_pid) => {
+        (_, None) if definitely_dead(process_pid) => {
             Ok(OmpLaunchPin::Replaceable("exited"))
         }
         (_, None) => Ok(OmpLaunchPin::Held {
@@ -1287,6 +1307,28 @@ pub(crate) fn prepare_own_omp_reservation_in_txn(
     session_id: &str,
     tool: &str,
 ) -> anyhow::Result<Option<HeldPin>> {
+    prepare_own_omp_reservation_in_txn_checked(
+        db,
+        tx,
+        name,
+        session_id,
+        tool,
+        &crate::sys::process::is_definitely_dead,
+        &crate::sys::process::identity,
+    )
+}
+
+/// [`prepare_own_omp_reservation_in_txn`] with the launch pin's process
+/// facts supplied by the caller; see [`omp_launch_pin_verdict_checked`].
+fn prepare_own_omp_reservation_in_txn_checked(
+    db: &HcomDb,
+    tx: &rusqlite::Transaction<'_>,
+    name: &str,
+    session_id: &str,
+    tool: &str,
+    definitely_dead: &dyn Fn(u32) -> bool,
+    identity: &dyn Fn(u32) -> Option<String>,
+) -> anyhow::Result<Option<HeldPin>> {
     if tool != "omp" {
         return Ok(None);
     }
@@ -1296,7 +1338,7 @@ pub(crate) fn prepare_own_omp_reservation_in_txn(
     if row.session_id.as_deref() != Some(session_id) || !is_unhooked_omp_reservation(db, &row)? {
         return Ok(None);
     }
-    match omp_launch_pin_verdict(db, &row)? {
+    match omp_launch_pin_verdict_checked(db, &row, definitely_dead, identity)? {
         OmpLaunchPin::Unpinned => Ok(None),
         OmpLaunchPin::Held { pid, reason } => Ok(Some(HeldPin { pid, reason })),
         OmpLaunchPin::Replaceable(reason) => {
@@ -1523,7 +1565,7 @@ fn bind_omp_session_to_process_checked(
                 .is_some_and(|binding| binding.instance_name == target)
             && current.target_row.is_none()
         {
-            let Some((stopped_name, event)) = db.find_stopped_event_by_session_id(session_id)?
+            let Some((stopped_name, _)) = db.find_stopped_event_by_session_id(session_id)?
             else {
                 anyhow::bail!("stopped history changed before claim");
             };
@@ -1531,6 +1573,12 @@ fn bind_omp_session_to_process_checked(
                 stopped_name == target,
                 "stopped history changed before claim"
             );
+            // The session locates the candidate, but the name's newest stop
+            // authorizes reclaim even when resuming an older session.
+            let (_, data) = db
+                .find_latest_stopped_event_by_name(&stopped_name)?
+                .context("newest stopped history for released OMP identity is missing")?;
+            let event: serde_json::Value = serde_json::from_str(&data)?;
             let caller_owns = |anchor| {
                 owner_under_anchor(anchor).is_some_and(|proof| {
                     proof.owner_pid == anchor && proof.anchor_kind == AncestorProcess::Omp
@@ -5584,4 +5632,261 @@ mod tests {
             cleanup(path);
         }
     }
+
+    const LAUNCH_PIN_PID: u32 = 424_242;
+    const LAUNCH_PIN_IDENTITY: &str = "launch-pin-birth-a";
+
+    /// Seed `luna` as this session's own unhooked OMP reservation pinned to
+    /// `LAUNCH_PIN_PID`. With `receipt_identity`, the stored receipt is
+    /// correlated to the row incarnation and the NULL-session process-binding
+    /// epoch exactly as `record_omp_launch_pid` writes it; the parse assert
+    /// proves the seed, so no verdict below can pass by silently degrading
+    /// to the receipt-less case.
+    fn seed_omp_launch_reservation(
+        db: &HcomDb,
+        receipt_identity: Option<&str>,
+    ) -> crate::db::InstanceRow {
+        seed_omp_claim(db, OMP_LAUNCH_ID, Some("sid-owner"), Some(LAUNCH_PIN_PID));
+        let context = match receipt_identity {
+            Some(identity) => {
+                let binding = process_binding_epoch(db, OMP_LAUNCH_ID).unwrap().unwrap();
+                assert_eq!(binding.session_id, None);
+                assert_eq!(binding.instance_name, "luna");
+                let row = db.get_instance_full("luna").unwrap().unwrap();
+                let receipt = serde_json::to_value(OmpLaunchPidReceipt {
+                    pid: LAUNCH_PIN_PID,
+                    identity: identity.to_owned(),
+                    process_id: OMP_LAUNCH_ID.to_owned(),
+                    binding_updated_at_bits: format!("{:016x}", binding.updated_at_bits),
+                    created_at_bits: format!("{:016x}", row.created_at.to_bits()),
+                })
+                .unwrap();
+                serde_json::json!({"pane_id": "kitty-42", "omp_launch_pid": receipt})
+            }
+            None => serde_json::json!({"pane_id": "kitty-42"}),
+        };
+        db.store_launch_context("luna", &context.to_string())
+            .unwrap();
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            OmpLaunchPidReceipt::parse(db, &row).unwrap().is_some(),
+            receipt_identity.is_some(),
+            "seeded receipt correlation does not match the case under test"
+        );
+        row
+    }
+
+    fn assert_launch_pin_held(verdict: OmpLaunchPin, expected_reason: &str) {
+        match verdict {
+            OmpLaunchPin::Held { pid, reason } => {
+                assert_eq!(pid, i64::from(LAUNCH_PIN_PID));
+                assert_eq!(reason, expected_reason);
+            }
+            OmpLaunchPin::Replaceable(reason) => {
+                panic!("expected Held ({expected_reason}), got Replaceable ({reason})")
+            }
+            OmpLaunchPin::Unpinned => panic!("expected Held ({expected_reason}), got Unpinned"),
+        }
+    }
+
+    fn assert_launch_pin_replaceable(verdict: OmpLaunchPin, expected_reason: &str) {
+        match verdict {
+            OmpLaunchPin::Replaceable(reason) => assert_eq!(reason, expected_reason),
+            OmpLaunchPin::Held { pid, reason } => {
+                panic!("expected Replaceable ({expected_reason}), got Held pid={pid} ({reason})")
+            }
+            OmpLaunchPin::Unpinned => {
+                panic!("expected Replaceable ({expected_reason}), got Unpinned")
+            }
+        }
+    }
+
+    // Counterfactual anchor: temporarily flipping the matching-live arm
+    // (`(Some(_), Some(_))`) of `omp_launch_pin_verdict_checked` from Held to
+    // Replaceable must fail this test. Calling the verdict directly keeps
+    // every earlier CLI guard out of the way.
+    #[test]
+    fn omp_launch_pin_matching_live_receipt_is_held() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let verdict = omp_launch_pin_verdict_checked(
+            &db,
+            &row,
+            &|_| false,
+            &|pid| (pid == LAUNCH_PIN_PID).then_some(LAUNCH_PIN_IDENTITY.to_string()),
+        )
+        .unwrap();
+        assert_launch_pin_held(verdict, "is still the running launch process");
+        cleanup(path);
+    }
+
+    #[test]
+    fn omp_launch_pin_receiptless_live_process_is_held() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, None);
+        let verdict = omp_launch_pin_verdict_checked(
+            &db,
+            &row,
+            &|_| false,
+            &|pid| (pid == LAUNCH_PIN_PID).then_some("some-live-birth".to_string()),
+        )
+        .unwrap();
+        assert_launch_pin_held(verdict, "is live and has no verifiable launch receipt");
+        cleanup(path);
+    }
+
+    // The correlated receipt is present, so this fails if an unreadable
+    // identity (`None`, dead still unproven on both probes) is ever read as
+    // a birth mismatch instead of Held.
+    #[test]
+    fn omp_launch_pin_unreadable_live_process_is_held_not_mismatched() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let verdict =
+            omp_launch_pin_verdict_checked(&db, &row, &|_| false, &|_| None).unwrap();
+        assert_launch_pin_held(verdict, "cannot be read");
+        cleanup(path);
+    }
+
+    #[test]
+    fn omp_launch_pin_mismatched_correlated_receipt_is_replaceable() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let verdict = omp_launch_pin_verdict_checked(
+            &db,
+            &row,
+            &|_| false,
+            &|pid| (pid == LAUNCH_PIN_PID).then_some("launch-pin-birth-b".to_string()),
+        )
+        .unwrap();
+        assert_launch_pin_replaceable(verdict, "now belongs to another process");
+        cleanup(path);
+    }
+
+    #[test]
+    fn omp_launch_pin_gone_process_is_replaceable() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let verdict =
+            omp_launch_pin_verdict_checked(&db, &row, &|_| true, &|_| None).unwrap();
+        assert_launch_pin_replaceable(verdict, "exited");
+        cleanup(path);
+    }
+
+    // A zombie still reports its birth identity, so the supplied identity
+    // here matches the receipt; the positive `definitely_dead` proof (the
+    // native gone/zombie proof itself is covered against a real unreaped
+    // zombie in `omp_released_identity_restores_from_an_unreaped_zombie_owner`)
+    // must win, and must be consulted before identity is read at all.
+    #[test]
+    fn omp_launch_pin_zombie_with_matching_identity_is_replaceable() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let identity_reads = std::cell::Cell::new(0u32);
+        let verdict = omp_launch_pin_verdict_checked(
+            &db,
+            &row,
+            &|_| true,
+            &|pid| {
+                identity_reads.set(identity_reads.get() + 1);
+                (pid == LAUNCH_PIN_PID).then_some(LAUNCH_PIN_IDENTITY.to_string())
+            },
+        )
+        .unwrap();
+        assert_launch_pin_replaceable(verdict, "exited");
+        assert_eq!(
+            identity_reads.get(),
+            0,
+            "a positive gone/zombie proof must precede any identity read"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_own_omp_reservation_matching_live_pin_is_held_and_leaves_state_untouched() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        let seeded = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let before = db_state(&db);
+        let before_binding = process_binding_epoch(&db, OMP_LAUNCH_ID).unwrap();
+        let held = db
+            .with_immediate_transaction(|tx| {
+                prepare_own_omp_reservation_in_txn_checked(
+                    &db,
+                    tx,
+                    "luna",
+                    "sid-owner",
+                    "omp",
+                    &|_| false,
+                    &|pid| (pid == LAUNCH_PIN_PID).then_some(LAUNCH_PIN_IDENTITY.to_string()),
+                )
+            })
+            .unwrap();
+        let held = held.expect("matching live pin must be reported Held, not released");
+        assert_eq!(held.pid, i64::from(LAUNCH_PIN_PID));
+        assert_eq!(held.reason, "is still the running launch process");
+        // db_state covers every table, so this also proves no event was left
+        // behind by the transaction; the row fields are asserted by name.
+        assert_eq!(db_state(&db), before);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.pid, Some(i64::from(LAUNCH_PIN_PID)));
+        assert_eq!(row.launch_context, seeded.launch_context);
+        assert_eq!(
+            process_binding_epoch(&db, OMP_LAUNCH_ID).unwrap(),
+            before_binding
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_own_omp_reservation_mismatched_pin_clears_only_its_own_pin_and_binding() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, created_at, agent_id, session_id, pid, status, status_context,
+                  last_event_id)
+                 VALUES ('fano', 'omp', 2.25, 'other-agent', 'sid-other', 777, 'inactive', 'new', 11)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("proc-other-seat", "", "fano").unwrap();
+        let other_before = db.get_instance_full("fano").unwrap().unwrap();
+        let other_binding_before = process_binding_epoch(&db, "proc-other-seat").unwrap();
+        let released = db
+            .with_immediate_transaction(|tx| {
+                prepare_own_omp_reservation_in_txn_checked(
+                    &db,
+                    tx,
+                    "luna",
+                    "sid-owner",
+                    "omp",
+                    &|_| false,
+                    &|pid| (pid == LAUNCH_PIN_PID).then_some("launch-pin-birth-b".to_string()),
+                )
+            })
+            .unwrap();
+        assert!(released.is_none(), "a released pin must not report Held");
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.pid, None);
+        assert_eq!(row.session_id.as_deref(), Some("sid-owner"));
+        assert_eq!(OmpLaunchPidReceipt::raw(&row), None);
+        let context: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert_eq!(context["pane_id"], "kitty-42");
+        assert_eq!(process_binding_epoch(&db, OMP_LAUNCH_ID).unwrap(), None);
+        let other = db.get_instance_full("fano").unwrap().unwrap();
+        assert_eq!(other.pid, other_before.pid);
+        assert_eq!(other.launch_context, other_before.launch_context);
+        assert_eq!(
+            process_binding_epoch(&db, "proc-other-seat").unwrap(),
+            other_binding_before
+        );
+        cleanup(path);
+    }
+
 }

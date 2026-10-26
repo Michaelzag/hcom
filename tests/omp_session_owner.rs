@@ -1420,6 +1420,391 @@ fn live_released_owner_with_incarnation_refuses_a_hook_recreation() {
 }
 
 #[test]
+fn older_session_hook_cannot_reclaim_name_released_by_a_newer_live_owner() {
+    let h = isolated_hcom();
+    let suffix = unique_suffix();
+    let name = format!("newestlive{suffix}");
+    let first_sid = format!("sid-older-live-{suffix}");
+    let second_sid = format!("sid-newer-live-{suffix}");
+    let first_path = h.workspace.join(format!("{first_sid}.jsonl"));
+    let second_path = h.workspace.join(format!("{second_sid}.jsonl"));
+    let first_endpoint = probe();
+    let second_endpoint = probe();
+    let incoming_endpoint = probe();
+
+    let mut first = HookProcess::spawn(
+        &h,
+        "older-live-first",
+        "omp",
+        Some(&launcher_id()),
+        false,
+    );
+    seed_launch(&h, &first, &name);
+    assert_eq!(
+        first
+            .run(
+                &h,
+                &start_command(&first_sid, &first_path, &h.workspace, &first_endpoint),
+            )
+            .ok()["name"],
+        name
+    );
+    assert_bound(&h, &first, &name, &first_sid, &first_path, &h.workspace);
+    first
+        .run(
+            &h,
+            &format!("H omp-stop --name {} --reason shutdown", quote(&name)),
+        )
+        .ok();
+    let first_stop = assert_released_history(&h, &name, &first.process_id);
+    assert_eq!(first_stop["snapshot"]["session_id"], first_sid);
+    assert_eq!(first_stop["snapshot"]["pid"], first.owner_pid);
+    assert!(first_stop["snapshot"]["pid_start_time"].as_u64().is_some());
+    assert!(
+        first_stop["snapshot"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty())
+    );
+    let first_event_id: i64 = db(&h)
+        .query_row(
+            "SELECT id FROM events WHERE type='life' AND instance=?1
+               AND json_extract(data,'$.action')='stopped' ORDER BY id DESC LIMIT 1",
+            [&name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let first_pid = first.owner_pid;
+    trigger_step(&first.out_dir, first.next_step.get(), "exit 0");
+    let first_exit = h.eventually("older owner exited", Duration::from_secs(30), || {
+        Ok(first.child.try_wait().expect("reap older owner"))
+    });
+    assert!(first_exit.success(), "older owner did not exit normally");
+    assert!(!Path::new(&format!("/proc/{first_pid}")).exists());
+    drop(first);
+
+    let mut second = HookProcess::spawn(&h, "older-live-second", "omp", None, false);
+    let initial = second
+        .run(
+            &h,
+            &start_command(&second_sid, &second_path, &h.workspace, &second_endpoint),
+        )
+        .ok();
+    let initial_name = initial["name"].as_str().unwrap();
+    assert_ne!(initial_name, name);
+    assert_bound(
+        &h,
+        &second,
+        initial_name,
+        &second_sid,
+        &second_path,
+        &h.workspace,
+    );
+    // The existing process binding supplies S2 to --as; the following
+    // ordinary hook pins its new name to P2 rather than P1's dead anchor.
+    let reclaim = second.run(&h, &format!("H start --as {}", quote(&name)));
+    assert_eq!(
+        reclaim.code, 0,
+        "newer owner could not reclaim the dead owner's name: {} {}",
+        reclaim.stdout, reclaim.stderr
+    );
+    let reclaimed: (String, String, String) = db(&h)
+        .query_row(
+            "SELECT i.session_id,p.instance_name,s.instance_name FROM instances i
+               JOIN process_bindings p ON p.instance_name=i.name AND p.session_id=i.session_id
+               JOIN session_bindings s ON s.session_id=i.session_id
+               WHERE i.name=?1 AND p.process_id=?2",
+            rusqlite::params![name, second.process_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        reclaimed,
+        (second_sid.clone(), name.clone(), name.clone()),
+        "--as did not transfer P2's existing session and bindings to N"
+    );
+    assert_eq!(
+        second
+            .run(
+                &h,
+                &start_command(&second_sid, &second_path, &h.workspace, &second_endpoint),
+            )
+            .ok()["name"],
+        name
+    );
+    assert_bound(&h, &second, &name, &second_sid, &second_path, &h.workspace);
+    second
+        .run(
+            &h,
+            &format!("H omp-stop --name {} --reason shutdown", quote(&name)),
+        )
+        .ok();
+    let second_stop = assert_released_history(&h, &name, &second.process_id);
+    assert_eq!(second_stop["snapshot"]["session_id"], second_sid);
+    assert_eq!(second_stop["snapshot"]["pid"], second.owner_pid);
+    assert!(second_stop["snapshot"]["pid_start_time"].as_u64().is_some());
+    assert!(
+        second_stop["snapshot"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty())
+    );
+    let latest_by_name: (i64, String, String) = db(&h)
+        .query_row(
+            "SELECT id,instance,data FROM events WHERE type='life' AND instance=?1
+               AND json_extract(data,'$.action')='stopped' ORDER BY id DESC LIMIT 1",
+            [&name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(latest_by_name.0 > first_event_id);
+    assert_eq!(latest_by_name.1, name);
+    assert_eq!(
+        serde_json::from_str::<Value>(&latest_by_name.2).unwrap(),
+        second_stop
+    );
+    let latest_by_first_session: (i64, String, String) = db(&h)
+        .query_row(
+            "SELECT id,instance,data FROM events WHERE type='life'
+               AND json_extract(data,'$.action')='stopped'
+               AND json_extract(data,'$.snapshot.session_id')=?1 ORDER BY id DESC LIMIT 1",
+            [&first_sid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(latest_by_first_session.0, first_event_id);
+    assert_eq!(latest_by_first_session.1, name);
+    assert_eq!(
+        serde_json::from_str::<Value>(&latest_by_first_session.2).unwrap(),
+        first_stop
+    );
+    second.assert_alive();
+
+    let caller = HookProcess::spawn(&h, "older-live-caller", "omp", None, false);
+    assert_eq!(
+        caller.process_id,
+        format!("omp-{}-1-1", caller.owner_pid)
+    );
+    discard_setup_wakes(&first_endpoint);
+    discard_setup_wakes(&second_endpoint);
+    let before = full_state(&h);
+    let output = caller.run(
+        &h,
+        &start_command(&first_sid, &first_path, &h.workspace, &incoming_endpoint),
+    );
+    let after = full_state(&h);
+    let second_still_alive = second
+        .child
+        .try_wait()
+        .expect("poll newer released owner")
+        .is_none()
+        && Path::new(&format!("/proc/{}", second.owner_pid)).exists();
+    // Reap both private fixtures before the intentionally failing base
+    // assertion; retain the post-hook state and liveness observation.
+    drop(caller);
+    drop(second);
+    assert_eq!(
+        after, before,
+        "older session's dead history stole a newer live owner's released name: {} {}",
+        output.stdout, output.stderr
+    );
+    output.refused();
+    assert_no_wake(&[&first_endpoint, &second_endpoint, &incoming_endpoint]);
+    assert!(
+        second_still_alive,
+        "newer released owner exited during the hook"
+    );
+}
+
+#[test]
+fn older_session_hook_can_resume_after_the_newest_released_owner_exits() {
+    let h = isolated_hcom();
+    let suffix = unique_suffix();
+    let name = format!("newestdead{suffix}");
+    let first_sid = format!("sid-older-dead-{suffix}");
+    let second_sid = format!("sid-newer-dead-{suffix}");
+    let first_path = h.workspace.join(format!("{first_sid}.jsonl"));
+    let second_path = h.workspace.join(format!("{second_sid}.jsonl"));
+    let first_endpoint = probe();
+    let second_endpoint = probe();
+    let incoming_endpoint = probe();
+
+    let mut first = HookProcess::spawn(
+        &h,
+        "older-dead-first",
+        "omp",
+        Some(&launcher_id()),
+        false,
+    );
+    seed_launch(&h, &first, &name);
+    assert_eq!(
+        first
+            .run(
+                &h,
+                &start_command(&first_sid, &first_path, &h.workspace, &first_endpoint),
+            )
+            .ok()["name"],
+        name
+    );
+    assert_bound(&h, &first, &name, &first_sid, &first_path, &h.workspace);
+    first
+        .run(
+            &h,
+            &format!("H omp-stop --name {} --reason shutdown", quote(&name)),
+        )
+        .ok();
+    let first_stop = assert_released_history(&h, &name, &first.process_id);
+    assert_eq!(first_stop["snapshot"]["session_id"], first_sid);
+    assert_eq!(first_stop["snapshot"]["pid"], first.owner_pid);
+    assert!(first_stop["snapshot"]["pid_start_time"].as_u64().is_some());
+    assert!(
+        first_stop["snapshot"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty())
+    );
+    let first_event_id: i64 = db(&h)
+        .query_row(
+            "SELECT id FROM events WHERE type='life' AND instance=?1
+               AND json_extract(data,'$.action')='stopped' ORDER BY id DESC LIMIT 1",
+            [&name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let first_pid = first.owner_pid;
+    trigger_step(&first.out_dir, first.next_step.get(), "exit 0");
+    let first_exit = h.eventually("older owner exited", Duration::from_secs(30), || {
+        Ok(first.child.try_wait().expect("reap older owner"))
+    });
+    assert!(first_exit.success(), "older owner did not exit normally");
+    assert!(!Path::new(&format!("/proc/{first_pid}")).exists());
+    drop(first);
+
+    let mut second = HookProcess::spawn(&h, "older-dead-second", "omp", None, false);
+    let initial = second
+        .run(
+            &h,
+            &start_command(&second_sid, &second_path, &h.workspace, &second_endpoint),
+        )
+        .ok();
+    let initial_name = initial["name"].as_str().unwrap();
+    assert_ne!(initial_name, name);
+    assert_bound(
+        &h,
+        &second,
+        initial_name,
+        &second_sid,
+        &second_path,
+        &h.workspace,
+    );
+    let reclaim = second.run(&h, &format!("H start --as {}", quote(&name)));
+    assert_eq!(
+        reclaim.code, 0,
+        "newer owner could not reclaim the dead owner's name: {} {}",
+        reclaim.stdout, reclaim.stderr
+    );
+    let reclaimed: (String, String, String) = db(&h)
+        .query_row(
+            "SELECT i.session_id,p.instance_name,s.instance_name FROM instances i
+               JOIN process_bindings p ON p.instance_name=i.name AND p.session_id=i.session_id
+               JOIN session_bindings s ON s.session_id=i.session_id
+               WHERE i.name=?1 AND p.process_id=?2",
+            rusqlite::params![name, second.process_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        reclaimed,
+        (second_sid.clone(), name.clone(), name.clone()),
+        "--as did not transfer P2's existing session and bindings to N"
+    );
+    assert_eq!(
+        second
+            .run(
+                &h,
+                &start_command(&second_sid, &second_path, &h.workspace, &second_endpoint),
+            )
+            .ok()["name"],
+        name
+    );
+    assert_bound(&h, &second, &name, &second_sid, &second_path, &h.workspace);
+    second
+        .run(
+            &h,
+            &format!("H omp-stop --name {} --reason shutdown", quote(&name)),
+        )
+        .ok();
+    let second_stop = assert_released_history(&h, &name, &second.process_id);
+    assert_eq!(second_stop["snapshot"]["session_id"], second_sid);
+    assert_eq!(second_stop["snapshot"]["pid"], second.owner_pid);
+    assert!(second_stop["snapshot"]["pid_start_time"].as_u64().is_some());
+    assert!(
+        second_stop["snapshot"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty())
+    );
+    let latest_by_name: (i64, String, String) = db(&h)
+        .query_row(
+            "SELECT id,instance,data FROM events WHERE type='life' AND instance=?1
+               AND json_extract(data,'$.action')='stopped' ORDER BY id DESC LIMIT 1",
+            [&name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(latest_by_name.0 > first_event_id);
+    assert_eq!(latest_by_name.1, name);
+    assert_eq!(
+        serde_json::from_str::<Value>(&latest_by_name.2).unwrap(),
+        second_stop
+    );
+    let latest_by_first_session: (i64, String, String) = db(&h)
+        .query_row(
+            "SELECT id,instance,data FROM events WHERE type='life'
+               AND json_extract(data,'$.action')='stopped'
+               AND json_extract(data,'$.snapshot.session_id')=?1 ORDER BY id DESC LIMIT 1",
+            [&first_sid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(latest_by_first_session.0, first_event_id);
+    assert_eq!(latest_by_first_session.1, name);
+    assert_eq!(
+        serde_json::from_str::<Value>(&latest_by_first_session.2).unwrap(),
+        first_stop
+    );
+    let second_pid = second.owner_pid;
+    trigger_step(&second.out_dir, second.next_step.get(), "exit 0");
+    let second_exit = h.eventually("newer owner exited", Duration::from_secs(30), || {
+        Ok(second.child.try_wait().expect("reap newer owner"))
+    });
+    assert!(second_exit.success(), "newer owner did not exit normally");
+    assert!(!Path::new(&format!("/proc/{second_pid}")).exists());
+    drop(second);
+
+    let caller = HookProcess::spawn(&h, "older-dead-caller", "omp", None, false);
+    assert_eq!(
+        caller.process_id,
+        format!("omp-{}-1-1", caller.owner_pid)
+    );
+    let restored = caller
+        .run(
+            &h,
+            &start_command(&first_sid, &first_path, &h.workspace, &incoming_endpoint),
+        )
+        .ok();
+    assert_eq!(restored["name"], name);
+    assert_bound(&h, &caller, &name, &first_sid, &first_path, &h.workspace);
+    let counts: (i64, i64, i64) = db(&h)
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM instances),
+                (SELECT COUNT(*) FROM process_bindings),
+                (SELECT COUNT(*) FROM session_bindings)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (1, 1, 1), "resume duplicated or retained an old owner");
+}
+
+#[test]
 fn child_own_minted_identity_cannot_recreate_a_released_parent() {
     let h = isolated_hcom();
     let suffix = unique_suffix();
