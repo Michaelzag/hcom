@@ -187,14 +187,15 @@ impl Proxy {
 
         let writer = pair.master.take_writer().context("take_writer failed")?;
 
-        // Persist PID so `hcom kill` can target the agent.
+        // Persist PID so `hcom kill` can target the agent. The OMP child (or its
+        // cmd.exe shim) is the launch's last pre-hook pin and its root.
         if let Some(ref instance_name) = config.instance_name
             && let Ok(db) = HcomDb::open()
             && let Some(pid) = child.process_id()
         {
             if is_omp {
                 if let Some(expected) = omp_launch_pid.as_mut() {
-                    let _ = crate::instance_binding::record_omp_launch_pid(&db, expected, pid);
+                    let _ = crate::instance_binding::record_omp_launch_root(&db, expected, pid);
                 }
             } else {
                 let _ = db.update_instance_pid(instance_name, pid);

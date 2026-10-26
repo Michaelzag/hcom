@@ -772,14 +772,16 @@ impl Proxy {
         crate::sys::process::close_inherited_fds(&mut cmd);
         let child = cmd.spawn().context("spawn failed")?;
 
-        // Write PID and launch context to database for hcom kill
-        if let Some(ref instance_name) = config.instance_name
+        // Write PID and launch context to database for hcom kill. The OMP child
+        // is the launch's last pre-hook pin and its root: the tree kill reaches
+        // after the first hook re-pins the owner to the interpreter.
+        if let Some(instance_name) = &config.instance_name
             && let Ok(db) = crate::db::HcomDb::open()
         {
             if is_omp {
                 if let Some(expected) = omp_launch_pid.as_mut() {
                     let _ =
-                        crate::instance_binding::record_omp_launch_pid(&db, expected, child.id());
+                        crate::instance_binding::record_omp_launch_root(&db, expected, child.id());
                 }
             } else {
                 let _ = db.update_instance_pid(instance_name, child.id());

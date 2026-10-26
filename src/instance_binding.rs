@@ -94,7 +94,8 @@ pub fn persist_terminal_launch_context(
 /// Capture environment context and store it for the instance.
 ///
 /// Captures git branch, terminal program, tty, and relevant env vars.
-/// Preserves terminal metadata and launch receipts under the writer lock.
+/// Preserves terminal metadata, the launch receipt and the launch root under
+/// the writer lock.
 pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     let new_ctx = capture_context();
     let store = || -> anyhow::Result<()> {
@@ -106,6 +107,7 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
             "process_id",
             "terminal_preset_effective",
             "omp_launch_pid",
+            "omp_launch_root",
         ];
         let mut ctx = new_ctx;
 
@@ -1059,11 +1061,16 @@ pub(crate) fn copied_pid_identity_receipt(row: &InstanceRow) -> Option<String> {
     OmpLaunchPidReceipt::raw(row).map(|receipt| receipt.to_string())
 }
 
+/// One raw `launch_context` entry; `None` when the key or the JSON object is absent.
+fn launch_context_value(row: &InstanceRow, key: &str) -> Option<serde_json::Value> {
+    let mut context =
+        serde_json::from_str::<serde_json::Value>(row.launch_context.as_deref()?).ok()?;
+    context.as_object_mut()?.remove(key)
+}
+
 impl OmpLaunchPidReceipt {
     fn raw(row: &InstanceRow) -> Option<serde_json::Value> {
-        let mut context =
-            serde_json::from_str::<serde_json::Value>(row.launch_context.as_deref()?).ok()?;
-        context.as_object_mut()?.remove("omp_launch_pid")
+        launch_context_value(row, "omp_launch_pid")
     }
 
     fn parse(db: &HcomDb, row: &InstanceRow) -> anyhow::Result<Option<Self>> {
@@ -1165,6 +1172,9 @@ pub(crate) struct OmpLaunchPidSnapshot {
     binding: ProcessBindingEpoch,
     receipt: Option<serde_json::Value>,
     pub(crate) replaces_stale_pin: bool,
+    /// The capture saw no pin, or a dead/reused one: this launch's first pin
+    /// starts a new reservation and drops an older launch's root.
+    starts_reservation: bool,
 }
 
 /// Capture before spawn. A resumed row may already have its prior session ID;
@@ -1210,6 +1220,7 @@ pub(crate) fn capture_omp_launch_pid(
         };
         Ok(Some(OmpLaunchPidSnapshot {
             receipt: OmpLaunchPidReceipt::raw(&row),
+            starts_reservation: replaces_stale_pin || row.pid.is_none(),
             replaces_stale_pin,
             row,
             process_id: process_id.to_owned(),
@@ -1218,13 +1229,36 @@ pub(crate) fn capture_omp_launch_pid(
     })
 }
 
-/// Record only this launch's next PID. A successful write advances the local
-/// expectation (runner/NULL -> wrapper -> child); a lost CAS never re-reads and
-/// retries against a bound owner, canonical move or replacement row.
+/// Record only this launch's next pre-hook PID. A successful write advances the
+/// local expectation (runner/NULL -> wrapper); a lost CAS never re-reads and
+/// retries against a bound owner, canonical move or replacement row. The first
+/// pin of a new or replaced reservation drops an older launch's root.
 pub(crate) fn record_omp_launch_pid(
     db: &HcomDb,
     expected: &mut OmpLaunchPidSnapshot,
     new_pid: u32,
+) -> anyhow::Result<bool> {
+    record_omp_launch_pin(db, expected, new_pid, false)
+}
+
+/// Record the PTY child, this launch's last pre-hook pin, and with it the
+/// launch's `omp_launch_root` `{pid, identity}`: the tree `hcom kill` must
+/// reach after the first hook re-pins the owner to the interpreter. One
+/// identity read fills the root and the receipt, in the pin's transaction and
+/// CAS. Only this writer creates a root; later owner pins carry it unchanged.
+pub(crate) fn record_omp_launch_root(
+    db: &HcomDb,
+    expected: &mut OmpLaunchPidSnapshot,
+    child_pid: u32,
+) -> anyhow::Result<bool> {
+    record_omp_launch_pin(db, expected, child_pid, true)
+}
+
+fn record_omp_launch_pin(
+    db: &HcomDb,
+    expected: &mut OmpLaunchPidSnapshot,
+    new_pid: u32,
+    records_root: bool,
 ) -> anyhow::Result<bool> {
     let (changed, receipt) = db.with_immediate_transaction(|tx| {
         if process_binding_epoch(db, &expected.process_id)?.as_ref() != Some(&expected.binding) {
@@ -1250,6 +1284,8 @@ pub(crate) fn record_omp_launch_pid(
         {
             return Ok((false, None));
         }
+        // A context that is no JSON object takes the generic owner CAS, which
+        // never writes a root.
         let Some(mut context) = context else {
             let changed =
                 db.compare_and_set_instance_pid_in_txn(tx, &expected.row, Some(new_pid))?;
@@ -1262,7 +1298,19 @@ pub(crate) fn record_omp_launch_pid(
             };
             return Ok((changed, receipt));
         };
-        let receipt = crate::sys::process::identity(new_pid)
+        let identity = crate::sys::process::identity(new_pid);
+        if records_root {
+            match &identity {
+                Some(identity) => context.insert(
+                    "omp_launch_root".into(),
+                    serde_json::json!({"pid": new_pid, "identity": identity}),
+                ),
+                None => context.remove("omp_launch_root"),
+            };
+        } else if expected.starts_reservation {
+            context.remove("omp_launch_root");
+        }
+        let receipt = identity
             .map(|identity| {
                 serde_json::to_value(OmpLaunchPidReceipt {
                     pid: new_pid,
@@ -1291,6 +1339,7 @@ pub(crate) fn record_omp_launch_pid(
     if changed {
         expected.row.pid = Some(i64::from(new_pid));
         expected.receipt = receipt;
+        expected.starts_reservation = false;
     }
     Ok(changed)
 }
