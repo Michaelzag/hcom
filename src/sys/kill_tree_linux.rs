@@ -485,10 +485,24 @@ struct Sweep<'a, P, E, A> {
     process_id_of: P,
     eligible: E,
     authorize: A,
-    /// Late members `authorize` refused: never signaled, still confirmed.
-    refused: HashSet<u32>,
-    /// The first late refusal, reported if any member is left running.
-    refusal: Option<KillError>,
+}
+
+/// Whether a fresh read proves `member`'s captured incarnation is over:
+/// exited, a zombie, or its PID reused. An unreadable PID proves nothing.
+fn proven_gone(member: &Member, seen: Seen) -> bool {
+    match seen {
+        Seen::Gone => true,
+        Seen::Live(fact) => fact.start != member.start,
+        Seen::Unknown => false,
+    }
+}
+
+/// The bare reason a refusal carries, without any survivor list.
+fn refusal_reason(refusal: KillError) -> String {
+    match refusal {
+        KillError::Refused(reason) | KillError::Unconfirmed { reason, .. } => reason,
+        survivors @ KillError::Survivors(_) => survivors.to_string(),
+    }
 }
 
 impl<P, E, A> Sweep<'_, P, E, A>
@@ -513,23 +527,28 @@ where
         )
     }
 
-    /// Authorize every member the kill would signal, before the first
-    /// signal; one refusal refuses the whole capture.
-    fn authorize_all(&mut self, members: &[Member]) -> Result<(), KillError> {
+    /// Authorize `members` before any of them is signaled. A refusal stands
+    /// unless a fresh read proves that member's incarnation already over, as
+    /// when a short-lived child exits between the listing and the check.
+    fn preflight(&mut self, members: &[Member]) -> Result<(), KillError> {
         for member in members {
-            if !self.lineage.spares(member.pid) {
-                (self.authorize)(member.pid)?;
+            if self.lineage.spares(member.pid) {
+                continue;
+            }
+            if let Err(refusal) = (self.authorize)(member.pid)
+                && !proven_gone(member, observe(self.proc_root, member.pid))
+            {
+                return Err(refusal);
             }
         }
         Ok(())
     }
 
-    /// Whether `member` may get a per-PID signal now. An excluded or
-    /// refused PID never does, whatever else it proves.
+    /// Whether `member` may get a per-PID signal now. An excluded PID never
+    /// does, whatever else it proves.
     fn proven(&mut self, member: &Member) -> bool {
         let pid = member.pid;
         !self.lineage.spares(pid)
-            && !self.refused.contains(&pid)
             && signal_proof(
                 member,
                 observe(self.proc_root, pid),
@@ -576,15 +595,17 @@ where
                     });
                 }
             };
+            // Every new member is authorized before any new member is
+            // signaled: a standing refusal ends the kill here, so neither
+            // the refused process nor its descendants ever get a signal.
+            if let Err(refusal) = self.preflight(&fresh) {
+                members.extend(fresh);
+                return Err(KillError::Unconfirmed {
+                    reason: refusal_reason(refusal),
+                    survivors: self.survivors(members),
+                });
+            }
             for member in &fresh {
-                if self.lineage.spares(member.pid) {
-                    continue;
-                }
-                if let Err(refusal) = (self.authorize)(member.pid) {
-                    self.refused.insert(member.pid);
-                    self.refusal.get_or_insert(refusal);
-                    continue;
-                }
                 if self.proven(member) {
                     // SAFETY: one positive PID absorbed from this round's
                     // snapshot, authorized and just re-proven; never a
@@ -634,9 +655,10 @@ fn group_signal_allowed(
 /// caller's own chain: those PIDs anchor capture and rescans but are never
 /// signaled or confirmed. Any ancestor, excluded or ineligible PID in the
 /// root's group turns the group signal into per-PID signals. `authorize`
-/// runs on every member to be signaled before the first signal (one refusal
-/// refuses the kill) and on each late member before its signal (a refused
-/// one stays unsignaled and unconfirmed). Ok carries the root's own signal
+/// runs on every member to be signaled before the first signal, and on
+/// every late member before any late member is signaled; a refusal stands
+/// unless a fresh read proves that member already gone, and a standing one
+/// refuses the kill (initially) or ends it Unconfirmed (late). Ok carries the root's own signal
 /// outcome, as with the other GroupSignal primitives, once every captured
 /// member is confirmed gone; an excluded root is never signaled and reports
 /// NotFound. Members left at the deadline are an error naming their PIDs.
@@ -687,12 +709,10 @@ pub(crate) fn terminate(
         process_id_of,
         eligible,
         authorize,
-        refused: HashSet::new(),
-        refusal: None,
     };
     let found = sweep.absorb(&snapshot, &members)?;
     members.splice(0..0, found);
-    sweep.authorize_all(&members)?;
+    sweep.preflight(&members)?;
 
     let mut root_signal = None;
     for member in &members {
@@ -763,14 +783,7 @@ pub(crate) fn terminate(
     if left.is_empty() {
         return Ok(root_signal);
     }
-    Err(match sweep.refusal.take() {
-        // A refused late member was never signaled; say why it may be left.
-        Some(refusal) => KillError::Unconfirmed {
-            reason: refusal.to_string(),
-            survivors: left,
-        },
-        None => KillError::Survivors(left),
-    })
+    Err(KillError::Survivors(left))
 }
 
 fn signal_result(result: libc::c_int) -> GroupSignal {
@@ -2203,14 +2216,91 @@ mod tests {
             panic!("expected an unconfirmed kill, got {result:?}");
         };
         assert!(reason.ends_with("is foreign"), "{reason}");
-        assert!(!survivors.is_empty());
+        let refused: u32 = reason.split(' ').next().unwrap().parse().unwrap();
         let limit = cutoff.get().unwrap();
-        // Every survivor is a refused late fork, still running unsignaled.
+        // The kill stopped at the refusal: the refused late fork is named,
+        // and it is still running, never signaled.
+        assert!(survivors.contains(&refused), "{survivors:?}");
+        assert!(start_of(refused).is_some_and(|start| start > limit));
+        drop(fixture);
+    }
+
+    #[test]
+    fn a_refusal_stands_unless_a_fresh_read_proves_the_member_gone() {
+        let member = Member {
+            pid: 20,
+            start: 110,
+            depth: 1,
+            in_group: false,
+            carrier: false,
+        };
+        assert!(proven_gone(&member, Seen::Gone), "exited or zombie");
         assert!(
-            survivors
-                .iter()
-                .all(|pid| start_of(*pid).is_some_and(|start| start > limit))
+            proven_gone(&member, Seen::Live(fact(20, 1, 20, 111))),
+            "reused"
+        );
+        assert!(
+            !proven_gone(&member, Seen::Live(fact(20, 1, 20, 110))),
+            "live"
+        );
+        assert!(!proven_gone(&member, Seen::Unknown), "unreadable");
+    }
+
+    /// Kill a test-owned leader root whose `authorize` refuses `victim`'s
+    /// PID after ending it: SIGKILL, then wait until a fresh read shows it
+    /// gone (reaped by a shell parent, or a zombie under an exec'd one).
+    fn kill_refusing_an_ended_member(
+        script: &str,
+    ) -> (Result<GroupSignal, KillError>, Vec<Member>) {
+        let leader = spawn(script, 0);
+        let root = leader.id();
+        let fixture = Fixture {
+            group: root,
+            children: vec![leader],
+        };
+        let tree = captured(root, 2);
+        let victim = tree.iter().find(|member| member.pid != root).unwrap().pid;
+        let result = terminate(
+            root,
+            &identity(root).unwrap(),
+            &[],
+            &[],
+            |_| EnvRead::Absent,
+            |_| true,
+            |pid| {
+                if pid != victim {
+                    return Ok(());
+                }
+                // SAFETY: the test's own sleeper, still live.
+                unsafe { libc::kill(victim as libc::pid_t, libc::SIGKILL) };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while observe(Path::new("/proc"), victim) != Seen::Gone {
+                    assert!(Instant::now() < deadline, "victim never ended");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(KillError::Unconfirmed {
+                    reason: "not signaled: identity unreadable".into(),
+                    survivors: vec![victim],
+                })
+            },
         );
         drop(fixture);
+        (result, tree)
+    }
+
+    #[test]
+    fn a_member_that_exits_before_its_refusal_is_rechecked_is_gone() {
+        // The root execs sleep after its child dies and is reaped.
+        let (result, tree) = kill_refusing_an_ended_member("sleep 30 & wait; exec sleep 30");
+        assert_eq!(result, Ok(GroupSignal::Sent));
+        assert!(tree.iter().all(|member| !running(member)));
+    }
+
+    #[test]
+    fn a_zombie_member_behind_a_refusal_is_gone() {
+        // The exec'd root never reaps, so the killed child stays a zombie.
+        let (result, tree) = kill_refusing_an_ended_member("sleep 30 & exec sleep 30");
+        assert_eq!(result, Ok(GroupSignal::Sent));
+        assert!(tree.iter().all(|member| !running(member)));
     }
 }
