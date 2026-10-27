@@ -379,7 +379,10 @@ mod tests {
             )
         };
         let members = linux_members(root.path(), 42, capture).unwrap();
-        let states: Vec<_> = members.iter().map(|member| (member.pid, member.state)).collect();
+        let states: Vec<_> = members
+            .iter()
+            .map(|member| (member.pid, member.state))
+            .collect();
         assert_eq!(
             states,
             vec![
@@ -410,10 +413,12 @@ mod tests {
     fn linux_scan_requires_a_readable_process_directory() {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let missing = root.path().join("missing");
-        assert!(linux_members(&missing, 42, |pid, _| {
-            fixture_member(pid, KillState::Live)
-        })
-        .is_err());
+        assert!(
+            linux_members(&missing, 42, |pid, _| {
+                fixture_member(pid, KillState::Live)
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -424,10 +429,12 @@ mod tests {
         let mut stat = b"42 (sleep) S 1 42 42".to_vec();
         stat.resize(MAX_STAT_BYTES + 1, b' ');
         std::fs::write(directory.join("stat"), stat).unwrap();
-        assert!(linux_members(root.path(), 42, |pid, _| {
-            fixture_member(pid, KillState::Live)
-        })
-        .is_err());
+        assert!(
+            linux_members(root.path(), 42, |pid, _| {
+                fixture_member(pid, KillState::Live)
+            })
+            .is_err()
+        );
     }
 
     #[test]
