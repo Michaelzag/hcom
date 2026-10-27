@@ -3,22 +3,44 @@
 //! Membership is not ownership evidence. Callers must authenticate the persisted
 //! owner's incarnation separately before deciding whether any signal is safe.
 
-#[cfg(target_os = "linux")]
-use super::kill_tree_linux::{ProcState, linux_state};
+use super::process::KillState;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_PROCESS_COUNT: usize = 65_536;
 #[cfg(target_os = "linux")]
 const MAX_STAT_BYTES: usize = 8_192;
 
-/// List the live members of exactly `pgid`, without signaling any process.
-/// A bounded snapshot must complete before any members are returned.
-/// On Linux, unreadable or changing member thread sets fail the snapshot.
-pub(crate) fn live_members(pgid: u32) -> Result<Vec<u32>, &'static str> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Member {
+    pub pid: u32,
+    pub identity: String,
+    pub state: KillState,
+}
+
+/// List only the live members of exactly `pgid`, without signaling a process.
+pub(crate) fn live_members(pgid: u32) -> Result<Vec<u32>, String> {
+    capture_members(pgid).map(live_pids)
+}
+
+fn live_pids(members: Vec<Member>) -> Vec<u32> {
+    members
+        .into_iter()
+        .filter_map(|member| (member.state == KillState::Live).then_some(member.pid))
+        .collect()
+}
+
+/// Capture live and exiting group members with their native incarnations.
+/// Unknown states or missing identities fail the snapshot, never omit a member.
+pub(crate) fn capture_members(pgid: u32) -> Result<Vec<Member>, String> {
     #[cfg(target_os = "linux")]
     {
-        linux_members(std::path::Path::new("/proc"), pgid, |pid| {
-            linux_state(pid, None)
+        linux_members(std::path::Path::new("/proc"), pgid, |pid, stat| {
+            capture_member(
+                pid,
+                || super::process::kill_state(pid),
+                || super::process::proc_stat_identity(stat),
+                || super::process::identity(pid),
+            )
         })
     }
     #[cfg(target_os = "macos")]
@@ -28,7 +50,43 @@ pub(crate) fn live_members(pgid: u32) -> Result<Vec<u32>, &'static str> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pgid;
-        Err("unsupported")
+        Err("unsupported".into())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn capture_member(
+    pid: u32,
+    mut state_of: impl FnMut() -> KillState,
+    captured_identity: impl FnOnce() -> Option<String>,
+    current_identity: impl FnOnce() -> Option<String>,
+) -> Result<Option<Member>, String> {
+    let state = match state_of() {
+        KillState::Gone => return Ok(None),
+        KillState::Unknown => {
+            if state_of() == KillState::Gone {
+                return Ok(None);
+            }
+            return Err(format!("process-group member {pid} state is unknown"));
+        }
+        state @ (KillState::Live | KillState::Exiting) => state,
+    };
+    let Some(identity) = captured_identity() else {
+        if state_of() == KillState::Gone {
+            return Ok(None);
+        }
+        return Err(format!("process-group member {pid} identity is unreadable"));
+    };
+    match current_identity() {
+        // The recorded incarnation ended while the group was being read.
+        Some(current) if current != identity => Ok(None),
+        Some(_) => Ok(Some(Member {
+            pid,
+            identity,
+            state,
+        })),
+        None if state_of() == KillState::Gone => Ok(None),
+        None => Err(format!("process-group member {pid} identity is unreadable")),
     }
 }
 
@@ -36,8 +94,8 @@ pub(crate) fn live_members(pgid: u32) -> Result<Vec<u32>, &'static str> {
 fn linux_members(
     proc_root: &std::path::Path,
     pgid: u32,
-    state_of: impl Fn(u32) -> ProcState,
-) -> Result<Vec<u32>, &'static str> {
+    mut capture: impl FnMut(u32, &str) -> Result<Option<Member>, String>,
+) -> Result<Vec<Member>, String> {
     use std::io::Read;
 
     use super::process::proc_stat_group_id;
@@ -48,7 +106,7 @@ fn linux_members(
     let mut stat_path = proc_root.to_path_buf();
     for (index, entry) in entries.enumerate() {
         if index >= MAX_PROCESS_COUNT {
-            return Err("process directory exceeds the safety limit");
+            return Err("process directory exceeds the safety limit".into());
         }
         let Ok(entry) = entry else {
             continue;
@@ -84,7 +142,7 @@ fn linux_members(
             continue;
         }
         if stat.len() > MAX_STAT_BYTES {
-            return Err("process stat exceeds the safety limit");
+            return Err("process stat exceeds the safety limit".into());
         }
         // comm can contain non-UTF-8 bytes. Replacing those bytes preserves
         // the ASCII fields parsed after its final closing parenthesis.
@@ -92,16 +150,12 @@ fn linux_members(
         if proc_stat_group_id(&stat) != Some(pgid) {
             continue;
         }
-        // A zombie leader can still front a live thread. Classify the whole
-        // thread set instead of treating the leader's state as process death.
-        match state_of(pid) {
-            ProcState::Live => members.push(pid),
-            ProcState::Gone | ProcState::Exiting => continue,
-            ProcState::Unknown => return Err("could not determine process-group member state"),
+        if let Some(member) = capture(pid, &stat)? {
+            members.push(member);
         }
     }
-    members.sort_unstable();
-    members.dedup();
+    members.sort_unstable_by_key(|member| member.pid);
+    members.dedup_by_key(|member| member.pid);
     Ok(members)
 }
 
@@ -116,8 +170,8 @@ fn apple_pid_count(read: i32, capacity: usize) -> Result<usize, &'static str> {
 }
 
 #[cfg(target_os = "macos")]
-fn apple_members(pgid: u32) -> Result<Vec<u32>, &'static str> {
-    let pgid = libc::pid_t::try_from(pgid)
+fn apple_members(pgid: u32) -> Result<Vec<Member>, String> {
+    let native_pgid = libc::pid_t::try_from(pgid)
         .ok()
         .filter(|pgid| *pgid > 0)
         .ok_or("invalid process group")?;
@@ -127,27 +181,50 @@ fn apple_members(pgid: u32) -> Result<Vec<u32>, &'static str> {
         // SAFETY: u32 and Apple's pid_t have the same size and alignment.
         // pids provides `bytes` writable storage, and a positive group ID
         // selects only the requested group. This API sends no signal.
-        let read = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes) };
+        let read = unsafe { libc::proc_listpgrppids(native_pgid, pids.as_mut_ptr().cast(), bytes) };
         let count = apple_pid_count(read, pids.len())?;
         if count == pids.len() {
             // A full buffer may be truncated. Retry with more room, but never
             // return a possibly partial group at the hard cap.
             if pids.len() >= MAX_PROCESS_COUNT {
-                return Err("process group exceeds the safety limit");
+                return Err("process group exceeds the safety limit".into());
             }
             pids.resize((pids.len() * 2).min(MAX_PROCESS_COUNT), 0);
             continue;
         }
         pids.truncate(count);
-        // Reuse the native result buffer instead of copying the snapshot.
-        // The shared native state probe recognizes zombies; an unreadable
-        // state is unknown, not positive death evidence.
-        pids.retain(|pid| {
-            *pid > 0 && *pid <= libc::pid_t::MAX as u32 && !super::process::is_definitely_dead(*pid)
-        });
-        pids.sort_unstable();
-        pids.dedup();
-        return Ok(pids);
+        let mut members = Vec::with_capacity(count);
+        for pid in pids {
+            if pid == 0 || pid > libc::pid_t::MAX as u32 {
+                continue;
+            }
+            let info = super::process::process_info_apple(pid).filter(|info| info.pbi_pid == pid);
+            let Some(info) = info else {
+                // A missing BSD receipt is unknown unless the shared state
+                // reader can positively confirm that the member has gone.
+                let _ = capture_member(
+                    pid,
+                    || super::process::kill_state(pid),
+                    || None,
+                    || super::process::identity(pid),
+                )?;
+                continue;
+            };
+            if info.pbi_pgid != pgid {
+                continue;
+            }
+            if let Some(member) = capture_member(
+                pid,
+                || super::process::kill_state(pid),
+                || super::process::apple_info_identity(&info),
+                || super::process::identity(pid),
+            )? {
+                members.push(member);
+            }
+        }
+        members.sort_unstable_by_key(|member| member.pid);
+        members.dedup_by_key(|member| member.pid);
+        return Ok(members);
     }
 }
 
@@ -171,6 +248,60 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         killed.expect("kill own fixture");
+    }
+
+    fn fixture_member(pid: u32, state: KillState) -> Result<Option<Member>, String> {
+        capture_member(
+            pid,
+            || state,
+            || Some(format!("linux:fixture:{pid}")),
+            || Some(format!("linux:fixture:{pid}")),
+        )
+    }
+
+    #[test]
+    fn an_exiting_member_requires_a_native_identity() {
+        let result = capture_member(42, || KillState::Exiting, || None, || None);
+        assert!(result.unwrap_err().contains("42"));
+    }
+
+    #[test]
+    fn a_process_reused_during_capture_is_omitted() {
+        let result = capture_member(
+            42,
+            || KillState::Live,
+            || Some("linux:fixture:1".into()),
+            || Some("linux:fixture:2".into()),
+        );
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn a_busy_exit_during_capture_is_not_an_unknown_member() {
+        for initial in [KillState::Unknown, KillState::Live] {
+            let mut first = Some(initial);
+            let result = capture_member(
+                42,
+                || first.take().unwrap_or(KillState::Gone),
+                || None,
+                || None,
+            );
+            assert_eq!(result, Ok(None));
+        }
+        let mut first = true;
+        let result = capture_member(
+            42,
+            || {
+                if std::mem::take(&mut first) {
+                    KillState::Live
+                } else {
+                    KillState::Gone
+                }
+            },
+            || Some("linux:fixture:1".into()),
+            || None,
+        );
+        assert_eq!(result, Ok(None));
     }
 
     #[test]
@@ -216,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_scan_skips_dead_malformed_and_unreadable_entries() {
+    fn linux_capture_retains_exiting_members_but_live_view_excludes_them() {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         for (pid, stat) in [
             ("30", "30 (sleep) S 1 42 42"),
@@ -236,32 +367,53 @@ mod tests {
         // Missing and unreadable stat entries don't invalidate the other PIDs.
         std::fs::create_dir(root.path().join("24")).unwrap();
         std::fs::create_dir_all(root.path().join("25/stat")).unwrap();
-        let state_of = |pid| match pid {
-            12 => ProcState::Unknown,
-            20 => ProcState::Exiting,
-            21 => ProcState::Gone,
-            _ => ProcState::Live,
+        let capture = |pid, _stat: &str| {
+            fixture_member(
+                pid,
+                match pid {
+                    12 => KillState::Unknown,
+                    20 => KillState::Exiting,
+                    21 => KillState::Gone,
+                    _ => KillState::Live,
+                },
+            )
         };
-        let members = linux_members(root.path(), 42, state_of);
-        assert_eq!(members, Ok(vec![9, 30, 31]));
-        let unrelated = linux_members(root.path(), 100, state_of);
-        assert_eq!(unrelated, Ok(vec![]));
+        let members = linux_members(root.path(), 42, capture).unwrap();
+        let states: Vec<_> = members.iter().map(|member| (member.pid, member.state)).collect();
+        assert_eq!(
+            states,
+            vec![
+                (9, KillState::Live),
+                (20, KillState::Exiting),
+                (30, KillState::Live),
+                (31, KillState::Live),
+            ]
+        );
+        assert_eq!(live_pids(members), vec![9, 30, 31]);
+        assert_eq!(linux_members(root.path(), 100, capture), Ok(vec![]));
     }
 
     #[test]
     fn linux_scan_refuses_an_unknown_member_thread_set() {
         let root = tempfile::tempdir_in("/tmp").unwrap();
-        let directory = root.path().join("42");
+        let directory = root.path().join("31");
         std::fs::create_dir(&directory).unwrap();
-        std::fs::write(directory.join("stat"), "42 (leader) Z 1 42 42").unwrap();
-        assert!(linux_members(root.path(), 42, |_| ProcState::Unknown).is_err());
+        std::fs::write(directory.join("stat"), "31 (leader) Z 1 42 42").unwrap();
+        let error = linux_members(root.path(), 42, |pid, _| {
+            fixture_member(pid, KillState::Unknown)
+        })
+        .unwrap_err();
+        assert!(error.contains("31"));
     }
 
     #[test]
     fn linux_scan_requires_a_readable_process_directory() {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let missing = root.path().join("missing");
-        assert!(linux_members(&missing, 42, |_| ProcState::Live).is_err());
+        assert!(linux_members(&missing, 42, |pid, _| {
+            fixture_member(pid, KillState::Live)
+        })
+        .is_err());
     }
 
     #[test]
@@ -272,7 +424,10 @@ mod tests {
         let mut stat = b"42 (sleep) S 1 42 42".to_vec();
         stat.resize(MAX_STAT_BYTES + 1, b' ');
         std::fs::write(directory.join("stat"), stat).unwrap();
-        assert!(linux_members(root.path(), 42, |_| ProcState::Live).is_err());
+        assert!(linux_members(root.path(), 42, |pid, _| {
+            fixture_member(pid, KillState::Live)
+        })
+        .is_err());
     }
 
     #[test]
@@ -286,10 +441,20 @@ mod tests {
             .spawn()
             .expect("spawn own process-group fixture");
         let pid = child.id();
+        let identity = super::super::process::identity(pid);
+        let captured = capture_members(pid);
         let members = live_members(pid);
         // Only this test's own child receives a signal. Reap it before any
         // assertions so an enumeration failure doesn't leave a fixture behind.
         kill_and_reap_child(&mut child);
+        assert_eq!(
+            captured,
+            Ok(vec![Member {
+                pid,
+                identity: identity.expect("owned fixture identity"),
+                state: KillState::Live,
+            }])
+        );
         assert_eq!(members, Ok(vec![pid]));
     }
 
@@ -341,7 +506,7 @@ ctypes.CDLL(None).syscall(int(sys.argv[1]), 0)
 mod tests {
     #[test]
     fn live_members_is_unsupported() {
-        assert_eq!(super::live_members(42), Err("unsupported"));
+        assert_eq!(super::live_members(42), Err("unsupported".into()));
     }
 }
 
