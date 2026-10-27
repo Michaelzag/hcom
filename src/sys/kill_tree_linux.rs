@@ -393,11 +393,23 @@ fn carrier_ancestry(
         if current.ppid <= 1 {
             return Ok(None);
         }
-        let parent = by_pid
-            .get(&current.ppid)
-            .copied()
-            .ok_or("carrier ancestry is unreadable or invalid")?;
+        let Some(parent) = by_pid.get(&current.ppid).copied() else {
+            #[cfg(test)]
+            eprintln!(
+                "HCOM106_ANCESTRY_DIAGNOSTIC reason=missing_snapshot_parent candidate={candidate:?} current={current:?} parent_pid={} fresh_parent_stat={:?} fresh_current_stat={:?}",
+                current.ppid,
+                std::fs::read_to_string(format!("/proc/{}/stat", current.ppid))
+                    .map(|stat| parse_stat(current.ppid, &stat)),
+                std::fs::read_to_string(format!("/proc/{}/stat", current.pid))
+                    .map(|stat| parse_stat(current.pid, &stat))
+            );
+            return Err("carrier ancestry is unreadable or invalid");
+        };
         if parent.start > current.start {
+            #[cfg(test)]
+            eprintln!(
+                "HCOM106_ANCESTRY_DIAGNOSTIC reason=parent_birth_after_child candidate={candidate:?} current={current:?} parent={parent:?}"
+            );
             return Err("carrier ancestry is unreadable or invalid");
         }
         if let Some(launcher) = lineage.rejected_carriers.get(&(parent.pid, parent.start)) {
@@ -407,7 +419,17 @@ fn carrier_ancestry(
         // between scans was never observed there. Its own current chain
         // and seat id decide admission; no historical edge is invented.
         match process_id_of(parent.pid) {
-            EnvRead::Unreadable => return Err("carrier ancestry is unreadable or invalid"),
+            EnvRead::Unreadable => {
+                #[cfg(test)]
+                eprintln!(
+                    "HCOM106_ANCESTRY_DIAGNOSTIC reason=parent_env_unreadable candidate={candidate:?} current={current:?} parent={parent:?} fresh_parent_stat={:?} fresh_current_stat={:?}",
+                    std::fs::read_to_string(format!("/proc/{}/stat", parent.pid))
+                        .map(|stat| parse_stat(parent.pid, &stat)),
+                    std::fs::read_to_string(format!("/proc/{}/stat", current.pid))
+                        .map(|stat| parse_stat(current.pid, &stat))
+                );
+                return Err("carrier ancestry is unreadable or invalid");
+            }
             EnvRead::Absent => return Ok(None),
             EnvRead::Present(id) if id.is_empty() || !bound_ids.contains(&id) => return Ok(None),
             EnvRead::Present(_) => {}
@@ -421,6 +443,10 @@ fn carrier_ancestry(
         }
         current = parent;
     }
+    #[cfg(test)]
+    eprintln!(
+        "HCOM106_ANCESTRY_DIAGNOSTIC reason=depth_exhausted candidate={candidate:?} current={current:?} MAX_TREE_DEPTH={MAX_TREE_DEPTH}"
+    );
     Err("carrier ancestry is unreadable or invalid")
 }
 
@@ -3014,39 +3040,107 @@ mod tests {
 
     #[test]
     fn a_reparented_carrier_with_a_bound_id_is_captured_and_terminated() {
-        let leader = spawn("exec sleep 30", 0);
-        let root = leader.id();
-        let fixture = Fixture::new(leader);
-        wait_for_sleep(root);
-        let id = format!("kill-tree-linux-carrier-{}-{root}", std::process::id());
-        // The intermediate shell exits at once; its background sleep is
-        // adopted by init or a subreaper, outside the root's tree.
-        let output = Command::new("sh")
-            .args([
-                "-c",
-                "HCOM_PROCESS_ID=\"$1\" sleep 30 </dev/null >/dev/null 2>&1 & echo $!",
-                "sh",
-                &id,
-            ])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .expect("spawn own carrier");
-        let carrier: u32 = String::from_utf8(output.stdout)
-            .unwrap()
-            .trim()
-            .parse()
+        let dir = tempfile::Builder::new()
+            .prefix("hcom-reparented-carrier-")
+            .tempdir()
             .unwrap();
+        let home = dir.path().join("home");
+        let state = dir.path().join("hcom");
+        let tmp = dir.path().join("tmp");
+        for path in [&home, &state, &tmp] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(state.join("config.toml"), "[relay]\nenabled = false\n").unwrap();
+        let root_file = dir.path().join("root");
+        let carrier_file = dir.path().join("carrier");
+        let stop = dir.path().join("stop");
+        let program = dir.path().join("subreaper.py");
+        std::fs::write(
+            &program,
+            format!(
+                r#"import ctypes, os, subprocess, sys, time
+root_file, carrier_file, stop, token = sys.argv[1:]
+if ctypes.CDLL(None).prctl({}, 1, 0, 0, 0) != 0:
+    raise RuntimeError("fixture could not become a subreaper")
+marked = os.environ.copy()
+marked["HCOM_PROCESS_ID"] = token
+root = subprocess.Popen(["/bin/sleep", "30"], env=marked, start_new_session=True)
+with open(root_file, "w") as output:
+    output.write(str(root.pid))
+carrier = int(subprocess.check_output(
+    ["/bin/sh", "-c", "/bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $!"],
+    env=marked,
+))
+with open(carrier_file, "w") as output:
+    output.write(str(carrier))
+while not os.path.exists(stop):
+    time.sleep(0.01)
+root.wait()
+os.waitpid(carrier, 0)
+"#,
+                libc::PR_SET_CHILD_SUBREAPER,
+            ),
+        )
+        .unwrap();
+        let id = marker("reparented-carrier");
+        let subreaper = Command::new("python3")
+            .arg(&program)
+            .args([&root_file, &carrier_file, &stop])
+            .arg(&id)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("HCOM_DIR", &state)
+            .env("TMPDIR", &tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn own non-id subreaper");
+        let subreaper_pid = subreaper.id();
+        let subreaper_start = start_of(subreaper_pid).expect("fixture subreaper start");
+        let fixture = Fixture::new(subreaper);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (root, carrier) = loop {
+            let read_pid = |path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|pid| pid.parse::<u32>().ok())
+            };
+            if let (Some(root), Some(carrier)) = (read_pid(&root_file), read_pid(&carrier_file))
+                && matches!(
+                    observe(Path::new("/proc"), carrier),
+                    Seen::Live(fact) if fact.ppid == subreaper_pid
+                )
+            {
+                break (root, carrier);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture carrier was never adopted"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        wait_for_sleep(root);
         wait_for_sleep(carrier);
+        let root_start = start_of(root).expect("fixture root start");
         let carrier_start = start_of(carrier).expect("carrier start");
+        let root_guard = Stray(Pinned::pin(root, root_start, &id));
         let stray = Stray(Pinned::pin(carrier, carrier_start, &id));
+        assert!(carrier_start >= root_start);
+        assert_eq!(start_of(subreaper_pid), Some(subreaper_start));
+        assert!(matches!(
+            crate::proctruth::process_id_of(subreaper_pid),
+            EnvRead::Absent
+        ));
         let tree = captured(root, 1);
         assert!(tree.iter().all(|member| member.pid != carrier));
 
         let result = terminate(
             (root, &identity(root).unwrap()),
             std::slice::from_ref(&id),
-            &[],
+            &[subreaper_pid],
             crate::proctruth::process_id_of,
             |_| true,
             |_| Ok(()),
@@ -3055,7 +3149,14 @@ mod tests {
         assert_eq!(result, Ok(GroupSignal::Sent));
         assert_ne!(start_of(carrier), Some(carrier_start), "carrier survived");
         assert!(tree.iter().all(|member| !running(member)));
+        assert_eq!(
+            start_of(subreaper_pid),
+            Some(subreaper_start),
+            "non-id subreaper was signaled"
+        );
+        std::fs::write(&stop, b"").unwrap();
         drop(stray);
+        drop(root_guard);
         drop(fixture);
     }
 
@@ -3693,35 +3794,114 @@ time.sleep(30)
 
     #[test]
     fn forks_made_during_the_kill_are_absorbed_and_confirmed_gone() {
+        let dir = tempfile::Builder::new()
+            .prefix("hcom-forking-carrier-")
+            .tempdir()
+            .unwrap();
+        let home = dir.path().join("home");
+        let state = dir.path().join("hcom");
+        let tmp = dir.path().join("tmp");
+        for path in [&home, &state, &tmp] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(state.join("config.toml"), "[relay]\nenabled = false\n").unwrap();
         // A test-owned group whose leader is not the seat root.
-        let anchor = spawn("exec sleep 30", 0);
+        let anchor = command("exec sleep 30", 0)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("HCOM_DIR", &state)
+            .env("TMPDIR", &tmp)
+            .spawn()
+            .expect("spawn own anchor");
         let group = anchor.id();
-        let mut fixture = Fixture::new(anchor);
+        let fixture = Fixture::new(anchor);
         wait_for_sleep(group);
-        let id = format!("kill-tree-linux-forker-{}-{group}", std::process::id());
+        let id = marker("forking-carrier");
+        let root_file = dir.path().join("root");
+        let stop = dir.path().join("stop");
+        let program = dir.path().join("subreaper.py");
         // The root and its sleepers ignore SIGTERM, so the root keeps forking
         // a sleeper every 50ms through the whole TERM budget, long after the
         // initial capture; one forked just before its SIGKILL is orphaned.
-        let root_child = Command::new("sh")
-            .args([
-                "-c",
-                "trap '' TERM; while :; do sleep 30 & sleep 0.05; done",
-            ])
-            .env("HCOM_PROCESS_ID", &id)
+        // The subreaper stays outside that group and adopts those late forks.
+        std::fs::write(
+            &program,
+            format!(
+                r#"import ctypes, os, subprocess, sys, time
+root_file, stop, token, group = sys.argv[1:]
+if ctypes.CDLL(None).prctl({}, 1, 0, 0, 0) != 0:
+    raise RuntimeError("fixture could not become a subreaper")
+marked = os.environ.copy()
+marked["HCOM_PROCESS_ID"] = token
+root = subprocess.Popen(
+    ["/bin/sh", "-c", "trap '' TERM; while :; do sleep 30 & sleep 0.05; done"],
+    env=marked,
+    preexec_fn=lambda: os.setpgid(0, int(group)),
+)
+with open(root_file, "w") as output:
+    output.write(str(root.pid))
+while not os.path.exists(stop):
+    time.sleep(0.01)
+root.wait()
+while True:
+    try:
+        os.waitpid(-1, 0)
+    except ChildProcessError:
+        break
+"#,
+                libc::PR_SET_CHILD_SUBREAPER,
+            ),
+        )
+        .unwrap();
+        let subreaper = Command::new("python3")
+            .arg(&program)
+            .args([&root_file, &stop])
+            .arg(&id)
+            .arg(group.to_string())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("HCOM_DIR", &state)
+            .env("TMPDIR", &tmp)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(group as i32)
+            .process_group(0)
             .spawn()
-            .expect("spawn own forking root");
-        let root = root_child.id();
-        fixture.children.push(root_child);
+            .expect("spawn own non-id subreaper");
+        let subreaper_pid = subreaper.id();
+        let subreaper_start = start_of(subreaper_pid).expect("fixture subreaper start");
+        let adopter_fixture = Fixture::new(subreaper);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let root = loop {
+            if let Some(root) = std::fs::read_to_string(&root_file)
+                .ok()
+                .and_then(|pid| pid.parse::<u32>().ok())
+                && matches!(
+                    observe(Path::new("/proc"), root),
+                    Seen::Live(fact) if fact.ppid == subreaper_pid
+                )
+            {
+                break root;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture forking root was never ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(start_of(subreaper_pid), Some(subreaper_start));
+        assert!(matches!(
+            crate::proctruth::process_id_of(subreaper_pid),
+            EnvRead::Absent
+        ));
         let first = captured(root, 3);
 
         let result = terminate(
             (root, &identity(root).unwrap()),
             std::slice::from_ref(&id),
-            &[],
+            &[subreaper_pid],
             crate::proctruth::process_id_of,
             |_| true,
             |_| Ok(()),
@@ -3734,6 +3914,13 @@ time.sleep(30)
             super::super::kill_group::live_members(group),
             Ok(vec![group])
         );
+        assert_eq!(
+            start_of(subreaper_pid),
+            Some(subreaper_start),
+            "non-id subreaper was signaled"
+        );
+        std::fs::write(&stop, b"").unwrap();
+        drop(adopter_fixture);
         drop(fixture);
     }
 
