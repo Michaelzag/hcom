@@ -27,6 +27,7 @@ mod launch_root_tests;
 ///
 /// The launcher owns the authoritative preset decision. Merge context under
 /// the writer lock so concurrent launch pins and other metadata stay intact.
+/// An opaque context stays byte for byte; only the preset columns change.
 pub fn persist_terminal_launch_context(
     db: &HcomDb,
     instance_name: &str,
@@ -35,38 +36,14 @@ pub fn persist_terminal_launch_context(
     process_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let persist = || {
-        let mut ctx = db
+        let current = db
             .get_instance_full(instance_name)?
-            .and_then(|pos| pos.launch_context)
-            .and_then(|json| {
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok()
-            })
-            .unwrap_or_default();
+            .and_then(|pos| pos.launch_context);
+        let context = launch_context_object(current.as_deref());
 
         #[cfg(test)]
         if let Some(hook) = PERSIST_TERMINAL_CONTEXT_GAP_HOOK.with(std::cell::Cell::take) {
             hook(db, instance_name);
-        }
-
-        if let Some(pid) = process_id.filter(|v| !v.is_empty()) {
-            ctx.insert("process_id".into(), serde_json::json!(pid));
-        }
-        if !effective_preset.is_empty() {
-            ctx.insert(
-                "terminal_preset_effective".into(),
-                serde_json::json!(effective_preset),
-            );
-            // Legacy compatibility for older readers and migration logic.
-            ctx.insert(
-                "terminal_preset".into(),
-                serde_json::json!(effective_preset),
-            );
-        }
-        if let Some(requested) = requested_preset.filter(|v| !v.is_empty() && *v != "default") {
-            ctx.insert(
-                "terminal_preset_requested".into(),
-                serde_json::json!(requested),
-            );
         }
 
         let mut updates = serde_json::Map::new();
@@ -82,10 +59,32 @@ pub fn persist_terminal_launch_context(
             "terminal_preset_effective".into(),
             serde_json::json!(effective_preset),
         );
-        updates.insert(
-            "launch_context".into(),
-            serde_json::json!(serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string())),
-        );
+        if let Some(mut ctx) = context {
+            if let Some(pid) = process_id.filter(|v| !v.is_empty()) {
+                ctx.insert("process_id".into(), serde_json::json!(pid));
+            }
+            if !effective_preset.is_empty() {
+                ctx.insert(
+                    "terminal_preset_effective".into(),
+                    serde_json::json!(effective_preset),
+                );
+                // Legacy compatibility for older readers and migration logic.
+                ctx.insert(
+                    "terminal_preset".into(),
+                    serde_json::json!(effective_preset),
+                );
+            }
+            if let Some(requested) = requested_preset.filter(|v| !v.is_empty() && *v != "default") {
+                ctx.insert(
+                    "terminal_preset_requested".into(),
+                    serde_json::json!(requested),
+                );
+            }
+            updates.insert(
+                "launch_context".into(),
+                serde_json::json!(serde_json::to_string(&ctx)?),
+            );
+        }
         db.update_instance_fields(instance_name, &updates)
     };
     if db.conn().is_autocommit() {
@@ -98,11 +97,17 @@ pub fn persist_terminal_launch_context(
 /// Capture environment context and store it for the instance.
 ///
 /// Captures git branch, terminal program, tty, and relevant env vars.
-/// Preserves terminal metadata, the launch receipt and the launch root under
-/// the writer lock.
+/// Preserves terminal metadata and, verbatim by key presence, the launch
+/// receipt and root, under the writer lock. An opaque context stays as is.
 pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     let new_ctx = capture_context();
     let store = || -> anyhow::Result<()> {
+        let current = db
+            .get_instance_full(instance_name)?
+            .and_then(|pos| pos.launch_context);
+        let Some(mut old_ctx) = launch_context_object(current.as_deref()) else {
+            return Ok(());
+        };
         // Preserve fields from prior context that can't be recaptured in hook env.
         let preserve_keys = [
             "pane_id",
@@ -110,32 +115,24 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
             "kitty_listen_on",
             "process_id",
             "terminal_preset_effective",
-            "omp_launch_pid",
-            "omp_launch_root",
         ];
         let mut ctx = new_ctx;
-
-        let missing: Vec<&str> = preserve_keys
-            .iter()
-            .filter(|k| launch_context_value_missing(ctx.get(**k)))
-            .copied()
-            .collect();
-
-        if !missing.is_empty()
-            && let Ok(Some(pos)) = db.get_instance_full(instance_name)
-            && let Some(old_json) = &pos.launch_context
-            && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
-        {
-            for k in &missing {
-                if let Some(val) = old_ctx.get(*k)
-                    && !launch_context_value_missing(Some(val))
-                {
-                    ctx.insert(k.to_string(), val.clone());
-                }
+        for key in preserve_keys {
+            if launch_context_value_missing(ctx.get(key))
+                && let Some(value) = old_ctx.remove(key)
+                && !launch_context_value_missing(Some(&value))
+            {
+                ctx.insert(key.to_string(), value);
             }
         }
+        for key in LAUNCH_RECORD_KEYS {
+            match old_ctx.remove(key) {
+                Some(value) => ctx.insert(key.to_string(), value),
+                None => ctx.remove(key),
+            };
+        }
 
-        let json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string(&ctx)?;
         let mut updates = serde_json::Map::new();
         updates.insert("launch_context".into(), serde_json::json!(json));
         update_instance_position(db, instance_name, &updates);
@@ -1049,9 +1046,9 @@ struct OmpLaunchPidReceipt {
 /// The same native PID receipt serves both launch reservations and hooked
 /// owners. Launches add their binding/incarnation token; every other fresh
 /// PID write records only the native identity, never a second receipt.
-pub(crate) fn pid_identity_receipt(pid: u32) -> Option<String> {
+pub(crate) fn pid_identity_receipt(pid: u32) -> Option<serde_json::Value> {
     let identity = crate::sys::process::identity(pid)?;
-    serde_json::to_string(&OmpLaunchPidReceipt {
+    serde_json::to_value(OmpLaunchPidReceipt {
         pid,
         identity,
         process_id: String::new(),
@@ -1061,20 +1058,25 @@ pub(crate) fn pid_identity_receipt(pid: u32) -> Option<String> {
     .ok()
 }
 
-pub(crate) fn copied_pid_identity_receipt(row: &InstanceRow) -> Option<String> {
-    OmpLaunchPidReceipt::raw(row).map(|receipt| receipt.to_string())
-}
+/// The launch records only their own PID writers set or clear. Every other
+/// writer carries them by key presence, verbatim, malformed values included.
+pub(crate) const LAUNCH_RECORD_KEYS: [&str; 2] = ["omp_launch_pid", "omp_launch_root"];
 
-/// The row's `omp_launch_root`, verbatim, for a migration that moves its PID.
-pub(crate) fn copied_omp_launch_root(row: &InstanceRow) -> Option<String> {
-    launch_context_value(row, "omp_launch_root").map(|root| root.to_string())
+/// A launch_context as a JSON object; empty text is a fresh `{}`. Any other
+/// text that is no JSON object is opaque, and writers leave it byte for byte:
+/// none erases or rewrites launch records it cannot read.
+pub(crate) fn launch_context_object(
+    text: Option<&str>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match text.filter(|text| !text.is_empty()) {
+        None => Some(serde_json::Map::new()),
+        Some(text) => serde_json::from_str(text).ok(),
+    }
 }
 
 /// One raw `launch_context` entry; `None` when the key or the JSON object is absent.
 fn launch_context_value(row: &InstanceRow, key: &str) -> Option<serde_json::Value> {
-    let mut context =
-        serde_json::from_str::<serde_json::Value>(row.launch_context.as_deref()?).ok()?;
-    context.as_object_mut()?.remove(key)
+    launch_context_object(row.launch_context.as_deref())?.remove(key)
 }
 
 impl OmpLaunchPidReceipt {
@@ -1398,12 +1400,8 @@ fn record_late_omp_launch_root(
         return Ok(false);
     }
     let text = row.launch_context.as_deref().unwrap_or("");
-    let context = if text.is_empty() {
-        Some(serde_json::Map::new())
-    } else {
-        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).ok()
-    };
-    let Some(mut context) = context.filter(|context| !context.contains_key("omp_launch_root"))
+    let Some(mut context) = launch_context_object(Some(text))
+        .filter(|context| !context.contains_key("omp_launch_root"))
     else {
         return Ok(false);
     };

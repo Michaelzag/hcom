@@ -214,16 +214,34 @@ impl HcomDb {
         Ok(())
     }
 
+    /// `name`'s launch_context text, `None` when the row or the text is absent.
+    fn launch_context_text(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT launch_context FROM instances WHERE name = ?1",
+                params![name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Update the PID and its native identity together after spawn.
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
-        let receipt = crate::instance_binding::pid_identity_receipt(pid);
+        if self.conn.is_autocommit() {
+            return self.with_immediate_transaction(|_| self.update_instance_pid(name, pid));
+        }
+        let context = with_launch_records(
+            self.launch_context_text(name)?,
+            [(
+                "omp_launch_pid",
+                crate::instance_binding::pid_identity_receipt(pid),
+            )],
+        )?;
         self.conn.execute(
-            "UPDATE instances SET pid = ?1,
-                launch_context = json_patch(
-                    CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
-                    json_object('omp_launch_pid', json(?3)))
-             WHERE name = ?2",
-            params![i64::from(pid), name, receipt],
+            "UPDATE instances SET pid = ?1, launch_context = ?3 WHERE name = ?2",
+            params![i64::from(pid), name, context],
         )?;
         Ok(())
     }
@@ -231,34 +249,50 @@ impl HcomDb {
     /// Record `pid` only while the row has none. Returns whether this call set
     /// it; an existing anchor (a PTY wrapper's, a launcher's) is never replaced.
     pub fn set_instance_pid_if_unset(&self, name: &str, pid: u32) -> Result<bool> {
-        let receipt = crate::instance_binding::pid_identity_receipt(pid);
+        if self.conn.is_autocommit() {
+            return self.with_immediate_transaction(|_| self.set_instance_pid_if_unset(name, pid));
+        }
+        let context = with_launch_records(
+            self.launch_context_text(name)?,
+            [(
+                "omp_launch_pid",
+                crate::instance_binding::pid_identity_receipt(pid),
+            )],
+        )?;
         let changed = self.conn.execute(
-            "UPDATE instances SET pid = ?1,
-                launch_context = json_patch(
-                    CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
-                    json_object('omp_launch_pid', json(?3)))
-             WHERE name = ?2 AND pid IS NULL",
-            params![i64::from(pid), name, receipt],
+            "UPDATE instances SET pid = ?1, launch_context = ?3 WHERE name = ?2 AND pid IS NULL",
+            params![i64::from(pid), name, context],
         )?;
         Ok(changed > 0)
     }
 
     /// Move an existing anchor without certifying whichever process happens
-    /// to hold its PID now. The source receipt and launch root, including
-    /// their absence, follow the copied PID in the same write.
+    /// to hold its PID now. The source receipt and launch root follow the
+    /// copied PID verbatim in the same write, absence and malformed values
+    /// included; an unreadable source context follows it whole. An opaque
+    /// destination context is never rewritten.
     pub(crate) fn copy_instance_pid(&self, name: &str, source: &InstanceRow) -> Result<()> {
+        if self.conn.is_autocommit() {
+            return self.with_immediate_transaction(|_| self.copy_instance_pid(name, source));
+        }
+        let current = self.launch_context_text(name)?;
+        let context = match crate::instance_binding::launch_context_object(
+            source.launch_context.as_deref(),
+        ) {
+            Some(mut records) => with_launch_records(
+                current,
+                crate::instance_binding::LAUNCH_RECORD_KEYS.map(|key| (key, records.remove(key))),
+            )?,
+            None if crate::instance_binding::launch_context_object(current.as_deref())
+                .is_some() =>
+            {
+                source.launch_context.clone()
+            }
+            None => current,
+        };
         self.conn.execute(
-            "UPDATE instances SET pid = ?1,
-                launch_context = json_patch(
-                    CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
-                    json_object('omp_launch_pid', json(?3), 'omp_launch_root', json(?4)))
-             WHERE name = ?2",
-            params![
-                source.pid,
-                name,
-                crate::instance_binding::copied_pid_identity_receipt(source),
-                crate::instance_binding::copied_omp_launch_root(source),
-            ],
+            "UPDATE instances SET pid = ?1, launch_context = ?3 WHERE name = ?2",
+            params![source.pid, name, context],
         )?;
         Ok(())
     }
@@ -275,19 +309,39 @@ impl HcomDb {
         expected: &InstanceRow,
         pid: Option<u32>,
     ) -> Result<bool> {
+        let Some(current) = tx
+            .query_row(
+                "SELECT launch_context FROM instances
+                 WHERE name = ?1 AND created_at = ?2 AND agent_id IS ?3
+                   AND pid IS ?4 AND session_id IS ?5
+                   AND tool = ?6 AND NULLIF(origin_device_id, '') IS ?7",
+                params![
+                    expected.name,
+                    expected.created_at,
+                    expected.agent_id,
+                    expected.pid,
+                    expected.session_id,
+                    expected.tool,
+                    expected.origin_device_id,
+                ],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
         let receipt = pid.and_then(crate::instance_binding::pid_identity_receipt);
+        let context = with_launch_records(
+            current,
+            std::iter::once(("omp_launch_pid", receipt))
+                .chain(pid.is_none().then_some(("omp_launch_root", None))),
+        )?;
         let changed = tx.execute(
-            "UPDATE instances SET pid = ?1,
-                launch_context = json_patch(
-                    CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
-                    CASE WHEN ?1 IS NULL
-                        THEN json_object('omp_launch_pid', NULL, 'omp_launch_root', NULL)
-                        ELSE json_object('omp_launch_pid', json(?9)) END)
-             WHERE name = ?2 AND created_at = ?3 AND agent_id IS ?4
-               AND pid IS ?5 AND session_id IS ?6
-               AND tool = ?7 AND NULLIF(origin_device_id, '') IS ?8",
+            "UPDATE instances SET pid = ?8, launch_context = ?9
+             WHERE name = ?1 AND created_at = ?2 AND agent_id IS ?3
+               AND pid IS ?4 AND session_id IS ?5
+               AND tool = ?6 AND NULLIF(origin_device_id, '') IS ?7",
             params![
-                pid.map(i64::from),
                 expected.name,
                 expected.created_at,
                 expected.agent_id,
@@ -295,7 +349,8 @@ impl HcomDb {
                 expected.session_id,
                 expected.tool,
                 expected.origin_device_id,
-                receipt,
+                pid.map(i64::from),
+                context,
             ],
         )?;
         Ok(changed == 1)
@@ -408,9 +463,15 @@ impl HcomDb {
 
         let mut changed = false;
         for (key, value) in incoming {
-            let should_fill = existing.get(&key).is_none_or(|current| {
-                current.is_null() || current.as_str().is_some_and(str::is_empty)
-            });
+            // A present launch record, malformed or not, is never filled over.
+            let should_fill = if crate::instance_binding::LAUNCH_RECORD_KEYS.contains(&key.as_str())
+            {
+                !existing.contains_key(&key)
+            } else {
+                existing.get(&key).is_none_or(|current| {
+                    current.is_null() || current.as_str().is_some_and(str::is_empty)
+                })
+            };
             if should_fill {
                 existing.insert(key, value);
                 changed = true;
@@ -1300,8 +1361,9 @@ impl HcomDb {
 
     /// Generic field writers must carry the same identity invariant as the
     /// dedicated PID setters: a fresh receipt for the new PID and the row's
-    /// launch root unchanged. A caller's whole context never adds, moves or
-    /// drops a root, and a brand-new row starts with none. Called under their
+    /// launch root unchanged, verbatim. A caller's whole context never adds,
+    /// moves or drops a root, and a brand-new row starts with none. A row whose
+    /// context is no JSON object keeps it byte for byte. Called under their
     /// writer transaction.
     fn pid_identity_context(
         &self,
@@ -1309,27 +1371,26 @@ impl HcomDb {
         pid: &serde_json::Value,
         context: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let parse = |text: &str| {
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).ok()
-        };
-        let row_context = match name {
-            Some(name) => self
-                .get_instance_full(name)?
-                .and_then(|row| row.launch_context)
-                .as_deref()
-                .and_then(parse),
+        let row_text = match name {
+            Some(name) => self.launch_context_text(name)?,
             None => None,
+        };
+        let Some(mut row_context) =
+            crate::instance_binding::launch_context_object(row_text.as_deref())
+        else {
+            return Ok(serde_json::Value::String(row_text.unwrap_or_default()));
         };
         let mut context = match context {
             Some(value) => {
-                let mut supplied = value.as_str().and_then(parse).unwrap_or_default();
-                match row_context.and_then(|mut row| row.remove("omp_launch_root")) {
+                let mut supplied = crate::instance_binding::launch_context_object(value.as_str())
+                    .unwrap_or_default();
+                match row_context.remove("omp_launch_root") {
                     Some(root) => supplied.insert("omp_launch_root".into(), root),
                     None => supplied.remove("omp_launch_root"),
                 };
                 supplied
             }
-            None => row_context.unwrap_or_default(),
+            None => row_context,
         };
         context.remove("omp_launch_pid");
         if let Some(receipt) = pid
@@ -1337,7 +1398,7 @@ impl HcomDb {
             .and_then(|pid| u32::try_from(pid).ok())
             .and_then(crate::instance_binding::pid_identity_receipt)
         {
-            context.insert("omp_launch_pid".into(), serde_json::from_str(&receipt)?);
+            context.insert("omp_launch_pid".into(), receipt);
         }
         Ok(serde_json::Value::String(serde_json::to_string(&context)?))
     }
@@ -1440,6 +1501,26 @@ impl HcomDb {
         )?;
         Ok(())
     }
+}
+
+/// `current` with PID-bound launch `records` set verbatim, `None` removing a
+/// key. Empty text starts as `{}`; text that is no JSON object comes back
+/// unchanged, so a PID write never erases or rewrites records it can't read.
+fn with_launch_records(
+    current: Option<String>,
+    records: impl IntoIterator<Item = (&'static str, Option<serde_json::Value>)>,
+) -> Result<Option<String>> {
+    let Some(mut context) = crate::instance_binding::launch_context_object(current.as_deref())
+    else {
+        return Ok(current);
+    };
+    for (key, value) in records {
+        match value {
+            Some(value) => context.insert(key.to_owned(), value),
+            None => context.remove(key),
+        };
+    }
+    Ok(Some(serde_json::to_string(&context)?))
 }
 
 #[cfg(test)]

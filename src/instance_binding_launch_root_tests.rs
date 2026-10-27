@@ -43,6 +43,11 @@ fn open_db(env: &tempfile::TempDir, label: &str) -> HcomDb {
     HcomDb::open_at(&env.path().join(format!("{label}.db"))).unwrap()
 }
 
+/// One named launch_context writer, run against a seeded row.
+type Writer<'a> = (&'static str, &'a dyn Fn(&HcomDb));
+/// A writer and the PID its receipt must name afterwards (`None`: unchanged).
+type ReceiptWriter<'a> = (&'static str, Option<u32>, &'a dyn Fn(&HcomDb));
+
 /// An unhooked OMP launch reservation and its UUID binding, as launch
 /// registration leaves it. A resume reservation already carries its session.
 fn seed_reservation(db: &HcomDb, session_id: Option<&str>) {
@@ -171,7 +176,7 @@ fn owner_writers_never_mint_a_root_on_a_legacy_row() {
             anchor_kind: AncestorProcess::Omp,
         })
     };
-    let writers: [(&str, &dyn Fn(&HcomDb)); 6] = [
+    let writers: [Writer<'_>; 6] = [
         ("hook bind", &|db| {
             assert_eq!(
                 bind_omp_session_to_process_checked(db, "sid-owner", LAUNCH_ID, &actual_owner)
@@ -313,7 +318,7 @@ fn every_context_and_owner_writer_carries_the_root_and_receipt() {
     let (child, interpreter, next) = (child.pid(), interpreter.pid(), next.pid());
     // Each writer and the PID its receipt names afterwards; `None` keeps the
     // hooked owner's receipt byte for byte.
-    let writers: [(&str, Option<u32>, &dyn Fn(&HcomDb)); 9] = [
+    let writers: [ReceiptWriter<'_>; 9] = [
         ("terminal details save", None, &|db| {
             persist_terminal_launch_context(
                 db,
@@ -696,5 +701,241 @@ fn a_late_capture_never_writes_into_a_replacement_reservation() {
             Some(root_of(next_child.pid())),
             "{replacement}"
         );
+    }
+}
+
+/// Launch records no writer can vouch for: a present root that is null or the
+/// wrong shape, inside an otherwise readable context.
+const MALFORMED_ROOTS: [&str; 2] = ["null", r#"{"pid":"not-a-pid"}"#];
+/// Whole contexts that are no JSON object, so any record inside is unreadable.
+const OPAQUE_CONTEXTS: [&str; 2] = [r#"not json {"omp_launch_root""#, r#"["omp_launch_root"]"#];
+
+/// `luna` pinned to `owner` with one malformed shape: a readable context whose
+/// root is `malformed`, or the opaque text itself.
+fn seed_malformed(db: &HcomDb, owner: u32, shape: &str) {
+    seed_reservation(db, None);
+    let text = if OPAQUE_CONTEXTS.contains(&shape) {
+        shape.to_string()
+    } else {
+        json!({
+            "pane_id": "p_1",
+            "omp_launch_pid": pid_identity_receipt(owner).unwrap(),
+            "omp_launch_root": serde_json::from_str::<Value>(shape).unwrap(),
+        })
+        .to_string()
+    };
+    db.conn()
+        .execute(
+            "UPDATE instances SET pid = ?1, launch_context = ?2 WHERE name = ?3",
+            rusqlite::params![i64::from(owner), text, "luna"],
+        )
+        .unwrap();
+}
+
+/// The malformed record still reads exactly as seeded.
+fn assert_malformed_kept(db: &HcomDb, name: &str, shape: &str, case: &str) {
+    if OPAQUE_CONTEXTS.contains(&shape) {
+        assert_eq!(
+            row(db, name).launch_context.as_deref(),
+            Some(shape),
+            "{case}: an opaque context was rewritten"
+        );
+    } else {
+        assert_eq!(
+            root(db, name),
+            Some(serde_json::from_str::<Value>(shape).unwrap()),
+            "{case}: a present malformed root was dropped or healed"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn no_writer_heals_or_erases_a_malformed_launch_record() {
+    let env = crate::hooks::test_helpers::isolated_test_env();
+    let (owner, next) = (Live::spawn(), Live::spawn());
+    let (owner, next) = (owner.pid(), next.pid());
+    let writers: [Writer<'_>; 9] = [
+        ("terminal details save", &|db| {
+            persist_terminal_launch_context(
+                db,
+                "luna",
+                Some("kitty"),
+                "kitty-tab",
+                Some(LAUNCH_ID),
+            )
+            .unwrap();
+        }),
+        ("hook-time context rewrite", &|db| {
+            capture_and_store_launch_context(db, "luna");
+        }),
+        ("pty early context merge", &|db| {
+            let incoming = json!({"pane_id": "p_2", "omp_launch_root": root_of(next)});
+            db.store_launch_context("luna", &incoming.to_string())
+                .unwrap();
+        }),
+        ("owner setter", &|db| {
+            db.update_instance_pid("luna", next).unwrap()
+        }),
+        ("start --as", &|db| {
+            db.conn()
+                .execute("UPDATE instances SET pid = NULL WHERE name = 'luna'", [])
+                .unwrap();
+            assert!(db.set_instance_pid_if_unset("luna", next).unwrap());
+        }),
+        ("owner CAS", &|db| {
+            let expected = row(db, "luna");
+            assert!(
+                db.with_immediate_transaction(|tx| {
+                    db.compare_and_set_instance_pid_in_txn(tx, &expected, Some(next))
+                })
+                .unwrap()
+            );
+        }),
+        ("generic field write, whole context", &|db| {
+            db.update_instance_fields(
+                "luna",
+                &serde_json::Map::from_iter([
+                    ("pid".to_string(), json!(next)),
+                    ("launch_context".to_string(), json!(r#"{"pane_id":"p_9"}"#)),
+                ]),
+            )
+            .unwrap();
+        }),
+        ("generic update", &|db| {
+            db.update_instance("luna", &HashMap::from([("pid".to_string(), json!(next))]))
+                .unwrap();
+        }),
+        ("generic upsert", &|db| {
+            db.save_instance(&HashMap::from([
+                ("name".to_string(), json!("luna")),
+                ("created_at".to_string(), json!(1.25)),
+                ("pid".to_string(), json!(next)),
+            ]))
+            .unwrap();
+        }),
+    ];
+    for shape in MALFORMED_ROOTS.into_iter().chain(OPAQUE_CONTEXTS) {
+        for (writer, write) in &writers {
+            let case = format!("{writer} over {shape}");
+            let db = open_db(
+                &env.0,
+                &format!(
+                    "malformed_{}",
+                    case.replace(|c: char| !c.is_alphanumeric(), "_")
+                ),
+            );
+            seed_malformed(&db, owner, shape);
+            write(&db);
+            assert_malformed_kept(&db, "luna", shape, &case);
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn copies_releases_and_pins_keep_malformed_launch_records_verbatim() {
+    let env = crate::hooks::test_helpers::isolated_test_env();
+    let (owner, pty, child) = (Live::spawn(), Live::spawn(), Live::spawn());
+    for shape in MALFORMED_ROOTS.into_iter().chain(OPAQUE_CONTEXTS) {
+        let label = shape.replace(|c: char| !c.is_alphanumeric(), "_");
+        let opaque = OPAQUE_CONTEXTS.contains(&shape);
+
+        // A copy moves the source's records with its PID, unreadable ones too.
+        let db = open_db(&env.0, &format!("copy_from_{label}"));
+        seed_malformed(&db, owner.pid(), shape);
+        seed_stale_canonical(&db, pty.pid());
+        let source = row(&db, "luna");
+        db.with_immediate_transaction(|tx| {
+            migrate_placeholder_runtime_state_in_txn(&db, tx, "fano", Some(&source))
+        })
+        .unwrap();
+        assert_eq!(row(&db, "fano").pid, source.pid, "copy from {shape}");
+        if opaque {
+            assert_eq!(
+                row(&db, "fano").launch_context,
+                source.launch_context,
+                "copy from {shape}"
+            );
+        } else {
+            assert_malformed_kept(&db, "fano", shape, &format!("copy from {shape}"));
+        }
+
+        // A copy onto an opaque row moves the PID but never rewrites that row.
+        if opaque {
+            let db = open_db(&env.0, &format!("copy_onto_{label}"));
+            seed_reservation(&db, None);
+            db.update_instance_pid("luna", owner.pid()).unwrap();
+            seed_stale_canonical(&db, pty.pid());
+            db.conn()
+                .execute(
+                    "UPDATE instances SET launch_context = ?1 WHERE name = 'fano'",
+                    [shape],
+                )
+                .unwrap();
+            let source = row(&db, "luna");
+            db.with_immediate_transaction(|tx| {
+                migrate_placeholder_runtime_state_in_txn(&db, tx, "fano", Some(&source))
+            })
+            .unwrap();
+            assert_eq!(row(&db, "fano").pid, source.pid, "copy onto {shape}");
+            assert_malformed_kept(&db, "fano", shape, &format!("copy onto {shape}"));
+        }
+
+        // Release clears a readable row's root, malformed or not, and leaves an
+        // opaque one byte for byte.
+        let db = open_db(&env.0, &format!("release_{label}"));
+        seed_malformed(&db, owner.pid(), shape);
+        let expected = row(&db, "luna");
+        assert!(
+            db.with_immediate_transaction(|tx| {
+                db.compare_and_set_instance_pid_in_txn(tx, &expected, None)
+            })
+            .unwrap()
+        );
+        assert_eq!(row(&db, "luna").pid, None, "release over {shape}");
+        if opaque {
+            assert_malformed_kept(&db, "luna", shape, &format!("release over {shape}"));
+        } else {
+            assert_eq!(root(&db, "luna"), None, "release over {shape}");
+        }
+
+        // Neither the child pin nor a late root write replaces what is there.
+        for hooked in [false, true] {
+            let db = open_db(&env.0, &format!("pin_{hooked}_{label}"));
+            seed_reservation(&db, None);
+            let mut launch = capture_omp_launch_pid(&db, LAUNCH_ID, "luna")
+                .unwrap()
+                .unwrap();
+            assert!(record_omp_launch_pid(&db, &mut launch, pty.pid()).unwrap());
+            if opaque {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET launch_context = ?1 WHERE name = 'luna'",
+                        [shape],
+                    )
+                    .unwrap();
+            } else {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET launch_context =
+                             json_set(launch_context, '$.omp_launch_root', json(?1))
+                         WHERE name = 'luna'",
+                        [shape],
+                    )
+                    .unwrap();
+            }
+            if hooked {
+                db.set_process_binding(LAUNCH_ID, "sid-owner", "luna")
+                    .unwrap();
+            }
+            let _ = record_omp_launch_root(&db, &mut launch, child.pid());
+            assert_malformed_kept(
+                &db,
+                "luna",
+                shape,
+                &format!("child pin (hooked={hooked}) over {shape}"),
+            );
+        }
     }
 }
