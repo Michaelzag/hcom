@@ -894,14 +894,76 @@ impl Drop for Sentinel {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The fixture terminal preset the executor's row was launched under. Its
+/// close command records the pane id it was asked to close, then fails.
+const PANE_PRESET: &str = "rkfail";
+
+/// Pre-upgrade pane ownership for the executor's row `name`: the preset in
+/// the row, the pane ids in its launch context (no identity or root receipt),
+/// and the launch receipt in exactly the shape `write_terminal_id` writes,
+/// naming `receipt_preset`. The real `closeable_terminal_id` gate decides
+/// whether the kill may close the pane. Returns (close marker, pane id,
+/// close script).
+fn seed_pane(
+    h: &Hcom,
+    name: &str,
+    process_id: &str,
+    receipt_preset: &str,
+) -> (PathBuf, String, PathBuf) {
+    let marker = h.root_path().join("pane-close-attempt");
+    let script = h.root_path().join("close-pane.sh");
+    fs::write(
+        &script,
+        format!("printf '%s' \"$1\" > '{}'\nexit 1\n", marker.display()),
+    )
+    .expect("write failing close script");
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(h.path().join("config.toml"))
+        .expect("open executor config");
+    write!(
+        config,
+        "\n[terminal.presets.{PANE_PRESET}]\nopen = 'sh {{script}}'\nclose = 'sh {} {{pane_id}}'\n",
+        script.display()
+    )
+    .expect("add the failing fixture preset");
+    let pane_id = format!("rkpane-{}", unique_suffix());
+    let updated = db(h)
+        .execute(
+            "UPDATE instances SET terminal_preset_effective=?2, launch_context=?3 WHERE name=?1",
+            rusqlite::params![
+                name,
+                PANE_PRESET,
+                json!({"process_id": process_id, "terminal_id": pane_id}).to_string()
+            ],
+        )
+        .expect("record the row's pane");
+    assert_eq!(updated, 1, "no executor row {name} to give a pane");
+    let owners = h.path().join(".tmp/terminal_owners");
+    fs::create_dir_all(&owners).expect("create terminal owner receipts");
+    fs::write(
+        owners.join(process_id),
+        json!({
+            "instance_name": name,
+            "process_id": process_id,
+            "preset": receipt_preset,
+            "terminal_id": pane_id,
+        })
+        .to_string(),
+    )
+    .expect("write the launch receipt");
+    (marker, pane_id, script)
+}
+
 /// Rule 3 on the executor: a legacy OMP row whose live owner carries the bound
-/// HCOM_PROCESS_ID, with no `hcom pty` ancestor and no `omp_launch_root`. The
-/// owner tree is terminated but the seat launcher is not verified. The caller
-/// must see that warning and a nonzero exit, never the clean success report.
-#[test]
-fn remote_kill_reports_unverified_launcher_as_failure() {
+/// HCOM_PROCESS_ID, with no `hcom pty` ancestor and no `omp_launch_root`, in a
+/// pane its launch receipt proves it owns. The owner tree is terminated but
+/// the seat launcher is not verified, and closing the pane fails. With
+/// `receipt_matches` false the receipt names another preset, so no close may
+/// be attempted.
+fn unverified_launcher_kill(label: &str, receipt_matches: bool) {
     let mut pair = Pair::new();
-    let base = format!("rkwarn{}", unique_suffix());
+    let base = format!("{label}{}", unique_suffix());
     let process_id = uuid::Uuid::new_v4().to_string();
     let omp = omp_standin(&pair.executor.h);
     let owner = Sentinel::spawn(
@@ -912,6 +974,13 @@ fn remote_kill_reports_unverified_launcher_as_failure() {
         false,
     );
     seed_row(&pair.executor.h, &base, "omp", &process_id, owner.pid());
+    let receipt_preset = if receipt_matches {
+        PANE_PRESET
+    } else {
+        "rkother"
+    };
+    let (marker, pane_id, script) =
+        seed_pane(&pair.executor.h, &base, &process_id, receipt_preset);
     pair.start_workers();
     let target = pair.remote_target(&base);
 
@@ -941,6 +1010,50 @@ fn remote_kill_reports_unverified_launcher_as_failure() {
         code, 0,
         "`hcom kill {target}` exited 0 on an unverified launcher:\n{output}"
     );
+
+    let attempted = fs::read_to_string(&marker).ok();
+    let script = script.display().to_string();
+    let retry = output
+        .lines()
+        .find(|line| line.contains(&script) && line.contains(&pane_id));
+    if receipt_matches {
+        assert_eq!(
+            attempted.as_deref(),
+            Some(pane_id.as_str()),
+            "the executor never tried to close {base}'s owned pane {pane_id}:\n{output}\n{}",
+            pair.diagnostics()
+        );
+        assert!(
+            output.contains("but pane remains"),
+            "`hcom kill {target}` did not report that pane {pane_id} remains:\n{output}"
+        );
+        assert!(
+            retry.is_some(),
+            "`hcom kill {target}` lost the executor's pane retry command `sh {script} {pane_id}`:\n{output}"
+        );
+    } else {
+        assert_eq!(
+            attempted, None,
+            "SAFETY: the executor closed pane {pane_id} that {base}'s receipt does not own:\n{output}"
+        );
+        assert!(
+            retry.is_none() && !output.contains("pane remains"),
+            "`hcom kill {target}` offered a pane retry for a pane it does not own:\n{output}"
+        );
+    }
+}
+
+#[test]
+fn remote_kill_reports_unverified_launcher_as_failure() {
+    unverified_launcher_kill("rkwarn", true);
+}
+
+/// The control: the same kill, but the launch receipt names another preset.
+/// The real ownership gate refuses the pane, so nothing is closed and no
+/// retry is offered; the launcher warning and failure still come through.
+#[test]
+fn remote_kill_attempts_no_close_without_a_matching_pane_receipt() {
+    unverified_launcher_kill("rknopane", false);
 }
 
 /// The executor's row names a PID now held by an unrelated live process that
