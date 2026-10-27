@@ -2644,14 +2644,40 @@ fn zellij_terminal_pane_exists(session_name: &str, pane_id: &str) -> Option<bool
     }))
 }
 
-/// Close the owned pane, then signal only the verified PID incarnation's group.
+/// Confirm the native root tree is gone before attempting owned-pane cleanup.
+/// A closed pane is never evidence that any captured process has exited.
 pub(crate) fn kill_process(
     owner: &crate::proctruth::KillOwner,
     instance_names: &[String],
+    binding_ids: &[String],
+    excluded: &[u32],
     info: &TerminalInfo,
-) -> Result<(KillResult, bool, Option<String>), String> {
+    authorize: impl FnMut(u32) -> Result<(), crate::sys::process::KillError>,
+) -> Result<(KillResult, bool, Option<String>), crate::sys::process::KillError> {
     let pid = owner.pid();
-    let live = owner.recheck()?;
+    use crate::sys::process::GroupSignal;
+    let kill_result = if owner.recheck()? {
+        match crate::sys::process::terminate_group_verified(
+            pid,
+            owner
+                .identity()
+                .ok_or("process ownership was not verified")?,
+            binding_ids,
+            excluded,
+            crate::proctruth::process_id_of,
+            crate::proctruth::kill_candidate_eligible,
+            authorize,
+        )? {
+            GroupSignal::Sent => KillResult::Sent,
+            GroupSignal::NotFound => KillResult::AlreadyDead,
+            #[cfg(unix)]
+            GroupSignal::PermissionDenied | GroupSignal::Other => {
+                return Err("native tree termination was not confirmed".into());
+            }
+        }
+    } else {
+        KillResult::AlreadyDead
+    };
     let TerminalInfo {
         preset_name,
         pane_id,
@@ -2660,14 +2686,19 @@ pub(crate) fn kill_process(
         terminal_id,
         zellij_session_name,
     } = info;
-    let pane_close = if let Some(owned_id) = closeable_terminal_id(
-        &paths::hcom_path(&[".tmp", "terminal_owners"]),
-        process_id,
-        instance_names,
-        preset_name,
-        pane_id,
-        terminal_id,
-    ) {
+    let owned_id = (!excluded.contains(&pid))
+        .then(|| {
+            closeable_terminal_id(
+                &paths::hcom_path(&[".tmp", "terminal_owners"]),
+                process_id,
+                instance_names,
+                preset_name,
+                pane_id,
+                terminal_id,
+            )
+        })
+        .flatten();
+    let pane_close = if let Some(owned_id) = owned_id {
         let pane_id = if is_zellij_preset(preset_name) {
             owned_id.strip_prefix("terminal_").unwrap_or(&owned_id)
         } else {
@@ -2687,25 +2718,6 @@ pub(crate) fn kill_process(
             closed: false,
             retry_command: None,
         }
-    };
-
-    use crate::sys::process::GroupSignal;
-    let kill_result = if live && owner.recheck()? {
-        match crate::sys::process::terminate_group_verified(
-            pid,
-            owner
-                .identity()
-                .ok_or("process ownership was not verified")?,
-        )? {
-            GroupSignal::Sent => KillResult::Sent,
-            #[cfg(unix)]
-            GroupSignal::PermissionDenied => KillResult::PermissionDenied,
-            GroupSignal::NotFound => KillResult::AlreadyDead,
-            #[cfg(unix)]
-            GroupSignal::Other => KillResult::AlreadyDead,
-        }
-    } else {
-        KillResult::AlreadyDead
     };
 
     Ok((kill_result, pane_close.closed, pane_close.retry_command))
@@ -3215,7 +3227,8 @@ mod tests {
                 ..Default::default()
             };
             let owner = crate::proctruth::verify_kill_owner(2_000_000_000, None, &[]).unwrap();
-            let (_, closed, _) = kill_process(&owner, &["bura".into()], &info).unwrap();
+            let (_, closed, _) =
+                kill_process(&owner, &["bura".into()], &[], &[], &info, |_| Ok(())).unwrap();
             assert_eq!(
                 closed,
                 should_close,

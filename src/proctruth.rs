@@ -573,9 +573,7 @@ fn is_bound_process_id(process_id: &str, binding_ids: &[String]) -> bool {
 }
 
 /// Broker-owned daemons inherit the first session's identity but do not belong
-/// to it. Only a nested `omp` below the nearest broker starts a new carrier
-/// subtree. Off Linux and Android there is no `/proc/<pid>/comm` to distinguish
-/// them, so keep the existing identity-only rule.
+/// to it. Stop's existing /proc ancestry boundary is intentionally unchanged.
 #[cfg(unix)]
 pub(crate) fn carrier_eligible(pid: u32) -> bool {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -591,6 +589,48 @@ pub(crate) fn carrier_eligible(pid: u32) -> bool {
         let _ = pid;
         true
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KillCandidateKind {
+    Member,
+    SharedBroker,
+    PtyWrapper,
+    Unreadable,
+}
+
+fn kill_candidate_argv_kind(cmdline: Option<&[u8]>, windows: bool) -> KillCandidateKind {
+    let Some(argv) = cmdline.and_then(|argv| ToolCommandLine::parse(argv, windows)) else {
+        return KillCandidateKind::Unreadable;
+    };
+    if cmdline.is_some_and(crate::sys::seat_root::is_wrapper) {
+        return KillCandidateKind::PtyWrapper;
+    }
+    if argv.is_daemon_broker(windows) {
+        KillCandidateKind::SharedBroker
+    } else {
+        KillCandidateKind::Member
+    }
+}
+
+fn kill_candidate_kind(pid: u32) -> KillCandidateKind {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| comm.strip_suffix('\n').unwrap_or(&comm) == "omp daemon brok")
+    {
+        return KillCandidateKind::SharedBroker;
+    }
+    kill_candidate_argv_kind(
+        crate::sys::process_args::command_line(pid).as_deref(),
+        cfg!(windows),
+    )
+}
+
+/// Only a positively identified shared broker is silently outside kill scope.
+/// Unreadable argv enters native preflight, which correlates the authorization
+/// error with its captured birth before refusing a still-live incarnation.
+pub(crate) fn kill_candidate_eligible(pid: u32) -> bool {
+    kill_candidate_kind(pid) != KillCandidateKind::SharedBroker
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -700,29 +740,6 @@ impl ReapCapture {
     }
 }
 
-/// A kill of a positively dead leader performs bookkeeping only. Neither a
-/// surviving group nor inherited carriers authorize a signal through its PID.
-pub(crate) fn gone_kill_capture(
-    row: &crate::db::InstanceRow,
-    binding_ids: &[String],
-) -> ReapCapture {
-    ReapCapture {
-        #[cfg(unix)]
-        scope: carrier_tree_scope(None, &[], &[]),
-        #[cfg(unix)]
-        carriers: Vec::new(),
-        incarnation: Some(CapturedIncarnation {
-            created_at: row.created_at,
-            pid: row.pid,
-            session_id: row.session_id.clone(),
-            agent_id: row.agent_id.clone(),
-            binding_ids: binding_ids.to_vec(),
-        }),
-        signal_free: true,
-        recovering_empty_row: false,
-    }
-}
-
 #[cfg(unix)]
 fn carrier_tree_scope(
     row_pid: Option<i64>,
@@ -807,7 +824,6 @@ fn capture_reap_carriers_unbound(
 /// parses it to admit a root: the loose `omp-<head>-…` head plus the
 /// mandatory trailing `-`. "A minted pid" therefore means the same thing in
 /// the root admission and in the foreign-owner guard.
-#[cfg(unix)]
 fn minted_root_pid(id: &str) -> Option<u32> {
     let pid = shell_pid_from_process_id(id)?;
     id.strip_prefix("omp-")
@@ -1314,12 +1330,7 @@ pub(crate) fn process_gone(pid: u32) -> bool {
 }
 
 fn is_zombie(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    stat.rsplit_once(')')
-        .map(|(_, rest)| rest.trim_start().starts_with('Z'))
-        .unwrap_or(false)
+    crate::sys::process::is_zombie(pid)
 }
 
 /// Every live descendant of `root`, in breadth-first order, `root` excluded.
@@ -1456,6 +1467,11 @@ impl<'a> ToolCommandLine<'a> {
     fn is_omp_worker(&self) -> bool {
         self.first_script_arg
             .is_some_and(|arg| arg.starts_with(b"__omp_worker_"))
+    }
+
+    fn is_daemon_broker(&self, windows: bool) -> bool {
+        self.matches(None, "omp", windows)
+            && self.first_script_arg == Some(b"__omp_worker_daemon_broker".as_slice())
     }
 }
 
@@ -1629,6 +1645,40 @@ pub fn caller_ancestor_pids() -> Vec<u32> {
     )))]
     {
         vec![std::process::id()]
+    }
+}
+
+/// Kill must know the complete caller chain before excluding it from capture.
+/// Other lifecycle operations retain their existing best-effort ancestry.
+pub(crate) fn kill_caller_ancestor_pids() -> Result<Vec<u32>, &'static str> {
+    use crate::sys::process;
+    #[cfg(windows)]
+    let snapshot =
+        process::snapshot_parents(false).ok_or("caller's own process chain is unreadable")?;
+    let mut chain = vec![std::process::id()];
+    let mut current = chain[0];
+    let mut child_start = process::creation_time(current)
+        .ok_or("caller's own process creation time is unreadable")?;
+    loop {
+        #[cfg(windows)]
+        let parent = snapshot.get(&current).map(|entry| entry.parent_pid);
+        #[cfg(not(windows))]
+        let parent = process::parent_pid(current);
+        let parent = parent.ok_or("caller's own process chain is unreadable")?;
+        if parent <= 1 || (cfg!(windows) && parent <= 4) {
+            return Ok(chain);
+        }
+        if chain.contains(&parent) || chain.len() >= 1024 {
+            return Err("caller's own process chain is cyclic or too deep");
+        }
+        let parent_start = process::creation_time(parent)
+            .ok_or("caller's own ancestor creation time is unreadable")?;
+        if parent_start > child_start {
+            return Err("caller's own process chain contains a reused parent PID");
+        }
+        chain.push(parent);
+        current = parent;
+        child_start = parent_start;
     }
 }
 
@@ -1983,6 +2033,7 @@ pub(crate) fn carries_process_id(pid: u32, id: &str) -> bool {
 
 /// One HCOM process-ID reader for the kill gate and its ancestor proof.
 pub(crate) fn process_id_of(pid: u32) -> crate::sys::process_args::EnvRead {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     use crate::sys::process_args::EnvRead;
     let evidence = crate::sys::process_args::read_process_env_var(pid, "HCOM_PROCESS_ID");
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1997,11 +2048,95 @@ pub(crate) fn process_id_of(pid: u32) -> crate::sys::process_args::EnvRead {
     evidence
 }
 
+/// A receipt does not override a binding that now belongs to another live row.
+/// Native helpers call this before capture's first signal and at revalidation.
+/// Stop retains its own existing capture/reap guard and signaling behavior.
+pub(crate) fn verify_kill_candidate(
+    db: &HcomDb,
+    name: &str,
+    pid: u32,
+) -> Result<(), crate::sys::process::KillError> {
+    use crate::sys::process::KillError;
+    match kill_candidate_kind(pid) {
+        KillCandidateKind::Member => {}
+        KillCandidateKind::SharedBroker => {
+            return Err(KillError::Refused(format!(
+                "PID {pid} is a shared daemon broker; no signal sent"
+            )));
+        }
+        KillCandidateKind::PtyWrapper => {
+            return Err(KillError::Refused(format!(
+                "hcom pty PID {pid} is never a signal target"
+            )));
+        }
+        KillCandidateKind::Unreadable => {
+            use crate::sys::process::{KillState, kill_state};
+            match kill_state(pid) {
+                KillState::Gone => return Ok(()),
+                #[cfg(any(unix, test))]
+                KillState::Exiting => return Ok(()),
+                KillState::Live | KillState::Unknown => {
+                    return Err(KillError::Unconfirmed {
+                        reason: "not signaled: identity unreadable".into(),
+                        survivors: vec![pid],
+                    });
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let minted = minted_pid_owners(db).map_err(|error| error.to_string())?;
+        if let Some((owner, _)) =
+            foreign_live_owner(db, &minted, name, pid).map_err(|error| error.to_string())?
+        {
+            return Err(ReapError::ForeignLiveOwner { pid, owner }
+                .to_string()
+                .into());
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let process_id = match process_id_of(pid) {
+            crate::sys::process_args::EnvRead::Present(id) => Some(id),
+            _ => None,
+        };
+        if let Some(id) = process_id.as_deref() {
+            let owner = db
+                .live_process_binding_owner(id)
+                .map_err(|error| format!("binding registry unreadable: {error}"))?;
+            if let Some(owner) = owner
+                && owner != name
+            {
+                return Err(format!("PID {pid} is owned by live instance '{owner}'").into());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let carried_pid = process_id.as_deref().and_then(minted_root_pid);
+            let bindings = db
+                .live_process_bindings()
+                .map_err(|error| format!("binding registry unreadable: {error}"))?;
+            for (id, owner) in bindings {
+                if owner != name
+                    && minted_root_pid(&id)
+                        .is_some_and(|root| root == pid || Some(root) == carried_pid)
+                {
+                    return Err(format!("PID {pid} is owned by live instance '{owner}'").into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A kill capability for one verified PID incarnation, not merely a live PID.
-/// `None` identity means positively gone/zombie and never permits a signal.
+/// Zombies authorize only their receipt-verified group, never a PID signal.
 pub(crate) struct KillOwner {
     pid: u32,
     identity: Option<String>,
+    zombie: bool,
+    launcher_warning: Option<String>,
 }
 
 impl KillOwner {
@@ -2013,10 +2148,140 @@ impl KillOwner {
         self.identity.as_deref()
     }
 
-    /// Revalidate before both pane teardown and the group/tree signal. Death
-    /// needs no signal; a different or unreadable incarnation is a refusal.
+    pub(crate) fn is_zombie(&self) -> bool {
+        self.zombie
+    }
+
+    pub(crate) fn launcher_warning(&self) -> Option<&str> {
+        self.launcher_warning.as_deref()
+    }
+
+    /// Owner authentication always precedes root resolution. A stale root
+    /// receipt never authorizes its reused PID, and a live unverifiable root
+    /// never permits falling back to a smaller, apparently successful kill.
+    pub(crate) fn resolve_root(
+        mut self,
+        tool: Option<&str>,
+        launch_context: Option<&str>,
+        binding_ids: &[String],
+    ) -> Result<Self, &'static str> {
+        use crate::sys::{process, process_args, seat_root};
+        if tool != Some("omp") {
+            self.refuse_pty_wrapper()?;
+            return Ok(self);
+        }
+        let context = kill_launch_context(launch_context)?;
+        let verified_root = if let Some(receipt) = context
+            .as_ref()
+            .and_then(|context| context.get("omp_launch_root"))
+        {
+            let (root, expected) = kill_receipt(receipt)?;
+            if process::is_definitely_dead(root) {
+                self.refuse_pty_wrapper()?;
+                return Ok(self);
+            }
+            let current =
+                process::identity(root).ok_or("live seat launcher identity is unreadable")?;
+            if current != expected {
+                self.refuse_pty_wrapper()?;
+                return Ok(self);
+            }
+            Some((root, current))
+        } else {
+            None
+        };
+        if verified_root.is_none() && (self.identity.is_none() || self.zombie) {
+            return Ok(self);
+        }
+        #[cfg(windows)]
+        let parents = process::snapshot_parents(false);
+        let parent = |pid| {
+            #[cfg(windows)]
+            let value = parents
+                .as_ref()
+                .and_then(|entries| entries.get(&pid))
+                .map(|entry| entry.parent_pid);
+            #[cfg(not(windows))]
+            let value = process::parent_pid(pid);
+            kill_fact(pid, value)
+        };
+        let creation = |pid| kill_fact(pid, process::creation_time(pid));
+        if let Some((root, current)) = verified_root {
+            if !seat_root::descends_from(self.pid, root, &parent, &creation) {
+                return Err("verified owner does not descend from the recorded seat launcher");
+            }
+            if self.identity.is_none() || self.zombie {
+                return Ok(self);
+            }
+            self.pid = root;
+            self.identity = Some(current);
+        } else if let Some(root) = seat_root::legacy_pty_child_root(
+            self.pid,
+            binding_ids,
+            &parent,
+            &creation,
+            |pid| kill_fact(pid, process_args::command_line(pid)),
+            process_id_of,
+        ) {
+            self.pid = root;
+            self.identity = Some(
+                process::identity(root).ok_or("live legacy seat root identity is unreadable")?,
+            );
+        } else {
+            let mut current = self.pid;
+            let mut seen = [0; 17];
+            seen[0] = current;
+            let mut nearest = None;
+            for depth in 0..16 {
+                let seat_root::Read::Present(pid) = parent(current) else {
+                    break;
+                };
+                if pid <= 1 || seen[..=depth].contains(&pid) {
+                    break;
+                }
+                let (seat_root::Read::Present(child_start), seat_root::Read::Present(parent_start)) =
+                    (creation(current), creation(pid))
+                else {
+                    break;
+                };
+                if parent_start > child_start {
+                    break;
+                }
+                if !process::is_definitely_dead(pid)
+                    && matches!(process_id_of(pid), process_args::EnvRead::Present(id)
+                        if is_bound_process_id(&id, binding_ids))
+                {
+                    nearest = Some(pid);
+                    break;
+                }
+                seen[depth + 1] = pid;
+                current = pid;
+            }
+            self.launcher_warning = Some(match nearest {
+                Some(pid) => format!(
+                    "seat launcher not verified; nearest live bound-id ancestor PID {pid} was not signalled"
+                ),
+                None => "seat launcher not verified; no live bound-id ancestor was verified".into(),
+            });
+        }
+        self.refuse_pty_wrapper()?;
+        self.recheck()?;
+        Ok(self)
+    }
+
+    fn refuse_pty_wrapper(&self) -> Result<(), &'static str> {
+        if crate::sys::process_args::command_line(self.pid)
+            .is_some_and(|argv| crate::sys::seat_root::is_wrapper(&argv))
+        {
+            return Err("hcom pty is never a signal target");
+        }
+        Ok(())
+    }
+
+    /// Revalidate before native tree capture. Positive death needs no signal;
+    /// a different or unreadable incarnation is a refusal.
     pub(crate) fn recheck(&self) -> Result<bool, &'static str> {
-        if crate::sys::process::is_definitely_dead(self.pid) {
+        if self.zombie || crate::sys::process::is_definitely_dead(self.pid) {
             return Ok(false);
         }
         match (&self.identity, crate::sys::process::identity(self.pid)) {
@@ -2025,6 +2290,37 @@ impl KillOwner {
             _ => Err("PID now belongs to a different process"),
         }
     }
+}
+
+fn kill_fact<T>(pid: u32, value: Option<T>) -> crate::sys::seat_root::Read<T> {
+    match value {
+        Some(value) => crate::sys::seat_root::Read::Present(value),
+        None if crate::sys::process::is_definitely_dead(pid) => crate::sys::seat_root::Read::Absent,
+        None => crate::sys::seat_root::Read::Unreadable,
+    }
+}
+
+fn kill_launch_context(context: Option<&str>) -> Result<Option<serde_json::Value>, &'static str> {
+    context
+        .filter(|context| !context.is_empty())
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .map_err(|_| "recorded identity receipt is unreadable")
+}
+
+fn kill_receipt(receipt: &serde_json::Value) -> Result<(u32, &str), &'static str> {
+    let pid = receipt
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|&pid| pid > 1 && i32::try_from(pid).is_ok())
+        .ok_or("recorded identity receipt has an invalid PID")?;
+    let identity = receipt
+        .get("identity")
+        .and_then(serde_json::Value::as_str)
+        .filter(|identity| crate::sys::process::identity_precedes(identity, identity))
+        .ok_or("recorded identity receipt is unreadable")?;
+    Ok((pid, identity))
 }
 
 /// The one owner gate for every kill target, before any group/tree/pane
@@ -2036,38 +2332,38 @@ pub(crate) fn verify_kill_owner(
     launch_context: Option<&str>,
     binding_ids: &[String],
 ) -> Result<KillOwner, &'static str> {
-    if pid == 0 || i32::try_from(pid).is_err() {
+    if pid <= 1 || i32::try_from(pid).is_err() {
         return Err("recorded PID is invalid");
     }
-    if crate::sys::process::is_definitely_dead(pid) {
+    let zombie = crate::sys::process::is_zombie(pid);
+    if (zombie && !crate::sys::process::is_zombie_group_leader(pid))
+        || (!zombie && crate::sys::process::is_definitely_dead(pid))
+    {
         return Ok(KillOwner {
             pid,
             identity: None,
+            zombie,
+            launcher_warning: None,
         });
     }
     let identity =
         crate::sys::process::identity(pid).ok_or("live process identity is unreadable")?;
-    let context = launch_context
-        .filter(|context| !context.is_empty())
-        .map(serde_json::from_str::<serde_json::Value>)
-        .transpose()
-        .map_err(|_| "recorded identity receipt is unreadable")?;
+    let context = kill_launch_context(launch_context)?;
     if let Some(receipt) = context
         .as_ref()
         .and_then(|context| context.get("omp_launch_pid"))
     {
-        if receipt.get("pid").and_then(serde_json::Value::as_u64) != Some(u64::from(pid)) {
+        let (recorded_pid, expected) = kill_receipt(receipt)?;
+        if recorded_pid != pid {
             return Err("identity receipt does not name the recorded PID");
         }
-        let expected = receipt
-            .get("identity")
-            .and_then(serde_json::Value::as_str)
-            .filter(|identity| !identity.is_empty())
-            .ok_or("recorded identity receipt is unreadable")?;
         if expected != identity {
             return Err("PID now belongs to a different process (native identity mismatch)");
         }
     } else {
+        if zombie {
+            return Err("zombie owner has no verifiable identity receipt");
+        }
         use crate::sys::process_args::EnvRead;
         let evidence = process_id_of(pid);
         let process_id = match evidence {
@@ -2095,6 +2391,8 @@ pub(crate) fn verify_kill_owner(
     let owner = KillOwner {
         pid,
         identity: Some(identity),
+        zombie,
+        launcher_warning: None,
     };
     owner.recheck()?;
     Ok(owner)
@@ -3080,9 +3378,7 @@ fn pid_carries_instance(
 
 #[cfg(unix)]
 fn signal(pid: u32, sig: libc::c_int) {
-    unsafe {
-        libc::kill(pid as libc::pid_t, sig);
-    }
+    let _ = crate::sys::process::signal_pid(pid, sig);
     // Best-effort: ESRCH (already gone) and EPERM (foreign) both just mean
     // this pid is not ours to reap; the name re-enumeration sorts it out —
     // a pid that no longer carries the name is never a survivor.
@@ -4143,9 +4439,8 @@ pub(crate) mod orphan_fixtures {
         fn drop(&mut self) {
             for &pid in &self.pids {
                 if self.alive(pid) {
-                    // SAFETY: plain kill(2) on a pid that still carries this
-                    // fixture's unique marker.
-                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    // Only a live pid still carrying this fixture's marker.
+                    let _ = crate::sys::process::signal_pid(pid, libc::SIGKILL);
                 }
             }
             // Detached: their reaper (the subreaper above this test, or
@@ -4558,6 +4853,47 @@ mod tests {
     }
 
     #[test]
+    fn shared_broker_marker_is_exact_and_positional_on_native_argv() {
+        use KillCandidateKind::{Member, SharedBroker, Unreadable};
+        for windows in [false, true] {
+            for (argv, expected) in [
+                (
+                    b"bun\0/opt/bin/omp\0__omp_worker_daemon_broker\0".as_slice(),
+                    SharedBroker,
+                ),
+                (
+                    b"bun\0/opt/bin/omp\0__omp_worker_lsp_mux\0".as_slice(),
+                    Member,
+                ),
+                (
+                    b"bun\0/opt/bin/omp\0--prompt\0__omp_worker_daemon_broker\0".as_slice(),
+                    Member,
+                ),
+                (
+                    b"bun\0/opt/bin/omp\0__omp_worker_daemon_broker_extra\0".as_slice(),
+                    Member,
+                ),
+                (b"sh\0-c\0__omp_worker_daemon_broker\0".as_slice(), Member),
+                (b"omp daemon broker\0".as_slice(), Member),
+                (b"bun\0/opt/bin/omp".as_slice(), Unreadable),
+            ] {
+                assert_eq!(
+                    kill_candidate_argv_kind(Some(argv), windows),
+                    expected,
+                    "windows={windows}, argv={argv:?}"
+                );
+            }
+            assert_eq!(kill_candidate_argv_kind(None, windows), Unreadable);
+        }
+        assert_eq!(kill_candidate_argv_kind(Some(
+            b"C:\\node.exe\0C:\\node_modules\\@OH-MY-PI\\PI-CODING-AGENT\\DIST\\CLI.JS\0__omp_worker_daemon_broker\0"
+        ), true), SharedBroker);
+        assert_eq!(kill_candidate_argv_kind(Some(
+            b"/opt/node_modules/bun/bin/bun.exe\0/opt/bin/omp\0__omp_worker_daemon_broker\0"
+        ), false), SharedBroker);
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn broker_carrier_eligibility_decision_table() {
         let facts = [
@@ -4701,7 +5037,7 @@ mod tests {
         assert!(db.get_instance_full(&name).unwrap().is_some());
         assert_eq!(db.process_binding_ids(&name).unwrap(), vec![process_id]);
         assert!(!process_gone(carrier));
-        unsafe { libc::kill(carrier as libc::pid_t, libc::SIGKILL) };
+        let _ = crate::sys::process::signal_pid(carrier, libc::SIGKILL);
     }
 
     /// A live process exec'd through a symlink named `comm` (so
@@ -4812,7 +5148,7 @@ mod tests {
         let result = reap_instance_tree_for_excluding_captured(&db, &name, &bindings, &[], capture);
         assert!(result.is_err());
         assert!(!process_gone(carrier));
-        unsafe { libc::kill(carrier as libc::pid_t, libc::SIGKILL) };
+        let _ = crate::sys::process::signal_pid(carrier, libc::SIGKILL);
     }
 
     #[test]
@@ -4842,7 +5178,7 @@ mod tests {
         assert!(result.is_ok());
         rooted.wait().ok();
         assert!(!process_gone(detached));
-        unsafe { libc::kill(detached as libc::pid_t, libc::SIGKILL) };
+        let _ = crate::sys::process::signal_pid(detached, libc::SIGKILL);
     }
 
     /// Bulk kill against a `start --as` rebind landing between the pre-signal
@@ -4897,7 +5233,7 @@ mod tests {
             crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
         let row = db.get_instance_full(&name).unwrap();
         let b_alive = !process_gone(carrier_b);
-        unsafe { libc::kill(carrier_b as libc::pid_t, libc::SIGKILL) };
+        let _ = crate::sys::process::signal_pid(carrier_b, libc::SIGKILL);
 
         assert!(
             row.is_some_and(|row| row.created_at.to_bits() == created_b.to_bits()),
@@ -5068,7 +5404,7 @@ mod tests {
         wait_for_enumerated(&name, &[], leader);
         let capture = capture_reap_carriers(&db, &name, None, &[], &[], &[]).unwrap();
         // The orphan arm's group signal.
-        unsafe { libc::kill(-(leader as libc::pid_t), libc::SIGKILL) };
+        let _ = crate::sys::process::signal_group(leader, libc::SIGKILL);
         for _ in 0..100 {
             if process_gone(leader) {
                 break;
@@ -6598,7 +6934,7 @@ mod tests {
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let reap_name = name.clone();
@@ -6647,7 +6983,7 @@ mod tests {
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
 
         let fresh_binding = format!("proc-fresh-{}", rand_suffix());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -6708,7 +7044,7 @@ mod tests {
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let reap_name = name.clone();
@@ -6837,7 +7173,7 @@ mod tests {
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let reap_name = name.clone();
@@ -6895,7 +7231,7 @@ mod tests {
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
 
         let fresh_binding = format!("proc-fresh-{}", rand_suffix());
         let (hook, hit, release) = rendezvous_at(RoundPoint::Captured);
@@ -6966,7 +7302,7 @@ mod tests {
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
 
         let (hook, hit, release) = rendezvous_at(RoundPoint::Captured);
         let reap_name = name.clone();
@@ -7031,7 +7367,7 @@ mod tests {
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        unsafe { libc::kill(first_pid as libc::pid_t, libc::SIGSTOP) };
+        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
 
         let late_binding = format!("proc-fresh-{}", rand_suffix());
         let (mut spawn_hook, spawned, spawn_release) = rendezvous_at(RoundPoint::FirstCaptured);
@@ -8114,9 +8450,7 @@ mod tests {
         assert_eq!(err.kind, HolderKind::Orphan);
         assert!(err.pids.contains(&orphan), "refusal names the pid: {err}");
         assert!(err.to_string().contains(&format!("hcom kill {name}")));
-        unsafe {
-            libc::kill(orphan as libc::pid_t, libc::SIGKILL);
-        }
+        let _ = crate::sys::process::signal_pid(orphan, libc::SIGKILL);
     }
 
     /// Blocker-B shape: the kill self-path leaves a name-carrying shell
@@ -8552,11 +8886,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     impl Drop for FixtureTree {
         fn drop(&mut self) {
-            // SAFETY: a negative pid targets the process GROUP led by
-            // `self.0.id()`, which this test created with process_group(0).
-            unsafe {
-                libc::killpg(self.0.id() as libc::pid_t, libc::SIGKILL);
-            }
+            // The group this test created with process_group(0).
+            let _ = crate::sys::process::signal_group(self.0.id(), libc::SIGKILL);
             let _ = self.0.wait();
         }
     }

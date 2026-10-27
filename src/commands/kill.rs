@@ -34,8 +34,93 @@ pub struct KillTrackedResult {
     /// Carriers spared because they are the caller's own session tree
     /// (kill self-path only; 0 on the foreign path).
     pub self_excluded: usize,
+    pub self_pid: Option<u32>,
+    pub self_session: Option<String>,
+    pub leftovers_terminated: Option<usize>,
     /// Whether the resolved incarnation's row was actually torn down.
     pub teardown: TeardownOutcome,
+}
+
+/// Failed kills keep their structured verification evidence for relay callers.
+#[derive(Debug)]
+pub struct KillTrackedError {
+    pub message: String,
+    pub launcher_unverified: Option<String>,
+    pub survivors: Vec<u32>,
+    pub refusal: bool,
+    pub self_pid: Option<u32>,
+    pub self_session: Option<String>,
+    pub self_excluded: usize,
+}
+
+impl From<String> for KillTrackedError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            launcher_unverified: None,
+            survivors: Vec::new(),
+            refusal: true,
+            self_pid: None,
+            self_session: None,
+            self_excluded: 0,
+        }
+    }
+}
+
+impl KillTrackedError {
+    fn excluding(mut self, count: usize, session: Option<&str>) -> Self {
+        if count > 0 {
+            use std::fmt::Write;
+            self.self_pid = Some(std::process::id());
+            self.self_session = session.map(str::to_owned);
+            self.self_excluded = count;
+            let _ = write!(
+                &mut self.message,
+                "; caller PID {} (session {}) and its own ancestor chain were left running by design",
+                std::process::id(),
+                session.unwrap_or("unrecorded")
+            );
+        }
+        self
+    }
+}
+
+impl std::fmt::Display for KillTrackedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn native_kill_error(name: &str, error: crate::sys::process::KillError) -> KillTrackedError {
+    use crate::sys::process::KillError;
+    let message =
+        format!("Could not stop '{name}': {error}; hcom stop {name} clears the bookkeeping");
+    let (survivors, refusal) = match error {
+        KillError::Refused(_) => (Vec::new(), true),
+        KillError::Survivors(pids) => (pids, false),
+        KillError::Unconfirmed { survivors, .. } => (survivors, true),
+    };
+    KillTrackedError {
+        survivors,
+        refusal,
+        ..message.into()
+    }
+}
+
+fn launcher_unverified_error(name: &str, warning: &str, self_excluded: bool) -> KillTrackedError {
+    let stopped = if self_excluded {
+        "captured non-self processes"
+    } else {
+        "owner tree"
+    };
+    let message = format!(
+        "'{name}' {stopped} terminated, but {warning}; hcom stop {name} clears the bookkeeping"
+    );
+    KillTrackedError {
+        launcher_unverified: Some(warning.to_owned()),
+        refusal: false,
+        ..message.into()
+    }
 }
 
 /// Teardown outcome of a kill: whether the row of the incarnation the kill
@@ -162,8 +247,6 @@ impl ResolvedIncarnation {
     }
 }
 
-const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
 // Test seam: runs right after the kill's one-snapshot read, so a test can
 // commit a stop in the gap before any signal.
 #[cfg(test)]
@@ -219,84 +302,36 @@ fn resolve_initiator(db: &HcomDb, explicit_name: Option<&str>) -> String {
     }
 }
 
-fn normalize_kill_result(
-    name: &str,
-    pid: u32,
-    result: terminal::KillResult,
-    pane_closed: bool,
-) -> terminal::KillResult {
-    if !matches!(result, terminal::KillResult::PermissionDenied) {
-        return result;
-    }
-
-    let pid_str = pid.to_string();
-    log_info(
-        "kill",
-        "kill.eperm",
-        &format!(
-            "kill(2) returned EPERM for name={} pid={}; checking if process already exited",
-            name, pid
-        ),
-    );
-    if pane_closed {
-        log_info(
-            "kill",
-            "kill.eperm_resolved",
-            &format!(
-                "name={} pid={} resolved to already_dead because terminal pane closed",
-                name, pid_str
-            ),
-        );
-        return terminal::KillResult::AlreadyDead;
-    }
-
-    std::thread::sleep(EPERM_RECHECK_DELAY);
-    if !pidtrack::is_alive(pid) {
-        log_info(
-            "kill",
-            "kill.eperm_resolved",
-            &format!("name={} pid={} resolved to already_dead", name, pid_str),
-        );
-        terminal::KillResult::AlreadyDead
-    } else {
-        terminal::KillResult::PermissionDenied
-    }
-}
-
 pub fn kill_tracked_instance(
     db: &HcomDb,
     name: &str,
     initiator: &str,
-) -> Result<KillTrackedResult, String> {
-    kill_tracked_instance_with_self_pids(
+) -> Result<KillTrackedResult, KillTrackedError> {
+    let (inst, binding_ids, watermark) =
+        ResolvedIncarnation::read(db, name).map_err(|error| error.to_string())?;
+    let inst = inst.ok_or_else(|| format!("Agent '{name}' not found"))?;
+    kill_resolved_instance(
         db,
-        name,
+        &inst,
+        &binding_ids,
+        watermark,
         initiator,
-        &crate::proctruth::caller_ancestor_pids(),
-        |n, b, e, capture| {
-            crate::proctruth::reap_instance_tree_for_excluding_captured(db, n, b, e, capture)
-        },
+        None,
+        |_, _, _| Ok(()),
     )
 }
 
-/// [`kill_tracked_instance`] with an injectable self set and reap:
-/// production passes [`crate::proctruth::caller_ancestor_pids`] and the real
-/// [`crate::proctruth::reap_instance_tree_for_excluding_captured`]; tests
-/// pass a fake set holding a sleeper pid plus the real caller pid, and a reap
-/// that can mutate the row mid-kill (the teardown CAS seam).
-#[allow(clippy::too_many_arguments)]
+/// The self set is injectable so tests never need to signal their own seat.
+/// The hook runs after owner/root resolution and before native termination;
+/// tests use it to land incarnation changes or a refused termination.
+#[cfg(test)]
 fn kill_tracked_instance_with_self_pids(
     db: &HcomDb,
     name: &str,
     initiator: &str,
     self_pids: &[u32],
-    reap: impl FnOnce(
-        &str,
-        &[String],
-        &[u32],
-        crate::proctruth::ReapCapture,
-    ) -> Result<(), crate::proctruth::ReapError>,
-) -> Result<KillTrackedResult, String> {
+    before_terminate: impl FnOnce(&str, &[String], &[u32]) -> Result<(), crate::proctruth::ReapError>,
+) -> Result<KillTrackedResult, KillTrackedError> {
     // The row, its binding epoch, and the events watermark come from ONE
     // snapshot: separate reads can straddle a `start --as` and pair one
     // incarnation's row with another's bindings, and a watermark read after
@@ -310,26 +345,20 @@ fn kill_tracked_instance_with_self_pids(
         &binding_ids,
         event_watermark,
         initiator,
-        self_pids,
-        reap,
+        Some(self_pids),
+        before_terminate,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn kill_resolved_instance(
     db: &HcomDb,
     inst: &crate::db::InstanceRow,
     binding_ids: &[String],
     event_watermark: i64,
     initiator: &str,
-    self_pids: &[u32],
-    reap: impl FnOnce(
-        &str,
-        &[String],
-        &[u32],
-        crate::proctruth::ReapCapture,
-    ) -> Result<(), crate::proctruth::ReapError>,
-) -> Result<KillTrackedResult, String> {
+    self_pids: Option<&[u32]>,
+    before_terminate: impl FnOnce(&str, &[String], &[u32]) -> Result<(), crate::proctruth::ReapError>,
+) -> Result<KillTrackedResult, KillTrackedError> {
     let name = &inst.name;
     #[cfg(test)]
     if let Some(hook) = CAPTURE_GAP_HOOK.with(std::cell::Cell::take) {
@@ -346,11 +375,27 @@ fn kill_resolved_instance(
     let owner =
         crate::proctruth::verify_kill_owner(pid, inst.launch_context.as_deref(), binding_ids)
             .map_err(|reason| unverified_owner_error(name, pid, reason))?;
+    let owner = owner
+        .resolve_root(
+            Some(&inst.tool),
+            inst.launch_context.as_deref(),
+            binding_ids,
+        )
+        .map_err(|reason| unverified_owner_error(name, pid, reason))?;
+    // No caller-chain lookup, pane action or signal can precede owner/root
+    // authentication. A bookkeeping-only dead row needs no signal exclusion.
+    let caller_chain;
+    let self_pids = match self_pids {
+        Some(pids) => pids,
+        None if owner.identity().is_some() => {
+            caller_chain = crate::proctruth::kill_caller_ancestor_pids()
+                .map_err(|reason| unverified_owner_error(name, pid, reason))?;
+            &caller_chain
+        }
+        None => &[],
+    };
 
-    // The incarnation this kill resolves against: the row as read plus its
-    // binding epoch, and the events watermark read with them. Captured
-    // BEFORE any signal; the teardown below runs only while this exact
-    // incarnation is still the row's.
+    // The row, binding epoch and watermark were captured before any signal.
     let incarnation = ResolvedIncarnation::new(inst, binding_ids, event_watermark);
     let _teardown_claim = crate::hooks::common::TeardownClaim::register(
         db,
@@ -358,128 +403,141 @@ fn kill_resolved_instance(
         incarnation.token.created_at,
         incarnation.token.session_id.as_deref(),
     );
-    // A dead leader's group may outlive it or be reused independently. Never
-    // signal that group or reap through it; only finalize this incarnation.
-    if owner.identity().is_none() {
-        let capture = crate::proctruth::gone_kill_capture(inst, binding_ids);
-        reap(name, binding_ids, &[], capture).map_err(|error| survivors_error(name, &error))?;
-        let teardown = teardown_if_incarnation_unchanged(db, name, initiator, &incarnation)?;
-        return Ok(KillTrackedResult {
-            target: name.to_owned(),
-            pid,
-            kill_result: terminal::KillResult::AlreadyDead,
-            pane_closed: false,
-            pane_retry_command: None,
-            preset_name: String::new(),
-            pane_id: String::new(),
-            self_excluded: 0,
-            teardown,
-        });
-    }
+    let excluded: Vec<u32> = self_pids
+        .iter()
+        .copied()
+        .filter(|&candidate| candidate == owner.pid() || candidate == pid)
+        .collect();
+    before_terminate(name, binding_ids, &excluded).map_err(|error| {
+        survivors_error(name, &error).excluding(excluded.len(), inst.session_id.as_deref())
+    })?;
 
-    // Self-kill check BEFORE any signal: when the caller runs inside the
-    // instance it is killing, the carrier set holds the caller's own session
-    // tree — signalling it would kill this command mid-run and lose the
-    // `stopped` write. That path spares the caller's tree (`excluded` below),
-    // reaps every other eligible carrier FIRST, and fails closed: the row and
-    // bindings are torn down only once no in-scope non-self carrier remains.
-    let self_set: HashSet<u32> = self_pids.iter().copied().collect();
-    let owners = crate::proctruth::omp_owner_bindings(db, name);
-    let mut excluded: Vec<u32> =
-        crate::proctruth::processes_for_instance(name, binding_ids, &owners)
-            .into_iter()
-            .map(|m| m.pid)
-            .filter(|p| self_set.contains(p))
-            .collect();
-    // Native ancestry is available even where /proc carrier enumeration is
-    // not. Never terminate the verified interpreter above this kill command.
-    if self_set.contains(&pid) && !excluded.contains(&pid) {
-        excluded.push(pid);
-    }
-    // Capture identity, owner ancestry, and the first carrier set before
-    // kill_instance signals the recorded process group. Its root may die and
-    // reparent eligible descendants before reap begins. Built from the same
-    // snapshot as the incarnation above.
-    // The capture is also the gate: a refusal returns before `kill_instance`
-    // closes the pane or signals the group, and before the reap, leaving the
-    // row and its bindings untouched (the teardown claim above is dropped
-    // with the early return).
-    let capture = crate::proctruth::capture_reap_carriers(
-        db,
-        name,
-        Some(inst),
-        binding_ids,
-        &owners,
-        &excluded,
-    )
-    .map_err(|error| unverified_owner_error(name, pid, &error.to_string()))?;
-    if !excluded.is_empty() {
-        return kill_self_tracked_instance(
+    let mut leftovers_terminated = None;
+    let (result, pane_closed, pane_retry_command, preset_name, pane_id) = if owner.is_zombie()
+        || owner.identity().is_none()
+    {
+        if owner.is_zombie()
+            && let Some(identity) = owner.identity()
+        {
+            let leftovers = crate::sys::process::terminate_zombie_group_verified(
+                pid,
+                identity,
+                self_pids,
+                crate::proctruth::kill_candidate_eligible,
+                |candidate| crate::proctruth::verify_kill_candidate(db, name, candidate),
+            )
+            .map_err(|error| native_kill_error(name, error))?;
+            leftovers_terminated = Some(leftovers);
+            println!(
+                "'{name}' owner PID {pid} already exited; {leftovers} leftover process(es) terminated"
+            );
+        }
+        (
+            terminal::KillResult::AlreadyDead,
+            false,
+            None,
+            String::new(),
+            String::new(),
+        )
+    } else {
+        kill_instance(
             db,
             name,
-            initiator,
-            pid,
+            &owner,
+            inst,
+            inst.background != 0,
             binding_ids,
-            &excluded,
-            &incarnation,
-            capture,
-            reap,
+            self_pids,
+        )
+        .map_err(|error| error.excluding(excluded.len(), inst.session_id.as_deref()))?
+    };
+    // Native helpers have confirmed every captured incarnation gone. Only
+    // now may the old row's incarnation-bound bookkeeping be released.
+    let teardown =
+        teardown_if_incarnation_unchanged(db, name, initiator, &incarnation).map_err(|error| {
+            let state = if excluded.is_empty() {
+                "dead"
+            } else {
+                "gone (excluding the caller)"
+            };
+            KillTrackedError::from(format!(
+                "Captured processes verified {state}, but '{name}' row was not finalized: {error}. \
+                 Recovery: hcom kill {name}"
+            ))
+            .excluding(excluded.len(), inst.session_id.as_deref())
+        })?;
+    if let Some(warning) = owner.launcher_warning() {
+        return Err(
+            launcher_unverified_error(name, warning, !excluded.is_empty())
+                .excluding(excluded.len(), inst.session_id.as_deref()),
+        );
+    }
+    if !excluded.is_empty() {
+        println!(
+            "'{name}': caller PID {} (session {}) and its own ancestor chain were left running by design; owner/root death is not claimed",
+            std::process::id(),
+            inst.session_id.as_deref().unwrap_or("unrecorded")
         );
     }
 
-    let is_headless = inst.background != 0;
-    let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
-        kill_instance(db, name, &owner, inst, is_headless)?;
-    // Fail-closed ordering, shared with the self path: reap and verify the
-    // captured in-scope carrier set FIRST — a survivor fails the kill with
-    // the row and bindings untouched — and only then run the teardown write,
-    // only while the resolved incarnation is still the row's (see
-    // [`teardown_if_incarnation_unchanged`]).
-    if let Err(survivors) = reap(name, binding_ids, &[], capture) {
-        return Err(survivors_error(name, &survivors));
-    }
-    let teardown =
-        teardown_if_incarnation_unchanged(db, name, initiator, &incarnation).map_err(|error| {
-            let process_state = if pidtrack::is_alive(pid) {
-                "was signalled"
-            } else {
-                "is dead"
-            };
-            format!(
-                "Process {pid} {process_state}, but '{name}' row was not finalized: {error}. \
-                 Recovery: hcom kill {name}"
-            )
-        })?;
-
     Ok(KillTrackedResult {
         target: name.to_string(),
-        pid,
+        pid: owner.pid(),
         kill_result: result,
         pane_closed,
         pane_retry_command,
         preset_name,
         pane_id,
-        self_excluded: 0,
+        self_excluded: excluded.len(),
+        self_pid: (!excluded.is_empty()).then_some(std::process::id()),
+        self_session: if excluded.is_empty() {
+            None
+        } else {
+            inst.session_id.clone()
+        },
+        leftovers_terminated,
         teardown,
     })
 }
 
-fn unverified_owner_error(name: &str, pid: u32, reason: &str) -> String {
+fn unverified_owner_error(name: &str, pid: u32, reason: &str) -> KillTrackedError {
+    let leftovers = if crate::sys::process::is_zombie_group_leader(pid) {
+        match crate::sys::kill_group::live_members(pid) {
+            Ok(members) if !members.is_empty() => format!(
+                " Live group member PIDs {} were not signalled.",
+                members
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Ok(_) => " No live group members were found; no group was signalled.".into(),
+            Err(error) => format!(
+                " Live group members could not be enumerated ({error}); no group was signalled."
+            ),
+        }
+    } else {
+        String::new()
+    };
     format!(
-        "Refusing to signal PID {pid} for '{name}': {reason}; no signal sent to the unverified process. \
+        "Refusing to signal PID {pid} for '{name}': {reason}; no signal sent to the unverified process.{leftovers} \
          hcom stop {name} clears the bookkeeping."
-    )
+    ).into()
 }
 
 /// A refused reap leaves the row and bindings available for a retry.
-fn survivors_error(name: &str, error: &crate::proctruth::ReapError) -> String {
-    format!("could not stop {name}: {error} — run hcom kill {name} first")
-}
-
-/// A refused capture names the other owner and leaves the row and its
-/// bindings alone: there is no `hcom kill <name>` retry to run.
-fn refused_capture_error(name: &str, error: &crate::proctruth::ReapError) -> String {
-    format!("could not stop {name}: {error} — hcom stop {name} clears the bookkeeping")
+fn survivors_error(name: &str, error: &crate::proctruth::ReapError) -> KillTrackedError {
+    let message = format!("could not stop {name}: {error} — run hcom kill {name} first");
+    let survivors = match error {
+        crate::proctruth::ReapError::Survivors(pids) => pids.clone(),
+        #[cfg(unix)]
+        _ => Vec::new(),
+    };
+    KillTrackedError {
+        refusal: survivors.is_empty(),
+        survivors,
+        ..message.into()
+    }
 }
 
 /// Re-read the incarnation token of `name` through the teardown transaction;
@@ -665,65 +723,44 @@ fn classify_lost_teardown(
     })
 }
 
-/// Kill the instance the caller runs inside — fail-closed: reap first, then
-/// teardown. The foreign path's reap gate would signal the caller itself, so
-/// the carriers outside `excluded` (the caller's own session tree) are
-/// reaped here instead — and the row and bindings stay completely untouched
-/// until that reap is verified clean. A non-self survivor after the signal
-/// budget fails the whole kill with the foreign path's error (survivors
-/// listed), so a failed reap is never converted into a successful exit after
-/// ownership state is discarded: a kill never reports stopped or releases
-/// the row/bindings while any instance process may still be alive. Only the
-/// verified-clean reap over an UNCHANGED incarnation unlocks the shared
-/// teardown ([`stop_instance_without_reap`]) that writes `stopped` and
-/// releases the bindings — a row re-registered mid-kill is left intact (the
-/// fresh incarnation is not this kill's business). The terminal group kill /
-/// pane close is skipped: the pane is the caller's own, and its group signal
-/// would land on this command.
-#[allow(clippy::too_many_arguments)]
-fn kill_self_tracked_instance(
-    db: &HcomDb,
-    name: &str,
-    initiator: &str,
-    pid: u32,
-    binding_ids: &[String],
-    excluded: &[u32],
-    incarnation: &ResolvedIncarnation,
-    capture: crate::proctruth::ReapCapture,
-    reap: impl FnOnce(
-        &str,
-        &[String],
-        &[u32],
-        crate::proctruth::ReapCapture,
-    ) -> Result<(), crate::proctruth::ReapError>,
-) -> Result<KillTrackedResult, String> {
-    // Signal and verify the non-self carriers FIRST. On survivors: bail
-    // exactly like the foreign path, before touching the row or bindings.
-    if let Err(survivors) = reap(name, binding_ids, excluded, capture) {
-        return Err(survivors_error(name, &survivors));
-    }
-    let teardown =
-        teardown_if_incarnation_unchanged(db, name, initiator, incarnation).map_err(|error| {
-            format!(
-                "Non-self processes stopped, but '{name}' row was not finalized: {error}. \
-                 Recovery: hcom kill {name}"
-            )
-        })?;
-    Ok(KillTrackedResult {
-        target: name.to_string(),
-        pid,
-        kill_result: terminal::KillResult::AlreadyDead,
-        pane_closed: false,
-        pane_retry_command: None,
-        preset_name: String::new(),
-        pane_id: String::new(),
-        self_excluded: excluded.len(),
-        teardown,
-    })
-}
-
 fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Result<i32> {
     let result = &response["result"];
+    let verified = result["verified_kill"].as_bool() == Some(true);
+    if !verified {
+        eprintln!("Note: remote host predates verified kill; showing its reported result.");
+    }
+    if result["launcher_unverified"].is_string()
+        || result["survivors"]
+            .as_array()
+            .is_some_and(|pids| !pids.is_empty())
+        || result["refusal"].as_bool() == Some(true)
+        || (verified && response["ok"].as_bool() == Some(false))
+    {
+        if let Some(message) = result["error"].as_str() {
+            eprintln!("{message}");
+        } else {
+            if let Some(warning) = result["launcher_unverified"].as_str() {
+                eprintln!("'{name}': {warning}");
+            }
+            if let Some(pids) = result["survivors"].as_array()
+                && !pids.is_empty()
+            {
+                eprintln!(
+                    "Survivor PIDs: {}",
+                    pids.iter()
+                        .map(serde_json::Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if result["refusal"].as_bool() == Some(true) {
+                eprintln!(
+                    "Remote kill refused for '{name}'; hcom stop {name} clears the bookkeeping"
+                );
+            }
+        }
+        return Ok(1);
+    }
     let kill_result = result["kill_result"].as_str();
 
     // No kill_result means an RPC-level failure (e.g. timeout, protocol error).
@@ -750,6 +787,37 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
     let pane_retry_command = result["pane_retry_command"].as_str();
     let pane_info = pane_info_str(pane_closed, preset_name, pane_id);
 
+    if kill_result == "permission_denied" {
+        eprintln!(
+            "Permission denied to kill process group {} for '{}'",
+            pid, name
+        );
+        return Ok(1);
+    }
+    if let Some(leftovers) = result["leftovers_terminated"].as_u64() {
+        println!(
+            "'{name}' owner PID {pid} already exited; {leftovers} leftover process(es) terminated"
+        );
+    }
+    let excluded_caller = &result["excluded_caller"];
+    let self_excluded = excluded_caller["count"].as_u64().unwrap_or(0);
+    if self_excluded > 0 {
+        let caller = excluded_caller["pid"].as_u64().ok_or_else(|| {
+            anyhow::anyhow!("Remote self-kill did not identify its excluded caller")
+        })?;
+        println!(
+            "'{name}': caller PID {caller} (session {}) and its own ancestor chain were left running by design; owner/root death is not claimed",
+            excluded_caller["session_id"]
+                .as_str()
+                .unwrap_or("unrecorded")
+        );
+        if teardown == TeardownOutcome::Completed {
+            for line in render_self_kill_feedback(name, self_excluded as usize) {
+                println!("{line}");
+            }
+            return Ok(0);
+        }
+    }
     // Skipped teardown first, mirroring the local path (it takes precedence
     // over every kill_result report there too): plain report, exit 0.
     if let Some(lines) = render_skipped_teardown_feedback(name, teardown) {
@@ -757,14 +825,6 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
             println!("{line}");
         }
         return Ok(0);
-    }
-
-    if kill_result == "permission_denied" {
-        eprintln!(
-            "Permission denied to kill process group {} for '{}'",
-            pid, name
-        );
-        return Ok(1);
     }
 
     let lines = render_remote_kill_feedback(name, pid, kill_result, &pane_info, teardown)?;
@@ -957,63 +1017,10 @@ fn pane_info_str(pane_closed: bool, preset_name: &str, pane_id: &str) -> String 
     }
 }
 
-/// Reap an orphan's carrier set after its process-group signal: every name
-/// it holds, by name or (self-bound trees) by its process id. Returns true
-/// when anything survived — the caller must keep the pidtrack handle so a
-/// retry can rediscover the orphan.
-fn reap_orphan_tree(
-    db: &HcomDb,
-    orphan: &crate::pidtrack::OrphanProcess,
-    captures: Vec<(String, crate::proctruth::ReapCapture)>,
-) -> bool {
-    let ids: &[String] = if orphan.process_id.is_empty() {
-        &[]
-    } else {
-        std::slice::from_ref(&orphan.process_id)
-    };
-    let mut survived = false;
-    for (orphan_name, capture) in captures {
-        if let Err(survivors) = crate::proctruth::reap_instance_tree_for_excluding_captured(
-            db,
-            &orphan_name,
-            ids,
-            &[],
-            capture,
-        ) {
-            eprintln!("{}", survivors_error(&orphan_name, &survivors));
-            survived = true;
-        }
-    }
-    survived
-}
-
-fn capture_orphan_carriers(
-    db: &HcomDb,
-    orphan: &crate::pidtrack::OrphanProcess,
-) -> Result<Vec<(String, crate::proctruth::ReapCapture)>, crate::proctruth::ReapError> {
-    let mut captures = Vec::new();
-    for name in &orphan.names {
-        let (row, binding_ids) = db.get_instance_with_bindings(name).unwrap_or_default();
-        let owners = crate::proctruth::omp_owner_bindings(db, name);
-        captures.push((
-            name.clone(),
-            crate::proctruth::capture_reap_carriers(
-                db,
-                name,
-                row.as_ref(),
-                &binding_ids,
-                &owners,
-                &[],
-            )?,
-        ));
-    }
-    Ok(captures)
-}
-
 fn verify_orphan_kill_owner(
     db: &HcomDb,
     orphan: &crate::pidtrack::OrphanProcess,
-) -> Result<crate::proctruth::KillOwner, String> {
+) -> Result<crate::proctruth::KillOwner, KillTrackedError> {
     let mut context = None;
     for name in &orphan.names {
         let snapshot = db
@@ -1032,10 +1039,11 @@ fn verify_orphan_kill_owner(
     }
     let ids = std::slice::from_ref(&orphan.process_id);
     crate::proctruth::verify_kill_owner(orphan.pid, context.as_deref(), ids)
+        .and_then(|owner| owner.resolve_root(Some(&orphan.tool), context.as_deref(), ids))
         .map_err(|reason| unverified_owner_error(&orphan.names.join(", "), orphan.pid, reason))
 }
 
-/// Every target form uses the same owner gate, reap and incarnation-bound
+/// Every target form uses the same owner/root gate, native termination and
 /// cleanup. Batch rows, bindings and the stop watermark share one snapshot.
 fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<i32> {
     kill_selected(db, hcom_dir, None, initiator)
@@ -1057,7 +1065,6 @@ fn kill_selected(
             tx.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?;
         Ok((instances, watermark))
     })?;
-    let self_pids = crate::proctruth::caller_ancestor_pids();
     let mut active_pids = HashSet::new();
     let mut selected = 0;
     let mut killed = 0;
@@ -1074,33 +1081,14 @@ fn kill_selected(
         if let Some(pid) = inst.pid.and_then(|pid| u32::try_from(pid).ok()) {
             active_pids.insert(pid);
         }
-        if inst.pid.is_none() {
-            let incarnation = ResolvedIncarnation::new(inst, binding_ids, watermark);
-            match teardown_if_incarnation_unchanged(db, &inst.name, initiator, &incarnation) {
-                Ok(TeardownOutcome::RowReRegistered) => {
-                    eprintln!("{}", crate::hooks::common::skipped_stop_line(&inst.name));
-                    failed += 1;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    eprintln!("Error releasing '{}': {error}", inst.name);
-                    failed += 1;
-                }
-            }
-            continue;
-        }
         let result = match kill_resolved_instance(
             db,
             inst,
             binding_ids,
             watermark,
             initiator,
-            &self_pids,
-            |name, ids, exclude, capture| {
-                crate::proctruth::reap_instance_tree_for_excluding_captured(
-                    db, name, ids, exclude, capture,
-                )
-            },
+            None,
+            |_, _, _| Ok(()),
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -1116,6 +1104,13 @@ fn kill_selected(
             if result.teardown == TeardownOutcome::RowReRegistered {
                 failed += 1;
             }
+            continue;
+        }
+        if result.self_excluded > 0 {
+            for line in render_self_kill_feedback(&inst.name, result.self_excluded) {
+                println!("{line}");
+            }
+            killed += 1;
             continue;
         }
         let pane = pane_info_str(result.pane_closed, &result.preset_name, &result.pane_id);
@@ -1162,35 +1157,23 @@ fn kill_selected(
                 continue;
             }
         };
-        let captures = if owner.identity().is_some() {
-            match capture_orphan_carriers(db, &orphan) {
-                Ok(captures) => captures,
-                Err(error) => {
-                    eprintln!(
-                        "{}",
-                        refused_capture_error(&orphan.names.join(", "), &error)
-                    );
-                    failed += 1;
-                    continue;
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        let (result, pane_closed, retry) =
-            match terminal::kill_process(&owner, &orphan.names, &orphan_terminal_info(&orphan)) {
+        let (result, _pane_closed, retry, self_excluded) =
+            match kill_orphan_process(db, &owner, &orphan) {
                 Ok(result) => result,
                 Err(reason) => {
-                    eprintln!(
-                        "{}",
-                        unverified_owner_error(&orphan.names.join(", "), orphan.pid, &reason)
-                    );
+                    if reason.launcher_unverified.is_some() {
+                        pidtrack::remove_pid(hcom_dir, orphan.pid);
+                    }
+                    eprintln!("{reason}");
                     failed += 1;
                     continue;
                 }
             };
-        let result =
-            normalize_kill_result(&orphan.names.join(", "), orphan.pid, result, pane_closed);
+        if self_excluded {
+            killed += 1;
+            pidtrack::remove_pid(hcom_dir, orphan.pid);
+            continue;
+        }
         match result {
             terminal::KillResult::Sent | terminal::KillResult::AlreadyDead => {
                 println!(
@@ -1206,9 +1189,10 @@ fn kill_selected(
             }
         }
         incomplete += report_incomplete_pane_cleanup(result.into(), retry.as_deref()) as i32;
-        if reap_orphan_tree(db, &orphan, captures) {
-            failed += 1;
-        } else {
+        if matches!(
+            result,
+            terminal::KillResult::Sent | terminal::KillResult::AlreadyDead
+        ) {
             pidtrack::remove_pid(hcom_dir, orphan.pid);
         }
     }
@@ -1249,22 +1233,18 @@ fn kill_single(
                     || o.process_id == target
                     || target_pid == Some(o.pid)
             }) {
-                // A refused capture returns before `kill_process` closes the
-                // pane or signals the group; the pidtrack handle stays so a
-                // retry can rediscover the orphan.
                 let owner = verify_orphan_kill_owner(db, orphan).map_err(anyhow::Error::msg)?;
-                let pre_capture = if owner.identity().is_some() {
-                    capture_orphan_carriers(db, orphan)
-                        .map_err(|e| anyhow::Error::msg(refused_capture_error(target, &e)))?
-                } else {
-                    Vec::new()
-                };
-                let (result, pane_closed, pane_retry_command) =
-                    terminal::kill_process(&owner, &orphan.names, &orphan_terminal_info(orphan))
-                        .map_err(|reason| {
-                            anyhow::Error::msg(unverified_owner_error(target, orphan.pid, &reason))
-                        })?;
-                let result = normalize_kill_result(target, orphan.pid, result, pane_closed);
+                let (result, pane_closed, pane_retry_command, self_excluded) =
+                    kill_orphan_process(db, &owner, orphan).map_err(|error| {
+                        if error.launcher_unverified.is_some() {
+                            pidtrack::remove_pid(hcom_dir, orphan.pid);
+                        }
+                        anyhow::Error::msg(error)
+                    })?;
+                if self_excluded {
+                    pidtrack::remove_pid(hcom_dir, orphan.pid);
+                    return Ok(0);
+                }
                 let pane_info =
                     pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
                 match result {
@@ -1285,24 +1265,14 @@ fn kill_single(
                         return Ok(1);
                     }
                 }
-                // The group signal covers the recorded pid; reap any other
-                // live processes still holding the orphan's names — by name
-                // or, for self-bound trees, by its process id — so the
-                // kill is verified whole-instance, not single-pid.
-                let reap_failed = reap_orphan_tree(db, orphan, pre_capture);
-                // Keep the pidtrack handle while survivors live: it is the
-                // only handle by which a retry can rediscover this orphan.
-                // Dropping it on reap failure would force a hand-kill from
-                // the error text.
-                if !reap_failed {
+                if matches!(
+                    result,
+                    terminal::KillResult::Sent | terminal::KillResult::AlreadyDead
+                ) {
                     pidtrack::remove_pid(hcom_dir, orphan.pid);
                 }
                 return Ok(
-                    if reap_failed
-                        || report_incomplete_pane_cleanup(
-                            result.into(),
-                            pane_retry_command.as_deref(),
-                        )
+                    if report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref())
                     {
                         1
                     } else {
@@ -1439,22 +1409,77 @@ fn orphan_terminal_info(orphan: &crate::pidtrack::OrphanProcess) -> terminal::Te
     }
 }
 
+fn kill_orphan_process(
+    db: &HcomDb,
+    owner: &crate::proctruth::KillOwner,
+    orphan: &crate::pidtrack::OrphanProcess,
+) -> Result<(terminal::KillResult, bool, Option<String>, bool), KillTrackedError> {
+    let name = orphan.names.join(", ");
+    let chain = crate::proctruth::kill_caller_ancestor_pids()
+        .map_err(|reason| unverified_owner_error(&name, orphan.pid, reason))?;
+    let self_excluded = chain.contains(&owner.pid());
+    let result = if owner.is_zombie() {
+        if let Some(identity) = owner.identity() {
+            let leftovers = crate::sys::process::terminate_zombie_group_verified(
+                orphan.pid,
+                identity,
+                &chain,
+                crate::proctruth::kill_candidate_eligible,
+                |candidate| crate::proctruth::verify_kill_candidate(db, &name, candidate),
+            )
+            .map_err(|error| native_kill_error(&name, error))?;
+            println!(
+                "'{name}' owner PID {} already exited; {leftovers} leftover process(es) terminated",
+                orphan.pid
+            );
+        }
+        (terminal::KillResult::AlreadyDead, false, None)
+    } else {
+        terminal::kill_process(
+            owner,
+            &orphan.names,
+            std::slice::from_ref(&orphan.process_id),
+            &chain,
+            &orphan_terminal_info(orphan),
+            |candidate| crate::proctruth::verify_kill_candidate(db, &name, candidate),
+        )
+        .map_err(|error| native_kill_error(&name, error))?
+    };
+    if let Some(warning) = owner.launcher_warning() {
+        return Err(launcher_unverified_error(&name, warning, self_excluded));
+    }
+    if self_excluded {
+        println!(
+            "'{name}': caller PID {} and its own ancestor chain were left running by design; owner/root death is not claimed",
+            std::process::id()
+        );
+    }
+    Ok((result.0, result.1, result.2, self_excluded))
+}
+
 /// Kill a process and close its terminal pane.
 /// Returns (KillResult, pane_closed, pane_retry_command, preset_name, pane_id).
 fn kill_instance(
-    _db: &HcomDb,
+    db: &HcomDb,
     name: &str,
     owner: &crate::proctruth::KillOwner,
     instance: &crate::db::InstanceRow,
     is_headless: bool,
-) -> Result<(terminal::KillResult, bool, Option<String>, String, String), String> {
+    binding_ids: &[String],
+    excluded: &[u32],
+) -> Result<(terminal::KillResult, bool, Option<String>, String, String), KillTrackedError> {
     let pid = owner.pid();
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
-        let (result, pane_closed, pane_retry_command) =
-            terminal::kill_process(owner, &[], &terminal::TerminalInfo::default())
-                .map_err(|reason| unverified_owner_error(name, pid, &reason))?;
-        let result = normalize_kill_result(name, pid, result, pane_closed);
+        let (result, pane_closed, pane_retry_command) = terminal::kill_process(
+            owner,
+            &[],
+            binding_ids,
+            excluded,
+            &terminal::TerminalInfo::default(),
+            |candidate| crate::proctruth::verify_kill_candidate(db, name, candidate),
+        )
+        .map_err(|error| native_kill_error(name, error))?;
         log_info(
             "kill",
             "lifecycle.kill",
@@ -1477,10 +1502,15 @@ fn kill_instance(
         instance.launch_context.as_deref(),
     );
 
-    let (result, pane_closed, pane_retry_command) =
-        terminal::kill_process(owner, std::slice::from_ref(&instance.name), &ti)
-            .map_err(|reason| unverified_owner_error(name, pid, &reason))?;
-    let result = normalize_kill_result(name, pid, result, pane_closed);
+    let (result, pane_closed, pane_retry_command) = terminal::kill_process(
+        owner,
+        std::slice::from_ref(&instance.name),
+        binding_ids,
+        excluded,
+        &ti,
+        |candidate| crate::proctruth::verify_kill_candidate(db, name, candidate),
+    )
+    .map_err(|error| native_kill_error(name, error))?;
 
     log_info(
         "kill",

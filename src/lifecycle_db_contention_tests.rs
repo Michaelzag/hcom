@@ -133,7 +133,8 @@ fn kill_busy_deadline_reports_dead_process_and_recovery() {
     let started = Instant::now();
     let error = kill_tracked_instance(&db, "seat", "test")
         .err()
-        .expect("writer still holds the DB");
+        .expect("writer still holds the DB")
+        .to_string();
     let elapsed = started.elapsed();
     assert!(!crate::pidtrack::is_alive(pid));
     assert_eq!(

@@ -5,9 +5,23 @@
 
 use std::process::Command;
 
+#[cfg(unix)]
 pub(crate) const TERM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use super::kill_tree_linux::ProcState as KillState;
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillState {
+    Gone,
+    #[cfg(any(unix, test))]
+    Exiting,
+    Live,
+    Unknown,
+}
 
 fn identity_start(identity: &str) -> Option<(&str, u128)> {
     if let Some(value) = identity.strip_prefix("linux:") {
@@ -21,8 +35,14 @@ fn identity_start(identity: &str) -> Option<(&str, u128)> {
     if let Some(value) = identity.strip_prefix("apple:") {
         let (seconds, micros) = value.split_once(':')?;
         let seconds = seconds.parse::<u64>().ok()?;
-        let micros = micros.parse::<u64>().ok().filter(|&value| value < 1_000_000)?;
-        return Some(("apple", u128::from(seconds) * 1_000_000 + u128::from(micros)));
+        let micros = micros
+            .parse::<u64>()
+            .ok()
+            .filter(|&value| value < 1_000_000)?;
+        return Some((
+            "apple",
+            u128::from(seconds) * 1_000_000 + u128::from(micros),
+        ));
     }
     let ticks = identity.strip_prefix("windows:")?.parse::<u64>().ok()?;
     Some(("windows", u128::from(ticks)))
@@ -53,7 +73,12 @@ pub(crate) fn creation_time(pid: u32) -> Option<u128> {
     {
         creation_ticks_win(pid).map(u128::from)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
     {
         let _ = pid;
         None
@@ -70,7 +95,9 @@ pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
     }
     #[cfg(target_os = "macos")]
     {
-        process_info_apple(pid).map(|info| info.pbi_ppid).filter(|&pid| pid > 0)
+        process_info_apple(pid)
+            .map(|info| info.pbi_ppid)
+            .filter(|&pid| pid > 0)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
@@ -143,14 +170,7 @@ pub fn start_epoch(_pid: u32) -> Option<f64> {
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn process_start_ticks(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Fields after the final `) ` begin at field 3 (`state`). The process
-    // start time is field 22, hence index 19 in this slice.
-    stat.rsplit_once(") ")?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+    proc_stat_start_ticks(&stat)
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -163,6 +183,21 @@ fn proc_stat_fields(stat: &str) -> Option<(u8, std::str::SplitWhitespace<'_>)> {
     let mut fields = fields.split_whitespace();
     let state = fields.next()?.as_bytes();
     (state.len() == 1 && state[0].is_ascii_alphabetic()).then(|| (state[0], fields))
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub(crate) fn proc_stat_start_ticks(stat: &str) -> Option<u64> {
+    let (_, mut fields) = proc_stat_fields(stat)?;
+    fields.nth(18)?.parse().ok()
+}
+
+/// Build the native identity from the same stat record that supplied PGID.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub(crate) fn proc_stat_identity(stat: &str) -> Option<String> {
+    let ticks = proc_stat_start_ticks(stat)?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let boot = boot.trim();
+    (!boot.is_empty()).then(|| format!("linux:{boot}:{ticks}"))
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -179,7 +214,11 @@ pub(crate) fn proc_stat_is_dead(stat: &str) -> bool {
 pub(crate) fn proc_stat_group_id(stat: &str) -> Option<u32> {
     let (_, mut fields) = proc_stat_fields(stat)?;
     fields.next()?.parse::<u32>().ok()?;
-    fields.next()?.parse::<u32>().ok().filter(|&group| group != 0)
+    fields
+        .next()?
+        .parse::<u32>()
+        .ok()
+        .filter(|&group| group != 0)
 }
 
 /// One incarnation of `pid` on this host: its boot-relative start time in
@@ -205,18 +244,24 @@ pub fn procfs_start_identity(_pid: u32) -> Option<(u64, String)> {
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn process_identity_platform(pid: u32) -> Option<String> {
-    let (start_ticks, boot_id) = procfs_start_identity(pid)?;
-    // Boot ID keeps the boot-relative tick count unique across restarts.
-    Some(format!("linux:{boot_id}:{start_ticks}"))
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    proc_stat_identity(&stat)
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 fn process_identity_platform(pid: u32) -> Option<String> {
     let info = process_info_apple(pid)?;
-    Some(format!(
-        "apple:{}:{}",
-        info.pbi_start_tvsec, info.pbi_start_tvusec
-    ))
+    if info.pbi_pid != pid {
+        return None;
+    }
+    apple_info_identity(&info)
+}
+
+/// Use the same BSD record for group membership and its native birth receipt.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+pub(crate) fn apple_info_identity(info: &libc::proc_bsdinfo) -> Option<String> {
+    (info.pbi_pid != 0 && info.pbi_start_tvusec < 1_000_000)
+        .then(|| format!("apple:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -229,7 +274,9 @@ pub(crate) fn process_info_apple(pid: u32) -> Option<libc::proc_bsdinfo> {
         libc::proc_pidinfo(
             pid as libc::c_int,
             libc::PROC_PIDTBSDINFO,
-            0,
+            // PROC_PIDTBSDINFO arg=1 also finds unreaped zombies. Their
+            // start time still identifies the receipt; liveness is separate.
+            1,
             (&mut info as *mut libc::proc_bsdinfo).cast(),
             size,
         )
@@ -238,8 +285,7 @@ pub(crate) fn process_info_apple(pid: u32) -> Option<libc::proc_bsdinfo> {
 }
 
 /// One positive PID's `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)` reply.
-/// Only `state` decides; test builds also keep the raw reply so a failed native
-/// fixture shows exactly what the kernel said.
+/// The run state and exit flag decide lifecycle; tests also keep diagnostics.
 #[cfg(all(
     target_os = "macos",
     any(target_arch = "aarch64", target_arch = "x86_64")
@@ -263,6 +309,8 @@ struct AppleProcStateReply {
     /// `kp_proc.p_stat`, kept only from a successful reply of one whole record
     /// whose `p_pid` is the requested PID.
     state: Option<libc::c_char>,
+    flags: Option<libc::c_int>,
+    absent: bool,
 }
 
 #[cfg(all(
@@ -274,15 +322,26 @@ impl AppleProcStateReply {
     fn is_zombie(&self) -> bool {
         self.state == Some(libc::SZOMB as libc::c_char)
     }
+
+    fn lifecycle(&self) -> KillState {
+        // XNU bsd/sys/proc.h:183: P_WEXIT is kept in extern_proc.p_flag.
+        const P_WEXIT: libc::c_int = 0x0000_2000;
+        if self.absent || self.is_zombie() {
+            KillState::Gone
+        } else if let (Some(_), Some(flags)) = (self.state, self.flags) {
+            if flags & P_WEXIT != 0 {
+                KillState::Exiting
+            } else {
+                KillState::Live
+            }
+        } else {
+            KillState::Unknown
+        }
+    }
 }
 
-/// Read the BSD run state of a positive `pid` as zombie evidence.
-///
-/// [`process_info_apple`] cannot provide it: `proc_pidinfo(PROC_PIDTBSDINFO)`
-/// looks up zombies only when its argument is nonzero (xnu-11417.140.69
-/// bsd/kern/proc_info.c:2152-2163). The `kern.proc.pid` handler walks the
-/// zombie list as well (bsd/kern/kern_sysctl.c:912-913) and copies out
-/// `p_stat` and `p_pid` (kern_sysctl.c:1201-1202).
+/// Read native BSD state and P_WEXIT from the existing kinfo_proc query.
+/// SZOMB is positive death; P_WEXIT is only irreversible exit-in-progress.
 ///
 /// Only the leading fields of the record are declared; the rest stays opaque.
 /// `struct kinfo_proc` starts with `struct extern_proc kp_proc`
@@ -348,7 +407,6 @@ fn process_state_apple(pid: libc::pid_t) -> AppleProcStateReply {
     };
     // Test builds keep errno for the fixture's diagnostic. Read it immediately,
     // and only when the call failed.
-    #[cfg(test)]
     let errno = if ret == 0 {
         None
     } else {
@@ -366,6 +424,8 @@ fn process_state_apple(pid: libc::pid_t) -> AppleProcStateReply {
         #[cfg(test)]
         decoded_pid: None,
         state: None,
+        flags: None,
+        absent: (ret == 0 && len == 0) || errno == Some(libc::ESRCH),
     };
     // An error, an empty reply (no such PID), or any other length leaves the
     // buffer unread. A buffer too small for a whole record fails with ENOMEM
@@ -380,6 +440,7 @@ fn process_state_apple(pid: libc::pid_t) -> AppleProcStateReply {
             reply.decoded_pid = Some(kp_proc.p_pid);
         }
         reply.state = (kp_proc.p_pid == pid).then_some(kp_proc.p_stat);
+        reply.flags = (kp_proc.p_pid == pid).then_some(kp_proc.p_flag);
     }
     reply
 }
@@ -465,7 +526,10 @@ pub fn is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // SAFETY: kill(pid, 0) sends no signal; it only checks for existence.
-        let ret = unsafe { libc::kill(pid as i32, 0) };
+        let Ok(pid) = checked_pid(pid) else {
+            return false;
+        };
+        let ret = unsafe { libc::kill(pid, 0) };
         if ret == 0 {
             return true;
         }
@@ -493,6 +557,73 @@ pub fn is_alive(pid: u32) -> bool {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_gone_confirmed(pid: u32) -> bool {
+    if std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .is_ok_and(|stat| proc_stat_is_dead(&stat))
+    {
+        return true;
+    }
+    let Ok(pid) = checked_pid(pid) else {
+        return false;
+    };
+    // A hidden or unavailable procfs entry is not death while kill0 finds it.
+    // SAFETY: one positive representable PID and signal zero are read-only.
+    (unsafe { libc::kill(pid, 0) }) != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Native lifecycle proof. Exiting cannot run user code but isn't confirmed
+/// gone until the kernel has finished the whole process/thread set.
+pub(crate) fn kill_state(pid: u32) -> KillState {
+    if pid == 0 || i32::try_from(pid).is_err() {
+        return KillState::Unknown;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        match super::kill_tree_linux::linux_state(pid, None) {
+            KillState::Gone if !linux_gone_confirmed(pid) => KillState::Unknown,
+            state => state,
+        }
+    }
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    {
+        let Ok(pid) = checked_pid(pid) else {
+            return KillState::Unknown;
+        };
+        process_state_apple(pid).lifecycle()
+    }
+    #[cfg(windows)]
+    {
+        if is_definitely_dead(pid) {
+            KillState::Gone
+        } else if creation_ticks_win(pid).is_some() {
+            KillState::Live
+        } else {
+            KillState::Unknown
+        }
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        windows,
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    )))]
+    {
+        if is_definitely_dead(pid) {
+            KillState::Gone
+        } else {
+            KillState::Unknown
+        }
+    }
+}
+
 /// Positive evidence that a PID has exited or no longer exists. Probe failures
 /// are unknown, not death; unlike `is_alive`, this is safe for releasing a
 /// persisted owner's identity.
@@ -502,7 +633,7 @@ pub fn is_definitely_dead(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        let Ok(pid) = i32::try_from(pid) else {
+        let Ok(pid) = checked_pid(pid) else {
             return false;
         };
         // SAFETY: a positive PID and signal zero query one process, never a
@@ -511,20 +642,19 @@ pub fn is_definitely_dead(pid: u32) -> bool {
         if ret != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             return true;
         }
-        // kill(pid, 0) still succeeds for an exited, unreaped zombie. Only a
-        // readable native zombie status is additional positive death evidence.
+        // A zombie leader can still front live threads. Only the complete
+        // native process state supplies additional positive death evidence.
         #[cfg(any(target_os = "android", target_os = "linux"))]
         {
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .is_some_and(|stat| proc_stat_is_dead(&stat))
+            super::kill_tree_linux::linux_state(pid as u32, None) == KillState::Gone
+                && linux_gone_confirmed(pid as u32)
         }
         #[cfg(all(
             target_os = "macos",
             any(target_arch = "aarch64", target_arch = "x86_64")
         ))]
         {
-            process_state_apple(pid).is_zombie()
+            process_state_apple(pid).lifecycle() == KillState::Gone
         }
         #[cfg(not(any(
             target_os = "android",
@@ -569,18 +699,24 @@ pub fn is_definitely_dead(pid: u32) -> bool {
 pub(crate) fn is_zombie(pid: u32) -> bool {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .is_some_and(|stat| proc_stat_is_zombie(&stat))
+        super::kill_tree_linux::linux_is_zombie(pid)
     }
-    #[cfg(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
     {
-        i32::try_from(pid).ok().is_some_and(|pid| process_state_apple(pid).is_zombie())
+        i32::try_from(pid)
+            .ok()
+            .is_some_and(|pid| process_state_apple(pid).is_zombie())
     }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
-        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64"))
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
     )))]
     {
         let _ = pid;
@@ -607,23 +743,13 @@ pub(crate) fn is_zombie_group_leader(pid: u32) -> bool {
 }
 
 /// Only a receipt-matching unreaped leader can authorize its leftover PGID.
-pub(crate) fn signal_zombie_group(
-    pid: u32,
-    expected: &str,
-    force: bool,
-) -> Result<GroupSignal, &'static str> {
+#[cfg(unix)]
+fn signal_zombie_group(pid: u32, expected: &str, force: bool) -> Result<GroupSignal, &'static str> {
     if !is_zombie_group_leader(pid) || !has_identity(pid, expected) {
         return Err("zombie group leader identity changed or became unreadable");
     }
-    #[cfg(unix)]
-    {
-        Ok(signal_group_unix(pid, if force { libc::SIGKILL } else { libc::SIGTERM }))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = force;
-        Err("process groups are unsupported on this platform")
-    }
+    signal_group(pid, if force { libc::SIGKILL } else { libc::SIGTERM })
+        .map_err(|_| "zombie group leader PID is not signalable")
 }
 
 /// Forcefully terminate a process by PID. Best-effort; returns whether the
@@ -633,8 +759,7 @@ pub(crate) fn signal_zombie_group(
 pub fn kill(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        // SAFETY: standard kill(2) with a valid signal number.
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) == 0 }
+        signal_pid(pid, libc::SIGKILL).is_ok_and(|result| result == GroupSignal::Sent)
     }
     #[cfg(windows)]
     {
@@ -652,8 +777,7 @@ pub fn kill(pid: u32) -> bool {
 pub fn terminate(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        // SAFETY: standard kill(2) with a valid signal number.
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) == 0 }
+        signal_pid(pid, libc::SIGTERM).is_ok_and(|result| result == GroupSignal::Sent)
     }
     #[cfg(windows)]
     {
@@ -676,6 +800,95 @@ pub enum GroupSignal {
     Other,
 }
 
+/// Native termination failures retain PIDs as data for local and relay reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KillError {
+    Refused(String),
+    Survivors(Vec<u32>),
+    Unconfirmed { reason: String, survivors: Vec<u32> },
+}
+
+impl KillError {
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Self::Refused(reason) | Self::Unconfirmed { reason, .. } => reason,
+            Self::Survivors(_) => "processes survived termination",
+        }
+    }
+}
+
+impl From<String> for KillError {
+    fn from(reason: String) -> Self {
+        Self::Refused(reason)
+    }
+}
+
+impl From<&str> for KillError {
+    fn from(reason: &str) -> Self {
+        Self::Refused(reason.to_owned())
+    }
+}
+
+impl std::fmt::Display for KillError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(reason) => f.write_str(reason),
+            Self::Survivors(pids) => write!(f, "survivor PIDs: {}", format_pids(pids)),
+            Self::Unconfirmed { reason, survivors } => {
+                write!(f, "{reason}; survivor PIDs: {}", format_pids(survivors))
+            }
+        }
+    }
+}
+
+/// Authorization can race exit or PID reuse. Only the captured incarnation's
+/// live failure blocks termination; a gone incarnation remains a tree anchor.
+fn authorize_captured<T: PartialEq>(
+    pid: u32,
+    expected: &T,
+    mut observe: impl FnMut(u32) -> Option<T>,
+    mut definitely_dead: impl FnMut(u32) -> bool,
+    authorize: impl FnOnce(u32) -> Result<(), KillError>,
+) -> Result<bool, KillError> {
+    if definitely_dead(pid) || observe(pid).is_some_and(|current| &current != expected) {
+        return Ok(false);
+    }
+    let outcome = authorize(pid);
+    if definitely_dead(pid) {
+        return Ok(false);
+    }
+    match observe(pid) {
+        Some(current) if &current != expected => Ok(false),
+        Some(_) => outcome.map(|_| true),
+        None => Err(outcome.err().unwrap_or_else(|| KillError::Unconfirmed {
+            reason: "captured process identity is unreadable".into(),
+            survivors: vec![pid],
+        })),
+    }
+}
+
+#[cfg(windows)]
+fn authorize_windows_member(
+    pid: u32,
+    expected: Option<u64>,
+    authorize: &mut impl FnMut(u32) -> Result<(), KillError>,
+) -> Result<bool, KillError> {
+    if is_definitely_dead(pid) {
+        return Ok(false);
+    }
+    let expected = expected.ok_or_else(|| KillError::Unconfirmed {
+        reason: "captured process identity is unreadable".into(),
+        survivors: vec![pid],
+    })?;
+    authorize_captured(
+        pid,
+        &expected,
+        creation_ticks_win,
+        is_definitely_dead,
+        authorize,
+    )
+}
+
 /// Send a graceful termination request to a process group by PID.
 ///
 /// Unix: `killpg(SIGTERM)`. Windows has no process-group signal and no graceful
@@ -692,57 +905,449 @@ pub fn terminate_group(pid: u32) -> GroupSignal {
     }
 }
 
-/// Kill's signal primitive: a PID incarnation, not a bare PID, authorizes
-/// the group/tree. Other lifecycle callers keep their existing primitives.
+/// Terminate the verified seat root through exactly one native tree helper.
+/// A helper returns success only after all captured incarnations are gone.
 pub(crate) fn terminate_group_verified(
     pid: u32,
     expected: &str,
-) -> Result<GroupSignal, String> {
+    binding_ids: &[String],
+    excluded: &[u32],
+    process_id_of: impl FnMut(u32) -> super::process_args::EnvRead,
+    eligible: impl FnMut(u32) -> bool,
+    mut authorize: impl FnMut(u32) -> Result<(), KillError>,
+) -> Result<GroupSignal, KillError> {
     if is_definitely_dead(pid) {
         return Ok(GroupSignal::NotFound);
     }
     if !has_identity(pid, expected) {
-        return Err("PID identity changed or became unreadable before the group/tree signal".into());
+        return Err("PID identity changed or became unreadable before tree capture".into());
+    }
+    if !authorize_captured(
+        pid,
+        &true,
+        |pid| identity(pid).map(|current| current == expected),
+        is_definitely_dead,
+        &mut authorize,
+    )? {
+        return Ok(GroupSignal::NotFound);
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        super::kill_tree_linux::terminate(
+            pid,
+            expected,
+            binding_ids,
+            excluded,
+            process_id_of,
+            eligible,
+            authorize,
+        )
     }
     #[cfg(target_os = "macos")]
     {
-        super::kill_tree_apple::terminate(pid, expected)
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let result = signal_group_unix(pid, libc::SIGTERM);
-        if result != GroupSignal::NotFound || is_definitely_dead(pid) {
-            return Ok(result);
-        }
-        // Hook re-pinning can name the interpreter, not its group's leader.
-        // ESRCH from killpg is harmless, but does not mean that PID is dead.
-        if !has_identity(pid, expected) {
-            return Err("PID identity changed or became unreadable before the owner signal".into());
-        }
-        // SAFETY: a verified positive PID targets one process, not its parent
-        // or a shared launcher group. Carrier reap handles its captured tree.
-        if unsafe { libc::kill(pid as i32, libc::SIGTERM) } == 0 {
-            return Ok(GroupSignal::Sent);
-        }
-        Ok(match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => GroupSignal::NotFound,
-            Some(libc::EPERM) => GroupSignal::PermissionDenied,
-            _ => GroupSignal::Other,
-        })
+        let _ = (binding_ids, process_id_of);
+        super::kill_tree_apple::terminate(pid, expected, excluded, eligible, authorize)
     }
     #[cfg(windows)]
     {
+        let _ = (binding_ids, process_id_of);
+        let mut eligible = eligible;
         let ticks = expected
             .strip_prefix("windows:")
             .and_then(|ticks| ticks.parse::<u64>().ok())
             .ok_or("recorded Windows process creation time is unreadable")?;
-        let (result, root_terminated) = kill_tree_win_with_identity(pid, Some(ticks));
-        if !root_terminated && !is_definitely_dead(pid) {
-            return Err(
-                "verified owner could not be terminated: its identity changed, became unreadable, or access was denied".into(),
-            );
+        let mut captured = Vec::new();
+        let outcome = kill_tree_win_with_identity(
+            pid,
+            Some(ticks),
+            &mut captured,
+            excluded,
+            &mut eligible,
+            &mut authorize,
+        );
+        let deadline = std::time::Instant::now() + KILL_WAIT;
+        loop {
+            let survivors: Vec<u32> = captured
+                .iter()
+                .filter_map(|&(pid, expected)| {
+                    if is_definitely_dead(pid)
+                        || expected
+                            .zip(creation_ticks_win(pid))
+                            .is_some_and(|(old, now)| old != now)
+                    {
+                        None
+                    } else {
+                        Some(pid)
+                    }
+                })
+                .collect();
+            if survivors.is_empty() {
+                return outcome.map(|(result, _)| result);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(match outcome {
+                    Ok(_) => KillError::Survivors(survivors),
+                    Err(reason) => KillError::Unconfirmed {
+                        reason: reason.reason().to_owned(),
+                        survivors,
+                    },
+                });
+            }
+            std::thread::sleep(POLL_STEP);
         }
-        Ok(result)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
+    {
+        let _ = (binding_ids, excluded, process_id_of, eligible, authorize);
+        Err("verified process-tree termination is unsupported on this platform".into())
+    }
+}
+
+fn format_pids(pids: &[u32]) -> String {
+    pids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A captured zombie-group member. A late refusal fences it: it's never
+/// signaled, but it stays a survivor until it's gone.
+#[cfg(unix)]
+struct ZombieTarget {
+    member: super::kill_group::Member,
+    fenced: bool,
+}
+
+/// The captured incarnation's state, or None once it's Gone or reused.
+#[cfg(unix)]
+fn zombie_target_state(member: &super::kill_group::Member) -> Option<KillState> {
+    match kill_state(member.pid) {
+        KillState::Gone => None,
+        _ if identity(member.pid).is_some_and(|current| current != member.identity) => None,
+        state => Some(state),
+    }
+}
+
+#[cfg(unix)]
+fn zombie_survivors(targets: &[ZombieTarget]) -> Vec<(u32, KillState)> {
+    targets
+        .iter()
+        .filter_map(|target| {
+            zombie_target_state(&target.member).map(|state| (target.member.pid, state))
+        })
+        .collect()
+}
+
+/// Whether `member`, or a group member above it, is protected: the caller's
+/// chain, the leader's ancestry, or a shared broker. None if unverifiable.
+#[cfg(unix)]
+fn zombie_member_protected(
+    member: u32,
+    group: &[u32],
+    excluded: &[u32],
+    ancestors: &[u32],
+    eligible: &mut impl FnMut(u32) -> bool,
+) -> Option<bool> {
+    let mut current = member;
+    let mut start = creation_time(current)?;
+    for _ in 0..=group.len() {
+        if excluded.contains(&current) || ancestors.contains(&current) || !eligible(current) {
+            return Some(true);
+        }
+        let parent = parent_pid(current)?;
+        if !group.contains(&parent) {
+            return Some(false);
+        }
+        let parent_start = creation_time(parent)?;
+        if parent_start > start {
+            // A younger process reused the parent's PID: no longer its parent.
+            return Some(false);
+        }
+        current = parent;
+        start = parent_start;
+    }
+    None
+}
+
+/// Capture the zombie leader's current group. Protected members and their
+/// group subtrees stay out and forbid killpg; only an all-Live group exactly
+/// matching the unfenced capture may be signaled as a group.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn capture_zombie_members(
+    pid: u32,
+    expected: &str,
+    excluded: &[u32],
+    ancestors: &mut Vec<u32>,
+    eligible: &mut impl FnMut(u32) -> bool,
+    authorize: &mut impl FnMut(u32) -> Result<(), KillError>,
+    targets: &mut Vec<ZombieTarget>,
+    failure: &mut Option<KillError>,
+) -> Result<bool, KillError> {
+    if !is_zombie_group_leader(pid) || !has_identity(pid, expected) {
+        return Err("zombie group leader identity changed or became unreadable".into());
+    }
+    let late = !targets.is_empty() || failure.is_some();
+    let mut current = pid;
+    let mut child_start = creation_time(current).ok_or("zombie creation time is unreadable")?;
+    let mut seen = [0u32; 1024];
+    seen[0] = current;
+    let mut depth = 1;
+    loop {
+        let parent = parent_pid(current).ok_or("zombie owner's ancestry is unreadable")?;
+        if parent <= 1 {
+            break;
+        }
+        if depth == seen.len() || seen[..depth].contains(&parent) {
+            return Err("zombie owner's ancestry is cyclic or too deep".into());
+        }
+        let parent_start = creation_time(parent).ok_or("zombie ancestor identity is unreadable")?;
+        if parent_start > child_start {
+            return Err("zombie owner's ancestry contains a reused parent PID".into());
+        }
+        if !ancestors.contains(&parent) {
+            ancestors.push(parent);
+        }
+        seen[depth] = parent;
+        depth += 1;
+        current = parent;
+        child_start = parent_start;
+    }
+    let members = super::kill_group::capture_members(pid)?;
+    let group: Vec<u32> = members.iter().map(|member| member.pid).collect();
+    let mut group_safe = true;
+    for member in members {
+        group_safe &= member.state == KillState::Live;
+        let known = targets.iter().any(|target| {
+            target.member.pid == member.pid && target.member.identity == member.identity
+        });
+        match zombie_member_protected(member.pid, &group, excluded, ancestors, eligible) {
+            Some(true) => {
+                group_safe = false;
+                continue;
+            }
+            Some(false) => {}
+            None => {
+                group_safe = false;
+                if known || zombie_target_state(&member).is_none() {
+                    continue;
+                }
+                let error = KillError::Unconfirmed {
+                    reason: "not signaled: process ancestry unreadable".into(),
+                    survivors: vec![member.pid],
+                };
+                if !late {
+                    return Err(error);
+                }
+                failure.get_or_insert(error);
+                targets.push(ZombieTarget {
+                    member,
+                    fenced: true,
+                });
+                continue;
+            }
+        }
+        if known {
+            continue;
+        }
+        // Exiting members can't run user code: authorization is moot for them.
+        let fenced = member.state == KillState::Live
+            && match authorize_captured(
+                member.pid,
+                &member.identity,
+                identity,
+                is_definitely_dead,
+                &mut *authorize,
+            ) {
+                Ok(_) => false,
+                Err(error) if !late => return Err(error),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    true
+                }
+            };
+        targets.push(ZombieTarget { member, fenced });
+    }
+    if group_safe {
+        // Authorization can race group changes: recheck the exact membership.
+        group_safe = super::kill_group::capture_members(pid)?
+            .iter()
+            .all(|member| {
+                member.state == KillState::Live
+                    && targets.iter().any(|target| {
+                        !target.fenced
+                            && target.member.pid == member.pid
+                            && target.member.identity == member.identity
+                    })
+            });
+    }
+    if !is_zombie_group_leader(pid) || !has_identity(pid, expected) {
+        return Err("zombie group leader identity changed during capture".into());
+    }
+    Ok(group_safe)
+}
+
+/// Group-signal a safe group, else signal each unfenced captured Live member
+/// after rechecking its incarnation and authorization.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn signal_zombie_targets(
+    pid: u32,
+    expected: &str,
+    group_safe: bool,
+    force: bool,
+    targets: &mut [ZombieTarget],
+    authorize: &mut impl FnMut(u32) -> Result<(), KillError>,
+    failure: &mut Option<KillError>,
+) {
+    let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+    let grouped = group_safe && signal_zombie_group(pid, expected, force).is_ok();
+    for target in targets.iter_mut().filter(|target| !target.fenced) {
+        if (grouped && group_id(target.member.pid) == Some(pid))
+            || kill_state(target.member.pid) != KillState::Live
+        {
+            continue;
+        }
+        match authorize_captured(
+            target.member.pid,
+            &target.member.identity,
+            identity,
+            is_definitely_dead,
+            &mut *authorize,
+        ) {
+            Ok(true) => {
+                let _ = signal_pid(target.member.pid, sig);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                failure.get_or_insert(error);
+                target.fenced = true;
+            }
+        }
+    }
+}
+
+/// A receipt-matching unreaped leader authorizes only its captured leftovers.
+/// Protected group members disable killpg, not the safe per-PID fallback.
+/// Exiting members are tracked, never signaled, and must be gone by the end.
+pub(crate) fn terminate_zombie_group_verified(
+    pid: u32,
+    expected: &str,
+    excluded: &[u32],
+    mut eligible: impl FnMut(u32) -> bool,
+    mut authorize: impl FnMut(u32) -> Result<(), KillError>,
+) -> Result<usize, KillError> {
+    #[cfg(unix)]
+    {
+        let mut targets = Vec::new();
+        let mut ancestors = Vec::new();
+        let mut failure = None;
+        let mut group_safe = capture_zombie_members(
+            pid,
+            expected,
+            excluded,
+            &mut ancestors,
+            &mut eligible,
+            &mut authorize,
+            &mut targets,
+            &mut failure,
+        )?;
+        let terminated =
+            |targets: &[ZombieTarget]| targets.iter().filter(|target| !target.fenced).count();
+        'rounds: for (force, budget) in [(false, TERM_WAIT), (true, KILL_WAIT)] {
+            if zombie_survivors(&targets).is_empty() {
+                break 'rounds;
+            }
+            signal_zombie_targets(
+                pid,
+                expected,
+                group_safe,
+                force,
+                &mut targets,
+                &mut authorize,
+                &mut failure,
+            );
+            let deadline = std::time::Instant::now() + budget;
+            loop {
+                if zombie_survivors(&targets).is_empty() {
+                    let before = targets.len();
+                    // The leader may be reaped once its group empties; then no
+                    // late member can join a group this kill could signal.
+                    if !is_zombie_group_leader(pid) {
+                        break 'rounds;
+                    }
+                    group_safe = capture_zombie_members(
+                        pid,
+                        expected,
+                        excluded,
+                        &mut ancestors,
+                        &mut eligible,
+                        &mut authorize,
+                        &mut targets,
+                        &mut failure,
+                    )
+                    .map_err(|error| KillError::Unconfirmed {
+                        reason: error.reason().to_owned(),
+                        survivors: zombie_survivors(&targets)
+                            .into_iter()
+                            .map(|(pid, _)| pid)
+                            .collect(),
+                    })?;
+                    if targets.len() == before {
+                        break 'rounds;
+                    }
+                    signal_zombie_targets(
+                        pid,
+                        expected,
+                        group_safe,
+                        force,
+                        &mut targets[before..],
+                        &mut authorize,
+                        &mut failure,
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(POLL_STEP);
+            }
+        }
+        let survivors = zombie_survivors(&targets);
+        if survivors.is_empty() {
+            return Ok(terminated(&targets));
+        }
+        let pids: Vec<u32> = survivors.iter().map(|&(pid, _)| pid).collect();
+        let exiting: Vec<u32> = survivors
+            .iter()
+            .filter(|(_, state)| *state == KillState::Exiting)
+            .map(|&(pid, _)| pid)
+            .collect();
+        let note = if exiting.is_empty() {
+            String::new()
+        } else {
+            format!(" (still exiting: {})", format_pids(&exiting))
+        };
+        Err(match failure {
+            Some(error) => KillError::Unconfirmed {
+                reason: format!("{}{note}", error.reason()),
+                survivors: pids,
+            },
+            None if !note.is_empty() => KillError::Unconfirmed {
+                reason: format!("processes did not finish exiting by the deadline{note}"),
+                survivors: pids,
+            },
+            None => KillError::Survivors(pids),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, expected, excluded, &mut eligible, &mut authorize);
+        Err("zombie process groups are unsupported on this platform".into())
     }
 }
 
@@ -764,10 +1369,18 @@ pub fn kill_group(pid: u32) -> GroupSignal {
     }
 }
 
+/// The only conversion from a persisted/native PID to a signal target.
+/// PID 0 and negative values address groups; init is never a kill target.
+#[cfg(any(unix, test))]
+pub(crate) fn checked_pid(pid: u32) -> Result<i32, KillError> {
+    i32::try_from(pid)
+        .ok()
+        .filter(|&pid| pid > 1)
+        .ok_or_else(|| KillError::Refused(format!("PID {pid} is not a signalable process ID")))
+}
+
 #[cfg(unix)]
-fn signal_group_unix(pid: u32, sig: libc::c_int) -> GroupSignal {
-    // SAFETY: killpg with a valid signal number; return value is checked.
-    let ret = unsafe { libc::killpg(pid as i32, sig) };
+fn signal_result(ret: libc::c_int) -> GroupSignal {
     if ret == 0 {
         return GroupSignal::Sent;
     }
@@ -776,6 +1389,27 @@ fn signal_group_unix(pid: u32, sig: libc::c_int) -> GroupSignal {
         Some(libc::EPERM) => GroupSignal::PermissionDenied,
         _ => GroupSignal::Other,
     }
+}
+
+/// Signal exactly one positive process after checked PID conversion.
+#[cfg(unix)]
+pub(crate) fn signal_pid(pid: u32, sig: libc::c_int) -> Result<GroupSignal, KillError> {
+    let pid = checked_pid(pid)?;
+    // SAFETY: checked_pid admits only one positive non-init process ID.
+    Ok(signal_result(unsafe { libc::kill(pid, sig) }))
+}
+
+/// Signal exactly one positive process group after checked PGID conversion.
+#[cfg(unix)]
+pub(crate) fn signal_group(pgid: u32, sig: libc::c_int) -> Result<GroupSignal, KillError> {
+    let pgid = checked_pid(pgid)?;
+    // SAFETY: checked_pid admits only one positive non-init process group ID.
+    Ok(signal_result(unsafe { libc::killpg(pgid, sig) }))
+}
+
+#[cfg(unix)]
+fn signal_group_unix(pid: u32, sig: libc::c_int) -> GroupSignal {
+    signal_group(pid, sig).unwrap_or(GroupSignal::Other)
 }
 
 /// Replace the current process with the given command.
@@ -1213,15 +1847,42 @@ fn kill_tree_win(root: u32) -> GroupSignal {
 /// snapshot can still escape.
 #[cfg(windows)]
 fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
-    kill_tree_win_with_identity(root, None)
+    kill_tree_win_with_identity(root, None, &mut Vec::new(), &[], &mut |_| true, &mut |_| {
+        Ok(())
+    })
+    .unwrap_or((GroupSignal::NotFound, false))
 }
 
 #[cfg(windows)]
-fn kill_tree_win_with_identity(root: u32, expected: Option<u64>) -> (GroupSignal, bool) {
-    if expected.is_some_and(|ticks| creation_ticks_win(root) != Some(ticks)) {
-        return (GroupSignal::NotFound, false);
+fn kill_tree_win_with_identity(
+    root: u32,
+    expected: Option<u64>,
+    captured: &mut Vec<(u32, Option<u64>)>,
+    excluded: &[u32],
+    eligible: &mut impl FnMut(u32) -> bool,
+    authorize: &mut impl FnMut(u32) -> Result<(), KillError>,
+) -> Result<(GroupSignal, bool), KillError> {
+    if expected.is_some() && !eligible(root) {
+        return Err("verified root is an ineligible shared process; no signal sent".into());
+    }
+    if let Some(expected) = expected
+        && !excluded.contains(&root)
+    {
+        captured.push((root, Some(expected)));
+    }
+    if let Some(expected) = expected {
+        match creation_ticks_win(root) {
+            Some(current) if current == expected => {}
+            Some(_) => return Ok((GroupSignal::NotFound, false)),
+            None if is_definitely_dead(root) => return Ok((GroupSignal::NotFound, false)),
+            None => return Err("verified root identity is unreadable before tree capture".into()),
+        }
     }
     let Some(parents) = snapshot_parents(false) else {
+        if expected.is_some() {
+            // A verified kill must not signal a partial tree and claim success.
+            return Err("verified process-tree snapshot is unreadable; no signal sent".into());
+        }
         // Still can't enumerate descendants; kill only the root. Any
         // surviving descendants will be reaped when the job object
         // closes. This still reports `Sent` (not a distinct "partial"
@@ -1241,18 +1902,21 @@ fn kill_tree_win_with_identity(root: u32, expected: Option<u64>) -> (GroupSignal
             ),
         );
         let ok = terminate_win_matching(root, expected);
-        return (
+        return Ok((
             if ok {
                 GroupSignal::Sent
             } else {
                 GroupSignal::NotFound
             },
             ok,
-        );
+        ));
     };
 
     if !parents.contains_key(&root) {
-        return (GroupSignal::NotFound, false);
+        if expected.is_some() && !is_definitely_dead(root) {
+            return Err("live verified root is missing from the process-tree snapshot".into());
+        }
+        return Ok((GroupSignal::NotFound, false));
     }
 
     // Collect root + all descendants (BFS over the parent links), rejecting any
@@ -1279,12 +1943,18 @@ fn kill_tree_win_with_identity(root: u32, expected: Option<u64>) -> (GroupSignal
             if ppid != current || tree.contains(&pid) {
                 continue;
             }
+            if expected.is_some() && !eligible(pid) {
+                continue;
+            }
             let child_ticks = *ticks.entry(pid).or_insert_with(|| creation_ticks_win(pid));
             if expected.is_some()
                 && (parent_ticks.is_none()
                     || child_ticks.is_none()
                     || creation_ticks_win(current) != parent_ticks)
             {
+                if !excluded.contains(&pid) {
+                    captured.push((pid, child_ticks));
+                }
                 continue;
             }
             if child_link_is_plausible(parent_ticks, child_ticks) {
@@ -1293,14 +1963,44 @@ fn kill_tree_win_with_identity(root: u32, expected: Option<u64>) -> (GroupSignal
         }
         i += 1;
     }
-    if expected.is_some_and(|ticks| creation_ticks_win(root) != Some(ticks)) {
-        return (GroupSignal::NotFound, false);
+    if expected.is_some() {
+        captured.extend(
+            tree.iter()
+                .filter(|&&pid| pid != root && !excluded.contains(&pid))
+                .map(|&pid| (pid, ticks.get(&pid).copied().flatten())),
+        );
+    }
+    if let Some(expected) = expected {
+        match creation_ticks_win(root) {
+            Some(current) if current == expected => {}
+            Some(_) => return Ok((GroupSignal::NotFound, false)),
+            None if is_definitely_dead(root) => return Ok((GroupSignal::NotFound, false)),
+            None => {
+                return Err("verified root identity is unreadable before tree termination".into());
+            }
+        }
+    }
+    if expected.is_some() {
+        for &(pid, start) in captured.iter() {
+            authorize_windows_member(pid, start, authorize)?;
+        }
     }
 
     // Terminate children before parents (deepest first) so a parent can't spawn
     // a new child after we've passed it.
     let mut root_terminated = false;
     for &pid in tree.iter().rev() {
+        if excluded.contains(&pid) {
+            continue;
+        }
+        if expected.is_some() {
+            if !eligible(pid) {
+                continue;
+            }
+            if !authorize_windows_member(pid, ticks.get(&pid).copied().flatten(), authorize)? {
+                continue;
+            }
+        }
         let ok = if expected.is_some() {
             ticks
                 .get(&pid)
@@ -1340,6 +2040,9 @@ fn kill_tree_win_with_identity(root: u32, expected: Option<u64>) -> (GroupSignal
     for _ in 0..RESCAN_ROUNDS {
         std::thread::sleep(RESCAN_DELAY);
         let Some(parents) = snapshot_parents(false) else {
+            if expected.is_some() {
+                return Err("late-fork process-tree snapshot is unreadable".into());
+            }
             break;
         };
         let before = tree.len();
@@ -1348,6 +2051,9 @@ fn kill_tree_win_with_identity(root: u32, expected: Option<u64>) -> (GroupSignal
             for (&pid, entry) in &parents {
                 let ppid = entry.parent_pid;
                 if !tree.contains(&ppid) || tree.contains(&pid) {
+                    continue;
+                }
+                if expected.is_some() && !eligible(pid) {
                     continue;
                 }
                 let parent_ticks = *ticks
@@ -1362,14 +2068,28 @@ fn kill_tree_win_with_identity(root: u32, expected: Option<u64>) -> (GroupSignal
                         || child_ticks.is_none()
                         || creation_ticks_win(ppid) != parent_ticks)
                 {
+                    if child_ticks.is_none() && !excluded.contains(&pid) && !is_definitely_dead(pid)
+                    {
+                        captured.push((pid, None));
+                    }
                     continue;
                 }
                 if child_link_is_plausible(parent_ticks, child_ticks) {
                     tree.push(pid);
+                    if expected.is_some() && !excluded.contains(&pid) {
+                        captured.push((pid, child_ticks));
+                    }
                 }
             }
             if tree.len() == start_len {
                 break;
+            }
+        }
+        if expected.is_some() {
+            for &pid in &tree[before..] {
+                if !excluded.contains(&pid) {
+                    authorize_windows_member(pid, ticks.get(&pid).copied().flatten(), authorize)?;
+                }
             }
         }
         // Kill only the newly discovered stragglers (deepest-first isn't
@@ -1377,7 +2097,16 @@ fn kill_tree_win_with_identity(root: u32, expected: Option<u64>) -> (GroupSignal
         // to the known tree, but iterating in reverse discovery order costs
         // nothing and keeps the same "children before parents" spirit).
         for &pid in tree[before..].iter().rev() {
+            if excluded.contains(&pid) {
+                continue;
+            }
             if expected.is_some() {
+                if !eligible(pid) {
+                    continue;
+                }
+                if !authorize_windows_member(pid, ticks.get(&pid).copied().flatten(), authorize)? {
+                    continue;
+                }
                 if let Some(ticks) = ticks.get(&pid).copied().flatten() {
                     terminate_win_matching(pid, Some(ticks));
                 }
@@ -1387,12 +2116,71 @@ fn kill_tree_win_with_identity(root: u32, expected: Option<u64>) -> (GroupSignal
         }
     }
 
-    (GroupSignal::Sent, root_terminated)
+    Ok((GroupSignal::Sent, root_terminated))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_targets_reject_group_init_and_unrepresentable_pids() {
+        let invalid = [0, 1, i32::MAX as u32 + 1, u32::MAX];
+        for pid in invalid {
+            assert!(checked_pid(pid).is_err(), "pid {pid}");
+            // Signal zero: even a regressed guard would deliver nothing.
+            #[cfg(unix)]
+            {
+                assert!(signal_pid(pid, 0).is_err(), "pid {pid}");
+                assert!(signal_group(pid, 0).is_err(), "group {pid}");
+            }
+        }
+        assert_eq!(checked_pid(2), Ok(2));
+        assert_eq!(checked_pid(i32::MAX as u32), Ok(i32::MAX));
+    }
+
+    #[test]
+    fn captured_authorization_distinguishes_live_unreadable_from_exit_and_reuse() {
+        use std::cell::Cell;
+        let unreadable = KillError::Unconfirmed {
+            reason: "not signaled: identity unreadable".into(),
+            survivors: vec![42],
+        };
+        for (after, dead, expected) in [
+            (Some(7), false, Err(unreadable.clone())),
+            (Some(7), true, Ok(false)), // A zombie retains its creation time.
+            (None, true, Ok(false)),    // Reaped between listing and argv read.
+            (Some(8), false, Ok(false)), // Another process reused the PID.
+            (None, false, Err(unreadable.clone())), // No proof of death or reuse.
+        ] {
+            let authorized = Cell::new(false);
+            let result = authorize_captured(
+                42,
+                &7,
+                |_| if authorized.get() { after } else { Some(7) },
+                |_| authorized.get() && dead,
+                |_| {
+                    authorized.set(true);
+                    Err(unreadable.clone())
+                },
+            );
+            assert_eq!(result, expected, "after={after:?}, dead={dead}");
+        }
+        assert_eq!(
+            authorize_captured(42, &7, |_| Some(7), |_| false, |_| Ok(())),
+            Ok(true)
+        );
+        assert_eq!(
+            authorize_captured(
+                42,
+                &7,
+                |_| Some(8),
+                |_| false,
+                |_| panic!("a reused PID must never reach authorization")
+            ),
+            Ok(false)
+        );
+    }
 
     #[test]
     fn test_is_alive_current_process() {
@@ -1457,8 +2245,19 @@ mod tests {
     ))]
     #[test]
     fn test_is_definitely_dead_observes_an_unreaped_fixture() {
-        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read -r line"])
+            .env_clear()
+            .env("HOME", scratch.path())
+            .env("HCOM_DIR", scratch.path())
+            .env("TMPDIR", scratch.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         let pid = child.id();
+        let expected_identity = identity(pid).expect("live fixture identity");
+        drop(child.stdin.take());
         // SAFETY: waitid fills this writable siginfo buffer for our child.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         loop {
@@ -1482,11 +2281,13 @@ mod tests {
             }
         }
         // SAFETY: signal zero only queries this fixture's positive PID.
-        let kill_result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        let probe_pid = checked_pid(pid).expect("spawned child has a signalable PID");
+        let kill_result = unsafe { libc::kill(probe_pid, 0) };
         let dead_probe = is_definitely_dead(pid);
+        let zombie_identity = identity(pid);
         // Keep the kernel's raw reply while the zombie still exists.
         #[cfg(target_os = "macos")]
-        let native_reply = process_state_apple(pid as libc::pid_t);
+        let native_reply = process_state_apple(probe_pid);
         // Reap before asserting so even a failed probe leaves no zombie behind.
         child.wait().unwrap();
         assert_eq!(kill_result, 0, "an unreaped fixture still exists for kill0");
@@ -1503,6 +2304,11 @@ mod tests {
             native_reply.state
         );
         assert!(dead_probe, "an unreaped zombie is positively dead");
+        assert_eq!(
+            zombie_identity.as_deref(),
+            Some(expected_identity.as_str()),
+            "the unreaped PID must retain its receipt-verifiable start time"
+        );
     }
 
     #[test]

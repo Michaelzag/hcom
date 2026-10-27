@@ -906,10 +906,39 @@ fn handle_remote_kill(
     _config: &HcomConfig,
 ) -> Result<Value, String> {
     let target = required_param(params, "target")?;
-    let result = crate::commands::kill::kill_tracked_instance(db, target, initiated_by)?;
+    let result = match crate::commands::kill::kill_tracked_instance(db, target, initiated_by) {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(json!({
+                "target": target,
+                "ok": false,
+                "error": error.message,
+                "verified_kill": true,
+                "launcher_unverified": error.launcher_unverified,
+                "survivors": error.survivors,
+                "refusal": error.refusal,
+                "leftovers_terminated": null,
+                "excluded_caller": error.self_pid.map(|pid| json!({
+                    "pid": pid,
+                    "session_id": error.self_session,
+                    "count": error.self_excluded,
+                })),
+            }));
+        }
+    };
     Ok(json!({
         "target": result.target,
         "pid": result.pid,
+        "verified_kill": true,
+        "launcher_unverified": null,
+        "survivors": [],
+        "refusal": false,
+        "leftovers_terminated": result.leftovers_terminated,
+        "excluded_caller": result.self_pid.map(|pid| json!({
+            "pid": pid,
+            "session_id": result.self_session,
+            "count": result.self_excluded,
+        })),
         "kill_result": match result.kill_result {
             crate::terminal::KillResult::Sent => "sent",
             crate::terminal::KillResult::AlreadyDead => "already_dead",
