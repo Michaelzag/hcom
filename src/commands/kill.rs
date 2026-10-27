@@ -1065,23 +1065,22 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         return kill_all(&db, &hcom_dir, &initiator);
     }
 
+    let kill_target = |target: &str| match target.strip_prefix("tag:") {
+        Some(tag) => kill_by_tag(&db, &hcom_dir, tag, &initiator),
+        None => kill_single(&db, &hcom_dir, target, &initiator),
+    };
+    // One target's failure is the command's error, as before. With several
+    // targets, each one is reported independently and later ones still run.
+    if let [target] = targets.as_slice() {
+        return kill_target(target);
+    }
     let mut worst_exit = 0;
     for target in &targets {
-        let outcome = if let Some(tag) = target.strip_prefix("tag:") {
-            kill_by_tag(&db, &hcom_dir, tag, &initiator)
-        } else {
-            kill_single(&db, &hcom_dir, target, &initiator)
-        };
-        let exit = match outcome {
-            Ok(exit) => exit,
-            Err(error) => {
-                eprintln!("Error: {error}");
-                1
-            }
-        };
-        if exit > worst_exit {
-            worst_exit = exit;
-        }
+        let exit = kill_target(target).unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            1
+        });
+        worst_exit = worst_exit.max(exit);
     }
     Ok(worst_exit)
 }
