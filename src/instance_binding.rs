@@ -2868,6 +2868,23 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 
+    /// A database-only PID must never accidentally identify a host process.
+    fn impossible_pid(offset: u16) -> u32 {
+        #[cfg(target_os = "linux")]
+        let pid = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .expect("read kernel PID limit")
+            .trim()
+            .parse::<u32>()
+            .expect("parse kernel PID limit")
+            .checked_add(1 + u32::from(offset));
+        // Even at u16::MAX, these odd values remain above macOS's PID cap.
+        // Windows process IDs are multiples of four, so none can be live.
+        #[cfg(not(target_os = "linux"))]
+        let pid = Some(i32::MAX as u32 - 2 * u32::from(offset));
+        pid.filter(|pid| (2..=i32::MAX as u32).contains(pid))
+            .expect("impossible PID must be positive and fit pid_t")
+    }
+
     fn assert_released_session(db: &HcomDb, name: &str, sid: &str, cursor: i64, transcript: &str) {
         assert!(db.get_instance_full(name).unwrap().is_none());
         assert!(!db.has_session_binding(name));
@@ -3411,7 +3428,7 @@ mod tests {
         x_data.insert("tool".into(), serde_json::json!("omp"));
         x_data.insert("created_at".into(), serde_json::json!(now_epoch_i64()));
         x_data.insert("status".into(), serde_json::json!("listening"));
-        x_data.insert("pid".into(), serde_json::json!(4242));
+        x_data.insert("pid".into(), serde_json::json!(impossible_pid(0)));
         x_data.insert(
             "launch_context".into(),
             serde_json::json!(r#"{"pane_id":"p_9"}"#),
@@ -3538,7 +3555,7 @@ mod tests {
         );
         assert!(db.get_instance_full("xrow").unwrap().is_none());
         let yrow = db.get_instance_full("yrow").unwrap().unwrap();
-        assert_eq!(yrow.pid, Some(4242));
+        assert_eq!(yrow.pid, Some(i64::from(impossible_pid(0))));
         assert_eq!(yrow.launch_context.as_deref(), Some(r#"{"pane_id":"p_9"}"#));
 
         cleanup(path);
@@ -4227,7 +4244,7 @@ mod tests {
         mozi_data.insert("status_context".into(), serde_json::json!("new"));
         db.save_instance_named("mozi", &mozi_data).unwrap();
         db.set_process_binding("pid-oc", "", "mozi").unwrap();
-        db.update_instance_pid("mozi", 4242).unwrap();
+        db.update_instance_pid("mozi", impossible_pid(0)).unwrap();
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-99"}"#)
             .unwrap();
 
@@ -4238,7 +4255,7 @@ mod tests {
         // restored agent stays killable and its pane closeable.
         assert!(db.get_instance_full("mozi").unwrap().is_none());
         let fano = db.get_instance_full("fano").unwrap().unwrap();
-        assert_eq!(fano.pid, Some(4242));
+        assert_eq!(fano.pid, Some(i64::from(impossible_pid(0))));
         assert!(
             fano.launch_context
                 .as_deref()
@@ -4284,7 +4301,7 @@ mod tests {
         mozi_data.insert("status_context".into(), serde_json::json!("start"));
         db.save_instance_named("mozi", &mozi_data).unwrap();
         db.set_process_binding("pid-oc-ready", "", "mozi").unwrap();
-        db.update_instance_pid("mozi", 4343).unwrap();
+        db.update_instance_pid("mozi", impossible_pid(0)).unwrap();
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-101"}"#)
             .unwrap();
 
@@ -4293,7 +4310,7 @@ mod tests {
 
         assert!(db.get_instance_full("mozi").unwrap().is_none());
         let fano = db.get_instance_full("fano").unwrap().unwrap();
-        assert_eq!(fano.pid, Some(4343));
+        assert_eq!(fano.pid, Some(i64::from(impossible_pid(0))));
         assert!(
             fano.launch_context
                 .as_deref()
