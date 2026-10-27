@@ -1,0 +1,341 @@
+name: Kill106qualification
+
+on:
+  push:
+    branches: [ci/kill-106-qual]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Diagnostic capture or complete qualification"
+        type: choice
+        options: [diagnostic, qualify]
+        required: true
+        default: diagnostic
+      repeat:
+        description: "Times to repeat each real-tool test (stops at first failure)"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  rust-tests:
+    if: ${{ inputs.mode == 'qualify' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # Keep lint behavior reproducible across fresh runners and local installs.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  msrv:
+    if: ${{ inputs.mode == 'qualify' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.88
+        with:
+          toolchain: "1.88"
+      - run: cargo check --locked --all-targets
+
+  # Native Windows test gate. Release artifacts are built and published to
+  # artifact-cdn by the host-side release builder, not by CI; the pinned
+  # real-tool lifecycle has its own matrix below.
+  windows-build:
+    if: ${{ inputs.mode == 'qualify' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # Keep lint behavior reproducible across fresh runners and local installs.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+      - run: npm install --global bun@1.4.4
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --all-targets --locked
+
+  # Native kernel argv and CLI authorization proof, not Linux parser fixtures.
+  omp-owner-native:
+    if: ${{ inputs.mode == 'qualify' }}
+    name: OMP owner native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
+        with:
+          toolchain: "1.97.1"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+      - run: npm install --global bun@1.4.4
+      - if: runner.os == 'macOS'
+        run: cargo test --locked --bin hcom sys::process -- --nocapture --test-threads=1
+      - if: runner.os == 'Windows'
+        run: cargo test --locked --bin hcom native_windows_launch_pin_ -- --nocapture --test-threads=1
+      - shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --bin hcom native_headless_ -- --nocapture --test-threads=1 | tee native-headless.log
+          node --input-type=commonjs <<'NODE'
+          const { readFileSync } = require('node:fs');
+          const log = readFileSync('native-headless.log', 'utf8');
+          const summaries = [...log.matchAll(/^test result: ok\. (\d+) passed; 0 failed;/gm)];
+          const passed = summaries.length === 1 ? Number(summaries[0][1]) : 0;
+          if (summaries.length !== 1 || !Number.isSafeInteger(passed) || passed <= 0) {
+            console.error('Expected exactly one passing native_headless_ summary with a nonzero test count.');
+            process.exit(1);
+          }
+          console.log(`native_headless_ actual passed=${passed} os=${process.env.RUNNER_OS}`);
+          NODE
+      - run: cargo test --locked --test omp_native_owner -- --nocapture --test-threads=1
+      - run: cargo test --locked --test kill_owner -- --nocapture --test-threads=1
+
+  typecheck:
+    if: ${{ inputs.mode == 'qualify' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+      - run: bash ./scripts/typecheck.sh
+      - run: npm test
+
+  real-tool-tests:
+    if: ${{ inputs.mode == 'qualify' }}
+    name: Real tool (${{ matrix.tool }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # One pass fits well inside 25 minutes. A `repeat` hunt takes as long as the
+    # count asks for, so it gets the platform maximum instead — the loop stops at
+    # the first failure anyway, and expressions have no arithmetic to scale this
+    # by the count.
+    timeout-minutes: ${{ inputs.repeat && 350 || 25 }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            tool: codex
+            package: "@openai/codex@0.145.0"
+            test: real_tool_codex
+          - os: ubuntu-latest
+            tool: claude
+            package: "@anthropic-ai/claude-code@2.1.216"
+            test: real_tool_claude
+          - os: ubuntu-latest
+            tool: relay
+            package: "@anthropic-ai/claude-code@2.1.216"
+            test: test_relay_roundtrip
+          - os: windows-latest
+            tool: codex
+            package: "@openai/codex@0.145.0"
+            test: real_tool_codex
+          - os: windows-latest
+            tool: claude
+            package: "@anthropic-ai/claude-code@2.1.216"
+            test: real_tool_claude
+          - os: windows-latest
+            tool: relay
+            package: "@anthropic-ai/claude-code@2.1.216"
+            test: test_relay_roundtrip
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
+        with:
+          toolchain: "1.97.1"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+      - name: Configure Codex Linux sandbox
+        if: runner.os == 'Linux' && matrix.tool == 'codex'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap apparmor-profiles apparmor-utils
+          sudo install -m 0644 \
+            /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+            /etc/apparmor.d/bwrap-userns-restrict
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+      - name: Install pinned tool (Unix)
+        if: runner.os != 'Windows'
+        run: ./scripts/install-mock-tools.sh '${{ matrix.package }}'
+      - name: Add pinned tool to PATH (Unix)
+        if: runner.os != 'Windows'
+        run: echo "$PWD/target/mock-tools/bin" >> "$GITHUB_PATH"
+      - name: Verify Codex Linux sandbox
+        if: runner.os == 'Linux' && matrix.tool == 'codex'
+        run: codex sandbox -- /bin/true
+      - name: Install pinned tool (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/install-mock-tools.ps1 '${{ matrix.package }}'
+      - name: Add pinned tool to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: (Resolve-Path target/mock-tools).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      # Record exit code and elapsed time per attempt, and close the log group
+      # before failing. A cargo run that dies producing no output at all is
+      # otherwise indistinguishable from one that never started — a repeat hunt
+      # hit exactly that (instant exit 1, empty group, no annotation), and the
+      # per-attempt line is what separates "the test failed" from "something
+      # took the runner out from under it".
+      - shell: bash
+        if: runner.os != 'Windows'
+        run: |
+          for i in $(seq 1 "${{ inputs.repeat || 1 }}"); do
+            echo "::group::${{ matrix.test }} attempt $i"
+            start=$SECONDS
+            if cargo test --locked --test '${{ matrix.test }}' -- --ignored --nocapture --test-threads=1; then
+              code=0
+            else
+              code=$?
+            fi
+            elapsed=$((SECONDS - start))
+            echo "attempt $i: exit=$code elapsed=${elapsed}s"
+            echo "::endgroup::"
+            if [ "$code" -ne 0 ]; then
+              echo "::error::${{ matrix.test }} failed on attempt $i (exit $code after ${elapsed}s)"
+              exit "$code"
+            fi
+          done
+      - shell: pwsh
+        if: runner.os == 'Windows'
+        run: |
+          foreach ($i in 1..${{ inputs.repeat || 1 }}) {
+            Write-Host "::group::${{ matrix.test }} attempt $i"
+            $started = Get-Date
+            cargo test --locked --test '${{ matrix.test }}' -- --ignored --nocapture --test-threads=1
+            $code = $LASTEXITCODE
+            $elapsed = [int]((Get-Date) - $started).TotalSeconds
+            Write-Host "attempt ${i}: exit=$code elapsed=${elapsed}s"
+            Write-Host "::endgroup::"
+            if ($code -ne 0) {
+              Write-Host "::error::${{ matrix.test }} failed on attempt $i (exit $code after ${elapsed}s)"
+              exit $code
+            }
+          }
+
+  diagnostic:
+    if: ${{ (inputs.mode || 'diagnostic') == 'diagnostic' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
+        with:
+          toolchain: "1.97.1"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+      - run: npm install --global bun@1.4.4
+      # The helper isolates HOME/HCOMDIR/TMPDIR under RUNNER_TEMP, strips
+      # inherited HCOM_* fields, and retains the first quiet-session evidence.
+      # One quiet pass is followed by 20 more; the first failure exits nonzero.
+      - run: python .github/scripts/hcom106-ci-qualification.py diagnostic
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      - name: Preserve diagnostic logs and first-session evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # primary refs/tags/v4
+        with:
+          name: kill106-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/hcom106-qualification/diagnostic/
+            ${{ runner.temp }}/hcom106-watchdog-diagnostics/
+
+  owner20:
+    if: ${{ inputs.mode == 'qualify' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
+        with:
+          toolchain: "1.97.1"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+      - run: npm install --global bun@1.4.4
+      # The helper runs the FULL kill_owner target 20 consecutive times
+      # and saves each run's actual test count and raw output.
+      - run: python .github/scripts/hcom106-ci-qualification.py owner20
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      - name: Preserve 20 consecutive FULL kill_owner run outputs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # primary refs/tags/v4
+        with:
+          name: kill106-owner20-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/hcom106-qualification/owner20/
+            ${{ runner.temp }}/hcom106-watchdog-diagnostics/
+
+  ancestor50:
+    if: ${{ inputs.mode == 'qualify' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # 1.97.1
+        with:
+          toolchain: "1.97.1"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+      - run: npm install --global bun@1.4.4
+      # The helper records source SHA, commands, per-target counts, raw
+      # outputs, and concurrent full-suite execution proof for all 50 repeats.
+      - run: python .github/scripts/hcom106-ci-qualification.py ancestor50
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      - name: Preserve ancestor stress outputs and concurrent execution proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # primary refs/tags/v4
+        with:
+          name: kill106-ancestor50-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/hcom106-qualification/ancestor50/
+            ${{ runner.temp }}/hcom106-watchdog-diagnostics/
