@@ -3021,13 +3021,29 @@ mod tests {
     fn a_late_refusal_reports_the_final_survivors_not_an_instant_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("trapped");
-        // T delays its exit a second after its SIGTERM; the root itself
-        // ignores TERM and forks a sleeper every 50ms.
+        let gate = dir.path().join("gate");
+        let program = dir.path().join("trapped.py");
+        // T traps SIGTERM and then waits for the gate before it exits, so it
+        // is certainly alive when the refusal comes and certainly gone after
+        // the test opens the gate. The root ignores TERM and keeps forking.
+        std::fs::write(
+            &program,
+            "import os, signal, sys, time\n\
+             gate, pidfile = sys.argv[1], sys.argv[2]\n\
+             def on_term(*_):\n\
+             \x20   while not os.path.exists(gate):\n\
+             \x20       time.sleep(0.01)\n\
+             \x20   sys.exit(0)\n\
+             signal.signal(signal.SIGTERM, on_term)\n\
+             open(pidfile, 'w').write(str(os.getpid()))\n\
+             time.sleep(30)\n",
+        )
+        .unwrap();
         let script = format!(
-            "trap '' TERM; python3 -c 'import os, signal, sys, time; \
-             signal.signal(signal.SIGTERM, lambda *_: (time.sleep(1), sys.exit(0))); \
-             open(\"{}\", \"w\").write(str(os.getpid())); time.sleep(30)' & \
+            "trap '' TERM; python3 '{}' '{}' '{}' & \
              while :; do sleep 30 & sleep 0.05; done",
+            program.display(),
+            gate.display(),
             pidfile.display()
         );
         let leader = spawn(&script, 0);
@@ -3071,6 +3087,9 @@ mod tests {
                 cutoff.set(Some(limit));
                 match start_of(pid) {
                     Some(start) if start > limit => {
+                        // Only now may T finish exiting: it outlives the
+                        // refusal, and is gone long before the deadline.
+                        std::fs::write(&gate, b"").unwrap();
                         Err(KillError::Refused(format!("{pid} is foreign")))
                     }
                     _ => Ok(()),
@@ -3081,8 +3100,8 @@ mod tests {
             panic!("expected an unconfirmed kill, got {result:?}");
         };
         assert!(reason.contains("is foreign"), "{reason}");
-        // T was still exiting when the refusal came; the report is taken at
-        // the deadline, when T is long gone.
+        // T was alive when the refusal came (it waited on the gate the
+        // refusal opened); the report is taken at the deadline, when T is gone.
         assert!(!survivors.contains(&trapped), "{survivors:?}");
         assert_ne!(start_of(trapped), Some(trapped_start), "T survived");
         drop(fixture);
@@ -3093,14 +3112,19 @@ mod tests {
         // The child's main thread exits alone (SYS_exit, not exit_group)
         // while a second thread sleeps: its leader reads Z, it is alive. It
         // runs in its own session, so only a per-PID signal reaches it.
-        // It is pinned well before its leader exits: a leader that has
-        // released its memory has no readable marker any more.
+        // The leader thread waits on a gate the test opens only once the
+        // process is pinned and proven: a leader that has exited has
+        // released its memory, and with it its readable marker.
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
         let token = marker("zombie-leader");
         let leader = spawn_marked(
             &format!(
-                "setsid python3 -c 'import ctypes, threading, time; \
+                "setsid python3 -c 'import ctypes, os, threading, time; \
                  threading.Thread(target=time.sleep, args=(30,), daemon=True).start(); \
-                 time.sleep(0.5); ctypes.CDLL(None).syscall({}, 0)' & wait",
+                 [time.sleep(0.01) for _ in iter(lambda: os.path.exists(\"{}\"), True)]; \
+                 ctypes.CDLL(None).syscall({}, 0)' & wait",
+                gate.display(),
                 libc::SYS_exit
             ),
             0,
@@ -3115,6 +3139,7 @@ mod tests {
         let child = tree.iter().find(|member| member.pid != root).unwrap();
         let stray = Stray(Pinned::pin(child.pid, child.start, &token));
         let child = child.pid;
+        std::fs::write(&gate, b"").unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let thread = loop {
             let leader_state = std::fs::read_to_string(format!("/proc/{child}/stat"))
