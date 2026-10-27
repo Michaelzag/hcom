@@ -12,14 +12,20 @@ fn terminal_ownership_case(
     helper_pane: Option<&str>,
     silent: bool,
 ) -> (bool, String) {
-    let (pane_closed, marker) =
-        terminal_ownership_case_with_kill(target, pane, opened_as, helper_pane, silent, |db, name| {
+    let (pane_closed, marker) = terminal_ownership_case_with_kill(
+        target,
+        pane,
+        opened_as,
+        helper_pane,
+        silent,
+        |db, name| {
             let row = db.get_instance_full(name).unwrap().unwrap();
             let owner = crate::proctruth::verify_kill_owner(2_000_000_000, None, &[]).unwrap();
             let (_, pane_closed, _, _, _) =
                 kill_instance(db, name, &owner, &row, false, &[], &[]).unwrap();
             pane_closed
-        });
+        },
+    );
     (pane_closed, marker.unwrap_or_default())
 }
 
@@ -275,7 +281,10 @@ fn kill_gone_owner_closes_its_owned_pane() {
             assert_killed_by(db, name, "test");
             result.pane_closed
         });
-    assert!(closed, "the confirmed-Gone command path closes its owned pane");
+    assert!(
+        closed,
+        "the confirmed-Gone command path closes its owned pane"
+    );
     assert_eq!(marker.as_deref(), Some(pane.as_str()));
 }
 
@@ -310,8 +319,8 @@ fn kill_zombie_owner_closes_its_owned_pane_after_confirmation() {
                 |_, _, _| Ok(()),
             );
             owner.wait().unwrap();
-            let result =
-                result.unwrap_or_else(|error| panic!("confirmed-zombie kill must succeed: {error}"));
+            let result = result
+                .unwrap_or_else(|error| panic!("confirmed-zombie kill must succeed: {error}"));
             assert_eq!(result.kill_result, terminal::KillResult::AlreadyDead);
             assert_eq!(result.leftovers_terminated, Some(0));
             assert_eq!(result.teardown, TeardownOutcome::Completed);
@@ -323,7 +332,10 @@ fn kill_zombie_owner_closes_its_owned_pane_after_confirmation() {
             assert_killed_by(db, name, "test");
             result.pane_closed
         });
-    assert!(closed, "the confirmed-zombie command path closes its owned pane");
+    assert!(
+        closed,
+        "the confirmed-zombie command path closes its owned pane"
+    );
     assert_eq!(marker.as_deref(), Some(pane.as_str()));
 }
 
@@ -782,7 +794,10 @@ fn kill_reaps_name_tree_outside_recorded_pid() {
         crate::sys::process::is_alive(bpid),
         "different-named sleeper survives"
     );
-    let unbound_alive = unbound.try_wait().expect("try_wait unbound carrier").is_none();
+    let unbound_alive = unbound
+        .try_wait()
+        .expect("try_wait unbound carrier")
+        .is_none();
     unbound.kill().ok();
     unbound.wait().ok();
     bystander.kill().ok();
@@ -855,13 +870,7 @@ fn kill_self_path_reaps_before_release_and_spares_self() {
     let kill_name = name.clone();
     let killer = std::thread::spawn(move || {
         let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
-        kill_tracked_instance_with_self_pids(
-            &db,
-            &kill_name,
-            "test",
-            &self_set,
-            |_, _, _| Ok(()),
-        )
+        kill_tracked_instance_with_self_pids(&db, &kill_name, "test", &self_set, |_, _, _| Ok(()))
     });
 
     // Invariant poll on a second connection: the release must never be
@@ -968,13 +977,9 @@ fn kill_self_path_fails_closed_on_non_self_survivors() {
     wait_for_enumerated(&name, survivor_pid);
 
     let excluded = vec![std::process::id(), owner_pid];
-    let err = kill_tracked_instance_with_self_pids(
-        &db,
-        &name,
-        "test",
-        &excluded,
-        |_, _, _| Err(crate::proctruth::ReapError::Survivors(vec![survivor_pid])),
-    )
+    let err = kill_tracked_instance_with_self_pids(&db, &name, "test", &excluded, |_, _, _| {
+        Err(crate::proctruth::ReapError::Survivors(vec![survivor_pid]))
+    })
     .err()
     .expect("a non-self survivor must fail the kill")
     .to_string();
@@ -1049,7 +1054,7 @@ fn kill_foreign_path_reaps_tree_before_release() {
     let self_set = vec![std::process::id()];
     let result =
         kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |_, _, _| Ok(()))
-        .unwrap_or_else(|e| panic!("foreign kill must succeed: {e}"));
+            .unwrap_or_else(|e| panic!("foreign kill must succeed: {e}"));
     assert_eq!(result.self_excluded, 0, "no self overlap, no self report");
     sleeper.wait().ok();
     assert!(
@@ -1103,25 +1108,19 @@ fn kill_skips_teardown_when_row_rebound_mid_kill() {
     wait_for_enumerated(&name, old_pid);
 
     let excluded = vec![std::process::id()];
-    let result = kill_tracked_instance_with_self_pids(
-        &db,
-        &name,
-        "test",
-        &excluded,
-        |n, _, _| {
-            // Rebind after owner verification: same name, new binding
-            // epoch (the `start --as` shape).
-            db.conn()
-                .execute(
-                    "DELETE FROM process_bindings WHERE instance_name = ?1",
-                    rusqlite::params![n],
-                )
-                .unwrap();
-            db.set_process_binding("proc-kill-rb-new", "sess-kill-rb-new", n)
-                .unwrap();
-            Ok(())
-        },
-    )
+    let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &excluded, |n, _, _| {
+        // Rebind after owner verification: same name, new binding
+        // epoch (the `start --as` shape).
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?1",
+                rusqlite::params![n],
+            )
+            .unwrap();
+        db.set_process_binding("proc-kill-rb-new", "sess-kill-rb-new", n)
+            .unwrap();
+        Ok(())
+    })
     .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
 
     old_sleeper.wait().ok();
@@ -1218,19 +1217,18 @@ fn kill_skips_teardown_when_session_rebinds_without_bindings() {
     // Name-only incarnation: no bindings at all, before or after.
 
     let self_set = vec![std::process::id()];
-    let result =
-        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
-            // The name-only rebind: bindings stay empty, the session
-            // changes.
-            db.conn()
-                .execute(
-                    "UPDATE instances SET session_id = 'sess-rebound' WHERE name = ?1",
-                    rusqlite::params![n],
-                )
-                .unwrap();
-            Ok(())
-        })
-        .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
+    let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
+        // The name-only rebind: bindings stay empty, the session
+        // changes.
+        db.conn()
+            .execute(
+                "UPDATE instances SET session_id = 'sess-rebound' WHERE name = ?1",
+                rusqlite::params![n],
+            )
+            .unwrap();
+        Ok(())
+    })
+    .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
 
     assert_eq!(result.teardown, TeardownOutcome::RowReRegistered);
     let row = db
@@ -1300,13 +1298,12 @@ fn kill_owns_teardown_when_harness_soft_finalizes_mid_kill() {
     let spid = sleeper.id();
 
     let self_set = vec![std::process::id()];
-    let result =
-        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
-            // The harness's own shutdown hook runs while the kill holds its claim.
-            crate::hooks::common::soft_finalize_session(&db, n, "shutdown", None, false);
-            Ok(())
-        })
-        .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
+    let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
+        // The harness's own shutdown hook runs while the kill holds its claim.
+        crate::hooks::common::soft_finalize_session(&db, n, "shutdown", None, false);
+        Ok(())
+    })
+    .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
 
     sleeper.wait().ok();
     assert_eq!(result.teardown, TeardownOutcome::Completed);
@@ -1332,16 +1329,15 @@ fn kill_owns_teardown_when_harness_finalizes_row_mid_kill() {
     let spid = sleeper.id();
 
     let self_set = vec![std::process::id()];
-    let result =
-        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
-            // The harness's own SessionEnd runs while the kill holds its claim.
-            assert_eq!(
-                crate::hooks::common::finalize_session(&db, n, "shutdown", None),
-                StopOutcome::AlreadyStopped
-            );
-            Ok(())
-        })
-        .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
+    let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
+        // The harness's own SessionEnd runs while the kill holds its claim.
+        assert_eq!(
+            crate::hooks::common::finalize_session(&db, n, "shutdown", None),
+            StopOutcome::AlreadyStopped
+        );
+        Ok(())
+    })
+    .unwrap_or_else(|e| panic!("a session self-stop is not a kill failure: {e}"));
 
     sleeper.wait().ok();
     assert_eq!(result.teardown, TeardownOutcome::Completed);
@@ -1553,28 +1549,27 @@ fn kill_reports_re_registration_when_row_rebinds_after_session_self_stop() {
     let mut sleeper = seed_bound_row_with_sleeper(&db, &name, "proc-kill-sr-old", "sess-kill-sr");
 
     let self_set = vec![std::process::id()];
-    let result =
-        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
-            db.log_life_event(
-                n,
-                "stopped",
-                "pty",
-                "killed",
-                None,
-                Some("proc-kill-sr-old"),
+    let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, |n, _, _| {
+        db.log_life_event(
+            n,
+            "stopped",
+            "pty",
+            "killed",
+            None,
+            Some("proc-kill-sr-old"),
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM process_bindings WHERE instance_name = ?",
+                rusqlite::params![n],
             )
             .unwrap();
-            db.conn()
-                .execute(
-                    "DELETE FROM process_bindings WHERE instance_name = ?",
-                    rusqlite::params![n],
-                )
-                .unwrap();
-            db.set_process_binding("proc-kill-sr-new", "sess-kill-sr", n)
-                .unwrap();
-            Ok(())
-        })
-        .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
+        db.set_process_binding("proc-kill-sr-new", "sess-kill-sr", n)
+            .unwrap();
+        Ok(())
+    })
+    .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
 
     sleeper.wait().ok();
     assert_eq!(result.teardown, TeardownOutcome::RowReRegistered);
@@ -1602,12 +1597,11 @@ fn kill_mid_pty_exit(
     let spid = sleeper.id();
     let mut wrapper_db = crate::db::HcomDb::open_raw(db_path).unwrap();
     let self_set = vec![std::process::id()];
-    let result =
-        kill_tracked_instance_with_self_pids(&db, name, "test", &self_set, |n, _, _| {
-            exit(&mut wrapper_db, n);
-            Ok(())
-        })
-        .unwrap_or_else(|e| panic!("a PTY exit is not a kill failure: {e}"));
+    let result = kill_tracked_instance_with_self_pids(&db, name, "test", &self_set, |n, _, _| {
+        exit(&mut wrapper_db, n);
+        Ok(())
+    })
+    .unwrap_or_else(|e| panic!("a PTY exit is not a kill failure: {e}"));
     sleeper.wait().ok();
     assert!(!crate::sys::process::is_alive(spid), "sleeper reaped");
     result.teardown
@@ -2585,20 +2579,15 @@ fn kill_teardown_skips_when_rebind_commits_in_the_former_check_use_gap() {
     });
 
     let self_set = vec![std::process::id()];
-    let result = kill_tracked_instance_with_self_pids(
-        &db,
-        &name,
-        "test",
-        &self_set,
-        move |_n, _b, _e| {
+    let result =
+        kill_tracked_instance_with_self_pids(&db, &name, "test", &self_set, move |_n, _b, _e| {
             // Trigger the concurrent rebind from inside the termination seam
             // and wait until it HOLDS the write lock: it now owns the
             // write path until well past where the old comparison ran.
             locked_rx.recv().unwrap();
             Ok(())
-        },
-    )
-    .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
+        })
+        .unwrap_or_else(|e| panic!("a rebind is not a kill failure: {e}"));
     rebinder
         .join()
         .expect("rebind thread")
