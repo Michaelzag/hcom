@@ -499,11 +499,12 @@ pub(super) fn start_delivery_thread(
 /// The shutdown trigger only fires after the child has already exited — `run()`
 /// flips `running` false only once the reader has hit EOF and been joined — so
 /// there is no live child left to inject into and the delivery loop's `while
-/// running` body runs zero iterations (its `register_notify_port` never runs).
-/// This final start therefore exists so init-time registration (DB open, notify
-/// server, inject-port registration) and the loop's post-loop cleanup get a
-/// chance to run and settle the final DB status, not to hand an in-flight `hcom
-/// deliver` a live consumer.
+/// running` body runs zero iterations (no heartbeat endpoint refresh runs).
+/// This final start lets initialization open the DB, create the notify server,
+/// and attempt the atomic, ownership-fenced endpoint pair before post-loop
+/// cleanup settles the final DB status. A completed initialization failure is
+/// retryable; a pending thread must not be retried. This does not give an
+/// in-flight `hcom deliver` a live consumer.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn should_start_delivery(
     ready: bool,
