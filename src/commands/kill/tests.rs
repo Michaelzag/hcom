@@ -1215,9 +1215,24 @@ fn owner_refusal_without_a_foreign_binding_keeps_the_generic_message() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    db.update_instance_pid(&name, pid).unwrap();
+    // Raw column write: the receipt-minting pid writers would record this
+    // child's identity and let the owner gate accept it.
+    db.conn()
+        .execute(
+            "UPDATE instances SET pid = ?1 WHERE name = ?2",
+            rusqlite::params![i64::from(pid), &name],
+        )
+        .unwrap();
     let bindings = db.process_binding_ids(&name).unwrap();
     let original_row = db.get_instance_full(&name).unwrap().unwrap();
+    assert_eq!(original_row.pid, Some(i64::from(pid)));
+    assert!(
+        !original_row
+            .launch_context
+            .as_deref()
+            .is_some_and(|context| context.contains("omp_launch_pid")),
+        "the fixture must carry no identity receipt"
+    );
     let reached = std::cell::Cell::new(false);
     let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &[pid], |_, _, _| {
         reached.set(true);
