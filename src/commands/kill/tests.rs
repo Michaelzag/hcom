@@ -12,7 +12,28 @@ fn terminal_ownership_case(
     helper_pane: Option<&str>,
     silent: bool,
 ) -> (bool, String) {
+    let (pane_closed, marker) =
+        terminal_ownership_case_with_kill(target, pane, opened_as, helper_pane, silent, |db, name| {
+            let row = db.get_instance_full(name).unwrap().unwrap();
+            let owner = crate::proctruth::verify_kill_owner(2_000_000_000, None, &[]).unwrap();
+            let (_, pane_closed, _, _, _) =
+                kill_instance(db, name, &owner, &row, false, &[], &[]).unwrap();
+            pane_closed
+        });
+    (pane_closed, marker.unwrap_or_default())
+}
+
+#[cfg(unix)]
+fn terminal_ownership_case_with_kill(
+    target: &str,
+    pane: &str,
+    opened_as: Option<&str>,
+    helper_pane: Option<&str>,
+    silent: bool,
+    kill: impl FnOnce(&HcomDb, &str) -> bool,
+) -> (bool, Option<String>) {
     use std::collections::HashMap;
+    let process_id = format!("launch-nonce-{target}");
     let scratch = tempfile::tempdir().unwrap();
     let open = scratch.path().join("open.sh");
     let close = scratch.path().join("close.sh");
@@ -28,7 +49,7 @@ fn terminal_ownership_case(
     )
     .unwrap();
     let config = format!(
-        "[terminal]\nactive = 'gnomeseat'\n[terminal.presets.gnomeseat]\nopen = 'sh {} {{instance_name}} {{cwd}} {{script}}'\nclose = 'sh {} {{pane_id}}'\nbinary = 'sh'\npane_id_env = 'GNOME_SEAT_UNIT'\n",
+        "[relay]\nenabled = false\n[terminal]\nactive = 'gnomeseat'\n[terminal.presets.gnomeseat]\nopen = 'sh {} {{instance_name}} {{cwd}} {{script}}'\nclose = 'sh {} {{pane_id}}'\nbinary = 'sh'\npane_id_env = 'GNOME_SEAT_UNIT'\n",
         open.display(),
         close.display()
     );
@@ -38,7 +59,7 @@ fn terminal_ownership_case(
     if let Some(name) = opened_as {
         let env = HashMap::from([
             ("HCOM_INSTANCE_NAME".to_string(), name.to_string()),
-            ("HCOM_PROCESS_ID".to_string(), "launch-nonce".to_string()),
+            ("HCOM_PROCESS_ID".to_string(), process_id.clone()),
         ]);
         let (result, _) = terminal::launch_terminal(
             ":",
@@ -62,7 +83,7 @@ fn terminal_ownership_case(
         // instance identity: same nonce, no tool instance being launched.
         let env = HashMap::from([
             ("HCOM_INSTANCE_NAME".to_string(), "bura".to_string()),
-            ("HCOM_PROCESS_ID".to_string(), "launch-nonce".to_string()),
+            ("HCOM_PROCESS_ID".to_string(), process_id.clone()),
         ]);
         let (result, _) = terminal::launch_terminal(
             ":",
@@ -81,7 +102,7 @@ fn terminal_ownership_case(
     let saved: Vec<_> = [
         ("HCOM_LAUNCHED_PRESET", "gnomeseat"),
         ("GNOME_SEAT_UNIT", pane),
-        ("HCOM_PROCESS_ID", "launch-nonce"),
+        ("HCOM_PROCESS_ID", process_id.as_str()),
     ]
     .into_iter()
     .map(|(key, value)| {
@@ -109,13 +130,52 @@ fn terminal_ownership_case(
             }
         }
     }
-    let row = db.get_instance_full(target).unwrap().unwrap();
-    let owner = crate::proctruth::verify_kill_owner(2_000_000_000, None, &[]).unwrap();
-    let (_, pane_closed, _, _, _) = kill_instance(&db, target, &owner, &row, false, &[], &[]).unwrap();
-    (
-        pane_closed,
-        std::fs::read_to_string(closed).unwrap_or_default(),
-    )
+    let pane_closed = kill(&db, target);
+    let marker = match std::fs::read_to_string(closed) {
+        Ok(marker) => Some(marker),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read pane-close marker: {error}"),
+    };
+    (pane_closed, marker)
+}
+
+#[cfg(unix)]
+fn spawn_bound_pane_owner(db: &HcomDb, name: &str) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+
+    // Like the bound-sleeper fixtures, this shell stands in for a non-OMP
+    // tool: these tests cover pane cleanup, not launcher/root discovery.
+
+    let process_id = format!("launch-nonce-{name}");
+    db.set_process_binding(&process_id, "sess-owned-pane", name)
+        .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE instances SET tool = 'codex', status = 'active', \
+             session_id = 'sess-owned-pane' WHERE name = ?",
+            rusqlite::params![name],
+        )
+        .unwrap();
+    let mut command = std::process::Command::new("sh");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("HCOM_") {
+            command.env_remove(key);
+        }
+    }
+    let owner = command
+        .args(["-c", "read -r _"])
+        .process_group(0)
+        .env("HCOM_DIR", std::env::var_os("HCOM_DIR").unwrap())
+        .env("HCOM_INSTANCE_NAME", name)
+        .env("HCOM_PROCESS_ID", &process_id)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn owned-pane process");
+    db.update_instance_pid(name, owner.id()).unwrap();
+    wait_for_enumerated(name, owner.id());
+    owner
 }
 
 #[cfg(unix)]
@@ -177,6 +237,151 @@ fn terminal_ownership_without_launch_closes_nothing() {
     let (closed, log) = terminal_ownership_case("bura", "", None, None, false);
     assert!(!closed);
     assert_eq!(log, "");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn kill_gone_owner_closes_its_owned_pane() {
+    let name = format!("hcom-pane-gone-{}", std::process::id());
+    let pane = format!("gnome-terminal-seat-{name}");
+    let (closed, marker) =
+        terminal_ownership_case_with_kill(&name, &pane, Some(&name), None, false, |db, name| {
+            let mut owner = spawn_bound_pane_owner(db, name);
+            let pid = owner.id();
+            drop(owner.stdin.take());
+            owner.wait().unwrap();
+            assert!(crate::sys::process::is_definitely_dead(pid));
+
+            let (row, bindings, watermark) = ResolvedIncarnation::read(db, name).unwrap();
+            let result = kill_resolved_instance(
+                db,
+                &row.unwrap(),
+                &bindings,
+                watermark,
+                "test",
+                Some(&[std::process::id()]),
+                |_, _, _| Ok(()),
+            )
+            .unwrap_or_else(|error| panic!("confirmed-Gone kill must succeed: {error}"));
+            assert_eq!(result.kill_result, terminal::KillResult::AlreadyDead);
+            assert_eq!(result.leftovers_terminated, None);
+            assert_eq!(result.teardown, TeardownOutcome::Completed);
+            assert!(result.pane_retry_command.is_none());
+            assert_eq!(result.preset_name, "gnomeseat");
+            assert_eq!(result.pane_id, pane);
+            assert!(db.get_instance_full(name).unwrap().is_none());
+            assert!(db.process_binding_ids(name).unwrap().is_empty());
+            assert_killed_by(db, name, "test");
+            result.pane_closed
+        });
+    assert!(closed, "the confirmed-Gone command path closes its owned pane");
+    assert_eq!(marker.as_deref(), Some(pane.as_str()));
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+#[serial]
+fn kill_zombie_owner_closes_its_owned_pane_after_confirmation() {
+    let name = format!("hcom-pane-zombie-{}", std::process::id());
+    let pane = format!("gnome-terminal-seat-{name}");
+    let (closed, marker) =
+        terminal_ownership_case_with_kill(&name, &pane, Some(&name), None, false, |db, name| {
+            let mut owner = spawn_bound_pane_owner(db, name);
+            let pid = owner.id();
+            drop(owner.stdin.take());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !crate::sys::process::is_zombie_group_leader(pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned-pane process never became an unreaped zombie group leader"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            let (row, bindings, watermark) = ResolvedIncarnation::read(db, name).unwrap();
+            let result = kill_resolved_instance(
+                db,
+                &row.unwrap(),
+                &bindings,
+                watermark,
+                "test",
+                Some(&[std::process::id()]),
+                |_, _, _| Ok(()),
+            );
+            owner.wait().unwrap();
+            let result =
+                result.unwrap_or_else(|error| panic!("confirmed-zombie kill must succeed: {error}"));
+            assert_eq!(result.kill_result, terminal::KillResult::AlreadyDead);
+            assert_eq!(result.leftovers_terminated, Some(0));
+            assert_eq!(result.teardown, TeardownOutcome::Completed);
+            assert!(result.pane_retry_command.is_none());
+            assert_eq!(result.preset_name, "gnomeseat");
+            assert_eq!(result.pane_id, pane);
+            assert!(db.get_instance_full(name).unwrap().is_none());
+            assert!(db.process_binding_ids(name).unwrap().is_empty());
+            assert_killed_by(db, name, "test");
+            result.pane_closed
+        });
+    assert!(closed, "the confirmed-zombie command path closes its owned pane");
+    assert_eq!(marker.as_deref(), Some(pane.as_str()));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn kill_self_exclusion_leaves_its_owned_pane_open_by_design() {
+    let name = format!("hcom-pane-self-{}", std::process::id());
+    let pane = format!("gnome-terminal-seat-{name}");
+    let (closed, marker) =
+        terminal_ownership_case_with_kill(&name, &pane, Some(&name), None, false, |db, name| {
+            let mut owner = spawn_bound_pane_owner(db, name);
+            let pid = owner.id();
+            let (row, bindings, watermark) = ResolvedIncarnation::read(db, name).unwrap();
+            let result = kill_resolved_instance(
+                db,
+                &row.unwrap(),
+                &bindings,
+                watermark,
+                "test",
+                Some(&[std::process::id(), pid]),
+                |_, _, _| Ok(()),
+            );
+            let owner_alive = owner.try_wait().unwrap().is_none();
+            drop(owner.stdin.take());
+            owner.wait().unwrap();
+            let result =
+                result.unwrap_or_else(|error| panic!("self-excluded kill must succeed: {error}"));
+
+            assert!(owner_alive, "the self-excluded owner is never signalled");
+            assert_eq!(result.self_excluded, 1);
+            assert_eq!(result.self_pid, Some(std::process::id()));
+            assert_eq!(result.self_session.as_deref(), Some("sess-owned-pane"));
+            assert_eq!(result.leftovers_terminated, None);
+            assert_eq!(result.teardown, TeardownOutcome::Completed);
+            assert_eq!(result.preset_name, "gnomeseat");
+            assert_eq!(result.pane_id, pane);
+            assert!(
+                result.pane_retry_command.is_none(),
+                "no retry for a pane left open by design"
+            );
+            assert!(
+                !report_incomplete_pane_cleanup(
+                    result.kill_result.into(),
+                    result.pane_retry_command.as_deref(),
+                ),
+                "the caller's intentionally open pane is not a pane-close failure"
+            );
+            assert!(db.get_instance_full(name).unwrap().is_none());
+            assert!(db.process_binding_ids(name).unwrap().is_empty());
+            assert_killed_by(db, name, "test");
+            result.pane_closed
+        });
+    assert!(!closed, "the self-excluded caller's owned pane stays open");
+    assert!(
+        marker.is_none(),
+        "no terminal close command runs for the caller's pane"
+    );
 }
 
 #[test]
