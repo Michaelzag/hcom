@@ -187,7 +187,9 @@ fn handle_packet(id: u64, header: u8, body: &[u8], state: &Mutex<BrokerState>) -
     let mut cur = Cursor { buf: body, at: 0 };
     match header >> 4 {
         // CONNECT -> CONNACK: no session present, success, no properties.
-        1 => state.send(id, &[0x20, 0x03, 0x00, 0x00, 0x00]).then_some(()),
+        1 => state
+            .send(id, &[0x20, 0x03, 0x00, 0x00, 0x00])
+            .then_some(()),
         // PUBLISH
         3 => {
             let qos = (header >> 1) & 0x03;
@@ -504,7 +506,10 @@ impl Pair {
         assert_eq!(code, 0, "caller relay new: {output}");
         let token = output
             .lines()
-            .find_map(|line| line.trim().strip_prefix("On other devices: hcom relay connect "))
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("On other devices: hcom relay connect ")
+            })
             .and_then(|rest| rest.split_whitespace().next())
             .unwrap_or_else(|| panic!("no join token in `relay new` output:\n{output}"))
             .to_owned();
@@ -790,8 +795,7 @@ impl Sentinel {
             }
             let parent_ready = sentinel.dir.join("ready").exists()
                 && beats(&sentinel.dir) > 0
-                && caught_signals(sentinel.pid()) & mask(&PARENT_SIGNALS)
-                    == mask(&PARENT_SIGNALS);
+                && caught_signals(sentinel.pid()) & mask(&PARENT_SIGNALS) == mask(&PARENT_SIGNALS);
             let child_ready = !with_child
                 || fs::read_to_string(sentinel.dir.join("child.pid"))
                     .ok()
@@ -1024,8 +1028,7 @@ fn unverified_launcher_kill(label: &str, receipt_matches: bool) {
     } else {
         "rkother"
     };
-    let (marker, pane_id, script) =
-        seed_pane(&pair.executor.h, &base, &process_id, receipt_preset);
+    let (marker, pane_id, script) = seed_pane(&pair.executor.h, &base, &process_id, receipt_preset);
     pair.start_workers();
     let target = pair.remote_target(&base);
 
