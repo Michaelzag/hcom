@@ -304,7 +304,17 @@ impl PrivateCommand {
         )
     }
 
+    // Release detached tools before callers can drop Hcom's temporary tree,
+    // including a failed first-tool pin or a timed-out launch.
     fn stop(&mut self) {
+        if let Ok(entries) = fs::read_dir(&self.out) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|extension| extension == "started") {
+                    let _ = fs::write(path.with_extension("exit"), "");
+                }
+            }
+        }
         support::terminate_owned_child_group(&mut self.child, self.identity.as_deref());
     }
 
@@ -337,14 +347,6 @@ impl PrivateCommand {
 
 impl Drop for PrivateCommand {
     fn drop(&mut self) {
-        if let Ok(entries) = fs::read_dir(&self.out) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|extension| extension == "started") {
-                    let _ = fs::write(path.with_extension("exit"), "");
-                }
-            }
-        }
         self.stop();
     }
 }
