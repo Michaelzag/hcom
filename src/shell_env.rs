@@ -400,19 +400,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolver_shell_starts_in_a_new_session() {
-        use nix::sys::signal::{Signal, killpg};
+        use crate::sys::process::{identity, signal_owned_test_child};
         use nix::unistd::{Pid, getsid};
 
         let shell = test_shell_path();
         let mut command = shell_command(&shell, "sleep 30", "setsid-test");
         command.stdout(Stdio::null());
         let mut child = command.spawn().unwrap();
+        let expected = identity(child.id()).expect("spawned resolver shell identity");
         let child_pid = Pid::from_raw(child.id() as i32);
 
         let current_session = getsid(None).unwrap();
         let child_session = getsid(Some(child_pid)).unwrap();
 
-        let _ = killpg(child_pid, Signal::SIGKILL);
+        signal_owned_test_child(&child, &expected, libc::SIGKILL, true)
+            .expect("SIGKILL the resolver shell's own group");
         let _ = child.wait();
 
         assert_eq!(child_session, child_pid);

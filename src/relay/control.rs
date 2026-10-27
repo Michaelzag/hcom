@@ -930,6 +930,7 @@ fn handle_remote_kill(
                 "pane_id": error.pane_id,
                 "pane_left_for_caller": error.pane_left_for_caller,
                 "pane_close_needs_pid": error.pane_close_needs_pid,
+                "not_signaled_under_launcher": error.not_signaled_under_launcher,
             }));
         }
     };
@@ -958,6 +959,7 @@ fn handle_remote_kill(
         "pane_id": result.pane_id,
         "pane_left_for_caller": result.pane_left_for_caller,
         "pane_close_needs_pid": result.pane_close_needs_pid,
+        "not_signaled_under_launcher": result.not_signaled_under_launcher,
         "ok": !matches!(result.kill_result, crate::terminal::KillResult::PermissionDenied),
     }))
 }

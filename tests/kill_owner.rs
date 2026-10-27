@@ -1124,7 +1124,10 @@ exec sleep 300
             let (code, stdout, stderr) = self.run(
                 h,
                 &format!(
-                    "env -i PATH=/usr/bin:/bin /bin/bash {} {} 'HUP TERM USR1 USR2 CONT' < /dev/null > /dev/null 2>&1 9<&- & printf '%s' \"$!\"",
+                    "env -i PATH=/usr/bin:/bin HOME={} HCOM_DIR={} TMPDIR={} /bin/bash {} {} 'HUP TERM USR1 USR2 CONT' < /dev/null > /dev/null 2>&1 9<&- & printf '%s' \"$!\"",
+                    quote(&h.home.to_string_lossy()),
+                    quote(&h.hcom_dir.to_string_lossy()),
+                    quote(&h.root_path().join("tmp").to_string_lossy()),
                     quote(&sentinel_script(h).to_string_lossy()),
                     quote(&dir.to_string_lossy()),
                 ),
@@ -1329,7 +1332,10 @@ while True:
                 .arg(&dir)
                 .arg("HUP INT QUIT TERM USR1 USR2 CONT")
                 .env_clear()
-                .env("PATH", "/usr/bin:/bin");
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &h.home)
+                .env("HCOM_DIR", &h.hcom_dir)
+                .env("TMPDIR", h.root_path().join("tmp"));
             if with_child {
                 command.env("SENTINEL_CHILD", "1");
             }
@@ -1350,7 +1356,10 @@ while True:
                 .arg(SENTINEL_PY)
                 .arg(&dir)
                 .env_clear()
-                .env("PATH", "/usr/bin:/bin");
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &h.home)
+                .env("HCOM_DIR", &h.hcom_dir)
+                .env("TMPDIR", h.root_path().join("tmp"));
             let sentinel = Self::start(command, env, dir, false, "non-dumpable sentinel");
             let environ = fs::read(format!("/proc/{}/environ", sentinel.pid()));
             assert!(
@@ -2635,7 +2644,14 @@ wait "$!"
             }
             let dir = h.root_path().join(format!("sentinel-{label}"));
             let mut command = Command::new(node(h));
-            command.arg(&script).arg(&dir).arg("with-child").env_clear();
+            command
+                .arg(&script)
+                .arg(&dir)
+                .arg("with-child")
+                .env_clear()
+                .env("HOME", &h.home)
+                .env("HCOM_DIR", &h.hcom_dir)
+                .env("TMPDIR", h.root_path().join("tmp"));
             #[cfg(windows)]
             for key in ["SystemRoot", "WINDIR"] {
                 if let Some(value) = std::env::var_os(key) {
@@ -3433,6 +3449,16 @@ mod real {
             self.fields()?.get(1)?.parse().ok()
         }
 
+        /// The kernel's name for this process, read before its pin proves
+        /// the read was of it.
+        fn comm(&self) -> Option<String> {
+            let comm = fs::read_to_string(format!("/proc/{}/comm", self.pid));
+            if !self.alive() {
+                return None;
+            }
+            Some(comm.ok()?.trim_end_matches('\n').to_owned())
+        }
+
         /// This process's wait status while it is an unreaped zombie (stat
         /// field 52).
         fn zombie_status(&self) -> Option<i64> {
@@ -3854,7 +3880,9 @@ exec -a omp /bin/bash {runner}
     // -----------------------------------------------------------------------
     // An id-carrying terminal above the launch script: hcom runs the custom
     // terminal command `env HCOM_PROCESS_ID={process_id} <terminal>
-    // {script}`, and the terminal runs the launch script below it.
+    // {script}`, and the terminal runs the launch script below it. Once a
+    // test opens its `sibling.go` gate, the terminal also starts
+    // `sibling.sh`: an id-carrying child outside the seat's tree.
     // -----------------------------------------------------------------------
 
     fn install_terminal(real: &Real) -> PathBuf {
@@ -3873,10 +3901,15 @@ done
 printf '%s' "$$" > "$dir/ready"
 while :; do
     printf x >> "$dir/heartbeat"
+    if [ -e "$dir/sibling.go" ] && [ ! -e "$dir/sibling.started" ]; then
+        : > "$dir/sibling.started"
+        env --default-signal /bin/bash {sibling} "$dir/sibling" < /dev/null > /dev/null 2>&1 &
+    fi
     sleep 0.05
 done
 "#,
                 dir = quote(&real.root.join("terminal")),
+                sibling = quote(&real.root.join("sibling.sh")),
             ),
         );
         path
@@ -4031,6 +4064,89 @@ done
              n):\n{output}"
         );
         assert_kill_succeeded(code, &output, &real.name);
+    }
+
+    /// An id-carrying child of that terminal, started through the test's
+    /// gate once the seat runs, is a new carrier outside the seat's tree
+    /// whose chain reaches the terminal above the launch. The kill leaves it
+    /// unsignaled and lists it with that terminal, never as a survivor or a
+    /// failure, while the seat's own tree is gone. Linux only: the Linux
+    /// helper is the one that reports these, and adopting a launched
+    /// process needs its pidfd.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_kill_lists_the_unsignaled_sibling_under_the_terminal() {
+        let real = Real::new("sibling", false);
+        let terminal = install_terminal(&real);
+        fs::write(real.root.join("sibling.sh"), WATCH).expect("write the sibling's body");
+        let command = format!(
+            "env HCOM_PROCESS_ID={{process_id}} {} {{script}}",
+            terminal.display()
+        );
+        let resume = real.resume(&[
+            "r",
+            &real.name,
+            "--terminal",
+            &command,
+            "--no-run-here",
+            "--go",
+        ]);
+        let seat = real.seat(&resume);
+        let terminal = find_terminal(&real, &resume, &seat);
+        // Born after the seat root, as a fork made during a kill would be.
+        fs::write(real.root.join("terminal/sibling.go"), "").expect("open the sibling gate");
+        let sibling = Watched::find(
+            "sibling",
+            real.root.join("terminal/sibling"),
+            Mark::Child {
+                parent: terminal.tracked.pid,
+                process_id: &seat.process_id,
+            },
+            seat.since,
+            || resume.output(),
+        );
+        let notice = format!(
+            "not signaled: under launcher/terminal process {} ({}): {} ({})",
+            terminal.tracked.pid,
+            terminal.tracked.comm().expect("read the terminal's name"),
+            sibling.tracked.pid,
+            sibling.tracked.comm().expect("read the sibling's name"),
+        );
+        let before = [terminal.beats(), sibling.beats()];
+
+        let (code, output) = real.kill();
+        seat.assert_tree_gone(&output);
+        seat.assert_pty_exited(&output);
+        assert_kill_succeeded(code, &output, &real.name);
+        assert!(
+            output.lines().any(|line| line == notice),
+            "`hcom kill` did not list its unsignaled sibling as `{notice}`:\n{output}"
+        );
+        let listed = output
+            .lines()
+            .filter(|line| line.starts_with("not signaled: under launcher/terminal process "))
+            .count();
+        assert!(
+            listed <= 10,
+            "`hcom kill` named {listed} unsignaled processes, past its limit of 10:\n{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .filter(|line| names_pid(line, sibling.tracked.pid))
+                .all(|line| line == notice),
+            "`hcom kill` reported its unsignaled sibling {} outside its notice:\n{output}",
+            sibling.tracked.pid
+        );
+        for (watched, before) in [&terminal, &sibling].into_iter().zip(before) {
+            assert_eq!(
+                watched.observe(before),
+                json!({"alive": true, "heartbeat_progressed": true, "signals": ""}),
+                "SAFETY: `hcom kill` signalled the {} {} outside the seat:\n{output}",
+                watched.tracked.role,
+                watched.tracked.pid
+            );
+        }
     }
 
     /// A background launch (`hcom r N --go`).

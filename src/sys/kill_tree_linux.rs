@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use super::kill_group::capture_members;
 use super::process::{
-    GroupSignal, KILL_WAIT, KillError, POLL_STEP, TERM_WAIT, has_identity, proc_stat_group_id,
-    proc_stat_is_dead, proc_stat_is_zombie, signal_group, signal_pid,
+    GroupSignal, KILL_WAIT, KillError, POLL_STEP, TERM_WAIT, UNSIGNALED_CARRIER_LIMIT,
+    UnsignaledCarrier, UnsignaledCarriers, has_identity, proc_stat_group_id, proc_stat_is_dead,
+    proc_stat_is_zombie, signal_group, signal_pid,
 };
 use super::process_args::EnvRead;
 
@@ -334,6 +335,11 @@ struct Lineage<'a> {
     /// Ineligible processes and their whole subtrees: never captured,
     /// walked through, or signaled.
     fenced: HashSet<u32>,
+    /// New carrier births rejected during this kill stay out of scope even
+    /// if they later reparent. Captured members never enter this set.
+    rejected_carriers: HashMap<(u32, u64), ProcFact>,
+    /// Only the first ten unique rejections need names for their notices.
+    pending_notices: Vec<(ProcFact, ProcFact)>,
 }
 
 impl<'a> Lineage<'a> {
@@ -346,6 +352,8 @@ impl<'a> Lineage<'a> {
             complete,
             excluded: &[],
             fenced: HashSet::new(),
+            rejected_carriers: HashMap::new(),
+            pending_notices: Vec::new(),
         }
     }
 
@@ -356,6 +364,64 @@ impl<'a> Lineage<'a> {
     fn spares(&self, pid: u32) -> bool {
         self.excluded.contains(&pid)
     }
+
+    fn reject_carrier(&mut self, candidate: ProcFact, launcher: ProcFact) {
+        if self
+            .rejected_carriers
+            .insert((candidate.pid, candidate.start), launcher)
+            .is_none()
+            && self.rejected_carriers.len() <= UNSIGNALED_CARRIER_LIMIT
+        {
+            self.pending_notices.push((candidate, launcher));
+        }
+    }
+}
+
+/// A new carrier may have been adopted by a non-seat process. Stop at that
+/// boundary (or init); below a same-id excluded ancestor, ownership is not
+/// proven. Return that ancestor for an unsignaled notice. Missing/invalid
+/// facts or an unreadable parent id prove neither adoption nor ownership.
+fn carrier_ancestry(
+    by_pid: &HashMap<u32, &ProcFact>,
+    candidate: &ProcFact,
+    lineage: &Lineage,
+    bound_ids: &[String],
+    process_id_of: &mut impl FnMut(u32) -> EnvRead,
+) -> Result<Option<ProcFact>, &'static str> {
+    let mut current = candidate;
+    for _ in 0..MAX_TREE_DEPTH {
+        if current.ppid <= 1 {
+            return Ok(None);
+        }
+        let parent = by_pid
+            .get(&current.ppid)
+            .copied()
+            .ok_or("carrier ancestry is unreadable or invalid")?;
+        if parent.start > current.start {
+            return Err("carrier ancestry is unreadable or invalid");
+        }
+        if let Some(launcher) = lineage.rejected_carriers.get(&(parent.pid, parent.start)) {
+            return Ok(Some(*launcher));
+        }
+        // A child born below a rejected carrier and orphaned entirely
+        // between scans was never observed there. Its own current chain
+        // and seat id decide admission; no historical edge is invented.
+        match process_id_of(parent.pid) {
+            EnvRead::Unreadable => return Err("carrier ancestry is unreadable or invalid"),
+            EnvRead::Absent => return Ok(None),
+            EnvRead::Present(id) if id.is_empty() || !bound_ids.contains(&id) => return Ok(None),
+            EnvRead::Present(_) => {}
+        }
+        // hcom never sets PR_SET_CHILD_SUBREAPER on its id-carrying
+        // launchers/runners. Non-hcom id-carrying ancestors can adopt too,
+        // so report this branch rather than silently treating it as owned.
+        // If hcom ever sets that bit, revisit this admission rule.
+        if lineage.ancestors.contains(&parent.pid) || lineage.spares(parent.pid) {
+            return Ok(Some(*parent));
+        }
+        current = parent;
+    }
+    Err("carrier ancestry is unreadable or invalid")
 }
 
 /// Fence `pid` and its whole subtree as `by_parent` (a snapshot sorted by
@@ -418,18 +484,29 @@ fn fence_ineligible(
     members.retain(|member| member.pid == root || !fenced.contains(&member.pid));
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Absorbed {
+    found: Vec<Member>,
+    unconfirmed: Vec<Member>,
+}
+
 /// From one snapshot, the processes the capture hasn't seen yet:
 /// - descendants of a tree member still running as its captured incarnation,
 ///   through edges whose child is no older than its parent;
 /// - restricted carriers: live processes outside the tree and the root's
 ///   ancestry that carry one of `bound_ids` and pass `eligible`. None predates
-///   the root. A same-tick one is admitted only when both its ancestry and the
-///   root's read to the top: a same-tick ancestor above a broken link is
-///   otherwise indistinguishable from a carrier.
+///   the root; a same-tick one needs the root's complete capture lineage.
+///   Its parent chain must reach init or a non-bound-id adoption boundary
+///   before any same-id excluded ancestor. An unreadable/invalid chain is
+///   Unconfirmed, never authority to signal.
 ///
-/// Every candidate must pass `eligible`; a rejected one is fenced with its
-/// whole subtree, and nothing under a fence is ever admitted. Rescans run
-/// this again, so forks made while the kill runs join the set.
+/// Valid discoveries and uncertain native births are returned together;
+/// initial capture and late settlement apply their different refusal policy.
+///
+/// Ineligible tree candidates are fenced with their whole subtree; nothing
+/// under a fence is admitted. Rejected carrier births stay out of scope for
+/// this kill, even after reparenting. Captured members retain their native
+/// identity proof regardless of later ancestry. Rescans reuse these rules.
 fn absorb(
     snapshot: &[ProcFact],
     root_start: u64,
@@ -438,7 +515,7 @@ fn absorb(
     bound_ids: &[String],
     mut process_id_of: impl FnMut(u32) -> EnvRead,
     mut eligible: impl FnMut(u32) -> bool,
-) -> Result<Vec<Member>, &'static str> {
+) -> Result<Absorbed, KillError> {
     let captured: HashMap<u32, &Member> =
         members.iter().map(|member| (member.pid, member)).collect();
     let by_parent = sorted_by_parent(snapshot);
@@ -465,6 +542,9 @@ fn absorb(
             if child.pid <= 1
                 || child.start < start
                 || captured.contains_key(&child.pid)
+                || lineage
+                    .rejected_carriers
+                    .contains_key(&(child.pid, child.start))
                 || lineage.ancestors.contains(&child.pid)
                 || lineage.fenced.contains(&child.pid)
                 || !seen.insert(child.pid)
@@ -476,7 +556,7 @@ fn absorb(
                 continue;
             }
             if members.len() + found.len() >= MAX_TREE_PROCESSES {
-                return Err("seat's captured processes exceed the size limit");
+                return Err("seat's captured processes exceed the size limit".into());
             }
             found.push(Member {
                 pid: child.pid,
@@ -489,28 +569,55 @@ fn absorb(
         }
     }
     if bound_ids.is_empty() {
-        return Ok(found);
+        return Ok(Absorbed {
+            found,
+            unconfirmed: Vec::new(),
+        });
     }
     let by_pid: HashMap<u32, &ProcFact> = snapshot.iter().map(|fact| (fact.pid, fact)).collect();
+    let mut unconfirmed = Vec::new();
     for fact in snapshot {
         if fact.pid <= 1
             || fact.start < root_start
             || captured.contains_key(&fact.pid)
             || seen.contains(&fact.pid)
+            || lineage
+                .rejected_carriers
+                .contains_key(&(fact.pid, fact.start))
             || lineage.ancestors.contains(&fact.pid)
             || lineage.spares(fact.pid)
             || under_fence(&by_pid, fact.pid, &lineage.fenced)
         {
             continue;
         }
-        if fact.start == root_start && !(lineage.complete && ancestry(&by_pid, fact.pid).1) {
+        if fact.start == root_start && !lineage.complete {
             continue;
         }
         if !has_bound_id(process_id_of(fact.pid), bound_ids) || !eligible(fact.pid) {
             continue;
         }
-        if members.len() + found.len() >= MAX_TREE_PROCESSES {
-            return Err("seat's captured processes exceed the size limit");
+        match carrier_ancestry(&by_pid, fact, lineage, bound_ids, &mut process_id_of) {
+            Ok(Some(launcher)) => {
+                lineage.reject_carrier(*fact, launcher);
+                continue;
+            }
+            Err(_) => {
+                if members.len() + found.len() + unconfirmed.len() >= MAX_TREE_PROCESSES {
+                    return Err("seat's captured processes exceed the size limit".into());
+                }
+                unconfirmed.push(Member {
+                    pid: fact.pid,
+                    start: fact.start,
+                    depth: 0,
+                    in_group: false,
+                    carrier: true,
+                });
+                continue;
+            }
+            Ok(None) => {}
+        }
+        if members.len() + found.len() + unconfirmed.len() >= MAX_TREE_PROCESSES {
+            return Err("seat's captured processes exceed the size limit".into());
         }
         found.push(Member {
             pid: fact.pid,
@@ -520,7 +627,20 @@ fn absorb(
             carrier: true,
         });
     }
-    Ok(found)
+    Ok(Absorbed { found, unconfirmed })
+}
+
+/// Best-effort diagnostic text only; a name never authorizes a signal.
+fn notice_comm(proc_root: &Path, pid: u32) -> String {
+    let Ok(mut comm) = std::fs::read_to_string(proc_root.join(format!("{pid}/comm"))) else {
+        return "<unknown>".into();
+    };
+    comm.truncate(comm.trim_end_matches('\n').len());
+    if comm.is_empty() {
+        "<unknown>".into()
+    } else {
+        comm
+    }
 }
 
 /// The capture-time facts and injected proofs a kill reuses for every
@@ -530,11 +650,14 @@ struct Sweep<'a, P, E, A> {
     root_start: u64,
     lineage: Lineage<'a>,
     bound_ids: &'a [String],
+    not_signaled: &'a mut UnsignaledCarriers,
+    signal_sent: &'a std::cell::Cell<bool>,
     process_id_of: P,
     eligible: E,
     authorize: A,
     /// Late members refused by `authorize`, and everything below them:
     /// never signaled, still confirmed.
+    /// PID reuse can conservatively retain a refusal/false survivor, never authorize a signal.
     refused: HashSet<u32>,
     /// The first late refusal, reported if the kill ends with survivors.
     refusal: Option<KillError>,
@@ -583,12 +706,9 @@ where
     E: FnMut(u32) -> bool,
     A: FnMut(u32) -> Result<(), KillError>,
 {
-    fn absorb(
-        &mut self,
-        snapshot: &[ProcFact],
-        members: &[Member],
-    ) -> Result<Vec<Member>, &'static str> {
-        absorb(
+    fn absorb(&mut self, snapshot: &[ProcFact], members: &[Member]) -> Result<Absorbed, KillError> {
+        let rejected_before = self.lineage.rejected_carriers.len();
+        let result = absorb(
             snapshot,
             self.root_start,
             &mut self.lineage,
@@ -596,7 +716,36 @@ where
             self.bound_ids,
             &mut self.process_id_of,
             &mut self.eligible,
-        )
+        );
+        self.not_signaled.total += self.lineage.rejected_carriers.len() - rejected_before;
+        for (candidate, launcher) in self.lineage.pending_notices.drain(..) {
+            if self.not_signaled.entries.len() >= UNSIGNALED_CARRIER_LIMIT {
+                break;
+            }
+            self.not_signaled.entries.push(UnsignaledCarrier {
+                launcher_pid: launcher.pid,
+                launcher_comm: notice_comm(self.proc_root, launcher.pid),
+                pid: candidate.pid,
+                comm: notice_comm(self.proc_root, candidate.pid),
+            });
+        }
+        result
+    }
+
+    /// Late uncertainty is a refusal to signal this birth and its subtree,
+    /// not a reason to abandon other owned members before escalation.
+    fn fence_uncertain(&mut self, snapshot: &[ProcFact], unconfirmed: &[Member]) {
+        let by_parent = sorted_by_parent(snapshot);
+        for member in unconfirmed {
+            if refusal_moot(member, observe(self.proc_root, member.pid)) {
+                continue;
+            }
+            fence_subtree(&by_parent, member.pid, &mut self.refused);
+            self.refusal.get_or_insert_with(|| KillError::Unconfirmed {
+                reason: "carrier ancestry is unreadable or invalid".into(),
+                survivors: Vec::new(),
+            });
+        }
     }
 
     /// Authorize the initial members before the first signal. A refusal
@@ -706,24 +855,30 @@ where
                     });
                 }
             };
-            let fresh = match self.absorb(&snapshot, members) {
-                Ok(fresh) => fresh,
-                Err(reason) => {
+            let batch = match self.absorb(&snapshot, members) {
+                Ok(batch) => batch,
+                Err(error) => {
                     return Err(KillError::Unconfirmed {
-                        reason: reason.to_string(),
+                        reason: refusal_reason(error),
                         survivors: self.survivors(members),
                     });
                 }
             };
-            self.authorize_late(&snapshot, &fresh);
-            for member in &fresh {
-                if self.proven(member) {
-                    // One PID absorbed from this round's snapshot, authorized
-                    // and just re-proven; never a group signal.
-                    let _ = signal_pid(member.pid, signal);
+            let fresh_start = members.len();
+            members.extend(batch.found);
+            let fresh_end = members.len();
+            self.fence_uncertain(&snapshot, &batch.unconfirmed);
+            members.extend(batch.unconfirmed);
+            self.authorize_late(&snapshot, &members[fresh_start..fresh_end]);
+            for member in &members[fresh_start..fresh_end] {
+                // One PID absorbed from this round, authorized and just
+                // re-proven; never a group signal.
+                if self.proven(member)
+                    && matches!(signal_pid(member.pid, signal), Ok(GroupSignal::Sent))
+                {
+                    self.signal_sent.set(true);
                 }
             }
-            members.extend(fresh);
             let left = self.survivors(members);
             if left.is_empty() || Instant::now() >= end {
                 return Ok(left);
@@ -758,31 +913,41 @@ fn group_signal_allowed(
             .any(|member| member.in_group && spared(member.pid))
 }
 
-/// `expected` is the native `linux:<boot_id>:<start_ticks>` identity of the
-/// verified seat root. `bound_ids` and `process_id_of` admit the restricted
-/// carriers; `eligible` must pass for every capture candidate but the root,
-/// and a rejected one is spared with its whole subtree. `excluded` is the
-/// caller's own chain: those PIDs anchor capture and rescans but are never
-/// signaled or confirmed. Any ancestor, excluded or ineligible PID in the
-/// root's group turns the group signal into per-PID signals. `authorize`
-/// runs on every member before the first signal, and on each round's new
-/// members before any of them is signaled. A refusal is moot when a fresh
-/// read shows that member gone, reused or exiting; otherwise it refuses the
-/// kill (initially) or fences that member and its subtree, unsignaled, and
-/// the kill ends Unconfirmed with its reason (late). Exiting members are
-/// never signaled and are confirmed only once gone. Ok carries the root's
-/// own signal outcome, as with the other GroupSignal primitives, once every
-/// captured member is confirmed gone; an excluded or exiting root is never
-/// signaled and reports NotFound. Members left at the deadline are an error
-/// naming their PIDs, with the reason when they were refused or exiting.
-pub(crate) fn terminate(
-    root: u32,
-    expected: &str,
+fn signal_phase_error(error: KillError, signal_sent: bool, not_signaled: &[u32]) -> KillError {
+    if signal_sent {
+        return error;
+    }
+    let (reason, mut pids) = match error {
+        KillError::Refused(reason) => (reason, Vec::new()),
+        KillError::Unconfirmed { reason, survivors } => (reason, survivors),
+        KillError::Survivors(pids) => ("termination was not confirmed".into(), pids),
+    };
+    pids.extend_from_slice(not_signaled);
+    pids.sort_unstable();
+    pids.dedup();
+    let mut reason = format!("no signal sent: {reason}");
+    if !pids.is_empty() {
+        use std::fmt::Write;
+        reason.push_str("; not signaled:");
+        for pid in pids {
+            write!(reason, " {pid}").expect("formatting into a String cannot fail");
+        }
+    }
+    KillError::Refused(reason)
+}
+
+fn terminate_body(
+    (root, expected): (u32, &str),
     bound_ids: &[String],
     excluded: &[u32],
     process_id_of: impl FnMut(u32) -> EnvRead,
     mut eligible: impl FnMut(u32) -> bool,
     authorize: impl FnMut(u32) -> Result<(), KillError>,
+    (not_signaled, sent, members): (
+        &mut UnsignaledCarriers,
+        &std::cell::Cell<bool>,
+        &mut Vec<Member>,
+    ),
 ) -> Result<GroupSignal, KillError> {
     let expected_start = expected
         .strip_prefix("linux:")
@@ -794,22 +959,16 @@ pub(crate) fn terminate(
         return Err("seat root identity changed or became unreadable before tree capture".into());
     }
     let snapshot = snapshot(proc_root)?;
-    let mut members = capture(&snapshot, root, expected_start)?;
+    *members = capture(&snapshot, root, expected_start)?;
     let leader = members
         .iter()
         .any(|member| member.pid == root && member.in_group);
     // A group the capture didn't fully cover gets per-PID signals only.
-    let group_complete = !leader || verify_group(proc_root, root, &mut members)?;
+    let group_complete = !leader || verify_group(proc_root, root, members)?;
     let mut lineage = Lineage::of(&snapshot, root).excluding(excluded);
-    fence_ineligible(
-        &snapshot,
-        root,
-        &mut members,
-        &mut lineage.fenced,
-        &mut eligible,
-    );
+    fence_ineligible(&snapshot, root, members, &mut lineage.fenced, &mut eligible);
     let mut group_signal =
-        group_complete && group_signal_allowed(&snapshot, root, leader, &lineage, &members);
+        group_complete && group_signal_allowed(&snapshot, root, leader, &lineage, members);
     // The root's ancestors (its launch wrapper and everything above) are
     // never signaled, confirmed or walked through, even when they share its
     // group; excluded PIDs stay as anchors and are skipped at each signal.
@@ -819,15 +978,24 @@ pub(crate) fn terminate(
         root_start: expected_start,
         lineage,
         bound_ids,
+        not_signaled,
+        signal_sent: sent,
         process_id_of,
         eligible,
         authorize,
         refused: HashSet::new(),
         refusal: None,
     };
-    let found = sweep.absorb(&snapshot, &members)?;
-    members.splice(0..0, found);
-    let mooted = sweep.preflight(&members)?;
+    let batch = sweep.absorb(&snapshot, members)?;
+    members.splice(0..0, batch.found);
+    if !batch.unconfirmed.is_empty() {
+        members.extend(batch.unconfirmed);
+        return Err(KillError::Unconfirmed {
+            reason: "carrier ancestry is unreadable or invalid".into(),
+            survivors: sweep.survivors(members),
+        });
+    }
+    let mooted = sweep.preflight(members)?;
     // killpg can't skip a group member whose refusal a fresh read made moot,
     // nor one already exiting: then every member gets its own signal, and
     // those get none.
@@ -839,7 +1007,7 @@ pub(crate) fn terminate(
     });
 
     let mut root_signal = None;
-    for member in &members {
+    for member in members.iter() {
         if member.pid == root {
             if sweep.lineage.spares(root) {
                 root_signal = Some(GroupSignal::NotFound);
@@ -866,19 +1034,28 @@ pub(crate) fn terminate(
                     // Its group outlives it but gets no killpg from here, so
                     // the members the loop skipped get their own signals.
                     for grouped in members.iter().filter(|m| m.in_group && m.pid != root) {
-                        if sweep.proven(grouped) {
-                            let _ = signal_pid(grouped.pid, libc::SIGTERM);
+                        if sweep.proven(grouped)
+                            && matches!(
+                                signal_pid(grouped.pid, libc::SIGTERM),
+                                Ok(GroupSignal::Sent)
+                            )
+                        {
+                            sweep.signal_sent.set(true);
                         }
                     }
                 }
                 continue;
             }
-            root_signal = Some(if group_signal {
+            let outcome = if group_signal {
                 // The verified leader's own group.
                 signal_group(root, libc::SIGTERM)?
             } else {
                 signal_pid(root, libc::SIGTERM)?
-            });
+            };
+            if outcome == GroupSignal::Sent {
+                sweep.signal_sent.set(true);
+            }
+            root_signal = Some(outcome);
             continue;
         }
         if group_signal && member.in_group {
@@ -889,28 +1066,106 @@ pub(crate) fn terminate(
         }
         // Capture never admits a reserved PID, and signal_pid refuses one
         // anyway. ESRCH means it is gone.
-        let _ = signal_pid(member.pid, libc::SIGTERM);
+        if matches!(signal_pid(member.pid, libc::SIGTERM), Ok(GroupSignal::Sent)) {
+            sweep.signal_sent.set(true);
+        }
     }
     let root_signal = root_signal.ok_or("seat root is missing from the termination plan")?;
 
-    if sweep
-        .settle(&mut members, TERM_WAIT, libc::SIGTERM)?
-        .is_empty()
-    {
+    if sweep.settle(members, TERM_WAIT, libc::SIGTERM)?.is_empty() {
         return Ok(root_signal);
     }
     // Escalate per PID, never by group: the leader may have exited, and only
     // a freshly re-proven captured incarnation is signaled, never a reuse.
-    for pid in escalation_targets(&members, |member| sweep.proven(member)) {
+    let signal_sent = sweep.signal_sent;
+    for pid in escalation_targets(members, |member| sweep.proven(member)) {
         // A captured PID whose start time was just rechecked; ESRCH means it
         // exited in between.
-        let _ = signal_pid(pid, libc::SIGKILL);
+        if matches!(signal_pid(pid, libc::SIGKILL), Ok(GroupSignal::Sent)) {
+            signal_sent.set(true);
+        }
     }
-    let left = sweep.settle(&mut members, KILL_WAIT, libc::SIGKILL)?;
+    let left = sweep.settle(members, KILL_WAIT, libc::SIGKILL)?;
     if left.is_empty() {
         return Ok(root_signal);
     }
-    Err(sweep.verdict(&members, left))
+    Err(sweep.verdict(members, left))
+}
+
+/// `expected` is the native `linux:<boot_id>:<start_ticks>` identity of the
+/// verified seat root. `bound_ids` and `process_id_of` admit the restricted
+/// carriers. A new carrier's parent chain must reach a non-bound-id process
+/// or init before a same-id excluded ancestor. Unreadable ancestry before
+/// the first signal refuses the whole kill with every live captured PID.
+/// Late uncertainty fences that birth and subtree without signaling them;
+/// other owned members still settle and escalate. Final live/unknown births
+/// are reported as Unconfirmed at the deadline, with their native identities
+/// retained for confirmation.
+/// Rejected new carrier births are not survivors: `not_signaled` records
+/// their total and first ten launcher/process names, on success or failure.
+/// That rejection is sticky for this kill's `(pid, start)`; already-captured
+/// members remain tracked by identity after any reparenting.
+/// `eligible` must pass for every capture candidate but the root, and a
+/// rejected one is spared with its whole subtree. `excluded` is the
+/// caller's own chain: those PIDs anchor capture and rescans but are never
+/// signaled or confirmed. Any ancestor, excluded or ineligible PID in the
+/// root's group turns the group signal into per-PID signals. `authorize`
+/// runs on every member before the first signal, and on each round's new
+/// members before any of them is signaled. A refusal is moot when a fresh
+/// read shows that member gone, reused or exiting; otherwise it refuses the
+/// kill (initially) or fences that member and its subtree, unsignaled, and
+/// the kill ends Unconfirmed with its reason (late). Exiting members are
+/// never signaled and are confirmed only once gone. Ok carries the root's
+/// own signal outcome, as with the other GroupSignal primitives, once every
+/// captured member is confirmed gone; an excluded or exiting root is never
+/// signaled and reports NotFound. Members left at the deadline are an error
+/// naming their PIDs, with the reason when they were refused or exiting.
+/// Before any accepted signal, errors say "no signal sent" and label live
+/// PIDs "not signaled". After accepted actuation, existing error variants
+/// and survivor details are retained.
+pub(crate) fn terminate(
+    (root, expected): (u32, &str),
+    bound_ids: &[String],
+    excluded: &[u32],
+    process_id_of: impl FnMut(u32) -> EnvRead,
+    eligible: impl FnMut(u32) -> bool,
+    authorize: impl FnMut(u32) -> Result<(), KillError>,
+    not_signaled: &mut UnsignaledCarriers,
+) -> Result<GroupSignal, KillError> {
+    let sent = std::cell::Cell::new(false);
+    let mut members = Vec::new();
+    let result = terminate_body(
+        (root, expected),
+        bound_ids,
+        excluded,
+        process_id_of,
+        eligible,
+        authorize,
+        (not_signaled, &sent, &mut members),
+    );
+    result.map_err(|error| {
+        let accepted = sent.get();
+        let mut pids = if accepted {
+            Vec::new()
+        } else {
+            survivors(&members, |pid| {
+                if excluded.contains(&pid) {
+                    Seen::Gone
+                } else {
+                    observe(Path::new("/proc"), pid)
+                }
+            })
+        };
+        if !accepted
+            && pids.is_empty()
+            && root > 1
+            && !excluded.contains(&root)
+            && !matches!(observe(Path::new("/proc"), root), Seen::Gone)
+        {
+            pids.push(root);
+        }
+        signal_phase_error(error, accepted, &pids)
+    })
 }
 
 /// Parse one process from its stat line; None for a malformed line or one
@@ -1379,6 +1634,41 @@ mod tests {
     }
 
     #[test]
+    fn errors_before_any_accepted_signal_name_unsignaled_pids_not_survivors() {
+        for error in [
+            KillError::Refused("preflight validation refused".into()),
+            KillError::Unconfirmed {
+                reason: "ancestry unreadable".into(),
+                survivors: vec![20],
+            },
+            KillError::Survivors(vec![20]),
+        ] {
+            let formatted = signal_phase_error(error, false, &[10, 20]);
+            let KillError::Refused(reason) = formatted else {
+                panic!("pre-signal error kept a post-actuation variant");
+            };
+            assert!(reason.starts_with("no signal sent:"));
+            assert!(reason.contains("not signaled: 10 20"));
+            assert!(!reason.contains("survivors"));
+        }
+    }
+
+    #[test]
+    fn errors_after_an_accepted_signal_keep_their_typed_survivor_details() {
+        let error = KillError::Unconfirmed {
+            reason: "ancestry unreadable".into(),
+            survivors: vec![30],
+        };
+        assert_eq!(
+            signal_phase_error(error, true, &[10, 20]),
+            KillError::Unconfirmed {
+                reason: "ancestry unreadable".into(),
+                survivors: vec![30],
+            }
+        );
+    }
+
+    #[test]
     fn a_verdict_names_refusals_and_members_still_exiting() {
         let refusal = Some(KillError::Refused("61 is foreign".into()));
         assert_eq!(verdict(None, &[], vec![60]), KillError::Survivors(vec![60]));
@@ -1645,8 +1935,6 @@ mod tests {
             fact(42, 1, 42, 130),
             fact(43, 1, 43, 130),
             fact(46, 1, 46, 130),
-            // Same tick, its parent missing from the snapshot: skipped.
-            fact(44, 77, 44, 100),
             // Bound id, but not eligible.
             fact(45, 1, 45, 130),
         ]
@@ -1657,9 +1945,13 @@ mod tests {
         lineage: &mut Lineage,
         members: &[Member],
         bound: &[String],
-    ) -> Result<Vec<Member>, &'static str> {
+    ) -> Result<Vec<Member>, KillError> {
         absorb(snapshot, 100, lineage, members, bound, seat_env, |pid| {
             pid != 45
+        })
+        .map(|batch| {
+            assert!(batch.unconfirmed.is_empty(), "unexpected uncertain carrier");
+            batch.found
         })
     }
 
@@ -1682,6 +1974,458 @@ mod tests {
                 .iter()
                 .all(|member| member.carrier && !member.in_group)
         );
+    }
+
+    #[test]
+    fn fresh_children_of_a_spared_terminal_are_not_escaped_seat_carriers() {
+        let initial = [
+            fact(5, 1, 5, 50),
+            fact(10, 5, 10, 100),
+            fact(20, 10, 10, 110),
+        ];
+        let members = capture(&initial, 10, 100).unwrap();
+        let mut lineage = Lineage::of(&initial, 10).excluding(&[]);
+        let bound = [SEAT.to_string()];
+        // The root is gone. Its terminal's fresh child carries the same id,
+        // but only the detached process belongs to the carrier candidate set.
+        let later = [fact(5, 1, 5, 50), fact(30, 5, 5, 120), fact(40, 1, 40, 120)];
+        let mut admitted = pids(
+            &absorb(
+                &later,
+                100,
+                &mut lineage,
+                &members,
+                &bound,
+                |_| EnvRead::Present(SEAT.into()),
+                |_| true,
+            )
+            .map(|batch| {
+                assert!(batch.unconfirmed.is_empty());
+                batch.found
+            })
+            .unwrap(),
+        );
+        admitted.sort_unstable();
+        assert_eq!(admitted, vec![40]);
+    }
+
+    #[test]
+    fn a_non_bound_id_ancestor_is_a_carrier_adoption_boundary() {
+        let snapshot = [
+            fact(5, 1, 5, 50),
+            fact(10, 5, 10, 100),
+            fact(30, 5, 30, 120),
+        ];
+        let members = capture(&snapshot, 10, 100).unwrap();
+        let excluded = [5];
+        let mut lineage = Lineage::of(&snapshot, 10).excluding(&excluded);
+        let found = absorb(
+            &snapshot,
+            100,
+            &mut lineage,
+            &members,
+            &[SEAT.to_string()],
+            |pid| {
+                if pid == 5 {
+                    EnvRead::Absent
+                } else {
+                    EnvRead::Present(SEAT.into())
+                }
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert!(found.unconfirmed.is_empty());
+        assert_eq!(pids(&found.found), vec![30]);
+    }
+
+    #[test]
+    fn a_same_id_chain_to_an_excluded_caller_is_not_a_carrier() {
+        let initial = [fact(5, 1, 5, 50), fact(7, 1, 7, 50), fact(10, 5, 10, 100)];
+        let members = capture(&initial, 10, 100).unwrap();
+        let excluded = [7];
+        let mut lineage = Lineage::of(&initial, 10).excluding(&excluded);
+        let later = [
+            fact(5, 1, 5, 50),
+            fact(7, 1, 7, 50),
+            fact(30, 7, 30, 120),
+            fact(31, 30, 30, 130),
+            fact(40, 1, 40, 120),
+        ];
+        let found = absorb(
+            &later,
+            100,
+            &mut lineage,
+            &members,
+            &[SEAT.to_string()],
+            |_| EnvRead::Present(SEAT.into()),
+            |_| true,
+        )
+        .unwrap();
+        assert!(found.unconfirmed.is_empty());
+        assert_eq!(pids(&found.found), vec![40]);
+    }
+
+    #[test]
+    fn a_rejected_birth_stays_out_of_scope_after_adoption_but_a_reused_pid_is_new() {
+        let initial = [
+            fact(5, 1, 5, 50),
+            fact(10, 5, 10, 100),
+            fact(20, 10, 10, 110),
+        ];
+        let members = capture(&initial, 10, 100).unwrap();
+        let mut lineage = Lineage::of(&initial, 10);
+        let bound = [SEAT.to_string()];
+        let first = [
+            fact(5, 1, 5, 50),
+            fact(20, 1, 10, 110),
+            fact(30, 5, 30, 120),
+        ];
+        assert_eq!(
+            absorb(
+                &first,
+                100,
+                &mut lineage,
+                &members,
+                &bound,
+                |_| EnvRead::Present(SEAT.into()),
+                |_| true,
+            ),
+            Ok(Absorbed::default())
+        );
+        // The rejected birth is now directly beneath a captured member.
+        // Neither the tree arm nor the carrier arm may admit it.
+        let adopted = [
+            fact(20, 1, 10, 110),
+            fact(30, 20, 30, 120),
+            fact(40, 1, 40, 130),
+        ];
+        let found = absorb(
+            &adopted,
+            100,
+            &mut lineage,
+            &members,
+            &bound,
+            |_| EnvRead::Present(SEAT.into()),
+            |_| true,
+        )
+        .unwrap();
+        assert!(found.unconfirmed.is_empty());
+        assert_eq!(pids(&found.found), vec![40]);
+        // A different birth using the same numeric PID is evaluated anew.
+        let reused = [fact(20, 1, 10, 110), fact(30, 20, 30, 121)];
+        let found = absorb(
+            &reused,
+            100,
+            &mut lineage,
+            &members,
+            &bound,
+            |_| EnvRead::Present(SEAT.into()),
+            |_| true,
+        )
+        .unwrap();
+        assert!(found.unconfirmed.is_empty());
+        assert_eq!(pids(&found.found), vec![30]);
+        assert_eq!(lineage.rejected_carriers.len(), 1);
+    }
+
+    #[test]
+    fn a_child_observed_below_a_rejected_birth_is_rejected_before_any_adoption_boundary() {
+        let initial = [fact(5, 1, 5, 50), fact(10, 5, 10, 100)];
+        let members = capture(&initial, 10, 100).unwrap();
+        let mut lineage = Lineage::of(&initial, 10);
+        let bound = [SEAT.to_string()];
+        let first = [fact(5, 1, 5, 50), fact(30, 5, 30, 120)];
+        assert_eq!(
+            absorb(
+                &first,
+                100,
+                &mut lineage,
+                &members,
+                &bound,
+                seat_env,
+                |_| true
+            ),
+            Ok(Absorbed::default())
+        );
+        // The rejected parent is now adopted and has lost its seat id.
+        // Seeing its child below that same birth is still positive rejection.
+        let adopted = [fact(30, 1, 30, 120), fact(31, 30, 31, 130)];
+        let env = |pid| {
+            if pid == 30 {
+                EnvRead::Absent
+            } else {
+                EnvRead::Present(SEAT.into())
+            }
+        };
+        assert_eq!(
+            absorb(&adopted, 100, &mut lineage, &members, &bound, env, |_| true),
+            Ok(Absorbed::default())
+        );
+        assert_eq!(lineage.rejected_carriers[&(31, 130)].pid, 5);
+        let orphaned = [fact(31, 1, 31, 130)];
+        assert_eq!(
+            absorb(
+                &orphaned,
+                100,
+                &mut lineage,
+                &members,
+                &bound,
+                seat_env,
+                |_| true
+            ),
+            Ok(Absorbed::default())
+        );
+        // Neither the parent's nor the child's old rejection binds a new birth.
+        let reused = [fact(30, 1, 30, 121), fact(31, 30, 31, 131)];
+        let batch = absorb(&reused, 100, &mut lineage, &members, &bound, env, |_| true).unwrap();
+        assert!(batch.unconfirmed.is_empty());
+        assert_eq!(pids(&batch.found), vec![31]);
+    }
+
+    #[test]
+    fn a_captured_child_keeps_its_birth_proof_after_adoption_by_a_spared_ancestor() {
+        let initial = [
+            fact(5, 1, 5, 50),
+            fact(10, 5, 10, 100),
+            fact(20, 10, 10, 110),
+        ];
+        let members = capture(&initial, 10, 100).unwrap();
+        let excluded = [5];
+        let mut lineage = Lineage::of(&initial, 10).excluding(&excluded);
+        let later = [fact(5, 1, 5, 50), fact(20, 5, 10, 110)];
+        assert_eq!(
+            absorb(
+                &later,
+                100,
+                &mut lineage,
+                &members,
+                &[SEAT.to_string()],
+                |_| EnvRead::Present(SEAT.into()),
+                |_| true,
+            ),
+            Ok(Absorbed::default())
+        );
+        assert!(!lineage.rejected_carriers.contains_key(&(20, 110)));
+        let child = members.iter().find(|member| member.pid == 20).unwrap();
+        assert!(signal_proof(
+            child,
+            Seen::Live(later[1]),
+            &[],
+            || panic!("a captured child needs no carrier id"),
+            || panic!("a captured child keeps its native birth proof"),
+        ));
+    }
+
+    #[test]
+    fn a_same_tick_carrier_with_a_missing_parent_is_unconfirmed() {
+        let snapshot = [fact(10, 1, 10, 100), fact(44, 77, 44, 100)];
+        let members = capture(&snapshot, 10, 100).unwrap();
+        let result = absorb(
+            &snapshot,
+            100,
+            &mut Lineage::of(&snapshot, 10),
+            &members,
+            &[SEAT.to_string()],
+            |_| EnvRead::Present(SEAT.into()),
+            |_| true,
+        );
+        let batch = result.unwrap();
+        assert_eq!(pids(&batch.unconfirmed), vec![44]);
+        assert_eq!(batch.unconfirmed[0].start, 100);
+        assert!(batch.found.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_parent_id_cannot_prove_a_carrier_adoption_boundary() {
+        let snapshot = [
+            fact(5, 1, 5, 50),
+            fact(10, 1, 10, 100),
+            fact(30, 5, 30, 120),
+        ];
+        let members = capture(&snapshot, 10, 100).unwrap();
+        let result = absorb(
+            &snapshot,
+            100,
+            &mut Lineage::of(&snapshot, 10),
+            &members,
+            &[SEAT.to_string()],
+            |pid| {
+                if pid == 5 {
+                    EnvRead::Unreadable
+                } else {
+                    EnvRead::Present(SEAT.into())
+                }
+            },
+            |_| true,
+        );
+        let batch = result.unwrap();
+        assert_eq!(pids(&batch.unconfirmed), vec![30]);
+        assert!(batch.found.is_empty());
+    }
+
+    #[test]
+    fn invalid_parent_births_and_cycles_do_not_admit_carriers() {
+        for branch in [
+            [fact(30, 31, 30, 120), fact(31, 1, 31, 121)],
+            [fact(30, 31, 30, 120), fact(31, 30, 31, 120)],
+        ] {
+            let snapshot = [fact(10, 1, 10, 100), branch[0], branch[1]];
+            let members = capture(&snapshot, 10, 100).unwrap();
+            let result = absorb(
+                &snapshot,
+                100,
+                &mut Lineage::of(&snapshot, 10),
+                &members,
+                &[SEAT.to_string()],
+                |_| EnvRead::Present(SEAT.into()),
+                |_| true,
+            );
+            let batch = result.unwrap();
+            assert!(batch.unconfirmed.iter().any(|member| member.pid == 30));
+            assert!(!batch.found.iter().any(|member| member.pid == 30));
+        }
+    }
+
+    #[test]
+    fn unreadable_carrier_ancestry_unions_its_pid_with_captured_survivors() {
+        let proc_root = tempfile::tempdir().unwrap();
+        fake_process(proc_root.path(), 10, ("S", 0x40), &[]);
+        fake_process(proc_root.path(), 30, ("S", 0x40), &[]);
+        let snapshot = [fact(10, 1, 10, 98765), fact(30, 77, 30, 98765)];
+        let members = capture(&snapshot, 10, 98765).unwrap();
+        let bound = [SEAT.to_string()];
+        let mut not_signaled = UnsignaledCarriers::default();
+        let signal_sent = std::cell::Cell::new(false);
+        let mut sweep = Sweep {
+            proc_root: proc_root.path(),
+            root_start: 98765,
+            lineage: Lineage::of(&snapshot, 10),
+            bound_ids: &bound,
+            not_signaled: &mut not_signaled,
+            signal_sent: &signal_sent,
+            process_id_of: |_| EnvRead::Present(SEAT.into()),
+            eligible: |_| true,
+            authorize: |_| Ok(()),
+            refused: HashSet::new(),
+            refusal: None,
+        };
+        let batch = sweep.absorb(&snapshot, &members).unwrap();
+        let mut tracked = members;
+        tracked.extend(batch.found);
+        sweep.fence_uncertain(&snapshot, &batch.unconfirmed);
+        tracked.extend(batch.unconfirmed);
+        let uncertain = tracked.iter().find(|member| member.pid == 30).unwrap();
+        assert!(sweep.refused.contains(&30));
+        assert!(!sweep.proven(uncertain));
+        let left = sweep.survivors(&tracked);
+        let result = sweep.verdict(&tracked, left);
+        assert!(matches!(
+            result,
+            KillError::Unconfirmed { survivors, .. } if survivors == [10, 30]
+        ));
+    }
+
+    #[test]
+    fn an_unconfirmed_carrier_preserves_valid_forks_and_carriers_from_the_same_scan() {
+        let initial = [fact(10, 1, 10, 100)];
+        let members = capture(&initial, 10, 100).unwrap();
+        let later = [
+            fact(10, 1, 10, 100),
+            fact(20, 10, 10, 110),
+            fact(30, 77, 30, 120),
+            fact(40, 1, 40, 130),
+        ];
+        let batch = absorb(
+            &later,
+            100,
+            &mut Lineage::of(&initial, 10),
+            &members,
+            &[SEAT.to_string()],
+            seat_env,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(pids(&batch.found), vec![20, 40]);
+        assert_eq!(pids(&batch.unconfirmed), vec![30]);
+        assert_eq!(batch.unconfirmed[0].start, 120);
+    }
+
+    #[test]
+    fn unsignaled_carrier_notices_are_capped_deduplicated_and_preserved_on_error() {
+        let proc_root = tempfile::tempdir().unwrap();
+        fake_process(proc_root.path(), 10, ("S", 0x40), &[]);
+        let mut snapshot = vec![fact(5, 1, 5, 90000), fact(10, 5, 10, 98765)];
+        snapshot.extend((30..43).map(|pid| fact(pid, 5, pid, 98766)));
+        let members = capture(&snapshot, 10, 98765).unwrap();
+        let bound = [SEAT.to_string()];
+        let mut not_signaled = UnsignaledCarriers::default();
+        let signal_sent = std::cell::Cell::new(false);
+        let mut sweep = Sweep {
+            proc_root: proc_root.path(),
+            root_start: 98765,
+            lineage: Lineage::of(&snapshot, 10),
+            bound_ids: &bound,
+            not_signaled: &mut not_signaled,
+            signal_sent: &signal_sent,
+            process_id_of: |_| EnvRead::Present(SEAT.into()),
+            eligible: |_| true,
+            authorize: |_| Ok(()),
+            refused: HashSet::new(),
+            refusal: None,
+        };
+        assert_eq!(sweep.absorb(&snapshot, &members), Ok(Absorbed::default()));
+        assert_eq!(sweep.not_signaled.total, 13);
+        assert_eq!(sweep.not_signaled.entries.len(), UNSIGNALED_CARRIER_LIMIT);
+        assert_eq!(
+            sweep
+                .not_signaled
+                .entries
+                .iter()
+                .map(|entry| entry.pid)
+                .collect::<Vec<_>>(),
+            (30..40).collect::<Vec<_>>()
+        );
+        assert!(
+            sweep
+                .not_signaled
+                .entries
+                .iter()
+                .all(|entry| entry.launcher_pid == 5)
+        );
+
+        assert_eq!(sweep.absorb(&snapshot, &members), Ok(Absorbed::default()));
+        assert_eq!(
+            sweep.not_signaled.total, 13,
+            "a rescan counted the same births twice"
+        );
+        snapshot
+            .iter_mut()
+            .find(|fact| fact.pid == 30)
+            .unwrap()
+            .start += 1;
+        assert_eq!(sweep.absorb(&snapshot, &members), Ok(Absorbed::default()));
+        assert_eq!(sweep.not_signaled.total, 14, "a new birth was not counted");
+
+        snapshot.push(fact(61, 5, 61, 98767));
+        snapshot.push(fact(60, 77, 60, 98765));
+        fake_process(proc_root.path(), 60, ("S", 0x40), &[]);
+        let batch = sweep.absorb(&snapshot, &members).unwrap();
+        let mut tracked = members;
+        tracked.extend(batch.found);
+        sweep.fence_uncertain(&snapshot, &batch.unconfirmed);
+        tracked.extend(batch.unconfirmed);
+        let left = sweep.survivors(&tracked);
+        let result = sweep.verdict(&tracked, left);
+        assert!(matches!(
+            result,
+            KillError::Unconfirmed { survivors, .. } if survivors == [10, 60]
+        ));
+        assert_eq!(
+            sweep.not_signaled.total, 15,
+            "an error discarded a new notice"
+        );
+        assert_eq!(sweep.not_signaled.entries.len(), UNSIGNALED_CARRIER_LIMIT);
     }
 
     #[test]
@@ -1708,7 +2452,7 @@ mod tests {
             |_| panic!("no carrier arm without bound ids"),
             |_| panic!("no carrier arm without bound ids"),
         );
-        assert_eq!(found, Ok(Vec::new()));
+        assert_eq!(found, Ok(Absorbed::default()));
     }
 
     #[test]
@@ -1742,15 +2486,29 @@ mod tests {
             pid != 45
         })
         .unwrap();
-        let tree: Vec<u32> = found.iter().filter(|m| !m.carrier).map(|m| m.pid).collect();
-        let carriers: Vec<u32> = found.iter().filter(|m| m.carrier).map(|m| m.pid).collect();
+        assert!(found.unconfirmed.is_empty());
+        let tree: Vec<u32> = found
+            .found
+            .iter()
+            .filter(|m| !m.carrier)
+            .map(|m| m.pid)
+            .collect();
+        let carriers: Vec<u32> = found
+            .found
+            .iter()
+            .filter(|m| m.carrier)
+            .map(|m| m.pid)
+            .collect();
         assert_eq!(tree, vec![60, 61]);
         // The ancestors 3 and 5 still carry the id and are still excluded.
         assert_eq!(carriers, vec![95]);
 
-        members.extend(found);
+        members.extend(found.found);
         assert_eq!(
-            absorb(&later, 100, &mut lineage, &members, &bound, env, |_| true).map(|f| pids(&f)),
+            absorb(&later, 100, &mut lineage, &members, &bound, env, |_| true).map(|batch| {
+                assert!(batch.unconfirmed.is_empty());
+                pids(&batch.found)
+            }),
             Ok(vec![45])
         );
     }
@@ -1844,7 +2602,13 @@ mod tests {
             seat_env,
             eligible,
         );
-        assert_eq!(found.map(|f| pids(&f)), Ok(vec![70]));
+        assert_eq!(
+            found.map(|batch| {
+                assert!(batch.unconfirmed.is_empty());
+                pids(&batch.found)
+            }),
+            Ok(vec![70])
+        );
         assert!([60, 61, 62].iter().all(|pid| lineage.fenced.contains(pid)));
         members.push(Member {
             pid: 70,
@@ -1870,7 +2634,7 @@ mod tests {
             seat_env,
             eligible,
         );
-        assert_eq!(found, Ok(Vec::new()));
+        assert_eq!(found, Ok(Absorbed::default()));
     }
 
     #[test]
@@ -1951,13 +2715,13 @@ mod tests {
 
     fn terminate_tree(root: u32, expected: &str) -> Result<GroupSignal, KillError> {
         terminate(
-            root,
-            expected,
+            (root, expected),
             &[],
             &[],
             |_| EnvRead::Absent,
             |_| true,
             |_| Ok(()),
+            &mut UnsignaledCarriers::default(),
         )
     }
 
@@ -2046,18 +2810,59 @@ mod tests {
         }
     }
 
-    /// Owns this test's fixture processes and their process group. Drop
-    /// SIGKILLs the fixture group (created by the test itself) and reaps.
+    /// Owns this test's fixture processes and their process group. The
+    /// leader's birth is captured while its Child is still unreaped.
     struct Fixture {
         group: u32,
+        birth: Option<String>,
         children: Vec<Child>,
+    }
+
+    impl Fixture {
+        fn new(leader: Child) -> Self {
+            let group = leader.id();
+            let birth = identity(group);
+            Self {
+                group,
+                birth,
+                children: vec![leader],
+            }
+        }
+    }
+
+    /// WNOWAIT proves this is still our unreaped child without consuming
+    /// its exit status. ECHILD or an unreadable/changed birth fails closed.
+    fn still_owned(child: &Child, birth: Option<&str>) -> bool {
+        let Some(birth) = birth else {
+            return false;
+        };
+        // SAFETY: siginfo_t is a plain C result buffer; waitid only reads
+        // our positive child PID and writes this buffer, without reaping.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let owned = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == 0
+        };
+        owned && has_identity(child.id(), birth)
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            // `group` is a process group this test created with
-            // process_group(0); nothing else ever joins it.
-            let _ = signal_group(self.group, libc::SIGKILL);
+            // The unreaped leader pins this exact group number. No wait
+            // may reap it before its birth and group are rechecked.
+            if let Some(leader) = self.children.first()
+                && leader.id() == self.group
+                && let Ok(raw) = libc::pid_t::try_from(leader.id())
+                && still_owned(leader, self.birth.as_deref())
+                // SAFETY: reads the group of this positive, owned child.
+                && unsafe { libc::getpgid(raw) } == raw
+            {
+                let _ = signal_group(self.group, libc::SIGKILL);
+            }
             for child in &mut self.children {
                 let _ = child.kill();
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -2122,10 +2927,7 @@ mod tests {
     fn leader_group_with_two_children_is_terminated_and_confirmed_gone() {
         let leader = spawn("sleep 30 & sleep 30 & wait", 0);
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         let members = captured(root, 3);
         assert!(members.iter().all(|member| member.in_group));
 
@@ -2140,10 +2942,7 @@ mod tests {
         // A test-owned group whose leader is not the seat root.
         let anchor = spawn("exec sleep 30", 0);
         let group = anchor.id();
-        let mut fixture = Fixture {
-            group,
-            children: vec![anchor],
-        };
+        let mut fixture = Fixture::new(anchor);
         let root_child = spawn("sleep 30 & wait", group);
         let root = root_child.id();
         fixture.children.push(root_child);
@@ -2168,10 +2967,7 @@ mod tests {
     fn root_identity_mismatch_signals_nothing() {
         let leader = spawn("sleep 30 & wait", 0);
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         let members = captured(root, 2);
         let (boot, ticks) = identity(root)
             .unwrap()
@@ -2194,10 +2990,7 @@ mod tests {
         // SIG_IGN survives exec, so sleep itself ignores SIGTERM.
         let leader = spawn("trap '' TERM; exec sleep 30", 0);
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         // Wait for the exec, so the captured incarnation is sleep's.
         let deadline = Instant::now() + Duration::from_secs(5);
         while std::fs::read_to_string(format!("/proc/{root}/comm"))
@@ -2223,10 +3016,7 @@ mod tests {
     fn a_reparented_carrier_with_a_bound_id_is_captured_and_terminated() {
         let leader = spawn("exec sleep 30", 0);
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         wait_for_sleep(root);
         let id = format!("kill-tree-linux-carrier-{}-{root}", std::process::id());
         // The intermediate shell exits at once; its background sleep is
@@ -2254,13 +3044,13 @@ mod tests {
         assert!(tree.iter().all(|member| member.pid != carrier));
 
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             std::slice::from_ref(&id),
             &[],
             crate::proctruth::process_id_of,
             |_| true,
             |_| Ok(()),
+            &mut UnsignaledCarriers::default(),
         );
         assert_eq!(result, Ok(GroupSignal::Sent));
         assert_ne!(start_of(carrier), Some(carrier_start), "carrier survived");
@@ -2275,10 +3065,7 @@ mod tests {
         // keeping its start time, so it stays observable unless signaled.
         let anchor = spawn("sh -c 'sleep 30 & wait' & wait; exec sleep 30", 0);
         let group = anchor.id();
-        let fixture = Fixture {
-            group,
-            children: vec![anchor],
-        };
+        let fixture = Fixture::new(anchor);
         let tree = captured(group, 3);
         let root = tree
             .iter()
@@ -2292,8 +3079,7 @@ mod tests {
         // so the anchor is the only carrier candidate outside the root tree.
         let fixture_pids: Vec<u32> = tree.iter().map(|member| member.pid).collect();
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             &[SEAT.to_string()],
             &[],
             |pid| {
@@ -2305,6 +3091,7 @@ mod tests {
             },
             |_| true,
             |_| Ok(()),
+            &mut UnsignaledCarriers::default(),
         );
         assert_eq!(result, Ok(GroupSignal::Sent));
         let root_tree: Vec<&Member> = tree.iter().filter(|member| member.pid != group).collect();
@@ -2314,15 +3101,489 @@ mod tests {
     }
 
     #[test]
+    fn an_excluded_ancestor_spawning_bound_id_siblings_does_not_refill_the_seat() {
+        let dir = tempfile::Builder::new()
+            .prefix("hcom-off-seat-carriers-")
+            .tempdir()
+            .unwrap();
+        let home = dir.path().join("home");
+        let state = dir.path().join("hcom");
+        let tmp = dir.path().join("tmp");
+        for path in [&home, &state, &tmp] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(state.join("config.toml"), "[relay]\nenabled = false\n").unwrap();
+        let root_file = dir.path().join("root");
+        let sibling_file = dir.path().join("siblings");
+        let child_file = dir.path().join("seat-child");
+        let release_root = dir.path().join("release-root");
+        let begin = dir.path().join("begin");
+        let stop = dir.path().join("stop");
+        let program = dir.path().join("ancestor.py");
+        std::fs::write(
+            &program,
+            format!(
+                r#"import ctypes, os, subprocess, sys, time
+root_file, sibling_file, begin, stop, child_file, release_root = sys.argv[1:]
+if ctypes.CDLL(None).prctl({}, 1, 0, 0, 0) != 0:
+    raise RuntimeError("fixture could not become a subreaper")
+root = subprocess.Popen(
+    [sys.executable, "-c",
+     "import os, subprocess, sys, time\n"
+     "child = subprocess.Popen(['/bin/sh', '-c', \"trap '' TERM; exec /bin/sleep 30\"])\n"
+     "with open(sys.argv[1], 'w') as output: output.write(str(child.pid))\n"
+     "while not os.path.exists(sys.argv[2]): time.sleep(0.01)\n"
+     "os._exit(0)\n",
+     child_file, release_root],
+    start_new_session=True,
+)
+with open(root_file, "w") as output:
+    output.write(str(root.pid))
+while not os.path.exists(begin) and not os.path.exists(stop):
+    time.sleep(0.01)
+siblings = []
+while not os.path.exists(stop):
+    child = subprocess.Popen(["/bin/sleep", "30"])
+    siblings.append(child)
+    with open(sibling_file, "a") as output:
+        output.write(str(child.pid) + "\n")
+    root.poll()
+    time.sleep(0.02)
+root.wait()
+for child in siblings:
+    child.wait()
+"#,
+                libc::PR_SET_CHILD_SUBREAPER,
+            ),
+        )
+        .unwrap();
+        let token = marker("off-seat-siblings");
+        let ancestor = Command::new("python3")
+            .arg(&program)
+            .args([
+                &root_file,
+                &sibling_file,
+                &begin,
+                &stop,
+                &child_file,
+                &release_root,
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("HCOM_DIR", &state)
+            .env("TMPDIR", &tmp)
+            .env("HCOM_PROCESS_ID", &token)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn own excluded ancestor");
+        let ancestor_pid = ancestor.id();
+        let fixture = Fixture::new(ancestor);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (root, seat_child) = loop {
+            let read_pid = |path: &Path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|pid| pid.parse::<u32>().ok())
+            };
+            if let (Some(root), Some(child)) = (read_pid(&root_file), read_pid(&child_file)) {
+                break (root, child);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ancestor never spawned its seat tree"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let root_start = start_of(root).expect("fixture root start");
+        let root_guard = Stray(Pinned::pin(root, root_start, &token));
+        wait_for_sleep(seat_child);
+        let child_start = start_of(seat_child).expect("fixture seat child start");
+        let child_guard = Stray(Pinned::pin(seat_child, child_start, &token));
+        std::fs::write(&begin, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let siblings = loop {
+            let pids: Vec<u32> = std::fs::read_to_string(&sibling_file)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|pid| pid.parse().ok())
+                .take(3)
+                .collect();
+            if pids.len() == 3 {
+                break pids;
+            }
+            assert!(Instant::now() < deadline, "ancestor never spawned siblings");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let siblings: Vec<_> = siblings
+            .into_iter()
+            .map(|pid| {
+                let start = start_of(pid).expect("fixture sibling start");
+                assert!(start >= root_start);
+                (pid, start, Stray(Pinned::pin(pid, start, &token)))
+            })
+            .collect();
+
+        let mut not_signaled = UnsignaledCarriers::default();
+        let root_identity = identity(root).unwrap();
+        let mut root_released = false;
+        let result = terminate(
+            (root, &root_identity),
+            std::slice::from_ref(&token),
+            &[ancestor_pid],
+            crate::proctruth::process_id_of,
+            |_| true,
+            |pid| {
+                if pid == seat_child && !root_released {
+                    root_released = true;
+                    std::fs::write(&release_root, b"").unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while has_identity(root, &root_identity)
+                        || !matches!(
+                            observe(Path::new("/proc"), seat_child),
+                            Seen::Live(fact) if fact.start == child_start && fact.ppid == ancestor_pid
+                        )
+                    {
+                        assert!(
+                            Instant::now() < deadline,
+                            "captured child was never adopted"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                Ok(())
+            },
+            &mut not_signaled,
+        );
+        std::fs::write(&stop, b"").unwrap();
+        assert_eq!(result, Ok(GroupSignal::NotFound));
+        assert_ne!(start_of(root), Some(root_start), "seat root survived");
+        assert_ne!(
+            start_of(seat_child),
+            Some(child_start),
+            "captured adopted child survived"
+        );
+        assert!(not_signaled.total >= siblings.len());
+        assert_eq!(
+            not_signaled.entries.len(),
+            not_signaled.total.min(UNSIGNALED_CARRIER_LIMIT)
+        );
+        assert!(not_signaled.entries.iter().all(|entry| {
+            entry.launcher_pid == ancestor_pid && entry.pid != seat_child && entry.pid != root
+        }));
+        for (pid, start, guard) in &siblings {
+            assert_eq!(
+                start_of(*pid),
+                Some(*start),
+                "off-seat sibling was signaled"
+            );
+            assert!(guard.0.signal(0), "off-seat sibling exited");
+        }
+        drop(siblings);
+        drop(child_guard);
+        drop(root_guard);
+        drop(fixture);
+    }
+
+    #[test]
+    fn a_carrier_adopted_by_a_non_id_subreaper_is_still_terminated() {
+        let dir = tempfile::Builder::new()
+            .prefix("hcom-adopted-carrier-")
+            .tempdir()
+            .unwrap();
+        let home = dir.path().join("home");
+        let state = dir.path().join("hcom");
+        let tmp = dir.path().join("tmp");
+        for path in [&home, &state, &tmp] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(state.join("config.toml"), "[relay]\nenabled = false\n").unwrap();
+        let root_file = dir.path().join("root");
+        let carrier_file = dir.path().join("carrier");
+        let stop = dir.path().join("stop");
+        let program = dir.path().join("subreaper.py");
+        std::fs::write(
+            &program,
+            format!(
+                r#"import ctypes, os, subprocess, sys, time
+root_file, carrier_file, stop, token = sys.argv[1:]
+if ctypes.CDLL(None).prctl({}, 1, 0, 0, 0) != 0:
+    raise RuntimeError("fixture could not become a subreaper")
+marked = os.environ.copy()
+marked["HCOM_PROCESS_ID"] = token
+root = subprocess.Popen(["/bin/sleep", "30"], env=marked, start_new_session=True)
+with open(root_file, "w") as output:
+    output.write(str(root.pid))
+carrier = int(subprocess.check_output(
+    ["/bin/sh", "-c", "/bin/sleep 30 </dev/null >/dev/null 2>&1 & echo $!"],
+    env=marked,
+))
+with open(carrier_file, "w") as output:
+    output.write(str(carrier))
+while not os.path.exists(stop):
+    time.sleep(0.01)
+root.wait()
+os.waitpid(carrier, 0)
+"#,
+                libc::PR_SET_CHILD_SUBREAPER,
+            ),
+        )
+        .unwrap();
+        let token = marker("adopted-carrier");
+        let subreaper = Command::new("python3")
+            .arg(&program)
+            .args([&root_file, &carrier_file, &stop])
+            .arg(&token)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("HCOM_DIR", &state)
+            .env("TMPDIR", &tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn own non-id subreaper");
+        let subreaper_pid = subreaper.id();
+        let subreaper_start = start_of(subreaper_pid).expect("fixture subreaper start");
+        let fixture = Fixture::new(subreaper);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (root, carrier) = loop {
+            let read_pid = |path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|pid| pid.parse::<u32>().ok())
+            };
+            if let (Some(root), Some(carrier)) = (read_pid(&root_file), read_pid(&carrier_file))
+                && matches!(
+                    observe(Path::new("/proc"), carrier),
+                    Seen::Live(fact) if fact.ppid == subreaper_pid
+                )
+            {
+                break (root, carrier);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture carrier was never adopted"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        wait_for_sleep(root);
+        wait_for_sleep(carrier);
+        let root_start = start_of(root).expect("fixture root start");
+        let carrier_start = start_of(carrier).expect("fixture carrier start");
+        let root_guard = Stray(Pinned::pin(root, root_start, &token));
+        let carrier_guard = Stray(Pinned::pin(carrier, carrier_start, &token));
+        assert!(carrier_start >= root_start);
+        assert!(matches!(
+            crate::proctruth::process_id_of(subreaper_pid),
+            EnvRead::Absent
+        ));
+
+        let mut not_signaled = UnsignaledCarriers::default();
+        let result = terminate(
+            (root, &identity(root).unwrap()),
+            std::slice::from_ref(&token),
+            &[subreaper_pid],
+            crate::proctruth::process_id_of,
+            |_| true,
+            |_| Ok(()),
+            &mut not_signaled,
+        );
+        std::fs::write(&stop, b"").unwrap();
+        assert_eq!(result, Ok(GroupSignal::Sent));
+        assert_eq!(not_signaled.total, 0, "an adopted carrier was excluded");
+        assert_ne!(start_of(root), Some(root_start), "seat root survived");
+        assert_ne!(
+            start_of(carrier),
+            Some(carrier_start),
+            "adopted carrier survived"
+        );
+        assert_eq!(
+            start_of(subreaper_pid),
+            Some(subreaper_start),
+            "non-id subreaper was signaled"
+        );
+        drop(carrier_guard);
+        drop(root_guard);
+        drop(fixture);
+    }
+
+    #[test]
+    fn late_uncertain_ancestry_never_abandons_other_owned_members_before_sigkill() {
+        let dir = tempfile::Builder::new()
+            .prefix("hcom-late-uncertain-")
+            .tempdir()
+            .unwrap();
+        let home = dir.path().join("home");
+        let state = dir.path().join("hcom");
+        let tmp = dir.path().join("tmp");
+        for path in [&home, &state, &tmp] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(state.join("config.toml"), "[relay]\nenabled = false\n").unwrap();
+        let ready = dir.path().join("ready");
+        let begin = dir.path().join("begin");
+        let child_file = dir.path().join("child");
+        let program = dir.path().join("root.py");
+        std::fs::write(
+            &program,
+            r#"import os, signal, subprocess, sys, time
+ready, begin, child_file = sys.argv[1:]
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(ready, "w") as output:
+    output.write("ready")
+while not os.path.exists(begin):
+    time.sleep(0.01)
+child = subprocess.Popen(["/bin/sleep", "30"])
+with open(child_file, "w") as output:
+    output.write(str(child.pid))
+time.sleep(30)
+"#,
+        )
+        .unwrap();
+        let token = marker("late-uncertain");
+        let leader = Command::new("python3")
+            .arg(&program)
+            .args([&ready, &begin, &child_file])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("HCOM_DIR", &state)
+            .env("TMPDIR", &tmp)
+            .env("HCOM_PROCESS_ID", &token)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn own TERM-ignoring root");
+        let root = leader.id();
+        let fixture = Fixture::new(leader);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "root never installed SIG_IGN");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let root_identity = identity(root).unwrap();
+        let root_start = start_of(root).unwrap();
+        let me = std::process::id();
+        let mut valid_child = None::<(u32, u64, Stray)>;
+        let mut uncertain = None::<(Fixture, u32, u64, Stray)>;
+        let mut not_signaled = UnsignaledCarriers::default();
+        let result = terminate(
+            (root, &root_identity),
+            std::slice::from_ref(&token),
+            &[me],
+            |pid| {
+                if pid == me {
+                    EnvRead::Unreadable
+                } else {
+                    crate::proctruth::process_id_of(pid)
+                }
+            },
+            |_| true,
+            |pid| {
+                if pid == root && uncertain.is_none() {
+                    std::fs::write(&begin, b"").unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let child = loop {
+                        if let Some(child) = std::fs::read_to_string(&child_file)
+                            .ok()
+                            .and_then(|pid| pid.parse::<u32>().ok())
+                        {
+                            break child;
+                        }
+                        assert!(Instant::now() < deadline, "root never made its late fork");
+                        std::thread::sleep(Duration::from_millis(5));
+                    };
+                    wait_for_sleep(child);
+                    let start = start_of(child).unwrap();
+                    valid_child = Some((child, start, Stray(Pinned::pin(child, start, &token))));
+
+                    let child = command("exec /bin/sleep 30", 0)
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .env("HOME", &home)
+                        .env("HCOM_DIR", &state)
+                        .env("TMPDIR", &tmp)
+                        .env("HCOM_PROCESS_ID", &token)
+                        .spawn()
+                        .expect("spawn own uncertain carrier");
+                    let pid = child.id();
+                    let fixture = Fixture::new(child);
+                    wait_for_sleep(pid);
+                    let start = start_of(pid).unwrap();
+                    uncertain = Some((fixture, pid, start, Stray(Pinned::pin(pid, start, &token))));
+                }
+                Ok(())
+            },
+            &mut not_signaled,
+        );
+        let (_, pid, start, guard) = uncertain.as_ref().expect("late uncertain carrier");
+        assert!(matches!(
+            result,
+            Err(KillError::Unconfirmed { reason, survivors })
+                if reason.contains("ancestry") && survivors == [*pid]
+        ));
+        assert_ne!(
+            start_of(root),
+            Some(root_start),
+            "TERM-ignoring root escaped escalation"
+        );
+        // Peek at our own unreaped root's status without forfeiting the
+        // fixture's group-cleanup authority. It died by SIGKILL, not timeout.
+        // SAFETY: siginfo_t is a C result buffer with a valid zero value.
+        let mut exit: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: a writable result buffer and our positive, unreaped Child.
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    root as libc::id_t,
+                    &mut exit,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        assert_eq!(exit.si_code, libc::CLD_KILLED);
+        // SAFETY: waitid succeeded and filled this SIGCHLD result buffer.
+        assert_eq!(unsafe { exit.si_pid() }, root as libc::pid_t);
+        // SAFETY: the checked result is CLD_KILLED for this root.
+        assert_eq!(unsafe { exit.si_status() }, libc::SIGKILL);
+        let (child, child_start, _) = valid_child.as_ref().expect("validated same-pass fork");
+        assert_ne!(
+            start_of(*child),
+            Some(*child_start),
+            "same-pass validated fork was lost"
+        );
+        assert_eq!(
+            start_of(*pid),
+            Some(*start),
+            "uncertain carrier was signaled"
+        );
+        assert!(guard.0.signal(0), "uncertain carrier exited");
+        assert_eq!(
+            not_signaled.total, 0,
+            "uncertainty became an informational rejection"
+        );
+        drop(valid_child);
+        drop(uncertain);
+        drop(fixture);
+    }
+
+    #[test]
     fn a_root_that_exits_and_is_reaped_before_its_own_signal_is_success() {
         // Anchor -> root shell -> sleeper. The anchor reaps the root at once.
         let token = marker("root-reaped");
         let anchor = spawn_marked("sh -c 'sleep 30 & wait' & wait; exec sleep 30", 0, &token);
         let group = anchor.id();
-        let fixture = Fixture {
-            group,
-            children: vec![anchor],
-        };
+        let fixture = Fixture::new(anchor);
         let tree = captured(group, 3);
         let root_member = tree
             .iter()
@@ -2335,8 +3596,7 @@ mod tests {
         // descendants exits on its own, so it is gone at its own signal.
         let mut ended = false;
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             &[],
             &[],
             |_| EnvRead::Absent,
@@ -2356,6 +3616,7 @@ mod tests {
                 }
                 Ok(())
             },
+            &mut UnsignaledCarriers::default(),
         );
         assert_eq!(result, Ok(GroupSignal::NotFound));
         assert!(
@@ -2377,10 +3638,7 @@ mod tests {
             &token,
         );
         let group = anchor.id();
-        let fixture = Fixture {
-            group,
-            children: vec![anchor],
-        };
+        let fixture = Fixture::new(anchor);
         let tree = captured(group, 3);
         let root_member = tree
             .iter()
@@ -2404,8 +3662,7 @@ mod tests {
         let mut ended = false;
         let began = Instant::now();
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             &[],
             &[],
             |_| EnvRead::Absent,
@@ -2423,6 +3680,7 @@ mod tests {
                 }
                 Ok(())
             },
+            &mut UnsignaledCarriers::default(),
         );
         assert_eq!(result, Ok(GroupSignal::NotFound));
         assert!(!running(sleeper));
@@ -2438,10 +3696,7 @@ mod tests {
         // A test-owned group whose leader is not the seat root.
         let anchor = spawn("exec sleep 30", 0);
         let group = anchor.id();
-        let mut fixture = Fixture {
-            group,
-            children: vec![anchor],
-        };
+        let mut fixture = Fixture::new(anchor);
         wait_for_sleep(group);
         let id = format!("kill-tree-linux-forker-{}-{group}", std::process::id());
         // The root and its sleepers ignore SIGTERM, so the root keeps forking
@@ -2464,13 +3719,13 @@ mod tests {
         let first = captured(root, 3);
 
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             std::slice::from_ref(&id),
             &[],
             crate::proctruth::process_id_of,
             |_| true,
             |_| Ok(()),
+            &mut UnsignaledCarriers::default(),
         );
         assert_eq!(result, Ok(GroupSignal::Sent));
         assert!(first.iter().all(|member| !running(member)));
@@ -2486,10 +3741,7 @@ mod tests {
     fn an_excluded_group_member_survives_while_the_rest_of_the_group_goes() {
         let leader = spawn("sleep 30 & sleep 30 & wait", 0);
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         let tree = captured(root, 3);
         let spared = tree
             .iter()
@@ -2501,13 +3753,13 @@ mod tests {
 
         // The excluded sleeper shares the root's group, so no killpg may run.
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             &[],
             &[spared],
             |_| EnvRead::Absent,
             |_| true,
             |_| Ok(()),
+            &mut UnsignaledCarriers::default(),
         );
         assert_eq!(result, Ok(GroupSignal::Sent));
         assert!(
@@ -2528,21 +3780,18 @@ mod tests {
         // After its wait the root execs sleep, keeping its start time.
         let leader = spawn("sleep 30 & wait; exec sleep 30", 0);
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         let tree = captured(root, 2);
         let root_start = start_of(root).unwrap();
 
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             &[],
             &[root],
             |_| EnvRead::Absent,
             |_| true,
             |_| Ok(()),
+            &mut UnsignaledCarriers::default(),
         );
         assert_eq!(result, Ok(GroupSignal::NotFound));
         assert!(
@@ -2558,17 +3807,19 @@ mod tests {
         drop(fixture);
     }
 
-    /// SIGKILLs and reaps one process this test forked.
-    struct Forked(libc::pid_t);
+    /// SIGKILLs only a pinned fixture process and reaps our own fork.
+    struct Forked {
+        pid: libc::pid_t,
+        pinned: Option<Pinned>,
+    }
 
     impl Drop for Forked {
         fn drop(&mut self) {
-            // Our own forked child; waitpid reaps it after the kill.
-            if let Ok(pid) = u32::try_from(self.0) {
-                let _ = signal_pid(pid, libc::SIGKILL);
+            if let Some(pinned) = &self.pinned {
+                pinned.signal(libc::SIGKILL);
             }
-            // SAFETY: waits for our own forked child; no status is read.
-            unsafe { libc::waitpid(self.0, std::ptr::null_mut(), 0) };
+            // SAFETY: waits for our own positive fork PID; no status is read.
+            unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
         }
     }
 
@@ -2582,8 +3833,32 @@ mod tests {
         let (arg0, arg1) = (c"sleep", c"30");
         let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
         let token = marker("leader-shares-parent-group");
-        let env = std::ffi::CString::new(format!("HCOM_PROCESS_ID={token}")).unwrap();
-        let envp = [env.as_ptr(), std::ptr::null()];
+        let dir = tempfile::Builder::new()
+            .prefix("hcom-kill-tree-linux-")
+            .tempdir()
+            .unwrap();
+        let home = dir.path().join("home");
+        let state = dir.path().join("hcom");
+        let tmp = dir.path().join("tmp");
+        for path in [&home, &state, &tmp] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(state.join("config.toml"), "[relay]\nenabled = false\n").unwrap();
+        // execve inherits nothing: only private roots and this test's
+        // deliberate positive marker reach either fixture process.
+        let env = [
+            std::ffi::CString::new(format!("HOME={}", home.display())).unwrap(),
+            std::ffi::CString::new(format!("HCOM_DIR={}", state.display())).unwrap(),
+            std::ffi::CString::new(format!("TMPDIR={}", tmp.display())).unwrap(),
+            std::ffi::CString::new(format!("HCOM_PROCESS_ID={token}")).unwrap(),
+        ];
+        let envp = [
+            env[0].as_ptr(),
+            env[1].as_ptr(),
+            env[2].as_ptr(),
+            env[3].as_ptr(),
+            std::ptr::null(),
+        ];
         // The parent forks the root, makes it lead its own group, then joins
         // that group itself: a leader root whose group holds its ancestor.
         // SAFETY: between fork and exec the children call only fork, setpgid,
@@ -2607,7 +3882,10 @@ mod tests {
                 libc::_exit(127);
             }
         }
-        let parent_guard = Forked(parent);
+        let mut parent_guard = Forked {
+            pid: parent,
+            pinned: None,
+        };
         let parent = parent as u32;
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2626,6 +3904,11 @@ mod tests {
         };
         wait_for_sleep(root);
         wait_for_sleep(parent);
+        parent_guard.pinned = Some(Pinned::pin(
+            parent,
+            start_of(parent).expect("own fork start"),
+            &token,
+        ));
         let root_start = start_of(root).unwrap();
         let root_stray = Stray(Pinned::pin(root, root_start, &token));
         let parent_start = start_of(parent).unwrap();
@@ -2653,10 +3936,7 @@ mod tests {
             .spawn()
             .expect("spawn own root");
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         let tree = captured(root, 4);
         let snapshot = snapshot(Path::new("/proc")).unwrap();
         let broker = snapshot
@@ -2675,13 +3955,13 @@ mod tests {
         ];
 
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             std::slice::from_ref(&id),
             &[],
             crate::proctruth::process_id_of,
             |pid| pid != broker,
             |_| Ok(()),
+            &mut UnsignaledCarriers::default(),
         );
         assert_eq!(result, Ok(GroupSignal::Sent));
         for (pid, start) in spared {
@@ -2699,15 +3979,11 @@ mod tests {
     fn an_unauthorized_member_refuses_the_kill_before_any_signal() {
         let leader = spawn("sleep 30 & sleep 30 & wait", 0);
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         let tree = captured(root, 3);
         let foreign = tree.iter().find(|member| member.pid != root).unwrap().pid;
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             &[],
             &[],
             |_| EnvRead::Absent,
@@ -2719,11 +3995,18 @@ mod tests {
                     Ok(())
                 }
             },
+            &mut UnsignaledCarriers::default(),
         );
-        assert_eq!(
+        assert!(matches!(
             result,
-            Err(KillError::Refused("owned by another row".into()))
-        );
+            Err(KillError::Refused(reason))
+                if reason.contains("no signal sent")
+                    && reason.contains("owned by another row")
+                    && reason.contains("not signaled:")
+                    && reason.contains(&root.to_string())
+                    && reason.contains(&foreign.to_string())
+                    && !reason.contains("survivors:")
+        ));
         std::thread::sleep(Duration::from_millis(100));
         assert!(tree.iter().all(running), "a member was signaled");
         drop(fixture);
@@ -2733,10 +4016,7 @@ mod tests {
     fn an_unauthorized_late_fork_is_never_signaled_and_reported_unconfirmed() {
         let anchor = spawn("exec sleep 30", 0);
         let group = anchor.id();
-        let mut fixture = Fixture {
-            group,
-            children: vec![anchor],
-        };
+        let mut fixture = Fixture::new(anchor);
         wait_for_sleep(group);
         // The root ignores SIGTERM and keeps forking; only the processes
         // present at the start are authorized, so later forks stay unsignaled.
@@ -2766,8 +4046,7 @@ mod tests {
         };
 
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             &[],
             &[],
             |_| EnvRead::Absent,
@@ -2782,6 +4061,7 @@ mod tests {
                     _ => Ok(()),
                 }
             },
+            &mut UnsignaledCarriers::default(),
         );
         let Err(KillError::Unconfirmed { reason, survivors }) = result else {
             panic!("expected an unconfirmed kill, got {result:?}");
@@ -2839,17 +4119,13 @@ mod tests {
         let token = marker(name);
         let leader = spawn_marked(script, 0, &token);
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         let tree = captured(root, 2);
         let victim_member = tree.iter().find(|member| member.pid != root).unwrap();
         let victim = victim_member.pid;
         let pinned_victim = Pinned::pin(victim, victim_member.start, &token);
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             &[],
             &[],
             |_| EnvRead::Absent,
@@ -2870,6 +4146,7 @@ mod tests {
                     survivors: vec![victim],
                 })
             },
+            &mut UnsignaledCarriers::default(),
         );
         drop(fixture);
         (result, tree)
@@ -2918,10 +4195,7 @@ mod tests {
             &token,
         );
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         let tree = captured(root, 2);
         let child = tree.iter().find(|member| member.pid != root).unwrap().pid;
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -2945,8 +4219,7 @@ mod tests {
         // refuses it while it exits: the frontend's flake (b).
         let mut caught = false;
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             &[],
             &[],
             |_| EnvRead::Absent,
@@ -2967,6 +4240,7 @@ mod tests {
                     survivors: vec![child],
                 })
             },
+            &mut UnsignaledCarriers::default(),
         );
         assert!(caught, "the child was never seen exiting");
         assert_eq!(result, Ok(GroupSignal::Sent));
@@ -2992,11 +4266,15 @@ mod tests {
             carrier: false,
         };
         let preflight = |members: &[Member]| {
+            let mut not_signaled = UnsignaledCarriers::default();
+            let signal_sent = std::cell::Cell::new(false);
             let mut sweep = Sweep {
                 proc_root: root.path(),
                 root_start: 1,
                 lineage: Lineage::of(&[], 10),
                 bound_ids: &[],
+                not_signaled: &mut not_signaled,
+                signal_sent: &signal_sent,
                 process_id_of: |_| EnvRead::Absent,
                 eligible: |_| true,
                 authorize: |pid| Err(KillError::Refused(format!("{pid} unreadable"))),
@@ -3048,10 +4326,7 @@ mod tests {
         );
         let leader = spawn(&script, 0);
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         let deadline = Instant::now() + Duration::from_secs(5);
         let trapped: u32 = loop {
             if let Some(pid) = std::fs::read_to_string(&pidfile)
@@ -3076,8 +4351,7 @@ mod tests {
             (seconds * hertz) as u64
         };
         let result = terminate(
-            root,
-            &identity(root).unwrap(),
+            (root, &identity(root).unwrap()),
             &[],
             &[],
             |_| EnvRead::Absent,
@@ -3095,6 +4369,7 @@ mod tests {
                     _ => Ok(()),
                 }
             },
+            &mut UnsignaledCarriers::default(),
         );
         let Err(KillError::Unconfirmed { reason, survivors }) = result else {
             panic!("expected an unconfirmed kill, got {result:?}");
@@ -3131,10 +4406,7 @@ mod tests {
             &token,
         );
         let root = leader.id();
-        let fixture = Fixture {
-            group: root,
-            children: vec![leader],
-        };
+        let fixture = Fixture::new(leader);
         let tree = captured(root, 2);
         let child = tree.iter().find(|member| member.pid != root).unwrap();
         let stray = Stray(Pinned::pin(child.pid, child.start, &token));

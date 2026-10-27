@@ -22,8 +22,16 @@ fn terminal_ownership_case(
         |db, name| {
             let row = db.get_instance_full(name).unwrap().unwrap();
             let owner = crate::proctruth::verify_kill_owner(2_000_000_000, None, &[]).unwrap();
-            let (_, pane_closed, _, _, _) =
-                kill_instance(db, name, &owner, &row, false, &[], &[]).unwrap();
+            let (_, pane_closed, _, _, _) = kill_instance(
+                db,
+                name,
+                &owner,
+                &row,
+                &[],
+                &[],
+                &mut crate::sys::process::UnsignaledCarriers::default(),
+            )
+            .unwrap();
             pane_closed
         },
     );
@@ -685,6 +693,48 @@ fn test_handle_remote_kill_response_without_teardown_errors() {
     );
 }
 
+/// Remote notices come only from the executor's report: a peer that
+/// predates them shows none, and a long report names the first ten
+/// readable entries and counts the rest, unreadable ones included.
+#[test]
+fn test_remote_unsignaled_carriers_render_bounded_and_only_as_reported() {
+    let render = |result: serde_json::Value| {
+        render_unsignaled_carriers(&remote_unsignaled_carriers(&result))
+    };
+    let carriers = |pids: std::ops::Range<u32>| {
+        pids.map(|pid| {
+            json!({
+                "launcher_pid": 7,
+                "launcher_comm": "term",
+                "pid": pid,
+                "comm": "bash",
+            })
+        })
+        .collect::<Vec<_>>()
+    };
+    let named = |pids: std::ops::Range<u32>| {
+        pids.map(|pid| {
+            format!("not signaled: under launcher/terminal process 7 (term): {pid} (bash)")
+        })
+        .collect::<Vec<_>>()
+    };
+    assert!(render(json!({"pid": 42, "kill_result": "sent"})).is_empty());
+    assert_eq!(
+        render(json!({
+            "not_signaled_under_launcher": {"entries": carriers(100..110), "total": 10}
+        })),
+        named(100..110)
+    );
+    let mut listed = carriers(100..112);
+    listed.insert(0, json!({"launcher_pid": 7, "pid": "unreadable"}));
+    let mut expected = named(100..110);
+    expected.push("not signaled: 5 more process(es) under launcher/terminal processes".to_owned());
+    assert_eq!(
+        render(json!({"not_signaled_under_launcher": {"entries": listed, "total": 15}})),
+        expected
+    );
+}
+
 #[test]
 fn test_teardown_outcome_wire_tokens_round_trip() {
     for outcome in [
@@ -1017,6 +1067,226 @@ fn kill_self_path_fails_closed_on_non_self_survivors() {
     owner.kill().ok();
     owner.wait().ok();
     let _ = _guard;
+}
+
+#[test]
+#[cfg(unix)]
+#[serial]
+fn before_terminate_failure_retains_resolved_launcher_warning() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let (_env, hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+    for refuse in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = format!("launcher-warning-{}-{refuse}", std::process::id());
+        let nonce = format!("fixture-{name}");
+        let session = format!("session-{name}");
+        db.save_instance_named(
+            &name,
+            &serde_json::Map::from_iter([
+                ("tool".into(), json!("omp")),
+                ("created_at".into(), json!(1.0)),
+                ("status".into(), json!("active")),
+                ("session_id".into(), json!(session)),
+            ]),
+        )
+        .unwrap();
+        db.set_process_binding(&nonce, &session, &name).unwrap();
+
+        // This owned child has no launcher receipt or OMP wrapper ancestor.
+        // Its retained stdin is the cleanup gate: no signals or global reaper.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read -r line"])
+            .env_clear()
+            .env("HOME", &home)
+            .env("HCOM_DIR", &hcom_dir)
+            .env("TMPDIR", &home)
+            .env("HCOM_PROCESS_ID", &nonce)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        db.update_instance_pid(&name, pid).unwrap();
+        let bindings = db.process_binding_ids(&name).unwrap();
+        let original_row = db.get_instance_full(&name).unwrap().unwrap();
+        let injected = if refuse {
+            crate::proctruth::ReapError::BindingRegistryUnreadable(
+                "injected registry refusal".to_owned(),
+            )
+        } else {
+            crate::proctruth::ReapError::Survivors(vec![pid])
+        };
+        let original_error = injected.to_string();
+        let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &[pid], |_, _, _| {
+            Err(injected)
+        });
+        let still_running = child.try_wait().unwrap().is_none();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+
+        assert!(
+            still_running,
+            "the injected failure must leave the owner alone"
+        );
+        let error = result
+            .err()
+            .expect("termination failure must not become success");
+        assert!(error.to_string().contains(&original_error), "{error}");
+        assert!(
+            error.to_string().contains("launcher not verified"),
+            "{error}"
+        );
+        assert!(
+            error
+                .launcher_unverified
+                .as_deref()
+                .is_some_and(|warning| { warning.contains("launcher not verified") }),
+            "the resolved launcher warning must remain typed: {error}"
+        );
+        assert_eq!(error.refusal, refuse);
+        assert_eq!(error.survivors, if refuse { Vec::new() } else { vec![pid] });
+        assert_eq!(error.self_excluded, 1);
+        assert_eq!(error.self_pid, Some(std::process::id()));
+        assert_eq!(error.self_session.as_deref(), Some(session.as_str()));
+        assert!(!error.pane_closed);
+        let row = db.get_instance_full(&name).unwrap().expect("row retained");
+        assert_eq!(row.pid, original_row.pid);
+        assert_eq!(row.status, original_row.status);
+        assert_eq!(row.session_id, original_row.session_id);
+        assert_eq!(db.process_binding_ids(&name).unwrap(), bindings);
+        assert_eq!(stopped_events(&db, &name), 0);
+        assert!(
+            db.kv_get(&format!("teardown_claim:{name}"))
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+#[serial]
+fn native_failure_retains_resolved_launcher_warning_and_evidence() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let (_env, hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+    for unconfirmed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let name = format!("native-warning-{}-{unconfirmed}", std::process::id());
+        let nonce = format!("fixture-{name}");
+        let session = format!("session-{name}");
+        db.save_instance_named(
+            &name,
+            &serde_json::Map::from_iter([
+                ("tool".into(), json!("omp")),
+                ("created_at".into(), json!(1.0)),
+                ("status".into(), json!("active")),
+                ("session_id".into(), json!(session)),
+            ]),
+        )
+        .unwrap();
+        db.set_process_binding(&nonce, &session, &name).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read -r line"])
+            .env_clear()
+            .env("HOME", &home)
+            .env("HCOM_DIR", &hcom_dir)
+            .env("TMPDIR", &home)
+            .env("HCOM_PROCESS_ID", &nonce)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        db.update_instance_pid(&name, pid).unwrap();
+        let (row, bindings, watermark) = ResolvedIncarnation::read(&db, &name).unwrap();
+        let row = row.unwrap();
+        let native_error = if unconfirmed {
+            crate::sys::process::KillError::Unconfirmed {
+                reason: "injected native identity refusal".to_owned(),
+                survivors: vec![pid],
+            }
+        } else {
+            crate::sys::process::KillError::Survivors(vec![pid])
+        };
+        let original_error = native_error.to_string();
+        let mut resolved_warning = None;
+        let result = kill_resolved_instance_with_native(
+            &db,
+            (&row, &bindings, watermark),
+            "test",
+            Some(&[pid]),
+            |_, _, _| Ok(()),
+            |owner, _, _| {
+                resolved_warning = owner.launcher_warning().map(str::to_owned);
+                Err(
+                    native_kill_error(&name, native_error).with_pane(PaneOutcome {
+                        closed: false,
+                        retry_command: None,
+                        preset_name: "fixture-terminal".to_owned(),
+                        pane_id: "fixture-pane".to_owned(),
+                        left_for_caller: true,
+                        needs_pid: true,
+                    }),
+                )
+            },
+        );
+        let still_running = child.try_wait().unwrap().is_none();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+
+        assert!(
+            still_running,
+            "native error injection must not signal the owner"
+        );
+        let warning =
+            resolved_warning.expect("native callback follows an unverified launcher root");
+        assert!(warning.contains("launcher not verified"));
+        let error = result
+            .err()
+            .expect("native failure must not become success");
+        let message = error.to_string();
+        assert!(message.contains(&original_error), "{message}");
+        assert!(message.contains(&warning), "{message}");
+        assert!(
+            !message.contains("terminated"),
+            "native failure must not claim termination: {message}"
+        );
+        assert_eq!(error.launcher_unverified.as_deref(), Some(warning.as_str()));
+        assert_eq!(error.survivors, vec![pid]);
+        assert_eq!(error.refusal, unconfirmed);
+        assert_eq!(error.self_excluded, 1);
+        assert_eq!(error.self_pid, Some(std::process::id()));
+        assert_eq!(error.self_session.as_deref(), Some(session.as_str()));
+        assert!(!error.pane_closed);
+        assert!(error.pane_retry_command.is_none());
+        assert_eq!(error.preset_name, "fixture-terminal");
+        assert_eq!(error.pane_id, "fixture-pane");
+        assert!(error.pane_left_for_caller);
+        assert!(error.pane_close_needs_pid);
+        let retained = db.get_instance_full(&name).unwrap().expect("row retained");
+        assert_eq!(retained.pid, row.pid);
+        assert_eq!(retained.status, row.status);
+        assert_eq!(retained.session_id, row.session_id);
+        assert_eq!(db.process_binding_ids(&name).unwrap(), bindings);
+        assert_eq!(stopped_events(&db, &name), 0);
+        assert!(
+            db.kv_get(&format!("teardown_claim:{name}"))
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 /// Foreign path through the injectable entry: with no self overlap the

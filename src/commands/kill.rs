@@ -43,6 +43,9 @@ pub struct KillTrackedResult {
     pub leftovers_terminated: Option<usize>,
     /// Whether the resolved incarnation's row was actually torn down.
     pub teardown: TeardownOutcome,
+    /// ID-carrying processes left unsignaled under an excluded launcher or
+    /// terminal ancestor: reported only, never signaled or survivors.
+    pub(crate) not_signaled_under_launcher: crate::sys::process::UnsignaledCarriers,
 }
 
 /// Failed kills keep their structured verification evidence for relay callers.
@@ -64,6 +67,8 @@ pub struct KillFailure {
     pub pane_id: String,
     pub pane_left_for_caller: bool,
     pub pane_close_needs_pid: bool,
+    /// The native helper's unsignaled-carrier notices, whatever failed.
+    pub(crate) not_signaled_under_launcher: crate::sys::process::UnsignaledCarriers,
 }
 
 impl KillFailure {
@@ -82,6 +87,7 @@ impl KillFailure {
             pane_id: String::new(),
             pane_left_for_caller: false,
             pane_close_needs_pid: false,
+            not_signaled_under_launcher: Default::default(),
         }
     }
 }
@@ -161,6 +167,13 @@ impl KillTrackedError {
         self.pane_close_needs_pid = pane.needs_pid;
         self
     }
+
+    /// Carry the native helper's unsignaled-carrier notices: they are
+    /// reported with the failure and never change it.
+    fn with_not_signaled(mut self, report: crate::sys::process::UnsignaledCarriers) -> Self {
+        self.not_signaled_under_launcher = report;
+        self
+    }
 }
 
 /// The pane cleanup that followed native confirmation.
@@ -173,9 +186,14 @@ struct PaneOutcome {
     needs_pid: bool,
 }
 
+/// The failure message, then any unsignaled-carrier notices it carries.
 impl std::fmt::Display for KillTrackedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&self.message)?;
+        for line in render_unsignaled_carriers(&self.not_signaled_under_launcher) {
+            write!(f, "\n{line}")?;
+        }
+        Ok(())
     }
 }
 
@@ -449,6 +467,47 @@ fn kill_resolved_instance(
     self_pids: Option<&[u32]>,
     before_terminate: impl FnOnce(&str, &[String], &[u32]) -> Result<(), crate::proctruth::ReapError>,
 ) -> Result<KillTrackedResult, KillTrackedError> {
+    kill_resolved_instance_with_native(
+        db,
+        (inst, binding_ids, event_watermark),
+        initiator,
+        self_pids,
+        before_terminate,
+        |owner, excluded, not_signaled| {
+            kill_instance(
+                db,
+                &inst.name,
+                owner,
+                inst,
+                binding_ids,
+                excluded,
+                not_signaled,
+            )
+        },
+    )
+}
+
+fn kill_resolved_instance_with_native(
+    db: &HcomDb,
+    (inst, binding_ids, event_watermark): (&crate::db::InstanceRow, &[String], i64),
+    initiator: &str,
+    self_pids: Option<&[u32]>,
+    before_terminate: impl FnOnce(&str, &[String], &[u32]) -> Result<(), crate::proctruth::ReapError>,
+    terminate: impl FnOnce(
+        &crate::proctruth::KillOwner,
+        &[u32],
+        &mut crate::sys::process::UnsignaledCarriers,
+    ) -> Result<
+        (
+            terminal::KillResult,
+            bool,
+            terminal::PaneFollowup,
+            String,
+            String,
+        ),
+        KillTrackedError,
+    >,
+) -> Result<KillTrackedResult, KillTrackedError> {
     let name = &inst.name;
     #[cfg(test)]
     if let Some(hook) = CAPTURE_GAP_HOOK.with(std::cell::Cell::take) {
@@ -472,124 +531,135 @@ fn kill_resolved_instance(
             binding_ids,
         )
         .map_err(|reason| unverified_owner_error(name, pid, reason))?;
-    // No caller-chain lookup, pane action or signal can precede owner/root
-    // authentication. A bookkeeping-only dead row needs no signal exclusion.
-    let caller_chain;
-    let self_pids = match self_pids {
-        Some(pids) => pids,
-        None if owner.identity().is_some() => {
-            caller_chain = crate::proctruth::kill_caller_ancestor_pids()
-                .map_err(|reason| unverified_owner_error(name, pid, reason))?;
-            &caller_chain
-        }
-        None => &[],
-    };
+    // The native helper's notices leave with whichever outcome the kill
+    // reaches, never as a survivor or refusal of their own.
+    let mut not_signaled = crate::sys::process::UnsignaledCarriers::default();
+    // Every failure after root resolution must retain its launcher proof gap,
+    // without replacing native, pane, exclusion or bookkeeping evidence.
+    let result = (|| {
+        // No caller-chain lookup, pane action or signal can precede owner/root
+        // authentication. A bookkeeping-only dead row needs no signal exclusion.
+        let caller_chain;
+        let self_pids = match self_pids {
+            Some(pids) => pids,
+            None if owner.identity().is_some() => {
+                caller_chain = crate::proctruth::kill_caller_ancestor_pids()
+                    .map_err(|reason| unverified_owner_error(name, pid, reason))?;
+                &caller_chain
+            }
+            None => &[],
+        };
 
-    // The row, binding epoch and watermark were captured before any signal.
-    let incarnation = ResolvedIncarnation::new(inst, binding_ids, event_watermark);
-    let _teardown_claim = crate::hooks::common::TeardownClaim::register(
-        db,
-        name,
-        incarnation.token.created_at,
-        incarnation.token.session_id.as_deref(),
-    );
-    let excluded: Vec<u32> = self_pids
-        .iter()
-        .copied()
-        .filter(|&candidate| candidate == owner.pid() || candidate == pid)
-        .collect();
-    before_terminate(name, binding_ids, &excluded).map_err(|error| {
-        survivors_error(name, &error).excluding(excluded.len(), inst.session_id.as_deref())
-    })?;
-
-    let mut leftovers_terminated = None;
-    if owner.is_zombie()
-        && let Some(identity) = owner.identity()
-    {
-        let leftovers = crate::sys::process::terminate_zombie_group_verified(
-            pid,
-            identity,
-            self_pids,
-            crate::proctruth::kill_candidate_eligible,
-            |candidate| crate::proctruth::verify_kill_candidate(db, name, candidate),
-        )
-        .map_err(|error| native_kill_error(name, error))?;
-        leftovers_terminated = Some(leftovers);
-        println!(
-            "'{name}' owner PID {pid} already exited; {leftovers} leftover process(es) terminated"
+        // The row, binding epoch and watermark were captured before any signal.
+        let incarnation = ResolvedIncarnation::new(inst, binding_ids, event_watermark);
+        let _teardown_claim = crate::hooks::common::TeardownClaim::register(
+            db,
+            name,
+            incarnation.token.created_at,
+            incarnation.token.session_id.as_deref(),
         );
-    }
-    // Gone and zombie owners recheck false, so this sends them no signal; every
-    // mode still runs the receipt-verified pane close after confirmation.
-    let (result, pane_closed, followup, preset_name, pane_id) = kill_instance(
-        db,
-        name,
-        &owner,
-        inst,
-        inst.background != 0,
-        binding_ids,
-        self_pids,
-    )
-    .map_err(|error| error.excluding(excluded.len(), inst.session_id.as_deref()))?;
-    let pane_left_for_caller = !excluded.is_empty() && !preset_name.is_empty() && !pane_closed;
-    let pane = || PaneOutcome {
-        closed: pane_closed,
-        retry_command: followup.retry_command.clone(),
-        preset_name: preset_name.clone(),
-        pane_id: pane_id.clone(),
-        left_for_caller: pane_left_for_caller,
-        needs_pid: followup.needs_pid,
-    };
-    // Native helpers have confirmed every captured incarnation gone. Only
-    // now may the old row's incarnation-bound bookkeeping be released.
-    let teardown =
-        teardown_if_incarnation_unchanged(db, name, initiator, &incarnation).map_err(|error| {
-            let state = if excluded.is_empty() {
-                "dead"
-            } else {
-                "gone (excluding the caller)"
-            };
-            KillTrackedError::from(format!(
-                "Captured processes verified {state}, but '{name}' row was not finalized: {error}. \
-                 Recovery: hcom kill {name}"
-            ))
-            .excluding(excluded.len(), inst.session_id.as_deref())
-            .with_pane(pane())
+        let excluded: Vec<u32> = self_pids
+            .iter()
+            .copied()
+            .filter(|&candidate| candidate == owner.pid() || candidate == pid)
+            .collect();
+        before_terminate(name, binding_ids, &excluded).map_err(|error| {
+            survivors_error(name, &error).excluding(excluded.len(), inst.session_id.as_deref())
         })?;
-    if let Some(warning) = owner.launcher_warning() {
-        return Err(
-            launcher_unverified_error(name, warning, !excluded.is_empty())
-                .excluding(excluded.len(), inst.session_id.as_deref())
-                .with_pane(pane()),
-        );
-    }
-    if !excluded.is_empty() {
-        println!(
-            "'{name}': caller PID {} (session {}) and its own ancestor chain were left running by design; owner/root death is not claimed",
-            std::process::id(),
-            inst.session_id.as_deref().unwrap_or("unrecorded")
-        );
-    }
 
-    Ok(KillTrackedResult {
-        target: name.to_string(),
-        pid: owner.pid(),
-        kill_result: result,
-        pane_closed,
-        pane_retry_command: followup.retry_command,
-        preset_name,
-        pane_id,
-        pane_left_for_caller,
-        pane_close_needs_pid: followup.needs_pid,
-        self_excluded: excluded.len(),
-        self_pid: (!excluded.is_empty()).then_some(std::process::id()),
-        self_session: if excluded.is_empty() {
-            None
-        } else {
-            inst.session_id.clone()
-        },
-        leftovers_terminated,
-        teardown,
+        let mut leftovers_terminated = None;
+        if owner.is_zombie()
+            && let Some(identity) = owner.identity()
+        {
+            let leftovers = crate::sys::process::terminate_zombie_group_verified(
+                pid,
+                identity,
+                self_pids,
+                crate::proctruth::kill_candidate_eligible,
+                |candidate| crate::proctruth::verify_kill_candidate(db, name, candidate),
+            )
+            .map_err(|error| native_kill_error(name, error))?;
+            leftovers_terminated = Some(leftovers);
+            println!(
+                "'{name}' owner PID {pid} already exited; {leftovers} leftover process(es) terminated"
+            );
+        }
+        // Gone and zombie owners recheck false, so this sends them no signal; every
+        // mode still runs the receipt-verified pane close after confirmation.
+        let (result, pane_closed, followup, preset_name, pane_id) =
+            terminate(&owner, self_pids, &mut not_signaled)
+                .map_err(|error| error.excluding(excluded.len(), inst.session_id.as_deref()))?;
+        let pane_left_for_caller = !excluded.is_empty() && !preset_name.is_empty() && !pane_closed;
+        let pane = || PaneOutcome {
+            closed: pane_closed,
+            retry_command: followup.retry_command.clone(),
+            preset_name: preset_name.clone(),
+            pane_id: pane_id.clone(),
+            left_for_caller: pane_left_for_caller,
+            needs_pid: followup.needs_pid,
+        };
+        // Native helpers have confirmed every captured incarnation gone. Only
+        // now may the old row's incarnation-bound bookkeeping be released.
+        let teardown =
+            teardown_if_incarnation_unchanged(db, name, initiator, &incarnation).map_err(|error| {
+                let state = if excluded.is_empty() {
+                    "dead"
+                } else {
+                    "gone (excluding the caller)"
+                };
+                KillTrackedError::from(format!(
+                    "Captured processes verified {state}, but '{name}' row was not finalized: {error}. \
+                     Recovery: hcom kill {name}"
+                ))
+                .excluding(excluded.len(), inst.session_id.as_deref())
+                .with_pane(pane())
+            })?;
+        if let Some(warning) = owner.launcher_warning() {
+            return Err(
+                launcher_unverified_error(name, warning, !excluded.is_empty())
+                    .excluding(excluded.len(), inst.session_id.as_deref())
+                    .with_pane(pane()),
+            );
+        }
+        if !excluded.is_empty() {
+            println!(
+                "'{name}': caller PID {} (session {}) and its own ancestor chain were left running by design; owner/root death is not claimed",
+                std::process::id(),
+                inst.session_id.as_deref().unwrap_or("unrecorded")
+            );
+        }
+
+        Ok(KillTrackedResult {
+            target: name.to_string(),
+            pid: owner.pid(),
+            kill_result: result,
+            pane_closed,
+            pane_retry_command: followup.retry_command,
+            preset_name,
+            pane_id,
+            pane_left_for_caller,
+            pane_close_needs_pid: followup.needs_pid,
+            self_excluded: excluded.len(),
+            self_pid: (!excluded.is_empty()).then_some(std::process::id()),
+            self_session: if excluded.is_empty() {
+                None
+            } else {
+                inst.session_id.clone()
+            },
+            leftovers_terminated,
+            teardown,
+            not_signaled_under_launcher: std::mem::take(&mut not_signaled),
+        })
+    })();
+    result.map_err(|mut error: KillTrackedError| {
+        if error.launcher_unverified.is_none()
+            && let Some(warning) = owner.launcher_warning()
+        {
+            error.message.push_str("; ");
+            error.message.push_str(warning);
+            error.launcher_unverified = Some(warning.to_owned());
+        }
+        error.with_not_signaled(not_signaled)
     })
 }
 
@@ -823,6 +893,8 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
     if !verified {
         eprintln!("Note: remote host predates verified kill; showing its reported result.");
     }
+    // A peer that predates these notices sends none, and none are shown.
+    let not_signaled = render_unsignaled_carriers(&remote_unsignaled_carriers(result));
     if result["launcher_unverified"].is_string()
         || result["survivors"]
             .as_array()
@@ -858,7 +930,13 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
         {
             eprintln!("Run the pane-close retry command on remote device {device}.");
         }
+        for line in not_signaled {
+            eprintln!("{line}");
+        }
         return Ok(1);
+    }
+    for line in not_signaled {
+        println!("{line}");
     }
     let kill_result = result["kill_result"].as_str();
 
@@ -1036,6 +1114,62 @@ fn render_skipped_teardown_feedback(name: &str, teardown: TeardownOutcome) -> Op
     }
 }
 
+/// The unsignaled-carrier notices of a kill: one line per named carrier, at
+/// most `UNSIGNALED_CARRIER_LIMIT` of them, then the count of the rest.
+/// Shared by the local and remote render paths. Informational only: the
+/// notices never change the kill's outcome or claim anything terminated.
+fn render_unsignaled_carriers(report: &crate::sys::process::UnsignaledCarriers) -> Vec<String> {
+    let mut lines: Vec<String> = report
+        .entries
+        .iter()
+        .take(crate::sys::process::UNSIGNALED_CARRIER_LIMIT)
+        .map(|carrier| {
+            format!(
+                "not signaled: under launcher/terminal process {} ({}): {} ({})",
+                carrier.launcher_pid, carrier.launcher_comm, carrier.pid, carrier.comm
+            )
+        })
+        .collect();
+    let omitted = report.total.max(report.entries.len()) - lines.len();
+    if omitted > 0 {
+        lines.push(format!(
+            "not signaled: {omitted} more process(es) under launcher/terminal processes"
+        ));
+    }
+    lines
+}
+
+/// A remote kill's unsignaled-carrier notices as its executor reported them.
+/// A peer that predates them sends none. Only fully readable entries are
+/// named, at most the render limit; the rest still count.
+fn remote_unsignaled_carriers(
+    result: &serde_json::Value,
+) -> crate::sys::process::UnsignaledCarriers {
+    let report = &result["not_signaled_under_launcher"];
+    let listed = report["entries"].as_array();
+    let entries: Vec<_> = listed
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(crate::sys::process::UnsignaledCarrier {
+                launcher_pid: u32::try_from(entry["launcher_pid"].as_u64()?).ok()?,
+                launcher_comm: entry["launcher_comm"].as_str()?.to_owned(),
+                pid: u32::try_from(entry["pid"].as_u64()?).ok()?,
+                comm: entry["comm"].as_str()?.to_owned(),
+            })
+        })
+        .take(crate::sys::process::UNSIGNALED_CARRIER_LIMIT)
+        .collect();
+    let total = report["total"]
+        .as_u64()
+        .and_then(|total| usize::try_from(total).ok())
+        .unwrap_or(0);
+    crate::sys::process::UnsignaledCarriers {
+        total: total.max(listed.map_or(0, Vec::len)),
+        entries,
+    }
+}
+
 /// Run the kill command.
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     // Filter out global flags already consumed by the router
@@ -1206,6 +1340,9 @@ fn kill_selected(
                 continue;
             }
         };
+        for line in render_unsignaled_carriers(&result.not_signaled_under_launcher) {
+            println!("{line}");
+        }
         if let Some(lines) = render_skipped_teardown_feedback(&inst.name, result.teardown) {
             for line in lines {
                 println!("{line}");
@@ -1457,6 +1594,10 @@ fn kill_single(
         );
     }
     let kill_result = kill_tracked_instance(db, &name, initiator).map_err(anyhow::Error::msg)?;
+    // Informational notices first: every report below may return early.
+    for line in render_unsignaled_carriers(&kill_result.not_signaled_under_launcher) {
+        println!("{line}");
+    }
     // Skipped teardown: the processes were reaped, but the kill's teardown
     // write did not land — the row was re-registered mid-kill (left intact
     // for the fresh incarnation) or the session's own shutdown finalized it.
@@ -1566,15 +1707,22 @@ fn kill_orphan_process(
     }
     // Gone and zombie owners recheck false, so this sends them no signal; every
     // mode still runs the receipt-verified pane close after confirmation.
-    let result = terminal::kill_process(
+    let mut not_signaled = crate::sys::process::UnsignaledCarriers::default();
+    let result = match terminal::kill_process(
         owner,
         &orphan.names,
         std::slice::from_ref(&orphan.process_id),
         &chain,
         &orphan_terminal_info(orphan),
         |candidate| crate::proctruth::verify_kill_candidate(db, &name, candidate),
-    )
-    .map_err(|error| native_kill_error(&name, error))?;
+        &mut not_signaled,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            let error = native_kill_error(&name, error);
+            return Err(error.with_not_signaled(not_signaled));
+        }
+    };
     let pane = PaneOutcome {
         closed: result.1,
         retry_command: result.2.retry_command.clone(),
@@ -1584,7 +1732,11 @@ fn kill_orphan_process(
         left_for_caller: self_excluded && !orphan.terminal_preset.is_empty() && !result.1,
     };
     if let Some(warning) = owner.launcher_warning() {
-        return Err(launcher_unverified_error(&name, warning, self_excluded).with_pane(pane));
+        let error = launcher_unverified_error(&name, warning, self_excluded).with_pane(pane);
+        return Err(error.with_not_signaled(not_signaled));
+    }
+    for line in render_unsignaled_carriers(&not_signaled) {
+        println!("{line}");
     }
     if self_excluded {
         println!(
@@ -1605,9 +1757,9 @@ fn kill_instance(
     name: &str,
     owner: &crate::proctruth::KillOwner,
     instance: &crate::db::InstanceRow,
-    is_headless: bool,
     binding_ids: &[String],
     excluded: &[u32],
+    not_signaled: &mut crate::sys::process::UnsignaledCarriers,
 ) -> Result<
     (
         terminal::KillResult,
@@ -1620,7 +1772,7 @@ fn kill_instance(
 > {
     let pid = owner.pid();
     // Headless instances have no terminal pane — skip pane close
-    if is_headless {
+    if instance.background != 0 {
         let (result, pane_closed, followup) = terminal::kill_process(
             owner,
             &[],
@@ -1628,6 +1780,7 @@ fn kill_instance(
             excluded,
             &terminal::TerminalInfo::default(),
             |candidate| crate::proctruth::verify_kill_candidate(db, name, candidate),
+            not_signaled,
         )
         .map_err(|error| native_kill_error(name, error))?;
         log_info(
@@ -1653,6 +1806,7 @@ fn kill_instance(
         excluded,
         &ti,
         |candidate| crate::proctruth::verify_kill_candidate(db, name, candidate),
+        not_signaled,
     )
     .map_err(|error| native_kill_error(name, error))?;
 

@@ -2663,6 +2663,8 @@ fn zellij_terminal_pane_exists(session_name: &str, pane_id: &str) -> Option<bool
 
 /// Confirm the native root tree is gone before attempting owned-pane cleanup.
 /// A closed pane is never evidence that any captured process has exited.
+/// `not_signaled` collects the native helper's unsignaled-carrier notices,
+/// whatever the outcome.
 pub(crate) fn kill_process(
     owner: &crate::proctruth::KillOwner,
     instance_names: &[String],
@@ -2670,20 +2672,22 @@ pub(crate) fn kill_process(
     excluded: &[u32],
     info: &TerminalInfo,
     authorize: impl FnMut(u32) -> Result<(), crate::sys::process::KillError>,
+    not_signaled: &mut crate::sys::process::UnsignaledCarriers,
 ) -> Result<(KillResult, bool, PaneFollowup), crate::sys::process::KillError> {
     let pid = owner.pid();
     use crate::sys::process::GroupSignal;
     let kill_result = if owner.recheck()? {
+        let identity = owner
+            .identity()
+            .ok_or("process ownership was not verified")?;
         match crate::sys::process::terminate_group_verified(
-            pid,
-            owner
-                .identity()
-                .ok_or("process ownership was not verified")?,
+            (pid, identity),
             binding_ids,
             excluded,
             crate::proctruth::process_id_of,
             crate::proctruth::kill_candidate_eligible,
             authorize,
+            not_signaled,
         )? {
             GroupSignal::Sent => KillResult::Sent,
             GroupSignal::NotFound => KillResult::AlreadyDead,
@@ -3289,8 +3293,16 @@ mod tests {
                 ..Default::default()
             };
             let owner = crate::proctruth::verify_kill_owner(2_000_000_000, None, &[]).unwrap();
-            let (_, closed, _) =
-                kill_process(&owner, &["bura".into()], &[], &[], &info, |_| Ok(())).unwrap();
+            let (_, closed, _) = kill_process(
+                &owner,
+                &["bura".into()],
+                &[],
+                &[],
+                &info,
+                |_| Ok(()),
+                &mut crate::sys::process::UnsignaledCarriers::default(),
+            )
+            .unwrap();
             assert_eq!(
                 closed,
                 should_close,

@@ -3108,6 +3108,9 @@ done
         command
             .args(["-c", script])
             .env_clear()
+            .env("HOME", &h.home)
+            .env("HCOM_DIR", &h.hcom_dir)
+            .env("TMPDIR", h.root_path().join("tmp"))
             .env("FIXTURE_HEARTBEAT", &heartbeat)
             .env("FIXTURE_SIGNALS", &signals)
             .current_dir(&out)

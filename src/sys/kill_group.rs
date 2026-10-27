@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn linux_live_members_keeps_a_zombie_leader_with_a_live_thread() {
-        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let home = tempfile::tempdir().unwrap();
         let script = r"
 import ctypes, sys, threading, time
 threading.Thread(target=time.sleep, args=(30,), daemon=True).start()

@@ -5,7 +5,8 @@
 //! seeded on the executor, whose relay worker runs the kill. A partial result
 //! (seat launcher not verified) and a refusal must reach the caller as a
 //! nonzero exit carrying the executor's warning; only a clean kill prints the
-//! success report.
+//! success report. The executor's notices for id-carrying processes it left
+//! unsignaled reach the caller with either outcome and change neither.
 //!
 //! The relay setup follows `relay_worker_reconnect.rs`: managed mode, so hcom
 //! itself never spawns a worker, `relay new --broker mqtt://127.0.0.1:<port>`,
@@ -625,7 +626,9 @@ fn torn_down() -> Value {
 // Owner stand-ins and sentinels: a bash loop that records every trapped
 // signal and keeps a heartbeat. The direct child is never reaped before the
 // final drop (exit is observed with WNOWAIT), so its PID and process group
-// stay reserved and the drop's group SIGKILL only reaches this fixture.
+// stay reserved and the drop's group SIGKILL only reaches this fixture. Once
+// a test opens its `sibling.go` gate, a sentinel starts a second child like
+// its first, in its group and with its environment.
 // ---------------------------------------------------------------------------
 
 const SENTINEL_BASH: &str = r#"
@@ -643,6 +646,10 @@ mkfifo "$dir/hold" && exec 3<> "$dir/hold"
 printf '%s' "$$" > "$dir/ready"
 while :; do
     printf x >> "$dir/heartbeat"
+    if [ -e "$dir/sibling.go" ] && [ ! -e "$dir/sibling.pid" ]; then
+        SENTINEL_CHILD= /bin/bash "$0" "$dir/sibling" "HUP TERM USR1 USR2 CONT" &
+        printf '%s' "$!" > "$dir/sibling.pid"
+    fi
     read -r -t 0.05 -u 3 || true
 done
 "#;
@@ -706,16 +713,33 @@ fn beats(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// A stand-in whose comm reads as `omp`: `/bin/bash` run through a symlink
-/// named `omp`.
-fn omp_standin(h: &Hcom) -> PathBuf {
+/// What the fixture group member `pid` of `pgid`, writing to `dir`, went
+/// through since its `before` heartbeats: wait (bounded) until it beats
+/// twice more, which proves any signal already sent had its trap run, or
+/// until it is gone.
+fn member_observed(dir: &Path, pid: u32, pgid: u32, before: u64) -> Value {
+    let mut progressed = false;
+    wait_until(Duration::from_secs(5), || {
+        progressed = beats(dir) >= before + 2;
+        progressed || !member_alive(pid, pgid)
+    });
+    json!({
+        "alive": member_alive(pid, pgid),
+        "heartbeat_progressed": progressed,
+        "signals": fs::read_to_string(dir.join("signals")).unwrap_or_default(),
+    })
+}
+
+/// A stand-in whose comm reads as `name`: `/bin/bash` run through a symlink
+/// of that name.
+fn standin(h: &Hcom, name: &str) -> PathBuf {
     let dir = h.root_path().join("fakebin");
     fs::create_dir_all(&dir).expect("create fakebin");
-    let omp = dir.join("omp");
-    if !omp.exists() {
-        unix_fs::symlink("/bin/bash", &omp).expect("symlink omp stand-in");
+    let path = dir.join(name);
+    if !path.exists() {
+        unix_fs::symlink("/bin/bash", &path).expect("symlink bash stand-in");
     }
-    omp
+    path
 }
 
 /// Birth identity of `pid`: its start time in clock ticks since boot, field
@@ -742,6 +766,12 @@ impl Sentinel {
     /// environment plus `env`. `with_child` adds a child in the same group.
     fn spawn(h: &Hcom, label: &str, exe: &Path, env: &[(&str, &str)], with_child: bool) -> Self {
         let dir = h.root_path().join(format!("sentinel-{label}"));
+        // The device's state has relay enabled for the loopback broker.
+        // Sentinels need separate, relay-disabled state below the same root.
+        let hcom_dir = dir.join("hcom-state");
+        fs::create_dir_all(&hcom_dir).expect("create sentinel hcom state");
+        fs::write(hcom_dir.join("config.toml"), "[relay]\nenabled = false\n")
+            .expect("disable sentinel relay");
         let script = h.root_path().join("sentinel.sh");
         if !script.exists() {
             fs::write(&script, SENTINEL_BASH).expect("write sentinel script");
@@ -753,6 +783,9 @@ impl Sentinel {
             .arg("HUP INT QUIT TERM USR1 USR2 CONT")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &h.home)
+            .env("HCOM_DIR", &hcom_dir)
+            .env("TMPDIR", h.root_path().join("tmp"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -903,6 +936,28 @@ impl Sentinel {
             })),
         })
     }
+
+    /// Open the gate: the sentinel starts its sibling. Returns the sibling's
+    /// PID once it runs in the sentinel's group with its traps set.
+    fn start_sibling(&self) -> u32 {
+        let dir = self.dir.join("sibling");
+        fs::write(self.dir.join("sibling.go"), "").expect("open the sibling gate");
+        let mut sibling = None;
+        let started = wait_until(Duration::from_secs(30), || {
+            sibling = fs::read_to_string(self.dir.join("sibling.pid"))
+                .ok()
+                .and_then(|text| text.parse::<u32>().ok())
+                .filter(|&pid| {
+                    member_alive(pid, self.pid())
+                        && dir.join("ready").exists()
+                        && beats(&dir) > 0
+                        && caught_signals(pid) & mask(&CHILD_SIGNALS) == mask(&CHILD_SIGNALS)
+                });
+            sibling.is_some()
+        });
+        assert!(started, "sentinel {} never started its sibling", self.pid());
+        sibling.unwrap()
+    }
 }
 
 impl Drop for Sentinel {
@@ -1014,7 +1069,7 @@ fn unverified_launcher_kill(label: &str, receipt_matches: bool) {
     let mut pair = Pair::new();
     let base = format!("{label}{}", unique_suffix());
     let process_id = uuid::Uuid::new_v4().to_string();
-    let omp = omp_standin(&pair.executor.h);
+    let omp = standin(&pair.executor.h, "omp");
     let owner = Sentinel::spawn(
         &pair.executor.h,
         "unverified-owner",
@@ -1113,7 +1168,7 @@ fn remote_kill_reports_refusal_and_spares_pid_reuser() {
     let mut pair = Pair::new();
     let base = format!("rkreuse{}", unique_suffix());
     let process_id = uuid::Uuid::new_v4().to_string();
-    let omp = omp_standin(&pair.executor.h);
+    let omp = standin(&pair.executor.h, "omp");
     let sentinel = Sentinel::spawn(&pair.executor.h, "pid-reuser", &omp, &[], true);
     seed_row(&pair.executor.h, &base, "omp", &process_id, sentinel.pid());
     pair.start_workers();
@@ -1192,4 +1247,103 @@ fn remote_kill_reports_clean_success() {
         output.contains("Sent SIGTERM to process group"),
         "clean remote kill of {target} printed no success report:\n{output}"
     );
+}
+
+/// An id-carrying launcher on the executor, its owner child (the seat root
+/// the row names) and, started through the test's gate once the owner runs,
+/// its second child: an off-seat sibling carrying the same HCOM_PROCESS_ID.
+/// The executor kills the owner and leaves the launcher and the sibling
+/// unsignaled. Its notice for the sibling reaches the caller over the relay
+/// with either outcome and changes neither: a non-OMP row is a clean
+/// success, and a legacy OMP row's unverified launcher still fails.
+fn unsignaled_sibling_kill(label: &str, tool: &str) {
+    let mut pair = Pair::new();
+    let base = format!("{label}{}", unique_suffix());
+    let process_id = uuid::Uuid::new_v4().to_string();
+    let launcher = Sentinel::spawn(
+        &pair.executor.h,
+        label,
+        &standin(&pair.executor.h, "rklauncher"),
+        &[("HCOM_PROCESS_ID", process_id.as_str())],
+        true,
+    );
+    // The launcher leads its own group: its PID is that group's id too.
+    let leader = launcher.pid();
+    let owner = launcher.sub.expect("the launcher's owner child");
+    seed_row(&pair.executor.h, &base, tool, &process_id, owner);
+    let sibling = launcher.start_sibling();
+    let sibling_dir = launcher.dir.join("sibling");
+    pair.start_workers();
+    let target = pair.remote_target(&base);
+    let before = [beats(&launcher.dir), beats(&sibling_dir)];
+
+    let (code, output) = pair.kill(&target);
+    let owner_gone = wait_until(Duration::from_secs(10), || !member_alive(owner, leader));
+    assert!(
+        owner_gone,
+        "the executor left owner {owner} of {base} alive:\n{output}\n{}",
+        pair.diagnostics()
+    );
+    assert_eq!(
+        bookkeeping(&pair.executor.h, &base),
+        torn_down(),
+        "the executor did not tear down {base} after killing its owner"
+    );
+    let notice = format!(
+        "not signaled: under launcher/terminal process {leader} (rklauncher): {sibling} (bash)"
+    );
+    let notices: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with("not signaled:"))
+        .collect();
+    assert_eq!(
+        notices,
+        [notice.as_str()],
+        "`hcom kill {target}` did not relay the executor's one sibling notice:\n{output}\n{}",
+        pair.diagnostics()
+    );
+    for (dir, pid, before) in [
+        (&launcher.dir, leader, before[0]),
+        (&sibling_dir, sibling, before[1]),
+    ] {
+        assert_eq!(
+            member_observed(dir, pid, leader, before),
+            json!({"alive": true, "heartbeat_progressed": true, "signals": ""}),
+            "SAFETY: `hcom kill {target}` signalled {pid} outside the executor's seat:\n{output}"
+        );
+    }
+    if tool == "omp" {
+        assert!(
+            output.contains("launcher not verified") && !reports_success(&output),
+            "`hcom kill {target}` lost the executor's launcher failure:\n{output}\n{}",
+            pair.diagnostics()
+        );
+        assert_ne!(
+            code, 0,
+            "`hcom kill {target}` exited 0 on an unverified launcher:\n{output}"
+        );
+    } else {
+        assert!(
+            output.contains("Sent SIGTERM to process group"),
+            "clean remote kill of {target} printed no success report:\n{output}"
+        );
+        assert_eq!(
+            code,
+            0,
+            "clean remote kill of {target} failed:\n{output}\n{}",
+            pair.diagnostics()
+        );
+    }
+}
+
+/// The notice rides a clean success, which stays a success.
+#[test]
+fn remote_kill_relays_the_unsignaled_sibling_on_success() {
+    unsignaled_sibling_kill("rksibling", "claude");
+}
+
+/// The notice rides a failure, which stays a failure.
+#[test]
+fn remote_kill_relays_the_unsignaled_sibling_on_failure() {
+    unsignaled_sibling_kill("rksibfail", "omp");
 }

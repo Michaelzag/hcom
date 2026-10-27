@@ -177,8 +177,16 @@ pub struct OmpOwnerBinding {
 /// The instance's minted omp bindings with their registration times. A DB
 /// error reads as none: the owner arm only ever adds carriers.
 pub fn omp_owner_bindings(db: &HcomDb, name: &str) -> Vec<OmpOwnerBinding> {
-    db.process_bindings_registered(name)
-        .unwrap_or_default()
+    checked_omp_owner_bindings(db, name).unwrap_or_default()
+}
+
+/// The fallible owner read used when missing bindings would grant signal authority.
+pub(crate) fn checked_omp_owner_bindings(
+    db: &HcomDb,
+    name: &str,
+) -> anyhow::Result<Vec<OmpOwnerBinding>> {
+    Ok(db
+        .process_bindings_registered(name)?
         .into_iter()
         .filter_map(|(process_id, registered_at)| {
             Some(OmpOwnerBinding {
@@ -187,7 +195,7 @@ pub fn omp_owner_bindings(db: &HcomDb, name: &str) -> Vec<OmpOwnerBinding> {
                 registered_at,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// /proc start times derive from whole-second `btime`, so a start epoch can
@@ -3258,6 +3266,13 @@ pub(crate) enum RoundPoint {
     /// The KILL round has classified the captured set; the pre-signal
     /// revalidation and signal loop are next.
     Classified,
+    /// The headless TERM signal was sent; the grace-period wait is next.
+    #[cfg(target_os = "linux")]
+    HeadlessTermSent,
+    /// The headless grace-period wait ended; death confirmation and proof
+    /// revalidation must precede any escalation.
+    #[cfg(target_os = "linux")]
+    HeadlessWaitFinished,
 }
 
 /// The round seam's per-thread slot: an optional hook, armed by the tests
@@ -3272,7 +3287,7 @@ thread_local! {
 }
 
 #[cfg(all(test, unix))]
-fn fire_round_seam(point: RoundPoint) {
+pub(crate) fn fire_round_seam(point: RoundPoint) {
     ROUND_SEAM.with(|seam| {
         if let Some(hook) = seam.borrow_mut().as_mut() {
             hook(point);
@@ -3303,22 +3318,448 @@ fn live_carriers_for(
         .collect()
 }
 
-/// Pid-reuse guard for a recorded group leader: true when at least one live,
-/// non-zombie identity carrier of the instance (the reap's enumeration) is in
-/// process group `pgid`. A headless launch records the launch-script bash,
-/// which leads the group but never carries the identity itself; `hcom pty`
-/// below it does. An unrelated process that reused the pid has none of the
-/// instance's carriers in its group.
+/// Authority for one headless process-group incarnation. A fresh carrier
+/// with the same marker never replaces a captured carrier at escalation.
 #[cfg(target_os = "linux")]
-pub(crate) fn group_holds_instance_carrier(
+#[derive(Debug)]
+pub(crate) struct HeadlessGroupCapture {
+    pgid: u32,
+    leader_identity: String,
+    carriers: Vec<(u32, String)>,
+}
+
+#[cfg(target_os = "linux")]
+fn unconfirmed_headless_group(pgid: u32, reason: String) -> crate::sys::process::KillError {
+    let mut survivors = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|pid| pid.parse().ok()) else {
+                continue;
+            };
+            if crate::sys::process::group_id(pid) == Some(pgid) && !process_gone(pid) {
+                survivors.push(pid);
+            }
+        }
+    }
+    if !survivors.contains(&pgid) && !process_gone(pgid) {
+        survivors.push(pgid);
+    }
+    crate::sys::process::KillError::Unconfirmed {
+        reason: format!("headless group {pgid} is unconfirmed: {reason}"),
+        survivors,
+    }
+}
+
+/// Use the ordinary carrier marker/owner and broker rules, but do not turn
+/// an unreadable relevant fact into an absent carrier.
+#[cfg(target_os = "linux")]
+fn headless_carrier_verified(
+    pgid: u32,
+    pid: u32,
+    name: &str,
+    binding_ids: &[String],
+    owners: &[OmpOwnerBinding],
+) -> Result<bool, crate::sys::process::KillError> {
+    let (carries_name, process_id) = identity_facts_of(pid, name).ok_or_else(|| {
+        unconfirmed_headless_group(pgid, format!("carrier {pid} markers are unreadable"))
+    })?;
+    if !carries_name && !is_bound_process_id(&process_id, binding_ids) {
+        let Some(owner) = owners.iter().find(|owner| owner.pid == pid) else {
+            return Ok(false);
+        };
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).map_err(|error| {
+            unconfirmed_headless_group(pgid, format!("owner {pid} comm is unreadable: {error}"))
+        })?;
+        if comm.trim_end_matches('\n') != "omp" {
+            return Ok(false);
+        }
+        let btime = system_btime();
+        let start = process_start_epoch(pid, btime)
+            .filter(|_| btime > 0.0)
+            .ok_or_else(|| {
+                unconfirmed_headless_group(pgid, format!("owner {pid} start time is unreadable"))
+            })?;
+        let registered_owner = start <= owner.registered_at + START_EPOCH_SLACK_SECS;
+        if !registered_owner {
+            return Ok(false);
+        }
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).map_err(|error| {
+        unconfirmed_headless_group(pgid, format!("carrier {pid} comm is unreadable: {error}"))
+    })?;
+    Ok(carrier_eligible(pid))
+}
+
+/// Capture only positively verified carriers in this exact group. No valid
+/// carrier means no group authority, not an error or permission to signal.
+#[cfg(target_os = "linux")]
+pub(crate) fn capture_instance_group(
     pgid: u32,
     name: &str,
     binding_ids: &[String],
     owners: &[OmpOwnerBinding],
-) -> bool {
-    live_carriers_for(name, binding_ids, owners, &[], None)
-        .iter()
-        .any(|m| process_group_id(m.pid) == Some(pgid))
+) -> Result<Option<HeadlessGroupCapture>, crate::sys::process::KillError> {
+    let entries = std::fs::read_dir("/proc").map_err(|error| {
+        unconfirmed_headless_group(pgid, format!("cannot enumerate group members: {error}"))
+    })?;
+    let mut carriers = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            unconfirmed_headless_group(pgid, format!("cannot read group member: {error}"))
+        })?;
+        let Some(pid) = entry.file_name().to_str().and_then(|pid| pid.parse().ok()) else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let Some(group) = crate::sys::process::group_id(pid) else {
+            if process_gone(pid) {
+                continue;
+            }
+            return Err(unconfirmed_headless_group(
+                pgid,
+                format!("process {pid} group is unreadable"),
+            ));
+        };
+        if group != pgid || process_gone(pid) {
+            continue;
+        }
+        if !headless_carrier_verified(pgid, pid, name, binding_ids, owners)? {
+            continue;
+        }
+        let identity = carrier_identity(pid).ok_or_else(|| {
+            unconfirmed_headless_group(pgid, format!("carrier {pid} identity is unreadable"))
+        })?;
+        if crate::sys::process::group_id(pid) != Some(pgid) {
+            return Err(unconfirmed_headless_group(
+                pgid,
+                format!("carrier {pid} changed group during capture"),
+            ));
+        }
+        carriers.push((pid, identity));
+    }
+    if carriers.is_empty() {
+        return Ok(None);
+    }
+    let leader_identity = carrier_identity(pgid)
+        .ok_or_else(|| unconfirmed_headless_group(pgid, "leader identity is unreadable".into()))?;
+    if crate::sys::process::group_id(pgid) != Some(pgid) {
+        return Err(unconfirmed_headless_group(
+            pgid,
+            "recorded process no longer leads the group".into(),
+        ));
+    }
+    Ok(Some(HeadlessGroupCapture {
+        pgid,
+        leader_identity,
+        carriers,
+    }))
+}
+
+/// Every signal requires the original leader and at least one original,
+/// still marker/owner-verified carrier. Never enumerate replacement authority.
+#[cfg(target_os = "linux")]
+pub(crate) fn recheck_instance_group(
+    capture: &HeadlessGroupCapture,
+    name: &str,
+    binding_ids: &[String],
+    owners: &[OmpOwnerBinding],
+) -> Result<(), crate::sys::process::KillError> {
+    let pgid = capture.pgid;
+    let leader_matches = || {
+        carrier_identity(pgid).as_ref() == Some(&capture.leader_identity)
+            && crate::sys::process::group_id(pgid) == Some(pgid)
+    };
+    if !leader_matches() {
+        return Err(unconfirmed_headless_group(
+            pgid,
+            "captured leader identity or group changed or is unreadable".into(),
+        ));
+    }
+    let mut verified = false;
+    for (pid, identity) in &capture.carriers {
+        if process_gone(*pid) {
+            continue;
+        }
+        let current = carrier_identity(*pid).ok_or_else(|| {
+            unconfirmed_headless_group(
+                pgid,
+                format!("captured carrier {pid} identity is unreadable"),
+            )
+        })?;
+        if &current != identity {
+            continue;
+        }
+        let group = crate::sys::process::group_id(*pid).ok_or_else(|| {
+            unconfirmed_headless_group(pgid, format!("captured carrier {pid} group is unreadable"))
+        })?;
+        if group == pgid
+            && headless_carrier_verified(pgid, *pid, name, binding_ids, owners)?
+            && carrier_identity(*pid).as_ref() == Some(identity)
+            && crate::sys::process::group_id(*pid) == Some(pgid)
+        {
+            verified = true;
+            break;
+        }
+    }
+    if !verified || !leader_matches() {
+        return Err(unconfirmed_headless_group(
+            pgid,
+            "no original captured carrier still proves the unchanged group".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+impl HeadlessGroupCapture {
+    /// Death confirmation is separate from signal authority: an empty live
+    /// group needs no escalation even when an unreaped leader is a zombie.
+    pub(crate) fn confirmed_dead(&self) -> Result<bool, crate::sys::process::KillError> {
+        let entries = std::fs::read_dir("/proc").map_err(|error| {
+            unconfirmed_headless_group(self.pgid, format!("cannot confirm group death: {error}"))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                unconfirmed_headless_group(self.pgid, format!("cannot read group member: {error}"))
+            })?;
+            let Some(pid) = entry.file_name().to_str().and_then(|pid| pid.parse().ok()) else {
+                continue;
+            };
+            let Some(group) = crate::sys::process::group_id(pid) else {
+                if process_gone(pid) {
+                    continue;
+                }
+                return Err(unconfirmed_headless_group(
+                    self.pgid,
+                    format!("process {pid} group is unreadable"),
+                ));
+            };
+            if group == self.pgid && !process_gone(pid) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn unconfirmed(&self, reason: &str) -> crate::sys::process::KillError {
+        unconfirmed_headless_group(self.pgid, reason.into())
+    }
+}
+
+/// A native headless stop keeps the original bound-ID carriers, never a
+/// replacement discovered during a later native tree authorization.
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Debug)]
+pub(crate) struct NativeHeadlessCapture {
+    root_pid: u32,
+    root_identity: String,
+    carriers: Vec<(u32, String)>,
+}
+
+#[cfg(any(target_os = "macos", windows, test))]
+fn native_headless_carrier_matches(
+    expected_identity: &str,
+    current_identity: Option<&str>,
+    marker: crate::sys::process_args::EnvRead,
+    binding_ids: &[String],
+) -> Result<bool, &'static str> {
+    use crate::sys::process_args::EnvRead;
+
+    let Some(current_identity) = current_identity else {
+        return Err("native carrier identity is unreadable");
+    };
+    if current_identity != expected_identity {
+        return Ok(false);
+    }
+    match marker {
+        EnvRead::Present(id) => Ok(is_bound_process_id(&id, binding_ids)),
+        EnvRead::Absent => Ok(false),
+        EnvRead::Unreadable => Err("native carrier process-ID marker is unreadable"),
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl NativeHeadlessCapture {
+    pub(crate) fn root_identity(&self) -> &str {
+        &self.root_identity
+    }
+
+    pub(crate) fn unconfirmed(&self, reason: &str) -> crate::sys::process::KillError {
+        let mut survivors = Vec::new();
+        for pid in std::iter::once(self.root_pid).chain(self.carriers.iter().map(|(pid, _)| *pid)) {
+            if !survivors.contains(&pid) && !crate::sys::process::is_definitely_dead(pid) {
+                survivors.push(pid);
+            }
+        }
+        crate::sys::process::KillError::Unconfirmed {
+            reason: format!(
+                "native headless scope {} is unconfirmed: {reason}",
+                self.root_pid
+            ),
+            survivors,
+        }
+    }
+
+    fn recheck_root(&self) -> Result<(), crate::sys::process::KillError> {
+        if crate::sys::process::identity(self.root_pid).as_ref() != Some(&self.root_identity) {
+            return Err(self.unconfirmed("captured root identity changed or is unreadable"));
+        }
+        #[cfg(target_os = "macos")]
+        if crate::sys::process::group_id(self.root_pid) != Some(self.root_pid) {
+            return Err(self.unconfirmed("captured root no longer leads its process group"));
+        }
+        Ok(())
+    }
+}
+
+/// A live native root without a positively verified bound-ID carrier is
+/// unconfirmed, not a signal-free successful stop. Only positive root death
+/// produces `None`.
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn capture_native_headless_scope(
+    root: u32,
+    binding_ids: &[String],
+) -> Result<Option<NativeHeadlessCapture>, crate::sys::process::KillError> {
+    use crate::sys::process;
+
+    if process::is_definitely_dead(root) {
+        return Ok(None);
+    }
+    let root_identity = process::identity(root).ok_or_else(|| process::KillError::Unconfirmed {
+        reason: format!("native headless root {root} identity is unreadable"),
+        survivors: vec![root],
+    })?;
+    let mut capture = NativeHeadlessCapture {
+        root_pid: root,
+        root_identity,
+        carriers: Vec::new(),
+    };
+    capture.recheck_root()?;
+    #[cfg(target_os = "macos")]
+    let members = crate::sys::kill_group::capture_members(root)
+        .map_err(|reason| capture.unconfirmed(&reason))?
+        .into_iter()
+        .filter(|member| member.state == process::KillState::Live)
+        .map(|member| (member.pid, member.identity));
+    #[cfg(windows)]
+    let members = process::headless_tree_members(root, &capture.root_identity)
+        .map_err(|error| capture.unconfirmed(&error.to_string()))?
+        .into_iter();
+    for (pid, identity) in members {
+        if !kill_candidate_eligible(pid) {
+            continue;
+        }
+        let current_identity = process::identity(pid);
+        if native_headless_carrier_matches(
+            &identity,
+            current_identity.as_deref(),
+            process_id_of(pid),
+            binding_ids,
+        )
+        .map_err(|reason| capture.unconfirmed(reason))?
+        {
+            capture.carriers.push((pid, identity));
+        }
+    }
+    if capture.carriers.is_empty() {
+        return Err(capture.unconfirmed("live root has no verified bound-ID carrier"));
+    }
+    capture.recheck_root()?;
+    Ok(Some(capture))
+}
+
+/// Recheck only the captured native carrier incarnations. Native membership
+/// facts may be refreshed, but they can never admit a new carrier.
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn recheck_native_headless_scope(
+    capture: &NativeHeadlessCapture,
+    binding_ids: &[String],
+) -> Result<(), crate::sys::process::KillError> {
+    use crate::sys::process::{self, KillState};
+
+    capture.recheck_root()?;
+    #[cfg(windows)]
+    let mut parents = None;
+    for (pid, identity) in &capture.carriers {
+        if !kill_candidate_eligible(*pid) {
+            continue;
+        }
+        match process::kill_state(*pid) {
+            KillState::Gone => continue,
+            #[cfg(unix)]
+            KillState::Exiting => continue,
+            KillState::Unknown => {
+                return Err(capture.unconfirmed("captured carrier state is unreadable"));
+            }
+            KillState::Live => {}
+        }
+        let current_identity = process::identity(*pid);
+        if !native_headless_carrier_matches(
+            identity,
+            current_identity.as_deref(),
+            process_id_of(*pid),
+            binding_ids,
+        )
+        .map_err(|reason| capture.unconfirmed(reason))?
+        {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        let in_scope = process::group_id(*pid)
+            .ok_or_else(|| capture.unconfirmed("captured carrier group is unreadable"))?
+            == capture.root_pid;
+        #[cfg(windows)]
+        let in_scope = if *pid == capture.root_pid {
+            true
+        } else {
+            use crate::sys::seat_root::{self, Read};
+            let parents = parents.get_or_insert_with(|| process::snapshot_parents(false));
+            let Some(parents) = parents.as_ref() else {
+                return Err(capture.unconfirmed("native parent snapshot is unreadable"));
+            };
+
+            let unreadable = std::cell::Cell::new(false);
+            let in_scope = seat_root::descends_from(
+                *pid,
+                capture.root_pid,
+                |pid| match parents.get(&pid) {
+                    Some(parent) => Read::Present(parent.parent_pid),
+                    None => {
+                        unreadable.set(true);
+                        Read::Unreadable
+                    }
+                },
+                |pid| match process::creation_time(pid) {
+                    Some(created) => Read::Present(created),
+                    None => {
+                        unreadable.set(true);
+                        Read::Unreadable
+                    }
+                },
+            );
+            if unreadable.get() {
+                return Err(capture.unconfirmed("captured carrier ancestry is unreadable"));
+            }
+            in_scope
+        };
+        if in_scope
+            && process::identity(*pid).as_ref() == Some(identity)
+            && process::kill_state(*pid) == KillState::Live
+        {
+            #[cfg(target_os = "macos")]
+            if process::group_id(*pid)
+                .ok_or_else(|| capture.unconfirmed("captured carrier group is unreadable"))?
+                != capture.root_pid
+            {
+                continue;
+            }
+            capture.recheck_root()?;
+            return Ok(());
+        }
+    }
+    Err(capture.unconfirmed("no original captured carrier still proves the native scope"))
 }
 
 /// Whether every pid in `pids` is provably outside process group `pgid`:
@@ -4747,6 +5188,211 @@ pub(crate) mod orphan_fixtures {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_headless_carrier_authority_requires_readable_birth_and_an_exact_bound_id() {
+        use crate::sys::process_args::EnvRead;
+
+        let bindings = vec!["proc-owned".to_string()];
+        for (current, marker, expected) in [
+            (
+                Some("birth"),
+                EnvRead::Present("proc-owned".into()),
+                Some(true),
+            ),
+            (
+                Some("new-birth"),
+                EnvRead::Present("proc-owned".into()),
+                Some(false),
+            ),
+            (None, EnvRead::Present("proc-owned".into()), None),
+            (Some("birth"), EnvRead::Unreadable, None),
+            (Some("birth"), EnvRead::Absent, Some(false)),
+            (Some("birth"), EnvRead::Present(String::new()), Some(false)),
+            (
+                Some("birth"),
+                EnvRead::Present("proc-owned-other".into()),
+                Some(false),
+            ),
+        ] {
+            assert_eq!(
+                native_headless_carrier_matches("birth", current, marker, &bindings).ok(),
+                expected,
+            );
+        }
+        assert_eq!(
+            native_headless_carrier_matches(
+                "birth",
+                Some("birth"),
+                EnvRead::Present(String::new()),
+                &[String::new()],
+            ),
+            Ok(false),
+            "an empty marker and empty binding must never authorize",
+        );
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn native_headless_scope_rejects_changed_receipts_while_the_owned_carrier_lives() {
+        use std::io::BufRead;
+
+        // No signal actuator is used here. EOF on the private stdin gate
+        // terminates this retained Child, including on assertion failure.
+        struct Gate(std::process::Child);
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                self.0.stdin.take();
+                let _ = self.0.wait();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args(["-c", "printf 'ready\\n'; IFS= read -r release"])
+                .process_group(0);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("powershell");
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Write-Output 'ready'; [void][Console]::ReadLine()",
+            ]);
+            command
+        };
+        let binding = format!("proc-native-proof-{}", std::process::id());
+        let bindings = vec![binding.clone()];
+        let mut gate = Gate(
+            command
+                .env("HCOM_PROCESS_ID", &binding)
+                .env_remove("HCOM_INSTANCE_NAME")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        std::io::BufReader::new(gate.0.stdout.as_mut().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim_end(), "ready");
+        let root = gate.0.id();
+        let mut capture = capture_native_headless_scope(root, &bindings)
+            .unwrap()
+            .expect("owned live bound carrier must be captured");
+        assert_eq!(recheck_native_headless_scope(&capture, &bindings), Ok(()));
+
+        capture.root_identity.push_str("-changed");
+        assert!(matches!(
+            recheck_native_headless_scope(&capture, &bindings),
+            Err(crate::sys::process::KillError::Unconfirmed { .. })
+        ));
+        capture.root_identity = crate::sys::process::identity(root).unwrap();
+        capture.carriers[0].1.push_str("-changed");
+        assert!(matches!(
+            recheck_native_headless_scope(&capture, &bindings),
+            Err(crate::sys::process::KillError::Unconfirmed { .. })
+        ));
+        assert!(matches!(
+            capture_native_headless_scope(root, &[]),
+            Err(crate::sys::process::KillError::Unconfirmed { .. })
+        ));
+        assert_eq!(
+            crate::sys::process::kill_state(root),
+            crate::sys::process::KillState::Live
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_group_proof_rejects_changed_or_unreadable_leaders_and_empty_captures() {
+        use crate::sys::process::KillError;
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        // This retained Child is both leader and carrier. Cleanup only closes
+        // its private gate and reaps it; the boundary test sends no signals.
+        struct GatedLeader(std::process::Child);
+        impl Drop for GatedLeader {
+            fn drop(&mut self) {
+                self.0.stdin.take();
+                let _ = self.0.wait();
+            }
+        }
+        let name = unique_name("headless-proof");
+        let mut leader = GatedLeader(
+            std::process::Command::new("sh")
+                .args(["-c", "printf 'ready\\n'; IFS= read -r release"])
+                .env("HCOM_INSTANCE_NAME", &name)
+                .env_remove("HCOM_PROCESS_ID")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        std::io::BufReader::new(leader.0.stdout.as_mut().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let pgid = leader.0.id();
+        let mut capture = capture_instance_group(pgid, &name, &[], &[])
+            .unwrap()
+            .expect("owned marked group must be captured");
+        assert_eq!(recheck_instance_group(&capture, &name, &[], &[]), Ok(()));
+        assert!(!capture.confirmed_dead().unwrap());
+        assert!(
+            capture_instance_group(pgid, &format!("{name}-other"), &[], &[])
+                .unwrap()
+                .is_none(),
+            "group membership without the marker grants no authority"
+        );
+
+        let original_identity = capture.leader_identity.clone();
+        capture.leader_identity.push_str("-different-incarnation");
+        assert!(matches!(
+            recheck_instance_group(&capture, &name, &[], &[]),
+            Err(KillError::Unconfirmed { reason, survivors })
+                if reason.contains("leader") && survivors.contains(&pgid)
+        ));
+        capture.leader_identity = original_identity;
+
+        MISSING_CARRIER_IDENTITY.with(|missing| missing.set(Some(pgid)));
+        let unreadable = recheck_instance_group(&capture, &name, &[], &[]);
+        let unreadable_capture = capture_instance_group(pgid, &name, &[], &[]);
+        MISSING_CARRIER_IDENTITY.with(|missing| missing.set(None));
+        assert!(matches!(
+            unreadable,
+            Err(KillError::Unconfirmed { reason, survivors })
+                if reason.contains("unreadable") && survivors.contains(&pgid)
+        ));
+        assert!(matches!(
+            unreadable_capture,
+            Err(KillError::Unconfirmed { reason, survivors })
+                if reason.contains("identity is unreadable") && survivors.contains(&pgid)
+        ));
+
+        capture.carriers.clear();
+        assert!(matches!(
+            recheck_instance_group(&capture, &name, &[], &[]),
+            Err(KillError::Unconfirmed { reason, survivors })
+                if reason.contains("no original captured carrier") && survivors.contains(&pgid)
+        ));
+        assert!(
+            !process_gone(pgid),
+            "a rejected proof must not kill the group"
+        );
+    }
 
     #[test]
     fn legacy_history_requires_the_recorded_owner_or_positive_death() {
@@ -7017,9 +7663,12 @@ mod tests {
         let name = unique_name("scopefork");
         let binding_ids = vec![format!("proc-scope-{}", rand_suffix())];
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_identity =
+            crate::sys::process::identity(first.id()).expect("first carrier identity");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
+        crate::sys::process::signal_owned_test_child(&first, &first_identity, libc::SIGSTOP, false)
+            .expect("stop the owned first carrier");
 
         let (tx, rx) = std::sync::mpsc::channel();
         let reap_name = name.clone();
@@ -7066,9 +7715,12 @@ mod tests {
         let name = unique_name("scopespare");
         let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_identity =
+            crate::sys::process::identity(first.id()).expect("first carrier identity");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
+        crate::sys::process::signal_owned_test_child(&first, &first_identity, libc::SIGSTOP, false)
+            .expect("stop the owned first carrier");
 
         let fresh_binding = format!("proc-fresh-{}", rand_suffix());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -7127,9 +7779,12 @@ mod tests {
         let name = unique_name("scopebind");
         let binding = format!("proc-scope-{}", rand_suffix());
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_identity =
+            crate::sys::process::identity(first.id()).expect("first carrier identity");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
+        crate::sys::process::signal_owned_test_child(&first, &first_identity, libc::SIGSTOP, false)
+            .expect("stop the owned first carrier");
 
         let (tx, rx) = std::sync::mpsc::channel();
         let reap_name = name.clone();
@@ -7256,9 +7911,12 @@ mod tests {
         let name = unique_name("scopestale");
         let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_identity =
+            crate::sys::process::identity(first.id()).expect("first carrier identity");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
+        crate::sys::process::signal_owned_test_child(&first, &first_identity, libc::SIGSTOP, false)
+            .expect("stop the owned first carrier");
 
         let (tx, rx) = std::sync::mpsc::channel();
         let reap_name = name.clone();
@@ -7314,9 +7972,12 @@ mod tests {
         let name = unique_name("scopeorder");
         let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_identity =
+            crate::sys::process::identity(first.id()).expect("first carrier identity");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
+        crate::sys::process::signal_owned_test_child(&first, &first_identity, libc::SIGSTOP, false)
+            .expect("stop the owned first carrier");
 
         let fresh_binding = format!("proc-fresh-{}", rand_suffix());
         let (hook, hit, release) = rendezvous_at(RoundPoint::Captured);
@@ -7385,9 +8046,12 @@ mod tests {
         // carrier carries.
         insert_null_pid_row(&db, &other, &foreign_binding);
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_identity =
+            crate::sys::process::identity(first.id()).expect("first carrier identity");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
+        crate::sys::process::signal_owned_test_child(&first, &first_identity, libc::SIGSTOP, false)
+            .expect("stop the owned first carrier");
 
         let (hook, hit, release) = rendezvous_at(RoundPoint::Captured);
         let reap_name = name.clone();
@@ -7450,9 +8114,12 @@ mod tests {
         let name = unique_name("scoperecheck");
         let binding_ids = vec![format!("proc-bound-{}", rand_suffix())];
         let mut first = spawn_named_sleeper(&name, "proc-scope-old");
+        let first_identity =
+            crate::sys::process::identity(first.id()).expect("first carrier identity");
         let first_pid = first.id();
         wait_for_enumerated(&name, &[], first_pid);
-        let _ = crate::sys::process::signal_pid(first_pid, libc::SIGSTOP);
+        crate::sys::process::signal_owned_test_child(&first, &first_identity, libc::SIGSTOP, false)
+            .expect("stop the owned first carrier");
 
         let late_binding = format!("proc-fresh-{}", rand_suffix());
         let (mut spawn_hook, spawned, spawn_release) = rendezvous_at(RoundPoint::FirstCaptured);
@@ -8886,7 +9553,7 @@ mod tests {
     /// milliseconds until it exec's the shebang interpreter — a window in which
     /// every name check would answer about the wrong process.
     #[cfg(target_os = "linux")]
-    fn wrapper_tree(script: &str) -> (u32, u32, std::process::Child) {
+    fn wrapper_tree(script: &str) -> (u32, u32, FixtureTree) {
         use std::io::Read as _;
         use std::os::unix::process::CommandExt;
         let mut command = std::process::Command::new("/bin/sh");
@@ -8904,18 +9571,18 @@ mod tests {
         // the wrapper orphans those sleeps, and an orphan holding a pipe is
         // what turns a finished test into a hang.
         command.process_group(0);
-        let mut child = command.spawn().expect("spawn wrapper tree");
+        let mut child = FixtureTree::new(command.spawn().expect("spawn wrapper tree"));
         // `ChildStdout` is a `Read`, not a `BufRead`, so take the digits one at
         // a time until the newline the shell prints after `$!`.
         let mut digits = String::new();
         let mut byte = [0u8; 1];
-        let mut stdout = child.stdout.take().expect("wrapper stdout");
+        let mut stdout = child.0.stdout.take().expect("wrapper stdout");
         while stdout.read_exact(&mut byte).is_ok() && byte[0] != b'\n' {
             digits.push(byte[0] as char);
         }
         let tool: u32 = digits.trim().parse().expect("tool pid from `echo $!`");
-        wait_exec_settled(tool, child.id());
-        (child.id(), tool, child)
+        wait_exec_settled(tool, child.0.id());
+        (child.0.id(), tool, child)
     }
 
     /// Wait until `pid` is no longer the shell that forked it, i.e. its
@@ -8965,13 +9632,27 @@ mod tests {
     /// the wrapper, the tool, and nothing else. Nothing outside the test is
     /// ever signalled.
     #[cfg(target_os = "linux")]
-    struct FixtureTree(std::process::Child);
+    struct FixtureTree(std::process::Child, Option<String>);
+
+    #[cfg(target_os = "linux")]
+    impl FixtureTree {
+        fn new(child: std::process::Child) -> Self {
+            let identity = crate::sys::process::identity(child.id());
+            Self(child, identity)
+        }
+    }
 
     #[cfg(target_os = "linux")]
     impl Drop for FixtureTree {
         fn drop(&mut self) {
-            // The group this test created with process_group(0).
-            let _ = crate::sys::process::signal_group(self.0.id(), libc::SIGKILL);
+            if let Some(identity) = self.1.as_deref() {
+                let _ = crate::sys::process::signal_owned_test_child(
+                    &self.0,
+                    identity,
+                    libc::SIGKILL,
+                    true,
+                );
+            }
             let _ = self.0.wait();
         }
     }
@@ -8986,7 +9667,7 @@ mod tests {
         let gate = dir.path().join("hcom-fake-tool.live");
         let tool_bin = fake_tool_gated(dir.path(), "hcom-fake-tool", &gate);
         let (wrapper, tool, keep) = wrapper_tree(&tool_bin);
-        let _tree = FixtureTree(keep);
+        let _tree = keep;
 
         assert_eq!(orphan_fixtures::comm_of(tool), "hcom-fake-tool");
         assert!(
@@ -9027,9 +9708,9 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .process_group(0);
-        let tool = command.spawn().expect("spawn the tool itself");
-        let pid = tool.id();
-        let _tree = FixtureTree(tool);
+        let tool = FixtureTree::new(command.spawn().expect("spawn the tool itself"));
+        let pid = tool.0.id();
+        let _tree = tool;
 
         // The root is checked first and wins, so the answer is the recorded pid
         // itself and not some descendant of it.
@@ -9068,7 +9749,7 @@ mod tests {
         .unwrap();
         crate::sys::fs::set_executable(&mid).unwrap();
         let (wrapper, mid_pid, keep) = wrapper_tree(mid.to_str().unwrap());
-        let _tree = FixtureTree(keep);
+        let _tree = keep;
 
         // `$!` at the wrapper is the intermediate shell, so the tool is found
         // one level further down — which is exactly the point of the test.
@@ -9106,7 +9787,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wrapper, tool, keep) =
             wrapper_tree(&fake_tool_that_exits(dir.path(), "hcom-fake-brief", 1));
-        let _tree = FixtureTree(keep);
+        let _tree = keep;
 
         assert_eq!(
             live_tool_processes(wrapper, &["hcom-fake-brief"]),
@@ -9142,7 +9823,7 @@ mod tests {
         // against the tool name — as a `node .../claude` rewrite does.
         let script = fake_tool(dir.path(), "hcom-fake-node-tool");
         let (wrapper, tool, keep) = wrapper_tree(&format!("{} {}", node.display(), script));
-        let _tree = FixtureTree(keep);
+        let _tree = keep;
 
         // The premise, read from the process itself: argv[0]'s basename is
         // `node` and argv[1] is the tool. The matcher can only be right about
@@ -9194,7 +9875,7 @@ mod tests {
         std::fs::write(&sh, "#!/bin/bash\nwhile true; do sleep 1; done\n").unwrap();
         crate::sys::fs::set_executable(&sh).unwrap();
         let (wrapper, tool, keep) = wrapper_tree(&format!("{} hcom-fake-tool", sh.display()));
-        let _tree = FixtureTree(keep);
+        let _tree = keep;
 
         // `comm` is kernel-truncated to 15 chars, which is also why the
         // argv path (not comm) is what carries the tool's name here.

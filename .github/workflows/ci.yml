@@ -98,6 +98,21 @@ jobs:
         run: cargo test --locked --bin hcom sys::process -- --nocapture --test-threads=1
       - if: runner.os == 'Windows'
         run: cargo test --locked --bin hcom native_windows_launch_pin_ -- --nocapture --test-threads=1
+      - shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --bin hcom native_headless_ -- --nocapture --test-threads=1 | tee native-headless.log
+          node --input-type=commonjs <<'NODE'
+          const { readFileSync } = require('node:fs');
+          const log = readFileSync('native-headless.log', 'utf8');
+          const summaries = [...log.matchAll(/^test result: ok\. (\d+) passed; 0 failed;/gm)];
+          const passed = summaries.length === 1 ? Number(summaries[0][1]) : 0;
+          if (summaries.length !== 1 || !Number.isSafeInteger(passed) || passed <= 0) {
+            console.error('Expected exactly one passing native_headless_ summary with a nonzero test count.');
+            process.exit(1);
+          }
+          console.log(`native_headless_ actual passed=${passed} os=${process.env.RUNNER_OS}`);
+          NODE
       - run: cargo test --locked --test omp_native_owner -- --nocapture --test-threads=1
       - run: cargo test --locked --test kill_owner -- --nocapture --test-threads=1
 

@@ -1868,21 +1868,149 @@ pub(crate) fn signal_free_release_blocker(
     None
 }
 
-/// Whether the headless row's recorded pid still leads this instance's tree:
-/// some live identity carrier of `instance_name` is in process group `pid`.
-/// The recorded pid is the launch-script bash, which leads the group but
-/// never carries the identity; `hcom pty` below it does.
+/// A Linux group signal belongs to the captured leader and carrier
+/// incarnations, not to whoever happens to hold the recorded pgid later.
 #[cfg(target_os = "linux")]
-fn headless_group_holds_carrier(db: &HcomDb, instance_name: &str, pid: u32) -> bool {
-    let binding_ids = db.process_binding_ids(instance_name).unwrap_or_default();
-    let owners = crate::proctruth::omp_owner_bindings(db, instance_name);
-    crate::proctruth::group_holds_instance_carrier(pid, instance_name, &binding_ids, &owners)
+fn stop_headless_group(
+    db: &HcomDb,
+    instance_name: &str,
+    pid: u32,
+) -> Result<(), crate::sys::process::KillError> {
+    use crate::sys::process::{GroupSignal, KillError};
+
+    let facts = || {
+        let unreadable = |error| KillError::Unconfirmed {
+            reason: format!("headless group {pid} binding registry is unreadable: {error}"),
+            survivors: vec![pid],
+        };
+        let binding_ids = db.process_binding_ids(instance_name).map_err(unreadable)?;
+        let owners =
+            crate::proctruth::checked_omp_owner_bindings(db, instance_name).map_err(unreadable)?;
+        Ok::<_, KillError>((binding_ids, owners))
+    };
+    let (binding_ids, owners) = facts()?;
+    let Some(capture) =
+        crate::proctruth::capture_instance_group(pid, instance_name, &binding_ids, &owners)?
+    else {
+        log::log_info(
+            "hooks",
+            "stop_instance.headless_signal_skipped",
+            &format!("instance={instance_name} pid={pid} reason=no_carrier_in_group"),
+        );
+        return Ok(());
+    };
+    let recheck = || {
+        let (binding_ids, owners) = facts()?;
+        crate::proctruth::recheck_instance_group(&capture, instance_name, &binding_ids, &owners)
+    };
+    recheck()?;
+    if crate::sys::process::terminate_group(pid) != GroupSignal::Sent {
+        return if capture.confirmed_dead()? {
+            Ok(())
+        } else {
+            Err(capture.unconfirmed("SIGTERM was not delivered"))
+        };
+    }
+    #[cfg(test)]
+    crate::proctruth::fire_round_seam(crate::proctruth::RoundPoint::HeadlessTermSent);
+    // Liveness only bounds the grace-period wait. It grants no authority
+    // to signal the current owner of this numeric process-group ID.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        if !crate::sys::process::is_alive(pid) {
+            break;
+        }
+    }
+    #[cfg(test)]
+    crate::proctruth::fire_round_seam(crate::proctruth::RoundPoint::HeadlessWaitFinished);
+    if capture.confirmed_dead()? {
+        return Ok(());
+    }
+    recheck()?;
+    crate::sys::process::kill_group(pid);
+    for _ in 0..20 {
+        if capture.confirmed_dead()? {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(capture.unconfirmed("group death was not confirmed after SIGKILL"))
 }
 
-/// No /proc outside Linux: the recorded group is signalled as before.
-#[cfg(not(target_os = "linux"))]
-fn headless_group_holds_carrier(_db: &HcomDb, _instance_name: &str, _pid: u32) -> bool {
-    true
+/// Native platforms reuse the verified tree actuator, including its
+/// per-target identity checks and death confirmation. Every authorization
+/// uses this one captured carrier set, never replacement authority.
+#[cfg(any(target_os = "macos", windows))]
+fn stop_headless_group(
+    db: &HcomDb,
+    instance_name: &str,
+    pid: u32,
+) -> Result<(), crate::sys::process::KillError> {
+    use crate::sys::process::{self, GroupSignal, KillError};
+
+    let unreadable = |reason: String| KillError::Unconfirmed {
+        reason: format!("native headless root {pid} is unconfirmed: {reason}"),
+        survivors: vec![pid],
+    };
+    let bindings = || {
+        db.process_binding_ids(instance_name)
+            .map_err(|error| unreadable(format!("binding registry is unreadable: {error}")))
+    };
+    let binding_ids = bindings()?;
+    let Some(capture) = crate::proctruth::capture_native_headless_scope(pid, &binding_ids)? else {
+        return Ok(());
+    };
+    let excluded = crate::proctruth::kill_caller_ancestor_pids()
+        .map_err(|reason| unreadable(reason.into()))?;
+    crate::proctruth::recheck_native_headless_scope(&capture, &bindings()?)?;
+    #[cfg(test)]
+    NATIVE_HEADLESS_ACTUATOR_GAP.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+    let outcome = process::terminate_group_verified(
+        (pid, capture.root_identity()),
+        &binding_ids,
+        &excluded,
+        crate::proctruth::process_id_of,
+        crate::proctruth::kill_candidate_eligible,
+        |target| {
+            crate::proctruth::verify_kill_candidate(db, instance_name, target)?;
+            crate::proctruth::recheck_native_headless_scope(&capture, &bindings()?)
+        },
+        &mut process::UnsignaledCarriers::default(),
+    )?;
+    match outcome {
+        GroupSignal::Sent => Ok(()),
+        GroupSignal::NotFound => {
+            Err(capture.unconfirmed("captured root exited before native termination"))
+        }
+        #[cfg(unix)]
+        GroupSignal::PermissionDenied | GroupSignal::Other => {
+            Err(capture.unconfirmed("native tree termination was not confirmed"))
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn stop_headless_group(
+    _db: &HcomDb,
+    _instance_name: &str,
+    pid: u32,
+) -> Result<(), crate::sys::process::KillError> {
+    Err(crate::sys::process::KillError::Unconfirmed {
+        reason: "native headless ownership cannot be proven on this platform".into(),
+        survivors: vec![pid],
+    })
+}
+
+#[cfg(all(test, any(target_os = "macos", windows)))]
+type NativeHeadlessActuatorGap = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(all(test, any(target_os = "macos", windows)))]
+thread_local! {
+    static NATIVE_HEADLESS_ACTUATOR_GAP: NativeHeadlessActuatorGap = std::cell::RefCell::new(None);
 }
 
 /// Whether the caller's own tree (`exclude`: the caller and its ancestors) is
@@ -2227,34 +2355,15 @@ fn stop_instance_inner_scoped(
                         "stop_instance.headless_self_skip",
                         &format!("instance={instance_name} pid={pid_u32}"),
                     );
-                } else if !headless_group_holds_carrier(db, instance_name, pid_u32) {
-                    log::log_info(
+                } else if let Err(error) = stop_headless_group(db, instance_name, pid_u32) {
+                    log::log_warn(
                         "hooks",
-                        "stop_instance.headless_signal_skipped",
-                        &format!(
-                            "instance={instance_name} pid={pid_u32} reason=no_carrier_in_group"
-                        ),
+                        "stop_instance.headless_unconfirmed",
+                        &format!("instance={instance_name} pid={pid_u32} err={error}"),
                     );
-                } else {
-                    // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
-                    // Windows: forceful process-tree kill) → poll up to 2s for exit →
-                    // kill_group (Unix: SIGKILL; Windows: tree kill again). The poll also
-                    // waits out Windows' asynchronous TerminateProcess.
-                    use crate::sys::process::GroupSignal;
-                    if crate::sys::process::terminate_group(pid_u32) == GroupSignal::Sent {
-                        let mut dead = false;
-                        for _ in 0..20 {
-                            std::thread::sleep(Duration::from_millis(100));
-                            if !crate::sys::process::is_alive(pid_u32) {
-                                dead = true;
-                                break;
-                            }
-                        }
-                        if !dead {
-                            crate::sys::process::kill_group(pid_u32);
-                        }
-                    }
-                    // NotFound/PermissionDenied from initial signal is fine — process already gone or foreign
+                    return StopOutcome::RetryableError(
+                        format!("could not stop {instance_name}: {error}; row left intact").into(),
+                    );
                 }
             }
         } else {
@@ -4094,7 +4203,7 @@ mod tests {
             .unwrap();
         // An old carrier ensures the KILL-round seam fires even though the
         // pre-registered row has no pid yet.
-        let _old = OwnedGroup(
+        let _old = OwnedGroup::new(
             std::process::Command::new("sleep")
                 .arg("300")
                 .env("HCOM_INSTANCE_NAME", &name)
@@ -4109,7 +4218,7 @@ mod tests {
         let launch_name = name.clone();
         arm_round_seam(move |point| {
             if point == RoundPoint::Captured && observed.borrow().is_none() {
-                let child = OwnedGroup(
+                let child = OwnedGroup::new(
                     std::process::Command::new("sleep")
                         .arg("300")
                         .env_remove("HCOM_INSTANCE_NAME")
@@ -4764,14 +4873,250 @@ mod tests {
 
     /// Test-owned process group: Drop SIGKILLs the whole group the spawned
     /// leader leads (Windows: its tree), then reaps the leader. The leader is
-    /// never reaped before that, so its pgid cannot be recycled under the
-    /// signal, and no failure path, panics included, leaves a member running.
-    struct OwnedGroup(std::process::Child);
+    /// never reaped before that; numeric group cleanup also requires its
+    /// spawn-time identity and an unreaped-child proof immediately at signal.
+    struct OwnedGroup(std::process::Child, #[cfg(unix)] Option<String>);
+
+    impl OwnedGroup {
+        fn new(child: std::process::Child) -> Self {
+            #[cfg(unix)]
+            {
+                let identity = crate::sys::process::identity(child.id());
+                Self(child, identity)
+            }
+            #[cfg(not(unix))]
+            {
+                Self(child)
+            }
+        }
+    }
 
     impl Drop for OwnedGroup {
         fn drop(&mut self) {
+            #[cfg(unix)]
+            if let Some(identity) = self.1.as_deref() {
+                let _ = crate::sys::process::signal_owned_test_child(
+                    &self.0,
+                    identity,
+                    libc::SIGKILL,
+                    true,
+                );
+            }
+            #[cfg(not(unix))]
             crate::sys::process::kill_child_group(&mut self.0);
             let _ = self.0.wait();
+        }
+    }
+
+    /// Native-platform fixtures own one unreaped root and no subprocesses.
+    /// Closing stdin ends either image, so cleanup never signals a PID.
+    #[cfg(any(target_os = "macos", windows))]
+    struct NativeHeadlessChild {
+        child: std::process::Child,
+        identity: Option<String>,
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    impl NativeHeadlessChild {
+        fn spawn(binding: &str) -> Self {
+            #[cfg(target_os = "macos")]
+            let mut command = {
+                use std::os::unix::process::CommandExt;
+                let mut command = std::process::Command::new("/bin/sh");
+                command
+                    .args([
+                        "-c",
+                        "printf 'ready\\n'; IFS= read -r phase || exit 0; \
+                         exec env -u HCOM_PROCESS_ID /bin/sh -c \
+                         'printf \"unmarked\\n\"; IFS= read -r release'",
+                    ])
+                    .process_group(0);
+                command
+            };
+            #[cfg(windows)]
+            let mut command = {
+                let mut command = std::process::Command::new("powershell");
+                command.args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Write-Output 'ready'; $phase = [Console]::ReadLine(); \
+                     if ($null -eq $phase) { exit }; \
+                     [Environment]::SetEnvironmentVariable('HCOM_PROCESS_ID', $null, 'Process'); \
+                     Write-Output 'unmarked'; [void][Console]::ReadLine()",
+                ]);
+                command
+            };
+            let mut owned = Self {
+                child: command
+                    .env("HCOM_PROCESS_ID", binding)
+                    .env_remove("HCOM_INSTANCE_NAME")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+                identity: None,
+            };
+            owned.identity = Some(crate::sys::process::identity(owned.child.id()).unwrap());
+            owned.read_ack("ready");
+            owned
+        }
+
+        fn read_ack(&mut self, expected: &str) {
+            use std::io::BufRead;
+
+            let mut line = String::new();
+            std::io::BufReader::new(self.child.stdout.as_mut().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line.trim_end(), expected);
+        }
+
+        fn revoke_marker(&mut self) {
+            writeln!(self.child.stdin.as_mut().unwrap(), "unmark").unwrap();
+            self.child.stdin.as_mut().unwrap().flush().unwrap();
+            self.read_ack("unmarked");
+        }
+
+        fn exit_at_gate(&mut self) {
+            self.child.stdin.take();
+            #[cfg(target_os = "macos")]
+            {
+                // Keep the owned leader unreaped while the consumer handles
+                // a root that exited after its original capture.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                loop {
+                    let result = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            self.child.id(),
+                            &mut info,
+                            libc::WEXITED | libc::WNOWAIT,
+                        )
+                    };
+                    if result == 0 {
+                        break;
+                    }
+                    let error = std::io::Error::last_os_error();
+                    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+                }
+            }
+            #[cfg(windows)]
+            self.child.wait().unwrap();
+        }
+
+        fn unchanged(&self) -> bool {
+            self.identity.as_deref().is_some_and(|identity| {
+                crate::sys::process::has_identity(self.child.id(), identity)
+            })
+        }
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    impl Drop for NativeHeadlessChild {
+        fn drop(&mut self) {
+            self.child.stdin.take();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Each PID remains reserved by its unreaped Child. The shell ignores
+    /// TERM only after its readiness acknowledgement and exits at gate EOF.
+    #[cfg(target_os = "linux")]
+    struct GatedHeadlessChild {
+        child: std::process::Child,
+        identity: Option<String>,
+        leads_group: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl GatedHeadlessChild {
+        fn spawn(name: Option<&str>, pgid: Option<u32>) -> Self {
+            use std::io::BufRead;
+            use std::os::unix::process::CommandExt;
+
+            let mut command = std::process::Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "trap '' TERM; printf 'ready\\n'; IFS= read -r release",
+                ])
+                .env_remove("HCOM_INSTANCE_NAME")
+                .env_remove("HCOM_PROCESS_ID")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .process_group(pgid.map_or(0, |pgid| {
+                    i32::try_from(pgid).expect("owned process group ID fits i32")
+                }));
+            if let Some(name) = name {
+                command.env("HCOM_INSTANCE_NAME", name);
+            }
+            let mut owned = Self {
+                child: command.spawn().unwrap(),
+                identity: None,
+                leads_group: pgid.is_none(),
+            };
+            owned.identity = Some(crate::sys::process::identity(owned.child.id()).unwrap());
+            let mut ready = String::new();
+            std::io::BufReader::new(owned.child.stdout.as_mut().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            owned
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn unchanged(&self) -> bool {
+            self.identity
+                .as_deref()
+                .is_some_and(|identity| crate::sys::process::has_identity(self.pid(), identity))
+        }
+
+        fn wait_exit_without_reaping(&self) -> libc::siginfo_t {
+            // WNOWAIT observes only this retained Child, without freeing its
+            // PID before the stop's group-proof recheck or fixture cleanup.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            loop {
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        self.pid(),
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if result == 0 {
+                    return info;
+                }
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for GatedHeadlessChild {
+        fn drop(&mut self) {
+            self.child.stdin.take();
+            if self.leads_group {
+                if let Some(identity) = self.identity.as_deref() {
+                    let _ = crate::sys::process::signal_owned_test_child(
+                        &self.child,
+                        identity,
+                        libc::SIGKILL,
+                        true,
+                    );
+                }
+            } else if self.unchanged() {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
         }
     }
 
@@ -4804,7 +5149,7 @@ mod tests {
     fn spawn_headless_group(name: &str) -> (OwnedGroup, u32, u32) {
         use std::io::BufRead;
         use std::os::unix::process::CommandExt;
-        let mut group = OwnedGroup(
+        let mut group = OwnedGroup::new(
             std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
@@ -4897,6 +5242,337 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial]
+    fn headless_stop_refuses_escalation_when_only_a_replacement_carrier_remains() {
+        use crate::proctruth::{RoundPoint, arm_round_seam};
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        let name = format!("headless-replacement-{}", std::process::id());
+        let root = GatedHeadlessChild::spawn(None, None);
+        let pgid = root.pid();
+        let carrier = Rc::new(RefCell::new(GatedHeadlessChild::spawn(
+            Some(&name),
+            Some(pgid),
+        )));
+        let replacement = Rc::new(RefCell::new(None::<GatedHeadlessChild>));
+        let reached_escalation = Rc::new(Cell::new(false));
+        insert_headless_instance(&db, &name, pgid);
+        let binding = format!("proc-{name}");
+        db.set_process_binding(&binding, "", &name).unwrap();
+
+        let old = carrier.clone();
+        let new = replacement.clone();
+        let hit = reached_escalation.clone();
+        let replacement_name = name.clone();
+        let root_identity = root.identity.clone().unwrap();
+        arm_round_seam(move |point| match point {
+            RoundPoint::HeadlessTermSent => {
+                let mut old = old.borrow_mut();
+                old.child.stdin.take();
+                let exit = old.wait_exit_without_reaping();
+                assert_eq!(exit.si_code, libc::CLD_EXITED);
+                assert!(old.unchanged(), "dead carrier PID was not retained");
+                *new.borrow_mut() = Some(GatedHeadlessChild::spawn(
+                    Some(&replacement_name),
+                    Some(pgid),
+                ));
+            }
+            RoundPoint::HeadlessWaitFinished => {
+                hit.set(true);
+                assert!(crate::sys::process::is_alive(pgid));
+                assert!(crate::sys::process::has_identity(pgid, &root_identity));
+                assert_eq!(crate::sys::process::group_id(pgid), Some(pgid));
+            }
+            _ => {}
+        });
+
+        let outcome = stop_instance(&db, &name, "test", "headless-replacement");
+        arm_round_seam(|_| {});
+        let replacement = replacement.borrow();
+        let replacement = replacement.as_ref().expect("TERM seam did not run");
+        assert!(
+            reached_escalation.get(),
+            "escalation boundary was not reached"
+        );
+        assert!(
+            matches!(&outcome, StopOutcome::RetryableError(error)
+                if error.to_string().contains("unconfirmed")
+                    && error.to_string().contains("no original captured carrier")
+                    && error.to_string().contains(&replacement.pid().to_string())),
+            "{outcome:?}"
+        );
+        assert!(root.unchanged() && !process_gone(pgid));
+        assert!(replacement.unchanged() && !process_gone(replacement.pid()));
+        assert!(process_gone(carrier.borrow().pid()));
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_eq!(db.process_binding_ids(&name).unwrap(), vec![binding]);
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1
+               AND json_extract(data, '$.action') = 'stopped'",
+                [&name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "an unconfirmed group must not be released");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial]
+    fn headless_stop_escalates_only_while_the_captured_carrier_still_proves_the_group() {
+        use crate::proctruth::{RoundPoint, arm_round_seam};
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        let name = format!("headless-escalation-{}", std::process::id());
+        let root = GatedHeadlessChild::spawn(None, None);
+        let pgid = root.pid();
+        let carrier = Rc::new(RefCell::new(GatedHeadlessChild::spawn(
+            Some(&name),
+            Some(pgid),
+        )));
+        let reached_escalation = Rc::new(Cell::new(false));
+        insert_headless_instance(&db, &name, pgid);
+        db.set_process_binding(&format!("proc-{name}"), "", &name)
+            .unwrap();
+
+        let original = carrier.clone();
+        let hit = reached_escalation.clone();
+        arm_round_seam(move |point| {
+            if point == RoundPoint::HeadlessWaitFinished {
+                let original = original.borrow();
+                assert!(original.unchanged() && !process_gone(original.pid()));
+                assert_eq!(crate::sys::process::group_id(original.pid()), Some(pgid));
+                hit.set(true);
+            }
+        });
+
+        let outcome = stop_instance(&db, &name, "test", "headless-escalation");
+        arm_round_seam(|_| {});
+        assert!(
+            reached_escalation.get(),
+            "TERM-ignoring carrier was not observed"
+        );
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(process_gone(pgid), "success preceded group-leader death");
+        let root_exit = root.wait_exit_without_reaping();
+        assert_eq!(root_exit.si_code, libc::CLD_KILLED);
+        assert_eq!(unsafe { root_exit.si_status() }, libc::SIGKILL);
+        let carrier = carrier.borrow();
+        assert!(
+            process_gone(carrier.pid()),
+            "success preceded carrier death"
+        );
+        let exit = carrier.wait_exit_without_reaping();
+        assert_eq!(exit.si_code, libc::CLD_KILLED);
+        assert_eq!(unsafe { exit.si_status() }, libc::SIGKILL);
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert!(db.process_binding_ids(&name).unwrap().is_empty());
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    #[serial]
+    fn native_headless_stop_confirms_death_of_a_bound_owned_root() {
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        let name = format!("native-headless-stop-{}", std::process::id());
+        let binding = format!("proc-{name}");
+        let root = NativeHeadlessChild::spawn(&binding);
+        let pid = root.child.id();
+        insert_headless_instance(&db, &name, pid);
+        db.set_process_binding(&binding, "", &name).unwrap();
+
+        let outcome = stop_instance(&db, &name, "test", "native-headless-stop");
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert_eq!(
+            crate::sys::process::kill_state(pid),
+            crate::sys::process::KillState::Gone
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert!(db.process_binding_ids(&name).unwrap().is_empty());
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    #[serial]
+    fn native_headless_stop_keeps_row_when_captured_carrier_loses_its_marker() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        let name = format!("native-headless-lost-proof-{}", std::process::id());
+        let binding = format!("proc-{name}");
+        let root = Rc::new(RefCell::new(NativeHeadlessChild::spawn(&binding)));
+        let pid = root.borrow().child.id();
+        let reached = Rc::new(Cell::new(false));
+        insert_headless_instance(&db, &name, pid);
+        db.set_process_binding(&binding, "", &name).unwrap();
+
+        let revoked = root.clone();
+        let hit = reached.clone();
+        NATIVE_HEADLESS_ACTUATOR_GAP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let mut root = revoked.borrow_mut();
+                root.revoke_marker();
+                assert!(root.unchanged());
+                assert_eq!(
+                    crate::proctruth::process_id_of(pid),
+                    crate::sys::process_args::EnvRead::Absent,
+                );
+                hit.set(true);
+            }));
+        });
+        let outcome = stop_instance(&db, &name, "test", "native-headless-lost-proof");
+        NATIVE_HEADLESS_ACTUATOR_GAP.with(|slot| slot.borrow_mut().take());
+
+        assert!(
+            reached.get(),
+            "native pre-actuator boundary was not reached"
+        );
+        assert!(
+            matches!(
+                &outcome,
+                StopOutcome::RetryableError(error) if error.to_string().contains("unconfirmed")
+            ),
+            "{outcome:?}"
+        );
+        assert!(root.borrow().unchanged());
+        assert_eq!(
+            crate::sys::process::kill_state(pid),
+            crate::sys::process::KillState::Live
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_eq!(db.process_binding_ids(&name).unwrap(), vec![binding]);
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1
+               AND json_extract(data, '$.action') = 'stopped'",
+                [&name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "lost native authority must not release the row");
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    #[serial]
+    fn native_headless_stop_does_not_release_a_live_unbound_root() {
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        let name = format!("native-headless-unbound-{}", std::process::id());
+        let root = NativeHeadlessChild::spawn("proc-unclaimed");
+        let pid = root.child.id();
+        insert_headless_instance(&db, &name, pid);
+
+        let outcome = stop_instance(&db, &name, "test", "native-headless-unbound");
+
+        assert!(
+            matches!(
+                &outcome,
+                StopOutcome::RetryableError(error) if error.to_string().contains("unconfirmed")
+            ),
+            "{outcome:?}"
+        );
+        assert!(root.unchanged());
+        assert_eq!(
+            crate::sys::process::kill_state(pid),
+            crate::sys::process::KillState::Live
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    #[serial]
+    fn native_headless_stop_keeps_row_when_captured_root_exits_before_the_actuator() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        let name = format!("native-headless-root-exit-{}", std::process::id());
+        let binding = format!("proc-{name}");
+        let root = Rc::new(RefCell::new(NativeHeadlessChild::spawn(&binding)));
+        let pid = root.borrow().child.id();
+        let reached = Rc::new(Cell::new(false));
+        insert_headless_instance(&db, &name, pid);
+        db.set_process_binding(&binding, "", &name).unwrap();
+
+        let exiting = root.clone();
+        let hit = reached.clone();
+        NATIVE_HEADLESS_ACTUATOR_GAP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                exiting.borrow_mut().exit_at_gate();
+                hit.set(true);
+            }));
+        });
+        let outcome = stop_instance(&db, &name, "test", "native-headless-root-exit");
+        NATIVE_HEADLESS_ACTUATOR_GAP.with(|slot| slot.borrow_mut().take());
+
+        assert!(
+            reached.get(),
+            "native pre-actuator boundary was not reached"
+        );
+        assert!(
+            matches!(
+                &outcome,
+                StopOutcome::RetryableError(error) if error.to_string().contains("unconfirmed")
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            crate::sys::process::kill_state(pid),
+            crate::sys::process::KillState::Gone
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_some());
+        assert_eq!(db.process_binding_ids(&name).unwrap(), vec![binding]);
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = ?1
+               AND json_extract(data, '$.action') = 'stopped'",
+                [&name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0, "a lost captured root requires a fresh stop");
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    #[serial]
+    fn native_headless_stop_can_finalize_a_root_proven_dead_before_capture() {
+        let _env = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        let name = format!("native-headless-already-dead-{}", std::process::id());
+        let binding = format!("proc-{name}");
+        let mut root = NativeHeadlessChild::spawn(&binding);
+        let pid = root.child.id();
+        root.exit_at_gate();
+        insert_headless_instance(&db, &name, pid);
+        db.set_process_binding(&binding, "", &name).unwrap();
+
+        let outcome = stop_instance(&db, &name, "test", "native-headless-already-dead");
+
+        assert_eq!(outcome, StopOutcome::Stopped);
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert!(db.process_binding_ids(&name).unwrap().is_empty());
+    }
+
     /// The session's own release (non-empty `exclude`) never signals a
     /// recorded group holding a pid of its own tree, even when the recorded
     /// pid itself is not excluded. The reap still takes every other carrier,
@@ -4958,7 +5634,7 @@ mod tests {
         let (_dir, db) = make_test_db();
         let name = format!("selfoff{}", std::process::id());
         #[cfg(windows)]
-        let root = OwnedGroup(
+        let root = OwnedGroup::new(
             std::process::Command::new("powershell")
                 .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 300"])
                 .spawn()
@@ -4967,7 +5643,7 @@ mod tests {
         #[cfg(unix)]
         let root = {
             use std::os::unix::process::CommandExt;
-            OwnedGroup(
+            OwnedGroup::new(
                 std::process::Command::new("sleep")
                     .arg("300")
                     .process_group(0)

@@ -841,6 +841,29 @@ impl std::fmt::Display for KillError {
     }
 }
 
+/// Lines a report names before it summarizes the rest as a count.
+pub(crate) const UNSIGNALED_CARRIER_LIMIT: usize = 10;
+
+/// ID-carrying processes a verified kill left unsignaled because they sit
+/// under an excluded launcher or terminal ancestor. Informational only: they
+/// are neither survivors nor a refusal and never change the kill's outcome.
+/// `entries` names at most the first [`UNSIGNALED_CARRIER_LIMIT`]; `total`
+/// counts every unique such candidate.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct UnsignaledCarriers {
+    pub(crate) entries: Vec<UnsignaledCarrier>,
+    pub(crate) total: usize,
+}
+
+/// One unsignaled carrier and the excluded ancestor that holds it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct UnsignaledCarrier {
+    pub(crate) launcher_pid: u32,
+    pub(crate) launcher_comm: String,
+    pub(crate) pid: u32,
+    pub(crate) comm: String,
+}
+
 /// Authorization can race exit or PID reuse. Only the captured incarnation's
 /// live failure blocks termination; a gone incarnation remains a tree anchor.
 fn authorize_captured<T: PartialEq>(
@@ -891,30 +914,28 @@ fn authorize_windows_member(
 
 /// Send a graceful termination request to a process group by PID.
 ///
-/// Unix: `killpg(SIGTERM)`. Windows has no process-group signal and no graceful
-/// per-tree signal for an unrelated process, so this maps to a forceful
-/// process-tree termination ([`kill_tree_win`]) — the same as [`kill_group`].
+/// Linux: `killpg(SIGTERM)`. The headless stop path is the only consumer, and
+/// it exists on Linux alone: macOS and Windows terminate the verified tree
+/// through [`terminate_group_verified`] instead, which has no group signal to
+/// fall back on.
+#[cfg(target_os = "linux")]
 pub fn terminate_group(pid: u32) -> GroupSignal {
-    #[cfg(unix)]
-    {
-        signal_group_unix(pid, libc::SIGTERM)
-    }
-    #[cfg(windows)]
-    {
-        kill_tree_win(pid)
-    }
+    signal_group_unix(pid, libc::SIGTERM)
 }
 
-/// Terminate the verified seat root through exactly one native tree helper.
-/// A helper returns success only after all captured incarnations are gone.
+/// Terminate the verified seat root, `(pid, expected identity)`, through
+/// exactly one native tree helper. A helper returns success only after all
+/// captured incarnations are gone. `not_signaled` receives the ID-carrying
+/// processes the Linux helper left unsignaled under an excluded ancestor, on
+/// success and failure alike; the other platforms leave it untouched.
 pub(crate) fn terminate_group_verified(
-    pid: u32,
-    expected: &str,
+    (pid, expected): (u32, &str),
     binding_ids: &[String],
     excluded: &[u32],
     process_id_of: impl FnMut(u32) -> super::process_args::EnvRead,
     eligible: impl FnMut(u32) -> bool,
     mut authorize: impl FnMut(u32) -> Result<(), KillError>,
+    not_signaled: &mut UnsignaledCarriers,
 ) -> Result<GroupSignal, KillError> {
     if is_definitely_dead(pid) {
         return Ok(GroupSignal::NotFound);
@@ -934,23 +955,23 @@ pub(crate) fn terminate_group_verified(
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         super::kill_tree_linux::terminate(
-            pid,
-            expected,
+            (pid, expected),
             binding_ids,
             excluded,
             process_id_of,
             eligible,
             authorize,
+            not_signaled,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (binding_ids, process_id_of);
+        let _ = (binding_ids, process_id_of, not_signaled);
         super::kill_tree_apple::terminate(pid, expected, excluded, eligible, authorize)
     }
     #[cfg(windows)]
     {
-        let _ = (binding_ids, process_id_of);
+        let _ = (binding_ids, process_id_of, not_signaled);
         let mut eligible = eligible;
         let ticks = expected
             .strip_prefix("windows:")
@@ -1003,7 +1024,14 @@ pub(crate) fn terminate_group_verified(
         windows
     )))]
     {
-        let _ = (binding_ids, excluded, process_id_of, eligible, authorize);
+        let _ = (
+            binding_ids,
+            excluded,
+            process_id_of,
+            eligible,
+            authorize,
+            not_signaled,
+        );
         Err("verified process-tree termination is unsupported on this platform".into())
     }
 }
@@ -1410,6 +1438,64 @@ pub(crate) fn signal_group(pgid: u32, sig: libc::c_int) -> Result<GroupSignal, K
 #[cfg(unix)]
 fn signal_group_unix(pid: u32, sig: libc::c_int) -> GroupSignal {
     signal_group(pid, sig).unwrap_or(GroupSignal::Other)
+}
+
+/// Test-only numeric signal to a `Child` this test still owns. The `&Child`
+/// borrow keeps std from reaping it, and `waitid(WNOWAIT)` proves the PID is
+/// still our unreaped child, so it cannot have been reused. The identity
+/// captured at spawn must still match, and a group signal additionally
+/// requires the child to lead its own group. Any failed proof sends nothing.
+#[cfg(all(test, unix))]
+pub(crate) fn signal_owned_test_child(
+    child: &std::process::Child,
+    expected: &str,
+    signal: i32,
+    group: bool,
+) -> Result<(), String> {
+    let pid = child.id();
+    let raw = checked_pid(pid).map_err(|error| error.to_string())?;
+    if expected.is_empty() {
+        return Err(format!("child {pid}: empty expected spawn identity"));
+    }
+    // SAFETY: waitid fills this writable siginfo buffer; WNOWAIT never reaps.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: P_PID selects only this child, and info is writable.
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            raw as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if waited != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(format!("child {pid} is not an unreaped child: {error}"));
+    }
+    match identity(pid) {
+        Some(current) if current == expected => {}
+        Some(current) => {
+            return Err(format!(
+                "child {pid} identity changed: expected {expected}, found {current}"
+            ));
+        }
+        None => return Err(format!("child {pid} identity unreadable")),
+    }
+    let sent = if group {
+        // SAFETY: getpgid only queries the group of this positive child PID.
+        let pgid = unsafe { libc::getpgid(raw) };
+        if pgid != raw {
+            return Err(format!("child {pid} does not lead its group (pgid {pgid})"));
+        }
+        signal_group(pid, signal)
+    } else {
+        signal_pid(pid, signal)
+    }
+    .map_err(|error| error.to_string())?;
+    match sent {
+        GroupSignal::Sent => Ok(()),
+        other => Err(format!("signal {signal} to child {pid}: {other:?}")),
+    }
 }
 
 /// Replace the current process with the given command.
@@ -1853,6 +1939,62 @@ fn kill_tree_win_checked(root: u32) -> (GroupSignal, bool) {
     .unwrap_or((GroupSignal::NotFound, false))
 }
 
+/// Collect `root` and all its descendants (BFS over the snapshot's parent
+/// links), rejecting any candidate that is older than the tree member
+/// claiming it: that link is stale, not a real parent/child edge (see
+/// `child_link_is_plausible`). Creation times are read through `ticks`.
+/// A `verified` walk skips an ineligible child with its subtree and hands
+/// each child it cannot attribute (an unreadable time on either side, or a
+/// parent no longer its cached incarnation) to `unresolved`, never to the
+/// tree. Returns the tree, root first, and the deepest member's depth.
+#[cfg(windows)]
+fn capture_tree_win(
+    root: u32,
+    parents: &std::collections::HashMap<u32, ProcessSnapshot>,
+    ticks: &mut std::collections::HashMap<u32, Option<u64>>,
+    verified: bool,
+    eligible: &mut impl FnMut(u32) -> bool,
+    mut unresolved: impl FnMut(u32, Option<u64>),
+) -> (Vec<u32>, usize) {
+    let mut tree = vec![root];
+    let mut depth = 0;
+    let mut level_end = 1;
+    let mut i = 0;
+    while i < tree.len() {
+        if i == level_end {
+            depth += 1;
+            level_end = tree.len();
+        }
+        let current = tree[i];
+        let parent_ticks = *ticks
+            .entry(current)
+            .or_insert_with(|| creation_ticks_win(current));
+        for (&pid, entry) in parents {
+            let ppid = entry.parent_pid;
+            if ppid != current || tree.contains(&pid) {
+                continue;
+            }
+            if verified && !eligible(pid) {
+                continue;
+            }
+            let child_ticks = *ticks.entry(pid).or_insert_with(|| creation_ticks_win(pid));
+            if verified
+                && (parent_ticks.is_none()
+                    || child_ticks.is_none()
+                    || creation_ticks_win(current) != parent_ticks)
+            {
+                unresolved(pid, child_ticks);
+                continue;
+            }
+            if child_link_is_plausible(parent_ticks, child_ticks) {
+                tree.push(pid);
+            }
+        }
+        i += 1;
+    }
+    (tree, depth)
+}
+
 #[cfg(windows)]
 fn kill_tree_win_with_identity(
     root: u32,
@@ -1919,10 +2061,6 @@ fn kill_tree_win_with_identity(
         return Ok((GroupSignal::NotFound, false));
     }
 
-    // Collect root + all descendants (BFS over the parent links), rejecting any
-    // candidate that is older than the tree member claiming it — that link is
-    // stale, not a real parent/child edge (see `child_link_is_plausible`).
-    //
     // Creation times are cached per PID, and the cache is what makes the check
     // hold up across the re-scan rounds below: it keeps each tree member's time
     // as read while that member was still alive, so a candidate is always
@@ -1931,38 +2069,18 @@ fn kill_tree_win_with_identity(
     if let Some(expected) = expected {
         ticks.insert(root, Some(expected));
     }
-    let mut tree = vec![root];
-    let mut i = 0;
-    while i < tree.len() {
-        let current = tree[i];
-        let parent_ticks = *ticks
-            .entry(current)
-            .or_insert_with(|| creation_ticks_win(current));
-        for (&pid, entry) in &parents {
-            let ppid = entry.parent_pid;
-            if ppid != current || tree.contains(&pid) {
-                continue;
+    let (mut tree, _) = capture_tree_win(
+        root,
+        &parents,
+        &mut ticks,
+        expected.is_some(),
+        eligible,
+        |pid, child_ticks| {
+            if !excluded.contains(&pid) {
+                captured.push((pid, child_ticks));
             }
-            if expected.is_some() && !eligible(pid) {
-                continue;
-            }
-            let child_ticks = *ticks.entry(pid).or_insert_with(|| creation_ticks_win(pid));
-            if expected.is_some()
-                && (parent_ticks.is_none()
-                    || child_ticks.is_none()
-                    || creation_ticks_win(current) != parent_ticks)
-            {
-                if !excluded.contains(&pid) {
-                    captured.push((pid, child_ticks));
-                }
-                continue;
-            }
-            if child_link_is_plausible(parent_ticks, child_ticks) {
-                tree.push(pid);
-            }
-        }
-        i += 1;
-    }
+        },
+    );
     if expected.is_some() {
         captured.extend(
             tree.iter()
@@ -2117,6 +2235,66 @@ fn kill_tree_win_with_identity(
     }
 
     Ok((GroupSignal::Sent, root_terminated))
+}
+
+/// Bounds of a captured headless tree, the same as on Linux and macOS.
+#[cfg(windows)]
+const MAX_TREE_DEPTH: usize = 128;
+#[cfg(windows)]
+const MAX_TREE_PROCESSES: usize = 4_096;
+
+/// The verified `root` and every descendant one snapshot links to it, root
+/// first, each with its native `windows:<creation ticks>` identity, through
+/// the same walk the verified kill captures with. Read-only: nothing is
+/// signaled. `root` must hold `expected` both before and after the capture;
+/// an edge it cannot attribute, or a tree past the depth or size limit,
+/// refuses the whole capture instead of returning part of the tree.
+#[cfg(windows)]
+pub(crate) fn headless_tree_members(
+    root: u32,
+    expected: &str,
+) -> Result<Vec<(u32, String)>, KillError> {
+    let expected_ticks = expected
+        .strip_prefix("windows:")
+        .and_then(|ticks| ticks.parse::<u64>().ok())
+        .ok_or("recorded Windows process creation time is unreadable")?;
+    if creation_ticks_win(root) != Some(expected_ticks) {
+        return Err("root identity changed or became unreadable before tree capture".into());
+    }
+    let parents = snapshot_parents(false).ok_or("verified process-tree snapshot is unreadable")?;
+    if !parents.contains_key(&root) {
+        return Err("verified root is missing from the process-tree snapshot".into());
+    }
+    let mut ticks = std::collections::HashMap::from([(root, Some(expected_ticks))]);
+    let mut unresolved = Vec::new();
+    let (tree, depth) =
+        capture_tree_win(root, &parents, &mut ticks, true, &mut |_| true, |pid, _| {
+            unresolved.push(pid)
+        });
+    if !unresolved.is_empty() {
+        return Err(KillError::Unconfirmed {
+            reason: "process-tree edge is unreadable or its parent was reused".into(),
+            survivors: unresolved,
+        });
+    }
+    if depth > MAX_TREE_DEPTH {
+        return Err("verified root's process tree exceeds the depth limit".into());
+    }
+    if tree.len() > MAX_TREE_PROCESSES {
+        return Err("verified root's process tree exceeds the size limit".into());
+    }
+    if creation_ticks_win(root) != Some(expected_ticks) {
+        return Err("root identity changed or became unreadable after tree capture".into());
+    }
+    tree.into_iter()
+        .map(|pid| match ticks.get(&pid).copied().flatten() {
+            Some(created) => Ok((pid, format!("windows:{created}"))),
+            None => Err(KillError::Unconfirmed {
+                reason: "captured process identity is unreadable".into(),
+                survivors: vec![pid],
+            }),
+        })
+        .collect()
 }
 
 #[cfg(test)]
