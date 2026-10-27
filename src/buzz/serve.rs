@@ -506,6 +506,8 @@ struct ReaderHandles {
     /// Ping the relay this often so a healthy session never trips the limit
     /// (test seam: production uses PING_INTERVAL).
     ping_interval: Duration,
+    #[cfg(test)]
+    watchdog_diagnostics: Option<Arc<Mutex<WatchdogDiagnostics>>>,
 }
 
 /// What the reader thread takes from the connector.
@@ -524,7 +526,71 @@ fn reader_handles(connector: &Connector) -> ReaderHandles {
         shutdown: connector.shutdown.clone(),
         read_idle_limit: READ_IDLE_LIMIT,
         ping_interval: PING_INTERVAL,
+        #[cfg(test)]
+        watchdog_diagnostics: None,
     }
+}
+
+/// Installed only by the quiet-session fixture; never collects payloads or keys.
+#[cfg(test)]
+struct WatchdogDiagnostics {
+    started: Instant,
+    session_index: usize,
+    records: Vec<Value>,
+}
+
+#[cfg(test)]
+fn observe_watchdog(
+    handles: &ReaderHandles,
+    session: Option<&WsSession>,
+    last_ping: Option<Instant>,
+    event: Option<&'static str>,
+    operation: &'static str,
+    error: Option<&anyhow::Error>,
+) {
+    let Some(diagnostics) = &handles.watchdog_diagnostics else {
+        return;
+    };
+    let mut diagnostics = diagnostics.lock();
+    if operation == "session_start" {
+        diagnostics.session_index += 1;
+    }
+    let now = Instant::now();
+    let error_class = error.map(|error| match error.downcast_ref::<PublishError>() {
+        Some(PublishError::RateLimited { .. }) => "PublishError::RateLimited",
+        Some(PublishError::Server(_)) => "PublishError::Server",
+        Some(PublishError::Rejected(_)) => "PublishError::Rejected",
+        Some(PublishError::Auth(_)) => "PublishError::Auth",
+        Some(PublishError::Transport(message)) if message == "relay closed socket" => {
+            "PublishError::Transport: relay closed socket"
+        }
+        Some(PublishError::Transport(_)) => "PublishError::Transport (message omitted)",
+        Some(PublishError::Protocol(message)) if message == "invalid relay JSON" => {
+            "PublishError::Protocol: invalid relay JSON"
+        }
+        Some(PublishError::Protocol(message)) if message == "unexpected non-text relay frame" => {
+            "PublishError::Protocol: unexpected non-text relay frame"
+        }
+        Some(PublishError::Protocol(message)) if message == "unsupported TLS backend" => {
+            "PublishError::Protocol: unsupported TLS backend"
+        }
+        Some(PublishError::Protocol(_)) => "PublishError::Protocol (message omitted)",
+        Some(PublishError::Timeout) => "PublishError::Timeout",
+        None => "unclassified (message omitted)",
+    });
+    let record = json!({
+        "session_index": diagnostics.session_index,
+        "monotonic_ms": now.duration_since(diagnostics.started).as_secs_f64() * 1000.0,
+        "utc_epoch_seconds": crate::shared::time::now_epoch_f64(),
+        "event": event,
+        "operation": operation,
+        "error_class": error_class,
+        "last_inbound_age_ms": session.map(|session| session.idle().as_secs_f64() * 1000.0),
+        "last_ping_age_ms": last_ping.map(|ping| now.duration_since(ping).as_secs_f64() * 1000.0),
+        "read_idle_limit_ms": handles.read_idle_limit.as_secs_f64() * 1000.0,
+        "ping_interval_ms": handles.ping_interval.as_secs_f64() * 1000.0,
+    });
+    diagnostics.records.push(record);
 }
 
 /// Enroll the connector's reader in one channel, before any subscription.
@@ -637,11 +703,31 @@ fn reader_loop(handles: ReaderHandles) {
         ) {
             Ok(mut session) => {
                 if run_session(&mut session, &handles) {
+                    #[cfg(test)]
+                    observe_watchdog(
+                        &handles,
+                        Some(&session),
+                        None,
+                        None,
+                        "session_shutdown",
+                        None,
+                    );
                     return;
                 }
+                #[cfg(test)]
+                observe_watchdog(&handles, Some(&session), None, None, "session_end", None);
             }
             Err(error) => {
                 crate::log::log_warn("buzz", "serve.reader_connect", &error.to_string());
+                #[cfg(test)]
+                observe_watchdog(
+                    &handles,
+                    None,
+                    None,
+                    Some("serve.reader_connect"),
+                    "connect",
+                    Some(&anyhow::Error::from(error)),
+                );
             }
         }
         if started.elapsed() >= HEALTHY_SESSION {
@@ -670,12 +756,23 @@ const CATCH_UP_PAGE: usize = 500;
 /// One session: subscribe, then pump, catching each channel up once its
 /// subscription is answered. True when shutting down.
 fn run_session(session: &mut WsSession, handles: &ReaderHandles) -> bool {
+    #[cfg(test)]
+    observe_watchdog(handles, Some(session), None, None, "session_start", None);
     // The live filter starts the relay's admission window (plus skew) before
     // now: a publication backdated by up to 900 s that arrives live after the
     // catch-up's last page is still inside it.
     let live_since = nostr::now().saturating_sub(store::BACKFILL_SLACK_SECS);
     if let Err(error) = subscribe_all(session, handles, live_since) {
         crate::log::log_warn("buzz", "serve.reader_subscribe", &error.to_string());
+        #[cfg(test)]
+        observe_watchdog(
+            handles,
+            Some(session),
+            None,
+            Some("serve.reader_subscribe"),
+            "subscribe",
+            Some(&error),
+        );
         return false;
     }
     pump_session(session, handles, live_since)
@@ -903,12 +1000,30 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
                     session.req(&sub_id(&channel.slug), &[live_filter(&channel.id, since)])
                 {
                     crate::log::log_warn("buzz", "serve.reader_error", &error.to_string());
+                    #[cfg(test)]
+                    observe_watchdog(
+                        handles,
+                        Some(session),
+                        Some(last_ping),
+                        Some("serve.reader_error"),
+                        "req",
+                        Some(&anyhow::Error::from(error)),
+                    );
                     return false;
                 }
                 // Wait for the answer before scheduling another try.
                 state.reopen_at = Some(now + BACKOFF_MAX);
             }
             if state.catch_up_at.is_some_and(|at| at <= now) {
+                #[cfg(test)]
+                observe_watchdog(
+                    handles,
+                    Some(session),
+                    Some(last_ping),
+                    None,
+                    "catch_up_start",
+                    None,
+                );
                 match catch_up(handles, channel) {
                     Ok(stored) => {
                         state.caught_up = true;
@@ -918,6 +1033,15 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
                             "buzz",
                             "serve.caught_up",
                             &format!("{}: {stored} new event(s)", channel.slug),
+                        );
+                        #[cfg(test)]
+                        observe_watchdog(
+                            handles,
+                            Some(session),
+                            Some(last_ping),
+                            Some("serve.caught_up"),
+                            "catch_up_result",
+                            None,
                         );
                     }
                     Err(error) => {
@@ -933,8 +1057,26 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
                                 wait.as_secs().max(1)
                             ),
                         );
+                        #[cfg(test)]
+                        observe_watchdog(
+                            handles,
+                            Some(session),
+                            Some(last_ping),
+                            Some("serve.catch_up_failed"),
+                            "catch_up_result",
+                            Some(&error),
+                        );
                     }
                 }
+                #[cfg(test)]
+                observe_watchdog(
+                    handles,
+                    Some(session),
+                    Some(last_ping),
+                    None,
+                    "catch_up_end",
+                    None,
+                );
                 if handles.shutdown.load(Ordering::SeqCst) {
                     return true;
                 }
@@ -951,18 +1093,72 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
         }
 
         if last_ping.elapsed() >= handles.ping_interval {
+            #[cfg(test)]
+            observe_watchdog(
+                handles,
+                Some(session),
+                Some(last_ping),
+                None,
+                "ping_start",
+                None,
+            );
             if let Err(error) = session.ping() {
                 crate::log::log_warn("buzz", "serve.reader_error", &error.to_string());
+                #[cfg(test)]
+                observe_watchdog(
+                    handles,
+                    Some(session),
+                    Some(last_ping),
+                    Some("serve.reader_error"),
+                    "ping",
+                    Some(&anyhow::Error::from(error)),
+                );
                 return false;
             }
             last_ping = Instant::now();
+            #[cfg(test)]
+            observe_watchdog(
+                handles,
+                Some(session),
+                Some(last_ping),
+                None,
+                "ping_sent",
+                None,
+            );
         }
+        #[cfg(test)]
+        observe_watchdog(
+            handles,
+            Some(session),
+            Some(last_ping),
+            None,
+            "recv_start",
+            None,
+        );
         match session.recv(Duration::from_millis(500)) {
             Err(error) => {
                 crate::log::log_warn("buzz", "serve.reader_error", &error.to_string());
+                #[cfg(test)]
+                observe_watchdog(
+                    handles,
+                    Some(session),
+                    Some(last_ping),
+                    Some("serve.reader_error"),
+                    "recv",
+                    Some(&anyhow::Error::from(error)),
+                );
                 return false;
             }
             Ok(None) => {
+                #[cfg(test)]
+                observe_watchdog(
+                    handles,
+                    Some(session),
+                    Some(last_ping),
+                    None,
+                    "recv_none",
+                    None,
+                );
                 // No inbound frame for the whole limit: the socket is
                 // half-open (the relay closed its side without a FIN
                 // reaching us). Never resubscribe here; end the session so
@@ -983,10 +1179,28 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
                             subs,
                         ),
                     );
+                    #[cfg(test)]
+                    observe_watchdog(
+                        handles,
+                        Some(session),
+                        Some(last_ping),
+                        Some("serve.read_stall"),
+                        "idle_limit",
+                        None,
+                    );
                     return false;
                 }
             }
             Ok(Some(RelayMsg::Event { sub, event })) => {
+                #[cfg(test)]
+                observe_watchdog(
+                    handles,
+                    Some(session),
+                    Some(last_ping),
+                    None,
+                    "recv_event",
+                    None,
+                );
                 let Some(channel) = channel_for_sub(&handles.channels, &sub) else {
                     crate::log::log_warn("buzz", "serve.unknown_sub", &sub);
                     continue;
@@ -1001,10 +1215,28 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
                         "serve.store_failed",
                         &format!("{}: {error}; reconnecting to catch up", channel.slug),
                     );
+                    #[cfg(test)]
+                    observe_watchdog(
+                        handles,
+                        Some(session),
+                        Some(last_ping),
+                        Some("serve.store_failed"),
+                        "ingest_live",
+                        Some(&error),
+                    );
                     return false;
                 }
             }
             Ok(Some(RelayMsg::Eose(sub))) => {
+                #[cfg(test)]
+                observe_watchdog(
+                    handles,
+                    Some(session),
+                    Some(last_ping),
+                    None,
+                    "recv_eose",
+                    None,
+                );
                 let Some(channel) = channel_for_sub(&handles.channels, &sub) else {
                     continue;
                 };
@@ -1020,6 +1252,15 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
                 crate::log::log_info("buzz", "serve.subscribed", &sub);
             }
             Ok(Some(RelayMsg::Closed { sub, reason })) => {
+                #[cfg(test)]
+                observe_watchdog(
+                    handles,
+                    Some(session),
+                    Some(last_ping),
+                    None,
+                    "recv_closed",
+                    None,
+                );
                 let Some(channel) = channel_for_sub(&handles.channels, &sub) else {
                     continue;
                 };
@@ -1044,6 +1285,15 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
                 );
             }
             Ok(Some(RelayMsg::Notice(message))) => {
+                #[cfg(test)]
+                observe_watchdog(
+                    handles,
+                    Some(session),
+                    Some(last_ping),
+                    None,
+                    "recv_notice",
+                    None,
+                );
                 crate::log::log_warn("buzz", "serve.reader_notice", &message);
             }
             Ok(Some(RelayMsg::Ok {
@@ -1051,6 +1301,15 @@ fn pump_session(session: &mut WsSession, handles: &ReaderHandles, since: u64) ->
                 accepted,
                 message,
             })) => {
+                #[cfg(test)]
+                observe_watchdog(
+                    handles,
+                    Some(session),
+                    Some(last_ping),
+                    None,
+                    "recv_ok",
+                    None,
+                );
                 if !accepted && !message.starts_with("duplicate:") {
                     crate::log::log_warn(
                         "buzz",
@@ -6071,6 +6330,7 @@ mod tests {
         ws: FakeRelay,
         connector: Connector,
         thread: Option<std::thread::JoinHandle<()>>,
+        watchdog_diagnostics: Option<Arc<Mutex<WatchdogDiagnostics>>>,
     }
 
     impl LiveReader {
@@ -6084,6 +6344,15 @@ mod tests {
             before: impl FnOnce(&FakeRelay),
             read_idle_limit: Duration,
             ping_interval: Duration,
+        ) -> Self {
+            Self::start_tuned_observed(before, read_idle_limit, ping_interval, None)
+        }
+
+        fn start_tuned_observed(
+            before: impl FnOnce(&FakeRelay),
+            read_idle_limit: Duration,
+            ping_interval: Duration,
+            watchdog_diagnostics: Option<Arc<Mutex<WatchdogDiagnostics>>>,
         ) -> Self {
             let env = crate::hooks::test_helpers::isolated_test_env();
             let http = FakeRelay::http();
@@ -6100,6 +6369,7 @@ mod tests {
             let mut handles = reader_handles(&connector);
             handles.read_idle_limit = read_idle_limit;
             handles.ping_interval = ping_interval;
+            handles.watchdog_diagnostics = watchdog_diagnostics.clone();
             let thread = std::thread::spawn(move || reader_loop(handles));
             Self {
                 _env: env,
@@ -6107,6 +6377,7 @@ mod tests {
                 ws,
                 connector,
                 thread: Some(thread),
+                watchdog_diagnostics,
             }
         }
 
@@ -6211,6 +6482,45 @@ mod tests {
             self.connector.shutdown.store(true, Ordering::SeqCst);
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
+            }
+            if let Some(diagnostics) = &self.watchdog_diagnostics {
+                // Still inside the fixture's lifetime, after the reader stopped.
+                let records = &diagnostics.lock().records;
+                for record in records
+                    .iter()
+                    .filter(|record| record["session_index"] == 1 && !record["event"].is_null())
+                {
+                    eprintln!("hcom106 watchdog first-session record: {record}");
+                }
+                let Some(runner_temp) = std::env::var_os("RUNNER_TEMP") else {
+                    return;
+                };
+                let retain = || -> Result<std::path::PathBuf> {
+                    let root =
+                        std::path::PathBuf::from(runner_temp).join("hcom106-watchdog-diagnostics");
+                    std::fs::create_dir_all(&root)?;
+                    let root = root.canonicalize()?;
+                    let attempt = tempfile::Builder::new()
+                        .prefix("quiet-session-")
+                        .tempdir_in(&root)?;
+                    let mut sequence = File::create(attempt.path().join("reader.jsonl"))?;
+                    let mut log = File::create(attempt.path().join("hcom.filtered.log"))?;
+                    for record in records {
+                        writeln!(sequence, "{record}")?;
+                        if !record["event"].is_null() {
+                            writeln!(log, "{record}")?;
+                        }
+                    }
+                    sequence.flush()?;
+                    log.flush()?;
+                    Ok(attempt.keep())
+                };
+                match retain() {
+                    Ok(path) => eprintln!("hcom106 watchdog diagnostics: {}", path.display()),
+                    Err(error) => {
+                        eprintln!("hcom106 watchdog diagnostics retention failed: {error}")
+                    }
+                }
             }
         }
     }
@@ -6514,10 +6824,16 @@ mod tests {
         // The fake relay answers client pings with pongs and sends nothing
         // else: past several idle windows the session must still be the
         // first one, and still live enough to stream.
-        let reader = LiveReader::start_tuned(
+        let diagnostics = Arc::new(Mutex::new(WatchdogDiagnostics {
+            started: Instant::now(),
+            session_index: 0,
+            records: Vec::new(),
+        }));
+        let reader = LiveReader::start_tuned_observed(
             |_| {},
             Duration::from_millis(600),
             Duration::from_millis(150),
+            Some(diagnostics),
         );
         sleep(Duration::from_secs(2));
         assert_eq!(

@@ -7750,8 +7750,8 @@ mod tests {
     /// Reap scope (spare arm): a carrier that appears after the reap began
     /// with a non-empty `HCOM_PROCESS_ID` REGISTERED mid-sequence — a fresh
     /// binding of a newer epoch, outside the call-start ids — is never
-    /// signalled, never a survivor. Same SIGSTOP choreography as the kill
-    /// arm: the spare is the scope rule's doing, not a missed enumeration.
+    /// signalled, never a survivor. The first-capture rendezvous places it
+    /// outside the initial snapshot, ready before the first signal.
     #[test]
     #[cfg(unix)]
     fn reap_scope_spares_late_new_epoch_carrier() {
@@ -7768,27 +7768,41 @@ mod tests {
             .expect("stop the owned first carrier");
 
         let fresh_binding = format!("proc-fresh-{}", rand_suffix());
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (hook, hit, release) = rendezvous_at(RoundPoint::FirstCaptured);
         let reap_name = name.clone();
         let reap_bindings = binding_ids.clone();
         let reap_db_path = db_path.clone();
         let reaper = std::thread::spawn(move || {
             let db = crate::db::HcomDb::open_raw(&reap_db_path).unwrap();
-            tx.send(()).ok();
+            arm_round_seam(hook);
             reap_instance_tree_for_excluding(&db, &reap_name, &reap_bindings, &[])
         });
-        rx.recv().unwrap();
-        // Late with a fresh binding id outside the call-start set — the
-        // binding is REGISTERED mid-sequence (the newer-epoch evidence).
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        hit.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("reap reaches its first-capture boundary");
+        // The initial scope and identities are fixed; no signal has run.
+        // Register and ready the newer epoch before releasing the reaper.
         db.set_process_binding(&fresh_binding, "sess", &name)
             .unwrap();
         let mut late = spawn_named_sleeper(&name, &fresh_binding);
         let late_pid = late.id();
-        // Exec barrier: pin the late carrier as an ENUMERATED carrier (a
-        // pre-exec child carries no identity) — the spare must be the scope
-        // rule's doing, never a missed enumeration.
-        wait_for_enumerated(&name, &[], late_pid);
+        let late_identity = crate::sys::process::identity(late_pid).expect("late carrier identity");
+        // Exec barrier: prove this exact child carries the fresh id, not
+        // merely that its PID appeared in an enumeration.
+        let found = wait_for_enumerated(&name, &[], late_pid);
+        let carrier = found
+            .iter()
+            .find(|m| m.pid == late_pid)
+            .expect("late carrier enumerated before the first signal");
+        assert_eq!(carrier.process_id, fresh_binding);
+        assert!(
+            crate::sys::process::has_identity(late_pid, &late_identity),
+            "late carrier retains its captured birth identity"
+        );
+        assert!(
+            late.try_wait().unwrap().is_none(),
+            "late carrier is live before the first signal"
+        );
+        release.send(()).expect("release the first signal round");
 
         let result = reaper.join().expect("reap thread");
         assert!(
