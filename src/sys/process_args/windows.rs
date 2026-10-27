@@ -163,7 +163,8 @@ fn process_machine_matches(process: &Process) -> bool {
         return false;
     }
     // SAFETY: `module` is a live module and the export name is NUL-terminated.
-    let Some(query) = (unsafe { get_proc_address(module, c"IsWow64Process2".as_ptr().cast()) }) else {
+    let Some(query) = (unsafe { get_proc_address(module, c"IsWow64Process2".as_ptr().cast()) })
+    else {
         // Older Windows without this export cannot prove the target's machine.
         return false;
     };
