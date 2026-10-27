@@ -7,12 +7,13 @@ mod support;
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::PipeWriter;
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
-use support::{Hcom, unique_suffix};
+use support::{Hcom, child_identity, terminate_owned_child, unique_suffix};
 
 fn pid_in(path: &PathBuf) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
@@ -57,27 +58,19 @@ fn inherits_name(pid: u32, name: &str) -> bool {
         })
 }
 
-// Only signal fixture-owned pids: each pid comes from a private file written
-// by our spawned shell and must still carry this test's unique identity.
+// Cleanup signals only the owner Child we spawned, after its spawn identity
+// rechecks. Every descendant blocks on a private gate pipe whose only write
+// end this struct holds; dropping it is EOF, and each one exits on its own.
 struct OwnedTree {
     owner: Child,
-    name: String,
-    pid_files: [PathBuf; 5],
+    identity: Option<String>,
+    gate: Option<PipeWriter>,
 }
 
 impl Drop for OwnedTree {
     fn drop(&mut self) {
-        for path in self.pid_files.iter().rev() {
-            if let Some(pid) = pid_in(path)
-                && inherits_name(pid, &self.name)
-            {
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            }
-        }
-        if self.owner.try_wait().ok().flatten().is_none() {
-            let _ = self.owner.kill();
-        }
-        let _ = self.owner.wait();
+        drop(self.gate.take());
+        terminate_owned_child(&mut self.owner, self.identity.as_deref());
     }
 }
 
@@ -109,21 +102,28 @@ fn broker_shared_daemons_are_not_owner_carriers_but_nested_omp_is() {
     symlink("/bin/sh", &omp).expect("fake omp binary");
     symlink("/bin/sh", &broker).expect("fake broker binary");
     let setsid = h.resolve_external("setsid").expect("setsid binary");
-    let sleep = h.resolve_external("sleep").expect("sleep binary");
+    // `sleep` stand-in: comm stays `sleep`, but it reads the gate (fd 9) and
+    // exits on its own at EOF instead of needing a signal from cleanup.
+    let sleep = fixture.join("sleep");
+    symlink("/bin/sh", &sleep).expect("gated sleep binary");
+    let (gate_rx, gate) = std::io::pipe().expect("create cleanup gate");
 
     let pid_files = ["broker", "nested", "tool", "daemon", "tool-sleep"]
         .map(|role| fixture.join(format!("{role}.pid")));
     let owner = h
         .external_cmd(&omp)
-        .args(["-c", r#""$SETSID_BIN" "$BROKER_BIN" -c "$BROKER_SCRIPT" & wait"#])
+        .args([
+            "-c",
+            r#"exec 9<&0; "$SETSID_BIN" "$BROKER_BIN" -c "$BROKER_SCRIPT" & wait"#,
+        ])
         .env("SETSID_BIN", setsid)
         .env("BROKER_BIN", &broker)
-        .env("BROKER_SCRIPT", r#"printf '%s\n' "$$" > "$BROKER_PID_FILE"; "$OMP_BIN" -c "$NESTED_SCRIPT" & "$SLEEP_BIN" 300 & printf '%s\n' "$!" > "$DAEMON_PID_FILE"; wait"#)
+        .env("BROKER_SCRIPT", r#"printf '%s\n' "$$" > "$BROKER_PID_FILE"; "$OMP_BIN" -c "$NESTED_SCRIPT" & "$SLEEP_BIN" -c 'read _' <&9 & printf '%s\n' "$!" > "$DAEMON_PID_FILE"; wait"#)
         .env("NESTED_SCRIPT", r#"trap 'wait' TERM; printf '%s\n' "$$" > "$NESTED_PID_FILE"; "$TOOL_BIN" -c "$TOOL_SCRIPT" & wait"#)
-        .env("TOOL_SCRIPT", r#"printf '%s\n' "$$" > "$TOOL_PID_FILE"; "$SLEEP_BIN" 300 & printf '%s\n' "$!" > "$TOOL_SLEEP_PID_FILE"; wait"#)
+        .env("TOOL_SCRIPT", r#"printf '%s\n' "$$" > "$TOOL_PID_FILE"; "$SLEEP_BIN" -c 'read _' <&9 & printf '%s\n' "$!" > "$TOOL_SLEEP_PID_FILE"; wait"#)
         .env("OMP_BIN", &omp)
         .env("TOOL_BIN", "/bin/sh")
-        .env("SLEEP_BIN", sleep)
+        .env("SLEEP_BIN", &sleep)
         .env("BROKER_PID_FILE", &pid_files[0])
         .env("NESTED_PID_FILE", &pid_files[1])
         .env("TOOL_PID_FILE", &pid_files[2])
@@ -132,15 +132,15 @@ fn broker_shared_daemons_are_not_owner_carriers_but_nested_omp_is() {
         .env("HCOM_INSTANCE_NAME", &name)
         .env("HCOM_PROCESS_ID", &process_id)
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(gate_rx)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn owner omp");
     let tree = OwnedTree {
+        identity: child_identity(&owner),
         owner,
-        name: name.clone(),
-        pid_files,
+        gate: Some(gate),
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     let pids = loop {
@@ -150,7 +150,7 @@ fn broker_shared_daemons_are_not_owner_carriers_but_nested_omp_is() {
             Some(tool),
             Some(daemon),
             Some(tool_sleep),
-        ] = tree.pid_files.each_ref().map(pid_in)
+        ] = pid_files.each_ref().map(pid_in)
             && [broker, nested, tool, daemon, tool_sleep]
                 .into_iter()
                 .all(|pid| live(pid) && inherits_name(pid, &name))
