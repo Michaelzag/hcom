@@ -180,12 +180,16 @@ done
     out
 }
 
-/// The launch CLI in its own process group; output goes to files a terminal
-/// grandchild cannot hold open. Dropping it kills the whole group.
-struct Launch(Child);
+/// The launch CLI is retained unreaped. Detached tools use private exit gates
+/// and the fixture's hcom teardown, never borrowed PIDs or process-group signals.
+struct Launch {
+    child: Child,
+    identity: Option<String>,
+    out: PathBuf,
+}
 
 impl Launch {
-    fn start(h: &Hcom, label: &str, args: &[&str]) -> Self {
+    fn start(h: &Hcom, label: &str, args: &[&str], out: &Path) -> Self {
         let child = h
             .cmd()
             .args(args)
@@ -196,17 +200,29 @@ impl Launch {
             .process_group(0)
             .spawn()
             .unwrap();
-        h.track_cleanup_pid(i64::from(child.id()));
-        Self(child)
+        let identity = support::child_identity(&child);
+        Self {
+            child,
+            identity,
+            out: out.to_path_buf(),
+        }
     }
 }
 
 impl Drop for Launch {
     fn drop(&mut self) {
-        unsafe {
-            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        if let Ok(entries) = fs::read_dir(&self.out) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "started")
+                {
+                    let _ = fs::write(path.with_extension("exit"), "");
+                }
+            }
         }
-        let _ = self.0.wait();
+        support::terminate_owned_child(&mut self.child, self.identity.as_deref());
     }
 }
 
@@ -264,7 +280,7 @@ fn a_real_omp_launch_roots_at_its_pty_child_across_the_hook_repin() {
         let mut args = vec!["omp"];
         args.extend_from_slice(mode_args);
         args.push("--go");
-        let launch = Launch::start(&h, mode, &args);
+        let launch = Launch::start(&h, mode, &args, &out);
 
         // The interpreter's parent is the PTY child: the launcher exec'd from `omp`.
         let interpreter = wait_until(|| {
@@ -281,9 +297,7 @@ fn a_real_omp_launch_roots_at_its_pty_child_across_the_hook_repin() {
                     .unwrap_or_default()
             )
         });
-        h.track_cleanup_pid(interpreter);
         let child = parent_of(interpreter).unwrap();
-        h.track_cleanup_pid(child);
         let pty = parent_of(child).unwrap();
         let root = json!({"pid": child, "identity": native_identity(child).unwrap()});
         let (name, before) = wait_until(|| {
@@ -297,6 +311,7 @@ fn a_real_omp_launch_roots_at_its_pty_child_across_the_hook_repin() {
         let hook_stderr =
             fs::read_to_string(out.join(format!("{interpreter}.stderr"))).unwrap_or_default();
         let topology = (comm(pty), comm(child), comm(interpreter));
+        let _ = h.run(["kill", &name]);
         fs::write(out.join(format!("{interpreter}.exit")), "").unwrap();
         drop(launch);
         drop(h);
