@@ -15,8 +15,8 @@ use std::time::Instant;
 use super::{
     kill_group,
     process::{
-        GroupSignal, KILL_WAIT, KillError, KillState, POLL_STEP, TERM_WAIT, kill_state,
-        process_info_apple,
+        GroupSignal, KILL_WAIT, KillError, KillState, POLL_STEP, TERM_WAIT, checked_pid,
+        kill_state, process_info_apple, signal_pid,
     },
 };
 
@@ -547,6 +547,7 @@ pub(crate) fn terminate(
     mut eligible: impl FnMut(u32) -> bool,
     mut authorize: impl FnMut(u32) -> Result<(), KillError>,
 ) -> Result<GroupSignal, KillError> {
+    checked_pid(root)?;
     let expected_start = apple_start(expected)?;
     // Authenticate before any enumeration or signal, not just at the last
     // moment. A stale receipt never authorizes capture from a recycled root.
@@ -666,19 +667,19 @@ pub(crate) fn terminate(
             }
         }
         if signal_group {
-            let checked_root = signalable_fact(root)
-                .filter(|fact| {
-                    fact.start_time == expected_start
-                        && fact.pgid == root
-                        && fact.ppid == current_root.ppid
-                })
-                .ok_or("owner identity or ancestry changed before the group signal")?;
-            // SAFETY: the root's identity and ancestry were rechecked, and
-            // every fresh group member is a captured matching incarnation.
-            // Ancestors and excluded callers are absent from that set.
-            outcome = signal_result(unsafe {
-                libc::killpg(checked_root.pid as libc::pid_t, libc::SIGTERM)
-            });
+            if signalable_fact(root).is_some_and(|fact| {
+                fact.start_time == expected_start
+                    && fact.pgid == root
+                    && fact.ppid == current_root.ppid
+            }) {
+                // The root and every member are proven signalable captured
+                // incarnations; the shared wrapper checks the numeric PID.
+                outcome = super::process::signal_group(root, libc::SIGTERM)?;
+            } else {
+                // Exit can begin after the group preflight. Keep confirming
+                // that root and signal the remaining captures individually.
+                signal_group = false;
+            }
         }
     }
     for target in &targets {
@@ -830,9 +831,7 @@ pub(crate) fn terminate(
 
 #[cfg(target_os = "macos")]
 fn process_fact(pid: u32) -> Option<ProcFact> {
-    if pid <= 1 || pid > libc::pid_t::MAX as u32 {
-        return None;
-    }
+    checked_pid(pid).ok()?;
     let info = process_info_apple(pid)?;
     if info.pbi_pid != pid || info.pbi_start_tvusec >= 1_000_000 {
         return None;
@@ -908,6 +907,7 @@ fn signal_one(
     authorize: &mut impl FnMut(u32) -> Result<(), KillError>,
     mut eligible: impl FnMut(&ProcFact) -> bool,
 ) -> Result<Option<GroupSignal>, KillError> {
+    checked_pid(target.fact.pid)?;
     if !is_signalable(target.fact.start_time, observe(target.fact.pid)) {
         return Ok(None);
     }
@@ -921,24 +921,9 @@ fn signal_one(
     if !eligible(target.fact) || !is_signalable(target.fact.start_time, observe(target.fact.pid)) {
         return Ok(None);
     }
-    // SAFETY: the current incarnation was authorized and rechecked as one
-    // positive PID. The caller supplies only SIGTERM or SIGKILL.
-    Ok(Some(signal_result(unsafe {
-        libc::kill(target.fact.pid as libc::pid_t, signal)
-    })))
-}
-
-#[cfg(target_os = "macos")]
-fn signal_result(result: libc::c_int) -> GroupSignal {
-    if result == 0 {
-        GroupSignal::Sent
-    } else {
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => GroupSignal::NotFound,
-            Some(libc::EPERM) => GroupSignal::PermissionDenied,
-            _ => GroupSignal::Other,
-        }
-    }
+    // The shared primitive validates the PID again before its conversion and
+    // owns syscall error mapping. No unsigned PID is cast in this layer.
+    signal_pid(target.fact.pid, signal).map(Some)
 }
 
 #[cfg(target_os = "macos")]
