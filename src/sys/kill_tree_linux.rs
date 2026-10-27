@@ -2963,9 +2963,12 @@ mod tests {
         // while a second thread sleeps: its leader reads Z, it is alive. It
         // runs in its own session, so only a per-PID signal reaches it.
         let leader = spawn(
-            "setsid python3 -c 'import ctypes, threading, time; \
-             threading.Thread(target=time.sleep, args=(30,), daemon=True).start(); \
-             time.sleep(0.1); ctypes.CDLL(None).syscall(60, 0)' & wait",
+            &format!(
+                "setsid python3 -c 'import ctypes, threading, time; \
+                 threading.Thread(target=time.sleep, args=(30,), daemon=True).start(); \
+                 time.sleep(0.1); ctypes.CDLL(None).syscall({}, 0)' & wait",
+                libc::SYS_exit
+            ),
             0,
         );
         let root = leader.id();
