@@ -784,14 +784,13 @@ fn resume_busy_tree_guidance_refuses_unknown_child_ownership() {
     assert_eq!(stopped_events(&db), 0);
 }
 
-struct TestProcess(PathBuf);
-impl Drop for TestProcess {
+/// The terminal fixture's background process lives while this gate file
+/// exists. Drop removes the file and the process exits on its own: the test
+/// never signals the pid it reads back from the fixture's pidfile.
+struct LaunchedGate(PathBuf);
+impl Drop for LaunchedGate {
     fn drop(&mut self) {
-        if let Ok(pid) = std::fs::read_to_string(&self.0)
-            && let Ok(pid) = pid.trim().parse::<u32>()
-        {
-            crate::sys::process::kill(pid);
-        }
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -820,11 +819,15 @@ fn launched_terminal_is_not_zero_launched_when_db_reopen_is_busy() {
         .unwrap();
     let pid_file = home.join("launched.pid");
     let held_file = home.join("writer-held");
-    let _child = TestProcess(pid_file.clone());
+    let gate_file = home.join("launched.live");
+    std::fs::write(&gate_file, "").unwrap();
+    let _launched = LaunchedGate(gate_file.clone());
     let terminal = home.join("test-terminal");
+    // The launched process polls its gate for at most 30s (the old
+    // `sleep 30`), and leaves as soon as the gate is gone.
     std::fs::write(&terminal, format!(
-        "#!/bin/sh\nsleep 30 >/dev/null 2>&1 &\necho $! > '{}'\nfor i in $(seq 1 500); do\n [ -e '{}' ] && exit 0\n sleep 0.01\ndone\nexit 1\n",
-        pid_file.display(), held_file.display(),
+        "#!/bin/sh\n(i=0; while [ -e '{gate}' ] && [ $i -lt 300 ]; do i=$((i+1)); sleep 0.1; done) >/dev/null 2>&1 &\necho $! > '{pid}'\nfor i in $(seq 1 500); do\n [ -e '{held}' ] && exit 0\n sleep 0.01\ndone\nexit 1\n",
+        gate = gate_file.display(), pid = pid_file.display(), held = held_file.display(),
     )).unwrap();
     std::fs::set_permissions(&terminal, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (release, released) = mpsc::channel();

@@ -2220,28 +2220,6 @@ mod tests {
         (h.finish() % 900000) as u32 + 100000
     }
 
-    /// A name-carrying orphan in a tree of its own: `sh` spawns it in the
-    /// background and exits, so the sleeper is reparented to init — its ppid
-    /// chain never passes through the test process. Not our child: kill it
-    /// with `libc::kill`.
-    #[cfg(unix)]
-    fn spawn_detached_named_sleeper(name: &str, process_id: &str) -> u32 {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 300 >/dev/null 2>&1 & echo $!")
-            .env("HCOM_INSTANCE_NAME", name)
-            .env("HCOM_PROCESS_ID", process_id)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .expect("spawn detached sleeper");
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .expect("detached sleeper pid")
-    }
-
     #[cfg(unix)]
     fn backdate_binding(db: &HcomDb, process_id: &str, updated_at: f64) {
         db.conn()
@@ -2268,7 +2246,10 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let orphan = spawn_detached_named_sleeper(&target, &format!("proc-old-{}", rand_suffix()));
+        let (orphan, _gate) = crate::proctruth::gated_fixtures::spawn_detached_named_sleeper(
+            &target,
+            &format!("proc-old-{}", rand_suffix()),
+        );
         wait_for_carrier(&target, orphan);
         let start = crate::proctruth::processes_for_instance(&target, &[], &[])
             .into_iter()
@@ -2304,9 +2285,6 @@ mod tests {
             binding,
             "refused rebind leaves the bindings alone"
         );
-        unsafe {
-            libc::kill(orphan as libc::pid_t, libc::SIGKILL);
-        }
     }
 
     /// A caller bound to a live identity: row with a delivery cursor, plus
