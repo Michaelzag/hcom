@@ -713,8 +713,21 @@ fn omp_standin(h: &Hcom) -> PathBuf {
     omp
 }
 
+/// Birth identity of `pid`: its start time in clock ticks since boot, field
+/// 22 of /proc/<pid>/stat. Readable for a zombie too.
+fn start_ticks(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 2..]
+        .split_whitespace()
+        .nth(19)
+        .map(str::to_owned)
+}
+
 struct Sentinel {
     child: Child,
+    /// Start ticks captured right after spawn, rechecked before the group
+    /// kill in `Drop`.
+    birth: Option<String>,
     dir: PathBuf,
     sub: Option<u32>,
 }
@@ -758,11 +771,18 @@ impl Sentinel {
         let child = command
             .spawn()
             .unwrap_or_else(|e| panic!("spawn sentinel {label}: {e}"));
+        let birth = start_ticks(child.id());
         let mut sentinel = Self {
             child,
+            birth,
             dir,
             sub: None,
         };
+        assert!(
+            sentinel.birth.is_some(),
+            "sentinel {label}: could not read the birth identity of PID {}",
+            sentinel.pid()
+        );
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(exit) = sentinel.peek_exit() {
@@ -882,9 +902,33 @@ impl Sentinel {
 }
 
 impl Drop for Sentinel {
+    /// Kill the group only while it is provably this sentinel's: the leader
+    /// is still unreaped (so its PID and group id cannot be reused), it was
+    /// born when spawn recorded, and it still leads its own group. Otherwise
+    /// signal the owned child alone. Then reap.
     fn drop(&mut self) {
-        unsafe {
-            libc::killpg(self.pid() as libc::pid_t, libc::SIGKILL);
+        let pid = self.pid() as libc::pid_t;
+        // waitid with WNOWAIT succeeds only while the child is ours and not
+        // yet reaped, running or zombie; it never reaps.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let unreaped = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } == 0;
+        let owned_group = unreaped
+            && self.birth.is_some()
+            && start_ticks(self.pid()) == self.birth
+            && unsafe { libc::getpgid(pid) } == pid;
+        if owned_group {
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        } else {
+            let _ = self.child.kill();
         }
         let _ = self.child.wait();
     }
