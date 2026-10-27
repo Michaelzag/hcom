@@ -4716,16 +4716,40 @@ mod tests {
     }
 
     fn omp_claim_owner(anchor: u32) -> Option<OmpOwnerProof> {
-        let anchor_kind = match anchor {
-            100 => AncestorProcess::Other,
-            200 => AncestorProcess::Omp,
-            300 => AncestorProcess::OmpLauncherShim,
-            _ => return None,
+        claim_owner_proof([100, 200, 300], anchor)
+    }
+
+    /// The claim fixture's anchors in role order: a plain wrapper, the actual
+    /// OMP owner, and a native OMP launch shim. Each proves the same owner.
+    fn claim_owner_proof([wrapper, owner, shim]: [u32; 3], anchor: u32) -> Option<OmpOwnerProof> {
+        let anchor_kind = if anchor == wrapper {
+            AncestorProcess::Other
+        } else if anchor == owner {
+            AncestorProcess::Omp
+        } else if anchor == shim {
+            AncestorProcess::OmpLauncherShim
+        } else {
+            return None;
         };
         Some(OmpOwnerProof {
-            owner_pid: 200,
+            owner_pid: owner,
             anchor_kind,
         })
+    }
+
+    /// The claim roles at PIDs no process can hold, for tests whose owner pin
+    /// reads the owner's native identity.
+    fn impossible_claim_family() -> [u32; 3] {
+        [impossible_pid(0), impossible_pid(1), impossible_pid(2)]
+    }
+
+    /// An owner pin on an impossible PID writes no launch records. Its
+    /// receipt is the owner's native identity, which that PID lacks, and an
+    /// owner pin never mints a launch root.
+    fn assert_impossible_owner_left_no_launch_records(row: &InstanceRow, owner: u32) {
+        assert_eq!(crate::sys::process::identity(owner), None);
+        assert_eq!(OmpLaunchPidReceipt::raw(row), None);
+        assert_eq!(launch_context_value(row, "omp_launch_root"), None);
     }
 
     thread_local! {
@@ -4965,21 +4989,24 @@ mod tests {
     #[serial]
     fn omp_legacy_actual_anchor_needs_no_placeholder_metadata() {
         let _env = crate::hooks::test_helpers::isolated_test_env();
+        let claim = impossible_claim_family();
+        let [_, owner, shim] = claim;
+        let proof = |anchor| claim_owner_proof(claim, anchor);
         let (db, path) = setup_test_db();
-        seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-prior"), Some(200));
+        seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-prior"), Some(owner));
         db.set_process_binding(OMP_LAUNCH_ID, "sid-prior", "luna")
             .unwrap();
         db.rebind_session("sid-prior", "luna").unwrap();
         assert_eq!(
-            bind_omp_session_to_process_checked(&db, "sid-owner", OMP_LAUNCH_ID, &omp_claim_owner)
+            bind_omp_session_to_process_checked(&db, "sid-owner", OMP_LAUNCH_ID, &proof)
                 .unwrap()
                 .as_deref(),
             Some("luna")
         );
         let row = db.get_instance_full("luna").unwrap().unwrap();
-        assert_eq!(row.pid, Some(200));
+        assert_eq!(row.pid, Some(i64::from(owner)));
         assert_eq!(row.session_id.as_deref(), Some("sid-owner"));
-        assert!(row.launch_context.is_none());
+        assert_impossible_owner_left_no_launch_records(&row, owner);
         assert_eq!(db.get_session_binding("sid-prior").unwrap(), None);
         cleanup(path);
 
@@ -4989,8 +5016,8 @@ mod tests {
             bind_omp_session_to_process_checked(
                 &db,
                 "sid-plain",
-                "omp-200-plain",
-                &omp_claim_owner
+                &format!("omp-{owner}-plain"),
+                &proof
             )
             .unwrap(),
             None
@@ -5000,8 +5027,8 @@ mod tests {
             bind_omp_session_to_process_checked(
                 &db,
                 "sid-plain",
-                "omp-300-foreign",
-                &omp_claim_owner
+                &format!("omp-{shim}-foreign"),
+                &proof
             )
             .is_err()
         );
@@ -5647,15 +5674,17 @@ mod tests {
     #[serial]
     fn omp_bound_native_shim_reuses_one_source_proof_per_bind_phase() {
         let _env = crate::hooks::test_helpers::isolated_test_env();
+        let claim = impossible_claim_family();
+        let [_, owner, shim] = claim;
         let (db, path) = setup_test_db();
-        seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-owner"), Some(300));
+        seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-owner"), Some(shim));
         db.set_process_binding(OMP_LAUNCH_ID, "sid-owner", "luna")
             .unwrap();
         db.rebind_session("sid-owner", "luna").unwrap();
         let anchors = std::cell::RefCell::new(Vec::new());
         let proof = |anchor| {
             anchors.borrow_mut().push(anchor);
-            omp_claim_owner(anchor)
+            claim_owner_proof(claim, anchor)
         };
         assert_eq!(
             bind_omp_session_to_process_checked(&db, "sid-owner", OMP_LAUNCH_ID, &proof)
@@ -5664,12 +5693,12 @@ mod tests {
             Some("luna")
         );
         let row = db.get_instance_full("luna").unwrap().unwrap();
-        assert_eq!(row.pid, Some(200));
+        assert_eq!(row.pid, Some(i64::from(owner)));
         assert_eq!(row.session_id.as_deref(), Some("sid-owner"));
-        assert!(row.launch_context.is_none());
+        assert_impossible_owner_left_no_launch_records(&row, owner);
         assert_eq!(
             anchors.into_inner(),
-            vec![300, 300],
+            vec![shim, shim],
             "pre/post bind refresh independently; canonical policy does not re-read the same anchor"
         );
         cleanup(path);
