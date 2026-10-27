@@ -1214,6 +1214,7 @@ fn snapshot(proc_root: &Path) -> Result<Vec<ProcFact>, &'static str> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
 
@@ -1976,19 +1977,72 @@ mod tests {
         }
     }
 
-    /// SIGKILLs one test-spawned process that left every fixture group, only
-    /// while it is still the incarnation the test recorded.
-    struct Stray {
-        pid: u32,
-        start: u64,
+    /// The marker a test's fixtures carry: HCOM_PROCESS_ID set to a token
+    /// unique to that test and this test binary.
+    fn marker(test: &str) -> String {
+        format!("kill-tree-linux-{test}-{}", std::process::id())
     }
+
+    /// A fixture descendant the test holds no `Child` for, pinned with a
+    /// pidfd and proven the fixture's. After pinning it still has the start
+    /// recorded at capture and carries the test's marker, and it is still
+    /// alive afterwards, so no PID reuse can slip between those reads.
+    /// Signals go only through the pidfd, which can never reach a different
+    /// process: once the pinned one exits, they fail with ESRCH.
+    struct Pinned {
+        pidfd: OwnedFd,
+    }
+
+    impl Pinned {
+        fn pin(pid: u32, start: u64, token: &str) -> Self {
+            let raw = libc::pid_t::try_from(pid).expect("representable fixture PID");
+            // SAFETY: pidfd_open takes a PID and zero flags and returns a new
+            // descriptor or -1; it signals nothing.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, raw, 0) };
+            assert!(
+                fd >= 0,
+                "pidfd_open({pid}): {}",
+                std::io::Error::last_os_error()
+            );
+            let fd = libc::c_int::try_from(fd).expect("descriptor fits a c_int");
+            // SAFETY: a fresh descriptor that nothing else owns.
+            let pinned = Pinned {
+                pidfd: unsafe { OwnedFd::from_raw_fd(fd) },
+            };
+            assert_eq!(start_of(pid), Some(start), "{pid} is not the captured one");
+            assert!(
+                matches!(
+                    crate::proctruth::process_id_of(pid),
+                    EnvRead::Present(id) if id == token
+                ),
+                "{pid} lacks the fixture marker"
+            );
+            assert!(pinned.signal(0), "{pid} exited while it was proven");
+            pinned
+        }
+
+        /// Send `sig` to the pinned process; false once it has exited.
+        fn signal(&self, sig: libc::c_int) -> bool {
+            // SAFETY: a pidfd this struct owns, no siginfo and no flags.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    sig,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                ) == 0
+            }
+        }
+    }
+
+    /// SIGKILLs a pinned fixture process that left every fixture group, on
+    /// drop; one that already exited gets nothing.
+    struct Stray(Pinned);
 
     impl Drop for Stray {
         fn drop(&mut self) {
-            if start_of(self.pid) == Some(self.start) {
-                // One PID this test spawned, just rechecked.
-                let _ = signal_pid(self.pid, libc::SIGKILL);
-            }
+            self.0.signal(libc::SIGKILL);
         }
     }
 
@@ -2014,13 +2068,25 @@ mod tests {
         }
     }
 
-    fn spawn(script: &str, group: u32) -> Child {
-        Command::new("sh")
+    fn command(script: &str, group: u32) -> Command {
+        let mut command = Command::new("sh");
+        command
             .args(["-c", script])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(group as i32)
+            .process_group(group as i32);
+        command
+    }
+
+    fn spawn(script: &str, group: u32) -> Child {
+        command(script, group).spawn().expect("spawn own fixture")
+    }
+
+    /// [`spawn`], with every process in the fixture carrying `token`.
+    fn spawn_marked(script: &str, group: u32, token: &str) -> Child {
+        command(script, group)
+            .env("HCOM_PROCESS_ID", token)
             .spawn()
             .expect("spawn own fixture")
     }
@@ -2182,10 +2248,8 @@ mod tests {
             .parse()
             .unwrap();
         wait_for_sleep(carrier);
-        let stray = Stray {
-            pid: carrier,
-            start: start_of(carrier).expect("carrier start"),
-        };
+        let carrier_start = start_of(carrier).expect("carrier start");
+        let stray = Stray(Pinned::pin(carrier, carrier_start, &id));
         let tree = captured(root, 1);
         assert!(tree.iter().all(|member| member.pid != carrier));
 
@@ -2199,7 +2263,7 @@ mod tests {
             |_| Ok(()),
         );
         assert_eq!(result, Ok(GroupSignal::Sent));
-        assert_ne!(start_of(carrier), Some(stray.start), "carrier survived");
+        assert_ne!(start_of(carrier), Some(carrier_start), "carrier survived");
         assert!(tree.iter().all(|member| !running(member)));
         drop(stray);
         drop(fixture);
@@ -2252,18 +2316,20 @@ mod tests {
     #[test]
     fn a_root_that_exits_and_is_reaped_before_its_own_signal_is_success() {
         // Anchor -> root shell -> sleeper. The anchor reaps the root at once.
-        let anchor = spawn("sh -c 'sleep 30 & wait' & wait; exec sleep 30", 0);
+        let token = marker("root-reaped");
+        let anchor = spawn_marked("sh -c 'sleep 30 & wait' & wait; exec sleep 30", 0, &token);
         let group = anchor.id();
         let fixture = Fixture {
             group,
             children: vec![anchor],
         };
         let tree = captured(group, 3);
-        let root = tree
+        let root_member = tree
             .iter()
             .find(|member| member.depth == 1)
-            .expect("root shell")
-            .pid;
+            .expect("root shell");
+        let root = root_member.pid;
+        let pinned_root = Pinned::pin(root, root_member.start, &token);
         // `authorize` runs after the capture and before any signal: end and
         // reap the root there, the way a root that waited on its signaled
         // descendants exits on its own, so it is gone at its own signal.
@@ -2278,8 +2344,8 @@ mod tests {
             |pid| {
                 if pid == root && !ended {
                     ended = true;
-                    // The root shell this test spawned, still live.
-                    let _ = signal_pid(root, libc::SIGKILL);
+                    // The pinned root shell, never anything else.
+                    pinned_root.signal(libc::SIGKILL);
                     let deadline = Instant::now() + Duration::from_secs(5);
                     // Reaped, not merely a zombie: a zombie keeps its
                     // identity and can still take a signal.
@@ -2304,33 +2370,36 @@ mod tests {
     fn a_leader_root_reaped_before_its_signal_still_gets_its_group_signaled() {
         // Anchor -> root (setsid: its own session and group) -> sleeper in
         // the root's group. The anchor reaps the root at once.
-        let anchor = spawn("setsid sh -c 'sleep 30 & wait' & wait; exec sleep 30", 0);
+        let token = marker("leader-root-reaped");
+        let anchor = spawn_marked(
+            "setsid sh -c 'sleep 30 & wait' & wait; exec sleep 30",
+            0,
+            &token,
+        );
         let group = anchor.id();
         let fixture = Fixture {
             group,
             children: vec![anchor],
         };
         let tree = captured(group, 3);
-        let root = tree
+        let root_member = tree
             .iter()
             .find(|member| member.depth == 1)
-            .expect("root shell")
-            .pid;
+            .expect("root shell");
+        let root = root_member.pid;
+        let pinned_root = Pinned::pin(root, root_member.start, &token);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(observe(Path::new("/proc"), root), Seen::Live(fact) if fact.pgrp == root) {
             assert!(Instant::now() < deadline, "root never led its own group");
             std::thread::sleep(Duration::from_millis(5));
         }
         // The sleeper left the anchor's group with the root, so the fixture
-        // can't reach it; this kills it only while it is that incarnation.
+        // can't reach it; it is pinned and killed only through its pidfd.
         let sleeper = tree
             .iter()
             .find(|member| member.depth == 2)
             .expect("sleeper");
-        let stray = Stray {
-            pid: sleeper.pid,
-            start: sleeper.start,
-        };
+        let stray = Stray(Pinned::pin(sleeper.pid, sleeper.start, &token));
 
         let mut ended = false;
         let began = Instant::now();
@@ -2344,8 +2413,8 @@ mod tests {
             |pid| {
                 if pid == root && !ended {
                     ended = true;
-                    // The root shell this test spawned, still live.
-                    let _ = signal_pid(root, libc::SIGKILL);
+                    // The pinned root shell, never anything else.
+                    pinned_root.signal(libc::SIGKILL);
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while Path::new(&format!("/proc/{root}")).exists() {
                         assert!(Instant::now() < deadline, "root was never reaped");
@@ -2512,10 +2581,14 @@ mod tests {
         let path = std::ffi::CString::new(sleep).unwrap();
         let (arg0, arg1) = (c"sleep", c"30");
         let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
+        let token = marker("leader-shares-parent-group");
+        let env = std::ffi::CString::new(format!("HCOM_PROCESS_ID={token}")).unwrap();
+        let envp = [env.as_ptr(), std::ptr::null()];
         // The parent forks the root, makes it lead its own group, then joins
         // that group itself: a leader root whose group holds its ancestor.
         // SAFETY: between fork and exec the children call only fork, setpgid,
-        // execv and _exit, all async-signal-safe; argv was built beforehand.
+        // execve and _exit, all async-signal-safe; argv and envp were built
+        // beforehand.
         let parent = unsafe { libc::fork() };
         assert!(parent >= 0, "fork failed");
         if parent == 0 {
@@ -2523,13 +2596,13 @@ mod tests {
                 let root = libc::fork();
                 if root == 0 {
                     libc::setpgid(0, 0);
-                    libc::execv(path.as_ptr(), argv.as_ptr());
+                    libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
                     libc::_exit(127);
                 }
                 if root > 0 {
                     libc::setpgid(root, root);
                     libc::setpgid(0, root);
-                    libc::execv(path.as_ptr(), argv.as_ptr());
+                    libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
                 }
                 libc::_exit(127);
             }
@@ -2553,15 +2626,13 @@ mod tests {
         };
         wait_for_sleep(root);
         wait_for_sleep(parent);
-        let root_stray = Stray {
-            pid: root,
-            start: start_of(root).unwrap(),
-        };
+        let root_start = start_of(root).unwrap();
+        let root_stray = Stray(Pinned::pin(root, root_start, &token));
         let parent_start = start_of(parent).unwrap();
 
         let result = terminate_tree(root, &identity(root).unwrap());
         assert_eq!(result, Ok(GroupSignal::Sent));
-        assert_ne!(start_of(root), Some(root_stray.start), "root survived");
+        assert_ne!(start_of(root), Some(root_start), "root survived");
         assert_eq!(start_of(parent), Some(parent_start), "parent was signaled");
         drop(root_stray);
         drop(parent_guard);
@@ -2762,16 +2833,20 @@ mod tests {
     /// PID after ending it: SIGKILL, then wait until a fresh read shows it
     /// gone (reaped by a shell parent, or a zombie under an exec'd one).
     fn kill_refusing_an_ended_member(
+        name: &str,
         script: &str,
     ) -> (Result<GroupSignal, KillError>, Vec<Member>) {
-        let leader = spawn(script, 0);
+        let token = marker(name);
+        let leader = spawn_marked(script, 0, &token);
         let root = leader.id();
         let fixture = Fixture {
             group: root,
             children: vec![leader],
         };
         let tree = captured(root, 2);
-        let victim = tree.iter().find(|member| member.pid != root).unwrap().pid;
+        let victim_member = tree.iter().find(|member| member.pid != root).unwrap();
+        let victim = victim_member.pid;
+        let pinned_victim = Pinned::pin(victim, victim_member.start, &token);
         let result = terminate(
             root,
             &identity(root).unwrap(),
@@ -2783,8 +2858,8 @@ mod tests {
                 if pid != victim {
                     return Ok(());
                 }
-                // The test's own sleeper, still live.
-                let _ = signal_pid(victim, libc::SIGKILL);
+                // The pinned sleeper, never anything else.
+                pinned_victim.signal(libc::SIGKILL);
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while observe(Path::new("/proc"), victim) != Seen::Gone {
                     assert!(Instant::now() < deadline, "victim never ended");
@@ -2803,7 +2878,8 @@ mod tests {
     #[test]
     fn a_member_that_exits_before_its_refusal_is_rechecked_is_gone() {
         // The root execs sleep after its child dies and is reaped.
-        let (result, tree) = kill_refusing_an_ended_member("sleep 30 & wait; exec sleep 30");
+        let (result, tree) =
+            kill_refusing_an_ended_member("refused-reaped", "sleep 30 & wait; exec sleep 30");
         assert_eq!(result, Ok(GroupSignal::Sent));
         assert!(tree.iter().all(|member| !running(member)));
     }
@@ -2811,7 +2887,8 @@ mod tests {
     #[test]
     fn a_zombie_member_behind_a_refusal_is_gone() {
         // The exec'd root never reaps, so the killed child stays a zombie.
-        let (result, tree) = kill_refusing_an_ended_member("sleep 30 & exec sleep 30");
+        let (result, tree) =
+            kill_refusing_an_ended_member("refused-zombie", "sleep 30 & exec sleep 30");
         assert_eq!(result, Ok(GroupSignal::Sent));
         assert!(tree.iter().all(|member| !running(member)));
     }
@@ -2833,10 +2910,12 @@ mod tests {
     fn a_refusal_on_an_exiting_member_is_dropped_and_it_is_confirmed_once_gone() {
         // ~1 GiB of touched memory keeps the child in do_exit for ~150 ms
         // after its SIGKILL: long enough to recheck it while it exits.
-        let leader = spawn(
+        let token = marker("exiting-refusal");
+        let leader = spawn_marked(
             "python3 -c 'import time; b = bytearray(1 << 30); \
              b[::4096] = bytes([1]) * (1 << 18); time.sleep(30)' & wait",
             0,
+            &token,
         );
         let root = leader.id();
         let fixture = Fixture {
@@ -2860,6 +2939,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let child_start = start_of(child).unwrap();
+        let pinned_child = Pinned::pin(child, child_start, &token);
 
         // Its argv reads empty once its memory is released, so authorize
         // refuses it while it exits: the frontend's flake (b).
@@ -2875,8 +2955,8 @@ mod tests {
                 if pid != child {
                     return Ok(());
                 }
-                // This test's own child, still live.
-                let _ = signal_pid(child, libc::SIGKILL);
+                // The pinned child, never anything else.
+                pinned_child.signal(libc::SIGKILL);
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while !exiting_now(child) && Instant::now() < deadline {
                     std::hint::spin_loop();
@@ -3013,14 +3093,18 @@ mod tests {
         // The child's main thread exits alone (SYS_exit, not exit_group)
         // while a second thread sleeps: its leader reads Z, it is alive. It
         // runs in its own session, so only a per-PID signal reaches it.
-        let leader = spawn(
+        // It is pinned well before its leader exits: a leader that has
+        // released its memory has no readable marker any more.
+        let token = marker("zombie-leader");
+        let leader = spawn_marked(
             &format!(
                 "setsid python3 -c 'import ctypes, threading, time; \
                  threading.Thread(target=time.sleep, args=(30,), daemon=True).start(); \
-                 time.sleep(0.1); ctypes.CDLL(None).syscall({}, 0)' & wait",
+                 time.sleep(0.5); ctypes.CDLL(None).syscall({}, 0)' & wait",
                 libc::SYS_exit
             ),
             0,
+            &token,
         );
         let root = leader.id();
         let fixture = Fixture {
@@ -3029,10 +3113,7 @@ mod tests {
         };
         let tree = captured(root, 2);
         let child = tree.iter().find(|member| member.pid != root).unwrap();
-        let stray = Stray {
-            pid: child.pid,
-            start: child.start,
-        };
+        let stray = Stray(Pinned::pin(child.pid, child.start, &token));
         let child = child.pid;
         let deadline = Instant::now() + Duration::from_secs(10);
         let thread = loop {
