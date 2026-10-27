@@ -909,6 +909,7 @@ fn handle_remote_kill(
     let result = match crate::commands::kill::kill_tracked_instance(db, target, initiated_by) {
         Ok(result) => result,
         Err(error) => {
+            let error = error.into_failure();
             return Ok(json!({
                 "target": target,
                 "ok": false,
@@ -923,6 +924,11 @@ fn handle_remote_kill(
                     "session_id": error.self_session,
                     "count": error.self_excluded,
                 })),
+                "pane_closed": error.pane_closed,
+                "pane_retry_command": error.pane_retry_command,
+                "preset_name": error.preset_name,
+                "pane_id": error.pane_id,
+                "pane_left_for_caller": error.pane_left_for_caller,
             }));
         }
     };
@@ -949,6 +955,7 @@ fn handle_remote_kill(
         "pane_retry_command": result.pane_retry_command,
         "preset_name": result.preset_name,
         "pane_id": result.pane_id,
+        "pane_left_for_caller": result.pane_left_for_caller,
         "ok": !matches!(result.kill_result, crate::terminal::KillResult::PermissionDenied),
     }))
 }

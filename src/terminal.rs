@@ -1391,6 +1391,11 @@ fn substitute_close_argv(
     if needs("{id}") && terminal_id.is_empty() {
         return None;
     }
+    // Kill closes panes only after the root is confirmed gone, so it passes 0:
+    // a dead or reused PID must never select some other process's window.
+    if needs("{pid}") && pid == 0 {
+        return None;
+    }
 
     let pid_str = pid.to_string();
     let argv: Vec<String> = template
@@ -2705,7 +2710,7 @@ pub(crate) fn kill_process(
             &owned_id
         };
         close_terminal_pane(
-            pid,
+            0,
             preset_name,
             pane_id,
             process_id,

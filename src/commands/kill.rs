@@ -31,6 +31,8 @@ pub struct KillTrackedResult {
     pub pane_retry_command: Option<String>,
     pub preset_name: String,
     pub pane_id: String,
+    /// The owned pane holds the excluded caller, so it was left open by design.
+    pub pane_left_for_caller: bool,
     /// Carriers spared because they are the caller's own session tree
     /// (kill self-path only; 0 on the foreign path).
     pub self_excluded: usize,
@@ -43,7 +45,10 @@ pub struct KillTrackedResult {
 
 /// Failed kills keep their structured verification evidence for relay callers.
 #[derive(Debug)]
-pub struct KillTrackedError {
+pub struct KillTrackedError(Box<KillFailure>);
+
+#[derive(Debug)]
+pub struct KillFailure {
     pub message: String,
     pub launcher_unverified: Option<String>,
     pub survivors: Vec<u32>,
@@ -51,10 +56,15 @@ pub struct KillTrackedError {
     pub self_pid: Option<u32>,
     pub self_session: Option<String>,
     pub self_excluded: usize,
+    pub pane_closed: bool,
+    pub pane_retry_command: Option<String>,
+    pub preset_name: String,
+    pub pane_id: String,
+    pub pane_left_for_caller: bool,
 }
 
-impl From<String> for KillTrackedError {
-    fn from(message: String) -> Self {
+impl KillFailure {
+    fn new(message: String) -> Self {
         Self {
             message,
             launcher_unverified: None,
@@ -63,11 +73,46 @@ impl From<String> for KillTrackedError {
             self_pid: None,
             self_session: None,
             self_excluded: 0,
+            pane_closed: false,
+            pane_retry_command: None,
+            preset_name: String::new(),
+            pane_id: String::new(),
+            pane_left_for_caller: false,
         }
     }
 }
 
+impl std::ops::Deref for KillTrackedError {
+    type Target = KillFailure;
+
+    fn deref(&self) -> &KillFailure {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillTrackedError {
+    fn deref_mut(&mut self) -> &mut KillFailure {
+        &mut self.0
+    }
+}
+
+impl From<KillFailure> for KillTrackedError {
+    fn from(failure: KillFailure) -> Self {
+        Self(Box::new(failure))
+    }
+}
+
+impl From<String> for KillTrackedError {
+    fn from(message: String) -> Self {
+        KillFailure::new(message).into()
+    }
+}
+
 impl KillTrackedError {
+    pub fn into_failure(self) -> KillFailure {
+        *self.0
+    }
+
     fn excluding(mut self, count: usize, session: Option<&str>) -> Self {
         if count > 0 {
             use std::fmt::Write;
@@ -83,6 +128,39 @@ impl KillTrackedError {
         }
         self
     }
+
+    /// Carry the pane outcome of a kill whose processes are confirmed gone but
+    /// whose bookkeeping or launcher proof failed; pane close never upgrades it.
+    fn with_pane(mut self, pane: PaneOutcome) -> Self {
+        if pane.closed {
+            self.message
+                .push_str(&pane_info_str(true, &pane.preset_name, &pane.pane_id));
+        }
+        if let Some(command) = &pane.retry_command {
+            self.message.push_str(&format!(
+                "\nProcess terminated, but pane remains. Retry this command with approval/escalation:\n{command}"
+            ));
+        }
+        if pane.left_for_caller {
+            self.message
+                .push_str("\nPane left open by design: it holds the excluded caller.");
+        }
+        self.pane_closed = pane.closed;
+        self.pane_retry_command = pane.retry_command;
+        self.preset_name = pane.preset_name;
+        self.pane_id = pane.pane_id;
+        self.pane_left_for_caller = pane.left_for_caller;
+        self
+    }
+}
+
+/// The pane cleanup that followed native confirmation.
+struct PaneOutcome {
+    closed: bool,
+    retry_command: Option<String>,
+    preset_name: String,
+    pane_id: String,
+    left_for_caller: bool,
 }
 
 impl std::fmt::Display for KillTrackedError {
@@ -100,11 +178,12 @@ fn native_kill_error(name: &str, error: crate::sys::process::KillError) -> KillT
         KillError::Survivors(pids) => (pids, false),
         KillError::Unconfirmed { survivors, .. } => (survivors, true),
     };
-    KillTrackedError {
+    KillFailure {
         survivors,
         refusal,
-        ..message.into()
+        ..KillFailure::new(message)
     }
+    .into()
 }
 
 fn launcher_unverified_error(name: &str, warning: &str, self_excluded: bool) -> KillTrackedError {
@@ -116,11 +195,12 @@ fn launcher_unverified_error(name: &str, warning: &str, self_excluded: bool) -> 
     let message = format!(
         "'{name}' {stopped} terminated, but {warning}; hcom stop {name} clears the bookkeeping"
     );
-    KillTrackedError {
+    KillFailure {
         launcher_unverified: Some(warning.to_owned()),
         refusal: false,
-        ..message.into()
+        ..KillFailure::new(message)
     }
+    .into()
 }
 
 /// Teardown outcome of a kill: whether the row of the incarnation the kill
@@ -413,43 +493,41 @@ fn kill_resolved_instance(
     })?;
 
     let mut leftovers_terminated = None;
-    let (result, pane_closed, pane_retry_command, preset_name, pane_id) = if owner.is_zombie()
-        || owner.identity().is_none()
+    if owner.is_zombie()
+        && let Some(identity) = owner.identity()
     {
-        if owner.is_zombie()
-            && let Some(identity) = owner.identity()
-        {
-            let leftovers = crate::sys::process::terminate_zombie_group_verified(
-                pid,
-                identity,
-                self_pids,
-                crate::proctruth::kill_candidate_eligible,
-                |candidate| crate::proctruth::verify_kill_candidate(db, name, candidate),
-            )
-            .map_err(|error| native_kill_error(name, error))?;
-            leftovers_terminated = Some(leftovers);
-            println!(
-                "'{name}' owner PID {pid} already exited; {leftovers} leftover process(es) terminated"
-            );
-        }
-        (
-            terminal::KillResult::AlreadyDead,
-            false,
-            None,
-            String::new(),
-            String::new(),
-        )
-    } else {
-        kill_instance(
-            db,
-            name,
-            &owner,
-            inst,
-            inst.background != 0,
-            binding_ids,
+        let leftovers = crate::sys::process::terminate_zombie_group_verified(
+            pid,
+            identity,
             self_pids,
+            crate::proctruth::kill_candidate_eligible,
+            |candidate| crate::proctruth::verify_kill_candidate(db, name, candidate),
         )
-        .map_err(|error| error.excluding(excluded.len(), inst.session_id.as_deref()))?
+        .map_err(|error| native_kill_error(name, error))?;
+        leftovers_terminated = Some(leftovers);
+        println!(
+            "'{name}' owner PID {pid} already exited; {leftovers} leftover process(es) terminated"
+        );
+    }
+    // Gone and zombie owners recheck false, so this sends them no signal; every
+    // mode still runs the receipt-verified pane close after confirmation.
+    let (result, pane_closed, pane_retry_command, preset_name, pane_id) = kill_instance(
+        db,
+        name,
+        &owner,
+        inst,
+        inst.background != 0,
+        binding_ids,
+        self_pids,
+    )
+    .map_err(|error| error.excluding(excluded.len(), inst.session_id.as_deref()))?;
+    let pane_left_for_caller = !excluded.is_empty() && !preset_name.is_empty() && !pane_closed;
+    let pane = || PaneOutcome {
+        closed: pane_closed,
+        retry_command: pane_retry_command.clone(),
+        preset_name: preset_name.clone(),
+        pane_id: pane_id.clone(),
+        left_for_caller: pane_left_for_caller,
     };
     // Native helpers have confirmed every captured incarnation gone. Only
     // now may the old row's incarnation-bound bookkeeping be released.
@@ -465,11 +543,13 @@ fn kill_resolved_instance(
                  Recovery: hcom kill {name}"
             ))
             .excluding(excluded.len(), inst.session_id.as_deref())
+            .with_pane(pane())
         })?;
     if let Some(warning) = owner.launcher_warning() {
         return Err(
             launcher_unverified_error(name, warning, !excluded.is_empty())
-                .excluding(excluded.len(), inst.session_id.as_deref()),
+                .excluding(excluded.len(), inst.session_id.as_deref())
+                .with_pane(pane()),
         );
     }
     if !excluded.is_empty() {
@@ -488,6 +568,7 @@ fn kill_resolved_instance(
         pane_retry_command,
         preset_name,
         pane_id,
+        pane_left_for_caller,
         self_excluded: excluded.len(),
         self_pid: (!excluded.is_empty()).then_some(std::process::id()),
         self_session: if excluded.is_empty() {
@@ -533,11 +614,12 @@ fn survivors_error(name: &str, error: &crate::proctruth::ReapError) -> KillTrack
         #[cfg(unix)]
         _ => Vec::new(),
     };
-    KillTrackedError {
+    KillFailure {
         refusal: survivors.is_empty(),
         survivors,
-        ..message.into()
+        ..KillFailure::new(message)
     }
+    .into()
 }
 
 /// Re-read the incarnation token of `name` through the teardown transaction;
@@ -759,6 +841,11 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
                 );
             }
         }
+        if result["pane_retry_command"].is_string()
+            && let Some((_, device)) = crate::relay::control::split_device_suffix(name)
+        {
+            eprintln!("Run the pane-close retry command on remote device {device}.");
+        }
         return Ok(1);
     }
     let kill_result = result["kill_result"].as_str();
@@ -814,6 +901,9 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
         if teardown == TeardownOutcome::Completed {
             for line in render_self_kill_feedback(name, self_excluded as usize) {
                 println!("{line}");
+            }
+            if result["pane_left_for_caller"].as_bool() == Some(true) {
+                println!("{PANE_LEFT_FOR_CALLER}");
             }
             return Ok(0);
         }
@@ -882,10 +972,12 @@ fn render_remote_kill_feedback(
     }
 }
 
+/// The self path never closes the pane that holds the excluded caller.
+const PANE_LEFT_FOR_CALLER: &str = "  Pane left open by design: it holds the excluded caller.";
+
 /// Format the self-path report: the plain stopped report plus the resume
-/// hint. Rendered only after a verified-clean non-self reap and the
-/// completed teardown — the pane close is skipped (the pane is the caller's
-/// own), so this is the whole CLI contract of a self kill.
+/// hint. Rendered only after the captured non-self members are confirmed gone
+/// and the teardown completed; the pane holding the caller stays open.
 fn render_self_kill_feedback(name: &str, self_excluded: usize) -> Vec<String> {
     vec![
         format!(
@@ -1109,6 +1201,9 @@ fn kill_selected(
         if result.self_excluded > 0 {
             for line in render_self_kill_feedback(&inst.name, result.self_excluded) {
                 println!("{line}");
+            }
+            if result.pane_left_for_caller {
+                println!("{PANE_LEFT_FOR_CALLER}");
             }
             killed += 1;
             continue;
@@ -1353,6 +1448,9 @@ fn kill_single(
         for line in render_self_kill_feedback(&name, kill_result.self_excluded) {
             println!("{line}");
         }
+        if kill_result.pane_left_for_caller {
+            println!("{PANE_LEFT_FOR_CALLER}");
+        }
         return Ok(0);
     }
     let pid = kill_result.pid;
@@ -1418,41 +1516,51 @@ fn kill_orphan_process(
     let chain = crate::proctruth::kill_caller_ancestor_pids()
         .map_err(|reason| unverified_owner_error(&name, orphan.pid, reason))?;
     let self_excluded = chain.contains(&owner.pid());
-    let result = if owner.is_zombie() {
-        if let Some(identity) = owner.identity() {
-            let leftovers = crate::sys::process::terminate_zombie_group_verified(
-                orphan.pid,
-                identity,
-                &chain,
-                crate::proctruth::kill_candidate_eligible,
-                |candidate| crate::proctruth::verify_kill_candidate(db, &name, candidate),
-            )
-            .map_err(|error| native_kill_error(&name, error))?;
-            println!(
-                "'{name}' owner PID {} already exited; {leftovers} leftover process(es) terminated",
-                orphan.pid
-            );
-        }
-        (terminal::KillResult::AlreadyDead, false, None)
-    } else {
-        terminal::kill_process(
-            owner,
-            &orphan.names,
-            std::slice::from_ref(&orphan.process_id),
+    if owner.is_zombie()
+        && let Some(identity) = owner.identity()
+    {
+        let leftovers = crate::sys::process::terminate_zombie_group_verified(
+            orphan.pid,
+            identity,
             &chain,
-            &orphan_terminal_info(orphan),
+            crate::proctruth::kill_candidate_eligible,
             |candidate| crate::proctruth::verify_kill_candidate(db, &name, candidate),
         )
-        .map_err(|error| native_kill_error(&name, error))?
+        .map_err(|error| native_kill_error(&name, error))?;
+        println!(
+            "'{name}' owner PID {} already exited; {leftovers} leftover process(es) terminated",
+            orphan.pid
+        );
+    }
+    // Gone and zombie owners recheck false, so this sends them no signal; every
+    // mode still runs the receipt-verified pane close after confirmation.
+    let result = terminal::kill_process(
+        owner,
+        &orphan.names,
+        std::slice::from_ref(&orphan.process_id),
+        &chain,
+        &orphan_terminal_info(orphan),
+        |candidate| crate::proctruth::verify_kill_candidate(db, &name, candidate),
+    )
+    .map_err(|error| native_kill_error(&name, error))?;
+    let pane = PaneOutcome {
+        closed: result.1,
+        retry_command: result.2.clone(),
+        preset_name: orphan.terminal_preset.clone(),
+        pane_id: orphan.pane_id.clone(),
+        left_for_caller: self_excluded && !orphan.terminal_preset.is_empty() && !result.1,
     };
     if let Some(warning) = owner.launcher_warning() {
-        return Err(launcher_unverified_error(&name, warning, self_excluded));
+        return Err(launcher_unverified_error(&name, warning, self_excluded).with_pane(pane));
     }
     if self_excluded {
         println!(
             "'{name}': caller PID {} and its own ancestor chain were left running by design; owner/root death is not claimed",
             std::process::id()
         );
+        if pane.left_for_caller {
+            println!("{PANE_LEFT_FOR_CALLER}");
+        }
     }
     Ok((result.0, result.1, result.2, self_excluded))
 }

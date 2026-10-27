@@ -2281,7 +2281,10 @@ impl KillOwner {
     /// Revalidate before native tree capture. Positive death needs no signal;
     /// a different or unreadable incarnation is a refusal.
     pub(crate) fn recheck(&self) -> Result<bool, &'static str> {
-        if self.zombie || crate::sys::process::is_definitely_dead(self.pid) {
+        if self.zombie
+            || self.identity.is_none()
+            || crate::sys::process::is_definitely_dead(self.pid)
+        {
             return Ok(false);
         }
         match (&self.identity, crate::sys::process::identity(self.pid)) {
