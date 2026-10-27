@@ -6382,8 +6382,15 @@ mod tests {
             let row_before = row_state();
             let bindings_before = binding_state();
             let events_before = event_count();
-            assert!(row_before.contains("wren-session"), "seeded row: {row_before}");
-            assert_eq!(bindings_before.len(), 1, "seeded binding: {bindings_before:?}");
+            assert!(
+                row_before.contains("wren-session"),
+                "seeded row: {row_before}"
+            );
+            assert_eq!(
+                bindings_before.len(),
+                1,
+                "seeded binding: {bindings_before:?}"
+            );
 
             let refusals = [
                 (
@@ -6409,14 +6416,25 @@ mod tests {
                 let retry = err
                     .find(&format!("hcom r {name}"))
                     .unwrap_or_else(|| panic!("{gate} (pid {pid:?}) names no retry: {err}"));
-                assert!(stop < retry, "{gate} (pid {pid:?}) must stop before retry: {err}");
-                assert_eq!(row_state(), row_before, "{gate} (pid {pid:?}) changed the row");
+                assert!(
+                    stop < retry,
+                    "{gate} (pid {pid:?}) must stop before retry: {err}"
+                );
+                assert_eq!(
+                    row_state(),
+                    row_before,
+                    "{gate} (pid {pid:?}) changed the row"
+                );
                 assert_eq!(
                     binding_state(),
                     bindings_before,
                     "{gate} (pid {pid:?}) changed the bindings"
                 );
-                assert_eq!(event_count(), events_before, "{gate} (pid {pid:?}) wrote events");
+                assert_eq!(
+                    event_count(),
+                    events_before,
+                    "{gate} (pid {pid:?}) wrote events"
+                );
                 assert_eq!(stopped_count(), 0, "{gate} (pid {pid:?}) stopped the row");
             }
         }

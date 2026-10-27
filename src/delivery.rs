@@ -1652,7 +1652,11 @@ pub fn run_delivery_loop(
             notify.port(),
             state.inject_port,
         ) {
-            log_warn("native", "delivery.register_endpoints_fail", &format!("{e}"));
+            log_warn(
+                "native",
+                "delivery.register_endpoints_fail",
+                &format!("{e}"),
+            );
         }
     }
 
@@ -1750,7 +1754,11 @@ pub fn run_delivery_loop(
                     notify.port(),
                     state.inject_port,
                 ) {
-                    log_warn("native", "delivery.register_endpoints_fail", &format!("{e}"));
+                    log_warn(
+                        "native",
+                        "delivery.register_endpoints_fail",
+                        &format!("{e}"),
+                    );
                 }
             }
             drive_launch_outcome(
@@ -1819,7 +1827,11 @@ pub fn run_delivery_loop(
                 notify.port(),
                 state.inject_port,
             ) {
-                log_warn("native", "delivery.register_endpoints_fail", &format!("{e}"));
+                log_warn(
+                    "native",
+                    "delivery.register_endpoints_fail",
+                    &format!("{e}"),
+                );
             }
         }
     } else {
@@ -1862,7 +1874,11 @@ pub fn run_delivery_loop(
                     notify.port(),
                     state.inject_port,
                 ) {
-                    log_warn("native", "delivery.register_endpoints_fail", &format!("{e}"));
+                    log_warn(
+                        "native",
+                        "delivery.register_endpoints_fail",
+                        &format!("{e}"),
+                    );
                 }
             }
             drive_launch_outcome(
@@ -1938,7 +1954,11 @@ pub fn run_delivery_loop(
                         notify.port(),
                         state.inject_port,
                     ) {
-                        log_warn("native", "delivery.register_endpoints_fail", &format!("{e}"));
+                        log_warn(
+                            "native",
+                            "delivery.register_endpoints_fail",
+                            &format!("{e}"),
+                        );
                     }
 
                     // Check for pending messages
@@ -2565,7 +2585,11 @@ pub fn run_delivery_loop(
                         notify.port(),
                         state.inject_port,
                     ) {
-                        log_warn("native", "delivery.register_endpoints_fail", &format!("{e}"));
+                        log_warn(
+                            "native",
+                            "delivery.register_endpoints_fail",
+                            &format!("{e}"),
+                        );
                     }
 
                     let current_cursor = db.get_cursor(&current_name);
