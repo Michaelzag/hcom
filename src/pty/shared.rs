@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::db::HcomDb;
@@ -323,11 +323,13 @@ pub(super) fn start_delivery_thread(
     shared_current: Arc<RwLock<String>>,
     title_wake: Option<crate::delivery::TitleWake>,
 ) -> Result<DeliveryStart> {
+    let config = Config::get();
+    let process_id = config.process_id.unwrap_or_default();
     let instance_name = match instance_name_cfg {
         Some(name) => name.to_string(),
         None => {
             // Try to get from environment (fallback for testing without explicit config)
-            Config::get().instance_name.unwrap_or_default()
+            config.instance_name.unwrap_or_default()
         }
     };
 
@@ -351,13 +353,22 @@ pub(super) fn start_delivery_thread(
             &format!("Starting delivery thread for {}", instance_name),
         );
 
-        // Initialize delivery components with dependency injection
-        let (mut db, notify) = match super::initialize_delivery_components(
-            &instance_name,
-            HcomDb::open,
-            NotifyServer::new,
-        ) {
-            Ok((db, notify)) => {
+        let init_result = (|| -> Result<(HcomDb, NotifyServer, Option<f64>)> {
+            let db = HcomDb::open().context("Failed to open database")?;
+            let notify = NotifyServer::new().context("Failed to create notify server")?;
+            let mut endpoint_created_at = None;
+            db.refresh_pty_endpoints(
+                &instance_name,
+                &process_id,
+                &mut endpoint_created_at,
+                notify.port(),
+                inject_port,
+            )
+            .context("Failed to register delivery endpoints")?;
+            Ok((db, notify, endpoint_created_at))
+        })();
+        let (mut db, notify, endpoint_created_at) = match init_result {
+            Ok((db, notify, endpoint_created_at)) => {
                 log_info(
                     "native",
                     "delivery.init.success",
@@ -370,15 +381,6 @@ pub(super) fn start_delivery_thread(
                     "notify.registered",
                     &format!("Registered notify port {}", notify.port()),
                 );
-                // Register inject port for screen queries
-                if let Err(e) = db.register_inject_port(&instance_name, inject_port) {
-                    log_warn(
-                        "native",
-                        "inject.register_fail",
-                        &format!("Failed to register inject port: {}", e),
-                    );
-                }
-
                 // Signal successful initialization to parent
                 let _ = init_tx.send(Ok(()));
 
@@ -398,7 +400,7 @@ pub(super) fn start_delivery_thread(
                         );
                     });
                 }
-                (db, notify)
+                (db, notify, endpoint_created_at)
             }
             Err(e) => {
                 log_error(
@@ -429,6 +431,8 @@ pub(super) fn start_delivery_thread(
             &notify,
             &state,
             &instance_name,
+            &process_id,
+            endpoint_created_at,
             &config,
             Some(current_name),
             Some(current_status),
