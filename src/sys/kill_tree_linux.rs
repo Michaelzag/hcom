@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use super::kill_group::capture_members;
 use super::process::{
     GroupSignal, KILL_WAIT, KillError, POLL_STEP, TERM_WAIT, has_identity, proc_stat_group_id,
-    proc_stat_is_dead, proc_stat_is_zombie,
+    proc_stat_is_dead, proc_stat_is_zombie, signal_group, signal_pid,
 };
 use super::process_args::EnvRead;
 
@@ -718,10 +718,9 @@ where
             self.authorize_late(&snapshot, &fresh);
             for member in &fresh {
                 if self.proven(member) {
-                    // SAFETY: one positive PID absorbed from this round's
-                    // snapshot, authorized and just re-proven; never a
-                    // group signal.
-                    unsafe { libc::kill(member.pid as libc::pid_t, signal) };
+                    // One PID absorbed from this round's snapshot, authorized
+                    // and just re-proven; never a group signal.
+                    let _ = signal_pid(member.pid, signal);
                 }
             }
             members.extend(fresh);
@@ -868,19 +867,17 @@ pub(crate) fn terminate(
                     // the members the loop skipped get their own signals.
                     for grouped in members.iter().filter(|m| m.in_group && m.pid != root) {
                         if sweep.proven(grouped) {
-                            // SAFETY: one positive captured PID, just re-proven.
-                            unsafe { libc::kill(grouped.pid as libc::pid_t, libc::SIGTERM) };
+                            let _ = signal_pid(grouped.pid, libc::SIGTERM);
                         }
                     }
                 }
                 continue;
             }
             root_signal = Some(if group_signal {
-                // SAFETY: killpg receives the verified leader's positive PGID.
-                signal_result(unsafe { libc::killpg(root as libc::pid_t, libc::SIGTERM) })
+                // The verified leader's own group.
+                signal_group(root, libc::SIGTERM)?
             } else {
-                // SAFETY: kill receives one verified positive PID.
-                signal_result(unsafe { libc::kill(root as libc::pid_t, libc::SIGTERM) })
+                signal_pid(root, libc::SIGTERM)?
             });
             continue;
         }
@@ -890,9 +887,9 @@ pub(crate) fn terminate(
         if !sweep.proven(member) {
             continue;
         }
-        // SAFETY: capture rejects reserved PIDs, so this is one positive PID,
-        // never kill(0), kill(-1), or a group signal. ESRCH means it is gone.
-        unsafe { libc::kill(member.pid as libc::pid_t, libc::SIGTERM) };
+        // Capture never admits a reserved PID, and signal_pid refuses one
+        // anyway. ESRCH means it is gone.
+        let _ = signal_pid(member.pid, libc::SIGTERM);
     }
     let root_signal = root_signal.ok_or("seat root is missing from the termination plan")?;
 
@@ -905,26 +902,15 @@ pub(crate) fn terminate(
     // Escalate per PID, never by group: the leader may have exited, and only
     // a freshly re-proven captured incarnation is signaled, never a reuse.
     for pid in escalation_targets(&members, |member| sweep.proven(member)) {
-        // SAFETY: one positive captured PID whose start time was just
-        // rechecked; ESRCH means it exited in between.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        // A captured PID whose start time was just rechecked; ESRCH means it
+        // exited in between.
+        let _ = signal_pid(pid, libc::SIGKILL);
     }
     let left = sweep.settle(&mut members, KILL_WAIT, libc::SIGKILL)?;
     if left.is_empty() {
         return Ok(root_signal);
     }
     Err(sweep.verdict(&members, left))
-}
-
-fn signal_result(result: libc::c_int) -> GroupSignal {
-    if result == 0 {
-        return GroupSignal::Sent;
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => GroupSignal::NotFound,
-        Some(libc::EPERM) => GroupSignal::PermissionDenied,
-        _ => GroupSignal::Other,
-    }
 }
 
 /// Parse one process from its stat line; None for a malformed line or one
@@ -2000,8 +1986,8 @@ mod tests {
     impl Drop for Stray {
         fn drop(&mut self) {
             if start_of(self.pid) == Some(self.start) {
-                // SAFETY: one positive PID this test spawned, just rechecked.
-                unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
+                // One PID this test spawned, just rechecked.
+                let _ = signal_pid(self.pid, libc::SIGKILL);
             }
         }
     }
@@ -2015,9 +2001,9 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            // SAFETY: `group` is a process group this test created with
+            // `group` is a process group this test created with
             // process_group(0); nothing else ever joins it.
-            unsafe { libc::killpg(self.group as libc::pid_t, libc::SIGKILL) };
+            let _ = signal_group(self.group, libc::SIGKILL);
             for child in &mut self.children {
                 let _ = child.kill();
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -2292,8 +2278,8 @@ mod tests {
             |pid| {
                 if pid == root && !ended {
                     ended = true;
-                    // SAFETY: the root shell this test spawned, still live.
-                    unsafe { libc::kill(root as libc::pid_t, libc::SIGKILL) };
+                    // The root shell this test spawned, still live.
+                    let _ = signal_pid(root, libc::SIGKILL);
                     let deadline = Instant::now() + Duration::from_secs(5);
                     // Reaped, not merely a zombie: a zombie keeps its
                     // identity and can still take a signal.
@@ -2358,8 +2344,8 @@ mod tests {
             |pid| {
                 if pid == root && !ended {
                     ended = true;
-                    // SAFETY: the root shell this test spawned, still live.
-                    unsafe { libc::kill(root as libc::pid_t, libc::SIGKILL) };
+                    // The root shell this test spawned, still live.
+                    let _ = signal_pid(root, libc::SIGKILL);
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while Path::new(&format!("/proc/{root}")).exists() {
                         assert!(Instant::now() < deadline, "root was never reaped");
@@ -2508,11 +2494,12 @@ mod tests {
 
     impl Drop for Forked {
         fn drop(&mut self) {
-            // SAFETY: our own forked child; waitpid reaps it after the kill.
-            unsafe {
-                libc::kill(self.0, libc::SIGKILL);
-                libc::waitpid(self.0, std::ptr::null_mut(), 0);
+            // Our own forked child; waitpid reaps it after the kill.
+            if let Ok(pid) = u32::try_from(self.0) {
+                let _ = signal_pid(pid, libc::SIGKILL);
             }
+            // SAFETY: waits for our own forked child; no status is read.
+            unsafe { libc::waitpid(self.0, std::ptr::null_mut(), 0) };
         }
     }
 
@@ -2796,8 +2783,8 @@ mod tests {
                 if pid != victim {
                     return Ok(());
                 }
-                // SAFETY: the test's own sleeper, still live.
-                unsafe { libc::kill(victim as libc::pid_t, libc::SIGKILL) };
+                // The test's own sleeper, still live.
+                let _ = signal_pid(victim, libc::SIGKILL);
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while observe(Path::new("/proc"), victim) != Seen::Gone {
                     assert!(Instant::now() < deadline, "victim never ended");
@@ -2888,8 +2875,8 @@ mod tests {
                 if pid != child {
                     return Ok(());
                 }
-                // SAFETY: this test's own child, still live.
-                unsafe { libc::kill(child as libc::pid_t, libc::SIGKILL) };
+                // This test's own child, still live.
+                let _ = signal_pid(child, libc::SIGKILL);
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while !exiting_now(child) && Instant::now() < deadline {
                     std::hint::spin_loop();
