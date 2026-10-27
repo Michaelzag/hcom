@@ -414,7 +414,7 @@ pub fn kill_tracked_instance(
 /// The self set is injectable so tests never need to signal their own seat.
 /// The hook runs after owner/root resolution and before native termination;
 /// tests use it to land incarnation changes or a refused termination.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn kill_tracked_instance_with_self_pids(
     db: &HcomDb,
     name: &str,

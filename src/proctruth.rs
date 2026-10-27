@@ -2073,7 +2073,7 @@ pub(crate) fn verify_kill_candidate(
             use crate::sys::process::{KillState, kill_state};
             match kill_state(pid) {
                 KillState::Gone => return Ok(()),
-                #[cfg(any(unix, test))]
+                #[cfg(unix)]
                 KillState::Exiting => return Ok(()),
                 KillState::Live | KillState::Unknown => {
                     return Err(KillError::Unconfirmed {

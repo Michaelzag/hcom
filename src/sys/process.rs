@@ -17,7 +17,7 @@ pub(crate) use super::kill_tree_linux::ProcState as KillState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KillState {
     Gone,
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     Exiting,
     Live,
     Unknown,
@@ -2532,5 +2532,108 @@ mod tests {
             !child_link_is_plausible(claimed_parent, bystander),
             "a process that predates the PID claiming it must not join the kill tree"
         );
+    }
+
+    /// SIGNAL-target test, not a survival claim (on Windows the shared broker
+    /// still ends with its launching seat's job, hcom#108): with the broker
+    /// marked ineligible, the verified tree walk never targets it or its
+    /// child, and still terminates the rest of the tree.
+    #[cfg(windows)]
+    #[test]
+    fn verified_windows_tree_never_targets_an_ineligible_broker_subtree() {
+        use std::time::{Duration, Instant};
+        // The broker stand-in and its child exit on their own (~11s), so this
+        // test never signals a process it did not spawn itself.
+        let mut root = Command::new("cmd")
+            .args([
+                "/D",
+                "/C",
+                "start /B cmd /D /C ping -n 12 127.0.0.2 >NUL & start /B ping -n 60 127.0.0.3 >NUL & ping -n 60 127.0.0.1 >NUL",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let root_pid = root.id();
+        let carries = |pid: u32, needle: &[u8]| {
+            crate::sys::process_args::command_line(pid)
+                .is_some_and(|argv| argv.windows(needle.len()).any(|part| part == needle))
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (broker, broker_child, normal) = loop {
+            let snapshot = snapshot_parents(false).expect("process snapshot");
+            let children = |parent: u32| {
+                snapshot
+                    .iter()
+                    .filter(|(_, entry)| entry.parent_pid == parent)
+                    .map(|(&pid, _)| pid)
+                    .collect::<Vec<_>>()
+            };
+            let below_root = children(root_pid);
+            let broker = below_root
+                .iter()
+                .copied()
+                .find(|&pid| carries(pid, b"127.0.0.2"));
+            let normal = below_root
+                .iter()
+                .copied()
+                .find(|&pid| carries(pid, b"127.0.0.3"));
+            if let (Some(broker), Some(normal)) = (broker, normal)
+                && let Some(&child) = children(broker).first()
+            {
+                break (broker, child, normal);
+            }
+            assert!(Instant::now() < deadline, "fixture tree never formed");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let broker_ticks = creation_ticks_win(broker).expect("broker creation time");
+        let child_ticks = creation_ticks_win(broker_child).expect("broker child creation time");
+        let root_ticks = creation_ticks_win(root_pid).expect("root creation time");
+
+        let mut captured = Vec::new();
+        let mut authorized = Vec::new();
+        let outcome = kill_tree_win_with_identity(
+            root_pid,
+            Some(root_ticks),
+            &mut captured,
+            &[],
+            &mut |pid| pid != broker,
+            &mut |pid| {
+                authorized.push(pid);
+                Ok(())
+            },
+        );
+        let broker_untouched = creation_ticks_win(broker) == Some(broker_ticks);
+        let child_untouched = creation_ticks_win(broker_child) == Some(child_ticks);
+        let _ = root.wait();
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            broker_untouched && child_untouched,
+            "the broker subtree was terminated"
+        );
+        for pid in [broker, broker_child] {
+            assert!(!authorized.contains(&pid), "PID {pid} was a signal target");
+            assert!(
+                !captured.iter().any(|&(captured, _)| captured == pid),
+                "PID {pid} was captured"
+            );
+        }
+        assert!(
+            authorized.contains(&normal),
+            "the rest of the tree was not targeted"
+        );
+        let gone = Instant::now() + Duration::from_secs(5);
+        while !is_definitely_dead(normal) {
+            assert!(Instant::now() < gone, "the non-broker child survived");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Let the broker stand-in finish by itself rather than signal it.
+        let settled = Instant::now() + Duration::from_secs(30);
+        while !(is_definitely_dead(broker) && is_definitely_dead(broker_child)) {
+            assert!(Instant::now() < settled, "the broker stand-in never exited");
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
