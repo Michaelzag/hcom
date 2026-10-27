@@ -25,7 +25,9 @@ use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::omp_owner::{CONFIG, db, full_state, isolated_hcom};
-use support::{Hcom, child_identity, terminate_owned_child, terminate_owned_child_group, unique_suffix};
+use support::{
+    Hcom, child_identity, terminate_owned_child, terminate_owned_child_group, unique_suffix,
+};
 
 fn launcher_id() -> String {
     uuid::Uuid::new_v4().to_string()

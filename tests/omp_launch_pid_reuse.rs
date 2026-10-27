@@ -310,7 +310,10 @@ impl PrivateCommand {
         if let Ok(entries) = fs::read_dir(&self.out) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_some_and(|extension| extension == "started") {
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "started")
+                {
                     let _ = fs::write(path.with_extension("exit"), "");
                 }
             }

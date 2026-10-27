@@ -23,7 +23,9 @@ fn fixture_drop_terminates_only_its_retained_child() {
         command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
         command
     };
-    let mut unowned = command.spawn().expect("spawn child not retained by fixture");
+    let mut unowned = command
+        .spawn()
+        .expect("spawn child not retained by fixture");
     let unowned_identity = support::child_identity(&unowned).expect("capture child birth identity");
     let pid = i64::from(h.spawn_cleanup_child(&mut command));
     assert!(
@@ -38,7 +40,10 @@ fn fixture_drop_terminates_only_its_retained_child() {
         "fixture drop must not terminate a child it doesn't retain"
     );
     assert!(
-        !unowned.wait().expect("reap separately owned child").success(),
+        !unowned
+            .wait()
+            .expect("reap separately owned child")
+            .success(),
         "explicit owned cleanup should terminate the child"
     );
     let deadline = Instant::now() + Duration::from_secs(7);
@@ -66,7 +71,9 @@ fn owned_cleanup_refuses_missing_or_mismatched_birth_identity() {
         command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
         command
     };
-    let mut child = command.spawn().expect("spawn identity-checked cleanup child");
+    let mut child = command
+        .spawn()
+        .expect("spawn identity-checked cleanup child");
     let identity = support::child_identity(&child).expect("capture child identity at spawn");
     support::terminate_owned_child(&mut child, None);
     let survived_missing = child.try_wait().expect("poll owned child").is_none();
@@ -74,7 +81,10 @@ fn owned_cleanup_refuses_missing_or_mismatched_birth_identity() {
     let survived_mismatch = child.try_wait().expect("poll owned child").is_none();
     support::terminate_owned_child_group(&mut child, Some(&identity));
     assert!(survived_missing, "cleanup acted without a birth identity");
-    assert!(survived_mismatch, "cleanup acted on a mismatched birth identity");
+    assert!(
+        survived_mismatch,
+        "cleanup acted on a mismatched birth identity"
+    );
     assert!(!child.wait().expect("reap owned cleanup child").success());
     // A retained but already-reaped Child must never send another signal.
     support::terminate_owned_child_group(&mut child, Some(&identity));

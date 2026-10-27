@@ -325,7 +325,11 @@ impl NativeOwner {
                 "cmd fixture must retain a distinct shim PID"
             );
         } else {
-            assert_eq!(pid, owner.child.id(), "fixture must be the actual Node process");
+            assert_eq!(
+                pid,
+                owner.child.id(),
+                "fixture must be the actual Node process"
+            );
         }
         owner.pid = pid;
         owner
@@ -1224,7 +1228,6 @@ fn alive(pid: i64) -> bool {
     }
 }
 
-
 fn row_pid(h: &Hcom, name: &str) -> Option<i64> {
     db(h)
         .query_row("SELECT pid FROM instances WHERE name=?1", [name], |row| {
@@ -1794,7 +1797,9 @@ impl PrivateCommand {
     fn spawn(h: &Hcom, label: &str, mut command: std::process::Command) -> Self {
         let stdout = h.root_path().join(format!("{label}.stdout"));
         let stderr = h.root_path().join(format!("{label}.stderr"));
-        let exit_gate = h.root_path().join(format!("{label}-{}.exit", uuid::Uuid::new_v4()));
+        let exit_gate = h
+            .root_path()
+            .join(format!("{label}-{}.exit", uuid::Uuid::new_v4()));
         h.set_launch_env("TEST_LAUNCH_EXIT", exit_gate.to_str().unwrap());
         command
             .env("TEST_LAUNCH_EXIT", &exit_gate)
@@ -1842,7 +1847,11 @@ impl PrivateCommand {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .unwrap();
-            assert_eq!(existing, (0, 0, 0), "C1 seed must not overwrite current state");
+            assert_eq!(
+                existing,
+                (0, 0, 0),
+                "C1 seed must not overwrite current state"
+            );
             conn.execute(
                 "INSERT INTO instances
                     (name,tool,session_id,pid,status,status_context,created_at,directory,
@@ -2142,11 +2151,14 @@ fn first_tool(h: &Hcom, name: &str, out: &Path, launch: &mut PrivateCommand) -> 
                     .expect("anchor receipt must retain the live CMD incarnation");
                 assert_eq!(
                     launch.identity.as_deref(),
-                    Some(format!(
-                        "{}:{}",
-                        native.created_ticks >> 32,
-                        native.created_ticks & u64::from(u32::MAX),
-                    ).as_str()),
+                    Some(
+                        format!(
+                            "{}:{}",
+                            native.created_ticks >> 32,
+                            native.created_ticks & u64::from(u32::MAX),
+                        )
+                        .as_str()
+                    ),
                     "anchor receipt birth must match the original owned Child HANDLE"
                 );
                 let state: (String, String, i64, i64, i64) = db(h)
@@ -2158,7 +2170,15 @@ fn first_tool(h: &Hcom, name: &str, out: &Path, launch: &mut PrivateCommand) -> 
                             (SELECT COUNT(*) FROM process_bindings WHERE instance_name=?1)
                          FROM instances WHERE name=?1",
                         rusqlite::params![name, tool.launcher_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
                     )
                     .unwrap();
                 assert_eq!(
@@ -2918,7 +2938,15 @@ fn native_windows_background_pre_hook_crash_recovers_then_resume_binds() {
                             (SELECT COUNT(*) FROM session_bindings WHERE instance_name=?1)
                          FROM instances WHERE name=?1",
                         rusqlite::params![name, c1.launcher_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
                     )
                     .ok()?;
                 (state.0 == "listening" && state.1 == "start").then_some(state)
@@ -2942,7 +2970,10 @@ fn native_windows_background_pre_hook_crash_recovers_then_resume_binds() {
                 no_first_hook && no_hook_after_death && !first_bound,
                 "real background C1 bound before its hook gate"
             );
-            assert!(first_exited, "real background C1 did not die: {first_result:?}");
+            assert!(
+                first_exited,
+                "real background C1 did not die: {first_result:?}"
+            );
             let retained = first
                 .background
                 .as_ref()
@@ -2953,8 +2984,15 @@ fn native_windows_background_pre_hook_crash_recovers_then_resume_binds() {
                 .expect("keep the dead native pin HANDLE through recovery");
             assert!(retained.definitely_exited());
             assert_eq!(receipt["pid"].as_i64(), Some(pin));
-            assert_eq!(receipt["identity"].as_str(), Some(retained.identity.as_str()));
-            assert_eq!(row_pid(&h, &name), Some(pin), "crash fixture lost its recorded pin");
+            assert_eq!(
+                receipt["identity"].as_str(),
+                Some(retained.identity.as_str())
+            );
+            assert_eq!(
+                row_pid(&h, &name),
+                Some(pin),
+                "crash fixture lost its recorded pin"
+            );
 
             sentinel = Sentinel::spawn(&h, runtime);
             let before = sentinel.beats();
@@ -2985,30 +3023,40 @@ fn native_windows_background_pre_hook_crash_recovers_then_resume_binds() {
                 let same_dead_pin = || {
                     retained.definitely_exited()
                         && receipt["identity"].as_str() == Some(retained.identity.as_str())
-                        && first.background.as_ref().unwrap().processes.iter()
+                        && first
+                            .background
+                            .as_ref()
+                            .unwrap()
+                            .processes
+                            .iter()
                             .all(WindowsOwnedProcess::definitely_exited)
                         && row_pid(&h, &name) == Some(pin)
                         && launch_receipt(&h, &name).as_ref() == Some(&receipt)
-                        && db(&h).query_row(
-                            "SELECT created_at FROM instances WHERE name=?1 AND pid=?2
+                        && db(&h)
+                            .query_row(
+                                "SELECT created_at FROM instances WHERE name=?1 AND pid=?2
                                 AND session_id=?3 AND tool='omp'
                                 AND COALESCE(origin_device_id,'')=''",
-                            rusqlite::params![name, pin, sid],
-                            |row| row.get::<_, f64>(0),
-                        ).ok().is_some_and(|created_at| {
-                            receipt["created_at_bits"].as_str()
-                                == Some(format!("{:016x}", created_at.to_bits()).as_str())
-                        })
+                                rusqlite::params![name, pin, sid],
+                                |row| row.get::<_, f64>(0),
+                            )
+                            .ok()
+                            .is_some_and(|created_at| {
+                                receipt["created_at_bits"].as_str()
+                                    == Some(format!("{:016x}", created_at.to_bits()).as_str())
+                            })
                 };
                 let bookkeeping = || -> (i64, i64, i64, i64) {
-                    db(&h).query_row(
-                        "SELECT (SELECT COUNT(*) FROM instances WHERE name=?1),
+                    db(&h)
+                        .query_row(
+                            "SELECT (SELECT COUNT(*) FROM instances WHERE name=?1),
                             (SELECT COUNT(*) FROM process_bindings WHERE instance_name=?1),
                             (SELECT COUNT(*) FROM session_bindings WHERE instance_name=?1),
                             (SELECT COUNT(*) FROM notify_endpoints WHERE instance=?1)",
-                        [&name],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    ).unwrap()
+                            [&name],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        )
+                        .unwrap()
                 };
                 let before_recovery = full_state(&h);
                 assert!(
@@ -3018,7 +3066,9 @@ fn native_windows_background_pre_hook_crash_recovers_then_resume_binds() {
                 );
                 let before = sentinel.beats();
                 recovery = Some(PrivateCommand::start(
-                    &h, "background-stop", &["stop", &name],
+                    &h,
+                    "background-stop",
+                    &["stop", &name],
                 ));
                 let stopped = recovery.as_mut().unwrap().finish(&h);
                 let stop_bookkeeping = bookkeeping();
@@ -3036,7 +3086,9 @@ fn native_windows_background_pre_hook_crash_recovers_then_resume_binds() {
                     if same_dead_pin() {
                         let before = sentinel.beats();
                         kill_recovery = Some(PrivateCommand::start(
-                            &h, "background-kill", &["kill", &name],
+                            &h,
+                            "background-kill",
+                            &["kill", &name],
                         ));
                         killed = Some(kill_recovery.as_mut().unwrap().finish(&h));
                         kill_bookkeeping = Some(bookkeeping());
@@ -3056,16 +3108,16 @@ fn native_windows_background_pre_hook_crash_recovers_then_resume_binds() {
                      user-flow failures={user_flow_failures:?}"
                 );
                 if stop_untouched != (true, true, String::new())
-                    || kill_untouched.as_ref().is_some_and(|observation| {
-                        observation != &(true, true, String::new())
-                    })
+                    || kill_untouched
+                        .as_ref()
+                        .is_some_and(|observation| observation != &(true, true, String::new()))
                 {
                     user_flow_failures.push(
-                        "named crash recovery disturbed the unrelated native sentinel".to_string()
+                        "named crash recovery disturbed the unrelated native sentinel".to_string(),
                     );
                 }
-                let cleared = stop_bookkeeping == (0, 0, 0, 0)
-                    || kill_bookkeeping == Some((0, 0, 0, 0));
+                let cleared =
+                    stop_bookkeeping == (0, 0, 0, 0) || kill_bookkeeping == Some((0, 0, 0, 0));
                 assert!(
                     cleared,
                     "{}: retry={refused:?}; stop={stopped:?}; \
@@ -3083,10 +3135,15 @@ fn native_windows_background_pre_hook_crash_recovers_then_resume_binds() {
                     })
                 {
                     user_flow_failures.push(
-                        "recovery cleared bookkeeping but returned a failing CLI status".to_string()
+                        "recovery cleared bookkeeping but returned a failing CLI status"
+                            .to_string(),
                     );
                 }
-                third = Some(PrivateCommand::resume(&h, "background-after-recovery", &name));
+                third = Some(PrivateCommand::resume(
+                    &h,
+                    "background-after-recovery",
+                    &name,
+                ));
                 let third = third.as_mut().unwrap();
                 let c3 = wait_for_tool(&h, &out, third, Some(c1.pid));
                 let binding = bind_second(&h, &name, &sid, &out, c3.as_ref(), third);
@@ -3110,20 +3167,26 @@ fn native_windows_background_pre_hook_crash_recovers_then_resume_binds() {
             drop(sentinel);
             drop(workspace);
             assert_eq!(
-                retry_untouched, (true, true, String::new()),
+                retry_untouched,
+                (true, true, String::new()),
                 "ordinary retry disturbed the unrelated native sentinel"
             );
             assert_binding(&binding, tool.as_ref(), &name, &sid, &launch_result);
-            assert!(backend_ready, "recovered background backend was not ready: {launch_result:?}");
+            assert!(
+                backend_ready,
+                "recovered background backend was not ready: {launch_result:?}"
+            );
             assert_ne!(tool.as_ref().unwrap().pid, c1.pid);
             assert_eq!(tool.as_ref().unwrap().home, c1.home);
             assert_eq!(tool.as_ref().unwrap().hcom_dir, c1.hcom_dir);
             assert_eq!(
-                final_untouched, (true, true, String::new()),
+                final_untouched,
+                (true, true, String::new()),
                 "recovered resume disturbed the unrelated native sentinel"
             );
             assert!(
-                user_flow_failures.is_empty(), "{}",
+                user_flow_failures.is_empty(),
+                "{}",
                 user_flow_failures.join("\n")
             );
         });

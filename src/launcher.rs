@@ -3317,9 +3317,11 @@ mod tests {
         assert!(!strip.contains("TERM"));
     }
 
+    type EnvironmentEntries<'a> = &'a [(&'a str, &'a str)];
+
     #[test]
     fn test_contaminated_parent_detection() {
-        let cases: &[(&[(&str, &str)], bool, bool)] = &[
+        let cases: &[(EnvironmentEntries<'_>, bool, bool)] = &[
             (&[], false, false),
             (&[], true, true),
             (&[("CI", "")], false, true),
@@ -3352,17 +3354,13 @@ mod tests {
         use crate::shared::context::HcomContext;
         use crate::tool::Tool;
 
-        let cases: &[(&[(&str, &str)], Tool, bool)] = &[
+        let cases: &[(EnvironmentEntries<'_>, Tool, bool)] = &[
             (&[], Tool::Adhoc, false),
             (&[("CLAUDECODE", "1")], Tool::Claude, true),
             (&[("CODEX_THREAD_ID", "thread")], Tool::Codex, true),
             (&[("HCOM_OMP", "1")], Tool::Omp, true),
             (&[("OMPCODE", "1")], Tool::Omp, true),
-            (
-                &[("OMPCODE", "1"), ("CLAUDECODE", "1")],
-                Tool::Omp,
-                true,
-            ),
+            (&[("OMPCODE", "1"), ("CLAUDECODE", "1")], Tool::Omp, true),
             (&[("HCOM_LAUNCHED", "1")], Tool::Adhoc, true),
             (&[("HCOM_LAUNCHED", "true")], Tool::Adhoc, false),
         ];
