@@ -577,7 +577,7 @@ fn ensure_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<()> {
                 }
                 bail!("Cannot resume local row '{name}': {e}");
             }
-            None => bail!("{}", still_active_message(name, inst.pid)),
+            None => bail!("{}", still_active_message(name)),
         }
     }
     // Process truth gates the spawn: even with the row stopped, a
@@ -616,9 +616,9 @@ fn preview_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<Option<Pendi
                         orphans,
                     });
                 }
-                _ => bail!("{}", still_active_message(name, row.pid)),
+                _ => bail!("{}", still_active_message(name)),
             },
-            None => bail!("{}", still_active_message(name, None)),
+            None => bail!("{}", still_active_message(name)),
         }
     }
     if !fork && let Err(refusal) = crate::proctruth::check_spawn_allowed(db, name) {
@@ -628,15 +628,13 @@ fn preview_resumable(db: &HcomDb, name: &str, fork: bool) -> Result<Option<Pendi
 }
 
 /// The refusal a live (or undeterminable) row gets on every resume path.
-fn still_active_message(name: &str, pid: Option<i64>) -> String {
-    if pid
-        .and_then(|pid| u32::try_from(pid).ok())
-        .is_some_and(|pid| pid > 0 && !crate::proctruth::process_gone(pid))
-    {
-        format!("'{name}' is still active — run hcom kill {name} first")
-    } else {
-        format!("'{name}' is still active or its ownership is undetermined; resume refused")
-    }
+/// The caller has already refused, so the text always names the supported
+/// recovery: stop the row, then retry the resume.
+fn still_active_message(name: &str) -> String {
+    format!(
+        "'{name}' is still active or its ownership is undetermined; resume refused. \
+         Run 'hcom stop {name}' first, then retry 'hcom r {name}'."
+    )
 }
 
 /// `preview` is the AI-tool preview path (`hcom r` without `--go`): the plan
@@ -6315,6 +6313,131 @@ mod tests {
         assert_eq!(db.process_binding_ids(&name).unwrap(), bindings);
         assert_eq!(orphan_fixtures::stopped_events(&db, &name).len(), 1);
         assert!(seat.alive(seat.holder) && seat.alive(seat.carrier));
+    }
+
+    /// On Windows the carrier classifier has no process table to read, so a
+    /// listening omp row is Undetermined whether its pid is missing or still
+    /// names a running process. Both resume gates must keep refusing without
+    /// touching anything, and the refusal must still name the supported way
+    /// out: stop the row, then retry the resume.
+    #[test]
+    #[cfg(windows)]
+    #[serial_test::serial]
+    fn undetermined_windows_row_refusal_names_stop_then_retry() {
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let name = "wren";
+        for pid in [None, Some(i64::from(std::process::id()))] {
+            let db = test_db();
+            let mut data = serde_json::Map::new();
+            data.insert("tool".into(), json!("omp"));
+            data.insert("status".into(), json!("listening"));
+            data.insert("session_id".into(), json!("wren-session"));
+            data.insert("created_at".into(), json!(1.0));
+            data.insert("background".into(), json!(1));
+            if let Some(pid) = pid {
+                data.insert("pid".into(), json!(pid));
+            }
+            db.save_instance_named(name, &data).unwrap();
+            db.set_process_binding("wren-proc", "", name).unwrap();
+
+            let row_state = || format!("{:?}", db.get_instance_full(name).unwrap());
+            let binding_state = || {
+                let mut stmt = db
+                    .conn()
+                    .prepare(
+                        "SELECT process_id, session_id, instance_name, updated_at \
+                         FROM process_bindings ORDER BY process_id",
+                    )
+                    .unwrap();
+                stmt.query_map([], |r| {
+                    Ok(format!(
+                        "{:?}",
+                        (
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, f64>(3)?,
+                        )
+                    ))
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>()
+            };
+            let event_count = || {
+                db.conn()
+                    .query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0))
+                    .unwrap()
+            };
+            let stopped_count = || {
+                db.conn()
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE type='life' AND instance=? \
+                         AND json_extract(data, '$.action') = 'stopped'",
+                        rusqlite::params![name],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap()
+            };
+            let row_before = row_state();
+            let bindings_before = binding_state();
+            let events_before = event_count();
+            assert!(
+                row_before.contains("wren-session"),
+                "seeded row: {row_before}"
+            );
+            assert_eq!(
+                bindings_before.len(),
+                1,
+                "seeded binding: {bindings_before:?}"
+            );
+
+            let refusals = [
+                (
+                    "ensure_resumable",
+                    ensure_resumable(&db, name, false)
+                        .err()
+                        .map(|e| e.to_string()),
+                ),
+                (
+                    "preview_resumable",
+                    preview_resumable(&db, name, false)
+                        .err()
+                        .map(|e| e.to_string()),
+                ),
+            ];
+            for (gate, err) in refusals {
+                let err = err.unwrap_or_else(|| {
+                    panic!("{gate} must refuse an undetermined row (pid {pid:?})")
+                });
+                let stop = err
+                    .find(&format!("hcom stop {name}"))
+                    .unwrap_or_else(|| panic!("{gate} (pid {pid:?}) names no stop: {err}"));
+                let retry = err
+                    .find(&format!("hcom r {name}"))
+                    .unwrap_or_else(|| panic!("{gate} (pid {pid:?}) names no retry: {err}"));
+                assert!(
+                    stop < retry,
+                    "{gate} (pid {pid:?}) must stop before retry: {err}"
+                );
+                assert_eq!(
+                    row_state(),
+                    row_before,
+                    "{gate} (pid {pid:?}) changed the row"
+                );
+                assert_eq!(
+                    binding_state(),
+                    bindings_before,
+                    "{gate} (pid {pid:?}) changed the bindings"
+                );
+                assert_eq!(
+                    event_count(),
+                    events_before,
+                    "{gate} (pid {pid:?}) wrote events"
+                );
+                assert_eq!(stopped_count(), 0, "{gate} (pid {pid:?}) stopped the row");
+            }
+        }
     }
 
     // ── fleet-wide bare-name resolution ─────────────────────────────────

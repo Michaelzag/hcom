@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
 use crate::db::HcomDb;
 use crate::hooks::common::PostCommit;
 use crate::log::{log_error, log_info, log_warn};
@@ -50,9 +49,9 @@ pub(crate) fn refresh_binding(
     process_id: &str,
     current_name: &mut String,
     shared_name: &Option<Arc<std::sync::RwLock<String>>>,
-) {
+) -> bool {
     if process_id.is_empty() {
-        return;
+        return false;
     }
     match db.get_process_binding(process_id) {
         Ok(Some(new_name)) if new_name != *current_name => {
@@ -61,13 +60,6 @@ pub(crate) fn refresh_binding(
                 "delivery.binding_refresh",
                 &format!("Instance name changed: {} -> {}", current_name, new_name),
             );
-            if let Err(e) = db.migrate_notify_endpoints(current_name, &new_name) {
-                log_warn(
-                    "native",
-                    "delivery.migrate_endpoints_fail",
-                    &format!("{}", e),
-                );
-            }
             if let Err(e) = db.update_tcp_mode(&new_name, true) {
                 log_warn("native", "delivery.update_tcp_mode_fail", &format!("{}", e));
             }
@@ -77,14 +69,16 @@ pub(crate) fn refresh_binding(
                 *s = full_display_name(db, &new_name);
             }
             *current_name = new_name;
+            true
         }
-        Ok(_) => {}
+        Ok(_) => false,
         Err(e) => {
             log_error(
                 "native",
                 "delivery.binding_refresh",
                 &format!("DB error checking process binding: {}", e),
             );
+            false
         }
     }
 }
@@ -212,7 +206,7 @@ struct TitleRefresh<'a> {
 }
 /// Refresh OSC title state and push a matching label to terminals that expose
 /// a programmatic label API (currently only herdr).
-fn refresh_title_state(args: TitleRefresh<'_>) {
+fn refresh_title_state(args: TitleRefresh<'_>) -> bool {
     let TitleRefresh {
         db,
         process_id,
@@ -226,11 +220,12 @@ fn refresh_title_state(args: TitleRefresh<'_>) {
         tool,
         host_label,
     } = args;
-    refresh_binding(db, process_id, current_name, shared_name);
+    let name_changed = refresh_binding(db, process_id, current_name, shared_name);
     refresh_status_and_wake(db, current_name, current_status, shared_status, title_wake);
     refresh_display_name(db, current_name, shared_name);
     refresh_title_text(db, current_name, shared_purpose, shared_current, title_wake);
     host_label.sync(db, current_name, current_status, tool);
+    name_changed
 }
 
 /// Mirror the OSC 1/2 title into the terminal's own label API for terminals
@@ -1617,6 +1612,8 @@ pub fn run_delivery_loop(
     notify: &NotifyServer,
     state: &DeliveryState,
     instance_name: &str,
+    process_id: &str,
+    mut endpoint_created_at: Option<f64>,
     config: &ToolConfig,
     shared_name: Option<Arc<std::sync::RwLock<String>>>,
     shared_status: Option<Arc<std::sync::RwLock<String>>>,
@@ -1627,9 +1624,8 @@ pub fn run_delivery_loop(
     // Resolve authoritative instance name from process binding.
     // The instance_name parameter is a fallback - the binding is the source of truth
     // because it can change (e.g., Claude session resume switches to canonical instance).
-    let process_id = Config::get().process_id.unwrap_or_default();
     let mut current_name = if !process_id.is_empty() {
-        match db.get_process_binding(&process_id) {
+        match db.get_process_binding(process_id) {
             Ok(Some(name)) => name,
             Ok(None) => instance_name.to_string(),
             Err(e) => {
@@ -1647,6 +1643,22 @@ pub fn run_delivery_loop(
     } else {
         instance_name.to_string()
     };
+    if current_name != instance_name {
+        endpoint_created_at = None;
+        if let Err(e) = db.refresh_pty_endpoints(
+            &current_name,
+            process_id,
+            &mut endpoint_created_at,
+            notify.port(),
+            state.inject_port,
+        ) {
+            log_warn(
+                "native",
+                "delivery.register_endpoints_fail",
+                &format!("{e}"),
+            );
+        }
+    }
 
     log_info(
         "native",
@@ -1721,9 +1733,9 @@ pub fn run_delivery_loop(
         let mut current_status = ST_LISTENING.to_string();
 
         while running.load(Ordering::Acquire) {
-            refresh_title_state(TitleRefresh {
+            if refresh_title_state(TitleRefresh {
                 db,
-                process_id: &process_id,
+                process_id,
                 current_name: &mut current_name,
                 current_status: &mut current_status,
                 shared_name: &shared_name,
@@ -1733,7 +1745,22 @@ pub fn run_delivery_loop(
                 title_wake: &title_wake,
                 tool: &config.tool,
                 host_label: &mut host_label,
-            });
+            }) {
+                endpoint_created_at = None;
+                if let Err(e) = db.refresh_pty_endpoints(
+                    &current_name,
+                    process_id,
+                    &mut endpoint_created_at,
+                    notify.port(),
+                    state.inject_port,
+                ) {
+                    log_warn(
+                        "native",
+                        "delivery.register_endpoints_fail",
+                        &format!("{e}"),
+                    );
+                }
+            }
             drive_launch_outcome(
                 db,
                 state,
@@ -1793,11 +1820,18 @@ pub fn run_delivery_loop(
             if let Err(e) = db.update_heartbeat(&current_name) {
                 log_warn("native", "delivery.heartbeat_fail", &format!("{}", e));
             }
-            if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
-                log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
-            }
-            if let Err(e) = db.register_inject_port(&current_name, state.inject_port) {
-                log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
+            if let Err(e) = db.refresh_pty_endpoints(
+                &current_name,
+                process_id,
+                &mut endpoint_created_at,
+                notify.port(),
+                state.inject_port,
+            ) {
+                log_warn(
+                    "native",
+                    "delivery.register_endpoints_fail",
+                    &format!("{e}"),
+                );
             }
         }
     } else {
@@ -1814,15 +1848,14 @@ pub fn run_delivery_loop(
         // Gate block tracking for TUI status updates
         let mut block_since: Option<Instant> = None;
         let mut last_block_context: String = String::new();
-        let mut endpoints_name = String::new();
 
         // Status tracking for terminal title updates
         let mut current_status = ST_LISTENING.to_string();
 
         while running.load(Ordering::Acquire) {
-            refresh_title_state(TitleRefresh {
+            if refresh_title_state(TitleRefresh {
                 db,
-                process_id: &process_id,
+                process_id,
                 current_name: &mut current_name,
                 current_status: &mut current_status,
                 shared_name: &shared_name,
@@ -1832,7 +1865,22 @@ pub fn run_delivery_loop(
                 title_wake: &title_wake,
                 tool: &config.tool,
                 host_label: &mut host_label,
-            });
+            }) {
+                endpoint_created_at = None;
+                if let Err(e) = db.refresh_pty_endpoints(
+                    &current_name,
+                    process_id,
+                    &mut endpoint_created_at,
+                    notify.port(),
+                    state.inject_port,
+                ) {
+                    log_warn(
+                        "native",
+                        "delivery.register_endpoints_fail",
+                        &format!("{e}"),
+                    );
+                }
+            }
             drive_launch_outcome(
                 db,
                 state,
@@ -1850,24 +1898,9 @@ pub fn run_delivery_loop(
                     // Recheck launch readiness promptly while the TUI is still
                     // painting its initial screen. Some tools can start the
                     // delivery loop just before their input prompt appears.
-                    // Session switches create a new identity before it has endpoints.
-                    if endpoints_name != current_name {
-                        match db.refresh_pty_endpoints(
-                            &current_name,
-                            notify.port(),
-                            state.inject_port,
-                        ) {
-                            Ok(()) => endpoints_name = current_name.clone(),
-                            Err(e) => log_warn(
-                                "native",
-                                "delivery.register_endpoints_fail",
-                                &format!("{e}"),
-                            ),
-                        }
-                    }
                     // SessionEnd can wake us before SessionStart binds the new name.
                     let unbound = !process_id.is_empty()
-                        && matches!(db.get_process_binding(&process_id), Ok(None));
+                        && matches!(db.get_process_binding(process_id), Ok(None));
                     let idle_wait = if unbound
                         || matches!(
                             launch_outcome,
@@ -1913,12 +1946,19 @@ pub fn run_delivery_loop(
                             &format!("Failed to update heartbeat: {}", e),
                         );
                     }
-                    // Re-register endpoints (self-heals after DB reset/instance recreation)
-                    if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
-                        log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
-                    }
-                    if let Err(e) = db.register_inject_port(&current_name, state.inject_port) {
-                        log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
+                    // Refresh only the held incarnation or a verified own rebind.
+                    if let Err(e) = db.refresh_pty_endpoints(
+                        &current_name,
+                        process_id,
+                        &mut endpoint_created_at,
+                        notify.port(),
+                        state.inject_port,
+                    ) {
+                        log_warn(
+                            "native",
+                            "delivery.register_endpoints_fail",
+                            &format!("{e}"),
+                        );
                     }
 
                     // Check for pending messages
@@ -2538,11 +2578,18 @@ pub fn run_delivery_loop(
                             &format!("Failed to update heartbeat: {}", e),
                         );
                     }
-                    if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
-                        log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
-                    }
-                    if let Err(e) = db.register_inject_port(&current_name, state.inject_port) {
-                        log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
+                    if let Err(e) = db.refresh_pty_endpoints(
+                        &current_name,
+                        process_id,
+                        &mut endpoint_created_at,
+                        notify.port(),
+                        state.inject_port,
+                    ) {
+                        log_warn(
+                            "native",
+                            "delivery.register_endpoints_fail",
+                            &format!("{e}"),
+                        );
                     }
 
                     let current_cursor = db.get_cursor(&current_name);
@@ -2592,15 +2639,15 @@ pub fn run_delivery_loop(
     let owns_instance = if process_id.is_empty() {
         true
     } else {
-        matches!(db.get_process_binding(&process_id), Ok(Some(b)) if b == current_name)
+        matches!(db.get_process_binding(process_id), Ok(Some(b)) if b == current_name)
     };
     if matches!(
         Tool::from_str(&config.tool),
         Ok(Tool::Antigravity | Tool::Omp)
     ) {
-        antigravity::cleanup_antigravity_pty_exit(db, &current_name, &process_id, owns_instance);
+        antigravity::cleanup_antigravity_pty_exit(db, &current_name, process_id, owns_instance);
     } else {
-        cleanup_pty_exit_default(db, &current_name, &process_id, owns_instance);
+        cleanup_pty_exit_default(db, &current_name, process_id, owns_instance);
     }
 }
 
@@ -2947,6 +2994,137 @@ fn cleanup_pty_exit_default(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_publication_follows_different_and_same_name_own_bindings() {
+        for (target, expected_name_change) in [("beta", true), ("alpha", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+            db.init_db().unwrap();
+            db.conn()
+                .execute_batch(
+                    "INSERT INTO instances (name, tool, created_at, session_id) VALUES
+                       ('alpha', 'omp', 1, 'session-one'),
+                       ('spare', 'omp', 4, 'session-spare');
+                     INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES
+                       ('spare', 'pty', 44001, 41),
+                       ('spare', 'inject', 44002, 42),
+                       ('spare', 'plugin', 44003, 43);",
+                )
+                .unwrap();
+            db.set_process_binding("process-p", "session-one", "alpha")
+                .unwrap();
+            db.set_process_binding("process-r", "session-spare", "spare")
+                .unwrap();
+            let mut current_name = "alpha".to_string();
+            let mut endpoint_created_at = None;
+            db.refresh_pty_endpoints(
+                &current_name,
+                "process-p",
+                &mut endpoint_created_at,
+                41001,
+                41002,
+            )
+            .unwrap();
+
+            db.with_immediate_transaction(|tx| {
+                tx.execute_batch(
+                    "DELETE FROM instances WHERE name = 'alpha';
+                     DELETE FROM process_bindings WHERE instance_name = 'alpha';
+                     DELETE FROM notify_endpoints WHERE instance = 'alpha';",
+                )?;
+                if expected_name_change {
+                    // The old name now belongs to Q, not to the moving PTY.
+                    tx.execute_batch(
+                        "INSERT INTO instances (name, tool, created_at, session_id)
+                           VALUES ('alpha', 'omp', 2, 'session-other');
+                         INSERT INTO process_bindings
+                           (process_id, session_id, instance_name, updated_at)
+                           VALUES ('process-q', 'session-other', 'alpha', 20);
+                         INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES
+                           ('alpha', 'pty', 42001, 21),
+                           ('alpha', 'inject', 42002, 22),
+                           ('alpha', 'plugin', 42003, 23);",
+                    )?;
+                }
+                // A same-name self-registration also replaces the row and
+                // installs its own binding in this one transaction.
+                tx.execute(
+                    "INSERT INTO instances (name, tool, created_at, session_id)
+                     VALUES (?1, 'omp', 3, 'session-new')",
+                    rusqlite::params![target],
+                )?;
+                tx.execute(
+                    "INSERT INTO process_bindings
+                       (process_id, session_id, instance_name, updated_at)
+                     VALUES ('process-p', 'session-new', ?1, 30)",
+                    rusqlite::params![target],
+                )?;
+                tx.execute(
+                    "INSERT INTO notify_endpoints (instance, kind, port, updated_at)
+                     VALUES (?1, 'plugin', 43003, 33)",
+                    rusqlite::params![target],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            let untouched_endpoint_rows = || {
+                db.conn()
+                    .prepare(
+                        "SELECT instance, kind, port, updated_at FROM notify_endpoints
+                         WHERE instance != ?1 ORDER BY instance, kind",
+                    )
+                    .unwrap()
+                    .query_map(rusqlite::params![target], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, f64>(3)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let untouched_endpoints = untouched_endpoint_rows();
+
+            let name_changed = refresh_binding(&db, "process-p", &mut current_name, &None);
+            assert_eq!(name_changed, expected_name_change);
+            if name_changed {
+                endpoint_created_at = None;
+            }
+            db.refresh_pty_endpoints(
+                &current_name,
+                "process-p",
+                &mut endpoint_created_at,
+                45001,
+                45002,
+            )
+            .unwrap();
+
+            assert_eq!(current_name, target);
+            assert_eq!(
+                db.notify_endpoint_ports(target).unwrap(),
+                vec![
+                    ("inject".to_string(), 45002),
+                    ("plugin".to_string(), 43003),
+                    ("pty".to_string(), 45001),
+                ]
+            );
+            assert_eq!(untouched_endpoint_rows(), untouched_endpoints);
+            assert_eq!(
+                db.get_process_binding_full("process-p").unwrap(),
+                Some((Some("session-new".to_string()), target.to_string()))
+            );
+            if expected_name_change {
+                assert_eq!(
+                    db.get_process_binding_full("process-q").unwrap(),
+                    Some((Some("session-other".to_string()), "alpha".to_string()))
+                );
+            }
+        }
+    }
 
     /// Helper: create DeliveryState with given screen state
     fn make_state(screen: ScreenState, cooldown_ms: u64) -> DeliveryState {

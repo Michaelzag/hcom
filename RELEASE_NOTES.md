@@ -126,3 +126,13 @@ exclusions on Windows and macOS remains an effective soft stop: the row goes
 inactive, its own process binding is kept, and the canonical session binding
 and notify endpoints are cleared, so the same owner resumes normally. Linux
 keeps the full release. There is no native reaper port.
+
+The `still active or its ownership is undetermined` resume refusal now names
+`hcom stop <name>` followed by `hcom r <name>`, even when the recorded pid is
+gone or missing. The conservative refusal and its no-mutation behavior are
+unchanged.
+
+Delivery publishes PTY wake and inject endpoints atomically under the current
+row incarnation. Late refreshes cannot recreate endpoints after the row is
+removed or overwrite another owner's replacement. Binding-verified name changes
+and same-name re-registration still work.
