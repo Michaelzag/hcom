@@ -342,6 +342,173 @@ fn run_step(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Signalling processes. This test signals its own direct children, only
+// before it reaps them, so their PIDs cannot pass to anyone else; or, on
+// Linux, a launched process it pinned with a pidfd first and then proved,
+// through that pin, to be this fixture's, and only through the pin. It never
+// signals a bare PID it did not spawn.
+// ---------------------------------------------------------------------------
+
+/// A process's start time as its kernel records it: clock ticks since boot
+/// on Linux, microseconds since the epoch on macOS. Read by PID, so it is
+/// proof only for a process whose PID cannot pass to anyone else meanwhile:
+/// this test's own unreaped child.
+#[cfg(target_os = "linux")]
+fn start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 2..]
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "macos")]
+fn start_time(pid: u32) -> Option<u64> {
+    bsd_info(pid).map(|info| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (read == size && info.pbi_pid == pid).then_some(info)
+}
+
+/// Whether `child`, this test's own direct child, is provably still itself:
+/// not reaped (waitid with WNOWAIT still finds it, running or exited) and
+/// started at `birth`, read at spawn. Only such a child is signalled, and
+/// while it stays unreaped its PID cannot pass to anyone else.
+#[cfg(unix)]
+fn still_owned(child: &std::process::Child, birth: Option<u64>) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let unreaped = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } == 0;
+    unreaped && birth.is_some() && start_time(child.id()) == birth
+}
+
+/// Send `signal` to `child` alone, once it is [`still_owned`].
+#[cfg(target_os = "linux")]
+fn signal_owned_child(
+    child: &std::process::Child,
+    birth: Option<u64>,
+    signal: libc::c_int,
+) -> bool {
+    still_owned(child, birth) && unsafe { libc::kill(child.id() as libc::pid_t, signal) } == 0
+}
+
+/// Send `signal` to the process group `child` leads, once it is
+/// [`still_owned`] and still leads its own group.
+#[cfg(unix)]
+fn signal_owned_group(
+    child: &std::process::Child,
+    birth: Option<u64>,
+    signal: libc::c_int,
+) -> bool {
+    let pid = child.id() as libc::pid_t;
+    still_owned(child, birth)
+        && unsafe { libc::getpgid(pid) } == pid
+        && unsafe { libc::killpg(pid, signal) } == 0
+}
+
+/// Kill and reap `child` once it is [`still_owned`]: with the process group
+/// it leads, or alone when it leads none, and waited on only once that
+/// signal went out. A child that cannot be proven is neither signalled nor
+/// waited on.
+#[cfg(unix)]
+fn kill_owned_child(child: &mut std::process::Child, birth: Option<u64>) {
+    if !still_owned(child, birth) {
+        return;
+    }
+    let pid = child.id() as libc::pid_t;
+    let sent = if unsafe { libc::getpgid(pid) } == pid {
+        unsafe { libc::killpg(pid, libc::SIGKILL) == 0 }
+    } else {
+        unsafe { libc::kill(pid, libc::SIGKILL) == 0 }
+    };
+    if sent {
+        let _ = child.wait();
+    }
+}
+
+/// Pin `pid` with a pidfd: a signal sent through it reaches that process or
+/// nothing, never a later holder of its PID.
+#[cfg(target_os = "linux")]
+fn pidfd_open(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as libc::c_int) })
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_send(fd: &std::os::fd::OwnedFd, signal: libc::c_int) -> bool {
+    use std::os::fd::AsRawFd;
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    sent == 0
+}
+
+/// /proc/<pid>/stat after the comm, read before the pidfd `fd` confirms its
+/// task still exists, so a reused PID never reads as this one.
+#[cfg(target_os = "linux")]
+fn pinned_stat(pid: u32, fd: &std::os::fd::OwnedFd) -> Option<Vec<String>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+    if !pidfd_send(fd, 0) {
+        return None;
+    }
+    let stat = stat.ok()?;
+    let rest = &stat[stat.rfind(')')? + 2..];
+    Some(rest.split_whitespace().map(str::to_string).collect())
+}
+
+/// The value of `key` in `pid`'s environment. Unpinned: it proves who `pid`
+/// is only when a pidfd check shows the process outlived the read.
+#[cfg(target_os = "linux")]
+fn environ_var(pid: u32, key: &str) -> Option<String> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(key.as_bytes())?.strip_prefix(b"="))
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+}
+
+/// `pid`'s argv. Unpinned, like [`environ_var`].
+#[cfg(target_os = "linux")]
+fn cmdline(pid: u32) -> Vec<Vec<u8>> {
+    let argv = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    argv.strip_suffix(&[0_u8])
+        .unwrap_or(&argv)
+        .split(|byte| *byte == 0)
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
 /// Precondition: `launch-anchor` recorded `pid` and a native identity receipt
 /// for it.
 #[track_caller]
@@ -587,6 +754,8 @@ mod linux {
 
     struct Owned {
         child: Child,
+        /// Its start time, read at spawn: unreaped, it cannot change.
+        birth: Option<u64>,
         reaped: bool,
     }
 
@@ -596,8 +765,10 @@ mod linux {
             let child = command
                 .spawn()
                 .unwrap_or_else(|e| panic!("spawn {what}: {e}"));
+            let birth = start_time(child.id());
             Self {
                 child,
+                birth,
                 reaped: false,
             }
         }
@@ -650,9 +821,11 @@ mod linux {
         /// leader's PID is genuinely free. Returns the leader's wait status.
         fn crash(&mut self) -> Option<i32> {
             use std::os::unix::process::ExitStatusExt;
-            unsafe {
-                libc::killpg(self.pid() as libc::pid_t, libc::SIGKILL);
-            }
+            assert!(
+                signal_owned_group(&self.child, self.birth, libc::SIGKILL),
+                "crash fixture child {}'s group",
+                self.pid()
+            );
             let status = self.child.wait().expect("reap crashed fixture owner");
             self.reaped = true;
             status.signal()
@@ -661,22 +834,20 @@ mod linux {
         /// The leader alone dies by SIGKILL, with no cleanup, and is left
         /// unreaped: a zombie that still holds its PID and leads its group.
         fn die_unreaped(&self) -> Option<String> {
-            unsafe {
-                libc::kill(self.pid() as libc::pid_t, libc::SIGKILL);
-            }
+            assert!(
+                signal_owned_child(&self.child, self.birth, libc::SIGKILL),
+                "kill fixture child {}",
+                self.pid()
+            );
             self.wait_exit(Duration::from_secs(10))
         }
     }
 
     impl Drop for Owned {
         fn drop(&mut self) {
-            if self.reaped {
-                return;
+            if !self.reaped {
+                kill_owned_child(&mut self.child, self.birth);
             }
-            unsafe {
-                libc::killpg(self.pid() as libc::pid_t, libc::SIGKILL);
-            }
-            let _ = self.child.wait();
         }
     }
 
@@ -902,16 +1073,39 @@ exec sleep 300
                     "fixture OMP did not die by SIGKILL"
                 );
             } else {
-                // Not this test's child, but alive in this fixture's group up
-                // to the signal, and its idle parent never reaps it, so the
-                // PID cannot pass to anyone else.
+                // Not this test's child: pinned first, then proven this
+                // fixture's OMP through the pin (its ids, its idle launcher as
+                // parent, started after that launcher), and killed only
+                // through the pin. The idle launcher never reaps it, so it
+                // stays a zombie in this fixture's group.
+                let fd = pidfd_open(self.pid)
+                    .unwrap_or_else(|error| panic!("pin fixture OMP {}: {error}", self.pid));
+                let marked = environ_var(self.pid, "HCOM_PROCESS_ID").as_deref()
+                    == Some(self.process_id.as_str())
+                    && environ_var(self.pid, "TEST_OUT_DIR")
+                        .is_some_and(|out| Path::new(&out) == self.out_dir.as_path());
+                // Read last: the pinned OMP still existing proves the reads
+                // above were of it.
+                let stat = pinned_stat(self.pid, &fd);
+                let field = |index: usize| {
+                    stat.as_ref()
+                        .and_then(|fields| fields.get(index)?.parse::<u64>().ok())
+                };
+                let live = stat.as_ref().is_some_and(|fields| fields[0] != "Z");
+                let started = self
+                    .proc
+                    .birth
+                    .is_some_and(|birth| field(19).is_some_and(|start| start >= birth));
                 assert!(
-                    member_alive(self.pid, self.pgid()),
-                    "fixture OMP exited early"
+                    marked && live && field(1) == Some(u64::from(self.pgid())) && started,
+                    "fixture OMP {} is not this fixture's live process; it was let go unsignalled",
+                    self.pid
                 );
-                unsafe {
-                    libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
-                }
+                assert!(
+                    pidfd_send(&fd, libc::SIGKILL),
+                    "kill fixture OMP {} through its pidfd",
+                    self.pid
+                );
             }
             let zombie = Some(('Z', i64::from(self.pgid())));
             assert!(
@@ -2171,6 +2365,9 @@ wait "$!"
     /// child is reaped and never signalled again.
     struct Proc {
         child: Child,
+        /// Its start time, read at spawn: unreaped, it cannot change.
+        #[cfg(unix)]
+        birth: Option<u64>,
         dir: PathBuf,
         exit: Option<String>,
     }
@@ -2187,6 +2384,8 @@ wait "$!"
                 .spawn()
                 .unwrap_or_else(|e| panic!("spawn {what}: {e}"));
             Self {
+                #[cfg(unix)]
+                birth: start_time(child.id()),
                 child,
                 dir,
                 exit: None,
@@ -2222,9 +2421,11 @@ wait "$!"
             assert!(self.exit().is_none(), "fixture owner exited before crash");
             // Unreaped, so this PID and process group are still ours.
             #[cfg(unix)]
-            unsafe {
-                libc::killpg(self.pid() as libc::pid_t, libc::SIGKILL);
-            }
+            assert!(
+                signal_owned_group(&self.child, self.birth, libc::SIGKILL),
+                "crash fixture child {}'s group",
+                self.pid()
+            );
             #[cfg(windows)]
             let _ = self.child.kill();
             let status = self.child.wait().expect("reap crashed fixture owner");
@@ -2239,13 +2440,16 @@ wait "$!"
             if self.wait_exit(Duration::from_secs(3)).is_some() {
                 return;
             }
-            // Still unreaped, so this PID (and on Unix its group) is ours.
+            // Still running past its stop gate: killed and reaped only as
+            // this test's own child, proven first on Unix and through its
+            // process handle on Windows.
             #[cfg(unix)]
-            unsafe {
-                libc::killpg(self.pid() as libc::pid_t, libc::SIGKILL);
+            kill_owned_child(&mut self.child, self.birth);
+            #[cfg(windows)]
+            {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
             }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
         }
     }
 
@@ -2701,13 +2905,35 @@ wait "$!"
     // -----------------------------------------------------------------------
 
     /// A process this test did not spawn, held by a handle so its PID cannot
-    /// be reused while the test watches it.
+    /// be reused while the test watches it. It is armed, terminated through
+    /// that handle at drop, only once `open` has proven through the handle
+    /// that it is this fixture's; one that fails the proof is let go.
     #[cfg(windows)]
     struct Held {
         role: &'static str,
         pid: u32,
         handle: windows_sys::Win32::Foundation::HANDLE,
         created: u64,
+        armed: bool,
+    }
+
+    /// What proves a held process is this fixture's: its command line names
+    /// the fixture (the fixture root's unique directory name or the seat's
+    /// session id), and it was created no earlier than `since`, a FILETIME
+    /// taken before the fixture launched anything.
+    #[cfg(windows)]
+    struct Proof<'a> {
+        markers: [&'a str; 2],
+        since: u64,
+    }
+
+    /// Now as a FILETIME: 100-nanosecond intervals since 1601-01-01 UTC.
+    #[cfg(windows)]
+    fn file_time_now() -> u64 {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970");
+        u64::try_from(unix.as_nanos() / 100).expect("FILETIME range") + 116_444_736_000_000_000
     }
 
     // Base Cargo has no WDK feature: declare only this stable query ABI.
@@ -2726,9 +2952,10 @@ wait "$!"
 
     #[cfg(windows)]
     impl Held {
-        /// Hold `pid`, then prove it is still the expected live process: the
-        /// child of `parent`, created after it, when given.
-        fn open(role: &'static str, pid: u32, parent: Option<&Held>) -> Self {
+        /// Hold `pid` by a handle first, then prove through the handle that
+        /// it is this fixture's live process (`proof`), and the child of
+        /// `parent`, created after it, when given. Only then is it armed.
+        fn open(role: &'static str, pid: u32, parent: Option<&Held>, proof: &Proof<'_>) -> Self {
             use windows_sys::Win32::System::Threading::{
                 OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
                 PROCESS_TERMINATE,
@@ -2752,23 +2979,36 @@ wait "$!"
                 pid,
                 handle,
                 created: 0,
+                armed: false,
             };
             held.created = held.creation();
-            assert!(held.alive(), "the {role} {pid} exited before it was held");
+            let line = held.command_line().unwrap_or_default().to_lowercase();
+            let marked = proof
+                .markers
+                .iter()
+                .any(|marker| !marker.is_empty() && line.contains(&marker.to_lowercase()));
+            // Read last: still running after the reads above proves they
+            // were of this process.
+            assert!(
+                marked && held.created >= proof.since && held.alive(),
+                "the {role} {pid} is not this fixture's live process; it was let go unterminated"
+            );
             if let Some(parent) = parent {
                 held.assert_child_of(parent);
             }
+            held.armed = true;
             held
         }
 
         /// Hold this process's parent, proven older than this process.
-        fn parent_of(role: &'static str, child: &Held) -> Self {
+        fn parent_of(role: &'static str, child: &Held, proof: &Proof<'_>) -> Self {
             let parent = Self::open(
                 role,
                 child
                     .parent()
                     .unwrap_or_else(|| panic!("the {} has no parent", child.role)),
                 None,
+                proof,
             );
             child.assert_child_of(&parent);
             parent
@@ -2839,13 +3079,52 @@ wait "$!"
             };
             (status >= 0 && info.pid == self.pid as usize).then_some(info.parent_pid as u32)
         }
+
+        /// This process's command line, read through the handle
+        /// (ProcessCommandLineInformation = 60, Windows 8.1 and later).
+        fn command_line(&self) -> Option<String> {
+            #[repr(C)]
+            struct UnicodeString {
+                length: u16,
+                _maximum_length: u16,
+                buffer: *const u16,
+            }
+            let mut needed = 0u32;
+            unsafe { query_process(self.handle, 60, std::ptr::null_mut(), 0, &mut needed) };
+            let words = (needed as usize).div_ceil(8);
+            if words * 8 < std::mem::size_of::<UnicodeString>() {
+                return None;
+            }
+            // u64 storage keeps the header aligned for the pointer it holds.
+            let mut storage = vec![0u64; words];
+            let status = unsafe {
+                query_process(
+                    self.handle,
+                    60,
+                    storage.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            };
+            if status < 0 {
+                return None;
+            }
+            let text = unsafe { &*storage.as_ptr().cast::<UnicodeString>() };
+            if text.buffer.is_null() {
+                return None;
+            }
+            let units =
+                unsafe { std::slice::from_raw_parts(text.buffer, usize::from(text.length) / 2) };
+            Some(String::from_utf16_lossy(units))
+        }
     }
 
     #[cfg(windows)]
     impl Drop for Held {
         fn drop(&mut self) {
             use windows_sys::Win32::System::Threading::TerminateProcess;
-            if self.alive() {
+            // Terminated only through this handle, and only once proven.
+            if self.armed && self.alive() {
                 unsafe { TerminateProcess(self.handle, 1) };
             }
             unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
@@ -2868,6 +3147,9 @@ wait "$!"
     #[test]
     fn native_background_kill_retires_the_omp_cmd_launch_tree() {
         let h = Scene::new();
+        // Every process held below starts after this; a second of slack
+        // absorbs a clock adjustment.
+        let since = file_time_now() - 10_000_000;
         let name = format!("winseat{}", unique_suffix());
         let root = h.root_path().join("winseat");
         let steps = root.join("steps");
@@ -2901,6 +3183,16 @@ wait "$!"
         .unwrap();
         use_fixture_tools(&h, &fakebin);
         let (sid, transcript) = seed_stopped_omp(&h, &name, true);
+        let fixture = h
+            .root_path()
+            .file_name()
+            .expect("fixture root name")
+            .to_string_lossy()
+            .into_owned();
+        let proof = Proof {
+            markers: [fixture.as_str(), sid.as_str()],
+            since,
+        };
 
         let stdout = root.join("resume.stdout");
         let stderr = root.join("resume.stderr");
@@ -2936,10 +3228,10 @@ wait "$!"
             resume_output()
         );
         let pid = |value: &Value| u32::try_from(value.as_u64().unwrap()).unwrap();
-        let interpreter = Held::open("interpreter", pid(&ready["pid"]), None);
-        let launch_root = Held::parent_of("launch root", &interpreter);
-        let pty = Held::parent_of("hcom pty", &launch_root);
-        let _runner = Held::parent_of("launch runner", &pty);
+        let interpreter = Held::open("interpreter", pid(&ready["pid"]), None, &proof);
+        let launch_root = Held::parent_of("launch root", &interpreter, &proof);
+        let pty = Held::parent_of("hcom pty", &launch_root, &proof);
+        let _runner = Held::parent_of("launch runner", &pty, &proof);
         // Precondition: the pre-hook pin settled on cmd.exe, the process
         // `hcom pty` launched.
         assert!(
@@ -2960,7 +3252,7 @@ wait "$!"
                 && beats(&leaf_dir) > 0),
             "the interpreter's leaf never became ready"
         );
-        let leaf = Held::open("leaf", pid(&spawned["pid"]), Some(&interpreter));
+        let leaf = Held::open("leaf", pid(&spawned["pid"]), Some(&interpreter), &proof);
         let hook = native_request(
             &h,
             &steps,
@@ -3042,9 +3334,30 @@ mod real {
     }
 
     // -----------------------------------------------------------------------
-    // A launched process this test did not spawn, held so that a later reuse
-    // of its PID can never read as it or receive its signals.
+    // A launched process this test did not spawn. On Linux it is pinned with
+    // a pidfd first, held only once proven through that pin to be this
+    // fixture's (a fixture marker in its argv or environment, started no
+    // earlier than `hcom r`, still alive after those reads), and signalled,
+    // the kill at drop included, only through the pin; one that fails the
+    // proof is let go unsignalled. macOS has no pidfd: there a launched
+    // process is only observed, never signalled, and a test step that would
+    // signal one is skipped.
     // -----------------------------------------------------------------------
+
+    /// What proves a launched process is this fixture's.
+    #[derive(Clone, Copy)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    enum Mark<'a> {
+        /// The stand-in interpreter writing to this directory.
+        Interpreter(&'a Path),
+        /// `hcom pty`, carrying the seat's HCOM_PROCESS_ID.
+        Pty(&'a str),
+        /// The launch script, run from inside this fixture's root.
+        Script(&'a Path),
+        /// A child of the held process `parent`, carrying the seat's
+        /// HCOM_PROCESS_ID.
+        Child { parent: u32, process_id: &'a str },
+    }
 
     #[cfg(target_os = "linux")]
     struct Tracked {
@@ -3055,54 +3368,61 @@ mod real {
 
     #[cfg(target_os = "linux")]
     impl Tracked {
-        /// Pin `pid` with a pidfd, then prove it is still the expected live
-        /// process: the child of `parent`, when given.
-        fn adopt(role: &'static str, pid: u32, parent: Option<u32>) -> Self {
-            use std::os::fd::FromRawFd;
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-            assert!(
-                raw >= 0,
-                "pidfd_open({pid}) for the {role}: {}",
-                std::io::Error::last_os_error()
-            );
-            let tracked = Self {
-                role,
-                pid,
-                fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as libc::c_int) },
+        /// Pin `pid` with a pidfd and hold it once proven, through the pin,
+        /// the live process `mark` names, started no earlier than `since`. A
+        /// parent read alone proves nothing here: a live subreaper (systemd
+        /// --user) adopts an orphan.
+        fn adopt(role: &'static str, pid: u32, mark: Mark<'_>, since: u64) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            let fd = pidfd_open(pid)
+                .unwrap_or_else(|error| panic!("pidfd_open({pid}) for the {role}: {error}"));
+            let marked = match mark {
+                Mark::Interpreter(dir) => {
+                    environ_var(pid, "TEST_OUT_DIR").is_some_and(|out| Path::new(&out) == dir)
+                }
+                Mark::Pty(process_id) => {
+                    let argv = cmdline(pid);
+                    argv.first()
+                        .is_some_and(|program| program.ends_with(b"hcom"))
+                        && argv.get(1).is_some_and(|arg| arg.as_slice() == b"pty")
+                        && environ_var(pid, "HCOM_PROCESS_ID").as_deref() == Some(process_id)
+                }
+                Mark::Script(root) => cmdline(pid)
+                    .iter()
+                    .skip(1)
+                    .any(|arg| Path::new(std::ffi::OsStr::from_bytes(arg)).starts_with(root)),
+                Mark::Child { process_id, .. } => {
+                    environ_var(pid, "HCOM_PROCESS_ID").as_deref() == Some(process_id)
+                }
             };
-            let ppid = tracked.ppid();
+            // Read last: the pinned process still existing proves every read
+            // above was of it, not of a later holder of its PID.
+            let stat = pinned_stat(pid, &fd);
+            let field = |index: usize| {
+                stat.as_ref()
+                    .and_then(|fields| fields.get(index)?.parse::<u64>().ok())
+            };
+            let live = stat.as_ref().is_some_and(|fields| fields[0] != "Z");
+            let parented = match mark {
+                Mark::Child { parent, .. } => field(1) == Some(u64::from(parent)),
+                _ => true,
+            };
+            let started = field(19).is_some_and(|start| start >= since);
             assert!(
-                tracked.alive() && parent.is_none_or(|parent| ppid == Some(parent)),
-                "the {role} {pid} is not the expected live process (parent {ppid:?}, \
-                 expected {parent:?})"
+                marked && live && parented && started,
+                "the {role} {pid} is not this fixture's live process (parent {:?}); it was let \
+                 go unsignalled",
+                field(1)
             );
-            tracked
+            Self { role, pid, fd }
         }
 
         fn send(&self, signal: libc::c_int) -> bool {
-            use std::os::fd::AsRawFd;
-            let sent = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    self.fd.as_raw_fd(),
-                    signal,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            };
-            sent == 0
+            pidfd_send(&self.fd, signal)
         }
 
-        /// /proc/<pid>/stat after the comm, read before the pidfd confirms
-        /// its task still exists, so a reused PID never reads as this one.
         fn fields(&self) -> Option<Vec<String>> {
-            let stat = fs::read_to_string(format!("/proc/{}/stat", self.pid));
-            if !self.send(0) {
-                return None;
-            }
-            let stat = stat.ok()?;
-            let rest = &stat[stat.rfind(')')? + 2..];
-            Some(rest.split_whitespace().map(str::to_string).collect())
+            pinned_stat(self.pid, &self.fd)
         }
 
         fn alive(&self) -> bool {
@@ -3132,32 +3452,23 @@ mod real {
     }
 
     #[cfg(target_os = "macos")]
-    fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        let read = unsafe {
-            libc::proc_pidinfo(
-                pid as libc::c_int,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
-                size,
-            )
-        };
-        (read == size && info.pbi_pid == pid).then_some(info)
-    }
-
-    #[cfg(target_os = "macos")]
     impl Tracked {
-        /// Record `pid` with its start time, then prove it is still the
-        /// expected live process: the child of `parent`, when given.
-        fn adopt(role: &'static str, pid: u32, parent: Option<u32>) -> Self {
+        /// Record `pid` with its start time, to observe it only. macOS has no
+        /// pidfd, so no start-time recheck could keep a signal from racing a
+        /// PID reuse: a launched process this test did not spawn is never
+        /// signalled here. Without /proc, `mark` is checked only as far as a
+        /// parent: an orphan's parent is launchd (there is no subreaper),
+        /// which is refused.
+        fn adopt(role: &'static str, pid: u32, mark: Mark<'_>, _since: u64) -> Self {
             let info = bsd_info(pid)
                 .unwrap_or_else(|| panic!("the {role} {pid} exited before it was adopted"));
+            let marked = match mark {
+                Mark::Child { parent, .. } => info.pbi_ppid == parent,
+                Mark::Interpreter(_) | Mark::Pty(_) | Mark::Script(_) => pid != 1,
+            };
             assert!(
-                info.pbi_status != 5 && parent.is_none_or(|parent| info.pbi_ppid == parent),
-                "the {role} {pid} is not the expected live process (parent {}, expected \
-                 {parent:?})",
+                info.pbi_status != 5 && marked,
+                "the {role} {pid} is not this fixture's live process (parent {})",
                 info.pbi_ppid
             );
             Self {
@@ -3180,12 +3491,11 @@ mod real {
         fn ppid(&self) -> Option<u32> {
             self.current().map(|info| info.pbi_ppid)
         }
-
-        fn send(&self, signal: libc::c_int) -> bool {
-            self.alive() && unsafe { libc::kill(self.pid as libc::pid_t, signal) } == 0
-        }
     }
 
+    /// Linux only: a proven process still alive at drop is killed through its
+    /// pidfd. On macOS a `Tracked` is observe-only.
+    #[cfg(target_os = "linux")]
     impl Drop for Tracked {
         fn drop(&mut self) {
             if self.alive() {
@@ -3244,6 +3554,8 @@ exec -a omp /bin/bash {runner}
     /// its drop, so its group is this launch's until then.
     struct Resume {
         child: Child,
+        /// Its start time, read at spawn: no launched process starts earlier.
+        birth: Option<u64>,
         stdout: PathBuf,
         stderr: PathBuf,
     }
@@ -3260,10 +3572,9 @@ exec -a omp /bin/bash {runner}
 
     impl Drop for Resume {
         fn drop(&mut self) {
-            unsafe {
-                libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
-            }
-            let _ = self.child.wait();
+            // This test's own child: killed with its group, and reaped, only
+            // once proven still itself.
+            kill_owned_child(&mut self.child, self.birth);
         }
     }
 
@@ -3275,6 +3586,11 @@ exec -a omp /bin/bash {runner}
         leaf: Tracked,
         pty: Tracked,
         script: Tracked,
+        /// The seat's HCOM_PROCESS_ID, which every launched seat process
+        /// carries.
+        process_id: String,
+        /// `hcom r`'s start time: no launched process starts earlier.
+        since: u64,
     }
 
     impl Seat {
@@ -3343,8 +3659,10 @@ exec -a omp /bin/bash {runner}
                 .process_group(0)
                 .spawn()
                 .expect("spawn hcom r");
+            let birth = start_time(child.id());
             Resume {
                 child,
+                birth,
                 stdout,
                 stderr,
             }
@@ -3377,26 +3695,25 @@ exec -a omp /bin/bash {runner}
                 resume.output()
             );
             let (pid, process_id) = found.unwrap();
-            let interpreter = Tracked::adopt("interpreter", pid, None);
+            let since = resume.birth.expect("the start time of `hcom r`");
+            let interpreter = Tracked::adopt(
+                "interpreter",
+                pid,
+                Mark::Interpreter(&self.root.join(format!("interpreter-{pid}"))),
+                since,
+            );
             let pty = Tracked::adopt(
                 "hcom pty",
                 interpreter.ppid().expect("interpreter parent"),
-                None,
+                Mark::Pty(&process_id),
+                since,
             );
-            #[cfg(target_os = "linux")]
-            {
-                let argv = fs::read(format!("/proc/{}/cmdline", pty.pid)).unwrap_or_default();
-                let mut argv = argv.split(|byte| *byte == 0);
-                let program = argv.next().unwrap_or_default();
-                assert!(
-                    program.ends_with(b"hcom") && argv.next() == Some(b"pty".as_slice()),
-                    "the interpreter's parent {} is not hcom pty: {:?}",
-                    pty.pid,
-                    String::from_utf8_lossy(program)
-                );
-            }
-            let script =
-                Tracked::adopt("launch script", pty.ppid().expect("hcom pty parent"), None);
+            let script = Tracked::adopt(
+                "launch script",
+                pty.ppid().expect("hcom pty parent"),
+                Mark::Script(h.root_path()),
+                since,
+            );
             assert!(
                 wait_until(LAUNCH_WAIT, || row_facts(h, &self.name)["pid"]
                     == json!(interpreter.pid)),
@@ -3410,7 +3727,11 @@ exec -a omp /bin/bash {runner}
             let leaf = Tracked::adopt(
                 "leaf",
                 stdout.trim().parse().expect("leaf PID"),
-                Some(interpreter.pid),
+                Mark::Child {
+                    parent: interpreter.pid,
+                    process_id: &process_id,
+                },
+                since,
             );
             let start = run(&format!(
                 "H omp-start --session-id {} --transcript-path {} --cwd {}",
@@ -3436,6 +3757,8 @@ exec -a omp /bin/bash {runner}
                 leaf,
                 pty,
                 script,
+                process_id,
+                since,
             }
         }
 
@@ -3464,12 +3787,14 @@ exec -a omp /bin/bash {runner}
     }
 
     impl Watched {
-        /// Wait for the watched process writing to `dir` to start, pin it as
-        /// the child of `parent`, and on Linux wait for its signal traps.
+        /// Wait for the watched process writing to `dir` to start, hold it
+        /// once proven the process `mark` names, started no earlier than
+        /// `since`, and on Linux wait for its signal traps.
         fn find(
             role: &'static str,
             dir: PathBuf,
-            parent: u32,
+            mark: Mark<'_>,
+            since: u64,
             context: impl Fn() -> String,
         ) -> Self {
             let mut pid = None;
@@ -3483,7 +3808,7 @@ exec -a omp /bin/bash {runner}
                 "the {role} never started:\n{}",
                 context()
             );
-            let tracked = Tracked::adopt(role, pid.unwrap(), Some(parent));
+            let tracked = Tracked::adopt(role, pid.unwrap(), mark, since);
             #[cfg(target_os = "linux")]
             {
                 let handled = [
@@ -3561,7 +3886,11 @@ done
         let terminal = Watched::find(
             "terminal",
             real.root.join("terminal"),
-            resume.child.id(),
+            Mark::Child {
+                parent: resume.child.id(),
+                process_id: &seat.process_id,
+            },
+            seat.since,
             || resume.output(),
         );
         // Precondition: the launch script runs below the terminal.
@@ -3575,7 +3904,7 @@ done
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
-            carried_process_id(terminal.tracked.pid),
+            environ_var(terminal.tracked.pid, "HCOM_PROCESS_ID"),
             Some(bound_process_id(real)),
             "precondition: the terminal must carry the seat's HCOM_PROCESS_ID"
         );
@@ -3618,16 +3947,6 @@ done
         bsd_info(pid).map(|info| info.pbi_ppid)
     }
 
-    /// The HCOM_PROCESS_ID in `pid`'s environment.
-    #[cfg(target_os = "linux")]
-    fn carried_process_id(pid: u32) -> Option<String> {
-        let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
-        environ
-            .split(|byte| *byte == 0)
-            .find_map(|entry| entry.strip_prefix(b"HCOM_PROCESS_ID="))
-            .map(|value| String::from_utf8_lossy(value).into_owned())
-    }
-
     /// The process id the seat's binding holds.
     #[cfg(target_os = "linux")]
     fn bound_process_id(real: &Real) -> String {
@@ -3645,11 +3964,13 @@ done
     // -----------------------------------------------------------------------
 
     /// A PTY launch in an id-carrying terminal. On Linux the launch script is
-    /// stopped across the kill so `hcom pty`'s exit status survives as a
-    /// zombie's: it must have exited, not died by a signal. `hcom pty`
-    /// catches SIGTERM, SIGHUP and SIGINT and then exits normally, so this
-    /// proves no fatal signal (SIGKILL or any uncaught one) reached it, not
-    /// that none was sent.
+    /// stopped across the kill, through its pidfd, so `hcom pty`'s exit
+    /// status survives as a zombie's: it must have exited, not died by a
+    /// signal. `hcom pty` catches SIGTERM, SIGHUP and SIGINT and then exits
+    /// normally, so this proves no fatal signal (SIGKILL or any uncaught
+    /// one) reached it, not that none was sent. macOS skips the stop and the
+    /// zombie read: without a pidfd this test never signals a process it did
+    /// not spawn.
     #[test]
     fn pty_kill_retires_the_launched_tree_and_spares_every_ancestor() {
         let real = Real::new("terminal", false);
@@ -3670,6 +3991,8 @@ done
         ]);
         let seat = real.seat(&resume);
         let terminal = find_terminal(&real, &resume, &seat);
+        // Linux only: stopping a process this test did not spawn needs its
+        // pidfd.
         #[cfg(target_os = "linux")]
         assert!(seat.script.send(libc::SIGSTOP), "stop the launch script");
         let before = terminal.beats();
@@ -3677,6 +4000,7 @@ done
         let (code, output) = real.kill();
         seat.assert_tree_gone(&output);
         seat.assert_pty_exited(&output);
+        // Linux only, as the stop above.
         #[cfg(target_os = "linux")]
         {
             let status = seat.pty.zombie_status();
@@ -3773,17 +4097,30 @@ done
     impl Worker {
         fn find(real: &Real, seat: &Seat, role: &'static str) -> Self {
             let dir = real.root.join("workers").join(role);
-            let process = Watched::find(role, dir.clone(), seat.interpreter.pid, String::new);
+            let process = Watched::find(
+                role,
+                dir.clone(),
+                Mark::Child {
+                    parent: seat.interpreter.pid,
+                    process_id: &seat.process_id,
+                },
+                seat.since,
+                String::new,
+            );
             let child = Watched::find(
                 "worker child",
                 dir.join("child"),
-                process.tracked.pid,
+                Mark::Child {
+                    parent: process.tracked.pid,
+                    process_id: &seat.process_id,
+                },
+                seat.since,
                 String::new,
             );
             let id = bound_process_id(real);
             for member in [&process, &child] {
                 assert_eq!(
-                    carried_process_id(member.tracked.pid).as_deref(),
+                    environ_var(member.tracked.pid, "HCOM_PROCESS_ID").as_deref(),
                     Some(id.as_str()),
                     "precondition: the {role}'s {} {} must carry the seat's HCOM_PROCESS_ID",
                     member.tracked.role,
