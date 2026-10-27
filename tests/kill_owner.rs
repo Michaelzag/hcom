@@ -3235,6 +3235,8 @@ exec -a omp /bin/bash {runner}
         name: String,
         sid: String,
         transcript: PathBuf,
+        /// The next step the launched interpreter runs.
+        next_step: Cell<usize>,
     }
 
     /// The `hcom r` process, leading its own process group, with output in
@@ -3323,6 +3325,7 @@ exec -a omp /bin/bash {runner}
                 name,
                 sid,
                 transcript,
+                next_step: Cell::new(0),
             }
         }
 
@@ -3364,7 +3367,7 @@ exec -a omp /bin/bash {runner}
                         let mut lines = text.lines();
                         let pid: u32 = lines.next()?.parse().ok()?;
                         let process_id = lines.next()?.to_string();
-                        Some((pid, process_id, entry.path()))
+                        Some((pid, process_id))
                     });
                 found.is_some()
             });
@@ -3373,7 +3376,7 @@ exec -a omp /bin/bash {runner}
                 "the launched stand-in OMP never started:\n{}",
                 resume.output()
             );
-            let (pid, process_id, steps) = found.unwrap();
+            let (pid, process_id) = found.unwrap();
             let interpreter = Tracked::adopt("interpreter", pid, None);
             let pty = Tracked::adopt(
                 "hcom pty",
@@ -3401,12 +3404,7 @@ exec -a omp /bin/bash {runner}
                 interpreter.pid,
                 row_facts(h, &self.name)
             );
-            let next = Cell::new(0);
-            let run = |script: &str| {
-                let step = next.get();
-                next.set(step + 1);
-                run_step(h, &steps, step, script)
-            };
+            let run = |script: &str| self.step(pid, script);
             let (code, stdout, stderr) = run(LEAF);
             assert_eq!(code, 0, "start the interpreter's leaf: {stdout} {stderr}");
             let leaf = Tracked::adopt(
@@ -3441,50 +3439,39 @@ exec -a omp /bin/bash {runner}
             }
         }
 
+        /// Run `script` as the next step inside the launched interpreter
+        /// `interpreter`.
+        fn step(&self, interpreter: u32, script: &str) -> (i32, String, String) {
+            let step = self.next_step.get();
+            self.next_step.set(step + 1);
+            let steps = self.root.join(format!("interpreter-{interpreter}"));
+            run_step(&self.scene, &steps, step, script)
+        }
+
         fn kill(&self) -> (i32, String) {
             kill(&self.scene, &[&self.name])
         }
     }
 
     // -----------------------------------------------------------------------
-    // An id-carrying terminal above the launch script: hcom runs the custom
-    // terminal command `env HCOM_PROCESS_ID={process_id} <terminal>
-    // {script}`, and the terminal runs the launch script below it.
+    // A watched fixture process: it logs every catchable signal it gets,
+    // exits on it, and heartbeats while it lives.
     // -----------------------------------------------------------------------
 
-    struct Terminal {
+    struct Watched {
         tracked: Tracked,
         dir: PathBuf,
     }
 
-    impl Terminal {
-        fn install(real: &Real) -> PathBuf {
-            let path = real.root.join("terminal.sh");
-            executable(
-                &path,
-                &format!(
-                    r#"#!/bin/bash
-dir={dir}
-mkdir -p "$dir"
-: > "$dir/signals"
-for s in HUP INT QUIT TERM USR1 USR2 CONT; do
-    trap "printf '%s\n' $s >> \"$dir/signals\"; exit 0" "$s"
-done
-( /bin/bash "$1"; printf '%s' "$?" > "$dir/script.status" ) < /dev/null > "$dir/script.out" 2>&1 &
-printf '%s' "$$" > "$dir/ready"
-while :; do
-    printf x >> "$dir/heartbeat"
-    sleep 0.05
-done
-"#,
-                    dir = quote(&real.root.join("terminal")),
-                ),
-            );
-            path
-        }
-
-        fn find(real: &Real, resume: &Resume, seat: &Seat) -> Self {
-            let dir = real.root.join("terminal");
+    impl Watched {
+        /// Wait for the watched process writing to `dir` to start, pin it as
+        /// the child of `parent`, and on Linux wait for its signal traps.
+        fn find(
+            role: &'static str,
+            dir: PathBuf,
+            parent: u32,
+            context: impl Fn() -> String,
+        ) -> Self {
             let mut pid = None;
             assert!(
                 wait_until(LAUNCH_WAIT, || {
@@ -3493,39 +3480,12 @@ done
                         .and_then(|text| text.parse::<u32>().ok());
                     pid.is_some() && beats(&dir) > 0
                 }),
-                "the terminal never started:\n{}",
-                resume.output()
+                "the {role} never started:\n{}",
+                context()
             );
-            let tracked = Tracked::adopt("terminal", pid.unwrap(), Some(resume.child.id()));
-            // Precondition: the launch script runs below the terminal.
-            let subshell = seat.script.ppid().expect("launch script parent");
-            assert_eq!(
-                parent_pid(subshell),
-                Some(tracked.pid),
-                "precondition: the launch script {} must run below the terminal {}",
-                seat.script.pid,
-                tracked.pid
-            );
+            let tracked = Tracked::adopt(role, pid.unwrap(), Some(parent));
             #[cfg(target_os = "linux")]
             {
-                let bound: String = db(&real.scene)
-                    .query_row(
-                        "SELECT process_id FROM process_bindings WHERE instance_name=?1",
-                        [&real.name],
-                        |row| row.get(0),
-                    )
-                    .expect("read the seat's process binding");
-                let environ =
-                    fs::read(format!("/proc/{}/environ", tracked.pid)).unwrap_or_default();
-                let carried = environ
-                    .split(|byte| *byte == 0)
-                    .find_map(|entry| entry.strip_prefix(b"HCOM_PROCESS_ID="))
-                    .map(|value| String::from_utf8_lossy(value).into_owned());
-                assert_eq!(
-                    carried.as_deref(),
-                    Some(bound.as_str()),
-                    "precondition: the terminal must carry the seat's HCOM_PROCESS_ID"
-                );
                 let handled = [
                     libc::SIGHUP,
                     libc::SIGINT,
@@ -3539,7 +3499,8 @@ done
                 .fold(0_u64, |mask, signal| mask | 1_u64 << (signal - 1));
                 assert!(
                     wait_until(LAUNCH_WAIT, || caught(tracked.pid) & handled == handled),
-                    "the terminal never installed its signal traps"
+                    "the {role} {} never installed its signal traps",
+                    tracked.pid
                 );
             }
             Self { tracked, dir }
@@ -3563,6 +3524,62 @@ done
                 "signals": fs::read_to_string(self.dir.join("signals")).unwrap_or_default(),
             })
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // An id-carrying terminal above the launch script: hcom runs the custom
+    // terminal command `env HCOM_PROCESS_ID={process_id} <terminal>
+    // {script}`, and the terminal runs the launch script below it.
+    // -----------------------------------------------------------------------
+
+    fn install_terminal(real: &Real) -> PathBuf {
+        let path = real.root.join("terminal.sh");
+        executable(
+            &path,
+            &format!(
+                r#"#!/bin/bash
+dir={dir}
+mkdir -p "$dir"
+: > "$dir/signals"
+for s in HUP INT QUIT TERM USR1 USR2 CONT; do
+    trap "printf '%s\n' $s >> \"$dir/signals\"; exit 0" "$s"
+done
+( /bin/bash "$1"; printf '%s' "$?" > "$dir/script.status" ) < /dev/null > "$dir/script.out" 2>&1 &
+printf '%s' "$$" > "$dir/ready"
+while :; do
+    printf x >> "$dir/heartbeat"
+    sleep 0.05
+done
+"#,
+                dir = quote(&real.root.join("terminal")),
+            ),
+        );
+        path
+    }
+
+    fn find_terminal(real: &Real, resume: &Resume, seat: &Seat) -> Watched {
+        let terminal = Watched::find(
+            "terminal",
+            real.root.join("terminal"),
+            resume.child.id(),
+            || resume.output(),
+        );
+        // Precondition: the launch script runs below the terminal.
+        let subshell = seat.script.ppid().expect("launch script parent");
+        assert_eq!(
+            parent_pid(subshell),
+            Some(terminal.tracked.pid),
+            "precondition: the launch script {} must run below the terminal {}",
+            seat.script.pid,
+            terminal.tracked.pid
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            carried_process_id(terminal.tracked.pid),
+            Some(bound_process_id(real)),
+            "precondition: the terminal must carry the seat's HCOM_PROCESS_ID"
+        );
+        terminal
     }
 
     fn beats(dir: &Path) -> u64 {
@@ -3601,6 +3618,28 @@ done
         bsd_info(pid).map(|info| info.pbi_ppid)
     }
 
+    /// The HCOM_PROCESS_ID in `pid`'s environment.
+    #[cfg(target_os = "linux")]
+    fn carried_process_id(pid: u32) -> Option<String> {
+        let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
+        environ
+            .split(|byte| *byte == 0)
+            .find_map(|entry| entry.strip_prefix(b"HCOM_PROCESS_ID="))
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+    }
+
+    /// The process id the seat's binding holds.
+    #[cfg(target_os = "linux")]
+    fn bound_process_id(real: &Real) -> String {
+        db(&real.scene)
+            .query_row(
+                "SELECT process_id FROM process_bindings WHERE instance_name=?1",
+                [&real.name],
+                |row| row.get(0),
+            )
+            .expect("read the seat's process binding")
+    }
+
     // -----------------------------------------------------------------------
     // Rule 1: a genuine kill retires the launched tree and nothing above it.
     // -----------------------------------------------------------------------
@@ -3614,7 +3653,7 @@ done
     #[test]
     fn pty_kill_retires_the_launched_tree_and_spares_every_ancestor() {
         let real = Real::new("terminal", false);
-        let terminal = Terminal::install(&real);
+        let terminal = install_terminal(&real);
         let command = format!(
             "env HCOM_PROCESS_ID={{process_id}} {} {{script}}",
             terminal.display()
@@ -3630,7 +3669,7 @@ done
             "--go",
         ]);
         let seat = real.seat(&resume);
-        let terminal = Terminal::find(&real, &resume, &seat);
+        let terminal = find_terminal(&real, &resume, &seat);
         #[cfg(target_os = "linux")]
         assert!(seat.script.send(libc::SIGSTOP), "stop the launch script");
         let before = terminal.beats();
@@ -3696,6 +3735,225 @@ done
         let (code, output) = real.kill();
         seat.assert_tree_gone(&output);
         seat.assert_pty_exited(&output);
+        assert_kill_succeeded(code, &output, &real.name);
+    }
+
+    // -----------------------------------------------------------------------
+    // OMP workers under the seat (Linux). OMP starts a worker in its own
+    // session with a copy of its whole environment, so the worker, and
+    // anything the worker starts, carries the seat's HCOM_PROCESS_ID. One
+    // worker, the daemon broker, serves every seat. It is marked by
+    // `__omp_worker_daemon_broker` as the first argument to OMP's script, or
+    // by the process name `omp daemon brok`.
+    // -----------------------------------------------------------------------
+
+    /// A watched process's body, run as `bash watch.sh <dir>` or sourced.
+    #[cfg(target_os = "linux")]
+    const WATCH: &str = r#"dir=$1
+mkdir -p "$dir"
+: > "$dir/signals"
+for s in HUP INT QUIT TERM USR1 USR2 CONT; do
+    trap "printf '%s\n' $s >> \"$dir/signals\"; exit 0" "$s"
+done
+printf '%s' "$$" > "$dir/ready"
+while [ "$SECONDS" -lt 300 ]; do
+    printf x >> "$dir/heartbeat"
+    sleep 0.05
+done
+"#;
+
+    /// One worker the interpreter started, and the worker's own child.
+    #[cfg(target_os = "linux")]
+    struct Worker {
+        process: Watched,
+        child: Watched,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Worker {
+        fn find(real: &Real, seat: &Seat, role: &'static str) -> Self {
+            let dir = real.root.join("workers").join(role);
+            let process = Watched::find(role, dir.clone(), seat.interpreter.pid, String::new);
+            let child = Watched::find(
+                "worker child",
+                dir.join("child"),
+                process.tracked.pid,
+                String::new,
+            );
+            let id = bound_process_id(real);
+            for member in [&process, &child] {
+                assert_eq!(
+                    carried_process_id(member.tracked.pid).as_deref(),
+                    Some(id.as_str()),
+                    "precondition: the {role}'s {} {} must carry the seat's HCOM_PROCESS_ID",
+                    member.tracked.role,
+                    member.tracked.pid
+                );
+            }
+            let pid = process.tracked.pid as libc::pid_t;
+            assert_eq!(
+                unsafe { libc::getsid(pid) },
+                pid,
+                "precondition: the {role} {pid} must lead its own session"
+            );
+            Self { process, child }
+        }
+
+        /// The worker's argv and process name.
+        fn identity(&self) -> (Vec<String>, String) {
+            let pid = self.process.tracked.pid;
+            let argv = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            (
+                argv.split(|byte| *byte == 0)
+                    .filter(|arg| !arg.is_empty())
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect(),
+                comm.trim_end_matches('\n').to_string(),
+            )
+        }
+
+        #[track_caller]
+        fn assert_gone(&self, output: &str) {
+            let members = [&self.process.tracked, &self.child.tracked];
+            assert!(
+                wait_until(GONE_WAIT, || members.iter().all(|member| !member.alive())),
+                "`hcom kill` left the seat's {} (or its child) alive: {:?}:\n{output}",
+                self.process.tracked.role,
+                members
+                    .iter()
+                    .filter(|member| member.alive())
+                    .map(|member| (member.role, member.pid))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Start the seat's workers from inside its interpreter, each with a
+    /// child of its own: the broker marked by its argument, the broker
+    /// marked by its name, OMP's LSP multiplexer, and an OMP process that
+    /// names the broker selector anywhere but as the script's first
+    /// argument. Returns the path of OMP's stand-in script.
+    #[cfg(target_os = "linux")]
+    fn start_workers(real: &Real, seat: &Seat) -> String {
+        let watch = real.root.join("watch.sh");
+        fs::write(&watch, WATCH).expect("write the watched body");
+        // A background job of a non-interactive shell ignores SIGINT and
+        // SIGQUIT, and bash cannot trap a signal ignored at entry, so every
+        // disposition is reset first.
+        let worker = format!(
+            r#"[ -z "${{WORKER_TITLE:-}}" ] || printf '%s' "$WORKER_TITLE" > "/proc/$$/comm"
+env --default-signal /bin/bash {watch} "$WORKER/child" < /dev/null > /dev/null 2>&1 &
+. {watch} "$WORKER"
+"#,
+            watch = quote(&watch),
+        );
+        let cli = real
+            .root
+            .join("node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js");
+        fs::create_dir_all(cli.parent().unwrap()).expect("create the OMP package");
+        fs::write(&cli, &worker).expect("write OMP's stand-in script");
+        let titled = real.root.join("worker.sh");
+        fs::write(&titled, &worker).expect("write the titled worker");
+        let start = |role: &str, env: &str, command: String| {
+            format!(
+                "WORKER={dir} {env} setsid env --default-signal {command} \
+                 < /dev/null > /dev/null 2>&1 &\n",
+                dir = quote(&real.root.join("workers").join(role)),
+            )
+        };
+        let bun = |args: &str| {
+            format!(
+                "/bin/bash -c 'exec -a bun /bin/bash \"$@\"' bun {} {args}",
+                quote(&cli)
+            )
+        };
+        let script = [
+            start("broker-by-argument", "", bun("__omp_worker_daemon_broker")),
+            start(
+                "broker-by-name",
+                "WORKER_TITLE='omp daemon broker'",
+                format!("/bin/bash {}", quote(&titled)),
+            ),
+            start("lsp-mux", "", bun("__omp_worker_lsp_mux")),
+            start(
+                "late-selector",
+                "",
+                bun("--worker __omp_worker_daemon_broker"),
+            ),
+        ]
+        .concat();
+        let (code, stdout, stderr) = real.step(seat.interpreter.pid, &script);
+        assert_eq!(code, 0, "start the seat's workers: {stdout} {stderr}");
+        cli.to_string_lossy().into_owned()
+    }
+
+    /// OMP's shared daemon broker can sit under the seat that started it,
+    /// carrying that seat's HCOM_PROCESS_ID, but it serves every seat: the
+    /// kill leaves either marked broker and everything under it alone, and
+    /// still succeeds. Every other worker under the seat is the seat's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_spares_the_shared_daemon_broker_and_everything_under_it() {
+        let real = Real::new("broker", true);
+        let resume = real.resume(&["r", &real.name, "--go"]);
+        let seat = real.seat(&resume);
+        let cli = start_workers(&real, &seat);
+        let by_argument = Worker::find(&real, &seat, "broker-by-argument");
+        let by_name = Worker::find(&real, &seat, "broker-by-name");
+        let lsp_mux = Worker::find(&real, &seat, "lsp-mux");
+        let late = Worker::find(&real, &seat, "late-selector");
+        let omp = |args: &[&str]| {
+            ["bun", cli.as_str()]
+                .iter()
+                .chain(args)
+                .map(|arg| arg.to_string())
+                .collect::<Vec<_>>()
+        };
+        let bash = "bash".to_string();
+        assert_eq!(
+            by_argument.identity(),
+            (omp(&["__omp_worker_daemon_broker"]), bash.clone()),
+            "precondition: the argument-marked broker carries only its argument mark"
+        );
+        let (argv, comm) = by_name.identity();
+        assert!(
+            comm == "omp daemon brok" && !argv.iter().any(|arg| arg.starts_with("__omp_worker_")),
+            "precondition: the name-marked broker carries only its name mark: {argv:?} {comm:?}"
+        );
+        assert_eq!(
+            lsp_mux.identity(),
+            (omp(&["__omp_worker_lsp_mux"]), bash.clone()),
+            "precondition: the LSP multiplexer is an OMP worker that is not the broker"
+        );
+        assert_eq!(
+            late.identity(),
+            (omp(&["--worker", "__omp_worker_daemon_broker"]), bash),
+            "precondition: the late selector is not the script's first argument"
+        );
+        let spared = [
+            &by_argument.process,
+            &by_argument.child,
+            &by_name.process,
+            &by_name.child,
+        ];
+        let before: Vec<u64> = spared.iter().map(|member| member.beats()).collect();
+
+        let (code, output) = real.kill();
+        seat.assert_tree_gone(&output);
+        lsp_mux.assert_gone(&output);
+        late.assert_gone(&output);
+        seat.assert_pty_exited(&output);
+        for (member, before) in spared.into_iter().zip(before) {
+            assert_eq!(
+                member.observe(before),
+                json!({"alive": true, "heartbeat_progressed": true, "signals": ""}),
+                "SAFETY: `hcom kill` signalled the shared broker's tree: {} {} ({}):\n{output}",
+                member.tracked.role,
+                member.tracked.pid,
+                member.dir.display()
+            );
+        }
         assert_kill_succeeded(code, &output, &real.name);
     }
 }
