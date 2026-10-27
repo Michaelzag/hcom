@@ -13,6 +13,9 @@ pub(crate) const POLL_STEP: std::time::Duration = std::time::Duration::from_mill
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use super::kill_tree_linux::ProcState as KillState;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use super::kill_tree_linux::{KillTreeTestEvent, scoped_kill_tree_test_hook};
+
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KillState {

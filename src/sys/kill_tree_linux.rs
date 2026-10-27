@@ -29,6 +29,61 @@ const MAX_THREADS: usize = 65_536;
 /// never return to user space.
 const PF_EXITING: u64 = 0x4;
 
+/// Observations of real native actuation, available only to unit fixtures.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillTreeTestEvent {
+    DescendantSignal {
+        pid: u32,
+        signal: libc::c_int,
+        outcome: GroupSignal,
+    },
+    RootOutcome {
+        pid: u32,
+        outcome: GroupSignal,
+    },
+}
+
+#[cfg(test)]
+type KillTreeTestHook = std::rc::Rc<dyn Fn(KillTreeTestEvent)>;
+
+#[cfg(test)]
+thread_local! {
+    static KILL_TREE_TEST_HOOK: std::cell::RefCell<Option<KillTreeTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Retaining the previous Rc also keeps this guard on its installing thread.
+#[cfg(test)]
+pub(crate) struct KillTreeTestHookGuard {
+    previous: Option<KillTreeTestHook>,
+}
+
+#[cfg(test)]
+impl Drop for KillTreeTestHookGuard {
+    fn drop(&mut self) {
+        KILL_TREE_TEST_HOOK.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn scoped_kill_tree_test_hook(
+    hook: impl Fn(KillTreeTestEvent) + 'static,
+) -> KillTreeTestHookGuard {
+    let previous = KILL_TREE_TEST_HOOK.with(|slot| slot.replace(Some(std::rc::Rc::new(hook))));
+    KillTreeTestHookGuard { previous }
+}
+
+#[cfg(test)]
+fn record_kill_tree_test_event(event: KillTreeTestEvent) {
+    // Release the TLS borrow before calling the observer: its scoped guard
+    // must remain restorable even when the callback unwinds.
+    let hook = KILL_TREE_TEST_HOOK.with(|slot| slot.borrow().clone());
+    if let Some(hook) = hook {
+        hook(event);
+    }
+}
+
 /// One process from `/proc/<pid>/stat`: its leader's parent, group and start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProcFact {
@@ -900,9 +955,15 @@ where
                 // One PID absorbed from this round, authorized and just
                 // re-proven; never a group signal.
                 if self.proven(member)
-                    && matches!(signal_pid(member.pid, signal), Ok(GroupSignal::Sent))
+                    && let Ok(_outcome @ GroupSignal::Sent) = signal_pid(member.pid, signal)
                 {
                     self.signal_sent.set(true);
+                    #[cfg(test)]
+                    record_kill_tree_test_event(KillTreeTestEvent::DescendantSignal {
+                        pid: member.pid,
+                        signal,
+                        outcome: _outcome,
+                    });
                 }
             }
             let left = self.survivors(members);
@@ -1061,12 +1122,16 @@ fn terminate_body(
                     // the members the loop skipped get their own signals.
                     for grouped in members.iter().filter(|m| m.in_group && m.pid != root) {
                         if sweep.proven(grouped)
-                            && matches!(
-                                signal_pid(grouped.pid, libc::SIGTERM),
-                                Ok(GroupSignal::Sent)
-                            )
+                            && let Ok(_outcome @ GroupSignal::Sent) =
+                                signal_pid(grouped.pid, libc::SIGTERM)
                         {
                             sweep.signal_sent.set(true);
+                            #[cfg(test)]
+                            record_kill_tree_test_event(KillTreeTestEvent::DescendantSignal {
+                                pid: grouped.pid,
+                                signal: libc::SIGTERM,
+                                outcome: _outcome,
+                            });
                         }
                     }
                 }
@@ -1092,13 +1157,24 @@ fn terminate_body(
         }
         // Capture never admits a reserved PID, and signal_pid refuses one
         // anyway. ESRCH means it is gone.
-        if matches!(signal_pid(member.pid, libc::SIGTERM), Ok(GroupSignal::Sent)) {
+        if let Ok(_outcome @ GroupSignal::Sent) = signal_pid(member.pid, libc::SIGTERM) {
             sweep.signal_sent.set(true);
+            #[cfg(test)]
+            record_kill_tree_test_event(KillTreeTestEvent::DescendantSignal {
+                pid: member.pid,
+                signal: libc::SIGTERM,
+                outcome: _outcome,
+            });
         }
     }
     let root_signal = root_signal.ok_or("seat root is missing from the termination plan")?;
 
     if sweep.settle(members, TERM_WAIT, libc::SIGTERM)?.is_empty() {
+        #[cfg(test)]
+        record_kill_tree_test_event(KillTreeTestEvent::RootOutcome {
+            pid: root,
+            outcome: root_signal,
+        });
         return Ok(root_signal);
     }
     // Escalate per PID, never by group: the leader may have exited, and only
@@ -1107,12 +1183,25 @@ fn terminate_body(
     for pid in escalation_targets(members, |member| sweep.proven(member)) {
         // A captured PID whose start time was just rechecked; ESRCH means it
         // exited in between.
-        if matches!(signal_pid(pid, libc::SIGKILL), Ok(GroupSignal::Sent)) {
+        if let Ok(_outcome @ GroupSignal::Sent) = signal_pid(pid, libc::SIGKILL) {
             signal_sent.set(true);
+            #[cfg(test)]
+            if pid != root {
+                record_kill_tree_test_event(KillTreeTestEvent::DescendantSignal {
+                    pid,
+                    signal: libc::SIGKILL,
+                    outcome: _outcome,
+                });
+            }
         }
     }
     let left = sweep.settle(members, KILL_WAIT, libc::SIGKILL)?;
     if left.is_empty() {
+        #[cfg(test)]
+        record_kill_tree_test_event(KillTreeTestEvent::RootOutcome {
+            pid: root,
+            outcome: root_signal,
+        });
         return Ok(root_signal);
     }
     Err(sweep.verdict(members, left))
@@ -2922,6 +3011,65 @@ mod tests {
             .expect("spawn own fixture")
     }
 
+    /// Keeps a waiting root alive until the engine has signaled it, even
+    /// when killing its last child completes child.wait() first.
+    struct RootLifetimeGate {
+        dir: tempfile::TempDir,
+        hold: std::path::PathBuf,
+        post_wait: std::path::PathBuf,
+    }
+
+    impl RootLifetimeGate {
+        fn new() -> Self {
+            let dir = tempfile::Builder::new()
+                .prefix("hcom-root-lifetime-")
+                .tempdir()
+                .unwrap();
+            let hold = dir.path().join("hold-root");
+            let post_wait = dir.path().join("post-wait");
+            std::fs::write(&hold, b"").unwrap();
+            Self {
+                dir,
+                hold,
+                post_wait,
+            }
+        }
+    }
+
+    impl Drop for RootLifetimeGate {
+        fn drop(&mut self) {
+            // Removing the directory also releases the root; teardown never
+            // depends on a release file that could disappear before it is read.
+            let _ = std::fs::remove_file(&self.hold);
+        }
+    }
+
+    fn root_command(gate: &RootLifetimeGate, child_argv: &[&str], group: u32) -> Command {
+        let mut command = Command::new("python3");
+        command
+            .args([
+                "-c",
+                r#"import os, subprocess, sys, time
+child = subprocess.Popen(sys.argv[3:])
+child.wait()
+def root_lifetime_gate():
+    with open(sys.argv[2], "w") as acknowledgment:
+        acknowledgment.write("post-wait\n")
+    while os.path.exists(sys.argv[1]):
+        time.sleep(0.01)
+root_lifetime_gate()
+"#,
+            ])
+            .arg(&gate.hold)
+            .arg(&gate.post_wait)
+            .args(child_argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(group as i32);
+        command
+    }
+
     /// Wait until `root` has captured at least `count` members.
     fn captured(root: u32, count: usize) -> Vec<Member> {
         let start = start_of(root).expect("fixture root");
@@ -2969,7 +3117,10 @@ mod tests {
         let anchor = spawn("exec sleep 30", 0);
         let group = anchor.id();
         let mut fixture = Fixture::new(anchor);
-        let root_child = spawn("sleep 30 & wait", group);
+        let root_gate = RootLifetimeGate::new();
+        let root_child = root_command(&root_gate, &["sleep", "30"], group)
+            .spawn()
+            .expect("spawn own root");
         let root = root_child.id();
         fixture.children.push(root_child);
         let sibling = spawn("exec sleep 30", group);
@@ -3162,9 +3313,29 @@ os.waitpid(carrier, 0)
 
     #[test]
     fn an_ancestor_carrying_the_id_is_never_signaled() {
-        // Anchor -> root shell -> sleep. After its wait the anchor execs sleep,
-        // keeping its start time, so it stays observable unless signaled.
-        let anchor = spawn("sh -c 'sleep 30 & wait' & wait; exec sleep 30", 0);
+        // Anchor -> Python root -> file-gated child. After its wait the
+        // anchor execs sleep, keeping its start time and staying observable.
+        let root_gate = RootLifetimeGate::new();
+        let hold_child = root_gate.dir.path().join("hold-child");
+        std::fs::write(&hold_child, b"").unwrap();
+        let root_command = root_command(
+            &root_gate,
+            &[
+                "python3",
+                "-c",
+                "import os, sys, time\nwhile os.path.exists(sys.argv[1]): time.sleep(0.01)",
+                hold_child.to_str().unwrap(),
+            ],
+            0,
+        );
+        // The anchor starts the command directly, with no intervening shell
+        // parent between it and the actual Python root.
+        let anchor = command("\"$@\" & wait; exec sleep 30", 0)
+            .arg("anchor")
+            .arg(root_command.get_program())
+            .args(root_command.get_args())
+            .spawn()
+            .expect("spawn own ancestor");
         let group = anchor.id();
         let fixture = Fixture::new(anchor);
         let tree = captured(group, 3);
@@ -3174,7 +3345,8 @@ os.waitpid(carrier, 0)
             .expect("root shell")
             .pid;
         let anchor_start = start_of(group).unwrap();
-        assert!(anchor_start <= start_of(root).unwrap());
+        let root_start = start_of(root).unwrap();
+        assert!(anchor_start <= root_start);
 
         // Every fixture process reads as carrying the id, nothing else does,
         // so the anchor is the only carrier candidate outside the root tree.
@@ -3191,7 +3363,35 @@ os.waitpid(carrier, 0)
                 }
             },
             |_| true,
-            |_| Ok(()),
+            |pid| {
+                if pid == root {
+                    // Preflight has captured the tree but sent no signals.
+                    // Force child.wait() to finish before the engine proceeds.
+                    std::fs::remove_file(&hold_child).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        if root_gate.post_wait.exists() {
+                            assert!(
+                                matches!(observe(Path::new("/proc"), root), Seen::Live(fact)
+                                    if fact.start == root_start),
+                                "acknowledged root is not live"
+                            );
+                            break;
+                        }
+                        // Counterfactual: without the lifetime block (including
+                        // its acknowledgment), wait for verified exit instead.
+                        if matches!(observe(Path::new("/proc"), root), Seen::Gone) {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "root never completed child.wait()"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                Ok(())
+            },
             &mut UnsignaledCarriers::default(),
         );
         assert_eq!(result, Ok(GroupSignal::Sent));
@@ -4375,12 +4575,20 @@ while True:
         // ~1 GiB of touched memory keeps the child in do_exit for ~150 ms
         // after its SIGKILL: long enough to recheck it while it exits.
         let token = marker("exiting-refusal");
-        let leader = spawn_marked(
-            "python3 -c 'import time; b = bytearray(1 << 30); \
-             b[::4096] = bytes([1]) * (1 << 18); time.sleep(30)' & wait",
+        let root_gate = RootLifetimeGate::new();
+        let leader = root_command(
+            &root_gate,
+            &[
+                "python3",
+                "-c",
+                "import time; b = bytearray(1 << 30); \
+                 b[::4096] = bytes([1]) * (1 << 18); time.sleep(30)",
+            ],
             0,
-            &token,
-        );
+        )
+        .env("HCOM_PROCESS_ID", &token)
+        .spawn()
+        .expect("spawn own root");
         let root = leader.id();
         let fixture = Fixture::new(leader);
         let tree = captured(root, 2);
@@ -4580,18 +4788,19 @@ while True:
         let dir = tempfile::tempdir().unwrap();
         let gate = dir.path().join("gate");
         let token = marker("zombie-leader");
-        let leader = spawn_marked(
-            &format!(
-                "setsid python3 -c 'import ctypes, os, threading, time; \
-                 threading.Thread(target=time.sleep, args=(30,), daemon=True).start(); \
-                 [time.sleep(0.01) for _ in iter(lambda: os.path.exists(\"{}\"), True)]; \
-                 ctypes.CDLL(None).syscall({}, 0)' & wait",
-                gate.display(),
-                libc::SYS_exit
-            ),
-            0,
-            &token,
+        let root_gate = RootLifetimeGate::new();
+        let child_script = format!(
+            "import ctypes, os, threading, time; \
+             threading.Thread(target=time.sleep, args=(30,), daemon=True).start(); \
+             [time.sleep(0.01) for _ in iter(lambda: os.path.exists(\"{}\"), True)]; \
+             ctypes.CDLL(None).syscall({}, 0)",
+            gate.display(),
+            libc::SYS_exit
         );
+        let leader = root_command(&root_gate, &["setsid", "python3", "-c", &child_script], 0)
+            .env("HCOM_PROCESS_ID", &token)
+            .spawn()
+            .expect("spawn own root");
         let root = leader.id();
         let fixture = Fixture::new(leader);
         let tree = captured(root, 2);

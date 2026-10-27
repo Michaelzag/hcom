@@ -3221,3 +3221,502 @@ fn a_bare_name_live_nowhere_is_still_not_found() {
     let err = kill_single(&db, dir.path(), "luna", "tester").expect_err("not found");
     assert_eq!(err.to_string(), "Agent 'luna' not found");
 }
+
+#[cfg(target_os = "linux")]
+mod gone_root_command {
+    use std::cell::Cell;
+    use std::ffi::OsStr;
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::sys::process::{
+        self, GroupSignal, KillState, KillTreeTestEvent, scoped_kill_tree_test_hook,
+    };
+    use crate::sys::process_args::EnvRead;
+
+    /// The anchor alone owns/reaps the ungated shell. Neither process has a
+    /// timed lifetime: the child and anchor wait on initially present files.
+    const FIXTURE_SCRIPT: &str = r#"import json, os, pathlib, subprocess, sys, time
+base = pathlib.Path(os.environ["HCOM_DIR"])
+def publish(name, data):
+    pending = base / (name + ".pending")
+    pending.write_text(json.dumps(data))
+    pending.replace(base / name)
+def facts(pid):
+    fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    boot = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    return dict(pid=pid, identity=f"linux:{boot}:{fields[19]}",
+                ppid=int(fields[1]), group=int(fields[2]), session=int(fields[3]))
+if sys.argv[1] == "child":
+    publish("child.ready", facts(os.getpid()))
+    while (base / "hold-child").exists():
+        time.sleep(0.01)
+else:
+    publish("anchor.ready", facts(os.getpid()))
+    root_env = os.environ.copy()
+    root_env["HCOM_INSTANCE_NAME"] = sys.argv[2]
+    root_env["HCOM_PROCESS_ID"] = sys.argv[3]
+    root = subprocess.Popen(
+        ["/bin/sh", "-c", '"$1" "$2" child & wait', "hcom-gone-root",
+         sys.executable, __file__], env=root_env)
+    publish("root.ready", facts(root.pid))
+    status = root.wait()
+    publish("root.reaped", dict(pid=root.pid, status=status))
+    while (base / "hold-anchor").exists():
+        time.sleep(0.01)
+"#;
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct ProcessFact {
+        pid: u32,
+        identity: String,
+        ppid: u32,
+        group: u32,
+        session: u32,
+    }
+
+    impl ProcessFact {
+        fn assert_live(&self, parent: u32, group: u32, session: u32, marker: Option<&str>) {
+            assert!(self.pid > 1);
+            assert_eq!(
+                (self.ppid, self.group, self.session),
+                (parent, group, session)
+            );
+            assert!(process::has_identity(self.pid, &self.identity));
+            assert_eq!(process::kill_state(self.pid), KillState::Live);
+            assert_eq!(process::parent_pid(self.pid), Some(parent));
+            let raw = i32::try_from(self.pid).unwrap();
+            // SAFETY: both calls only query this positive fixture PID.
+            assert_eq!(unsafe { libc::getpgid(raw) }, i32::try_from(group).unwrap());
+            assert_eq!(
+                unsafe { libc::getsid(raw) },
+                i32::try_from(session).unwrap()
+            );
+            match (crate::proctruth::process_id_of(self.pid), marker) {
+                (EnvRead::Absent, None) => {}
+                (EnvRead::Present(actual), Some(expected)) => assert_eq!(actual, expected),
+                (actual, expected) => {
+                    panic!("fixture {} marker: {actual:?}, {expected:?}", self.pid)
+                }
+            }
+            assert!(process::has_identity(self.pid, &self.identity));
+        }
+    }
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct CommandFixture {
+        name: String,
+        nonce: String,
+        anchor: ProcessFact,
+        root: ProcessFact,
+        child: ProcessFact,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RootReaped {
+        pid: u32,
+        status: i32,
+    }
+
+    fn read_ack<T: serde::de::DeserializeOwned>(path: &Path) -> T {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(text) => {
+                    return serde_json::from_str(&text).expect("atomic private fixture ack");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read fixture ack {}: {error}", path.display()),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture ack missing: {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The retained Child pins the PID until either wait reaps it or Drop
+    /// proves ownership/birth immediately before its own-group cleanup.
+    struct OwnedChild {
+        child: Child,
+        identity: Option<String>,
+        reaped: bool,
+    }
+
+    impl OwnedChild {
+        fn spawn(mut command: Command) -> Self {
+            let mut owned = Self {
+                child: command.spawn().expect("spawn private gone-root fixture"),
+                identity: None,
+                reaped: false,
+            };
+            owned.identity = Some(process::identity(owned.child.id()).expect("owned child birth"));
+            owned
+        }
+
+        fn wait(&mut self, timeout: Duration) -> Option<ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(status)) => {
+                        self.reaped = true;
+                        return Some(status);
+                    }
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) | Err(_) => return None,
+                }
+            }
+        }
+    }
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if !self.reaped {
+                if let Some(identity) = self.identity.as_deref() {
+                    let _ = process::signal_owned_test_child(
+                        &self.child,
+                        identity,
+                        libc::SIGKILL,
+                        true,
+                    );
+                }
+                let _ = self.wait(Duration::from_secs(5));
+            }
+        }
+    }
+
+    struct Scene {
+        dir: tempfile::TempDir,
+        anchor: Option<OwnedChild>,
+    }
+
+    impl Scene {
+        fn new() -> Self {
+            let dir = tempfile::Builder::new()
+                .prefix("hcom-gone-command-")
+                .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+                .unwrap();
+            for name in ["home", "hcom", "tmp"] {
+                crate::paths::ensure_private_directory(&dir.path().join(name)).unwrap();
+            }
+            let hcom_dir = dir.path().join("hcom");
+            std::fs::write(hcom_dir.join("config.toml"), "[relay]\nenabled = false\n").unwrap();
+            std::fs::write(hcom_dir.join("fixture.py"), FIXTURE_SCRIPT).unwrap();
+            for gate in ["hold-child", "hold-anchor"] {
+                std::fs::write(hcom_dir.join(gate), b"held\n").unwrap();
+            }
+            crate::paths::test_roots::register(dir.path());
+            Self { dir, anchor: None }
+        }
+
+        fn hcom_dir(&self) -> PathBuf {
+            self.dir.path().join("hcom")
+        }
+
+        fn command(&self, program: impl AsRef<OsStr>) -> Command {
+            let mut command = Command::new(program);
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", self.dir.path().join("home"))
+                .env("HCOM_DIR", self.hcom_dir())
+                .env("TMPDIR", self.dir.path().join("tmp"))
+                .current_dir(self.dir.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            command
+        }
+    }
+
+    impl Drop for Scene {
+        fn drop(&mut self) {
+            // Release only this fixture's gates before owned-group fallback.
+            // The anchor waits for/reaps the shell, which reaps its child.
+            for gate in ["hold-child", "hold-anchor"] {
+                let _ = std::fs::remove_file(self.hcom_dir().join(gate));
+            }
+            // Keep the anchor unreaped until OwnedChild proves/signals its group.
+            // Cleanup must precede removal of the gate/ack directory.
+            drop(self.anchor.take());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn kill_ungated_nonleader_root_exits_after_child_sigterm() {
+        let mut scene = Scene::new();
+        let hcom_dir = scene.hcom_dir();
+        let name = format!("gone-command-{}", std::process::id());
+        let nonce = format!("gone-command-{}", uuid::Uuid::new_v4());
+        let session = format!("session-{name}");
+        let mut anchor_command = scene.command("python3");
+        anchor_command
+            .arg(hcom_dir.join("fixture.py"))
+            .arg("anchor")
+            .arg(&name)
+            .arg(&nonce);
+        scene.anchor = Some(OwnedChild::spawn(anchor_command));
+        let anchor: ProcessFact = read_ack(&hcom_dir.join("anchor.ready"));
+        let root: ProcessFact = read_ack(&hcom_dir.join("root.ready"));
+        let child: ProcessFact = read_ack(&hcom_dir.join("child.ready"));
+        assert_eq!(anchor.pid, scene.anchor.as_ref().unwrap().child.id());
+        assert_ne!(root.pid, anchor.pid, "the shell must not lead its group");
+        // SAFETY: getsid(0) only reads this test's session ID.
+        let sid = u32::try_from(unsafe { libc::getsid(0) }).unwrap();
+        anchor.assert_live(std::process::id(), anchor.pid, sid, None);
+        root.assert_live(anchor.pid, anchor.pid, sid, Some(&nonce));
+        child.assert_live(root.pid, anchor.pid, sid, Some(&nonce));
+
+        let db = HcomDb::open_raw(&hcom_dir.join("hcom.db")).unwrap();
+        db.init_db().unwrap();
+        db.save_instance_named(
+            &name,
+            &serde_json::Map::from_iter([
+                ("tool".into(), json!("codex")),
+                ("background".into(), json!(1)),
+                ("status".into(), json!("listening")),
+                (
+                    "created_at".into(),
+                    json!(crate::shared::time::now_epoch_f64()),
+                ),
+                ("session_id".into(), json!(session)),
+            ]),
+        )
+        .unwrap();
+        db.set_process_binding(&nonce, &session, &name).unwrap();
+        db.set_session_binding(&session, &name).unwrap();
+        db.register_notify_port(&name, 1).unwrap();
+        // Use the real writer: it mints the native identity receipt as well.
+        db.update_instance_pid(&name, root.pid).unwrap();
+        let row = db.get_instance_full(&name).unwrap().unwrap();
+        let bindings = db.process_binding_ids(&name).unwrap();
+        let owner =
+            crate::proctruth::verify_kill_owner(root.pid, row.launch_context.as_deref(), &bindings)
+                .unwrap()
+                .resolve_root(Some("codex"), row.launch_context.as_deref(), &bindings)
+                .unwrap();
+        assert_eq!(owner.identity(), Some(root.identity.as_str()));
+        assert!(owner.launcher_warning().is_none());
+        assert_eq!(bindings, vec![nonce.clone()]);
+        assert_eq!(
+            db.get_session_binding(&session).unwrap().as_deref(),
+            Some(name.as_str())
+        );
+        assert!(db.has_notify_endpoint(&name));
+
+        let config = CommandFixture {
+            name: name.clone(),
+            nonce,
+            anchor,
+            root,
+            child,
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(hcom_dir.join("gone-root-command.json"))
+            .unwrap()
+            .write_all(&serde_json::to_vec(&config).unwrap())
+            .unwrap();
+        let stdout_path = hcom_dir.join("command.stdout");
+        let stderr_path = hcom_dir.join("command.stderr");
+        let fixture_name = format!(
+            "{}::command_fixture",
+            module_path!().split_once("::").unwrap().1,
+        );
+        let mut command = scene.command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                &fixture_name,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+                "--quiet",
+            ])
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(std::fs::File::create(&stderr_path).unwrap());
+        let mut runner = OwnedChild::spawn(command);
+        let status = runner
+            .wait(Duration::from_secs(30))
+            .expect("command fixture deadline");
+        let stdout = std::fs::read_to_string(stdout_path).unwrap();
+        let stderr = std::fs::read_to_string(stderr_path).unwrap();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.lines().any(|line| line
+                == format!(
+                    "Process group {} not found for '{}' (already terminated)",
+                    config.root.pid, name,
+                )),
+            "missing exact AlreadyDead output:\n{stdout}\n{stderr}",
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == format!("  To resume: hcom r {name}")),
+            "missing exact resume output:\n{stdout}\n{stderr}",
+        );
+        assert!(db.get_instance_full(&name).unwrap().is_none());
+        assert!(db.process_binding_ids(&name).unwrap().is_empty());
+        assert!(db.get_session_binding(&session).unwrap().is_none());
+        assert!(db.notify_endpoint_ports(&name).unwrap().is_empty());
+        assert_eq!(stopped_events(&db, &name), 1);
+        config
+            .anchor
+            .assert_live(std::process::id(), config.anchor.pid, sid, None);
+        eprintln!("{stderr}");
+    }
+
+    /// Private subprocess entry, never an independently runnable scenario.
+    /// Keep the parent's seeded HCOM_DIR; installing isolated_test_env here
+    /// would silently switch databases and stop testing the real command.
+    #[test]
+    #[ignore = "owned subprocess fixture for the regular gone-root command test"]
+    fn command_fixture() {
+        let hcom_dir =
+            PathBuf::from(std::env::var_os("HCOM_DIR").expect("private fixture HCOM_DIR"));
+        let home = PathBuf::from(std::env::var_os("HOME").expect("private fixture HOME"));
+        let tmp = PathBuf::from(std::env::var_os("TMPDIR").expect("private fixture TMPDIR"));
+        for path in [&hcom_dir, &home, &tmp] {
+            assert!(
+                path.is_absolute(),
+                "fixture paths must be explicit and absolute"
+            );
+            assert_eq!(
+                path.canonicalize().unwrap(),
+                *path,
+                "canonical fixture path"
+            );
+        }
+        let base = hcom_dir.parent().unwrap();
+        assert!(
+            base.file_name()
+                .is_some_and(|name| { name.to_string_lossy().starts_with("hcom-gone-command-") }),
+            "not a private gone-root fixture",
+        );
+        assert_eq!(hcom_dir, base.join("hcom"));
+        assert_eq!(home, base.join("home"));
+        assert_eq!(tmp, base.join("tmp"));
+        // SAFETY: geteuid only queries this fixture process's effective UID.
+        let uid = unsafe { libc::geteuid() };
+        for path in [base, home.as_path(), hcom_dir.as_path(), tmp.as_path()] {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            assert!(metadata.is_dir(), "private fixture directory required");
+            assert_eq!(metadata.uid(), uid, "fixture directory owner");
+            assert_eq!(metadata.mode() & 0o077, 0, "fixture directory permissions");
+        }
+        let config_path = hcom_dir.join("gone-root-command.json");
+        let metadata = std::fs::symlink_metadata(&config_path).expect("parent fixture config");
+        assert!(metadata.is_file(), "owned regular fixture config required");
+        assert_eq!(metadata.uid(), uid, "fixture config owner");
+        assert_eq!(metadata.mode() & 0o077, 0, "fixture config permissions");
+        assert_eq!(config_path.canonicalize().unwrap(), config_path);
+        let config: CommandFixture =
+            serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+        crate::paths::test_roots::register(base);
+        crate::config::Config::reset();
+        crate::config::Config::init();
+        assert_eq!(crate::paths::hcom_dir(), hcom_dir);
+        config.anchor.assert_live(
+            config.anchor.ppid,
+            config.anchor.pid,
+            config.anchor.session,
+            None,
+        );
+        config.root.assert_live(
+            config.anchor.pid,
+            config.anchor.pid,
+            config.anchor.session,
+            Some(&config.nonce),
+        );
+        config.child.assert_live(
+            config.root.pid,
+            config.anchor.pid,
+            config.anchor.session,
+            Some(&config.nonce),
+        );
+        let descendant_seen = Rc::new(Cell::new(false));
+        let root_outcome = Rc::new(Cell::new(None));
+        let seen = descendant_seen.clone();
+        let outcome = root_outcome.clone();
+        let observed = config.clone();
+        let ack = hcom_dir.join("root.reaped");
+        let hook = scoped_kill_tree_test_hook(move |event| match event {
+            KillTreeTestEvent::DescendantSignal {
+                pid,
+                signal,
+                outcome,
+            } => {
+                assert_eq!(
+                    (pid, signal, outcome),
+                    (observed.child.pid, libc::SIGTERM, GroupSignal::Sent)
+                );
+                assert!(!seen.replace(true), "the fixture child was signaled twice");
+                eprintln!("HCOM106_GONE_COMMAND phase=child-sigterm pid={pid} outcome={outcome:?}");
+                let reaped: RootReaped = read_ack(&ack);
+                assert_eq!(reaped.pid, observed.root.pid);
+                assert_eq!(
+                    reaped.status, 0,
+                    "the shell must finish its plain wait naturally"
+                );
+                assert_eq!(process::kill_state(observed.root.pid), KillState::Gone);
+                assert!(!process::has_identity(
+                    observed.root.pid,
+                    &observed.root.identity
+                ));
+                assert!(process::has_identity(
+                    observed.anchor.pid,
+                    &observed.anchor.identity
+                ));
+                assert_eq!(process::kill_state(observed.anchor.pid), KillState::Live);
+                eprintln!("HCOM106_GONE_COMMAND phase=root-reaped pid={}", reaped.pid);
+            }
+            KillTreeTestEvent::RootOutcome {
+                pid,
+                outcome: actual,
+            } => {
+                assert!(
+                    seen.get(),
+                    "native capture must signal the live descendant first"
+                );
+                assert_eq!(pid, observed.root.pid);
+                assert_eq!(
+                    outcome.replace(Some(actual)),
+                    None,
+                    "one settled root outcome"
+                );
+                eprintln!("HCOM106_GONE_COMMAND phase=root-outcome pid={pid} outcome={actual:?}");
+            }
+        });
+        let code =
+            crate::commands::kill::run(&["kill".to_owned(), config.name], &GlobalFlags::default())
+                .expect("real kill command");
+        assert!(
+            descendant_seen.get(),
+            "native descendant-signal hook never ran"
+        );
+        assert_eq!(root_outcome.get(), Some(GroupSignal::NotFound));
+        drop(hook);
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().flush().unwrap();
+        std::process::exit(code);
+    }
+}
