@@ -508,12 +508,18 @@ pub(crate) fn terminate(
             // Ownership checks can query other state. Any membership change
             // during those checks selects the per-PID path, never a blind
             // signal to newly joined or otherwise uncaptured processes.
-            signal_group = kill_group::live_members(root)
-                .ok()
-                .filter(|current| current == &members)
-                .is_some_and(|current| {
-                    group_signal_allowed(root, current_root.pgid, &targets, &current, process_fact)
-                        && current.iter().all(|pid| {
+            if signal_group {
+                signal_group = kill_group::live_members(root)
+                    .ok()
+                    .filter(|current| current == &members)
+                    .is_some_and(|current| {
+                        group_signal_allowed(
+                            root,
+                            current_root.pgid,
+                            &targets,
+                            &current,
+                            process_fact,
+                        ) && current.iter().all(|pid| {
                             facts.get(pid).is_some_and(|fact| {
                                 eligible_now(
                                     fact,
@@ -526,7 +532,8 @@ pub(crate) fn terminate(
                                 )
                             })
                         })
-                });
+                    });
+            }
         }
         if signal_group {
             let checked_root = process_fact(root)
@@ -559,8 +566,17 @@ pub(crate) fn terminate(
         ) {
             continue;
         }
-        if let Some(result) = signal_one(target, libc::SIGTERM, &mut authorize)?
-            && (result == GroupSignal::Sent || outcome != GroupSignal::Sent)
+        if let Some(result) = signal_one(target, libc::SIGTERM, &mut authorize, |fact| {
+            eligible_now(
+                fact,
+                root,
+                &current_ancestors,
+                &facts,
+                &mut paths,
+                &mut eligible,
+                observe,
+            )
+        })? && (result == GroupSignal::Sent || outcome != GroupSignal::Sent)
         {
             outcome = result;
         }
@@ -607,7 +623,17 @@ pub(crate) fn terminate(
             continue;
         }
         if remaining.binary_search(&target.fact.pid).is_ok()
-            && let Some(result) = signal_one(target, libc::SIGKILL, &mut authorize)?
+            && let Some(result) = signal_one(target, libc::SIGKILL, &mut authorize, |fact| {
+                eligible_now(
+                    fact,
+                    root,
+                    &current_ancestors,
+                    &facts,
+                    &mut paths,
+                    &mut eligible,
+                    observe,
+                )
+            })?
             && (result == GroupSignal::Sent || outcome != GroupSignal::Sent)
         {
             outcome = result;
@@ -678,6 +704,7 @@ fn signal_one(
     target: &Target<'_>,
     signal: libc::c_int,
     authorize: &mut impl FnMut(u32) -> Result<(), KillError>,
+    mut eligible: impl FnMut(&ProcFact) -> bool,
 ) -> Result<Option<GroupSignal>, KillError> {
     if observe(target.fact.pid) != Observation::Present(target.fact.start_time) {
         return Ok(None);
@@ -689,7 +716,9 @@ fn signal_one(
             Ok(None)
         };
     }
-    if observe(target.fact.pid) != Observation::Present(target.fact.start_time) {
+    if !eligible(target.fact)
+        || observe(target.fact.pid) != Observation::Present(target.fact.start_time)
+    {
         return Ok(None);
     }
     // SAFETY: the current incarnation was authorized and rechecked as one
