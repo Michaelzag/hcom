@@ -3,6 +3,9 @@
 //! Membership is not ownership evidence. Callers must authenticate the persisted
 //! owner's incarnation separately before deciding whether any signal is safe.
 
+#[cfg(target_os = "linux")]
+use super::kill_tree_linux::{ProcState, linux_state};
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_PROCESS_COUNT: usize = 65_536;
 #[cfg(target_os = "linux")]
@@ -10,10 +13,13 @@ const MAX_STAT_BYTES: usize = 8_192;
 
 /// List the live members of exactly `pgid`, without signaling any process.
 /// A bounded snapshot must complete before any members are returned.
+/// On Linux, unreadable or changing member thread sets fail the snapshot.
 pub(crate) fn live_members(pgid: u32) -> Result<Vec<u32>, &'static str> {
     #[cfg(target_os = "linux")]
     {
-        linux_members(std::path::Path::new("/proc"), pgid)
+        linux_members(std::path::Path::new("/proc"), pgid, |pid| {
+            linux_state(pid, None)
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -27,10 +33,14 @@ pub(crate) fn live_members(pgid: u32) -> Result<Vec<u32>, &'static str> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_members(proc_root: &std::path::Path, pgid: u32) -> Result<Vec<u32>, &'static str> {
+fn linux_members(
+    proc_root: &std::path::Path,
+    pgid: u32,
+    state_of: impl Fn(u32) -> ProcState,
+) -> Result<Vec<u32>, &'static str> {
     use std::io::Read;
 
-    use super::process::{proc_stat_group_id, proc_stat_is_dead};
+    use super::process::proc_stat_group_id;
 
     let entries = std::fs::read_dir(proc_root).map_err(|_| "could not read process directory")?;
     let mut members = Vec::new();
@@ -79,8 +89,15 @@ fn linux_members(proc_root: &std::path::Path, pgid: u32) -> Result<Vec<u32>, &'s
         // comm can contain non-UTF-8 bytes. Replacing those bytes preserves
         // the ASCII fields parsed after its final closing parenthesis.
         let stat = String::from_utf8_lossy(&stat);
-        if proc_stat_group_id(&stat) == Some(pgid) && !proc_stat_is_dead(&stat) {
-            members.push(pid);
+        if proc_stat_group_id(&stat) != Some(pgid) {
+            continue;
+        }
+        // A zombie leader can still front a live thread. Classify the whole
+        // thread set instead of treating the leader's state as process death.
+        match state_of(pid) {
+            ProcState::Live => members.push(pid),
+            ProcState::Gone | ProcState::Exiting => continue,
+            ProcState::Unknown => return Err("could not determine process-group member state"),
         }
     }
     members.sort_unstable();
@@ -143,6 +160,19 @@ mod tests {
     use super::super::process::{proc_stat_group_id, proc_stat_is_dead, proc_stat_is_zombie};
     use super::*;
 
+    fn kill_and_reap_child(child: &mut std::process::Child) {
+        let killed = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if child.try_wait().expect("reap own fixture").is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fixture did not exit in time");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        killed.expect("kill own fixture");
+    }
+
     #[test]
     fn linux_stat_normal_line() {
         let stat = "42 (sleep) S 1 42 42 0 -1 4194304";
@@ -190,6 +220,7 @@ mod tests {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         for (pid, stat) in [
             ("30", "30 (sleep) S 1 42 42"),
+            ("31", "31 (live worker) Z 1 42 42"),
             ("9", "9 (space ) inside) R 1 42 42"),
             ("0009", "9 (duplicate) R 1 42 42"),
             ("12", "12 (other group) S 1 12 12"),
@@ -205,14 +236,32 @@ mod tests {
         // Missing and unreadable stat entries don't invalidate the other PIDs.
         std::fs::create_dir(root.path().join("24")).unwrap();
         std::fs::create_dir_all(root.path().join("25/stat")).unwrap();
-        assert_eq!(linux_members(root.path(), 42), Ok(vec![9, 30]));
-        assert_eq!(linux_members(root.path(), 100), Ok(vec![]));
+        let state_of = |pid| match pid {
+            12 => ProcState::Unknown,
+            20 => ProcState::Exiting,
+            21 => ProcState::Gone,
+            _ => ProcState::Live,
+        };
+        let members = linux_members(root.path(), 42, state_of);
+        assert_eq!(members, Ok(vec![9, 30, 31]));
+        let unrelated = linux_members(root.path(), 100, state_of);
+        assert_eq!(unrelated, Ok(vec![]));
+    }
+
+    #[test]
+    fn linux_scan_refuses_an_unknown_member_thread_set() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let directory = root.path().join("42");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("stat"), "42 (leader) Z 1 42 42").unwrap();
+        assert!(linux_members(root.path(), 42, |_| ProcState::Unknown).is_err());
     }
 
     #[test]
     fn linux_scan_requires_a_readable_process_directory() {
         let root = tempfile::tempdir_in("/tmp").unwrap();
-        assert!(linux_members(&root.path().join("missing"), 42).is_err());
+        let missing = root.path().join("missing");
+        assert!(linux_members(&missing, 42, |_| ProcState::Live).is_err());
     }
 
     #[test]
@@ -223,7 +272,7 @@ mod tests {
         let mut stat = b"42 (sleep) S 1 42 42".to_vec();
         stat.resize(MAX_STAT_BYTES + 1, b' ');
         std::fs::write(directory.join("stat"), stat).unwrap();
-        assert!(linux_members(root.path(), 42).is_err());
+        assert!(linux_members(root.path(), 42, |_| ProcState::Live).is_err());
     }
 
     #[test]
@@ -240,16 +289,50 @@ mod tests {
         let members = live_members(pid);
         // Only this test's own child receives a signal. Reap it before any
         // assertions so an enumeration failure doesn't leave a fixture behind.
-        let killed = child.kill();
+        kill_and_reap_child(&mut child);
+        assert_eq!(members, Ok(vec![pid]));
+    }
+
+    #[test]
+    fn linux_live_members_keeps_a_zombie_leader_with_a_live_thread() {
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let script = r"
+import ctypes, sys, threading, time
+threading.Thread(target=time.sleep, args=(30,), daemon=True).start()
+time.sleep(0.1)
+ctypes.CDLL(None).syscall(int(sys.argv[1]), 0)
+";
+        let mut child = Command::new("python3")
+            .args(["-I", "-S", "-B", "-c", script])
+            .arg(libc::SYS_exit.to_string())
+            .env("HOME", home.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn own zombie-leader fixture");
+        let pid = child.id();
+        let stat_path = format!("/proc/{pid}/stat");
+        let task_path = format!("/proc/{pid}/task");
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if child.try_wait().expect("reap own fixture").is_some() {
+        let mut leader_exited = false;
+        while Instant::now() < deadline {
+            let zombie = std::fs::read_to_string(&stat_path)
+                .ok()
+                .is_some_and(|stat| proc_stat_is_zombie(&stat));
+            let two_threads = std::fs::read_dir(&task_path)
+                .map(|entries| entries.filter_map(Result::ok).count() == 2)
+                .unwrap_or(false);
+            if zombie && two_threads {
+                leader_exited = true;
                 break;
             }
-            assert!(Instant::now() < deadline, "fixture did not exit in time");
             std::thread::sleep(Duration::from_millis(10));
         }
-        killed.expect("kill own fixture");
+        let members = live_members(pid);
+        kill_and_reap_child(&mut child);
+        assert!(leader_exited, "fixture did not expose its live worker");
         assert_eq!(members, Ok(vec![pid]));
     }
 }
