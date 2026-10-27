@@ -1430,7 +1430,7 @@ fn stop_snapshot(instance_data: &InstanceRow) -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn stop_instance_with_capture(
     db: &HcomDb,
     instance_name: &str,
