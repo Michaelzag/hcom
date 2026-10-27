@@ -5143,7 +5143,6 @@ mod tests {
         assert!(db.get_instance_full(&name).unwrap().is_some());
         assert_eq!(db.process_binding_ids(&name).unwrap(), vec![process_id]);
         assert!(!process_gone(carrier));
-
     }
 
     /// A live process exec'd through a symlink named `comm` (so
@@ -5254,7 +5253,6 @@ mod tests {
         let result = reap_instance_tree_for_excluding_captured(&db, &name, &bindings, &[], capture);
         assert!(result.is_err());
         assert!(!process_gone(carrier));
-
     }
 
     #[test]
@@ -5284,7 +5282,6 @@ mod tests {
         assert!(result.is_ok());
         rooted.wait().ok();
         assert!(!process_gone(detached));
-
     }
 
     /// Bulk kill against a `start --as` rebind landing between the pre-signal
@@ -8519,7 +8516,6 @@ mod tests {
         assert_eq!(err.kind, HolderKind::Orphan);
         assert!(err.pids.contains(&orphan), "refusal names the pid: {err}");
         assert!(err.to_string().contains(&format!("hcom kill {name}")));
-
     }
 
     /// Blocker-B shape: the kill self-path leaves a name-carrying shell
