@@ -1,8 +1,8 @@
 //! Real resume launches whose OMP process has not reached its first hook.
 //!
 //! The fixture tool only waits on file-step gates and calls the real omp-start
-//! hook. Every process belongs to a fixture-owned process group; none invokes
-//! a model, a terminal application, or the operator's hcom state.
+//! hook. Direct children remain retained with birth identities; detached tools
+//! exit through private file gates and fixture-local hcom teardown.
 
 #![cfg(target_os = "linux")]
 
@@ -232,7 +232,6 @@ fn seed_stopped_omp(h: &Hcom, name: &str) -> (String, PathBuf) {
         .spawn()
         .unwrap();
     let prior_pid = i64::from(prior.id());
-    h.track_cleanup_pid(prior_pid);
     prior.wait().unwrap();
     assert!(!alive(prior_pid), "historical fixture owner did not exit");
     let conn = db(h);
@@ -262,9 +261,11 @@ struct CommandOutput {
 }
 
 /// File-backed output cannot be held open by a terminal grandchild. The
-/// deadline and process group bound even a buggy launch that never returns.
+/// deadline bounds even a buggy launch that never returns.
 struct PrivateCommand {
     child: Child,
+    identity: Option<String>,
+    out: PathBuf,
     stdout: PathBuf,
     stderr: PathBuf,
     deadline: Instant,
@@ -284,9 +285,11 @@ impl PrivateCommand {
             .process_group(0)
             .spawn()
             .unwrap();
-        h.track_cleanup_pid(i64::from(child.id()));
+        let identity = support::child_identity(&child);
         Self {
             child,
+            identity,
+            out: h.root_path().join("omp-launch"),
             stdout,
             stderr,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -301,10 +304,21 @@ impl PrivateCommand {
         )
     }
 
-    fn kill_group(&self) {
-        unsafe {
-            nix::libc::kill(-(self.child.id() as i32), nix::libc::SIGKILL);
+    // Release detached tools before callers can drop Hcom's temporary tree,
+    // including a failed first-tool pin or a timed-out launch.
+    fn stop(&mut self) {
+        if let Ok(entries) = fs::read_dir(&self.out) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "started")
+                {
+                    let _ = fs::write(path.with_extension("exit"), "");
+                }
+            }
         }
+        support::terminate_owned_child_group(&mut self.child, self.identity.as_deref());
     }
 
     fn finish(&mut self) -> CommandOutput {
@@ -313,8 +327,7 @@ impl PrivateCommand {
                 break Some(status);
             }
             if Instant::now() >= self.deadline {
-                self.kill_group();
-                let _ = self.child.wait();
+                self.stop();
                 break None;
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -337,22 +350,20 @@ impl PrivateCommand {
 
 impl Drop for PrivateCommand {
     fn drop(&mut self) {
-        self.kill_group();
-        let _ = self.child.wait();
+        self.stop();
     }
 }
 
 #[derive(Debug)]
 struct Tool {
     pid: i64,
-    parent: i64,
     launcher_id: String,
     home: String,
     hcom_dir: String,
 }
 
 fn wait_for_tool(
-    h: &Hcom,
+    _h: &Hcom,
     out: &Path,
     launch: &mut PrivateCommand,
     previous: Option<i64>,
@@ -369,15 +380,13 @@ fn wait_for_tool(
             if Some(pid) == previous {
                 return None;
             }
+            let _parent: i64 = fields.next()?.parse().ok()?;
             let tool = Tool {
                 pid,
-                parent: fields.next()?.parse().ok()?,
                 launcher_id: fields.next()?.to_string(),
                 home: fields.next()?.to_string(),
                 hcom_dir: fields.next()?.to_string(),
             };
-            h.track_cleanup_pid(pid);
-            h.track_cleanup_pid(tool.parent);
             Some(tool)
         });
         if tool.is_some() || launch.child.try_wait().ok().flatten().is_some() {
@@ -400,12 +409,9 @@ fn first_tool(h: Hcom, name: &str, out: &Path, launch: &mut PrivateCommand) -> (
         })
     });
     match (tool, pin) {
-        (Some(tool), Some(pin)) => {
-            h.track_cleanup_pid(pin);
-            (h, tool, pin)
-        }
+        (Some(tool), Some(pin)) => (h, tool, pin),
         (tool, pin) => {
-            launch.kill_group();
+            launch.stop();
             let result = launch.finish();
             drop(h);
             panic!(
@@ -415,10 +421,10 @@ fn first_tool(h: Hcom, name: &str, out: &Path, launch: &mut PrivateCommand) -> (
     }
 }
 
-fn kill_first_tool(tool: &Tool, pin: i64, launch: &mut PrivateCommand) -> (CommandOutput, bool) {
-    unsafe {
-        nix::libc::kill(tool.pid as i32, nix::libc::SIGKILL);
-    }
+fn exit_first_tool(tool: &Tool, pin: i64, launch: &mut PrivateCommand) -> (CommandOutput, bool) {
+    // The tool is a detached grandchild, not an owned Child. Ask the fixture
+    // script to exit without its hook, preserving the stale pre-hook row.
+    fs::write(launch.out.join(format!("{}.exit", tool.pid)), "").unwrap();
     launch.deadline = Instant::now() + PROCESS_WAIT;
     let result = launch.finish();
     let gone = wait_until(PROCESS_WAIT, || {
@@ -502,7 +508,7 @@ fn bind_second(h: &Hcom, name: &str, sid: &str, out: &Path, tool: Option<&Tool>)
 fn cleanup_launch(launch: &mut PrivateCommand) -> CommandOutput {
     // The hook and live owner have already been observed. A custom terminal
     // waits for its tool, so cleanup exit status is not launch-success proof.
-    launch.kill_group();
+    launch.stop();
     launch.finish()
 }
 
@@ -560,7 +566,7 @@ fn a_second_resume_binds_after_the_first_omp_dies_before_its_hook() {
     let (h, c1, pin) = first_tool(h, name, &out, &mut first);
     let first_was_live = alive(pin) && live_tool_under(pin, c1.pid);
     let no_first_hook = !out.join(format!("{}.hook-called", c1.pid)).exists();
-    let (first_result, first_exited) = kill_first_tool(&c1, pin, &mut first);
+    let (first_result, first_exited) = exit_first_tool(&c1, pin, &mut first);
     let dead_pin = row_pid(&h, name);
     let no_hook_after_death = !out.join(format!("{}.hook-called", c1.pid)).exists();
     let first_bound: bool = db(&h)
@@ -635,7 +641,7 @@ fn a_live_matching_pre_hook_owner_cannot_be_stolen_by_another_resume() {
     let after = full_state(&h);
     let c1_live = alive(pin) && live_tool_under(pin, c1.pid);
     let no_hook = !out.join(format!("{}.hook-called", c1.pid)).exists();
-    let (_, first_exited) = kill_first_tool(&c1, pin, &mut first);
+    let (_, first_exited) = exit_first_tool(&c1, pin, &mut first);
     drop(second);
     drop(first);
     drop(h);
@@ -672,6 +678,7 @@ fn a_live_matching_pre_hook_owner_cannot_be_stolen_by_another_resume() {
 
 struct Sentinel {
     child: Child,
+    identity: Option<String>,
     heartbeat: PathBuf,
     signals: PathBuf,
 }
@@ -709,9 +716,10 @@ done
             .process_group(0)
             .spawn()
             .unwrap();
-        h.track_cleanup_pid(i64::from(child.id()));
+        let identity = support::child_identity(&child);
         let sentinel = Self {
             child,
+            identity,
             heartbeat,
             signals,
         };
@@ -747,10 +755,7 @@ done
 
 impl Drop for Sentinel {
     fn drop(&mut self) {
-        unsafe {
-            nix::libc::kill(-(self.child.id() as i32), nix::libc::SIGKILL);
-        }
-        let _ = self.child.wait();
+        support::terminate_owned_child_group(&mut self.child, self.identity.as_deref());
     }
 }
 
@@ -768,7 +773,7 @@ fn a_reused_live_pid_with_a_mismatched_launch_identity_is_replaceable() {
         .filter(|receipt| receipt.is_object())
         .cloned();
     let c1_ticks = start_ticks(pin);
-    let (_, first_exited) = kill_first_tool(&c1, pin, &mut first);
+    let (_, first_exited) = exit_first_tool(&c1, pin, &mut first);
     let Some(receipt) = receipt else {
         drop(first);
         drop(h);
@@ -844,7 +849,7 @@ fn stop_clears_a_live_unverifiable_pre_hook_reservation_without_signaling_then_r
     let out = install_fake_omp(&h, &sid, &transcript);
     let mut first = PrivateCommand::resume(&h, "first", name);
     let (h, c1, pin) = first_tool(h, name, &out, &mut first);
-    let (_, first_exited) = kill_first_tool(&c1, pin, &mut first);
+    let (_, first_exited) = exit_first_tool(&c1, pin, &mut first);
     let sentinel = Sentinel::spawn(&h);
     // An older whole-context rewrite drops the unknown receipt. A live PID
     // without it is legacy/unverifiable, never a matching or mismatched birth.

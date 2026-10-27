@@ -4248,6 +4248,101 @@ fn is_omp_or_hcom_process(pid: u32) -> bool {
         })
 }
 
+/// Detached fixture processes a test never signals. A detached pid is a
+/// bare number the test does not own, and the kernel may have recycled it
+/// by the time cleanup runs, so these fixtures exit on their own instead:
+/// each runs a `sleep` stand-in that blocks on a private gate pipe and
+/// exits at EOF. Cleanup is dropping the [`Gate`], the pipe's only writer.
+#[cfg(all(test, unix))]
+pub(crate) mod gated_fixtures {
+    use std::io::PipeWriter;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
+    /// The stand-in, run on the gate. A non-interactive shell points a
+    /// background job's stdin at /dev/null before any explicit redirect,
+    /// so a script saves the gate as fd 9 first (`exec 9<&0`) and hands it
+    /// back here with `<&9`. The builtin `read` blocks without forking.
+    pub(crate) const SLEEP_ON_GATE: &str = "\"$GATED_SLEEP\" -c 'read _' <&9";
+
+    /// `/bin/sh` linked as `<dir>/gate/sleep`: the stand-in's comm and
+    /// argv[0] basename read `sleep`, the shape the fixtures always had.
+    pub(crate) fn gated_sleep(dir: &Path) -> PathBuf {
+        let gate_dir = dir.join("gate");
+        let sleep = gate_dir.join("sleep");
+        if std::fs::symlink_metadata(&sleep).is_err() {
+            std::fs::create_dir_all(&gate_dir).expect("create gate directory");
+            std::os::unix::fs::symlink("/bin/sh", &sleep).expect("link the gated sleep");
+        }
+        sleep
+    }
+
+    /// A detached fixture's exit gate. Dropping it closes the gate's only
+    /// write end; the stand-in reads EOF and exits, and its reaper (init
+    /// or a subreaper) reaps it. Nothing is signalled.
+    pub(crate) struct Gate {
+        _writer: PipeWriter,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Run `script` under `sh -c` with the gate on stdin and
+    /// `GATED_SLEEP` set; returns the pid the script prints.
+    fn spawn(mut command: Command, script: &str) -> (u32, Gate) {
+        let dir = tempfile::tempdir().expect("gate dir");
+        let (reader, writer) = std::io::pipe().expect("create exit gate");
+        let out = command
+            .arg("-c")
+            .arg(format!("exec 9<&0; {script}"))
+            .env("GATED_SLEEP", gated_sleep(dir.path()))
+            .stdin(reader)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .expect("spawn detached fixture");
+        let pid = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("detached fixture pid");
+        (
+            pid,
+            Gate {
+                _writer: writer,
+                _dir: dir,
+            },
+        )
+    }
+
+    /// A name/process-id-carrying sleeper in a tree of its own: `sh` starts
+    /// it in the background and exits, so it is reparented to init and its
+    /// ppid chain never passes through the test process. It is not the
+    /// test's child: drop the [`Gate`] to end it, never signal its pid.
+    pub(crate) fn spawn_detached_named_sleeper(name: &str, process_id: &str) -> (u32, Gate) {
+        let mut command = Command::new("sh");
+        command
+            .env("HCOM_INSTANCE_NAME", name)
+            .env("HCOM_PROCESS_ID", process_id);
+        spawn(
+            command,
+            &format!("{SLEEP_ON_GATE} >/dev/null 2>&1 & echo $!"),
+        )
+    }
+
+    /// A name-carrying sleeper that leads its own session and process
+    /// group, outside the test's tree (the `sh` parent exits). Returns its
+    /// pid, which is also its group id, and the [`Gate`] that ends it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn spawn_detached_group_leader(name: &str) -> (u32, Gate) {
+        let mut command = Command::new("sh");
+        command
+            .env("HCOM_INSTANCE_NAME", name)
+            .env_remove("HCOM_PROCESS_ID");
+        spawn(
+            command,
+            &format!("setsid {SLEEP_ON_GATE} >/dev/null 2>&1 & echo $!"),
+        )
+    }
+}
+
 /// Row and process fixtures for the orphan-carrier tests here and in
 /// `commands::{stop, resume, kill}`. Every process tree starts OUTSIDE the
 /// test binary's own tree: a stop's capture roots its caller
@@ -4255,9 +4350,11 @@ fn is_omp_or_hcom_process(pid: u32) -> bool {
 /// that stop's signal scope, which no real orphan ever does.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod orphan_fixtures {
+    use super::gated_fixtures::{SLEEP_ON_GATE, gated_sleep};
     use super::{SWEEP_FRESH_GRACE_SECS, parent_pid, process_gone};
     use crate::db::HcomDb;
     use std::ffi::OsStr;
+    use std::io::{PipeReader, PipeWriter};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -4323,22 +4420,27 @@ pub(crate) mod orphan_fixtures {
             .is_some_and(|env| env.split(|b| *b == 0).any(|var| var == entry.as_bytes()))
     }
 
-    /// Processes a fixture started, all carrying `marker` in their environ.
-    /// Drop SIGKILLs them in order, each only while it still carries the
-    /// marker (so a failing assertion can never kill an unrelated process),
-    /// then waits until their reaper has reaped every one.
+    /// Processes a fixture started, all carrying `marker` in their environ
+    /// and all blocked on the tree's exit gate. Drop closes the gate, so
+    /// every one exits on its own (none is ever signalled), then waits
+    /// until their reaper has reaped every one.
     struct Tree {
         marker: String,
         pids: Vec<u32>,
         dir: tempfile::TempDir,
+        gate: Option<PipeWriter>,
+        gate_rx: PipeReader,
     }
 
     impl Tree {
         fn new(name: &str) -> Self {
+            let (gate_rx, gate) = std::io::pipe().expect("create exit gate");
             Self {
                 marker: format!("ORPHAN_FIXTURE={name}"),
                 pids: Vec::new(),
                 dir: tempfile::tempdir().expect("fixture dir"),
+                gate: Some(gate),
+                gate_rx,
             }
         }
 
@@ -4349,6 +4451,8 @@ pub(crate) mod orphan_fixtures {
         /// Start `script` under `program -c`, detached: the process is
         /// reparented away from this test before it execs, and with
         /// `subreaper` it is the child subreaper of everything it spawns.
+        /// The script runs with the exit gate saved as fd 9, so it starts
+        /// each of its sleepers as `SLEEP_ON_GATE`.
         fn spawn_detached(
             &self,
             program: &Path,
@@ -4359,14 +4463,15 @@ pub(crate) mod orphan_fixtures {
             let mut command = Command::new(program);
             command
                 .arg("-c")
-                .arg(script)
+                .arg(format!("exec 9<&0; {script}"))
                 .env_remove("HCOM_INSTANCE_NAME")
                 .env_remove("HCOM_PROCESS_ID")
                 .env(
                     "ORPHAN_FIXTURE",
                     self.marker.trim_start_matches("ORPHAN_FIXTURE="),
                 )
-                .stdin(Stdio::null())
+                .env("GATED_SLEEP", gated_sleep(self.dir.path()))
+                .stdin(self.gate_rx.try_clone().expect("clone the exit gate"))
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             for (key, value) in envs {
@@ -4440,12 +4545,8 @@ pub(crate) mod orphan_fixtures {
 
     impl Drop for Tree {
         fn drop(&mut self) {
-            for &pid in &self.pids {
-                if self.alive(pid) {
-                    // Only a live pid still carrying this fixture's marker.
-                    let _ = crate::sys::process::signal_pid(pid, libc::SIGKILL);
-                }
-            }
+            // Close the gate: every fixture process reads EOF and exits.
+            drop(self.gate.take());
             // Detached: their reaper (the subreaper above this test, or
             // init) reaps them. /proc/<pid> stays until that reap.
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -4492,9 +4593,11 @@ pub(crate) mod orphan_fixtures {
         let carrier_file = tree.path("carrier.pid");
         tree.spawn_detached(
             Path::new("/bin/sh"),
-            "echo $$ > \"$STANDIN_PID\"; \
-             (HCOM_INSTANCE_NAME=\"$INSTANCE\" sleep 300 & echo $! > \"$CARRIER_PID\"); \
-             exec sleep 300",
+            &format!(
+                "echo $$ > \"$STANDIN_PID\"; \
+                 (HCOM_INSTANCE_NAME=\"$INSTANCE\" {SLEEP_ON_GATE} & echo $! > \"$CARRIER_PID\"); \
+                 exec {SLEEP_ON_GATE}"
+            ),
             &[
                 ("STANDIN_PID", standin_file.as_os_str()),
                 ("CARRIER_PID", carrier_file.as_os_str()),
@@ -4502,8 +4605,6 @@ pub(crate) mod orphan_fixtures {
             ],
             true,
         );
-        // Carrier first: Drop kills in push order, so the stand-in, which
-        // reaps nothing, dies after its zombie child and hands it on.
         let carrier = tree.read_pid("carrier.pid");
         let standin = tree.read_pid("standin.pid");
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -4571,8 +4672,10 @@ pub(crate) mod orphan_fixtures {
         let transcript = dir.join(format!("{session_id}.jsonl"));
         tree.spawn_detached(
             &program,
-            "echo $$ > \"$HOLDER_PID\"; exec 3>>\"$TRANSCRIPT\"; \
-             HCOM_INSTANCE_NAME=\"$INSTANCE\" sleep 300 3>&- & echo $! > \"$CARRIER_PID\"; wait",
+            &format!(
+                "echo $$ > \"$HOLDER_PID\"; exec 3>>\"$TRANSCRIPT\"; \
+                 HCOM_INSTANCE_NAME=\"$INSTANCE\" {SLEEP_ON_GATE} 3>&- & echo $! > \"$CARRIER_PID\"; wait"
+            ),
             &[
                 ("HOLDER_PID", holder_file.as_os_str()),
                 ("CARRIER_PID", carrier_file.as_os_str()),
@@ -5030,7 +5133,7 @@ mod tests {
         let name = unique_name("unproven-release");
         let process_id = format!("proc-{}", rand_suffix());
         insert_null_pid_row(&db, &name, &process_id);
-        let carrier = spawn_detached_named_sleeper(&name, &process_id);
+        let (carrier, _gate) = gated_fixtures::spawn_detached_named_sleeper(&name, &process_id);
         wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
         let outcome = crate::hooks::common::stop_instance(&db, &name, "test", "stopped");
         assert!(matches!(
@@ -5040,7 +5143,7 @@ mod tests {
         assert!(db.get_instance_full(&name).unwrap().is_some());
         assert_eq!(db.process_binding_ids(&name).unwrap(), vec![process_id]);
         assert!(!process_gone(carrier));
-        let _ = crate::sys::process::signal_pid(carrier, libc::SIGKILL);
+
     }
 
     /// A live process exec'd through a symlink named `comm` (so
@@ -5144,14 +5247,14 @@ mod tests {
         let name = unique_name("bulk-pre-signal");
         let process_id = format!("proc-{}", rand_suffix());
         insert_null_pid_row(&db, &name, &process_id);
-        let carrier = spawn_detached_named_sleeper(&name, &process_id);
+        let (carrier, _gate) = gated_fixtures::spawn_detached_named_sleeper(&name, &process_id);
         wait_for_enumerated(&name, std::slice::from_ref(&process_id), carrier);
         let (row, bindings) = db.get_instance_with_bindings(&name).unwrap();
         let capture = capture_reap_carriers(&db, &name, row.as_ref(), &bindings, &[], &[]).unwrap();
         let result = reap_instance_tree_for_excluding_captured(&db, &name, &bindings, &[], capture);
         assert!(result.is_err());
         assert!(!process_gone(carrier));
-        let _ = crate::sys::process::signal_pid(carrier, libc::SIGKILL);
+
     }
 
     #[test]
@@ -5173,7 +5276,7 @@ mod tests {
         let token = format!("proc-{}", rand_suffix());
         insert_null_pid_row(&db, &name, &token);
         let mut rooted = spawn_named_sleeper(&name, &token);
-        let detached = spawn_detached_named_sleeper(&name, &token);
+        let (detached, _gate) = gated_fixtures::spawn_detached_named_sleeper(&name, &token);
         let bindings = db.process_binding_ids(&name).unwrap();
         wait_for_enumerated(&name, &bindings, rooted.id());
         wait_for_enumerated(&name, &bindings, detached);
@@ -5181,7 +5284,7 @@ mod tests {
         assert!(result.is_ok());
         rooted.wait().ok();
         assert!(!process_gone(detached));
-        let _ = crate::sys::process::signal_pid(detached, libc::SIGKILL);
+
     }
 
     /// Bulk kill against a `start --as` rebind landing between the pre-signal
@@ -5229,14 +5332,15 @@ mod tests {
             .unwrap();
         db.set_process_binding(&token_b, "sess-rebound", &name)
             .unwrap();
-        let carrier_b = spawn_detached_named_sleeper(&name, &token_b);
+        let (carrier_b, gate_b) = gated_fixtures::spawn_detached_named_sleeper(&name, &token_b);
         wait_for_enumerated(&name, std::slice::from_ref(&token_b), carrier_b);
 
         let outcome =
             crate::hooks::common::stop_instance_with_capture(&db, &name, "test", "killed", capture);
         let row = db.get_instance_full(&name).unwrap();
         let b_alive = !process_gone(carrier_b);
-        let _ = crate::sys::process::signal_pid(carrier_b, libc::SIGKILL);
+        // B is not the test's child: closing its gate ends it, unsignalled.
+        drop(gate_b);
 
         assert!(
             row.is_some_and(|row| row.created_at.to_bits() == created_b.to_bits()),
@@ -5373,48 +5477,29 @@ mod tests {
         );
     }
 
-    /// A name-carrying sleeper that leads its own session and process group,
-    /// outside the test's tree (the `sh` parent exits). Returns its pid, which
-    /// is also its group id.
-    #[cfg(target_os = "linux")]
-    fn spawn_detached_group_leader(name: &str) -> u32 {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("setsid sleep 300 >/dev/null 2>&1 & echo $!")
-            .env("HCOM_INSTANCE_NAME", name)
-            .env_remove("HCOM_PROCESS_ID")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .expect("spawn group leader");
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .expect("group leader pid")
-    }
-
     /// The orphan arm captures before its group signal. A row-less orphan
     /// has no row root, so its live group is dropped unproven; once the
-    /// signal kills it nothing lives, and the reap must not refuse on a
+    /// group is gone nothing lives, and the reap must not refuse on a
     /// carrier that existed only in the pre-signal snapshot.
     #[test]
     #[cfg(target_os = "linux")]
     fn unproven_refusal_requires_a_live_carrier_at_decision() {
         let db = test_db();
         let name = unique_name("orphan-group");
-        let leader = spawn_detached_group_leader(&name);
+        let (leader, gate) = gated_fixtures::spawn_detached_group_leader(&name);
         wait_for_enumerated(&name, &[], leader);
         let capture = capture_reap_carriers(&db, &name, None, &[], &[], &[]).unwrap();
-        // The orphan arm's group signal.
-        let _ = crate::sys::process::signal_group(leader, libc::SIGKILL);
+        // The orphan arm's group signal, stood in for by closing the
+        // leader's gate: the leader is not the test's child, so the test
+        // never signals its pid or group; it exits on its own.
+        drop(gate);
         for _ in 0..100 {
             if process_gone(leader) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(process_gone(leader), "group signal must kill the leader");
+        assert!(process_gone(leader), "the closed gate must end the leader");
         let result = reap_instance_tree_for_excluding_captured(&db, &name, &[], &[], capture);
         assert!(result.is_ok(), "{result:?}");
     }
@@ -8305,28 +8390,6 @@ mod tests {
         }
     }
 
-    /// A name/process-id-carrying sleeper in a tree of its own: `sh` spawns
-    /// it in the background and exits, so the sleeper is reparented to init —
-    /// its ppid chain never passes through the test process. Returns its pid
-    /// (it is not our child, so kill it with `libc::kill`).
-    #[cfg(unix)]
-    fn spawn_detached_named_sleeper(name: &str, process_id: &str) -> u32 {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 300 >/dev/null 2>&1 & echo $!")
-            .env("HCOM_INSTANCE_NAME", name)
-            .env("HCOM_PROCESS_ID", process_id)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .expect("spawn detached sleeper");
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .expect("detached sleeper pid")
-    }
-
     /// A sleeper with no identity env at all: it can sit topologically inside
     /// another process's tree but has no facts to share.
     #[cfg(unix)]
@@ -8436,7 +8499,10 @@ mod tests {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = test_db();
         let name = unique_name("orphanout");
-        let orphan = spawn_detached_named_sleeper(&name, &format!("proc-old-{}", rand_suffix()));
+        let (orphan, _gate) = gated_fixtures::spawn_detached_named_sleeper(
+            &name,
+            &format!("proc-old-{}", rand_suffix()),
+        );
         wait_for_enumerated(&name, &[], orphan);
         let start = processes_for_instance(&name, &[], &[])
             .into_iter()
@@ -8453,7 +8519,7 @@ mod tests {
         assert_eq!(err.kind, HolderKind::Orphan);
         assert!(err.pids.contains(&orphan), "refusal names the pid: {err}");
         assert!(err.to_string().contains(&format!("hcom kill {name}")));
-        let _ = crate::sys::process::signal_pid(orphan, libc::SIGKILL);
+
     }
 
     /// Blocker-B shape: the kill self-path leaves a name-carrying shell
@@ -8789,6 +8855,25 @@ mod tests {
         bin.to_str().expect("utf-8 tool path").to_string()
     }
 
+    /// A fake tool that lives while the file `gate` exists, so a test can
+    /// make a tool it did not spawn directly (a wrapper's `$!`) exit on its
+    /// own: removing the file ends it, and nothing is signalled.
+    #[cfg(target_os = "linux")]
+    fn fake_tool_gated(dir: &std::path::Path, name: &str, gate: &std::path::Path) -> String {
+        std::fs::write(gate, "").unwrap();
+        let bin = dir.join(name);
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/bash\nwhile [ -e '{}' ]; do sleep 1; done\n",
+                gate.display()
+            ),
+        )
+        .unwrap();
+        crate::sys::fs::set_executable(&bin).unwrap();
+        bin.to_str().expect("utf-8 tool path").to_string()
+    }
+
     /// A wrapper shell that starts `script &`, prints the tool's pid, and then
     /// stays alive — the generated launch script's shape, whose trailing
     /// `exec bash -l` is what keeps a dead tool's wrapper running.
@@ -8902,7 +8987,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn live_tool_processes_separates_a_live_tool_from_a_surviving_wrapper() {
         let dir = tempfile::tempdir().unwrap();
-        let tool_bin = fake_tool(dir.path(), "hcom-fake-tool");
+        let gate = dir.path().join("hcom-fake-tool.live");
+        let tool_bin = fake_tool_gated(dir.path(), "hcom-fake-tool", &gate);
         let (wrapper, tool, keep) = wrapper_tree(&tool_bin);
         let _tree = FixtureTree(keep);
 
@@ -8918,8 +9004,9 @@ mod tests {
         );
 
         // Now the trap: the tool exits before its first hook, and the wrapper
-        // keeps running. That must read as gone, never as alive.
-        let _ = crate::sys::process::kill(tool);
+        // keeps running. That must read as gone, never as alive. The tool is
+        // the wrapper's `$!`, not the test's child: removing its gate ends it.
+        std::fs::remove_file(&gate).unwrap();
         wait_gone(tool);
         assert!(
             !process_gone(wrapper),

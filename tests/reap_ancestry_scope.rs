@@ -6,12 +6,13 @@
 mod support;
 
 use std::fs;
+use std::io::PipeWriter;
 use std::os::unix::fs::symlink;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
-use support::{Hcom, unique_suffix};
+use support::{Hcom, child_identity, terminate_owned_child, unique_suffix};
 
 fn parent_pid(pid: u32) -> Option<u32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -84,29 +85,36 @@ fn wait_until_gone(pid: u32) {
     }
 }
 
-// The shell and sibling are Child handles we spawned. The one raw PID comes
-// from that shell's private pid file and is checked against its unique identity
-// before cleanup signals it, including after a test assertion fails.
+/// A `sleep` stand-in whose comm is still `sleep`: run as
+/// `"$SLEEP_BIN" -c 'read _' <&9`, it blocks on the fixture's private gate
+/// pipe and exits on its own at EOF, so cleanup never signals it.
+fn gated_sleep(h: &Hcom) -> PathBuf {
+    let dir = h.root_path().join("gate");
+    let sleep = dir.join("sleep");
+    if fs::symlink_metadata(&sleep).is_err() {
+        fs::create_dir_all(&dir).expect("create gate directory");
+        symlink("/bin/sh", &sleep).expect("create gated sleep binary");
+    }
+    sleep
+}
+
+// The shell and sibling are Child handles we spawned; cleanup signals only
+// them, after their spawn identity rechecks. The in-tree carrier is the
+// shell's child, not ours: it blocks on the gate this struct holds the only
+// write end of, so dropping the gate makes it exit on its own.
 struct Carriers {
     owner: Child,
-    inside: u32,
+    owner_identity: Option<String>,
     outside: Child,
-    process_id: String,
+    outside_identity: Option<String>,
+    gate: Option<PipeWriter>,
 }
 
 impl Drop for Carriers {
     fn drop(&mut self) {
-        if live(self.inside) && has_identity(self.inside, &self.process_id) {
-            unsafe { libc::kill(self.inside as libc::pid_t, libc::SIGKILL) };
-        }
-        if self.owner.try_wait().ok().flatten().is_none() {
-            let _ = self.owner.kill();
-        }
-        let _ = self.owner.wait();
-        if self.outside.try_wait().ok().flatten().is_none() {
-            let _ = self.outside.kill();
-        }
-        let _ = self.outside.wait();
+        drop(self.gate.take());
+        terminate_owned_child(&mut self.owner, self.owner_identity.as_deref());
+        terminate_owned_child(&mut self.outside, self.outside_identity.as_deref());
     }
 }
 
@@ -188,26 +196,32 @@ fn stop_reaps_recorded_owner_descendant_but_spares_sibling_with_same_identity() 
     let name = format!("ancestry-owner-{suffix}");
     let process_id = format!("stale-desktop-{suffix}");
     let child_pid_file = h.root_path().join("owner-child.pid");
+    let sleep = gated_sleep(&h);
+    let (gate_rx, gate) = std::io::pipe().expect("create cleanup gate");
     let owner = h
         .external_cmd("sh")
         .args([
             "-c",
-            "trap 'wait' TERM; sleep 300 & echo $! > \"$CHILD_PID_FILE\"; wait",
+            "exec 9<&0; trap 'wait' TERM; \"$SLEEP_BIN\" -c 'read _' <&9 & echo $! > \"$CHILD_PID_FILE\"; wait",
         ])
+        .env("SLEEP_BIN", &sleep)
         .env("CHILD_PID_FILE", &child_pid_file)
         .env("HCOM_PROCESS_ID", &process_id)
-        .stdin(Stdio::null())
+        .stdin(gate_rx)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn instance owner shell");
+    let owner_identity = child_identity(&owner);
     let inside = wait_for_inside(&child_pid_file, owner.id(), &process_id);
     let outside = spawn_outside(&h, &process_id);
+    let outside_identity = child_identity(&outside);
     let mut carriers = Carriers {
         owner,
-        inside,
+        owner_identity,
         outside,
-        process_id: process_id.clone(),
+        outside_identity,
+        gate: Some(gate),
     };
     assert_eq!(parent_pid(carriers.outside.id()), Some(std::process::id()));
     assert!(has_identity(carriers.outside.id(), &process_id));
@@ -232,6 +246,8 @@ fn stop_from_another_session_uses_live_omp_binding_owner_when_row_pid_is_null() 
     let omp = fixture.join("omp");
     symlink("/bin/sh", &omp).expect("create fake omp binary");
     let child_pid_file = fixture.join("owner-child.pid");
+    let sleep = gated_sleep(&h);
+    let (gate_rx, gate) = std::io::pipe().expect("create cleanup gate");
     let owner = h
         .external_cmd("sh")
         .args([
@@ -242,14 +258,16 @@ fn stop_from_another_session_uses_live_omp_binding_owner_when_row_pid_is_null() 
         .env("OMP_BIN", &omp)
         .env(
             "OWNER_SCRIPT",
-            "trap 'wait' TERM; sleep 300 & echo $! > \"$CHILD_PID_FILE\"; wait",
+            "exec 9<&0; trap 'wait' TERM; \"$SLEEP_BIN\" -c 'read _' <&9 & echo $! > \"$CHILD_PID_FILE\"; wait",
         )
+        .env("SLEEP_BIN", &sleep)
         .env("CHILD_PID_FILE", &child_pid_file)
-        .stdin(Stdio::null())
+        .stdin(gate_rx)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn minted omp owner");
+    let owner_identity = child_identity(&owner);
     let process_id = format!("omp-{}-{suffix}", owner.id());
     let inside = wait_for_inside(&child_pid_file, owner.id(), &process_id);
     assert_eq!(
@@ -260,11 +278,13 @@ fn stop_from_another_session_uses_live_omp_binding_owner_when_row_pid_is_null() 
     );
     assert!(has_identity(owner.id(), &process_id));
     let outside = spawn_outside(&h, &process_id);
+    let outside_identity = child_identity(&outside);
     let mut carriers = Carriers {
         owner,
-        inside,
+        owner_identity,
         outside,
-        process_id: process_id.clone(),
+        outside_identity,
+        gate: Some(gate),
     };
     assert_eq!(parent_pid(carriers.outside.id()), Some(std::process::id()));
     assert!(has_identity(carriers.outside.id(), &process_id));
@@ -291,25 +311,28 @@ fn kill_freezes_descendant_identity_before_the_owner_group_dies() {
     let process_id = format!("reparent-binding-{suffix}");
     let child_pid_file = h.root_path().join("detached-child.pid");
     let setsid = h.resolve_external("setsid").expect("setsid binary");
-    let sleep = h.resolve_external("sleep").expect("sleep binary");
+    let sleep = gated_sleep(&h);
+    let (gate_rx, gate) = std::io::pipe().expect("create cleanup gate");
     let owner = h
         .external_cmd("sh")
         .args([
             "-c",
-            "\"$SETSID_BIN\" \"$SLEEP_BIN\" 300 & echo $! > \"$CHILD_PID_FILE\"; wait",
+            "exec 9<&0; \"$SETSID_BIN\" \"$SLEEP_BIN\" -c 'read _' <&9 & echo $! > \"$CHILD_PID_FILE\"; wait",
         ])
         .env("SETSID_BIN", setsid)
-        .env("SLEEP_BIN", sleep)
+        .env("SLEEP_BIN", &sleep)
         .env("CHILD_PID_FILE", &child_pid_file)
         .env("HCOM_PROCESS_ID", &process_id)
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(gate_rx)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn headless owner shell");
+    let owner_identity = child_identity(&owner);
     let inside = wait_for_inside(&child_pid_file, owner.id(), &process_id);
     let outside = spawn_outside(&h, &process_id);
+    let outside_identity = child_identity(&outside);
     let detached_deadline = Instant::now() + Duration::from_secs(10);
     while process_group_id(inside) != Some(inside) {
         assert!(
@@ -325,9 +348,10 @@ fn kill_freezes_descendant_identity_before_the_owner_group_dies() {
     );
     let mut carriers = Carriers {
         owner,
-        inside,
+        owner_identity,
         outside,
-        process_id: process_id.clone(),
+        outside_identity,
+        gate: Some(gate),
     };
     let db = seed_row(&h, &name, &process_id, Some(carriers.owner.id()));
     db.execute(

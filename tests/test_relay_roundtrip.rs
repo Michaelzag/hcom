@@ -226,13 +226,13 @@ fn run_command_with_timeout(mut command: Command, label: &str, timeout: Duration
         ));
 
     let mut child = command.spawn().expect("failed to execute hcom");
+    let identity = support::child_identity(&child);
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                support::terminate_owned_child(&mut child, identity.as_deref());
                 let stdout = read_capture(&stdout_file);
                 let stderr = read_capture(&stderr_file);
                 panic!(
@@ -896,13 +896,13 @@ fn safe_relay_status(hcom_dir: &str) -> String {
         Ok(child) => child,
         Err(e) => return format!("<spawn failed: {e}>"),
     };
+    let identity = support::child_identity(&child);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                support::terminate_owned_child(&mut child, identity.as_deref());
                 return "<timed out after 10s>".to_string();
             }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
@@ -950,44 +950,6 @@ fn install_diagnostic_panic_hook(path_a: String, path_b: String) {
     }));
 }
 
-/// Kill orphan debug relay-worker processes from previous failed test runs.
-/// Without this, a stale daemon can hold MQTT connections and interfere with
-/// new test runs (the test creates isolated HCOM_DIRs but can't find orphan
-/// PIDs once the old temp dir is deleted).
-#[cfg(unix)]
-fn kill_orphan_debug_daemons() {
-    let Ok(output) = std::process::Command::new("pgrep")
-        .args(["-f", "target/debug/hcom relay-worker"])
-        .output()
-    else {
-        return;
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if let Ok(pid) = line.trim().parse::<i32>() {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn kill_orphan_debug_daemons() {
-    // Windows has no built-in command-line process matcher equivalent to
-    // pgrep. Each run uses unique HCOM_DIRs and its PID-file-owned daemons are
-    // still cleaned by RelayGuard below.
-}
-
-fn kill_daemon(hcom_dir: &str) {
-    let pid_path = Path::new(hcom_dir).join(".tmp").join("relay.pid");
-    if let Ok(content) = fs::read_to_string(&pid_path)
-        && let Ok(pid) = content.trim().parse::<i64>()
-    {
-        support::terminate_process_group(pid);
-    }
-}
-
 // ── Cleanup guard ──────────────────────────────────────────────────────
 
 struct RelayGuard {
@@ -1010,11 +972,15 @@ impl Drop for RelayGuard {
                 let _ = hcom_with_dir(&format!("kill {name}"), &d_str);
             }
         }
+        // Worker teardown goes only through hcom against each isolated
+        // HCOM_DIR: `relay daemon stop` verifies the recorded worker's
+        // identity before signalling it. The test never signals a PID read
+        // from relay.pid, and never sweeps relay-worker processes by name —
+        // on a shared host those may belong to other runs or users.
         for d in [&self.dir_a, &self.dir_b].into_iter().flatten() {
             let d_str = d.to_string_lossy();
             let _ = hcom_with_dir("relay off", &d_str);
             let _ = hcom_with_dir("relay daemon stop", &d_str);
-            kill_daemon(&d_str);
             let _ = fs::remove_dir_all(d);
         }
     }
@@ -1025,8 +991,6 @@ impl Drop for RelayGuard {
 #[test]
 #[ignore]
 fn test_relay_roundtrip() {
-    kill_orphan_debug_daemons();
-
     let dir_a = tempfile::tempdir().expect("failed to create temp dir A");
     let dir_b = tempfile::tempdir().expect("failed to create temp dir B");
 

@@ -25,12 +25,20 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// rumqttc's 1s+ retry pacing).
 const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A worker child that is always killed and reaped when the test ends.
+/// A worker child that is always killed and reaped when the test ends, and
+/// only while it is still the unreaped process whose birth identity was
+/// captured at spawn.
 struct Worker {
     child: Child,
+    identity: Option<String>,
 }
 
 impl Worker {
+    fn new(child: Child) -> Self {
+        let identity = support::child_identity(&child);
+        Self { child, identity }
+    }
+
     fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -55,8 +63,7 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        support::terminate_owned_child_group(&mut self.child, self.identity.as_deref());
     }
 }
 
@@ -76,7 +83,7 @@ fn start_worker(h: &Hcom, mut cmd: Command) -> Worker {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // Own process group, so the fixture's group sweep also reaps it.
+    // Own process group, so Drop can clean the worker's whole group.
     #[cfg(unix)]
     cmd.process_group(0);
     let deadline = Instant::now() + READY_TIMEOUT;
@@ -94,8 +101,7 @@ fn start_worker(h: &Hcom, mut cmd: Command) -> Worker {
             Err(e) => panic!("spawn relay-worker: {e}"),
         }
     };
-    h.track_cleanup_pid(i64::from(child.id()));
-    let mut worker = Worker { child };
+    let mut worker = Worker::new(child);
 
     loop {
         if read_pid_file(h) == Some(worker.pid()) {
@@ -457,8 +463,14 @@ fn shutdown_during_reconnect_backoff_exits() {
         event_count(log, "relay.reconnect_attempt") >= 2
     });
 
-    let rc = unsafe { nix::libc::kill(worker.pid() as i32, nix::libc::SIGTERM) };
-    assert_eq!(rc, 0, "SIGTERM delivery failed");
+    assert!(
+        support::signal_owned_child(
+            &mut worker.child,
+            worker.identity.as_deref(),
+            nix::libc::SIGTERM
+        ),
+        "SIGTERM delivery to the owned worker failed"
+    );
     // The graceful stop publishes a tombstone and waits up to 5s for its
     // PUBACK; anything well past that means the signal was swallowed by a
     // loop instead of ending the process.

@@ -299,15 +299,20 @@ pub fn launch_env_regime(run_here: bool, inside_ai_tool: bool) -> LaunchEnvRegim
     }
 }
 
-pub fn contaminated_parent() -> bool {
-    contaminated_parent_with_inside_ai_tool(crate::shared::platform::is_inside_ai_tool())
+fn contaminated_parent_with_inside_ai_tool(inside_ai_tool: bool) -> bool {
+    contaminated_parent_with_env(
+        inside_ai_tool,
+        |key| std::env::var_os(key).is_some(),
+        || std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("CARGO_")),
+    )
 }
 
-fn contaminated_parent_with_inside_ai_tool(inside_ai_tool: bool) -> bool {
-    inside_ai_tool
-        || std::env::var_os("CI").is_some()
-        || std::env::var_os("GITHUB_ACTIONS").is_some()
-        || std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("CARGO_"))
+fn contaminated_parent_with_env(
+    inside_ai_tool: bool,
+    has_key: impl Fn(&str) -> bool,
+    has_cargo_key: impl FnOnce() -> bool,
+) -> bool {
+    inside_ai_tool || has_key("CI") || has_key("GITHUB_ACTIONS") || has_cargo_key()
 }
 
 /// Build base environment, then overlay config.toml + ~/.hcom/env (these win).
@@ -2861,41 +2866,6 @@ mod tests {
     }
 
     impl EnvVarGuard {
-        fn clean_detection_env() -> Self {
-            let mut keys: Vec<String> = [
-                "CLAUDECODE",
-                "CLAUDE_ENV_FILE",
-                "ANTIGRAVITY_AGENT",
-                "GEMINI_CLI",
-                "CODEX_SANDBOX",
-                "CODEX_SANDBOX_NETWORK_DISABLED",
-                "CODEX_MANAGED_BY_NPM",
-                "CODEX_MANAGED_BY_BUN",
-                "CODEX_THREAD_ID",
-                "OPENCODE",
-                "KILO",
-                "CURSOR_AGENT",
-                "CURSOR_PROJECT_DIR",
-                "KIMI_CODE_CLI",
-                "KIMI_SESSION_ID",
-                "HCOM_TOOL",
-                "HCOM_LAUNCHED",
-                "HCOM_PI",
-                "CI",
-                "GITHUB_ACTIONS",
-                "CARGO_TEST_PARENT",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-            keys.extend(
-                std::env::vars()
-                    .map(|(key, _)| key)
-                    .filter(|key| key.starts_with("CARGO_")),
-            );
-            Self::remove(keys)
-        }
-
         fn remove<I>(keys: I) -> Self
         where
             I: IntoIterator<Item = String>,
@@ -3347,26 +3317,70 @@ mod tests {
         assert!(!strip.contains("TERM"));
     }
 
+    type EnvironmentEntries<'a> = &'a [(&'a str, &'a str)];
+
     #[test]
-    #[serial]
     fn test_contaminated_parent_detection() {
-        let _guard = EnvVarGuard::clean_detection_env();
-        assert!(!contaminated_parent());
+        let cases: &[(EnvironmentEntries<'_>, bool, bool)] = &[
+            (&[], false, false),
+            (&[], true, true),
+            (&[("CI", "")], false, true),
+            (&[("CI", "1")], false, true),
+            (&[("GITHUB_ACTIONS", "false")], false, true),
+            (&[("CARGO_", "")], false, true),
+            (&[("CARGO_TARGET_DIR", "/tmp/target")], false, true),
+            (&[("XCARGO_TARGET_DIR", "/tmp/target")], false, false),
+            (&[("cargo_TARGET_DIR", "/tmp/target")], false, false),
+        ];
+        for &(entries, inside_ai_tool, expected) in cases {
+            let env: HashMap<String, String> = entries
+                .iter()
+                .map(|&(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(
+                contaminated_parent_with_env(
+                    inside_ai_tool,
+                    |key| env.contains_key(key),
+                    || env.keys().any(|key| key.starts_with("CARGO_")),
+                ),
+                expected,
+                "entries={entries:?}, inside_ai_tool={inside_ai_tool}",
+            );
+        }
+    }
 
-        unsafe { std::env::set_var("CLAUDECODE", "1") };
-        assert!(contaminated_parent());
-        unsafe { std::env::remove_var("CLAUDECODE") };
+    #[test]
+    fn test_contaminated_parent_tool_detection() {
+        use crate::shared::context::HcomContext;
+        use crate::tool::Tool;
 
-        unsafe { std::env::set_var("CODEX_THREAD_ID", "thread") };
-        assert!(contaminated_parent());
-        unsafe { std::env::remove_var("CODEX_THREAD_ID") };
-
-        unsafe { std::env::set_var("CI", "1") };
-        assert!(contaminated_parent());
-        unsafe { std::env::remove_var("CI") };
-
-        unsafe { std::env::set_var("CARGO_TEST_PARENT", "1") };
-        assert!(contaminated_parent());
+        let cases: &[(EnvironmentEntries<'_>, Tool, bool)] = &[
+            (&[], Tool::Adhoc, false),
+            (&[("CLAUDECODE", "1")], Tool::Claude, true),
+            (&[("CODEX_THREAD_ID", "thread")], Tool::Codex, true),
+            (&[("HCOM_OMP", "1")], Tool::Omp, true),
+            (&[("OMPCODE", "1")], Tool::Omp, true),
+            (&[("OMPCODE", "1"), ("CLAUDECODE", "1")], Tool::Omp, true),
+            (&[("HCOM_LAUNCHED", "1")], Tool::Adhoc, true),
+            (&[("HCOM_LAUNCHED", "true")], Tool::Adhoc, false),
+        ];
+        for &(entries, expected_tool, expected) in cases {
+            let env: HashMap<String, String> = entries
+                .iter()
+                .map(|&(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            let context = HcomContext::from_env(&env, std::path::PathBuf::new());
+            assert_eq!(context.tool, expected_tool, "entries={entries:?}");
+            assert_eq!(
+                contaminated_parent_with_env(
+                    context.is_inside_ai_tool(),
+                    |key| env.contains_key(key),
+                    || env.keys().any(|key| key.starts_with("CARGO_")),
+                ),
+                expected,
+                "entries={entries:?}",
+            );
+        }
     }
 
     #[test]

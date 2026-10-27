@@ -13,13 +13,14 @@
 mod support;
 
 use std::fs;
+use std::io::PipeWriter;
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::Once;
 use std::time::{Duration, Instant};
-use support::{Hcom, unique_suffix};
+use support::{Hcom, child_identity, terminate_owned_child, unique_suffix};
 
 fn become_subreaper() {
     static SUBREAPER: Once = Once::new();
@@ -95,6 +96,19 @@ fn dead_pid(h: &Hcom) -> u32 {
     pid
 }
 
+/// A `sleep` stand-in whose comm is still `sleep`: run as
+/// `"$SLEEP_BIN" -c 'read _' <&9`, it blocks on the fixture's private gate
+/// pipe and exits on its own at EOF, so cleanup never signals it.
+fn gated_sleep(h: &Hcom) -> PathBuf {
+    let dir = h.root_path().join("gate");
+    let sleep = dir.join("sleep");
+    if fs::symlink_metadata(&sleep).is_err() {
+        fs::create_dir_all(&dir).expect("create gate directory");
+        symlink("/bin/sh", &sleep).expect("create gated sleep binary");
+    }
+    sleep
+}
+
 fn open_db(h: &Hcom) -> rusqlite::Connection {
     rusqlite::Connection::open(h.path().join("hcom.db")).expect("open isolated DB")
 }
@@ -148,23 +162,22 @@ fn stopped_events(db: &rusqlite::Connection, name: &str) -> i64 {
     .expect("count stopped events")
 }
 
-/// A carrier this test process adopted as subreaper. Cleanup signals it only
-/// while it still carries this test's unique name, then reaps it.
+/// A carrier this test process adopted as subreaper. It is never signalled:
+/// cleanup closes its gate, the carrier exits on EOF, and the subreaper
+/// reaps its own adopted child.
 struct Adopted {
     pid: u32,
     marker: String,
+    gate: Option<PipeWriter>,
 }
 
 impl Drop for Adopted {
     fn drop(&mut self) {
-        let signalled = live(self.pid) && environ_carries(self.pid, &self.marker);
-        if signalled {
-            // SAFETY: kill(2) on a pid that still carries this test's name.
-            unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
-        }
-        if (signalled || !live(self.pid)) && parent_pid(self.pid) == Some(std::process::id()) {
+        drop(self.gate.take());
+        if parent_pid(self.pid) == Some(std::process::id()) {
             let mut status = 0;
-            // SAFETY: waitpid(2) on our own (adopted) child.
+            // SAFETY: waitpid(2) on our own adopted child, which nothing else
+            // reaps, so its pid cannot have been reused. Reaps, never signals.
             unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, 0) };
         }
     }
@@ -173,18 +186,19 @@ impl Drop for Adopted {
 /// Double-fork a carrier of `name`: `sh` backgrounds it and exits, so the
 /// carrier is reparented to this subreaper, never to a root of the row.
 fn adopt_carrier(h: &Hcom, name: &str) -> Adopted {
-    let sleep = h.resolve_external("sleep").expect("sleep binary");
+    let sleep = gated_sleep(h);
     let pid_file = h.root_path().join(format!("carrier-{name}.pid"));
+    let (gate_rx, gate) = std::io::pipe().expect("create cleanup gate");
     let status = h
         .external_cmd("sh")
         .args([
             "-c",
-            "HCOM_INSTANCE_NAME=\"$INSTANCE\" \"$SLEEP_BIN\" 300 & echo $! > \"$PID_FILE\"",
+            "exec 9<&0; HCOM_INSTANCE_NAME=\"$INSTANCE\" \"$SLEEP_BIN\" -c 'read _' <&9 & echo $! > \"$PID_FILE\"",
         ])
         .env("INSTANCE", name)
         .env("SLEEP_BIN", &sleep)
         .env("PID_FILE", &pid_file)
-        .stdin(Stdio::null())
+        .stdin(gate_rx)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -193,6 +207,7 @@ fn adopt_carrier(h: &Hcom, name: &str) -> Adopted {
     Adopted {
         pid: wait_for_child_pid(&pid_file),
         marker: format!("HCOM_INSTANCE_NAME={name}"),
+        gate: Some(gate),
     }
 }
 
@@ -201,26 +216,23 @@ fn adopt_carrier(h: &Hcom, name: &str) -> Adopted {
 /// does not hold the fd itself.
 struct Seat {
     owner: Child,
+    identity: Option<String>,
     carrier: u32,
     marker: String,
+    gate: Option<PipeWriter>,
 }
 
 impl Drop for Seat {
     fn drop(&mut self) {
-        if live(self.carrier) && environ_carries(self.carrier, &self.marker) {
-            // SAFETY: kill(2) on a pid that still carries this test's name.
-            unsafe { libc::kill(self.carrier as libc::pid_t, libc::SIGKILL) };
-        }
-        // The owner's `wait` reaps the carrier; only then stop the owner, so
-        // no zombie is handed to this subreaper.
+        // The carrier is not our child, so it is never signalled: closing the
+        // gate makes it exit, and the owner's `wait` reaps it. Only then stop
+        // the owner, so no zombie is handed to this subreaper.
+        drop(self.gate.take());
         let deadline = Instant::now() + Duration::from_secs(10);
         while Path::new(&format!("/proc/{}", self.carrier)).exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        if self.owner.try_wait().ok().flatten().is_none() {
-            let _ = self.owner.kill();
-        }
-        let _ = self.owner.wait();
+        terminate_owned_child(&mut self.owner, self.identity.as_deref());
     }
 }
 
@@ -231,29 +243,32 @@ fn spawn_live_seat(h: &Hcom, name: &str, session_id: &str) -> Seat {
     symlink("/bin/sh", &omp).expect("create fake omp binary");
     let transcript = fixture.join(format!("{session_id}.jsonl"));
     let carrier_pid_file = fixture.join("carrier.pid");
-    let sleep = h.resolve_external("sleep").expect("sleep binary");
+    let sleep = gated_sleep(h);
+    let (gate_rx, gate) = std::io::pipe().expect("create cleanup gate");
     let owner = h
         .external_cmd("sh")
         .args(["-c", "exec \"$OMP_BIN\" -c \"$OWNER_SCRIPT\""])
         .env("OMP_BIN", &omp)
         .env(
             "OWNER_SCRIPT",
-            "exec 3>>\"$TRANSCRIPT\"; HCOM_INSTANCE_NAME=\"$INSTANCE\" \"$SLEEP_BIN\" 300 3>&- & echo $! > \"$CARRIER_PID_FILE\"; wait",
+            "exec 3>>\"$TRANSCRIPT\" 9<&0; HCOM_INSTANCE_NAME=\"$INSTANCE\" \"$SLEEP_BIN\" -c 'read _' 3>&- <&9 & echo $! > \"$CARRIER_PID_FILE\"; wait",
         )
         .env("TRANSCRIPT", &transcript)
         .env("INSTANCE", name)
         .env("SLEEP_BIN", &sleep)
         .env("CARRIER_PID_FILE", &carrier_pid_file)
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(gate_rx)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the live seat");
     let seat = Seat {
+        identity: child_identity(&owner),
         carrier: wait_for_child_pid(&carrier_pid_file),
         owner,
         marker: format!("HCOM_INSTANCE_NAME={name}"),
+        gate: Some(gate),
     };
     assert_eq!(parent_pid(seat.carrier), Some(seat.owner.id()));
     assert_eq!(comm(seat.owner.id()), "omp", "the seat must look like omp");

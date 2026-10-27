@@ -25,18 +25,24 @@ use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::omp_owner::{CONFIG, db, full_state, isolated_hcom};
-use support::{Hcom, unique_suffix};
+use support::{
+    Hcom, child_identity, terminate_owned_child, terminate_owned_child_group, unique_suffix,
+};
 
 fn launcher_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Runs while `$TEST_LIVE` exists. That fixture-private gate is the voluntary
+/// exit for every runner in the tree, background siblings included: the
+/// owning `HookProcess` removes it on drop, so a runner whose leader was
+/// already reaped (and whose group may no longer be signalled) still exits.
 const STEP_RUNNER: &str = r#"
 cd "$TEST_CWD" || exit 1
 H() { HCOM_LAUNCHED=1 HCOM_TOOL=omp "$TEST_BIN" "$@"; }
 export -f H
 printf '%s\n%s' "$$" "$HCOM_PROCESS_ID" > "$TEST_OUT_DIR/ready"
-while :; do
+while [ -e "$TEST_LIVE" ]; do
     for go in "$TEST_OUT_DIR"/go-*; do
         [ -e "$go" ] || continue
         step=${go##*/go-}
@@ -83,6 +89,8 @@ impl HookOutput {
 /// persistent OMP. The row may legitimately retain that earlier anchor PID.
 struct HookProcess {
     child: Child,
+    identity: Option<String>,
+    live: PathBuf,
     out_dir: PathBuf,
     owner_pid: u32,
     process_id: String,
@@ -101,6 +109,8 @@ impl HookProcess {
         }
         let out_dir = h.root_path().join(format!("process-{tag}"));
         fs::create_dir_all(&out_dir).expect("create process output directory");
+        let live = out_dir.join("live");
+        fs::write(&live, "").expect("open the runner's voluntary-exit gate");
         let worker = matches!(
             executable,
             "__omp_worker_daemon" | "__omp_worker_daemon_broker"
@@ -133,6 +143,7 @@ impl HookProcess {
             .env("TEST_RUNNER", &runner)
             .env("TEST_WORKER_MODE", executable)
             .env("TEST_OUT_DIR", &out_dir)
+            .env("TEST_LIVE", &live)
             .env("TEST_CWD", &h.workspace)
             .env("TEST_BIN", env!("CARGO_BIN_EXE_hcom"))
             .env("TERM", "dumb")
@@ -144,22 +155,26 @@ impl HookProcess {
             command.env("HCOM_PROCESS_ID", id);
         }
         let child = command.spawn().expect("spawn fixture hook process");
-        h.track_cleanup_pid(child.id() as i64);
+        let identity = child_identity(&child);
+        // Owned before the readiness wait, so its drop cleans up on that unwind.
+        let mut process = Self {
+            child,
+            identity,
+            live,
+            out_dir,
+            owner_pid: 0,
+            process_id: String::new(),
+            next_step: Cell::new(0),
+        };
         let ready = h.eventually("hook process ready", Duration::from_secs(30), || {
-            Ok(fs::read_to_string(out_dir.join("ready"))
+            Ok(fs::read_to_string(process.out_dir.join("ready"))
                 .ok()
                 .filter(|text| text.lines().count() == 2))
         });
         let mut lines = ready.lines();
-        let owner_pid = lines.next().unwrap().parse().expect("owner PID");
-        let process_id = lines.next().unwrap().to_string();
-        Self {
-            child,
-            out_dir,
-            owner_pid,
-            process_id,
-            next_step: Cell::new(0),
-        }
+        process.owner_pid = lines.next().unwrap().parse().expect("owner PID");
+        process.process_id = lines.next().unwrap().to_string();
+        process
     }
 
     fn run(&self, h: &Hcom, script: &str) -> HookOutput {
@@ -234,12 +249,10 @@ fn sibling_omps(h: &Hcom, wrapper: &HookProcess) -> [(PathBuf, u32); 2] {
 
 impl Drop for HookProcess {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            unsafe {
-                libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
-            }
-        }
-        let _ = self.child.wait();
+        // Close the gate first: every runner in this tree exits on its own,
+        // even one whose group can no longer be signalled.
+        let _ = fs::remove_file(&self.live);
+        terminate_owned_child_group(&mut self.child, self.identity.as_deref());
     }
 }
 
@@ -3070,6 +3083,7 @@ struct UnrelatedProcess<'a> {
     h: &'a Hcom,
     row: String,
     child: Child,
+    identity: Option<String>,
     heartbeat: PathBuf,
     signals: PathBuf,
 }
@@ -3111,10 +3125,12 @@ done
             });
         }
         let child = command.spawn().expect("spawn unrelated process");
+        let identity = child_identity(&child);
         let unrelated = Self {
             h,
             row: row.to_string(),
             child,
+            identity,
             heartbeat,
             signals,
         };
@@ -3193,9 +3209,8 @@ impl Drop for UnrelatedProcess<'_> {
     fn drop(&mut self) {
         // Unwind path too: never hand Hcom::drop a row PID naming this process.
         let _ = self.clear_row_pid();
-        // Not yet reaped, so this PID is still exactly our own child.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Signalled only while still the unreaped child born at spawn.
+        terminate_owned_child(&mut self.child, self.identity.as_deref());
     }
 }
 
@@ -3237,7 +3252,14 @@ fn crashed_hooked_owner_reused_pid(command: &str) -> Value {
 
     // Abrupt death of the OMP alone: no omp-stop, no PTY proxy or launcher
     // cleanup. Reaping it makes its PID genuinely free.
-    owner.child.kill().expect("SIGKILL the fixture OMP");
+    // Only while it is still the unreaped child born at spawn: a zombie holds
+    // its PID, so the signal cannot reach a reuser.
+    let owned = matches!(owner.child.try_wait(), Ok(None))
+        && owner.identity.is_some()
+        && child_identity(&owner.child) == owner.identity;
+    if owned {
+        owner.child.kill().expect("SIGKILL the fixture OMP");
+    }
     let crash = owner.child.wait().expect("reap the fixture OMP");
     let crashed = hooked_facts(&h, &name, &owner.process_id, &sid);
 

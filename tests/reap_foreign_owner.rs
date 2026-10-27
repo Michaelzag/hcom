@@ -9,12 +9,13 @@
 mod support;
 
 use std::fs;
+use std::io::PipeWriter;
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
-use support::{Hcom, unique_suffix};
+use support::{Hcom, child_identity, terminate_owned_child, unique_suffix};
 
 fn live(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -61,6 +62,19 @@ fn wait_for_child_pid(path: &Path) -> u32 {
     }
 }
 
+/// A `sleep` stand-in whose comm is still `sleep`: run as
+/// `"$SLEEP_BIN" -c 'read _' <&9`, it blocks on the fixture's private gate
+/// pipe and exits on its own at EOF, so cleanup never signals it.
+fn gated_sleep(h: &Hcom) -> PathBuf {
+    let dir = h.root_path().join("gate");
+    let sleep = dir.join("sleep");
+    if fs::symlink_metadata(&sleep).is_err() {
+        fs::create_dir_all(&dir).expect("create gate directory");
+        symlink("/bin/sh", &sleep).expect("create gated sleep binary");
+    }
+    sleep
+}
+
 /// A real process whose `/proc/<pid>/comm` is exactly `omp` and whose
 /// `HCOM_PROCESS_ID` is `omp-<its pid>-<id_suffix>` — the shape
 /// `carrier_tree_scope` admits as an owner root — plus one child of its own.
@@ -72,6 +86,8 @@ fn spawn_minted_omp_seat(h: &Hcom, id_suffix: &str) -> Seat {
     let omp = fixture.join("omp");
     symlink("/bin/sh", &omp).expect("create fake omp binary");
     let child_pid_file = fixture.join("owner-child.pid");
+    let sleep = gated_sleep(h);
+    let (gate_rx, gate) = std::io::pipe().expect("create cleanup gate");
     let owner = h
         .external_cmd("sh")
         .args([
@@ -82,15 +98,17 @@ fn spawn_minted_omp_seat(h: &Hcom, id_suffix: &str) -> Seat {
         .env("OMP_BIN", &omp)
         .env(
             "OWNER_SCRIPT",
-            "trap 'wait' TERM; sleep 300 & echo $! > \"$CHILD_PID_FILE\"; wait",
+            "exec 9<&0; trap 'wait' TERM; \"$SLEEP_BIN\" -c 'read _' <&9 & echo $! > \"$CHILD_PID_FILE\"; wait",
         )
+        .env("SLEEP_BIN", &sleep)
         .env("CHILD_PID_FILE", &child_pid_file)
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(gate_rx)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn minted omp seat");
+    let identity = child_identity(&owner);
     let process_id = format!("omp-{}-{id_suffix}", owner.id());
     let inside = wait_for_child_pid(&child_pid_file);
     assert_eq!(parent_pid(inside), Some(owner.id()));
@@ -107,38 +125,34 @@ fn spawn_minted_omp_seat(h: &Hcom, id_suffix: &str) -> Seat {
     ));
     Seat {
         owner,
+        identity,
         inside,
         process_id,
+        gate: Some(gate),
     }
 }
 
-// The seat process is a Child handle we spawned and the tree pid comes from
-// that shell's private pid file. Cleanup signals the raw pid only while it
-// still carries this test's unique identity, so a failing assertion can never
-// kill an unrelated process.
+// The seat process is a Child handle we spawned; cleanup signals only it,
+// after its spawn identity rechecks. The tree pid is that shell's child, not
+// ours: it blocks on the gate this struct holds the only write end of, so
+// dropping the gate makes it exit on its own and a failing assertion can never
+// signal an unrelated process.
 struct Seat {
     owner: Child,
+    identity: Option<String>,
     inside: u32,
     process_id: String,
+    gate: Option<PipeWriter>,
 }
 
 impl Drop for Seat {
     fn drop(&mut self) {
-        if live(self.inside) && environ_carries(self.inside, &self.process_id_marker()) {
-            unsafe { libc::kill(self.inside as libc::pid_t, libc::SIGKILL) };
-        }
-        if self.owner.try_wait().ok().flatten().is_none() {
-            let _ = self.owner.kill();
-        }
-        let _ = self.owner.wait();
+        drop(self.gate.take());
+        terminate_owned_child(&mut self.owner, self.identity.as_deref());
     }
 }
 
 impl Seat {
-    fn process_id_marker(&self) -> String {
-        format!("HCOM_PROCESS_ID={}", self.process_id)
-    }
-
     fn assert_spared(&mut self, what: &str) {
         let pid = self.owner.id();
         assert!(
@@ -304,15 +318,16 @@ fn stop_refuses_a_carrier_carrying_another_live_rows_process_id() {
     let meme = format!("meme-{suffix}");
     let seat_process_id = format!("seat-shell-{suffix}");
     let meme_process_id = format!("meme-shell-{suffix}");
-    let sleep = h.resolve_external("sleep").expect("sleep binary");
+    let sleep = gated_sleep(&h);
     let child_pid_file = h.root_path().join("meme-child.pid");
+    let (gate_rx, gate) = std::io::pipe().expect("create cleanup gate");
     // The recorded pid carries only the stopped row's own id; its child
     // carries the other live row's id and is admitted as a carrier by name.
     let owner = h
         .external_cmd("sh")
         .args([
             "-c",
-            "HCOM_INSTANCE_NAME=\"$INSTANCE\" HCOM_PROCESS_ID=\"$SEAT_ID\" \"$SLEEP_BIN\" 300 & echo $! > \"$CHILD_PID_FILE\"; wait",
+            "exec 9<&0; HCOM_INSTANCE_NAME=\"$INSTANCE\" HCOM_PROCESS_ID=\"$SEAT_ID\" \"$SLEEP_BIN\" -c 'read _' <&9 & echo $! > \"$CHILD_PID_FILE\"; wait",
         ])
         .env("INSTANCE", &meme)
         .env("SEAT_ID", &seat_process_id)
@@ -320,20 +335,23 @@ fn stop_refuses_a_carrier_carrying_another_live_rows_process_id() {
         .env("CHILD_PID_FILE", &child_pid_file)
         .env("HCOM_PROCESS_ID", &meme_process_id)
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(gate_rx)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the stopped row's owner shell");
+    let identity = child_identity(&owner);
     let inside = wait_for_child_pid(&child_pid_file);
     assert_eq!(parent_pid(inside), Some(owner.id()));
     let mut carriers = Carriers {
         owner,
+        identity,
         inside,
         markers: vec![
             format!("HCOM_PROCESS_ID={seat_process_id}"),
             format!("HCOM_INSTANCE_NAME={meme}"),
         ],
+        gate: Some(gate),
     };
     assert!(environ_carries(
         inside,
@@ -377,23 +395,21 @@ fn stop_refuses_a_carrier_carrying_another_live_rows_process_id() {
     assert_intact(&db, &rows, "stop");
 }
 
-// The owner shell is a Child handle we spawned and the child pid comes from
-// that shell's private pid file. Cleanup signals the raw pid only while it
-// still carries one of this test's unique identity markers.
+// The owner shell is a Child handle we spawned; cleanup signals only it,
+// after its spawn identity rechecks. The child pid is that shell's child, not
+// ours: it blocks on the gate this struct holds the only write end of, so
+// dropping the gate makes it exit on its own.
 struct Carriers {
     owner: Child,
+    identity: Option<String>,
     inside: u32,
     markers: Vec<String>,
+    gate: Option<PipeWriter>,
 }
 
 impl Drop for Carriers {
     fn drop(&mut self) {
-        if live(self.inside) && self.markers.iter().any(|m| environ_carries(self.inside, m)) {
-            unsafe { libc::kill(self.inside as libc::pid_t, libc::SIGKILL) };
-        }
-        if self.owner.try_wait().ok().flatten().is_none() {
-            let _ = self.owner.kill();
-        }
-        let _ = self.owner.wait();
+        drop(self.gate.take());
+        terminate_owned_child(&mut self.owner, self.identity.as_deref());
     }
 }

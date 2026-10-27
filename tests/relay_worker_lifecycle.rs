@@ -14,12 +14,20 @@ use support::Hcom;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A worker child that is always killed and reaped when the test ends.
+/// A worker child that is always killed and reaped when the test ends, and
+/// only while it is still the unreaped process whose birth identity was
+/// captured at spawn.
 struct Worker {
     child: Child,
+    identity: Option<String>,
 }
 
 impl Worker {
+    fn new(child: Child) -> Self {
+        let identity = support::child_identity(&child);
+        Self { child, identity }
+    }
+
     fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -44,8 +52,10 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // A relay worker leads its own group; anything else (the sleeper)
+        // does not, so the group helper declines and the leader-only one acts.
+        support::terminate_owned_child_group(&mut self.child, self.identity.as_deref());
+        support::terminate_owned_child(&mut self.child, self.identity.as_deref());
     }
 }
 
@@ -93,7 +103,7 @@ fn start_worker(h: &Hcom, mut cmd: Command) -> Worker {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // Own process group, so the fixture's group sweep also reaps it.
+    // Own process group, so Drop can clean the worker's whole group.
     #[cfg(unix)]
     cmd.process_group(0);
     let deadline = Instant::now() + READY_TIMEOUT;
@@ -111,8 +121,7 @@ fn start_worker(h: &Hcom, mut cmd: Command) -> Worker {
             Err(e) => panic!("spawn relay-worker: {e}"),
         }
     };
-    h.track_cleanup_pid(i64::from(child.id()));
-    let mut worker = Worker { child };
+    let mut worker = Worker::new(child);
 
     loop {
         if read_pid_file(h) == Some(worker.pid()) {
@@ -175,9 +184,7 @@ fn stale_pidfile_with_live_unrelated_pid_does_not_block_start() {
 fn stale_pidfile_with_live_unrelated_pid_is_never_signalled() {
     let h = Hcom::new();
     let _lock = hold_singleton_lock(&h);
-    let mut sleeper = Worker {
-        child: Command::new("sleep").arg("30").spawn().unwrap(),
-    };
+    let mut sleeper = Worker::new(Command::new("sleep").arg("30").spawn().unwrap());
     std::fs::write(pid_file(&h), sleeper.pid().to_string()).unwrap();
     std::fs::File::options()
         .write(true)
@@ -198,8 +205,14 @@ fn sigterm_exits_promptly_and_removes_pidfile() {
     set_managed(&h);
     let mut worker = start_worker(&h, h.cmd());
 
-    let rc = unsafe { nix::libc::kill(worker.pid() as i32, nix::libc::SIGTERM) };
-    assert_eq!(rc, 0, "SIGTERM delivery failed");
+    assert!(
+        support::signal_owned_child(
+            &mut worker.child,
+            worker.identity.as_deref(),
+            nix::libc::SIGTERM
+        ),
+        "SIGTERM delivery to the owned worker failed"
+    );
     let status = worker
         .wait_exit(Duration::from_secs(3))
         .expect("relay-worker did not exit within 3s of SIGTERM");
