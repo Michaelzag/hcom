@@ -108,20 +108,12 @@ inactive, its own process binding is kept, and the canonical session binding
 and notify endpoints are cleared, so the same owner resumes normally. Linux
 keeps the full release. There is no native reaper port.
 
-A resume that refuses a live or undetermined row now names the recovery every
-time. The refusal itself is unchanged — hcom still refuses, and still leaves
-the row, its bindings, and its event log exactly as they were — but the message
-always names `hcom stop <name>` and then `hcom r <name>`, in that order.
-Previously the recovery line depended on the recorded pid's liveness, so a row
-whose pid was already gone or was never recorded got a refusal with no way out
-named. That is the case on a platform with no process table to read, where hcom
-cannot classify a row's carriers and the row's ownership stays undetermined.
+The `still active or its ownership is undetermined` resume refusal now names
+`hcom stop <name>` followed by `hcom r <name>`, even when the recorded pid is
+gone or missing. The conservative refusal and its no-mutation behavior are
+unchanged.
 
-Delivery endpoint publication is fenced by the row's current incarnation. A
-delivery loop publishes its PTY wake and inject ports in one transaction that
-authorizes the write against the row it captured: that row's creation stamp, or
-this process's own binding on the name. A late write that arrives after the
-row was removed publishes nothing, and one that arrives after another owner
-took the name leaves the new owner's endpoints untouched. A seat that rebinds
-to a different name, or re-registers its own name, still publishes — its own
-binding is what authorizes it.
+Delivery publishes PTY wake and inject endpoints atomically under the current
+row incarnation. Late refreshes cannot recreate endpoints after the row is
+removed or overwrite another owner's replacement. Binding-verified name changes
+and same-name re-registration still work.
