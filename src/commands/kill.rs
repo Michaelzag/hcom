@@ -523,14 +523,14 @@ fn kill_resolved_instance_with_native(
         })?;
     let owner =
         crate::proctruth::verify_kill_owner(pid, inst.launch_context.as_deref(), binding_ids)
-            .map_err(|reason| unverified_owner_error(name, pid, reason))?;
+            .map_err(|reason| unverified_owner_error(db, name, pid, reason))?;
     let owner = owner
         .resolve_root(
             Some(&inst.tool),
             inst.launch_context.as_deref(),
             binding_ids,
         )
-        .map_err(|reason| unverified_owner_error(name, pid, reason))?;
+        .map_err(|reason| unverified_owner_error(db, name, pid, reason))?;
     // The native helper's notices leave with whichever outcome the kill
     // reaches, never as a survivor or refusal of their own.
     let mut not_signaled = crate::sys::process::UnsignaledCarriers::default();
@@ -544,7 +544,7 @@ fn kill_resolved_instance_with_native(
             Some(pids) => pids,
             None if owner.identity().is_some() => {
                 caller_chain = crate::proctruth::kill_caller_ancestor_pids()
-                    .map_err(|reason| unverified_owner_error(name, pid, reason))?;
+                    .map_err(|reason| unverified_owner_error(db, name, pid, reason))?;
                 &caller_chain
             }
             None => &[],
@@ -663,7 +663,9 @@ fn kill_resolved_instance_with_native(
     })
 }
 
-fn unverified_owner_error(name: &str, pid: u32, reason: &str) -> KillTrackedError {
+/// Formats an already-decided owner refusal. The foreign-owner lookup only
+/// names the live row the process is bound to; it never decides the refusal.
+fn unverified_owner_error(db: &HcomDb, name: &str, pid: u32, reason: &str) -> KillTrackedError {
     let leftovers = if crate::sys::process::is_zombie_group_leader(pid) {
         match crate::sys::kill_group::live_members(pid) {
             Ok(members) if !members.is_empty() => format!(
@@ -682,8 +684,13 @@ fn unverified_owner_error(name: &str, pid: u32, reason: &str) -> KillTrackedErro
     } else {
         String::new()
     };
+    let owner = crate::proctruth::foreign_live_owner_name_for_kill(db, name, pid);
+    let (owner_note, owner) = match owner.as_deref() {
+        Some(owner) => ("; it belongs to live instance ", owner),
+        None => ("", ""),
+    };
     format!(
-        "Refusing to signal PID {pid} for '{name}': {reason}; no signal sent to the unverified process.{leftovers} \
+        "Refusing to signal PID {pid} for '{name}': {reason}{owner_note}{owner}; no signal sent to the unverified process.{leftovers} \
          hcom stop {name} clears the bookkeeping."
     ).into()
 }
@@ -1268,7 +1275,7 @@ fn verify_orphan_kill_owner(
     for name in &orphan.names {
         let snapshot = db
             .newest_stopped_snapshot(name)
-            .map_err(|error| unverified_owner_error(name, orphan.pid, &error.to_string()))?;
+            .map_err(|error| unverified_owner_error(db, name, orphan.pid, &error.to_string()))?;
         if let Some(snapshot) = snapshot
             && snapshot.get("pid").and_then(serde_json::Value::as_u64)
                 == Some(u64::from(orphan.pid))
@@ -1283,7 +1290,7 @@ fn verify_orphan_kill_owner(
     let ids = std::slice::from_ref(&orphan.process_id);
     crate::proctruth::verify_kill_owner(orphan.pid, context.as_deref(), ids)
         .and_then(|owner| owner.resolve_root(Some(&orphan.tool), context.as_deref(), ids))
-        .map_err(|reason| unverified_owner_error(&orphan.names.join(", "), orphan.pid, reason))
+        .map_err(|reason| unverified_owner_error(db, &orphan.names.join(", "), orphan.pid, reason))
 }
 
 /// Every target form uses the same owner/root gate, native termination and
@@ -1687,7 +1694,7 @@ fn kill_orphan_process(
 ) -> Result<(terminal::KillResult, bool, terminal::PaneFollowup, bool), KillTrackedError> {
     let name = orphan.names.join(", ");
     let chain = crate::proctruth::kill_caller_ancestor_pids()
-        .map_err(|reason| unverified_owner_error(&name, orphan.pid, reason))?;
+        .map_err(|reason| unverified_owner_error(db, &name, orphan.pid, reason))?;
     let self_excluded = chain.contains(&owner.pid());
     if owner.is_zombie()
         && let Some(identity) = owner.identity()

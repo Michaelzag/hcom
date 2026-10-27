@@ -2138,6 +2138,51 @@ pub(crate) fn verify_kill_candidate(
     Ok(())
 }
 
+/// Diagnostic only: the live row, other than `name`, that the owner readers
+/// of [`verify_kill_candidate`] bind `pid` to, composed per platform exactly
+/// as that check composes them. Called only while formatting a refusal that
+/// was already decided; it authorizes nothing and writes nothing. Any
+/// unreadable fact or registry error yields `None` (owner unknown).
+pub(crate) fn foreign_live_owner_name_for_kill(
+    db: &HcomDb,
+    name: &str,
+    pid: u32,
+) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let minted = minted_pid_owners(db).ok()?;
+        if let Some((owner, _)) = foreign_live_owner(db, &minted, name, pid).ok()? {
+            return Some(owner);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let process_id = match process_id_of(pid) {
+            crate::sys::process_args::EnvRead::Present(id) => Some(id),
+            _ => None,
+        };
+        if let Some(id) = process_id.as_deref()
+            && let Some(owner) = db.live_process_binding_owner(id).ok()?
+            && owner != name
+        {
+            return Some(owner);
+        }
+        #[cfg(not(unix))]
+        {
+            let carried_pid = process_id.as_deref().and_then(minted_root_pid);
+            for (id, owner) in db.live_process_bindings().ok()? {
+                if owner != name
+                    && minted_root_pid(&id)
+                        .is_some_and(|root| root == pid || Some(root) == carried_pid)
+                {
+                    return Some(owner);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// A kill capability for one verified PID incarnation, not merely a live PID.
 /// Zombies authorize only their receipt-verified group, never a PID signal.
 pub(crate) struct KillOwner {

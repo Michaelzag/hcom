@@ -1169,6 +1169,109 @@ fn before_terminate_failure_retains_resolved_launcher_warning() {
     }
 }
 
+/// An owner refusal whose process carries an id no live row binds names no
+/// owner: the generic unverifiable message stands, pointing at the target's
+/// own stop, and nothing is signalled or released.
+#[test]
+#[cfg(unix)]
+#[serial]
+fn owner_refusal_without_a_foreign_binding_keeps_the_generic_message() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let (_env, hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+    db.init_db().unwrap();
+    let name = format!("generic-owner-{}", std::process::id());
+    let nonce = format!("fixture-{name}");
+    let unbound = format!("unbound-{name}");
+    let session = format!("session-{name}");
+    db.save_instance_named(
+        &name,
+        &serde_json::Map::from_iter([
+            ("tool".into(), json!("omp")),
+            ("created_at".into(), json!(1.0)),
+            ("status".into(), json!("active")),
+            ("session_id".into(), json!(session)),
+        ]),
+    )
+    .unwrap();
+    db.set_process_binding(&nonce, &session, &name).unwrap();
+
+    // The owned child carries an id no row binds and has no receipt, so the
+    // owner gate refuses it. Its retained stdin is the cleanup gate.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "read -r line"])
+        .env_clear()
+        .env("HOME", &home)
+        .env("HCOM_DIR", &hcom_dir)
+        .env("TMPDIR", &home)
+        .env("HCOM_PROCESS_ID", &unbound)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    db.update_instance_pid(&name, pid).unwrap();
+    let bindings = db.process_binding_ids(&name).unwrap();
+    let original_row = db.get_instance_full(&name).unwrap().unwrap();
+    let reached = std::cell::Cell::new(false);
+    let result = kill_tracked_instance_with_self_pids(&db, &name, "test", &[pid], |_, _, _| {
+        reached.set(true);
+        Err(crate::proctruth::ReapError::BindingRegistryUnreadable(
+            "owner refusal must precede termination".to_owned(),
+        ))
+    });
+    let still_running = child.try_wait().unwrap().is_none();
+    drop(child.stdin.take());
+    child.wait().unwrap();
+
+    assert!(still_running, "a refused owner must be left running");
+    assert!(!reached.get(), "the refusal must precede termination");
+    let error = result
+        .err()
+        .expect("an unverifiable owner must not become success");
+    let message = &error.message;
+    assert!(
+        message.contains(&format!("PID {pid}")) && message.contains(&format!("'{name}'")),
+        "the refusal must name the refused target: {message}"
+    );
+    assert!(
+        message.contains("does not match a bound process id")
+            && message.contains("no identity receipt"),
+        "the refusal must keep the generic unverifiable reason: {message}"
+    );
+    assert!(
+        message.contains("no signal sent"),
+        "the refusal must state that nothing was signalled: {message}"
+    );
+    assert!(
+        message.contains(&format!("hcom stop {name}")),
+        "the refusal must point at the target's own stop: {message}"
+    );
+    assert!(
+        !message.contains("belongs to live instance"),
+        "no owner may be named without a live binding: {message}"
+    );
+    assert!(error.survivors.is_empty());
+    assert!(error.launcher_unverified.is_none());
+    let row = db.get_instance_full(&name).unwrap().expect("row retained");
+    assert_eq!(row.pid, original_row.pid);
+    assert_eq!(row.status, original_row.status);
+    assert_eq!(row.session_id, original_row.session_id);
+    assert_eq!(db.process_binding_ids(&name).unwrap(), bindings);
+    assert_eq!(db.live_process_binding_owner(&unbound).unwrap(), None);
+    assert_eq!(stopped_events(&db, &name), 0);
+    assert!(
+        db.kv_get(&format!("teardown_claim:{name}"))
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[test]
 #[cfg(unix)]
 #[serial]
