@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::kill_group::live_members;
+use super::kill_group::capture_members;
 use super::process::{
     GroupSignal, KILL_WAIT, KillError, POLL_STEP, TERM_WAIT, has_identity, proc_stat_group_id,
     proc_stat_is_dead, proc_stat_is_zombie,
@@ -226,21 +226,40 @@ fn group_member(
     }
 }
 
-/// A leader owns its exact group: every PID the group scan reports must be
-/// captured already, captured now, or proven gone before killpg reaches it.
-fn verify_group(proc_root: &Path, root: u32, members: &mut Vec<Member>) -> Result<(), String> {
+/// A leader's killpg must reach exactly what was captured. The shared group
+/// enumeration (live and exiting members) is checked against the capture:
+/// every PID it reports is captured already, captured now, or proven gone.
+/// Returns whether killpg may still run: not when the group holds any member
+/// the capture didn't have, exiting ones included; those join the set and
+/// everything is signaled per PID instead.
+fn verify_group(proc_root: &Path, root: u32, members: &mut Vec<Member>) -> Result<bool, String> {
+    let scanned: Vec<u32> = capture_members(root)?
+        .into_iter()
+        .map(|member| member.pid)
+        .collect();
+    reconcile_group(root, members, &scanned, |pid| observe(proc_root, pid))
+}
+
+/// [`verify_group`]'s decision over a group scan and fresh reads.
+fn reconcile_group(
+    root: u32,
+    members: &mut Vec<Member>,
+    scanned: &[u32],
+    mut observe: impl FnMut(u32) -> Seen,
+) -> Result<bool, String> {
     let captured: HashMap<u32, Member> =
         members.iter().map(|member| (member.pid, *member)).collect();
-    for pid in live_members(root)? {
-        let seen = observe(proc_root, pid);
-        if let Some(member) = group_member(root, pid, captured.get(&pid), seen)? {
+    let mut complete = true;
+    for &pid in scanned {
+        if let Some(member) = group_member(root, pid, captured.get(&pid), observe(pid))? {
             if members.len() >= MAX_TREE_PROCESSES {
                 return Err("seat root's process group exceeds the size limit".into());
             }
+            complete = false;
             members.push(member);
         }
     }
-    Ok(())
+    Ok(complete)
 }
 
 /// Whether a fresh read shows `member` still as its captured incarnation and
@@ -780,9 +799,8 @@ pub(crate) fn terminate(
     let leader = members
         .iter()
         .any(|member| member.pid == root && member.in_group);
-    if leader {
-        verify_group(proc_root, root, &mut members)?;
-    }
+    // A group the capture didn't fully cover gets per-PID signals only.
+    let group_complete = !leader || verify_group(proc_root, root, &mut members)?;
     let mut lineage = Lineage::of(&snapshot, root).excluding(excluded);
     fence_ineligible(
         &snapshot,
@@ -791,7 +809,8 @@ pub(crate) fn terminate(
         &mut lineage.fenced,
         &mut eligible,
     );
-    let mut group_signal = group_signal_allowed(&snapshot, root, leader, &lineage, &members);
+    let mut group_signal =
+        group_complete && group_signal_allowed(&snapshot, root, leader, &lineage, &members);
     // The root's ancestors (its launch wrapper and everything above) are
     // never signaled, confirmed or walked through, even when they share its
     // group; excluded PIDs stay as anchors and are skipped at each signal.
@@ -1522,6 +1541,48 @@ mod tests {
             [
                 "read 10", "kill 10", "read 20", "read 30", "read 40", "read 50", "kill 50"
             ]
+        );
+    }
+
+    #[test]
+    fn an_uncaptured_group_member_even_exiting_turns_off_the_group_signal() {
+        let snapshot = [fact(10, 1, 10, 100), fact(20, 10, 10, 110)];
+        let captured = capture(&snapshot, 10, 100).unwrap();
+        let seen = |pid| match pid {
+            10 => Seen::Live(fact(10, 1, 10, 100)),
+            20 => Seen::Live(fact(20, 10, 10, 110)),
+            // Late, already exiting, reparented to init, still in the group.
+            30 => Seen::Exiting(fact(30, 1, 10, 120)),
+            31 => Seen::Live(fact(31, 1, 10, 121)),
+            _ => Seen::Gone,
+        };
+
+        // Exactly the capture, plus a PID gone by now: killpg may run.
+        let mut members = captured.clone();
+        assert_eq!(
+            reconcile_group(10, &mut members, &[10, 20, 99], seen),
+            Ok(true)
+        );
+        assert_eq!(pids(&members), pids(&captured));
+
+        // A late member, already exiting or live: no killpg, and it joins
+        // the set so it is confirmed (and, only if live, signaled per PID).
+        for late in [30, 31] {
+            let mut members = captured.clone();
+            assert_eq!(
+                reconcile_group(10, &mut members, &[10, 20, late], seen),
+                Ok(false)
+            );
+            assert!(members.iter().any(|m| m.pid == late && m.in_group));
+        }
+
+        // An unreadable scanned member still refuses before any signal.
+        let mut members = captured.clone();
+        assert!(
+            reconcile_group(10, &mut members, &[10, 77], |pid| {
+                if pid == 77 { Seen::Unknown } else { seen(pid) }
+            })
+            .is_err()
         );
     }
 
@@ -2359,7 +2420,10 @@ mod tests {
         assert_eq!(result, Ok(GroupSignal::Sent));
         assert!(first.iter().all(|member| !running(member)));
         // Every sleeper, late or orphaned, is gone; only the anchor is left.
-        assert_eq!(live_members(group), Ok(vec![group]));
+        assert_eq!(
+            super::super::kill_group::live_members(group),
+            Ok(vec![group])
+        );
         drop(fixture);
     }
 
