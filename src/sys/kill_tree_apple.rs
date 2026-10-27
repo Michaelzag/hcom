@@ -5,15 +5,17 @@
 //! parent links, and never escalate against a different PID incarnation.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::time::Duration;
 
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(target_os = "macos")]
 use super::{
     kill_group,
     process::{
-        GroupSignal, KILL_WAIT, KillError, POLL_STEP, TERM_WAIT, is_definitely_dead,
+        GroupSignal, KILL_WAIT, KillError, KillState, POLL_STEP, TERM_WAIT, kill_state,
         process_info_apple,
     },
 };
@@ -44,6 +46,63 @@ struct Target<'a> {
 struct Capture<'a> {
     targets: Vec<Target<'a>>,
     facts: HashMap<u32, &'a ProcFact>,
+}
+
+#[derive(Debug, Default)]
+struct Refusals {
+    roots: HashSet<u32>,
+    paths: HashMap<u32, bool>,
+    reason: Option<String>,
+}
+
+impl Refusals {
+    fn record(&mut self, pid: u32, reason: String) {
+        if self.roots.insert(pid) {
+            self.paths.clear();
+        }
+        self.reason.get_or_insert(reason);
+    }
+
+    fn blocks(
+        &mut self,
+        candidate: &ProcFact,
+        root: u32,
+        ancestors: &HashSet<u32>,
+        facts: &HashMap<u32, &ProcFact>,
+    ) -> bool {
+        if self.roots.is_empty() {
+            return false;
+        }
+        if self.roots.contains(&root) {
+            return true;
+        }
+        let roots = &self.roots;
+        !eligible_path(
+            candidate,
+            root,
+            ancestors,
+            facts,
+            &mut self.paths,
+            &mut |pid| !roots.contains(&pid),
+        )
+    }
+
+    fn track(
+        &mut self,
+        candidate: &ProcFact,
+        root: u32,
+        ancestors: &HashSet<u32>,
+        facts: &HashMap<u32, &ProcFact>,
+        mut eligible: impl FnMut(&ProcFact) -> bool,
+    ) -> bool {
+        self.blocks(candidate, root, ancestors, facts) || eligible(candidate)
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Confirmation {
+    survivors: Vec<u32>,
+    exiting: Vec<u32>,
 }
 
 /// Authenticate the root and every parent edge before returning a deepest-first
@@ -328,11 +387,11 @@ fn apply_exclusions(captured: &mut Vec<Target<'_>>, excluded: &[u32]) -> bool {
 /// A group signal may reach only captured, still-matching incarnations. Any
 /// ancestor, excluded caller, new/unreadable member, or reused PID selects the
 /// per-PID path instead of rejecting an otherwise authenticated kill.
-fn group_signal_allowed(
+fn group_signal_allowed<'p>(
     root: u32,
     root_group: u32,
     captured: &[Target<'_>],
-    members: &[u32],
+    members: impl IntoIterator<Item = &'p u32>,
     mut current: impl FnMut(u32) -> Option<ProcFact>,
 ) -> bool {
     if root_group != root || !captured.iter().any(|target| target.fact.pid == root) {
@@ -342,7 +401,7 @@ fn group_signal_allowed(
         .iter()
         .map(|target| (target.fact.pid, target.fact))
         .collect();
-    members.iter().all(|pid| {
+    members.into_iter().all(|pid| {
         by_pid.get(pid).is_some_and(|captured| {
             current(*pid).is_some_and(|fact| {
                 fact.pid == *pid && fact.pgid == root && fact.start_time == captured.start_time
@@ -354,6 +413,7 @@ fn group_signal_allowed(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observation {
     Gone,
+    Exiting(StartTime),
     Present(StartTime),
     Unknown,
 }
@@ -363,9 +423,17 @@ enum Observation {
 fn may_survive(expected: StartTime, observed: Observation) -> bool {
     match observed {
         Observation::Gone => false,
-        Observation::Present(start) => start == expected,
+        Observation::Present(start) | Observation::Exiting(start) => start == expected,
         Observation::Unknown => true,
     }
+}
+
+fn is_signalable(expected: StartTime, observed: Observation) -> bool {
+    observed == Observation::Present(expected)
+}
+
+fn refusal_stands(expected: StartTime, observed: Observation) -> bool {
+    !matches!(observed, Observation::Exiting(_)) && may_survive(expected, observed)
 }
 
 /// Refresh a captured lineage before signaling or confirmation. An exited or
@@ -386,7 +454,7 @@ fn eligible_now(
             return false;
         };
         match observe(pid) {
-            Observation::Gone => true,
+            Observation::Gone | Observation::Exiting(_) => true,
             Observation::Present(start) if start != captured.start_time => true,
             Observation::Present(_) | Observation::Unknown => eligible(pid),
         }
@@ -395,15 +463,76 @@ fn eligible_now(
 
 /// Query failures are survivors, not evidence of exit. A different creation
 /// time proves the captured incarnation has gone without authorizing its PID.
-fn survivors(captured: &[Target<'_>], mut observe: impl FnMut(u32) -> Observation) -> Vec<u32> {
-    let mut pids = Vec::new();
+fn confirmation(
+    captured: &[Target<'_>],
+    mut observe: impl FnMut(u32) -> Observation,
+) -> Confirmation {
+    let mut status = Confirmation::default();
     for target in captured {
-        if may_survive(target.fact.start_time, observe(target.fact.pid)) {
-            pids.push(target.fact.pid);
+        let observed = observe(target.fact.pid);
+        if may_survive(target.fact.start_time, observed) {
+            status.survivors.push(target.fact.pid);
+            if matches!(observed, Observation::Exiting(_)) {
+                status.exiting.push(target.fact.pid);
+            }
         }
     }
-    pids.sort_unstable();
-    pids
+    status.survivors.sort_unstable();
+    status.exiting.sort_unstable();
+    status
+}
+
+fn verdict_reason(first_refusal: Option<String>, exiting: &[u32]) -> Option<String> {
+    if exiting.is_empty() {
+        return first_refusal;
+    }
+    let mut reason = first_refusal.unwrap_or_default();
+    if !reason.is_empty() {
+        reason.push_str("; ");
+    }
+    write!(&mut reason, "exiting: {exiting:?}").expect("writing to String cannot fail");
+    Some(reason)
+}
+
+/// The native wrapper supplies elapsed time and sleep; tests supply a pure
+/// deterministic clock. Refused members remain observable until this settles.
+fn confirm_until(
+    captured: &mut Vec<Target<'_>>,
+    grace: Duration,
+    poll_step: Duration,
+    mut retain: impl FnMut(&ProcFact) -> bool,
+    mut observe: impl FnMut(u32) -> Observation,
+    mut now: impl FnMut() -> Duration,
+    mut pause: impl FnMut(Duration),
+) -> Confirmation {
+    let deadline = now().saturating_add(grace);
+    loop {
+        captured.retain(|target| retain(target.fact));
+        let status = confirmation(captured, &mut observe);
+        let current = now();
+        if status.survivors.is_empty() || current >= deadline {
+            return status;
+        }
+        pause(poll_step.min(deadline.saturating_sub(current)));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apple_start(identity: &str) -> Result<StartTime, &'static str> {
+    let (seconds, micros) = identity
+        .strip_prefix("apple:")
+        .and_then(|identity| identity.split_once(':'))
+        .ok_or("recorded Apple process creation time is unreadable")?;
+    Ok((
+        seconds
+            .parse::<u64>()
+            .map_err(|_| "recorded Apple process creation time is unreadable")?,
+        micros
+            .parse::<u64>()
+            .ok()
+            .filter(|micros| *micros < 1_000_000)
+            .ok_or("recorded Apple process creation time is unreadable")?,
+    ))
 }
 
 /// `expected` is the native `apple:seconds:microseconds` seat-root identity.
@@ -418,20 +547,7 @@ pub(crate) fn terminate(
     mut eligible: impl FnMut(u32) -> bool,
     mut authorize: impl FnMut(u32) -> Result<(), KillError>,
 ) -> Result<GroupSignal, KillError> {
-    let (seconds, micros) = expected
-        .strip_prefix("apple:")
-        .and_then(|identity| identity.split_once(':'))
-        .ok_or("recorded Apple process creation time is unreadable")?;
-    let expected_start = (
-        seconds
-            .parse::<u64>()
-            .map_err(|_| "recorded Apple process creation time is unreadable")?,
-        micros
-            .parse::<u64>()
-            .ok()
-            .filter(|micros| *micros < 1_000_000)
-            .ok_or("recorded Apple process creation time is unreadable")?,
-    );
+    let expected_start = apple_start(expected)?;
     // Authenticate before any enumeration or signal, not just at the last
     // moment. A stale receipt never authorizes capture from a recycled root.
     let verified_root = process_fact(root)
@@ -439,7 +555,7 @@ pub(crate) fn terminate(
         .ok_or("owner identity changed or became unreadable before tree capture")?;
     let snapshot = snapshot()?;
     let group_members = if verified_root.pgid == root {
-        group_snapshot(root)?
+        group_snapshot(root, &snapshot)?
     } else {
         Vec::new()
     };
@@ -469,30 +585,42 @@ pub(crate) fn terminate(
             )
     });
     let blocks_group = apply_exclusions(&mut targets, excluded);
-    authorize_all(&targets, &mut authorize)?;
+    let initial_group_ok = authorize_initial(&targets, &mut authorize)?;
+    let mut refused = Refusals::default();
     let mut signal_group = false;
     let mut outcome = GroupSignal::NotFound;
     // If the group cannot be re-proven, the captured PID targets remain safe.
     if current_root.pgid == root
         && !blocks_group
-        && let Ok(members) = kill_group::live_members(root)
+        && initial_group_ok
+        && is_signalable(expected_start, observe(root))
+        && let Ok(members) = kill_group::capture_members(root)
+        && members.iter().all(|member| member.state == KillState::Live)
     {
-        signal_group =
-            group_signal_allowed(root, current_root.pgid, &targets, &members, process_fact);
+        signal_group = group_signal_allowed(
+            root,
+            current_root.pgid,
+            &targets,
+            members.iter().map(|member| &member.pid),
+            signalable_fact,
+        );
         if signal_group {
-            for &pid in &members {
+            for member in &members {
+                let pid = member.pid;
                 let captured = facts
                     .get(&pid)
                     .ok_or("captured group member lost its process facts")?;
-                if !eligible_now(
-                    captured,
-                    root,
-                    &current_ancestors,
-                    &facts,
-                    &mut paths,
-                    &mut eligible,
-                    observe,
-                ) {
+                if refused.blocks(captured, root, &current_ancestors, &facts)
+                    || !eligible_now(
+                        captured,
+                        root,
+                        &current_ancestors,
+                        &facts,
+                        &mut paths,
+                        &mut eligible,
+                        observe,
+                    )
+                {
                     signal_group = false;
                     break;
                 }
@@ -500,16 +628,18 @@ pub(crate) fn terminate(
                     && targets
                         .iter()
                         .find(|target| target.fact.pid == pid)
-                        .is_none_or(|target| may_survive(target.fact.start_time, observe(pid)))
+                        .is_none_or(|target| refusal_stands(target.fact.start_time, observe(pid)))
                 {
-                    return Err(error);
+                    record_refusal(&mut refused, captured, error);
+                    signal_group = false;
+                    break;
                 }
             }
             // Ownership checks can query other state. Any membership change
             // during those checks selects the per-PID path, never a blind
             // signal to newly joined or otherwise uncaptured processes.
             if signal_group {
-                signal_group = kill_group::live_members(root)
+                signal_group = kill_group::capture_members(root)
                     .ok()
                     .filter(|current| current == &members)
                     .is_some_and(|current| {
@@ -517,10 +647,10 @@ pub(crate) fn terminate(
                             root,
                             current_root.pgid,
                             &targets,
-                            &current,
-                            process_fact,
-                        ) && current.iter().all(|pid| {
-                            facts.get(pid).is_some_and(|fact| {
+                            current.iter().map(|member| &member.pid),
+                            signalable_fact,
+                        ) && current.iter().all(|member| {
+                            facts.get(&member.pid).is_some_and(|fact| {
                                 eligible_now(
                                     fact,
                                     root,
@@ -536,7 +666,7 @@ pub(crate) fn terminate(
             }
         }
         if signal_group {
-            let checked_root = process_fact(root)
+            let checked_root = signalable_fact(root)
                 .filter(|fact| {
                     fact.start_time == expected_start
                         && fact.pgid == root
@@ -555,6 +685,9 @@ pub(crate) fn terminate(
         if signal_group && target.in_group {
             continue;
         }
+        if refused.blocks(target.fact, root, &current_ancestors, &facts) {
+            continue;
+        }
         if !eligible_now(
             target.fact,
             root,
@@ -566,7 +699,7 @@ pub(crate) fn terminate(
         ) {
             continue;
         }
-        if let Some(result) = signal_one(target, libc::SIGTERM, &mut authorize, |fact| {
+        match signal_one(target, libc::SIGTERM, &mut authorize, |fact| {
             eligible_now(
                 fact,
                 root,
@@ -576,41 +709,68 @@ pub(crate) fn terminate(
                 &mut eligible,
                 observe,
             )
-        })? && (result == GroupSignal::Sent || outcome != GroupSignal::Sent)
-        {
-            outcome = result;
+        }) {
+            Ok(Some(result)) if result == GroupSignal::Sent || outcome != GroupSignal::Sent => {
+                outcome = result;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                record_refusal(&mut refused, target.fact, error);
+            }
         }
     }
     let remaining = wait_for_exit(&mut targets, TERM_WAIT, |fact| {
-        eligible_now(
-            fact,
-            root,
-            &current_ancestors,
-            &facts,
-            &mut paths,
-            &mut eligible,
-            observe,
-        )
+        refused.track(fact, root, &current_ancestors, &facts, |fact| {
+            eligible_now(
+                fact,
+                root,
+                &current_ancestors,
+                &facts,
+                &mut paths,
+                &mut eligible,
+                observe,
+            )
+        })
     });
-    if remaining.is_empty() {
-        return finish(root, expected_start, excluded, outcome);
+    if remaining.survivors.is_empty() {
+        return finish(
+            root,
+            expected_start,
+            excluded,
+            &targets,
+            outcome,
+            remaining,
+            refused.reason,
+        );
     }
     // Reauthorize the complete late batch before any escalation can signal a
     // descendant of a newly unreadable or differently bound process.
     targets.retain(|target| {
-        eligible_now(
-            target.fact,
-            root,
-            &current_ancestors,
-            &facts,
-            &mut paths,
-            &mut eligible,
-            observe,
-        )
+        refused.track(target.fact, root, &current_ancestors, &facts, |fact| {
+            eligible_now(
+                fact,
+                root,
+                &current_ancestors,
+                &facts,
+                &mut paths,
+                &mut eligible,
+                observe,
+            )
+        })
     });
-    authorize_all(&targets, &mut authorize)?;
+    authorize_late(
+        &targets,
+        root,
+        &current_ancestors,
+        &facts,
+        &mut refused,
+        &mut authorize,
+    );
     // The root may already have exited; escalation never repeats killpg.
     for target in &targets {
+        if refused.blocks(target.fact, root, &current_ancestors, &facts) {
+            continue;
+        }
         if !eligible_now(
             target.fact,
             root,
@@ -622,8 +782,8 @@ pub(crate) fn terminate(
         ) {
             continue;
         }
-        if remaining.binary_search(&target.fact.pid).is_ok()
-            && let Some(result) = signal_one(target, libc::SIGKILL, &mut authorize, |fact| {
+        if remaining.survivors.binary_search(&target.fact.pid).is_ok() {
+            match signal_one(target, libc::SIGKILL, &mut authorize, |fact| {
                 eligible_now(
                     fact,
                     root,
@@ -633,28 +793,39 @@ pub(crate) fn terminate(
                     &mut eligible,
                     observe,
                 )
-            })?
-            && (result == GroupSignal::Sent || outcome != GroupSignal::Sent)
-        {
-            outcome = result;
+            }) {
+                Ok(Some(result)) if result == GroupSignal::Sent || outcome != GroupSignal::Sent => {
+                    outcome = result;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    record_refusal(&mut refused, target.fact, error);
+                }
+            }
         }
     }
     let remaining = wait_for_exit(&mut targets, KILL_WAIT, |fact| {
-        eligible_now(
-            fact,
-            root,
-            &current_ancestors,
-            &facts,
-            &mut paths,
-            &mut eligible,
-            observe,
-        )
+        refused.track(fact, root, &current_ancestors, &facts, |fact| {
+            eligible_now(
+                fact,
+                root,
+                &current_ancestors,
+                &facts,
+                &mut paths,
+                &mut eligible,
+                observe,
+            )
+        })
     });
-    if remaining.is_empty() {
-        finish(root, expected_start, excluded, outcome)
-    } else {
-        Err(KillError::Survivors(remaining))
-    }
+    finish(
+        root,
+        expected_start,
+        excluded,
+        &targets,
+        outcome,
+        remaining,
+        refused.reason,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -675,28 +846,59 @@ fn process_fact(pid: u32) -> Option<ProcFact> {
 }
 
 #[cfg(target_os = "macos")]
-fn group_snapshot(root: u32) -> Result<Vec<ProcFact>, String> {
-    let pids = kill_group::live_members(root)?;
-    let mut facts = Vec::with_capacity(pids.len());
-    for pid in pids {
-        if let Some(fact) = process_fact(pid) {
-            facts.push(fact);
+fn group_snapshot(root: u32, snapshot: &[ProcFact]) -> Result<Vec<ProcFact>, String> {
+    let members = kill_group::capture_members(root)?;
+    let mut facts = Vec::with_capacity(members.len());
+    for member in members {
+        let start = apple_start(&member.identity)?;
+        match process_fact(member.pid) {
+            Some(fact) if fact.start_time != start => continue,
+            Some(mut fact) => {
+                // The stamped group snapshot authorizes this membership even
+                // if the same incarnation left the group before its info read.
+                fact.pgid = root;
+                facts.push(fact);
+            }
+            None if kill_state(member.pid) == KillState::Gone => {}
+            None => {
+                // Exiting can race a second info query. A matching fact from
+                // the full snapshot keeps its ancestry and captured identity.
+                let mut fact = snapshot
+                    .iter()
+                    .find(|fact| fact.pid == member.pid && fact.start_time == start)
+                    .copied()
+                    .ok_or_else(|| format!("group member {} ancestry is unreadable", member.pid))?;
+                fact.pgid = root;
+                facts.push(fact);
+            }
         }
-        // An unreadable member cannot authorize a PID. The fresh group check
-        // will reject blind group signaling if it is still present.
     }
     Ok(facts)
 }
 
 #[cfg(target_os = "macos")]
 fn observe(pid: u32) -> Observation {
-    if is_definitely_dead(pid) {
-        Observation::Gone
-    } else if let Some(fact) = process_fact(pid) {
-        Observation::Present(fact.start_time)
-    } else {
-        Observation::Unknown
+    let state = kill_state(pid);
+    if state == KillState::Gone {
+        return Observation::Gone;
     }
+    if state == KillState::Unknown {
+        return Observation::Unknown;
+    }
+    let Some(fact) = process_fact(pid) else {
+        return Observation::Unknown;
+    };
+    match state {
+        KillState::Live => Observation::Present(fact.start_time),
+        KillState::Exiting => Observation::Exiting(fact.start_time),
+        KillState::Gone | KillState::Unknown => unreachable!(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn signalable_fact(pid: u32) -> Option<ProcFact> {
+    let fact = process_fact(pid)?;
+    is_signalable(fact.start_time, observe(pid)).then_some(fact)
 }
 
 #[cfg(target_os = "macos")]
@@ -706,19 +908,17 @@ fn signal_one(
     authorize: &mut impl FnMut(u32) -> Result<(), KillError>,
     mut eligible: impl FnMut(&ProcFact) -> bool,
 ) -> Result<Option<GroupSignal>, KillError> {
-    if observe(target.fact.pid) != Observation::Present(target.fact.start_time) {
+    if !is_signalable(target.fact.start_time, observe(target.fact.pid)) {
         return Ok(None);
     }
     if let Err(error) = authorize(target.fact.pid) {
-        return if may_survive(target.fact.start_time, observe(target.fact.pid)) {
+        return if refusal_stands(target.fact.start_time, observe(target.fact.pid)) {
             Err(error)
         } else {
             Ok(None)
         };
     }
-    if !eligible(target.fact)
-        || observe(target.fact.pid) != Observation::Present(target.fact.start_time)
-    {
+    if !eligible(target.fact) || !is_signalable(target.fact.start_time, observe(target.fact.pid)) {
         return Ok(None);
     }
     // SAFETY: the current incarnation was authorized and rechecked as one
@@ -745,33 +945,64 @@ fn signal_result(result: libc::c_int) -> GroupSignal {
 fn wait_for_exit(
     captured: &mut Vec<Target<'_>>,
     grace: Duration,
-    mut eligible: impl FnMut(&ProcFact) -> bool,
-) -> Vec<u32> {
-    let deadline = Instant::now() + grace;
-    loop {
-        captured.retain(|target| eligible(target.fact));
-        let remaining = survivors(captured, observe);
-        let now = Instant::now();
-        if remaining.is_empty() || now >= deadline {
-            return remaining;
+    retain: impl FnMut(&ProcFact) -> bool,
+) -> Confirmation {
+    let started = Instant::now();
+    confirm_until(
+        captured,
+        grace,
+        POLL_STEP,
+        retain,
+        observe,
+        || started.elapsed(),
+        std::thread::sleep,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn authorize_initial(
+    captured: &[Target<'_>],
+    authorize: &mut impl FnMut(u32) -> Result<(), KillError>,
+) -> Result<bool, KillError> {
+    let mut group_ok = true;
+    for target in captured {
+        if let Err(error) = authorize(target.fact.pid) {
+            if refusal_stands(target.fact.start_time, observe(target.fact.pid)) {
+                return Err(error);
+            }
+            group_ok = false;
         }
-        std::thread::sleep(POLL_STEP.min(deadline.saturating_duration_since(now)));
+    }
+    Ok(group_ok)
+}
+
+#[cfg(target_os = "macos")]
+fn record_refusal(refused: &mut Refusals, captured: &ProcFact, error: KillError) {
+    if refusal_stands(captured.start_time, observe(captured.pid)) {
+        let reason = match error {
+            KillError::Refused(reason) | KillError::Unconfirmed { reason, .. } => reason,
+            other => other.reason().to_owned(),
+        };
+        refused.record(captured.pid, reason);
     }
 }
 
 #[cfg(target_os = "macos")]
-fn authorize_all(
+fn authorize_late(
     captured: &[Target<'_>],
+    root: u32,
+    ancestors: &HashSet<u32>,
+    facts: &HashMap<u32, &ProcFact>,
+    refused: &mut Refusals,
     authorize: &mut impl FnMut(u32) -> Result<(), KillError>,
-) -> Result<(), KillError> {
+) {
     for target in captured {
-        if let Err(error) = authorize(target.fact.pid)
-            && may_survive(target.fact.start_time, observe(target.fact.pid))
+        if !refused.blocks(target.fact, root, ancestors, facts)
+            && let Err(error) = authorize(target.fact.pid)
         {
-            return Err(error);
+            record_refusal(refused, target.fact, error);
         }
     }
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -779,14 +1010,34 @@ fn finish(
     root: u32,
     expected_start: StartTime,
     excluded: &[u32],
+    captured: &[Target<'_>],
     outcome: GroupSignal,
+    mut status: Confirmation,
+    first_refusal: Option<String>,
 ) -> Result<GroupSignal, KillError> {
-    // Eligibility may have removed a root that became protected while its
-    // children were stopping. Only explicit self-exclusion permits a live root.
-    if !excluded.contains(&root) && may_survive(expected_start, observe(root)) {
-        Err(KillError::Survivors(vec![root]))
-    } else {
+    // Never re-probe an already confirmed root: a later PID reuse must not
+    // resurrect its captured incarnation. A pruned protected root still needs
+    // positive death evidence unless the caller explicitly excluded it.
+    if !excluded.contains(&root) && !captured.iter().any(|target| target.fact.pid == root) {
+        let observed = observe(root);
+        if may_survive(expected_start, observed) {
+            status.survivors.push(root);
+            status.survivors.sort_unstable();
+            if matches!(observed, Observation::Exiting(_)) {
+                status.exiting.push(root);
+                status.exiting.sort_unstable();
+            }
+        }
+    }
+    if status.survivors.is_empty() {
         Ok(outcome)
+    } else if let Some(reason) = verdict_reason(first_refusal, &status.exiting) {
+        Err(KillError::Unconfirmed {
+            reason,
+            survivors: status.survivors,
+        })
+    } else {
+        Err(KillError::Survivors(status.survivors))
     }
 }
 
@@ -1113,13 +1364,14 @@ mod tests {
             members.iter().find(|fact| fact.pid == pid).copied()
         }));
         assert_eq!(
-            survivors(&captured, |pid| {
+            confirmation(&captured, |pid| {
                 Observation::Present(if pid == 10 {
                     root.start_time
                 } else {
                     replacement.start_time
                 })
-            }),
+            })
+            .survivors,
             [10]
         );
     }
@@ -1173,14 +1425,14 @@ mod tests {
         let captured = capture_members(&snapshot, 10, root.start_time, 5, &[], |_| true)
             .unwrap()
             .targets;
-        let remaining = survivors(&captured, |pid| match pid {
+        let remaining = confirmation(&captured, |pid| match pid {
             10 => Observation::Present(root.start_time),
             11 => Observation::Gone,
             12 => Observation::Present((100, 14)),
             13 => Observation::Unknown,
             _ => panic!("unexpected captured PID"),
         });
-        assert_eq!(remaining, [10, 13]);
+        assert_eq!(remaining.survivors, [10, 13]);
     }
 
     #[test]
@@ -1191,13 +1443,14 @@ mod tests {
             .unwrap()
             .targets;
         assert_eq!(
-            survivors(&captured, |pid| {
+            confirmation(&captured, |pid| {
                 if pid == 10 {
                     Observation::Present((101, 0))
                 } else {
                     Observation::Gone
                 }
-            }),
+            })
+            .survivors,
             Vec::<u32>::new()
         );
     }
@@ -1372,13 +1625,14 @@ mod tests {
         let pids: Vec<_> = captured.iter().map(|target| target.fact.pid).collect();
         assert_eq!(pids, [12, 13]);
         assert_eq!(
-            survivors(&captured, |pid| {
+            confirmation(&captured, |pid| {
                 match pid {
                     12 => Observation::Present((100, 12)),
                     13 => Observation::Present((100, 13)),
                     _ => panic!("excluded caller chain must never be observed"),
                 }
-            }),
+            })
+            .survivors,
             [12, 13]
         );
     }
@@ -1433,10 +1687,11 @@ mod tests {
         let pids: Vec<_> = captured.iter().map(|target| target.fact.pid).collect();
         assert_eq!(pids, [12]);
         assert_eq!(
-            survivors(&captured, |pid| {
+            confirmation(&captured, |pid| {
                 assert_eq!(pid, 12, "excluded roots are not survivor probes");
                 Observation::Gone
-            }),
+            })
+            .survivors,
             Vec::<u32>::new()
         );
     }
@@ -1639,5 +1894,158 @@ mod tests {
                 })
             },
         ));
+    }
+
+    #[test]
+    fn kill_tree_exiting_member_is_unsignalable_until_confirmed_gone() {
+        let root = fact(10, 1, 10);
+        let child = fact(11, 10, 11);
+        let snapshot = [root, child];
+        let mut captured = capture_members(&snapshot, 10, root.start_time, 5, &[], |_| true)
+            .unwrap()
+            .targets;
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let transition = Duration::from_millis(100);
+        let grace = Duration::from_millis(300);
+        let status = confirm_until(
+            &mut captured,
+            grace,
+            transition,
+            |_| true,
+            |pid| {
+                let observed = if pid == root.pid || elapsed.get() >= transition {
+                    Observation::Gone
+                } else {
+                    Observation::Exiting(child.start_time)
+                };
+                assert!(!is_signalable(child.start_time, observed));
+                assert!(!refusal_stands(child.start_time, observed));
+                observed
+            },
+            || elapsed.get(),
+            |step| elapsed.set(elapsed.get() + step),
+        );
+        assert_eq!(status, Confirmation::default());
+        assert!(elapsed.get() >= transition && elapsed.get() < grace);
+    }
+
+    #[test]
+    fn kill_tree_exiting_member_at_the_deadline_remains_a_survivor() {
+        let root = fact(10, 1, 10);
+        let child = fact(11, 10, 11);
+        let snapshot = [root, child];
+        let mut captured = capture_members(&snapshot, 10, root.start_time, 5, &[], |_| true)
+            .unwrap()
+            .targets;
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let grace = Duration::from_millis(250);
+        let status = confirm_until(
+            &mut captured,
+            grace,
+            Duration::from_millis(100),
+            |_| true,
+            |pid| {
+                if pid == root.pid {
+                    Observation::Gone
+                } else {
+                    let observed = Observation::Exiting(child.start_time);
+                    assert!(!is_signalable(child.start_time, observed));
+                    assert!(!refusal_stands(child.start_time, observed));
+                    observed
+                }
+            },
+            || elapsed.get(),
+            |step| elapsed.set(elapsed.get() + step),
+        );
+        assert_eq!(elapsed.get(), grace);
+        assert_eq!(status.survivors, [11]);
+        assert_eq!(status.exiting, [11]);
+        assert!(
+            verdict_reason(None, &status.exiting)
+                .unwrap()
+                .contains("exiting")
+        );
+    }
+
+    #[test]
+    fn kill_tree_unknown_lifecycle_is_neither_exiting_nor_gone() {
+        let root = fact(10, 1, 10);
+        let snapshot = [root];
+        let mut captured = capture_members(&snapshot, 10, root.start_time, 5, &[], |_| true)
+            .unwrap()
+            .targets;
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let grace = Duration::from_millis(100);
+        let status = confirm_until(
+            &mut captured,
+            grace,
+            grace,
+            |_| true,
+            |_| {
+                assert!(!is_signalable(root.start_time, Observation::Unknown));
+                assert!(refusal_stands(root.start_time, Observation::Unknown));
+                Observation::Unknown
+            },
+            || elapsed.get(),
+            |step| elapsed.set(elapsed.get() + step),
+        );
+        assert_eq!(elapsed.get(), grace);
+        assert_eq!(status.survivors, [10]);
+        assert!(status.exiting.is_empty());
+    }
+
+    #[test]
+    fn kill_tree_late_refusal_fences_subtrees_and_reports_deadline_survivors() {
+        let root = fact(10, 1, 10);
+        let refused_parent = fact(11, 10, 11);
+        let child = fact(12, 11, 12);
+        let sibling = fact(13, 10, 13);
+        let first_refused = fact(14, 10, 14);
+        let snapshot = [root, refused_parent, child, sibling, first_refused];
+        let Capture { mut targets, facts } =
+            capture_members(&snapshot, 10, root.start_time, 5, &[], |_| true).unwrap();
+        let ancestors = HashSet::new();
+        let mut refused = Refusals::default();
+        refused.record(first_refused.pid, "first refusal".to_owned());
+        // A later refusal must invalidate previously allowed ancestry paths.
+        assert!(!refused.blocks(&child, 10, &ancestors, &facts));
+        refused.record(refused_parent.pid, "later refusal".to_owned());
+        assert!(refused.blocks(&refused_parent, 10, &ancestors, &facts));
+        assert!(refused.blocks(&child, 10, &ancestors, &facts));
+        assert!(!refused.blocks(&sibling, 10, &ancestors, &facts));
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let grace = Duration::from_millis(250);
+        let status = confirm_until(
+            &mut targets,
+            grace,
+            Duration::from_millis(100),
+            |fact| {
+                refused.track(fact, 10, &ancestors, &facts, |fact| {
+                    fact.pid != 11 && fact.pid != 12 && fact.pid != 14
+                })
+            },
+            |pid| {
+                let settled = match pid {
+                    10 | 14 => elapsed.get() >= Duration::from_millis(100),
+                    12 | 13 => elapsed.get() >= Duration::from_millis(200),
+                    11 => false,
+                    _ => panic!("unexpected captured PID"),
+                };
+                if settled {
+                    Observation::Gone
+                } else {
+                    Observation::Present(facts[&pid].start_time)
+                }
+            },
+            || elapsed.get(),
+            |step| elapsed.set(elapsed.get() + step),
+        );
+        assert_eq!(elapsed.get(), grace);
+        assert_eq!(status.survivors, [11]);
+        assert!(status.exiting.is_empty());
+        assert_eq!(
+            verdict_reason(refused.reason, &status.exiting).as_deref(),
+            Some("first refusal")
+        );
     }
 }
