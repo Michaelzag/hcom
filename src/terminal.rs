@@ -32,10 +32,21 @@ pub enum KillResult {
 
 const TERMINAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PaneCloseResult {
     pub closed: bool,
     pub retry_command: Option<String>,
+    /// The close command needs the seat's PID, which kill no longer trusts.
+    pub needs_pid: bool,
+}
+
+/// What a kill reports about a pane it did not close.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaneFollowup {
+    /// The exact close command to retry with approval, when one exists.
+    pub retry_command: Option<String>,
+    /// The close command needs the seat's PID, so it was never run.
+    pub needs_pid: bool,
 }
 
 fn format_close_command(argv: &[String]) -> String {
@@ -1391,11 +1402,6 @@ fn substitute_close_argv(
     if needs("{id}") && terminal_id.is_empty() {
         return None;
     }
-    // Kill closes panes only after the root is confirmed gone, so it passes 0:
-    // a dead or reused PID must never select some other process's window.
-    if needs("{pid}") && pid == 0 {
-        return None;
-    }
 
     let pid_str = pid.to_string();
     let argv: Vec<String> = template
@@ -2468,10 +2474,7 @@ pub fn close_terminal_pane(
     terminal_id: &str,
     zellij_session_name: &str,
 ) -> PaneCloseResult {
-    let failed_without_command = || PaneCloseResult {
-        closed: false,
-        retry_command: None,
-    };
+    let failed_without_command = PaneCloseResult::default;
     let merged = match crate::config::get_merged_preset(preset_name) {
         Some(p) => p,
         None => return failed_without_command(),
@@ -2481,6 +2484,14 @@ pub fn close_terminal_pane(
         Some(c) => c,
         None => return failed_without_command(),
     };
+    // Kill closes panes only after the root is confirmed gone and passes 0: a
+    // dead or reused PID must never select some other process's window.
+    if pid == 0 && close_template.iter().any(|part| part.contains("{pid}")) {
+        return PaneCloseResult {
+            needs_pid: true,
+            ..PaneCloseResult::default()
+        };
+    }
 
     // Determine effective pane_id (fall back to terminal_id)
     let effective_pane_id = if pane_id.is_empty() && !terminal_id.is_empty() {
@@ -2559,8 +2570,8 @@ pub fn close_terminal_pane(
     }
     let retry_command = format_close_command(&argv);
     let failed = || PaneCloseResult {
-        closed: false,
         retry_command: Some(retry_command.clone()),
+        ..PaneCloseResult::default()
     };
 
     // Run the close command directly (no shell) so it works on Windows too.
@@ -2612,12 +2623,13 @@ pub fn close_terminal_pane(
         return PaneCloseResult {
             closed,
             retry_command: (!closed).then_some(retry_command),
+            needs_pid: false,
         };
     }
 
     PaneCloseResult {
         closed: true,
-        retry_command: None,
+        ..PaneCloseResult::default()
     }
 }
 
@@ -2658,7 +2670,7 @@ pub(crate) fn kill_process(
     excluded: &[u32],
     info: &TerminalInfo,
     authorize: impl FnMut(u32) -> Result<(), crate::sys::process::KillError>,
-) -> Result<(KillResult, bool, Option<String>), crate::sys::process::KillError> {
+) -> Result<(KillResult, bool, PaneFollowup), crate::sys::process::KillError> {
     let pid = owner.pid();
     use crate::sys::process::GroupSignal;
     let kill_result = if owner.recheck()? {
@@ -2719,13 +2731,17 @@ pub(crate) fn kill_process(
             zellij_session_name,
         )
     } else {
-        PaneCloseResult {
-            closed: false,
-            retry_command: None,
-        }
+        PaneCloseResult::default()
     };
 
-    Ok((kill_result, pane_close.closed, pane_close.retry_command))
+    Ok((
+        kill_result,
+        pane_close.closed,
+        PaneFollowup {
+            retry_command: pane_close.retry_command,
+            needs_pid: pane_close.needs_pid,
+        },
+    ))
 }
 
 /// A run-here launch owns only a single, identified pane, never the enclosing
@@ -3060,6 +3076,47 @@ mod tests {
     /// Build a `Vec<String>` argv from `&str` literals (test helper).
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Kill closes panes only after the seat is confirmed gone and passes PID 0,
+    /// so a close command needing the seat's PID never runs with a stale one.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn kill_never_runs_a_pid_close_template_after_the_seat_is_gone() {
+        let (_dir, hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let marker = hcom.join("ran");
+        let close = hcom.join("close.sh");
+        fs::write(
+            &close,
+            format!("printf '%s' \"$1\" > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::write(
+            hcom.join("config.toml"),
+            format!(
+                "[terminal.presets.pidterm]\nopen = 'sh {{script}}'\nclose = 'sh {} {{pid}}'\n",
+                close.display()
+            ),
+        )
+        .unwrap();
+        crate::config::Config::reset();
+        crate::config::Config::init();
+
+        let result = close_terminal_pane(0, "pidterm", "pane-7", "nonce", "", "", "");
+        assert_eq!(
+            result,
+            PaneCloseResult {
+                needs_pid: true,
+                ..PaneCloseResult::default()
+            }
+        );
+        assert!(!marker.exists(), "a PID close command must never run");
+        // An ID-based close command still gets its pane id with the same PID 0.
+        assert_eq!(
+            substitute_close_argv(&argv(&["sh", "close.sh", "{pane_id}"]), 0, "pane-7", "", ""),
+            Some(argv(&["sh", "close.sh", "pane-7"]))
+        );
     }
 
     fn write_owner_receipt(dir: &std::path::Path, process_id: &str, json: &str) {

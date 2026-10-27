@@ -929,6 +929,7 @@ fn handle_remote_kill(
                 "preset_name": error.preset_name,
                 "pane_id": error.pane_id,
                 "pane_left_for_caller": error.pane_left_for_caller,
+                "pane_close_needs_pid": error.pane_close_needs_pid,
             }));
         }
     };
@@ -956,6 +957,7 @@ fn handle_remote_kill(
         "preset_name": result.preset_name,
         "pane_id": result.pane_id,
         "pane_left_for_caller": result.pane_left_for_caller,
+        "pane_close_needs_pid": result.pane_close_needs_pid,
         "ok": !matches!(result.kill_result, crate::terminal::KillResult::PermissionDenied),
     }))
 }

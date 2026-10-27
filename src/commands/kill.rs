@@ -33,6 +33,8 @@ pub struct KillTrackedResult {
     pub pane_id: String,
     /// The owned pane holds the excluded caller, so it was left open by design.
     pub pane_left_for_caller: bool,
+    /// The owned pane's close command needs a PID kill no longer trusts.
+    pub pane_close_needs_pid: bool,
     /// Carriers spared because they are the caller's own session tree
     /// (kill self-path only; 0 on the foreign path).
     pub self_excluded: usize,
@@ -61,6 +63,7 @@ pub struct KillFailure {
     pub preset_name: String,
     pub pane_id: String,
     pub pane_left_for_caller: bool,
+    pub pane_close_needs_pid: bool,
 }
 
 impl KillFailure {
@@ -78,6 +81,7 @@ impl KillFailure {
             preset_name: String::new(),
             pane_id: String::new(),
             pane_left_for_caller: false,
+            pane_close_needs_pid: false,
         }
     }
 }
@@ -145,11 +149,16 @@ impl KillTrackedError {
             self.message
                 .push_str("\nPane left open by design: it holds the excluded caller.");
         }
+        if pane.needs_pid {
+            self.message.push('\n');
+            self.message.push_str(PANE_NEEDS_PID.trim_start());
+        }
         self.pane_closed = pane.closed;
         self.pane_retry_command = pane.retry_command;
         self.preset_name = pane.preset_name;
         self.pane_id = pane.pane_id;
         self.pane_left_for_caller = pane.left_for_caller;
+        self.pane_close_needs_pid = pane.needs_pid;
         self
     }
 }
@@ -161,6 +170,7 @@ struct PaneOutcome {
     preset_name: String,
     pane_id: String,
     left_for_caller: bool,
+    needs_pid: bool,
 }
 
 impl std::fmt::Display for KillTrackedError {
@@ -511,7 +521,7 @@ fn kill_resolved_instance(
     }
     // Gone and zombie owners recheck false, so this sends them no signal; every
     // mode still runs the receipt-verified pane close after confirmation.
-    let (result, pane_closed, pane_retry_command, preset_name, pane_id) = kill_instance(
+    let (result, pane_closed, followup, preset_name, pane_id) = kill_instance(
         db,
         name,
         &owner,
@@ -524,10 +534,11 @@ fn kill_resolved_instance(
     let pane_left_for_caller = !excluded.is_empty() && !preset_name.is_empty() && !pane_closed;
     let pane = || PaneOutcome {
         closed: pane_closed,
-        retry_command: pane_retry_command.clone(),
+        retry_command: followup.retry_command.clone(),
         preset_name: preset_name.clone(),
         pane_id: pane_id.clone(),
         left_for_caller: pane_left_for_caller,
+        needs_pid: followup.needs_pid,
     };
     // Native helpers have confirmed every captured incarnation gone. Only
     // now may the old row's incarnation-bound bookkeeping be released.
@@ -565,10 +576,11 @@ fn kill_resolved_instance(
         pid: owner.pid(),
         kill_result: result,
         pane_closed,
-        pane_retry_command,
+        pane_retry_command: followup.retry_command,
         preset_name,
         pane_id,
         pane_left_for_caller,
+        pane_close_needs_pid: followup.needs_pid,
         self_excluded: excluded.len(),
         self_pid: (!excluded.is_empty()).then_some(std::process::id()),
         self_session: if excluded.is_empty() {
@@ -921,6 +933,9 @@ fn handle_remote_kill_response(name: &str, response: &serde_json::Value) -> Resu
     for line in lines {
         println!("{line}");
     }
+    if result["pane_close_needs_pid"].as_bool() == Some(true) {
+        println!("{PANE_NEEDS_PID}");
+    }
     if pane_retry_command.is_some()
         && let Some((_, device)) = crate::relay::control::split_device_suffix(name)
     {
@@ -974,6 +989,9 @@ fn render_remote_kill_feedback(
 
 /// The self path never closes the pane that holds the excluded caller.
 const PANE_LEFT_FOR_CALLER: &str = "  Pane left open by design: it holds the excluded caller.";
+
+/// The pane's close command would need the dead seat's PID; nothing was run.
+const PANE_NEEDS_PID: &str = "  Pane not closed: this terminal's close command needs a process ID, and the seat's process ID can no longer be used safely; close the pane manually.";
 
 /// Format the self-path report: the plain stopped report plus the resume
 /// hint. Rendered only after the captured non-self members are confirmed gone
@@ -1231,6 +1249,9 @@ fn kill_selected(
                 failed += 1;
             }
         }
+        if result.pane_close_needs_pid {
+            println!("{PANE_NEEDS_PID}");
+        }
         incomplete += report_incomplete_pane_cleanup(
             result.kill_result.into(),
             result.pane_retry_command.as_deref(),
@@ -1251,7 +1272,7 @@ fn kill_selected(
                 continue;
             }
         };
-        let (result, _pane_closed, retry, self_excluded) =
+        let (result, _pane_closed, followup, self_excluded) =
             match kill_orphan_process(db, &owner, &orphan) {
                 Ok(result) => result,
                 Err(reason) => {
@@ -1282,7 +1303,11 @@ fn kill_selected(
                 failed += 1;
             }
         }
-        incomplete += report_incomplete_pane_cleanup(result.into(), retry.as_deref()) as i32;
+        if followup.needs_pid {
+            println!("{PANE_NEEDS_PID}");
+        }
+        incomplete +=
+            report_incomplete_pane_cleanup(result.into(), followup.retry_command.as_deref()) as i32;
         if matches!(
             result,
             terminal::KillResult::Sent | terminal::KillResult::AlreadyDead
@@ -1328,7 +1353,7 @@ fn kill_single(
                     || target_pid == Some(o.pid)
             }) {
                 let owner = verify_orphan_kill_owner(db, orphan).map_err(anyhow::Error::msg)?;
-                let (result, pane_closed, pane_retry_command, self_excluded) =
+                let (result, pane_closed, followup, self_excluded) =
                     kill_orphan_process(db, &owner, orphan).map_err(|error| {
                         if error.launcher_unverified.is_some() {
                             pidtrack::remove_pid(hcom_dir, orphan.pid);
@@ -1359,6 +1384,9 @@ fn kill_single(
                         return Ok(1);
                     }
                 }
+                if followup.needs_pid {
+                    println!("{PANE_NEEDS_PID}");
+                }
                 if matches!(
                     result,
                     terminal::KillResult::Sent | terminal::KillResult::AlreadyDead
@@ -1366,8 +1394,10 @@ fn kill_single(
                     pidtrack::remove_pid(hcom_dir, orphan.pid);
                 }
                 return Ok(
-                    if report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref())
-                    {
+                    if report_incomplete_pane_cleanup(
+                        result.into(),
+                        followup.retry_command.as_deref(),
+                    ) {
                         1
                     } else {
                         0
@@ -1485,6 +1515,9 @@ fn kill_single(
             1
         }
     };
+    if kill_result.pane_close_needs_pid {
+        println!("{PANE_NEEDS_PID}");
+    }
     Ok(
         if report_incomplete_pane_cleanup(result.into(), pane_retry_command.as_deref()) {
             1
@@ -1510,7 +1543,7 @@ fn kill_orphan_process(
     db: &HcomDb,
     owner: &crate::proctruth::KillOwner,
     orphan: &crate::pidtrack::OrphanProcess,
-) -> Result<(terminal::KillResult, bool, Option<String>, bool), KillTrackedError> {
+) -> Result<(terminal::KillResult, bool, terminal::PaneFollowup, bool), KillTrackedError> {
     let name = orphan.names.join(", ");
     let chain = crate::proctruth::kill_caller_ancestor_pids()
         .map_err(|reason| unverified_owner_error(&name, orphan.pid, reason))?;
@@ -1544,7 +1577,8 @@ fn kill_orphan_process(
     .map_err(|error| native_kill_error(&name, error))?;
     let pane = PaneOutcome {
         closed: result.1,
-        retry_command: result.2.clone(),
+        retry_command: result.2.retry_command.clone(),
+        needs_pid: result.2.needs_pid,
         preset_name: orphan.terminal_preset.clone(),
         pane_id: orphan.pane_id.clone(),
         left_for_caller: self_excluded && !orphan.terminal_preset.is_empty() && !result.1,
@@ -1565,7 +1599,7 @@ fn kill_orphan_process(
 }
 
 /// Kill a process and close its terminal pane.
-/// Returns (KillResult, pane_closed, pane_retry_command, preset_name, pane_id).
+/// Returns (KillResult, pane_closed, pane follow-up, preset_name, pane_id).
 fn kill_instance(
     db: &HcomDb,
     name: &str,
@@ -1574,11 +1608,20 @@ fn kill_instance(
     is_headless: bool,
     binding_ids: &[String],
     excluded: &[u32],
-) -> Result<(terminal::KillResult, bool, Option<String>, String, String), KillTrackedError> {
+) -> Result<
+    (
+        terminal::KillResult,
+        bool,
+        terminal::PaneFollowup,
+        String,
+        String,
+    ),
+    KillTrackedError,
+> {
     let pid = owner.pid();
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
-        let (result, pane_closed, pane_retry_command) = terminal::kill_process(
+        let (result, pane_closed, followup) = terminal::kill_process(
             owner,
             &[],
             binding_ids,
@@ -1595,13 +1638,7 @@ fn kill_instance(
                 name, pid, result, pane_closed
             ),
         );
-        return Ok((
-            result,
-            pane_closed,
-            pane_retry_command,
-            String::new(),
-            String::new(),
-        ));
+        return Ok((result, pane_closed, followup, String::new(), String::new()));
     }
 
     let ti = terminal::resolve_terminal_info(
@@ -1609,7 +1646,7 @@ fn kill_instance(
         instance.launch_context.as_deref(),
     );
 
-    let (result, pane_closed, pane_retry_command) = terminal::kill_process(
+    let (result, pane_closed, followup) = terminal::kill_process(
         owner,
         std::slice::from_ref(&instance.name),
         binding_ids,
@@ -1631,7 +1668,7 @@ fn kill_instance(
     Ok((
         result,
         pane_closed,
-        pane_retry_command,
+        followup,
         ti.preset_name.clone(),
         ti.pane_id.clone(),
     ))
