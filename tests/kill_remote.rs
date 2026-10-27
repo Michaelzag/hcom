@@ -471,7 +471,7 @@ impl Drop for Device {
             let _ = worker.kill();
             let _ = worker.wait();
         }
-        // `Hcom::drop` runs `kill all` and sweeps every row PID. By now each
+        // `Hcom::drop` runs `kill all`, which acts on every row PID. By now each
         // fixture process is reaped, so a recorded PID may already belong to
         // somebody else, and a mirrored remote row would send a kill over a
         // relay that is gone. Only this fixture's private state is touched.
