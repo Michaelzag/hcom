@@ -121,8 +121,13 @@ fn has_bound_id(env_id: EnvRead, bound_ids: &[String]) -> bool {
     matches!(env_id, EnvRead::Present(id) if !id.is_empty() && bound_ids.iter().any(|bound| bound == &id))
 }
 
-/// Recognize only exact, NUL-delimited `hcom pty` or `hcom.exe pty` argv.
+/// Recognize only NUL-delimited `hcom pty` or `hcom.exe pty` argv.
+/// Windows `.exe` basenames ignore ASCII case; the subcommand remains exact.
 pub(crate) fn is_wrapper(argv: &[u8]) -> bool {
+    is_wrapper_on_platform(argv, cfg!(windows))
+}
+
+fn is_wrapper_on_platform(argv: &[u8], windows: bool) -> bool {
     if argv.last() != Some(&0) {
         return false;
     }
@@ -132,7 +137,12 @@ pub(crate) fn is_wrapper(argv: &[u8]) -> bool {
         .rsplit(|byte| matches!(*byte, b'/' | b'\\'))
         .next()
         .unwrap_or_default();
-    (basename == b"hcom" || basename == b"hcom.exe") && args.next() == Some(b"pty".as_slice())
+    let hcom_exe = if windows {
+        basename.eq_ignore_ascii_case(b"hcom.exe")
+    } else {
+        basename == b"hcom.exe"
+    };
+    (basename == b"hcom" || hcom_exe) && args.next() == Some(b"pty".as_slice())
 }
 
 #[cfg(test)]
@@ -301,6 +311,35 @@ mod tests {
             process(20, 300, &[r"C:\Program Files\hcom\hcom.exe", "pty"]),
         );
         assert_eq!(legacy(&processes, OWNER), Some(MIDDLE));
+    }
+
+    #[test]
+    fn windows_wrapper_image_name_is_ascii_case_insensitive() {
+        for argv in [
+            b"HCOM.EXE\0pty\0".as_slice(),
+            b"C:\\Program Files\\HcOm.ExE\0pty\0",
+        ] {
+            assert!(is_wrapper_on_platform(argv, true), "{argv:?}");
+            assert!(!is_wrapper_on_platform(argv, false), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn wrapper_casing_never_admits_lookalikes_or_different_subcommands() {
+        for argv in [
+            b"HCOM.EXE.OLD\0pty\0".as_slice(),
+            b"NOT-HCOM.EXE\0pty\0",
+            b"HCOM.EXE.CMD\0pty\0",
+            b"hcom.cmd\0pty\0",
+            b"HCOM.EXE\0send\0",
+            b"HCOM.EXE\0PTY\0",
+            b"HCOM.EXE\0pty-other\0",
+            b"HCOM.EXE\0pty",
+        ] {
+            for windows in [false, true] {
+                assert!(!is_wrapper_on_platform(argv, windows), "{argv:?}");
+            }
+        }
     }
 
     #[test]
