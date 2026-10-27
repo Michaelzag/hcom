@@ -902,10 +902,11 @@ impl Sentinel {
 }
 
 impl Drop for Sentinel {
-    /// Kill the group only while it is provably this sentinel's: the leader
-    /// is still unreaped (so its PID and group id cannot be reused), it was
-    /// born when spawn recorded, and it still leads its own group. Otherwise
-    /// signal the owned child alone. Then reap.
+    /// Signal only what is provably this sentinel's. Ownership is the leader
+    /// still unreaped (so its PID and group id cannot be reused) and born when
+    /// spawn recorded; without it nothing is signalled or waited on. With it,
+    /// the whole group is killed while the leader still leads it, else the
+    /// leader alone. Then reap.
     fn drop(&mut self) {
         let pid = self.pid() as libc::pid_t;
         // waitid with WNOWAIT succeeds only while the child is ours and not
@@ -919,11 +920,11 @@ impl Drop for Sentinel {
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
         } == 0;
-        let owned_group = unreaped
-            && self.birth.is_some()
-            && start_ticks(self.pid()) == self.birth
-            && unsafe { libc::getpgid(pid) } == pid;
-        if owned_group {
+        let owned = unreaped && self.birth.is_some() && start_ticks(self.pid()) == self.birth;
+        if !owned {
+            return;
+        }
+        if unsafe { libc::getpgid(pid) } == pid {
             unsafe {
                 libc::killpg(pid, libc::SIGKILL);
             }
