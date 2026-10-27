@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::hooks::common::StopOutcome;
 use serde_json::json;
 #[cfg(unix)]
