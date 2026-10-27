@@ -1462,7 +1462,7 @@ fn install_fake_omp(h: &Hcom, runtime: &str, sid: &str, transcript: &Path) -> Pa
     out
 }
 
-fn seed_stopped_omp(h: &Hcom, runtime: &str, name: &str) -> (String, PathBuf) {
+fn seed_stopped_omp_history(h: &Hcom, runtime: &str, name: &str) -> (String, PathBuf) {
     let sid = uuid::Uuid::new_v4().to_string();
     let transcript = h
         .home
@@ -1496,11 +1496,6 @@ fn seed_stopped_omp(h: &Hcom, runtime: &str, name: &str) -> (String, PathBuf) {
     let background = i64::from(cfg!(windows));
     let conn = db(h);
     conn.execute(
-        "INSERT INTO instances (name,tool,session_id,status,status_context,status_time,created_at,directory,transcript_path,last_event_id,background)
-         VALUES (?1,'omp',?2,'inactive','exit:0',0,CAST(strftime('%s','now') AS REAL),?3,?4,0,?5)",
-        rusqlite::params![name,sid,h.workspace.to_string_lossy(),transcript.to_string_lossy(),background],
-    ).unwrap();
-    conn.execute(
         "INSERT INTO events (timestamp,type,instance,data) VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'),'life',?1,?2)",
         rusqlite::params![name,json!({
             "action":"stopped", "by":"session", "reason":"exit:normal",
@@ -1509,6 +1504,18 @@ fn seed_stopped_omp(h: &Hcom, runtime: &str, name: &str) -> (String, PathBuf) {
                 "directory":h.workspace, "transcript_path":transcript, "background":background,
                 "launch_args":"", "last_event_id":0}
         }).to_string()],
+    ).unwrap();
+    (sid, transcript)
+}
+
+fn seed_stopped_omp(h: &Hcom, runtime: &str, name: &str) -> (String, PathBuf) {
+    let (sid, transcript) = seed_stopped_omp_history(h, runtime, name);
+    let background = i64::from(cfg!(windows));
+    let conn = db(h);
+    conn.execute(
+        "INSERT INTO instances (name,tool,session_id,status,status_context,status_time,created_at,directory,transcript_path,last_event_id,background)
+         VALUES (?1,'omp',?2,'inactive','exit:0',0,CAST(strftime('%s','now') AS REAL),?3,?4,0,?5)",
+        rusqlite::params![name,sid,h.workspace.to_string_lossy(),transcript.to_string_lossy(),background],
     ).unwrap();
     (sid, transcript)
 }
@@ -2570,6 +2577,9 @@ fn native_pre_hook_dead_pin_can_resume_and_bind() {
         let (h, workspace) = launch_fixture();
         let suffix = unique_suffix();
         let name = format!("prehookdead{suffix}");
+        #[cfg(windows)]
+        let (sid, transcript) = seed_stopped_omp_history(&h, runtime, &name);
+        #[cfg(not(windows))]
         let (sid, transcript) = seed_stopped_omp(&h, runtime, &name);
         let out = install_fake_omp(&h, runtime, &sid, &transcript);
         #[cfg(not(windows))]
@@ -2659,6 +2669,9 @@ fn native_pre_hook_live_matching_pin_is_held() {
         let (h, workspace) = launch_fixture();
         let suffix = unique_suffix();
         let name = format!("prehooklive{suffix}");
+        #[cfg(windows)]
+        let (sid, transcript) = seed_stopped_omp_history(&h, runtime, &name);
+        #[cfg(not(windows))]
         let (sid, transcript) = seed_stopped_omp(&h, runtime, &name);
         let out = install_fake_omp(&h, runtime, &sid, &transcript);
         #[cfg(not(windows))]
@@ -2768,6 +2781,9 @@ fn native_stop_releases_unhooked_reservation_without_signaling_then_resume_binds
         let (h, workspace) = launch_fixture();
         let suffix = unique_suffix();
         let name = format!("prehookstop{suffix}");
+        #[cfg(windows)]
+        let (sid, transcript) = seed_stopped_omp_history(&h, runtime, &name);
+        #[cfg(not(windows))]
         let (sid, transcript) = seed_stopped_omp(&h, runtime, &name);
         let out = install_fake_omp(&h, runtime, &sid, &transcript);
         #[cfg(not(windows))]
