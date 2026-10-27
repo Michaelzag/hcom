@@ -28,7 +28,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::Duration;
-use support::{Hcom, unique_suffix};
+use support::{Hcom, child_identity, terminate_owned_child_group, unique_suffix};
 
 use serde_json::{Value, json};
 
@@ -37,16 +37,6 @@ fn relay_disabled_hcom() -> Hcom {
     fs::write(h.path().join("config.toml"), "[relay]\nenabled = false\n")
         .expect("disable fixture relay");
     h
-}
-
-/// SIGKILL the whole group `child` leads (spawned with `process_group(0)`),
-/// then reap it. Called only while the leader is unreaped, so its pgid cannot
-/// have been recycled.
-fn kill_group(child: &mut Child) {
-    unsafe {
-        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-    }
-    let _ = child.wait();
 }
 
 fn open_db(h: &Hcom) -> rusqlite::Connection {
@@ -212,12 +202,37 @@ printf "%s" "$?" > "$TEST_OUT_DIR/start.code"
 while :; do sleep 1; done
 "#;
 
+/// Owns the session's direct child and its birth identity, recorded before
+/// anything can reap it. The group is signalled only through
+/// `terminate_owned_child_group`, on `kill` and on the unwind path.
 struct FakeOmpSession {
     child: Child,
+    identity: Option<String>,
     out_dir: PathBuf,
 }
 
+impl Drop for FakeOmpSession {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 impl FakeOmpSession {
+    fn new(child: Child, out_dir: PathBuf) -> Self {
+        let identity = child_identity(&child);
+        Self {
+            child,
+            identity,
+            out_dir,
+        }
+    }
+
+    /// SIGKILL the group this still-owned leader heads (spawned with
+    /// `process_group(0)`), then reap it.
+    fn kill(&mut self) {
+        terminate_owned_child_group(&mut self.child, self.identity.as_deref());
+    }
+
     fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -276,8 +291,7 @@ fn spawn_provable_omp_session(h: &Hcom, tag: &str, session_id: &str) -> FakeOmpS
     let child = command
         .spawn()
         .unwrap_or_else(|e| panic!("spawn fake omp session {tag}: {e}"));
-    h.track_cleanup_pid(child.id() as i64);
-    FakeOmpSession { child, out_dir }
+    FakeOmpSession::new(child, out_dir)
 }
 
 /// Block until the session's `omp-start` run has finished writing its output
@@ -511,8 +525,7 @@ while :; do sleep 1; done
         .env("TEST_CWD", &h.workspace)
         .process_group(0);
     let child = cmd.spawn().expect("spawn fake omp retry session");
-    h.track_cleanup_pid(child.id() as i64);
-    let mut session = FakeOmpSession { child, out_dir };
+    let mut session = FakeOmpSession::new(child, out_dir);
     let (start_code, start) = wait_for_start(&h, &session);
     assert_eq!(start_code, "0", "retry exit {}", session.detail(&start));
     let first: Value =
@@ -543,7 +556,7 @@ while :; do sleep 1; done
         1
     );
     drop(db);
-    kill_group(&mut session.child);
+    session.kill();
 }
 
 #[test]
@@ -635,7 +648,7 @@ fn provable_omp_ancestor_is_trusted_but_external_hook_cannot_reap_it() {
         "external hook changed the owner's process binding"
     );
     drop(db);
-    kill_group(&mut session.child);
+    session.kill();
 }
 
 #[test]
@@ -688,7 +701,7 @@ fn plain_sessions_gate_controls_provable_chain_minting() {
         "process binding created with plain_sessions unset"
     );
     drop(db);
-    kill_group(&mut session_a.child);
+    session_a.kill();
 
     // Phase B — with the opt-in, plugin load replaces the inherited
     // pid-agy-123 id with each OMP process's own minted id.
@@ -782,6 +795,6 @@ fn plain_sessions_gate_controls_provable_chain_minting() {
     );
     drop(db);
 
-    kill_group(&mut session_b.child);
-    kill_group(&mut session_c.child);
+    session_b.kill();
+    session_c.kill();
 }
