@@ -299,15 +299,20 @@ pub fn launch_env_regime(run_here: bool, inside_ai_tool: bool) -> LaunchEnvRegim
     }
 }
 
-pub fn contaminated_parent() -> bool {
-    contaminated_parent_with_inside_ai_tool(crate::shared::platform::is_inside_ai_tool())
+fn contaminated_parent_with_inside_ai_tool(inside_ai_tool: bool) -> bool {
+    contaminated_parent_with_env(
+        inside_ai_tool,
+        |key| std::env::var_os(key).is_some(),
+        || std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("CARGO_")),
+    )
 }
 
-fn contaminated_parent_with_inside_ai_tool(inside_ai_tool: bool) -> bool {
-    inside_ai_tool
-        || std::env::var_os("CI").is_some()
-        || std::env::var_os("GITHUB_ACTIONS").is_some()
-        || std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("CARGO_"))
+fn contaminated_parent_with_env(
+    inside_ai_tool: bool,
+    has_key: impl Fn(&str) -> bool,
+    has_cargo_key: impl FnOnce() -> bool,
+) -> bool {
+    inside_ai_tool || has_key("CI") || has_key("GITHUB_ACTIONS") || has_cargo_key()
 }
 
 /// Build base environment, then overlay config.toml + ~/.hcom/env (these win).
@@ -1397,6 +1402,7 @@ fn finalize_background_launch(
     log_file: String,
     pid: u32,
     effective_preset: String,
+    omp_launch_pid: Option<&mut instance_binding::OmpLaunchPidSnapshot>,
 ) {
     if let Err(error) = instance_binding::persist_terminal_launch_context(
         ctx.db,
@@ -1415,7 +1421,15 @@ fn finalize_background_launch(
     // The wrapper can record its own pid and then its tool's pid during that
     // wait; an unconditional launcher write here would replace the proof.
     // Non-PTY backgrounds have no wrapper writer, so they keep this pid.
-    if let Err(e) = ctx.db.set_instance_pid_if_unset(ctx.instance_name, pid) {
+    let recorded = if ctx.tool == "omp" {
+        match omp_launch_pid {
+            Some(expected) => instance_binding::record_omp_launch_pid(ctx.db, expected, pid),
+            None => Ok(false),
+        }
+    } else {
+        ctx.db.set_instance_pid_if_unset(ctx.instance_name, pid)
+    };
+    if let Err(e) = recorded {
         crate::log::log_error("launcher", "background.pid", &format!("{e}"));
         eprintln!(
             "Warning: '{}' launched, but recording its pid failed: {e}. \
@@ -1530,6 +1544,14 @@ fn launch_pty_or_background(
     inside_ai_tool: bool,
 ) -> Result<bool> {
     if params.background {
+        // The runner can bind before launch_terminal returns. Retain the
+        // original unbound UUID reservation; never refresh after spawn.
+        let mut omp_launch_pid = if ctx.tool == "omp" {
+            instance_binding::capture_omp_launch_pid(ctx.db, ctx.process_id, ctx.instance_name)?
+                .filter(|expected| expected.row.pid.is_none() || expected.replaces_stale_pin)
+        } else {
+            None
+        };
         let (log_file, pid, effective_preset) = launch_background_runner(
             ctx.tool,
             ctx.working_dir,
@@ -1540,7 +1562,13 @@ fn launch_pty_or_background(
             inside_ai_tool,
             params.answer_omp_reroot_prompt,
         )?;
-        finalize_background_launch(ctx, log_file, pid, effective_preset);
+        finalize_background_launch(
+            ctx,
+            log_file,
+            pid,
+            effective_preset,
+            omp_launch_pid.as_mut(),
+        );
         Ok(true)
     } else {
         let effective_run_here = will_run_in_current_terminal(
@@ -1604,10 +1632,7 @@ pub(crate) fn registered_unclaimed_incarnation(
     let Some(row) = db.get_instance_full(name)? else {
         return Ok(None);
     };
-    let reserving = (row.status == crate::shared::ST_INACTIVE
-        || row.status == instance_names::PLACEHOLDER_STATUS)
-        && row.status_context == instance_names::PLACEHOLDER_CONTEXT;
-    if !reserving {
+    if !instance_binding::is_launch_reservation_shape(&row) {
         return Ok(None);
     }
     let Some(session_id) = row.session_id.filter(|s| !s.is_empty()) else {
@@ -1767,10 +1792,26 @@ pub(crate) fn register_launch_instance(
     // One PostCommit for the registration: the `life.created` fan-out runs
     // inline with wakes collected, and `fire` runs only after commit. A
     // rollback drops `post`, discarding wakes for the unwritten row.
-    let post = db.with_immediate_transaction(|_tx| {
+    let post = db.with_immediate_transaction(|tx| {
         let mut post = PostCommit::default();
         if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            let held_pin = instance_binding::prepare_own_omp_reservation_in_txn(
+                db,
+                tx,
+                instance_name,
+                sid,
+                tool,
+            )?;
             refuse_held_session(db, instance_name, sid)?;
+            if let Some(pin) = held_pin {
+                bail!(
+                    "'{instance_name}' has an unhooked OMP launch reservation whose recorded pid {} {}. \
+                     If that launch is hung or gone, run 'hcom stop {instance_name}' to release the \
+                     reservation (no process is signaled), then resume again.",
+                    pin.pid,
+                    pin.reason
+                );
+            }
         }
         if !instance_binding::initialize_instance_in_position_file_collected(
             db,
@@ -2367,6 +2408,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                     log_file,
                                     pid,
                                     effective_preset,
+                                    None,
                                 );
                                 Ok(true)
                             }
@@ -2824,41 +2866,6 @@ mod tests {
     }
 
     impl EnvVarGuard {
-        fn clean_detection_env() -> Self {
-            let mut keys: Vec<String> = [
-                "CLAUDECODE",
-                "CLAUDE_ENV_FILE",
-                "ANTIGRAVITY_AGENT",
-                "GEMINI_CLI",
-                "CODEX_SANDBOX",
-                "CODEX_SANDBOX_NETWORK_DISABLED",
-                "CODEX_MANAGED_BY_NPM",
-                "CODEX_MANAGED_BY_BUN",
-                "CODEX_THREAD_ID",
-                "OPENCODE",
-                "KILO",
-                "CURSOR_AGENT",
-                "CURSOR_PROJECT_DIR",
-                "KIMI_CODE_CLI",
-                "KIMI_SESSION_ID",
-                "HCOM_TOOL",
-                "HCOM_LAUNCHED",
-                "HCOM_PI",
-                "CI",
-                "GITHUB_ACTIONS",
-                "CARGO_TEST_PARENT",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-            keys.extend(
-                std::env::vars()
-                    .map(|(key, _)| key)
-                    .filter(|key| key.starts_with("CARGO_")),
-            );
-            Self::remove(keys)
-        }
-
         fn remove<I>(keys: I) -> Self
         where
             I: IntoIterator<Item = String>,
@@ -3310,26 +3317,70 @@ mod tests {
         assert!(!strip.contains("TERM"));
     }
 
+    type EnvironmentEntries<'a> = &'a [(&'a str, &'a str)];
+
     #[test]
-    #[serial]
     fn test_contaminated_parent_detection() {
-        let _guard = EnvVarGuard::clean_detection_env();
-        assert!(!contaminated_parent());
+        let cases: &[(EnvironmentEntries<'_>, bool, bool)] = &[
+            (&[], false, false),
+            (&[], true, true),
+            (&[("CI", "")], false, true),
+            (&[("CI", "1")], false, true),
+            (&[("GITHUB_ACTIONS", "false")], false, true),
+            (&[("CARGO_", "")], false, true),
+            (&[("CARGO_TARGET_DIR", "/tmp/target")], false, true),
+            (&[("XCARGO_TARGET_DIR", "/tmp/target")], false, false),
+            (&[("cargo_TARGET_DIR", "/tmp/target")], false, false),
+        ];
+        for &(entries, inside_ai_tool, expected) in cases {
+            let env: HashMap<String, String> = entries
+                .iter()
+                .map(|&(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(
+                contaminated_parent_with_env(
+                    inside_ai_tool,
+                    |key| env.contains_key(key),
+                    || env.keys().any(|key| key.starts_with("CARGO_")),
+                ),
+                expected,
+                "entries={entries:?}, inside_ai_tool={inside_ai_tool}",
+            );
+        }
+    }
 
-        unsafe { std::env::set_var("CLAUDECODE", "1") };
-        assert!(contaminated_parent());
-        unsafe { std::env::remove_var("CLAUDECODE") };
+    #[test]
+    fn test_contaminated_parent_tool_detection() {
+        use crate::shared::context::HcomContext;
+        use crate::tool::Tool;
 
-        unsafe { std::env::set_var("CODEX_THREAD_ID", "thread") };
-        assert!(contaminated_parent());
-        unsafe { std::env::remove_var("CODEX_THREAD_ID") };
-
-        unsafe { std::env::set_var("CI", "1") };
-        assert!(contaminated_parent());
-        unsafe { std::env::remove_var("CI") };
-
-        unsafe { std::env::set_var("CARGO_TEST_PARENT", "1") };
-        assert!(contaminated_parent());
+        let cases: &[(EnvironmentEntries<'_>, Tool, bool)] = &[
+            (&[], Tool::Adhoc, false),
+            (&[("CLAUDECODE", "1")], Tool::Claude, true),
+            (&[("CODEX_THREAD_ID", "thread")], Tool::Codex, true),
+            (&[("HCOM_OMP", "1")], Tool::Omp, true),
+            (&[("OMPCODE", "1")], Tool::Omp, true),
+            (&[("OMPCODE", "1"), ("CLAUDECODE", "1")], Tool::Omp, true),
+            (&[("HCOM_LAUNCHED", "1")], Tool::Adhoc, true),
+            (&[("HCOM_LAUNCHED", "true")], Tool::Adhoc, false),
+        ];
+        for &(entries, expected_tool, expected) in cases {
+            let env: HashMap<String, String> = entries
+                .iter()
+                .map(|&(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            let context = HcomContext::from_env(&env, std::path::PathBuf::new());
+            assert_eq!(context.tool, expected_tool, "entries={entries:?}");
+            assert_eq!(
+                contaminated_parent_with_env(
+                    context.is_inside_ai_tool(),
+                    |key| env.contains_key(key),
+                    || env.keys().any(|key| key.starts_with("CARGO_")),
+                ),
+                expected,
+                "entries={entries:?}",
+            );
+        }
     }
 
     #[test]

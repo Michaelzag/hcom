@@ -1,8 +1,8 @@
 //! Hermetic CLI fixture for integration tests.
 //!
 //! `Hcom::new()` returns a fixture pointing at a fresh temp tree. Every hcom,
-//! Codex, XDG, and temporary path is redirected below that tree. Long-lived
-//! launches are cleaned up by process group when the fixture is dropped.
+//! Codex, XDG, and temporary path is redirected below that tree. Detached
+//! launches use fixture-local hcom teardown; direct children stay owned until reaped.
 //!
 //! Each integration-test file that uses this declares `mod support;` so this
 //! `tests/support/mod.rs` is picked up via the subdirectory-module rule (which
@@ -13,12 +13,13 @@
 pub mod claude_mock;
 pub mod codex_mock;
 pub mod mock_http;
+pub mod omp_owner;
 pub mod real_tool;
 
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
@@ -54,8 +55,7 @@ pub struct Hcom {
     /// would be dropped. The `$HCOM_DIR/env` passthrough is overlaid last and
     /// wins, so Claude's `ANTHROPIC_BASE_URL` actually reaches the child.
     launch_env: RefCell<BTreeMap<String, String>>,
-    cleanup_pids: RefCell<HashSet<i64>>,
-    cleanup_children: RefCell<Vec<Child>>,
+    cleanup_children: RefCell<Vec<(Child, Option<String>)>>,
 }
 
 /// Everything [`diagnostics_for`] needs to shell out to the fixture's exact
@@ -378,7 +378,6 @@ impl Hcom {
             bin,
             path_env,
             launch_env: RefCell::new(BTreeMap::new()),
-            cleanup_pids: RefCell::new(HashSet::new()),
             cleanup_children: RefCell::new(Vec::new()),
         };
         install_diagnostics_panic_hook();
@@ -586,9 +585,7 @@ impl Hcom {
             .stdin(Stdio::null())
             .stdout(output)
             .stderr(Stdio::null());
-        let child = command.spawn().expect("spawn live test recipient");
-        self.track_cleanup_pid(i64::from(child.id()));
-        self.cleanup_children.borrow_mut().push(child);
+        self.spawn_cleanup_child(&mut command);
         self.eventually(
             "manual test recipient to enter listening state",
             Duration::from_secs(10),
@@ -723,16 +720,17 @@ impl Hcom {
             .optional()
             .map(|row| row.flatten())
             .map_err(|e| format!("query pid for {name}: {e}"))?;
-        if let Some(pid) = pid.filter(|pid| *pid > 1) {
-            self.cleanup_pids.borrow_mut().insert(pid);
-        }
         Ok(pid)
     }
 
-    pub fn track_cleanup_pid(&self, pid: i64) {
-        if pid > 1 {
-            self.cleanup_pids.borrow_mut().insert(pid);
-        }
+    /// Spawn and retain a direct child, recording its birth identity before any
+    /// wait can reap it. Borrowed row PIDs are never cleanup registrations.
+    pub fn spawn_cleanup_child(&self, command: &mut Command) -> u32 {
+        let child = command.spawn().expect("spawn owned cleanup child");
+        let pid = child.id();
+        let identity = child_identity(&child);
+        self.cleanup_children.borrow_mut().push((child, identity));
+        pid
     }
 
     /// Insert a synthetic file-edit status event for another instance, directly
@@ -763,25 +761,6 @@ impl Hcom {
         )
         .map_err(|e| format!("insert test file-edit event: {e}"))?;
         Ok(())
-    }
-
-    pub fn all_tracked_pids(&self) -> Vec<i64> {
-        let db_path = self.hcom_dir.join("hcom.db");
-        if !db_path.exists() {
-            return Vec::new();
-        }
-        let Ok(conn) = rusqlite::Connection::open(&db_path) else {
-            return Vec::new();
-        };
-        let Ok(mut stmt) = conn.prepare("SELECT DISTINCT pid FROM instances WHERE pid IS NOT NULL")
-        else {
-            return Vec::new();
-        };
-        let rows = match stmt.query_map([], |row| row.get::<_, i64>(0)) {
-            Ok(rows) => rows,
-            Err(_) => return Vec::new(),
-        };
-        rows.filter_map(Result::ok).filter(|pid| *pid > 1).collect()
     }
 
     /// Poll a public/semantic condition. On timeout, panic with hcom state,
@@ -816,12 +795,6 @@ impl Hcom {
     pub fn process_group_alive(&self, pid: i64) -> bool {
         process_group_alive(pid)
     }
-
-    /// Terminate one hcom-owned process group, escalating only after bounded
-    /// polling. Returns true once the group no longer exists.
-    pub fn terminate_process_group(&self, pid: i64) -> bool {
-        terminate_process_group(pid)
-    }
 }
 
 impl Drop for Hcom {
@@ -837,20 +810,35 @@ impl Drop for Hcom {
                 self.root.path().display()
             );
         }
-        // Capture pids before `hcom kill all` removes instance rows.
-        let mut pids: HashSet<i64> = self.all_tracked_pids().into_iter().collect();
-        pids.extend(self.cleanup_pids.borrow().iter().copied());
-        // `kill all` is the clean teardown path, but a wedged binary must not
-        // hang suite teardown: bound it, then fall through to the pid sweep
-        // (which SIGKILLs by process group) regardless of how it ended.
-        if let Ok(mut child) = self.cmd().args(["kill", "all"]).spawn() {
+        // Detached launches belong to hcom's identity-checked teardown,
+        // never a raw sweep of database rows or previously reaped PIDs.
+        let mut command = self.cmd();
+        assert_eq!(self.hcom_dir, self.root.path().join("hcom-state"));
+        assert_eq!(
+            self.hcom_dir.canonicalize().ok(),
+            self.root
+                .path()
+                .canonicalize()
+                .ok()
+                .map(|root| root.join("hcom-state")),
+            "teardown HCOM_DIR must remain inside this fixture"
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "HCOM_DIR")
+                .and_then(|(_, value)| value),
+            Some(self.hcom_dir.as_os_str()),
+            "kill all must use this fixture's isolated HCOM_DIR"
+        );
+        if let Ok(mut child) = command.args(["kill", "all"]).spawn() {
+            let identity = child_identity(&child);
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) if Instant::now() >= deadline => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        terminate_owned_child(&mut child, identity.as_deref());
                         break;
                     }
                     Ok(None) => std::thread::sleep(POLL_INTERVAL),
@@ -858,12 +846,8 @@ impl Drop for Hcom {
                 }
             }
         }
-        for pid in pids {
-            let _ = self.terminate_process_group(pid);
-        }
-        for mut child in self.cleanup_children.borrow_mut().drain(..) {
-            let _ = child.kill();
-            let _ = child.wait();
+        for (mut child, identity) in self.cleanup_children.borrow_mut().drain(..) {
+            terminate_owned_child(&mut child, identity.as_deref());
         }
     }
 }
@@ -906,42 +890,114 @@ pub fn process_group_alive(pid: i64) -> bool {
     }
 }
 
-/// Terminate one hcom-owned process group, escalating only after bounded
-/// polling. Returns true once the group no longer exists.
-#[cfg(unix)]
-pub fn terminate_process_group(pid: i64) -> bool {
-    if !process_group_alive(pid) {
-        return true;
+/// Capture a direct child's kernel birth identity immediately after spawn.
+/// Keep its `Child` unreaped until cleanup; a cached, reaped Child is not proof.
+pub fn child_identity(child: &Child) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", child.id())).ok()?;
+        stat.rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .nth(19)
+            .map(str::to_string)
     }
-    unsafe {
-        nix::libc::kill(-(pid as i32), nix::libc::SIGTERM);
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as libc::c_int;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                child.id() as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        (read == size && info.pbi_pid == child.id() && info.pbi_start_tvusec < 1_000_000)
+            .then(|| format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec))
     }
-    if poll_until(Duration::from_secs(3), || !process_group_alive(pid)) {
-        return true;
-    }
-    unsafe {
-        nix::libc::kill(-(pid as i32), nix::libc::SIGKILL);
-    }
-    poll_until(Duration::from_secs(3), || !process_group_alive(pid))
-}
-
-// Windows has no process-group primitive; terminate just the tracked pid.
-#[cfg(windows)]
-pub fn terminate_process_group(pid: i64) -> bool {
-    if !process_group_alive(pid) {
-        return true;
-    }
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-    // SAFETY: opens a terminate-only handle, closes it before returning.
-    unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
-        if !handle.is_null() {
-            TerminateProcess(handle, 1);
-            CloseHandle(handle);
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        unsafe {
+            let mut created: FILETIME = std::mem::zeroed();
+            let mut exited: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            (GetProcessTimes(
+                child.as_raw_handle(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            ) != 0)
+                .then(|| format!("{}:{}", created.dwHighDateTime, created.dwLowDateTime))
         }
     }
-    poll_until(Duration::from_secs(3), || !process_group_alive(pid))
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = child;
+        None
+    }
+}
+
+fn owns_unreaped_child(child: &mut Child, expected: Option<&str>) -> bool {
+    matches!(child.try_wait(), Ok(None))
+        && expected.is_some()
+        && child_identity(child).as_deref() == expected
+}
+
+/// Send a Unix signal without reaping, under the same retained-child birth gate.
+/// Only this owned Child's PID may be used; no borrowed process or group IDs.
+#[cfg(unix)]
+pub fn signal_owned_child(child: &mut Child, expected: Option<&str>, signal: libc::c_int) -> bool {
+    if !owns_unreaped_child(child, expected) {
+        return false;
+    }
+    let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+        return false;
+    };
+    pid > 1 && unsafe { libc::kill(pid, signal) } == 0
+}
+
+/// Fail closed unless this is still the unreaped child captured at spawn.
+/// Only a retained Child may be signalled, never a borrowed or already reaped
+/// PID. Detached descendants use isolated hcom kill/stop or private exit gates.
+/// If group cleanup is needed, use `terminate_owned_child_group`: it also
+/// requires that the child's current PGID equals its PID.
+pub fn terminate_owned_child(child: &mut Child, expected: Option<&str>) {
+    if owns_unreaped_child(child, expected) && child.kill().is_ok() {
+        let _ = child.wait();
+    }
+}
+
+/// Clean a group created by `process_group(0)` on this retained direct child.
+/// An unreaped, birth-identity-matched leader holds the PGID against reuse;
+/// additionally require `getpgid(child) == child.id()` before signalling it.
+/// This must never be used for row PIDs or discovered/reaped descendants.
+#[cfg(unix)]
+pub fn terminate_owned_child_group(child: &mut Child, expected: Option<&str>) {
+    if !owns_unreaped_child(child, expected) {
+        return;
+    }
+    let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+        return;
+    };
+    if pid > 1
+        && unsafe { libc::getpgid(pid) } == pid
+        && unsafe { libc::killpg(pid, libc::SIGKILL) } == 0
+    {
+        let _ = child.wait();
+    }
+}
+
+#[cfg(windows)]
+pub fn terminate_owned_child_group(child: &mut Child, expected: Option<&str>) {
+    terminate_owned_child(child, expected);
 }
 
 pub fn parse_hcom_marker(stdout: &str) -> Option<String> {

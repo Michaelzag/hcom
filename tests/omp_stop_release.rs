@@ -7,10 +7,12 @@
 
 mod support;
 
+use std::fs;
+use std::os::unix::fs as unix_fs;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Child, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
-use support::{Hcom, unique_suffix};
+use support::{Hcom, child_identity, terminate_owned_child_group, unique_suffix};
 
 fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
@@ -23,31 +25,74 @@ fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus
     None
 }
 
-/// SIGKILL the whole group `child` leads (spawned with `process_group(0)`),
-/// then reap it. Called only while the leader is unreaped, so its pgid cannot
-/// have been recycled.
-fn kill_group(child: &mut Child) {
-    unsafe {
-        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+/// A direct child spawned with `process_group(0)`, with its birth identity
+/// recorded before anything can reap it. Its group is signalled only through
+/// `terminate_owned_child_group`, which refuses a reaped or mismatched leader,
+/// and the unwind path cleans it too.
+struct OwnedGroup {
+    child: Child,
+    identity: Option<String>,
+}
+
+impl OwnedGroup {
+    fn spawn(command: &mut Command, what: &str) -> Self {
+        let child = command
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {what}: {e}"));
+        let identity = child_identity(&child);
+        Self { child, identity }
     }
-    let _ = child.wait();
+
+    /// SIGKILL the group this still-owned leader heads, then reap it.
+    fn kill(&mut self) {
+        terminate_owned_child_group(&mut self.child, self.identity.as_deref());
+    }
+}
+
+impl Drop for OwnedGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 #[test]
 fn omp_stop_release_spares_caller_tree_and_out_of_scope_sibling() {
     let h = Hcom::new();
+    fs::write(h.path().join("config.toml"), "[relay]\nenabled = false\n")
+        .expect("disable fixture relay");
     // Creates the schema in the isolated HCOM_DIR.
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
 
     let suffix = unique_suffix();
     let name = format!("rocstop{suffix}");
-    let process_id = format!("omp-roc-stop-{suffix}");
+    let process_id = uuid::Uuid::new_v4().to_string();
+    let fakebin = h.root_path().join("fakebin");
+    fs::create_dir_all(&fakebin).expect("create fakebin");
+    let omp = fakebin.join("omp");
+    unix_fs::symlink("/bin/bash", &omp).expect("symlink omp stand-in");
+    let go = h.root_path().join("go-stop");
+
+    // A real kernel PID recognized as OMP, not the actual application. It
+    // waits until its UUID, row PID and bindings are durably seeded.
+    let mut session = OwnedGroup::spawn(
+        h.external_cmd(&omp)
+            .arg("-c")
+            .arg("while [ ! -e \"$GO\" ]; do sleep 0.05; done; \"$BIN\" omp-stop --name \"$NAME\" --reason shutdown; exit $?")
+            .env("GO", &go)
+            .env("BIN", env!("CARGO_BIN_EXE_hcom"))
+            .env("NAME", &name)
+            .env("HCOM_PROCESS_ID", &process_id)
+            .env("HCOM_LAUNCHED", "1")
+            .env("HCOM_TOOL", "omp")
+            .process_group(0),
+        "recognized OMP session",
+    );
     let db = rusqlite::Connection::open(h.path().join("hcom.db")).expect("open db");
     db.execute(
-        "INSERT INTO instances (name, tool, session_id, status, status_context, status_time, created_at, last_event_id)
-         VALUES (?1, 'omp', ?2, 'listening', 'start', 0, 0, 0)",
-        rusqlite::params![name, format!("sid-{suffix}")],
+        "INSERT INTO instances (name, tool, session_id, status, status_context, status_time, created_at, last_event_id, pid)
+         VALUES (?1, 'omp', ?2, 'listening', 'start', 0, 0, 0, ?3)",
+        rusqlite::params![name, format!("sid-{suffix}"), session.child.id()],
     )
     .expect("seed instance");
     db.execute(
@@ -56,37 +101,31 @@ fn omp_stop_release_spares_caller_tree_and_out_of_scope_sibling() {
         rusqlite::params![process_id, format!("sid-{suffix}"), name],
     )
     .expect("seed process binding");
+    db.execute(
+        "INSERT INTO session_bindings (session_id, instance_name, created_at) VALUES (?1, ?2, 0)",
+        rusqlite::params![format!("sid-{suffix}"), name],
+    )
+    .expect("seed session binding");
 
     // A leaked desktop-shaped carrier: it has the binding but is a sibling
     // of the session shell, not a descendant of either owning root.
-    let mut sibling = h
-        .external_cmd("sleep")
-        .arg("300")
-        .env("HCOM_PROCESS_ID", &process_id)
-        .process_group(0)
-        .spawn()
-        .expect("spawn sibling carrier");
+    let mut sibling = OwnedGroup::spawn(
+        h.external_cmd("sleep")
+            .arg("300")
+            .env("HCOM_PROCESS_ID", &process_id)
+            .process_group(0),
+        "sibling carrier",
+    );
 
-    // `sh` stands in for omp: a carrier ancestor of the hcom child. The
-    // trailing `exit` keeps sh from exec'ing hcom in its place.
-    let mut session = h
-        .external_cmd("sh")
-        .arg("-c")
-        .arg("\"$BIN\" omp-stop --name \"$NAME\" --reason shutdown; exit $?")
-        .env("BIN", env!("CARGO_BIN_EXE_hcom"))
-        .env("NAME", &name)
-        .env("HCOM_PROCESS_ID", &process_id)
-        .process_group(0)
-        .spawn()
-        .expect("spawn session shell");
+    fs::write(&go, "").expect("trigger stop after fixture seed");
 
-    let session_status = wait_with_deadline(&mut session, Duration::from_secs(30));
+    let session_status = wait_with_deadline(&mut session.child, Duration::from_secs(30));
     if session_status.is_none() {
-        kill_group(&mut session);
+        session.kill();
     }
-    let sibling_status = sibling.try_wait().expect("poll out-of-scope sibling");
+    let sibling_status = sibling.child.try_wait().expect("poll out-of-scope sibling");
     if sibling_status.is_none() {
-        kill_group(&mut sibling);
+        sibling.kill();
     }
 
     let session_status = session_status.expect("omp-stop session shell did not exit");

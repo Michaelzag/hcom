@@ -5,48 +5,89 @@ mod support;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::process::Command;
 use std::time::{Duration, Instant};
 use support::{Hcom, parse_hcom_marker};
 
 #[test]
-fn fixture_drop_terminates_registered_process_group() {
-    #[cfg(unix)]
-    let mut child = Command::new("sh")
-        .args(["-c", "sleep 60"])
-        .process_group(0)
-        .spawn()
-        .expect("spawn cleanup test process group");
-    #[cfg(windows)]
-    let mut child = Command::new("powershell")
-        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
-        .spawn()
-        .expect("spawn cleanup test process group");
-    let pid = i64::from(child.id());
-
+fn fixture_drop_terminates_only_its_retained_child() {
     let h = Hcom::new();
-    h.track_cleanup_pid(pid);
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = h.external_cmd("sh");
+        command.args(["-c", "exec sleep 60"]).process_group(0);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = h.external_cmd("powershell");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
+        command
+    };
+    let mut unowned = command
+        .spawn()
+        .expect("spawn child not retained by fixture");
+    let unowned_identity = support::child_identity(&unowned).expect("capture child birth identity");
+    let pid = i64::from(h.spawn_cleanup_child(&mut command));
     assert!(
         h.process_group_alive(pid),
-        "cleanup test process group did not start"
+        "cleanup test child did not start"
     );
-
-    let reaper = std::thread::spawn(move || child.wait().expect("reap cleanup test process"));
     drop(h);
-    let status = reaper.join().expect("cleanup reaper thread");
+    let unowned_status = unowned.try_wait().expect("poll unowned child");
+    support::terminate_owned_child(&mut unowned, Some(&unowned_identity));
     assert!(
-        !status.success(),
-        "fixture cleanup should terminate the registered process"
+        unowned_status.is_none(),
+        "fixture drop must not terminate a child it doesn't retain"
     );
-
+    assert!(
+        !unowned
+            .wait()
+            .expect("reap separately owned child")
+            .success(),
+        "explicit owned cleanup should terminate the child"
+    );
     let deadline = Instant::now() + Duration::from_secs(7);
     while Instant::now() < deadline && support::process_group_alive(pid) {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
         !support::process_group_alive(pid),
-        "fixture drop left process group {pid} alive"
+        "fixture drop left its retained child {pid} alive"
     );
+}
+
+#[test]
+fn owned_cleanup_refuses_missing_or_mismatched_birth_identity() {
+    let h = Hcom::new();
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = h.external_cmd("sh");
+        command.args(["-c", "exec sleep 60"]).process_group(0);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = h.external_cmd("powershell");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
+        command
+    };
+    let mut child = command
+        .spawn()
+        .expect("spawn identity-checked cleanup child");
+    let identity = support::child_identity(&child).expect("capture child identity at spawn");
+    support::terminate_owned_child(&mut child, None);
+    let survived_missing = child.try_wait().expect("poll owned child").is_none();
+    support::terminate_owned_child(&mut child, Some("not-the-child-birth-identity"));
+    let survived_mismatch = child.try_wait().expect("poll owned child").is_none();
+    support::terminate_owned_child_group(&mut child, Some(&identity));
+    assert!(survived_missing, "cleanup acted without a birth identity");
+    assert!(
+        survived_mismatch,
+        "cleanup acted on a mismatched birth identity"
+    );
+    assert!(!child.wait().expect("reap owned cleanup child").success());
+    // A retained but already-reaped Child must never send another signal.
+    support::terminate_owned_child_group(&mut child, Some(&identity));
 }
 
 #[test]
@@ -463,9 +504,14 @@ fn security_external_script_names_still_deliver() {
 /// `ack`, `status` and `stop` naming a connector-hosted participant must all
 /// be refused before a handler runs — `read` would return the participant's
 /// private mail, `ack` would consume it, `status`/`stop` would mutate its
-/// row. The same hooks naming the agent's own identity must keep working.
+/// row. Ordinary names still work for legacy hooks; OMP requires owner proof.
 /// Kilo shares the opencode hook names and dispatcher.
-fn argv_hook_hosted_name_refusal_matrix(read: &str, status: &str, stop: &str) {
+fn argv_hook_hosted_name_refusal_matrix(
+    read: &str,
+    status: &str,
+    stop: &str,
+    requires_owner_proof: bool,
+) {
     let h = Hcom::new();
     let me = h.start();
     let other = h.start();
@@ -550,6 +596,59 @@ fn argv_hook_hosted_name_refusal_matrix(read: &str, status: &str, stop: &str) {
     assert_eq!(status_value, "listening");
     drop(db);
 
+    if requires_owner_proof {
+        let (code, stdout, stderr) = h.run(["send", &me, "--name", &other, "--", "own mail"]);
+        assert_eq!(code, 0, "{stdout} {stderr}");
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let event_id: i64 = db
+            .query_row(
+                "SELECT id FROM events WHERE type = 'message'
+                 AND json_extract(data, '$.text') = 'own mail'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("own private message must be queued");
+        drop(db);
+        let up_to = event_id.to_string();
+        let before = support::omp_owner::full_state(&h);
+        for args in [
+            vec![read, "--name", &me],
+            vec![read, "--name", &me, "--ack", "--up-to", &up_to],
+            vec![
+                status,
+                "--name",
+                &me,
+                "--status",
+                "active",
+                "--context",
+                "prompt",
+            ],
+            vec![stop, "--name", &me, "--reason", "done"],
+        ] {
+            let (code, stdout, stderr) = h.run(args.clone());
+            assert_eq!(code, 0, "RPC refusal {args:?}: {stdout} {stderr}");
+            let response: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("RPC refusal {args:?}: {error}: {stdout}"));
+            assert!(
+                response["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty()),
+                "missing RPC error for {args:?}: {stdout}"
+            );
+            assert!(
+                !stdout.contains("own mail") && !stderr.contains("own mail"),
+                "non-owner {args:?} leaked private mail: {stdout} {stderr}"
+            );
+            assert_eq!(
+                support::omp_owner::full_state(&h),
+                before,
+                "non-owner {args:?} must not mutate the row, cursor, message or other state"
+            );
+        }
+        return;
+    }
+
     // The agent's own identity works on the same hooks.
     let (code, stdout, stderr) = h.run([
         status,
@@ -575,17 +674,22 @@ fn argv_hook_hosted_name_refusal_matrix(read: &str, status: &str, stop: &str) {
 
 #[test]
 fn security_argv_hook_hosted_name_refused_omp() {
-    argv_hook_hosted_name_refusal_matrix("omp-read", "omp-status", "omp-stop");
+    argv_hook_hosted_name_refusal_matrix("omp-read", "omp-status", "omp-stop", true);
 }
 
 #[test]
 fn security_argv_hook_hosted_name_refused_pi() {
-    argv_hook_hosted_name_refusal_matrix("pi-read", "pi-status", "pi-stop");
+    argv_hook_hosted_name_refusal_matrix("pi-read", "pi-status", "pi-stop", false);
 }
 
 #[test]
 fn security_argv_hook_hosted_name_refused_opencode() {
-    argv_hook_hosted_name_refusal_matrix("opencode-read", "opencode-status", "opencode-stop");
+    argv_hook_hosted_name_refusal_matrix(
+        "opencode-read",
+        "opencode-status",
+        "opencode-stop",
+        false,
+    );
 }
 
 /// The reservation set used to live only in `hcom.db`, so `hcom reset` (or a

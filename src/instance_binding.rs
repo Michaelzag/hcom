@@ -5,11 +5,13 @@
 //! initialization for newly launched or recovered sessions.
 
 use anyhow::Context;
+use rusqlite::OptionalExtension;
 
 use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::common::PostCommit;
 use crate::instance_names::{PLACEHOLDER_CONTEXT, PLACEHOLDER_STATUS};
 use crate::instances::update_instance_position;
+use crate::proctruth::{AncestorProcess, OmpOwnerProof};
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
 use crate::shared::{ST_INACTIVE, ST_LISTENING};
 
@@ -19,8 +21,8 @@ mod terminal_ownership_tests;
 
 /// Persist terminal launch metadata without clobbering other launch_context fields.
 ///
-/// The launcher owns the authoritative preset decision. launch_context is only
-/// for late-bound metadata such as pane_id, terminal_id, and env snapshot.
+/// The launcher owns the authoritative preset decision. Merge context under
+/// the writer lock so concurrent launch pins and other metadata stay intact.
 pub fn persist_terminal_launch_context(
     db: &HcomDb,
     instance_name: &str,
@@ -28,102 +30,129 @@ pub fn persist_terminal_launch_context(
     effective_preset: &str,
     process_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut ctx = db
-        .get_instance_full(instance_name)?
-        .and_then(|pos| pos.launch_context)
-        .and_then(|json| {
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok()
-        })
-        .unwrap_or_default();
+    let persist = || {
+        let mut ctx = db
+            .get_instance_full(instance_name)?
+            .and_then(|pos| pos.launch_context)
+            .and_then(|json| {
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json).ok()
+            })
+            .unwrap_or_default();
 
-    if let Some(pid) = process_id.filter(|v| !v.is_empty()) {
-        ctx.insert("process_id".into(), serde_json::json!(pid));
-    }
-    if !effective_preset.is_empty() {
-        ctx.insert(
+        #[cfg(test)]
+        if let Some(hook) = PERSIST_TERMINAL_CONTEXT_GAP_HOOK.with(std::cell::Cell::take) {
+            hook(db, instance_name);
+        }
+
+        if let Some(pid) = process_id.filter(|v| !v.is_empty()) {
+            ctx.insert("process_id".into(), serde_json::json!(pid));
+        }
+        if !effective_preset.is_empty() {
+            ctx.insert(
+                "terminal_preset_effective".into(),
+                serde_json::json!(effective_preset),
+            );
+            // Legacy compatibility for older readers and migration logic.
+            ctx.insert(
+                "terminal_preset".into(),
+                serde_json::json!(effective_preset),
+            );
+        }
+        if let Some(requested) = requested_preset.filter(|v| !v.is_empty() && *v != "default") {
+            ctx.insert(
+                "terminal_preset_requested".into(),
+                serde_json::json!(requested),
+            );
+        }
+
+        let mut updates = serde_json::Map::new();
+        updates.insert(
+            "terminal_preset_requested".into(),
+            serde_json::json!(
+                requested_preset
+                    .filter(|v| !v.is_empty() && *v != "default")
+                    .unwrap_or("")
+            ),
+        );
+        updates.insert(
             "terminal_preset_effective".into(),
             serde_json::json!(effective_preset),
         );
-        // Legacy compatibility for older readers and migration logic.
-        ctx.insert(
-            "terminal_preset".into(),
-            serde_json::json!(effective_preset),
+        updates.insert(
+            "launch_context".into(),
+            serde_json::json!(serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string())),
         );
+        db.update_instance_fields(instance_name, &updates)
+    };
+    if db.conn().is_autocommit() {
+        db.with_immediate_transaction(|_tx| persist())
+    } else {
+        persist()
     }
-    if let Some(requested) = requested_preset.filter(|v| !v.is_empty() && *v != "default") {
-        ctx.insert(
-            "terminal_preset_requested".into(),
-            serde_json::json!(requested),
-        );
-    }
-
-    let mut updates = serde_json::Map::new();
-    updates.insert(
-        "terminal_preset_requested".into(),
-        serde_json::json!(
-            requested_preset
-                .filter(|v| !v.is_empty() && *v != "default")
-                .unwrap_or("")
-        ),
-    );
-    updates.insert(
-        "terminal_preset_effective".into(),
-        serde_json::json!(effective_preset),
-    );
-    updates.insert(
-        "launch_context".into(),
-        serde_json::json!(serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string())),
-    );
-    db.update_instance_fields(instance_name, &updates)
 }
 
 /// Capture environment context and store it for the instance.
 ///
 /// Captures git branch, terminal program, tty, and relevant env vars.
+/// Preserves terminal metadata and launch receipts under the writer lock.
 pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     let new_ctx = capture_context();
+    let store = || -> anyhow::Result<()> {
+        // Preserve fields from prior context that can't be recaptured in hook env.
+        let preserve_keys = [
+            "pane_id",
+            "terminal_id",
+            "kitty_listen_on",
+            "process_id",
+            "terminal_preset_effective",
+            "omp_launch_pid",
+        ];
+        let mut ctx = new_ctx;
 
-    // Preserve fields from prior context that can't be recaptured in hook env
-    let preserve_keys = [
-        "pane_id",
-        "terminal_id",
-        "kitty_listen_on",
-        "process_id",
-        "terminal_preset_effective",
-    ];
-    let mut ctx = new_ctx;
+        let missing: Vec<&str> = preserve_keys
+            .iter()
+            .filter(|k| launch_context_value_missing(ctx.get(**k)))
+            .copied()
+            .collect();
 
-    let missing: Vec<&str> = preserve_keys
-        .iter()
-        .filter(|k| launch_context_value_missing(ctx.get(**k)))
-        .copied()
-        .collect();
-
-    if !missing.is_empty()
-        && let Ok(Some(pos)) = db.get_instance_full(instance_name)
-        && let Some(old_json) = &pos.launch_context
-        && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
-    {
-        for k in &missing {
-            if let Some(val) = old_ctx.get(*k)
-                && !launch_context_value_missing(Some(val))
-            {
-                ctx.insert(k.to_string(), val.clone());
+        if !missing.is_empty()
+            && let Ok(Some(pos)) = db.get_instance_full(instance_name)
+            && let Some(old_json) = &pos.launch_context
+            && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
+        {
+            for k in &missing {
+                if let Some(val) = old_ctx.get(*k)
+                    && !launch_context_value_missing(Some(val))
+                {
+                    ctx.insert(k.to_string(), val.clone());
+                }
             }
         }
-    }
 
-    let json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
-    let mut updates = serde_json::Map::new();
-    updates.insert("launch_context".into(), serde_json::json!(json));
-    update_instance_position(db, instance_name, &updates);
+        let json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
+        let mut updates = serde_json::Map::new();
+        updates.insert("launch_context".into(), serde_json::json!(json));
+        update_instance_position(db, instance_name, &updates);
+        Ok(())
+    };
+    let result = if db.conn().is_autocommit() {
+        db.with_immediate_transaction(|_tx| store())
+    } else {
+        store()
+    };
+    if let Err(error) = result {
+        crate::log::log_error(
+            "core",
+            "db.error",
+            &format!("capture_and_store_launch_context: {instance_name} - {error}"),
+        );
+    }
 }
 
 /// "Missing" for the preserve-from-prior-context check. Treats absent, JSON
 /// null, and empty strings as missing. Non-string non-null values (numbers,
-/// objects, arrays) are considered present even though every preserved field
-/// is currently a string — this is intentionally conservative so a future
-/// non-string preserved field doesn't silently get clobbered by re-capture.
+/// objects, arrays) are considered present so structured metadata survives
+/// re-capture.
 fn launch_context_value_missing(value: Option<&serde_json::Value>) -> bool {
     match value {
         None | Some(serde_json::Value::Null) => true,
@@ -257,7 +286,7 @@ fn zellij_pane_id_from_terminal_id(terminal_id: &str) -> Option<String> {
         .map(|suffix| suffix.to_string())
 }
 
-fn is_true_launch_placeholder(data: Option<&InstanceRow>) -> bool {
+pub(crate) fn is_true_launch_placeholder(data: Option<&InstanceRow>) -> bool {
     let Some(data) = data else {
         return false;
     };
@@ -448,6 +477,30 @@ fn retire_true_placeholder_after_canonical_bind(
     delete_true_placeholder_instance(db, ph_name);
 }
 
+/// Strict retirement for OMP's carrying transaction. Unlike the standalone
+/// best-effort path, any migration/deletion failure aborts the owner claim.
+fn retire_true_placeholder_after_canonical_bind_in_txn(
+    db: &HcomDb,
+    tx: &rusqlite::Transaction<'_>,
+    placeholder_name: Option<&String>,
+    canonical_name: &str,
+    placeholder_data: Option<&InstanceRow>,
+) -> anyhow::Result<()> {
+    let Some(name) = placeholder_name else {
+        return Ok(());
+    };
+    if name == canonical_name || !is_true_launch_placeholder(placeholder_data) {
+        return Ok(());
+    }
+    db.migrate_notify_endpoints_in_txn(tx, name, canonical_name)?;
+    migrate_placeholder_runtime_state_in_txn(db, tx, canonical_name, placeholder_data)?;
+    anyhow::ensure!(
+        db.delete_instance(name)?,
+        "OMP launch placeholder disappeared"
+    );
+    Ok(())
+}
+
 /// Whether another live process still holds this row. A stale binding alone
 /// cannot keep an abandoned identity alive; a live carrier of that binding can.
 fn held_by_another_live_process(
@@ -565,15 +618,33 @@ fn recreate_instance_from_placeholder(
     target_name: &str,
     session_id: &str,
     ph: Option<&InstanceRow>,
+    caller_tx: Option<&rusqlite::Transaction<'_>>,
     post: &mut PostCommit,
-) {
-    if db.get_instance_full(target_name).ok().flatten().is_some() {
-        return;
+) -> anyhow::Result<()> {
+    if db.get_instance_full(target_name)?.is_some() {
+        return Ok(());
     }
     let Some(ph) = ph else {
-        return;
+        return Ok(());
     };
-    initialize_instance_in_position_file_collected(
+    if let Some(tx) = caller_tx
+        && let Some(agent_id) = &ph.agent_id
+    {
+        // The initializer inserts with OR REPLACE. Transfer the UNIQUE agent
+        // identity explicitly, never by implicitly deleting the source row
+        // (and its endpoints) before the binding migration reaches it.
+        let changed = tx.execute(
+            "UPDATE instances SET agent_id = NULL
+             WHERE name = ?1 AND created_at = ?2 AND agent_id = ?3
+               AND pid IS ?4 AND session_id IS ?5",
+            rusqlite::params![ph.name, ph.created_at, agent_id, ph.pid, ph.session_id],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "OMP placeholder incarnation changed before recreation"
+        );
+    }
+    let initialized = initialize_instance_in_position_file_collected(
         db,
         target_name,
         Some(session_id),
@@ -590,6 +661,8 @@ fn recreate_instance_from_placeholder(
         Some(ph.directory.as_str()),
         post,
     );
+    anyhow::ensure!(initialized, "could not recreate instance '{target_name}'");
+    Ok(())
 }
 
 /// Identity metadata a reclaim or restore carries over: what a `life.stopped`
@@ -816,6 +889,16 @@ thread_local! {
     /// after its last write and before the commit, so a test can read the DB
     /// from a second connection the way another process sees it mid-switch.
     static RESTORE_STOPPED_COMMIT_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
+    /// Between the entry snapshot and BEGIN IMMEDIATE: a deterministic raced
+    /// replacement/UUID remap must invalidate the pending claim, and a
+    /// mapping that appears before a plain mint must refuse it.
+    static OMP_BIND_CLAIM_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
+    /// After the final actual-owner pin, before commit: observers still see
+    /// the old binding, row PID and endpoints together (no minted row yet).
+    static OMP_BIND_COMMIT_GAP_HOOK: crate::db::GapHook = const { std::cell::Cell::new(None) };
+    /// Between terminal context's read and write, while the writer lock is held.
+    static PERSIST_TERMINAL_CONTEXT_GAP_HOOK: crate::db::GapHook =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Whether `process_id` presents the process incarnation the `life.stopped`
@@ -888,6 +971,678 @@ pub fn stopped_restore_for_own_process(
     .then_some(name)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessBindingEpoch {
+    session_id: Option<String>,
+    instance_name: String,
+    updated_at_bits: u64,
+}
+
+fn process_binding_epoch(
+    db: &HcomDb,
+    process_id: &str,
+) -> anyhow::Result<Option<ProcessBindingEpoch>> {
+    Ok(db
+        .conn()
+        .query_row(
+            "SELECT session_id, instance_name, updated_at
+             FROM process_bindings WHERE process_id = ?1",
+            [process_id],
+            |row| {
+                Ok(ProcessBindingEpoch {
+                    session_id: row.get(0)?,
+                    instance_name: row.get(1)?,
+                    updated_at_bits: row.get::<_, f64>(2)?.to_bits(),
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Whether the session has no carriers, or exactly the expected row, bound or
+/// not and whatever its tool or status.
+fn session_carriers_match(
+    db: &HcomDb,
+    session_id: &str,
+    expected_name: Option<&str>,
+) -> anyhow::Result<bool> {
+    Ok(db.conn().query_row(
+        "SELECT CASE WHEN ?2 IS NULL THEN COUNT(*) = 0
+         ELSE COUNT(*) = 1 AND COALESCE(MIN(name = ?2), 0) = 1 END
+         FROM instances WHERE session_id = ?1",
+        rusqlite::params![session_id, expected_name],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
+fn same_row_incarnation(expected: Option<&InstanceRow>, current: Option<&InstanceRow>) -> bool {
+    match (expected, current) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => {
+            expected.name == current.name
+                && expected.created_at.to_bits() == current.created_at.to_bits()
+                && expected.agent_id == current.agent_id
+                && expected.pid == current.pid
+                && expected.session_id == current.session_id
+                && expected.tool == current.tool
+                && expected.origin_device_id == current.origin_device_id
+        }
+        _ => false,
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OmpLaunchPidReceipt {
+    pid: u32,
+    identity: String,
+    process_id: String,
+    binding_updated_at_bits: String,
+    created_at_bits: String,
+}
+
+impl OmpLaunchPidReceipt {
+    fn raw(row: &InstanceRow) -> Option<serde_json::Value> {
+        let mut context =
+            serde_json::from_str::<serde_json::Value>(row.launch_context.as_deref()?).ok()?;
+        context.as_object_mut()?.remove("omp_launch_pid")
+    }
+
+    fn parse(db: &HcomDb, row: &InstanceRow) -> anyhow::Result<Option<Self>> {
+        let Some(receipt) =
+            Self::raw(row).and_then(|value| serde_json::from_value::<Self>(value).ok())
+        else {
+            return Ok(None);
+        };
+        if row.pid != Some(i64::from(receipt.pid))
+            || receipt.created_at_bits != format!("{:016x}", row.created_at.to_bits())
+        {
+            return Ok(None);
+        }
+        if let Some(binding) = process_binding_epoch(db, &receipt.process_id)?
+            && (binding.session_id.is_some()
+                || binding.instance_name != row.name
+                || receipt.binding_updated_at_bits != format!("{:016x}", binding.updated_at_bits))
+        {
+            return Ok(None);
+        }
+        Ok(Some(receipt))
+    }
+}
+
+enum OmpLaunchPin {
+    Unpinned,
+    Replaceable(&'static str),
+    Held { pid: i64, reason: &'static str },
+}
+
+/// Classify only the recorded launch pin, never a stopped identity's owner.
+fn omp_launch_pin_verdict(db: &HcomDb, row: &InstanceRow) -> anyhow::Result<OmpLaunchPin> {
+    omp_launch_pin_verdict_checked(
+        db,
+        row,
+        &crate::sys::process::is_definitely_dead,
+        &crate::sys::process::identity,
+    )
+}
+
+/// [`omp_launch_pin_verdict`] with the two native process facts supplied by
+/// the caller. Fact precedence is the policy: a positive `definitely_dead`
+/// proof (gone or zombie) is consulted before any identity read, and an
+/// unreadable identity (`None`) is never read as a mismatch. The launch
+/// receipt is still parsed and correlated against the DB here, so supplying
+/// facts cannot bypass receipt correlation.
+fn omp_launch_pin_verdict_checked(
+    db: &HcomDb,
+    row: &InstanceRow,
+    definitely_dead: &dyn Fn(u32) -> bool,
+    identity: &dyn Fn(u32) -> Option<String>,
+) -> anyhow::Result<OmpLaunchPin> {
+    let Some(pid) = row.pid else {
+        return Ok(OmpLaunchPin::Unpinned);
+    };
+    let Some(process_pid) = u32::try_from(pid).ok().filter(|&pid| pid > 0) else {
+        return Ok(OmpLaunchPin::Held {
+            pid,
+            reason: "is malformed",
+        });
+    };
+    if definitely_dead(process_pid) {
+        return Ok(OmpLaunchPin::Replaceable("exited"));
+    }
+    let receipt = OmpLaunchPidReceipt::parse(db, row)?;
+    match (receipt, identity(process_pid)) {
+        (Some(receipt), Some(current)) if current != receipt.identity => {
+            Ok(OmpLaunchPin::Replaceable("now belongs to another process"))
+        }
+        (Some(_), Some(_)) => Ok(OmpLaunchPin::Held {
+            pid,
+            reason: "is still the running launch process",
+        }),
+        (_, None) if definitely_dead(process_pid) => Ok(OmpLaunchPin::Replaceable("exited")),
+        (_, None) => Ok(OmpLaunchPin::Held {
+            pid,
+            reason: "cannot be read",
+        }),
+        (None, Some(_)) => Ok(OmpLaunchPin::Held {
+            pid,
+            reason: "is live and has no verifiable launch receipt",
+        }),
+    }
+}
+
+pub(crate) struct HeldPin {
+    pub(crate) pid: i64,
+    pub(crate) reason: &'static str,
+}
+
+/// A launch's original, still-unbound UUID tuple and row incarnation. Keep this
+/// across spawn; refreshing it after a failed write would authorize a new owner.
+#[derive(Debug, Clone)]
+pub(crate) struct OmpLaunchPidSnapshot {
+    pub(crate) row: InstanceRow,
+    process_id: String,
+    binding: ProcessBindingEpoch,
+    receipt: Option<serde_json::Value>,
+    pub(crate) replaces_stale_pin: bool,
+}
+
+/// Capture before spawn. A resumed row may already have its prior session ID;
+/// the launch reservation is the original UUID binding's NULL session, not the
+/// instance's session column.
+pub(crate) fn capture_omp_launch_pid(
+    db: &HcomDb,
+    process_id: &str,
+    instance_name: &str,
+) -> anyhow::Result<Option<OmpLaunchPidSnapshot>> {
+    if !crate::proctruth::is_launcher_process_id(process_id) {
+        return Ok(None);
+    }
+    db.with_read_snapshot(|_tx| {
+        let Some(binding) = process_binding_epoch(db, process_id)? else {
+            return Ok(None);
+        };
+        if binding.session_id.is_some() || binding.instance_name != instance_name {
+            return Ok(None);
+        }
+        let Some(row) = db.get_instance_full(instance_name)? else {
+            return Ok(None);
+        };
+        if row.tool != "omp" {
+            return Ok(None);
+        }
+        let replaces_stale_pin = if let Some(pid) = row.pid {
+            if u32::try_from(pid)
+                .ok()
+                .is_some_and(crate::proctruth::caller_is_pre_omp_launch_runner)
+            {
+                false
+            } else if matches!(
+                omp_launch_pin_verdict(db, &row)?,
+                OmpLaunchPin::Replaceable(_)
+            ) {
+                true
+            } else {
+                return Ok(None);
+            }
+        } else {
+            false
+        };
+        Ok(Some(OmpLaunchPidSnapshot {
+            receipt: OmpLaunchPidReceipt::raw(&row),
+            replaces_stale_pin,
+            row,
+            process_id: process_id.to_owned(),
+            binding,
+        }))
+    })
+}
+
+/// Record only this launch's next PID. A successful write advances the local
+/// expectation (runner/NULL -> wrapper -> child); a lost CAS never re-reads and
+/// retries against a bound owner, canonical move or replacement row.
+pub(crate) fn record_omp_launch_pid(
+    db: &HcomDb,
+    expected: &mut OmpLaunchPidSnapshot,
+    new_pid: u32,
+) -> anyhow::Result<bool> {
+    let (changed, receipt) = db.with_immediate_transaction(|tx| {
+        if process_binding_epoch(db, &expected.process_id)?.as_ref() != Some(&expected.binding) {
+            return Ok((false, None));
+        }
+        let Some(current) = db.get_instance_full(&expected.row.name)? else {
+            return Ok((false, None));
+        };
+        if !same_row_incarnation(Some(&expected.row), Some(&current)) {
+            return Ok((false, None));
+        }
+        let current_context_text = current.launch_context.as_deref().unwrap_or("");
+        let context = if current_context_text.is_empty() {
+            Some(serde_json::Map::new())
+        } else {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(current_context_text)
+                .ok()
+        };
+        if context
+            .as_ref()
+            .and_then(|context| context.get("omp_launch_pid"))
+            != expected.receipt.as_ref()
+        {
+            return Ok((false, None));
+        }
+        let Some(mut context) = context else {
+            return Ok((
+                db.compare_and_set_instance_pid_in_txn(tx, &expected.row, Some(new_pid))?,
+                None,
+            ));
+        };
+        let receipt = crate::sys::process::identity(new_pid)
+            .map(|identity| {
+                serde_json::to_value(OmpLaunchPidReceipt {
+                    pid: new_pid,
+                    identity,
+                    process_id: expected.process_id.clone(),
+                    binding_updated_at_bits: format!("{:016x}", expected.binding.updated_at_bits),
+                    created_at_bits: format!("{:016x}", current.created_at.to_bits()),
+                })
+            })
+            .transpose()?;
+        if let Some(receipt) = receipt {
+            context.insert("omp_launch_pid".into(), receipt);
+        } else {
+            context.remove("omp_launch_pid");
+        }
+        let new_context_text = serde_json::to_string(&context)?;
+        let changed = db.compare_and_set_omp_launch_pin_in_txn(
+            tx,
+            &expected.row,
+            current_context_text,
+            new_pid,
+            &new_context_text,
+        )?;
+        Ok((changed, context.remove("omp_launch_pid")))
+    })?;
+    if changed {
+        expected.row.pid = Some(i64::from(new_pid));
+        expected.receipt = receipt;
+    }
+    Ok(changed)
+}
+
+pub(crate) fn is_launch_reservation_shape(row: &InstanceRow) -> bool {
+    (row.status == ST_INACTIVE || row.status == PLACEHOLDER_STATUS)
+        && row.status_context == PLACEHOLDER_CONTEXT
+}
+
+pub(crate) fn is_unhooked_omp_reservation(db: &HcomDb, row: &InstanceRow) -> anyhow::Result<bool> {
+    if row.tool != "omp"
+        || !row.origin_device_id.as_deref().is_none_or(str::is_empty)
+        || !is_launch_reservation_shape(row)
+    {
+        return Ok(false);
+    }
+    if let Some(session_id) = row.session_id.as_deref().filter(|sid| !sid.is_empty())
+        && db.get_session_binding(session_id)?.is_some()
+    {
+        return Ok(false);
+    }
+    let bound_session: bool = db.conn().query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM process_bindings
+             WHERE instance_name = ?1 AND session_id IS NOT NULL
+         )",
+        [&row.name],
+        |row| row.get(0),
+    )?;
+    Ok(!bound_session)
+}
+
+/// Release a stale launch pin on this session's own unhooked reservation.
+/// The caller holds the immediate registration transaction.
+pub(crate) fn prepare_own_omp_reservation_in_txn(
+    db: &HcomDb,
+    tx: &rusqlite::Transaction<'_>,
+    name: &str,
+    session_id: &str,
+    tool: &str,
+) -> anyhow::Result<Option<HeldPin>> {
+    prepare_own_omp_reservation_in_txn_checked(
+        db,
+        tx,
+        name,
+        session_id,
+        tool,
+        &crate::sys::process::is_definitely_dead,
+        &crate::sys::process::identity,
+    )
+}
+
+/// [`prepare_own_omp_reservation_in_txn`] with the launch pin's process
+/// facts supplied by the caller; see [`omp_launch_pin_verdict_checked`].
+fn prepare_own_omp_reservation_in_txn_checked(
+    db: &HcomDb,
+    tx: &rusqlite::Transaction<'_>,
+    name: &str,
+    session_id: &str,
+    tool: &str,
+    definitely_dead: &dyn Fn(u32) -> bool,
+    identity: &dyn Fn(u32) -> Option<String>,
+) -> anyhow::Result<Option<HeldPin>> {
+    if tool != "omp" {
+        return Ok(None);
+    }
+    let Some(row) = db.get_instance_full(name)? else {
+        return Ok(None);
+    };
+    if row.session_id.as_deref() != Some(session_id) || !is_unhooked_omp_reservation(db, &row)? {
+        return Ok(None);
+    }
+    match omp_launch_pin_verdict_checked(db, &row, definitely_dead, identity)? {
+        OmpLaunchPin::Unpinned => Ok(None),
+        OmpLaunchPin::Held { pid, reason } => Ok(Some(HeldPin { pid, reason })),
+        OmpLaunchPin::Replaceable(reason) => {
+            let receipt = OmpLaunchPidReceipt::parse(db, &row)?;
+            anyhow::ensure!(
+                db.compare_and_set_instance_pid_in_txn(tx, &row, None)?,
+                "OMP launch reservation changed before release"
+            );
+            if let Some(receipt) = receipt
+                && let Ok(updated_at_bits) =
+                    u64::from_str_radix(&receipt.binding_updated_at_bits, 16)
+            {
+                db.conn().execute(
+                    "DELETE FROM process_bindings
+                     WHERE process_id = ?1 AND session_id IS NULL
+                       AND instance_name = ?2 AND updated_at = ?3",
+                    rusqlite::params![receipt.process_id, name, f64::from_bits(updated_at_bits),],
+                )?;
+            }
+            crate::log::log_info(
+                "launcher",
+                "omp_launch_pin.released",
+                &format!("instance={name} pid={} {reason}", row.pid.unwrap()),
+            );
+            Ok(None)
+        }
+    }
+}
+
+struct OmpBindingSnapshot {
+    binding: Option<ProcessBindingEpoch>,
+    row: Option<InstanceRow>,
+    canonical: Option<String>,
+    target_name: Option<String>,
+    target_row: Option<InstanceRow>,
+}
+
+impl OmpBindingSnapshot {
+    fn capture(db: &HcomDb, session_id: &str, process_id: &str) -> anyhow::Result<Self> {
+        let binding = process_binding_epoch(db, process_id)?;
+        let row = binding
+            .as_ref()
+            .map(|binding| db.get_instance_full(&binding.instance_name))
+            .transpose()?
+            .flatten();
+        let canonical = db.get_session_binding(session_id)?;
+        let target_name = match &canonical {
+            Some(name) => Some(name.clone()),
+            None => db
+                .find_stopped_snapshot_by_session_id(session_id)?
+                .map(|(name, _)| name),
+        };
+        let target_row = match target_name.as_deref() {
+            Some(name) if row.as_ref().is_some_and(|row| row.name == name) => None,
+            Some(name) => db.get_instance_full(name)?,
+            None => None,
+        };
+        Ok(Self {
+            binding,
+            row,
+            canonical,
+            target_name,
+            target_row,
+        })
+    }
+
+    fn target_row(&self) -> Option<&InstanceRow> {
+        self.row
+            .as_ref()
+            .filter(|row| self.target_name.as_deref() == Some(row.name.as_str()))
+            .or(self.target_row.as_ref())
+    }
+
+    fn matches(&self, current: &Self) -> bool {
+        self.binding == current.binding
+            && self.canonical == current.canonical
+            && self.target_name == current.target_name
+            && same_row_incarnation(self.row.as_ref(), current.row.as_ref())
+            && same_row_incarnation(self.target_row.as_ref(), current.target_row.as_ref())
+    }
+}
+
+fn verified_omp_binding_owner(
+    process_id: &str,
+    snapshot: &OmpBindingSnapshot,
+    owner_under_anchor: &dyn Fn(u32) -> Option<OmpOwnerProof>,
+) -> anyhow::Result<(u32, OmpOwnerProof)> {
+    if let Some(pid) = crate::proctruth::omp_minted_pid(process_id) {
+        let proof = owner_under_anchor(pid)
+            .filter(|proof| proof.owner_pid == pid && proof.anchor_kind == AncestorProcess::Omp)
+            .context("OMP process ID does not name the nearest actual OMP owner")?;
+        return Ok((pid, proof));
+    }
+    anyhow::ensure!(
+        crate::proctruth::is_launcher_process_id(process_id),
+        "OMP binding requires a launcher UUID or an OMP-minted process ID"
+    );
+    let row = snapshot
+        .row
+        .as_ref()
+        .context("OMP launcher binding has no instance row")?;
+    let anchor = row
+        .pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .context("OMP launcher binding has no process anchor")?;
+    let proof =
+        owner_under_anchor(anchor).context("OMP launcher has no nearest actual OMP owner")?;
+    let actual_anchor = proof.owner_pid == anchor && proof.anchor_kind == AncestorProcess::Omp;
+    if !actual_anchor && proof.anchor_kind != AncestorProcess::OmpLauncherShim {
+        anyhow::ensure!(
+            proof.anchor_kind == AncestorProcess::Other
+                && is_true_launch_placeholder(Some(row))
+                && snapshot
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.session_id.is_none()),
+            "OMP wrapper handoff requires a still-unbound launch placeholder"
+        );
+    }
+    Ok((anchor, proof))
+}
+
+/// OMP's owner claim and the whole session bind share one immediate transaction.
+/// Existing actual-OMP anchors and verified native OMP launch shims need no
+/// receipt or new metadata. An ordinary wrapper is only a first launch claim.
+pub(crate) fn bind_omp_session_to_process(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: &str,
+) -> anyhow::Result<Option<String>> {
+    bind_omp_session_to_process_checked(
+        db,
+        session_id,
+        process_id,
+        &crate::proctruth::caller_omp_owner_under_anchor,
+    )
+    .inspect_err(|error| {
+        crate::log::log_error(
+            "binding",
+            "bind_omp_session_to_process.failed",
+            &format!("session_id={session_id}, process_id={process_id}, err={error:#}"),
+        );
+    })
+}
+
+fn bind_omp_session_to_process_checked(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: &str,
+    owner_under_anchor: &dyn Fn(u32) -> Option<OmpOwnerProof>,
+) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(!session_id.is_empty(), "OMP session ID is empty");
+    let expected =
+        db.with_read_snapshot(|_tx| OmpBindingSnapshot::capture(db, session_id, process_id))?;
+    #[cfg(test)]
+    if let Some(hook) = OMP_BIND_CLAIM_GAP_HOOK.with(std::cell::Cell::take) {
+        hook(db, process_id);
+    }
+    let mut post = PostCommit::default();
+    let name = db.with_immediate_transaction(|tx| {
+        let current = OmpBindingSnapshot::capture(db, session_id, process_id)?;
+        anyhow::ensure!(
+            expected.matches(&current),
+            "OMP binding incarnation or process mapping changed before claim"
+        );
+        // Fresh kernel proof under the write lock, before any mutation.
+        let (source_anchor, owner_proof) =
+            verified_omp_binding_owner(process_id, &current, owner_under_anchor)?;
+        let owner = owner_proof.owner_pid;
+        if let Some(target) = current.target_row() {
+            // A session ID locates a canonical candidate; it cannot authorize
+            // taking a live foreign seat. Propagate registry errors even when
+            // direct kernel proof already establishes the same owner.
+            let bindings = db.process_binding_ids(&target.name)?;
+            let same_owner = |pid| {
+                pid == owner
+                    || (if pid == source_anchor {
+                        Some(owner_proof)
+                    } else {
+                        owner_under_anchor(pid)
+                    })
+                    .is_some_and(|proof| {
+                        proof.owner_pid == owner
+                            && proof.anchor_kind == AncestorProcess::OmpLauncherShim
+                    })
+            };
+            let same_bound_minted_owner = target.pid.is_none()
+                && crate::proctruth::omp_minted_pid(process_id) == Some(owner)
+                && current
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.instance_name == target.name)
+                && same_row_incarnation(current.row.as_ref(), Some(target));
+            let target_pid = target.pid.and_then(|pid| u32::try_from(pid).ok());
+            let target_owned = target_pid.is_some_and(&same_owner);
+            if !same_bound_minted_owner && !target_owned {
+                match crate::proctruth::classify_row_carriers(db, target, &bindings) {
+                    crate::proctruth::CarrierVerdict::Rooted { pid, .. } => {
+                        anyhow::ensure!(
+                            if Some(pid) == target_pid {
+                                target_owned
+                            } else {
+                                same_owner(pid)
+                            },
+                            "OMP canonical target '{}' has another live owner",
+                            target.name
+                        );
+                    }
+                    crate::proctruth::CarrierVerdict::Orphaned(_) => {}
+                    crate::proctruth::CarrierVerdict::Undetermined(why) => {
+                        anyhow::bail!(
+                            "OMP canonical target '{}' ownership is undetermined: {why}",
+                            target.name
+                        );
+                    }
+                }
+            }
+        }
+        if current.canonical.is_none()
+            && let Some(target) = current.target_name.as_deref()
+            && !current
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.instance_name == target)
+            && current.target_row.is_none()
+        {
+            let Some((stopped_name, _)) = db.find_stopped_event_by_session_id(session_id)? else {
+                anyhow::bail!("stopped history changed before claim");
+            };
+            anyhow::ensure!(
+                stopped_name == target,
+                "stopped history changed before claim"
+            );
+            // The session locates the candidate, but the name's newest stop
+            // authorizes reclaim even when resuming an older session.
+            let (_, data) = db
+                .find_latest_stopped_event_by_name(&stopped_name)?
+                .context("newest stopped history for released OMP identity is missing")?;
+            let event: serde_json::Value = serde_json::from_str(&data)?;
+            let caller_owns = |anchor| {
+                owner_under_anchor(anchor).is_some_and(|proof| {
+                    proof.owner_pid == anchor && proof.anchor_kind == AncestorProcess::Omp
+                })
+            };
+            if let Err(reason) = crate::proctruth::authorize_historical_omp_reclaim(
+                &event["snapshot"],
+                event["process_id"].as_str(),
+                &caller_owns,
+                &crate::sys::process::is_definitely_dead,
+                &crate::sys::process::procfs_start_identity,
+            ) {
+                anyhow::bail!(
+                    "released OMP identity '{target}' is not this caller's to restore: {reason}"
+                );
+            }
+        }
+        let name =
+            bind_session_to_process_body(db, session_id, Some(process_id), Some(tx), &mut post)?;
+        if let Some(name) = &name {
+            let final_row = db
+                .get_instance_full(name)?
+                .with_context(|| format!("OMP bound row '{name}' is missing"))?;
+            let original = if current.target_name.as_deref() == Some(name.as_str()) {
+                current.target_row()
+            } else {
+                current.row.as_ref().filter(|row| row.name == *name)
+            };
+            if let Some(original) = original {
+                anyhow::ensure!(
+                    original.created_at.to_bits() == final_row.created_at.to_bits()
+                        && original.agent_id == final_row.agent_id,
+                    "OMP canonical row incarnation changed during bind"
+                );
+            }
+            let bound = db.get_process_binding_full(process_id)?;
+            anyhow::ensure!(
+                bound.as_ref().is_some_and(|(bound_sid, bound_name)| {
+                    bound_sid.as_deref() == Some(session_id) && bound_name == name
+                }),
+                "OMP process binding did not commit its session claim"
+            );
+            anyhow::ensure!(
+                verified_omp_binding_owner(process_id, &current, owner_under_anchor)?
+                    == (source_anchor, owner_proof),
+                "OMP owner changed during bind"
+            );
+            // Runtime migration may have copied the old wrapper PID. The actual
+            // owner pin is LAST, in the same commit as both bindings.
+            anyhow::ensure!(
+                db.compare_and_set_instance_pid_in_txn(tx, &final_row, Some(owner))?,
+                "OMP owner pin lost its row incarnation"
+            );
+            #[cfg(test)]
+            if let Some(hook) = OMP_BIND_COMMIT_GAP_HOOK.with(std::cell::Cell::take) {
+                hook(db, name);
+            }
+        }
+        Ok(name)
+    })?;
+    if let (Some(name), Some(row)) = (name.as_deref(), expected.row.as_ref()) {
+        rekey_migrated_terminal(db, name, row);
+    }
+    post.fire(db);
+    Ok(name)
+}
+
 /// Bind session_id to canonical instance for process_id.
 /// Handles 4 paths: canonical exists (with placeholder merge/switch), placeholder bind,
 /// and two no-op paths.
@@ -901,7 +1656,8 @@ pub fn bind_session_to_process(
     session_id: &str,
     process_id: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
-    bind_session_to_process_body(db, session_id, process_id).inspect_err(|e| {
+    let mut post = PostCommit::default();
+    bind_session_to_process_body(db, session_id, process_id, None, &mut post).inspect_err(|e| {
         crate::log::log_error(
             "binding",
             "bind_session_to_process.failed",
@@ -914,6 +1670,8 @@ fn bind_session_to_process_body(
     db: &HcomDb,
     session_id: &str,
     process_id: Option<&str>,
+    caller_tx: Option<&rusqlite::Transaction<'_>>,
+    post: &mut PostCommit,
 ) -> anyhow::Result<Option<String>> {
     if session_id.is_empty() {
         crate::log::log_info("binding", "bind_session_to_process.no_session_id", "");
@@ -928,29 +1686,43 @@ fn bind_session_to_process_body(
 
     // Find placeholder from process binding
     let (placeholder_name, placeholder_data) = if let Some(pid) = process_id {
-        match db.get_process_binding(pid) {
-            Ok(Some(name)) => {
-                let data = match db.get_instance_full(&name) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("[hcom] warn: get_instance_full failed for {name}: {e}");
-                        None
-                    }
-                };
-                (Some(name), data)
+        if caller_tx.is_some() {
+            let name = db.get_process_binding(pid)?;
+            let row = name
+                .as_deref()
+                .map(|name| db.get_instance_full(name))
+                .transpose()?
+                .flatten();
+            (name, row)
+        } else {
+            match db.get_process_binding(pid) {
+                Ok(Some(name)) => {
+                    let data = match db.get_instance_full(&name) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!("[hcom] warn: get_instance_full failed for {name}: {e}");
+                            None
+                        }
+                    };
+                    (Some(name), data)
+                }
+                _ => (None, None),
             }
-            _ => (None, None),
         }
     } else {
         (None, None)
     };
 
     // Find canonical from session binding
-    let canonical = match db.get_session_binding(session_id) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[hcom] warn: get_session_binding failed for {session_id}: {e}");
-            None
+    let canonical = if caller_tx.is_some() {
+        db.get_session_binding(session_id)?
+    } else {
+        match db.get_session_binding(session_id) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[hcom] warn: get_session_binding failed for {session_id}: {e}");
+                None
+            }
         }
     };
 
@@ -965,16 +1737,19 @@ fn bind_session_to_process_body(
             ),
         );
 
-        // No open txn here: fan-out runs inline, wakes fire at once.
-        let mut post = PostCommit::default();
+        // The OMP caller carries creation fan-out in its one collector.
         recreate_instance_from_placeholder(
             db,
             canonical_name,
             session_id,
             placeholder_data.as_ref(),
-            &mut post,
-        );
-        post.fire(db);
+            caller_tx,
+            post,
+        )?;
+        if caller_tx.is_none() {
+            post.fire(db);
+            *post = PostCommit::default();
+        }
 
         // Reset last_stop on resume
         let now = now_epoch_i64();
@@ -985,7 +1760,7 @@ fn bind_session_to_process_body(
             && ph_name != canonical_name
         {
             let true_placeholder = is_true_launch_placeholder(placeholder_data.as_ref());
-            let migrated = if true_placeholder {
+            let migrated = if true_placeholder && caller_tx.is_none() {
                 migrate_placeholder_notify(db, ph_name, canonical_name)
             } else {
                 false
@@ -1009,7 +1784,15 @@ fn bind_session_to_process_body(
                     }
                 }
 
-                if migrated {
+                if let Some(tx) = caller_tx {
+                    retire_true_placeholder_after_canonical_bind_in_txn(
+                        db,
+                        tx,
+                        placeholder_name.as_ref(),
+                        canonical_name,
+                        placeholder_data.as_ref(),
+                    )?;
+                } else if migrated {
                     delete_true_placeholder_if_migrated(
                         db,
                         ph_name,
@@ -1020,11 +1803,14 @@ fn bind_session_to_process_body(
             }
         }
 
-        update_instance_position(db, canonical_name, &resume_updates);
+        if caller_tx.is_some() {
+            db.update_instance_fields(canonical_name, &resume_updates)?;
+        } else {
+            update_instance_position(db, canonical_name, &resume_updates);
+        }
 
         if let Some(pid) = process_id {
-            let mut post = PostCommit::default();
-            let released = db.with_immediate_transaction(|tx| {
+            let mut bind_canonical = |tx: &rusqlite::Transaction<'_>| {
                 db.set_process_binding(pid, session_id, canonical_name)
                     .with_context(|| {
                         format!("bind_canonical.set_process_binding for '{canonical_name}'")
@@ -1048,13 +1834,21 @@ fn bind_session_to_process_body(
                     );
                 }
                 Ok(None)
-            })?;
-            if let Some(ph) = placeholder_data.as_ref() {
-                rekey_migrated_terminal(db, canonical_name, ph);
-            }
-            post.fire(db);
-            if let Some(displaced) = &placeholder_name {
-                notify_session_switch_stop(db, displaced, released);
+            };
+            let released = match caller_tx {
+                Some(tx) => bind_canonical(tx)?,
+                None => db.with_immediate_transaction(bind_canonical)?,
+            };
+            if caller_tx.is_none() {
+                if let Some(ph) = placeholder_data.as_ref() {
+                    rekey_migrated_terminal(db, canonical_name, ph);
+                }
+                post.fire(db);
+                if let Some(displaced) = &placeholder_name {
+                    notify_session_switch_stop(db, displaced, released);
+                }
+            } else if let (Some(displaced), Some((id, event))) = (&placeholder_name, released) {
+                post.events.push((id, displaced.clone(), event));
             }
         }
 
@@ -1062,10 +1856,14 @@ fn bind_session_to_process_body(
     }
 
     // Path 2: session_bindings CASCADE'd on delete — recover canonical name from life.stopped
-    if canonical.is_none()
-        && let Ok(Some((stopped_name, snapshot))) =
-            db.find_stopped_snapshot_by_session_id(session_id)
-    {
+    let stopped = if caller_tx.is_some() {
+        db.find_stopped_snapshot_by_session_id(session_id)?
+    } else {
+        db.find_stopped_snapshot_by_session_id(session_id)
+            .ok()
+            .flatten()
+    };
+    if let Some((stopped_name, snapshot)) = stopped {
         crate::log::log_info(
             "binding",
             "bind_session_to_process.restore_stopped",
@@ -1076,20 +1874,16 @@ fn bind_session_to_process_body(
         // endpoints that follow the process, the displaced row's release and
         // the launch placeholder's retirement. Any failure rolls all of it
         // back, leaving the DB exactly as it was before this hook.
-        let (released, post) = db.with_immediate_transaction(|tx| {
-            // The whole switch shares one PostCommit: the `life.created`
-            // fan-out runs inline with wakes collected, and `fire` below runs
-            // only after commit. A rollback drops `post`, discarding wakes
-            // for events that never became durable.
-            let mut post = PostCommit::default();
+        let mut restore_stopped = |tx: &rusqlite::Transaction<'_>| {
             if is_true_launch_placeholder(placeholder_data.as_ref()) {
                 recreate_instance_from_placeholder(
                     db,
                     &stopped_name,
                     session_id,
                     placeholder_data.as_ref(),
-                    &mut post,
-                );
+                    caller_tx,
+                    post,
+                )?;
             } else {
                 // A real old session is not the restored identity: take the
                 // stopped name's cursor and settings, never the displaced row's.
@@ -1099,7 +1893,7 @@ fn bind_session_to_process_body(
                     &stopped_name,
                     session_id,
                     &snapshot,
-                    &mut post,
+                    post,
                 )?;
             }
 
@@ -1136,30 +1930,44 @@ fn bind_session_to_process_body(
                     )?;
                 }
             }
-            retire_true_placeholder_after_canonical_bind(
-                db,
-                tx,
-                placeholder_name.as_ref(),
-                &stopped_name,
-                placeholder_data.as_ref(),
-            );
+            if caller_tx.is_some() {
+                retire_true_placeholder_after_canonical_bind_in_txn(
+                    db,
+                    tx,
+                    placeholder_name.as_ref(),
+                    &stopped_name,
+                    placeholder_data.as_ref(),
+                )?;
+            } else {
+                retire_true_placeholder_after_canonical_bind(
+                    db,
+                    tx,
+                    placeholder_name.as_ref(),
+                    &stopped_name,
+                    placeholder_data.as_ref(),
+                );
+            }
 
             #[cfg(test)]
             if let Some(hook) = RESTORE_STOPPED_COMMIT_GAP_HOOK.with(std::cell::Cell::take) {
                 hook(db, &stopped_name);
             }
-            Ok((released, post))
-        })?;
-        // Committed: fire the collected wakes. A rolled-back transaction never
-        // reaches here, and its event rows are gone with the rollback.
-        // The transaction above moved the runtime state, not the filesystem.
-        // Re-key only after commit; rollback must leave the old receipt intact.
-        if let Some(ph) = placeholder_data.as_ref() {
-            rekey_migrated_terminal(db, &stopped_name, ph);
-        }
-        post.fire(db);
-        if let Some(displaced) = &placeholder_name {
-            notify_session_switch_stop(db, displaced, released);
+            Ok(released)
+        };
+        let released = match caller_tx {
+            Some(tx) => restore_stopped(tx)?,
+            None => db.with_immediate_transaction(restore_stopped)?,
+        };
+        if caller_tx.is_none() {
+            if let Some(ph) = placeholder_data.as_ref() {
+                rekey_migrated_terminal(db, &stopped_name, ph);
+            }
+            post.fire(db);
+            if let Some(displaced) = &placeholder_name {
+                notify_session_switch_stop(db, displaced, released);
+            }
+        } else if let (Some(displaced), Some((id, event))) = (&placeholder_name, released) {
+            post.events.push((id, displaced.clone(), event));
         }
 
         return Ok(Some(stopped_name));
@@ -1174,7 +1982,12 @@ fn bind_session_to_process_body(
         );
         let mut updates = serde_json::Map::new();
         updates.insert("session_id".into(), serde_json::json!(session_id));
-        update_instance_position(db, ph_name, &updates);
+        if caller_tx.is_some() {
+            db.update_instance_fields(ph_name, &updates)
+                .with_context(|| format!("bind_placeholder.update_session for '{ph_name}'"))?;
+        } else {
+            update_instance_position(db, ph_name, &updates);
+        }
 
         // Shared rows retain the other live process's session binding. Only
         // the sole holder may replace the old session on this row.
@@ -1198,59 +2011,94 @@ fn bind_session_to_process_body(
     Ok(None)
 }
 
-/// Rebind process/session after soft-finalize cleared bindings but left the
-/// instance row (typically inactive). Used when `bind_session_to_process` finds
-/// no process binding, but the caller still knows the instance name via
-/// `HCOM_INSTANCE_NAME` in a live OMP process.
+/// Restore a soft-stopped OMP's missing process binding. The environment name
+/// only locates a candidate; its PID must be the actual OMP owner or a verified
+/// native OMP launch shim. Ordinary wrappers and PID-less rows grant no authority.
 pub fn recover_process_binding_for_instance(
     db: &HcomDb,
     instance_name: &str,
     session_id: &str,
     process_id: &str,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
+    recover_process_binding_for_instance_checked(
+        db,
+        instance_name,
+        session_id,
+        process_id,
+        &crate::proctruth::caller_omp_owner_under_anchor,
+    )
+    .inspect_err(|error| {
+        crate::log::log_error("binding", "recover.omp_owner", &format!("{error:#}"));
+    })
+}
+
+fn recover_process_binding_for_instance_checked(
+    db: &HcomDb,
+    instance_name: &str,
+    session_id: &str,
+    process_id: &str,
+    owner_under_anchor: &dyn Fn(u32) -> Option<OmpOwnerProof>,
+) -> anyhow::Result<Option<String>> {
     if instance_name.is_empty() || session_id.is_empty() || process_id.is_empty() {
-        return None;
+        return Ok(None);
     }
-
-    let instance = db.get_instance_full(instance_name).ok().flatten()?;
-
-    if instance.tool != "omp" {
-        return None;
-    }
-    if instance.status != ST_INACTIVE {
-        return None;
-    }
-
-    if let Err(e) = db.clear_session_id_from_other_instances(session_id, instance_name) {
-        crate::log::log_error("binding", "recover.clear_session", &format!("{e}"));
-        return None;
-    }
-
-    let mut updates = serde_json::Map::new();
-    updates.insert("session_id".into(), serde_json::json!(session_id));
-    if let Err(e) = db.update_instance_fields(instance_name, &updates) {
-        crate::log::log_error("binding", "recover.update_session_id", &format!("{e}"));
-        return None;
-    }
-
-    if let Err(e) = db.rebind_session(session_id, instance_name) {
-        crate::log::log_error("binding", "recover.rebind_session", &format!("{e}"));
-        return None;
-    }
-    if let Err(e) = db.set_process_binding(process_id, session_id, instance_name) {
-        crate::log::log_error("binding", "recover.set_process_binding", &format!("{e}"));
-        return None;
-    }
-
-    crate::log::log_info(
-        "binding",
-        "recover_process_binding_for_instance",
-        &format!(
-            "instance={} session_id={} process_id={}",
-            instance_name, session_id, process_id
-        ),
-    );
-    Some(instance_name.to_string())
+    let (expected, binding, session_binding) = db.with_read_snapshot(|_tx| {
+        Ok((
+            db.get_instance_full(instance_name)?,
+            process_binding_epoch(db, process_id)?,
+            db.get_session_binding(session_id)?,
+        ))
+    })?;
+    let Some(expected) = expected else {
+        return Ok(None);
+    };
+    db.with_immediate_transaction(|tx| {
+        let current = db.get_instance_full(instance_name)?;
+        anyhow::ensure!(
+            same_row_incarnation(Some(&expected), current.as_ref())
+                && process_binding_epoch(db, process_id)? == binding
+                && db.get_session_binding(session_id)? == session_binding,
+            "OMP recovery incarnation or mapping changed"
+        );
+        anyhow::ensure!(
+            binding.is_none() && session_binding.is_none(),
+            "OMP recovery requires missing bindings; use the session binder"
+        );
+        anyhow::ensure!(
+            current.as_ref().is_some_and(|row| {
+                row.tool == "omp"
+                    && row.status == ST_INACTIVE
+                    && row.origin_device_id.as_deref().is_none_or(str::is_empty)
+            }),
+            "OMP recovery target is not an inactive local OMP row"
+        );
+        let anchor = expected
+            .pid
+            .and_then(|pid| u32::try_from(pid).ok())
+            .context("OMP recovery has no actual-owner PID")?;
+        let proof = owner_under_anchor(anchor).context("OMP recovery has no actual owner")?;
+        let owner = proof.owner_pid;
+        anyhow::ensure!(
+            ((owner == anchor && proof.anchor_kind == AncestorProcess::Omp)
+                || proof.anchor_kind == AncestorProcess::OmpLauncherShim)
+                && (crate::proctruth::omp_minted_pid(process_id) == Some(owner)
+                    || crate::proctruth::is_launcher_process_id(process_id)),
+            "OMP recovery target is not owned by the caller"
+        );
+        db.clear_session_id_from_other_instances(session_id, instance_name)?;
+        let mut updates = serde_json::Map::new();
+        updates.insert("session_id".into(), serde_json::json!(session_id));
+        db.update_instance_fields(instance_name, &updates)?;
+        db.rebind_session(session_id, instance_name)?;
+        db.set_process_binding(process_id, session_id, instance_name)?;
+        let mut pinned = expected;
+        pinned.session_id = Some(session_id.to_owned());
+        anyhow::ensure!(
+            db.compare_and_set_instance_pid_in_txn(tx, &pinned, Some(owner))?,
+            "OMP recovery lost its row incarnation"
+        );
+        Ok(Some(instance_name.to_owned()))
+    })
 }
 
 /// Initialize the DB row and default bindings for an instance identity.
@@ -1481,7 +2329,7 @@ pub(crate) fn initialize_instance_in_position_file_collected(
                             parent_name,
                             tool.unwrap_or(""),
                             post,
-                        );
+                        )?;
                         true
                     }
                     Ok(false) => true,
@@ -1521,7 +2369,7 @@ fn log_created_and_auto_subscribe(
     parent_name: Option<&str>,
     tool: &str,
     post: &mut PostCommit,
-) {
+) -> anyhow::Result<()> {
     let launcher = std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
     let event_data = serde_json::json!({
         "action": "created",
@@ -1530,8 +2378,9 @@ fn log_created_and_auto_subscribe(
         "is_subagent": parent_session_id.is_some(),
         "parent_name": parent_name.unwrap_or(""),
     });
-    let _ = db.log_event_collected("life", instance_name, &event_data, post);
+    db.log_event_collected("life", instance_name, &event_data, post)?;
     auto_subscribe_defaults(db, instance_name, tool);
+    Ok(())
 }
 
 /// Create orphaned PTY identity — called when process binding exists but session_id
@@ -1585,6 +2434,150 @@ pub fn create_orphaned_pty_identity(
     }
 
     Some(name)
+}
+
+/// The OMP plain-session fallback once the checked binder found no process
+/// binding, session binding or stopped restore candidate. The minted PID only
+/// locates the actual owner. The reserved-then-promoted row, both bindings and
+/// the owner pin commit together. Creation, not recovery: a row already
+/// carrying the session ID, or a mapping that appeared since that miss, is
+/// refused, never taken over or cleared.
+pub(crate) fn create_omp_identity(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: &str,
+) -> anyhow::Result<String> {
+    create_omp_identity_checked(
+        db,
+        session_id,
+        process_id,
+        &crate::proctruth::caller_omp_owner_under_anchor,
+    )
+    .inspect_err(|error| {
+        crate::log::log_error(
+            "binding",
+            "create_omp_identity.failed",
+            &format!("session_id={session_id}, process_id={process_id}, err={error:#}"),
+        );
+    })
+}
+
+fn create_omp_identity_checked(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: &str,
+    owner_under_anchor: &dyn Fn(u32) -> Option<OmpOwnerProof>,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(!session_id.is_empty(), "OMP session ID is empty");
+    anyhow::ensure!(!process_id.is_empty(), "OMP process ID is empty");
+    let (expected, carriers_absent) = db.with_read_snapshot(|_tx| {
+        Ok((
+            OmpBindingSnapshot::capture(db, session_id, process_id)?,
+            session_carriers_match(db, session_id, None)?,
+        ))
+    })?;
+    // A row carrying this session ID is occupied even with no binding.
+    anyhow::ensure!(
+        expected.binding.is_none()
+            && expected.canonical.is_none()
+            && expected.target_name.is_none()
+            && carriers_absent,
+        "OMP plain identity requires an unclaimed process and session"
+    );
+    #[cfg(test)]
+    if let Some(hook) = OMP_BIND_CLAIM_GAP_HOOK.with(std::cell::Cell::take) {
+        hook(db, process_id);
+    }
+    // Lock order, as for every name reserver: name_gen.lock, then BEGIN
+    // IMMEDIATE. Both stay held from the reservation through the final pin.
+    let name_lock = crate::instance_names::lock_name_generation(db)?;
+    let mut post = PostCommit::default();
+    let created = db.with_immediate_transaction(|tx| {
+        let current = OmpBindingSnapshot::capture(db, session_id, process_id)?;
+        anyhow::ensure!(
+            expected.matches(&current) && session_carriers_match(db, session_id, None)?,
+            "OMP plain identity candidate appeared before creation"
+        );
+        let (anchor, owner_proof) =
+            verified_omp_binding_owner(process_id, &current, owner_under_anchor)?;
+        let owner = owner_proof.owner_pid;
+        // Reserve, then promote, like the generic mint: no `created` event.
+        let name = crate::instance_names::reserve_generated_name_locked(db, &name_lock)?;
+        anyhow::ensure!(
+            initialize_instance_in_position_file_collected(
+                db,
+                &name,
+                Some(session_id),
+                None,
+                None,
+                None,
+                None,
+                Some("omp"),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut post,
+            ),
+            "Cannot register OMP identity '{name}'"
+        );
+        let promoted = db
+            .get_instance_full(&name)?
+            .with_context(|| format!("OMP minted row '{name}' is missing"))?;
+        // The new row must be the session's sole carrier, so the clearing
+        // UPDATE inside `rebind_session` below matches no other row.
+        anyhow::ensure!(
+            session_carriers_match(db, session_id, Some(name.as_str()))?,
+            "OMP session ID is not carried by its new row alone"
+        );
+        db.rebind_session(session_id, &name)
+            .with_context(|| format!("create_omp_identity.rebind_session for '{name}'"))?;
+        db.set_process_binding(process_id, session_id, &name)
+            .with_context(|| format!("create_omp_identity.set_process_binding for '{name}'"))?;
+        let final_row = db
+            .get_instance_full(&name)?
+            .with_context(|| format!("OMP minted row '{name}' is missing"))?;
+        anyhow::ensure!(
+            same_row_incarnation(Some(&promoted), Some(&final_row))
+                && final_row.tool == "omp"
+                && final_row.session_id.as_deref() == Some(session_id),
+            "OMP minted row changed during creation"
+        );
+        let bound = db.get_process_binding_full(process_id)?;
+        let session_owner = db.get_session_binding(session_id)?;
+        anyhow::ensure!(
+            bound
+                .as_ref()
+                .is_some_and(|(bound_session_id, bound_name)| {
+                    bound_session_id.as_deref() == Some(session_id)
+                        && bound_name.as_str() == name.as_str()
+                })
+                && session_owner.as_deref() == Some(name.as_str()),
+            "OMP minted bindings did not commit their claim"
+        );
+        anyhow::ensure!(
+            verified_omp_binding_owner(process_id, &current, owner_under_anchor)?
+                == (anchor, owner_proof),
+            "OMP owner changed during creation"
+        );
+        // The actual-owner pin is LAST, in the same commit as both bindings.
+        anyhow::ensure!(
+            db.compare_and_set_instance_pid_in_txn(tx, &final_row, Some(owner))?,
+            "OMP owner pin lost its row incarnation"
+        );
+        #[cfg(test)]
+        if let Some(hook) = OMP_BIND_COMMIT_GAP_HOOK.with(std::cell::Cell::take) {
+            hook(db, &name);
+        }
+        Ok(name)
+    });
+    // Released after the commit or rollback; wakes fire only after both.
+    drop(name_lock);
+    let name = created?;
+    post.fire(db);
+    Ok(name)
 }
 
 /// Resolve instance name for a process_id via process_bindings.
@@ -3507,5 +4500,1597 @@ mod tests {
         assert_eq!(row.wait_timeout, Some(86400));
 
         cleanup(path);
+    }
+
+    const OMP_LAUNCH_ID: &str = "af04a012-7f6f-4a43-9c83-854a11f69dc2";
+
+    fn seed_omp_claim(db: &HcomDb, id: &str, sid: Option<&str>, pid: Option<u32>) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, created_at, agent_id, session_id, pid, status, status_context,
+                  last_event_id)
+                 VALUES ('luna', 'omp', 1.25, 'launch-agent', ?1, ?2, 'inactive', 'new', 27)",
+                rusqlite::params![sid, pid.map(i64::from)],
+            )
+            .unwrap();
+        db.set_process_binding(id, "", "luna").unwrap();
+    }
+
+    fn seed_omp_target(db: &HcomDb, path: &str) {
+        match path {
+            "canonical" => {
+                db.conn()
+                    .execute(
+                        "INSERT INTO instances (name, tool, created_at, session_id, status)
+                         VALUES ('fano', 'omp', 2.25, 'sid-owner', 'inactive')",
+                        [],
+                    )
+                    .unwrap();
+                db.rebind_session("sid-owner", "fano").unwrap();
+            }
+            "stopped" => {
+                #[cfg(unix)]
+                let mut child = std::process::Command::new("true").spawn().unwrap();
+                #[cfg(windows)]
+                let mut child = std::process::Command::new("cmd")
+                    .args(["/C", "exit 0"])
+                    .spawn()
+                    .unwrap();
+                let owner = child.id();
+                child.wait().unwrap();
+                drop(child);
+                db.log_life_event(
+                    "fano",
+                    "stopped",
+                    "test",
+                    "exit",
+                    Some(serde_json::json!({
+                        "tool": "omp", "session_id": "sid-owner", "pid": owner
+                    })),
+                    None,
+                )
+                .unwrap();
+            }
+            "placeholder" => {}
+            _ => panic!("unknown binding path"),
+        }
+    }
+
+    fn omp_claim_owner(anchor: u32) -> Option<OmpOwnerProof> {
+        let anchor_kind = match anchor {
+            100 => AncestorProcess::Other,
+            200 => AncestorProcess::Omp,
+            300 => AncestorProcess::OmpLauncherShim,
+            _ => return None,
+        };
+        Some(OmpOwnerProof {
+            owner_pid: 200,
+            anchor_kind,
+        })
+    }
+
+    thread_local! {
+        static OMP_OBSERVED_STATE: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
+        static TERMINAL_CONTEXT_COMPETING_PIN:
+            std::cell::RefCell<Option<(OmpLaunchPidSnapshot, bool)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn observe_omp_commit(db: &HcomDb, _name: &str) {
+        let observer = HcomDb::open_raw(db.path()).unwrap();
+        OMP_OBSERVED_STATE.set(Some(db_state(&observer)));
+    }
+
+    fn try_pin_during_terminal_context_write(db: &HcomDb, _name: &str) {
+        let competitor = HcomDb::open_raw(db.path()).unwrap();
+        competitor
+            .conn()
+            .busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+        TERMINAL_CONTEXT_COMPETING_PIN.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            let (launch, committed) = pending.as_mut().unwrap();
+            match record_omp_launch_pid(&competitor, launch, std::process::id()) {
+                Ok(recorded) => {
+                    assert!(
+                        recorded,
+                        "the competing pin must commit or encounter the writer lock"
+                    );
+                    *committed = true;
+                }
+                Err(error) => assert!(crate::db::is_busy_error(&error), "{error:#}"),
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn persist_terminal_context_never_drops_a_concurrent_launch_receipt() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for in_transaction in [false, true] {
+            let (db, path) = setup_test_db();
+            seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-prior"), None);
+            db.store_launch_context("luna", r#"{"pane_id":"kitty-42"}"#)
+                .unwrap();
+            let mut launch = capture_omp_launch_pid(&db, OMP_LAUNCH_ID, "luna")
+                .unwrap()
+                .unwrap();
+            #[cfg(unix)]
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            #[cfg(windows)]
+            let mut child = std::process::Command::new("cmd")
+                .args(["/C", "exit 0"])
+                .spawn()
+                .unwrap();
+            let predecessor = child.id();
+            child.wait().unwrap();
+            drop(child);
+            assert!(record_omp_launch_pid(&db, &mut launch, predecessor).unwrap());
+            assert!(launch.receipt.is_none());
+            TERMINAL_CONTEXT_COMPETING_PIN.set(Some((launch, false)));
+            PERSIST_TERMINAL_CONTEXT_GAP_HOOK
+                .with(|hook| hook.set(Some(try_pin_during_terminal_context_write)));
+            let persist = || {
+                persist_terminal_launch_context(
+                    &db,
+                    "luna",
+                    Some("kitty-requested"),
+                    "kitty-effective",
+                    Some(OMP_LAUNCH_ID),
+                )
+            };
+            if in_transaction {
+                db.with_immediate_transaction(|_tx| persist()).unwrap();
+            } else {
+                persist().unwrap();
+            }
+            let (mut launch, competing_pin_committed) =
+                TERMINAL_CONTEXT_COMPETING_PIN.take().unwrap();
+            if competing_pin_committed {
+                assert!(launch.receipt.is_some());
+                assert_eq!(
+                    OmpLaunchPidReceipt::raw(&db.get_instance_full("luna").unwrap().unwrap()),
+                    launch.receipt,
+                    "terminal metadata must not erase a committed competing pin"
+                );
+            }
+            assert!(record_omp_launch_pid(&db, &mut launch, std::process::id()).unwrap());
+            assert!(launch.receipt.is_some());
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            let context: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+            assert_eq!(row.pid, Some(i64::from(std::process::id())));
+            assert_eq!(context["pane_id"], "kitty-42");
+            assert_eq!(context["process_id"], OMP_LAUNCH_ID);
+            assert_eq!(context["terminal_preset_requested"], "kitty-requested");
+            assert_eq!(context["terminal_preset_effective"], "kitty-effective");
+            assert_eq!(context["terminal_preset"], "kitty-effective");
+            assert_eq!(context.get("omp_launch_pid"), launch.receipt.as_ref());
+            capture_and_store_launch_context(&db, "luna");
+            assert_eq!(
+                OmpLaunchPidReceipt::raw(&db.get_instance_full("luna").unwrap().unwrap()),
+                launch.receipt,
+                "hook-time context capture must preserve the launch receipt"
+            );
+            cleanup(path);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial]
+    fn omp_released_identity_restores_from_an_unreaped_zombie_owner() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let owner = child.id();
+        // SAFETY: waitid writes this buffer for our own child without reaping it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // SAFETY: P_PID selects this child; WNOWAIT leaves it as a zombie.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    owner as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR),
+                "waitid for the stopped owner"
+            );
+        }
+        let identity = crate::sys::process::procfs_start_identity(owner).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({
+                "tool": "omp",
+                "session_id": "sid-owner",
+                "pid": owner,
+                "pid_start_time": identity.0,
+                "boot_id": identity.1,
+            })),
+            None,
+        )
+        .unwrap();
+        let caller = std::process::id();
+        let id = format!("omp-{caller}-new-owner");
+        assert_eq!(
+            bind_omp_session_to_process_checked(&db, "sid-owner", &id, &|anchor| {
+                (anchor == caller).then_some(OmpOwnerProof {
+                    owner_pid: caller,
+                    anchor_kind: AncestorProcess::Omp,
+                })
+            })
+            .unwrap()
+            .as_deref(),
+            Some("fano")
+        );
+        assert_eq!(
+            db.get_instance_full("fano").unwrap().unwrap().pid,
+            Some(i64::from(caller))
+        );
+        assert_eq!(
+            db.get_session_binding("sid-owner").unwrap().as_deref(),
+            Some("fano")
+        );
+        assert_eq!(
+            db.get_process_binding_full(&id).unwrap(),
+            Some((Some("sid-owner".into()), "fano".into()))
+        );
+        assert_eq!(
+            crate::sys::process::procfs_start_identity(owner),
+            Some(identity),
+            "the old owner remains unreaped through the claim"
+        );
+        child.wait().unwrap();
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn omp_wrapper_claim_and_actual_owner_pin_commit_together() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        seed_omp_claim(&db, OMP_LAUNCH_ID, None, Some(100));
+        let before = db_state(&db);
+        OMP_BIND_COMMIT_GAP_HOOK.with(|hook| hook.set(Some(observe_omp_commit)));
+        assert_eq!(
+            bind_omp_session_to_process_checked(&db, "sid-owner", OMP_LAUNCH_ID, &omp_claim_owner)
+                .unwrap()
+                .as_deref(),
+            Some("luna")
+        );
+        assert_eq!(OMP_OBSERVED_STATE.take(), Some(before));
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.pid, Some(200));
+        assert_eq!(row.session_id.as_deref(), Some("sid-owner"));
+        assert_eq!(row.last_event_id, 27);
+        assert_eq!(
+            db.get_process_binding_full(OMP_LAUNCH_ID).unwrap(),
+            Some((Some("sid-owner".into()), "luna".into()))
+        );
+        assert_eq!(
+            db.get_session_binding("sid-owner").unwrap().as_deref(),
+            Some("luna")
+        );
+        assert_eq!(
+            bind_omp_session_to_process_checked(&db, "sid-owner", OMP_LAUNCH_ID, &omp_claim_owner)
+                .unwrap()
+                .as_deref(),
+            Some("luna")
+        );
+        let after_retry = db_state(&db);
+        assert!(
+            bind_omp_session_to_process_checked(&db, "sid-sibling", OMP_LAUNCH_ID, &|_| None)
+                .is_err()
+        );
+        assert_eq!(db_state(&db), after_retry);
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().pid,
+            Some(200)
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn omp_legacy_actual_anchor_needs_no_placeholder_metadata() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-prior"), Some(200));
+        db.set_process_binding(OMP_LAUNCH_ID, "sid-prior", "luna")
+            .unwrap();
+        db.rebind_session("sid-prior", "luna").unwrap();
+        assert_eq!(
+            bind_omp_session_to_process_checked(&db, "sid-owner", OMP_LAUNCH_ID, &omp_claim_owner)
+                .unwrap()
+                .as_deref(),
+            Some("luna")
+        );
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.pid, Some(200));
+        assert_eq!(row.session_id.as_deref(), Some("sid-owner"));
+        assert!(row.launch_context.is_none());
+        assert_eq!(db.get_session_binding("sid-prior").unwrap(), None);
+        cleanup(path);
+
+        let (db, path) = setup_test_db();
+        let before = db_state(&db);
+        assert_eq!(
+            bind_omp_session_to_process_checked(
+                &db,
+                "sid-plain",
+                "omp-200-plain",
+                &omp_claim_owner
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(db_state(&db), before);
+        assert!(
+            bind_omp_session_to_process_checked(
+                &db,
+                "sid-plain",
+                "omp-300-foreign",
+                &omp_claim_owner
+            )
+            .is_err()
+        );
+        assert_eq!(db_state(&db), before);
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn omp_wrapper_claim_refuses_bound_or_nonlaunch_rows_without_mutation() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for case in ["preset-row-session", "bound-process-session", "active-row"] {
+            let (db, path) = setup_test_db();
+            seed_omp_claim(
+                &db,
+                OMP_LAUNCH_ID,
+                (case == "preset-row-session").then_some("sid-prior"),
+                Some(100),
+            );
+            if case == "bound-process-session" {
+                db.set_process_binding(OMP_LAUNCH_ID, "sid-prior", "luna")
+                    .unwrap();
+            }
+            if case == "active-row" {
+                db.set_status("luna", "active", "tool").unwrap();
+            }
+            let before = db_state(&db);
+            assert!(
+                bind_omp_session_to_process_checked(
+                    &db,
+                    "sid-owner",
+                    OMP_LAUNCH_ID,
+                    &omp_claim_owner
+                )
+                .is_err(),
+                "{case}"
+            );
+            assert_eq!(db_state(&db), before, "{case}");
+            cleanup(path);
+        }
+    }
+
+    fn replace_pending_omp_row(db: &HcomDb, _id: &str) {
+        let prior = db.get_instance_full("luna").unwrap().unwrap();
+        assert!(db.delete_instance("luna").unwrap());
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, created_at, agent_id, session_id, pid, status, status_context)
+                 VALUES ('luna', 'omp', 9.5, 'replacement-agent', ?1, ?2, 'inactive', 'new')",
+                rusqlite::params![prior.session_id, prior.pid],
+            )
+            .unwrap();
+        OMP_OBSERVED_STATE.set(Some(db_state(db)));
+    }
+
+    fn remap_pending_omp_uuid(db: &HcomDb, id: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, pid, status, status_context)
+                 VALUES ('fano', 'omp', 2.25, 100, 'inactive', 'new')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding(id, "", "fano").unwrap();
+        OMP_OBSERVED_STATE.set(Some(db_state(db)));
+    }
+
+    fn renew_pending_omp_uuid_epoch(db: &HcomDb, id: &str) {
+        db.conn()
+            .execute(
+                "UPDATE process_bindings SET updated_at = updated_at + 1 WHERE process_id = ?1",
+                [id],
+            )
+            .unwrap();
+        OMP_OBSERVED_STATE.set(Some(db_state(db)));
+    }
+
+    #[test]
+    #[serial]
+    fn omp_claim_rejects_replaced_rows_remapped_uuids_and_new_binding_epochs() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for race in [
+            replace_pending_omp_row as fn(&HcomDb, &str),
+            remap_pending_omp_uuid,
+            renew_pending_omp_uuid_epoch,
+        ] {
+            let (db, path) = setup_test_db();
+            seed_omp_claim(&db, OMP_LAUNCH_ID, None, Some(100));
+            OMP_BIND_CLAIM_GAP_HOOK.with(|hook| hook.set(Some(race)));
+            assert!(
+                bind_omp_session_to_process_checked(
+                    &db,
+                    "sid-owner",
+                    OMP_LAUNCH_ID,
+                    &omp_claim_owner
+                )
+                .is_err()
+            );
+            assert_eq!(db_state(&db), OMP_OBSERVED_STATE.take().unwrap());
+            cleanup(path);
+        }
+    }
+
+    fn appear_canonical_session(db: &HcomDb, _id: &str) {
+        seed_omp_target(db, "canonical");
+        OMP_OBSERVED_STATE.set(Some(db_state(db)));
+    }
+
+    fn appear_stopped_restore(db: &HcomDb, _id: &str) {
+        seed_omp_target(db, "stopped");
+        OMP_OBSERVED_STATE.set(Some(db_state(db)));
+    }
+
+    /// A row carrying the session ID with no process, session or stopped
+    /// mapping. The binder misses it, yet it occupies the session.
+    fn appear_unbound_session_row(db: &HcomDb, id: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, session_id, status)
+                 VALUES ('fano', 'omp', 2.25, 'sid-owner', 'listening')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            bind_omp_session_to_process_checked(db, "sid-owner", id, &omp_claim_owner).unwrap(),
+            None
+        );
+        OMP_OBSERVED_STATE.set(Some(db_state(db)));
+    }
+
+    /// A process, session or restore mapping, or a row already carrying the
+    /// session ID, present when the plain mint starts or appearing in its
+    /// snapshot-to-transaction gap refuses the mint. The holder stays exactly
+    /// as it appeared and the creation subscriber gets no wake.
+    #[test]
+    #[serial]
+    fn omp_plain_mint_refuses_a_mapping_that_appears_after_the_miss() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let id = "omp-200-plain";
+        for race in [
+            remap_pending_omp_uuid as fn(&HcomDb, &str),
+            appear_canonical_session,
+            appear_stopped_restore,
+            appear_unbound_session_row,
+        ] {
+            for in_gap in [false, true] {
+                let (db, path) = setup_test_db();
+                let listener = subscribe_omp_creation(&db);
+                assert_eq!(
+                    bind_omp_session_to_process_checked(&db, "sid-owner", id, &omp_claim_owner)
+                        .unwrap(),
+                    None
+                );
+                if in_gap {
+                    OMP_BIND_CLAIM_GAP_HOOK.with(|hook| hook.set(Some(race)));
+                } else {
+                    race(&db, id);
+                }
+                assert!(
+                    create_omp_identity_checked(&db, "sid-owner", id, &omp_claim_owner).is_err(),
+                    "in_gap={in_gap}"
+                );
+                assert_eq!(
+                    db_state(&db),
+                    OMP_OBSERVED_STATE.take().unwrap(),
+                    "in_gap={in_gap}"
+                );
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "in_gap={in_gap}"
+                );
+                cleanup(path);
+            }
+        }
+    }
+
+    fn win_omp_claim_before_waiters_lock(db: &HcomDb, id: &str) {
+        assert_eq!(
+            bind_omp_session_to_process_checked(db, "sid-owner", id, &omp_claim_owner)
+                .unwrap()
+                .as_deref(),
+            Some("luna")
+        );
+        OMP_OBSERVED_STATE.set(Some(db_state(db)));
+    }
+
+    #[test]
+    #[serial]
+    fn omp_waiting_sibling_cannot_use_a_preclaim_wrapper_snapshot() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        seed_omp_claim(&db, OMP_LAUNCH_ID, None, Some(100));
+        OMP_BIND_CLAIM_GAP_HOOK.with(|hook| hook.set(Some(win_omp_claim_before_waiters_lock)));
+        assert!(
+            bind_omp_session_to_process_checked(&db, "sid-sibling", OMP_LAUNCH_ID, &|anchor| {
+                (anchor == 100 || anchor == 300).then_some(OmpOwnerProof {
+                    owner_pid: 300,
+                    anchor_kind: if anchor == 300 {
+                        AncestorProcess::Omp
+                    } else {
+                        AncestorProcess::Other
+                    },
+                })
+            })
+            .is_err()
+        );
+        assert_eq!(db_state(&db), OMP_OBSERVED_STATE.take().unwrap());
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().pid,
+            Some(200)
+        );
+        assert_eq!(db.get_session_binding("sid-sibling").unwrap(), None);
+        cleanup(path);
+    }
+
+    fn subscribe_omp_creation(db: &HcomDb) -> std::net::TcpListener {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('mora', 'listening', 0.5)",
+                [],
+            )
+            .unwrap();
+        db.upsert_notify_endpoint("mora", "plugin", listener.local_addr().unwrap().port())
+            .unwrap();
+        crate::db::subscriptions::create_filter_subscription(
+            db,
+            &std::collections::HashMap::from([
+                ("type".into(), vec!["life".into()]),
+                ("action".into(), vec!["created".into()]),
+            ]),
+            &[],
+            "mora",
+            false,
+            None,
+        )
+        .unwrap();
+        listener
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn omp_all_binding_paths_roll_back_and_fire_no_wakes_when_the_final_pin_fails() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for binding_path in ["canonical", "stopped", "placeholder", "plain-mint"] {
+            for raise in ["ABORT, 'cannot pin actual owner'", "IGNORE"] {
+                let (db, path) = setup_test_db();
+                seed_omp_claim(&db, OMP_LAUNCH_ID, None, Some(100));
+                let plain = binding_path == "plain-mint";
+                if !plain {
+                    seed_omp_target(&db, binding_path);
+                }
+                db.upsert_notify_endpoint("luna", "inject", 54_991).unwrap();
+                let listener = subscribe_omp_creation(&db);
+                db.conn()
+                    .execute_batch(&format!(
+                        "CREATE TRIGGER refuse_omp_pin BEFORE UPDATE OF pid ON instances
+                         WHEN NEW.pid = 200
+                         BEGIN SELECT RAISE({raise}); END;"
+                    ))
+                    .unwrap();
+                let before = db_state(&db);
+                // The plain mint is the launcher-less fallback: a fresh session
+                // for an unbound minted ID, beside the untouched launch claim.
+                let refused = if plain {
+                    create_omp_identity_checked(&db, "sid-plain", "omp-200-new", &omp_claim_owner)
+                        .is_err()
+                } else {
+                    bind_omp_session_to_process_checked(
+                        &db,
+                        "sid-owner",
+                        OMP_LAUNCH_ID,
+                        &omp_claim_owner,
+                    )
+                    .is_err()
+                };
+                assert!(refused, "{binding_path}/{raise}");
+                assert_eq!(db_state(&db), before, "{binding_path}/{raise}");
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "{binding_path}/{raise}"
+                );
+                if plain {
+                    // Once the pin may land, the same mint commits it, and its
+                    // reserve-then-promote creation still publishes no wake.
+                    db.conn()
+                        .execute_batch("DROP TRIGGER refuse_omp_pin")
+                        .unwrap();
+                    let minted = create_omp_identity_checked(
+                        &db,
+                        "sid-plain",
+                        "omp-200-new",
+                        &omp_claim_owner,
+                    );
+                    let name = minted.unwrap();
+                    let row = db.get_instance_full(&name).unwrap().unwrap();
+                    assert_eq!(row.pid, Some(200), "{raise}");
+                    assert_eq!(
+                        db.get_process_binding_full("omp-200-new").unwrap(),
+                        Some((Some("sid-plain".into()), name.clone()))
+                    );
+                    assert_eq!(db.get_session_binding("sid-plain").unwrap(), Some(name));
+                    assert_eq!(
+                        listener.accept().unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock,
+                        "{raise}"
+                    );
+                }
+                cleanup(path);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn omp_canonical_adoption_pins_after_runtime_copy_and_invalidates_late_pid_writes() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for binding_path in ["canonical", "stopped"] {
+            let (db, path) = setup_test_db();
+            seed_omp_claim(&db, OMP_LAUNCH_ID, None, None);
+            let mut launch = capture_omp_launch_pid(&db, OMP_LAUNCH_ID, "luna")
+                .unwrap()
+                .unwrap();
+            assert!(record_omp_launch_pid(&db, &mut launch, 100).unwrap());
+            seed_omp_target(&db, binding_path);
+            db.upsert_notify_endpoint("luna", "inject", 54_992).unwrap();
+            let listener = subscribe_omp_creation(&db);
+            let before = db_state(&db);
+            OMP_BIND_COMMIT_GAP_HOOK.with(|hook| hook.set(Some(observe_omp_commit)));
+            assert_eq!(
+                bind_omp_session_to_process_checked(
+                    &db,
+                    "sid-owner",
+                    OMP_LAUNCH_ID,
+                    &omp_claim_owner
+                )
+                .unwrap()
+                .as_deref(),
+                Some("fano")
+            );
+            assert_eq!(OMP_OBSERVED_STATE.take(), Some(before));
+            assert!(db.get_instance_full("luna").unwrap().is_none());
+            let row = db.get_instance_full("fano").unwrap().unwrap();
+            assert_eq!(row.pid, Some(200));
+            assert_eq!(row.session_id.as_deref(), Some("sid-owner"));
+            assert_eq!(notify_endpoint_port(&db, "fano", "inject"), Some(54_992));
+            if binding_path == "stopped" {
+                assert_eq!(row.agent_id.as_deref(), Some("launch-agent"));
+                assert!(
+                    listener.accept().is_ok(),
+                    "creation wake fires after commit"
+                );
+            }
+            let committed = db_state(&db);
+            assert!(!record_omp_launch_pid(&db, &mut launch, 300).unwrap());
+            assert_eq!(db_state(&db), committed);
+            assert_eq!(
+                db.get_instance_full("fano").unwrap().unwrap().pid,
+                Some(200)
+            );
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn omp_owner_proof_and_binding_write_failures_roll_back_the_claim() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for failure in ["binding", "owner-proof", "created-event"] {
+            let (db, path) = setup_test_db();
+            seed_omp_claim(&db, OMP_LAUNCH_ID, None, Some(100));
+            if failure == "binding" {
+                db.conn()
+                    .execute_batch(
+                        "CREATE TRIGGER refuse_omp_binding BEFORE INSERT ON process_bindings
+                         BEGIN SELECT RAISE(ABORT, 'cannot bind owner'); END;",
+                    )
+                    .unwrap();
+            }
+            if failure == "created-event" {
+                seed_omp_target(&db, "stopped");
+                db.conn()
+                    .execute_batch(
+                        "CREATE TRIGGER refuse_omp_created BEFORE INSERT ON events
+                         WHEN NEW.type = 'life' AND json_extract(NEW.data, '$.action') = 'created'
+                         BEGIN SELECT RAISE(ABORT, 'cannot publish creation'); END;",
+                    )
+                    .unwrap();
+            }
+            let before = db_state(&db);
+            let proofs = std::cell::Cell::new(0);
+            let owner = |anchor| {
+                let count = proofs.get();
+                proofs.set(count + 1);
+                if failure == "owner-proof" && count > 0 {
+                    None
+                } else {
+                    omp_claim_owner(anchor)
+                }
+            };
+            assert!(
+                bind_omp_session_to_process_checked(&db, "sid-owner", OMP_LAUNCH_ID, &owner)
+                    .is_err()
+            );
+            assert_eq!(db_state(&db), before, "{failure}");
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn omp_delayed_pre_and_post_spawn_writers_lose_after_new_or_resumed_owner_claims() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for prior_session in [None, Some("sid-prior")] {
+            let (db, path) = setup_test_db();
+            seed_omp_claim(&db, OMP_LAUNCH_ID, prior_session, None);
+            let mut launch = capture_omp_launch_pid(&db, OMP_LAUNCH_ID, "luna")
+                .unwrap()
+                .unwrap();
+            let mut delayed_pre = launch.clone();
+            assert!(record_omp_launch_pid(&db, &mut launch, 100).unwrap());
+            let mut delayed_post = launch.clone();
+            if prior_session.is_some() {
+                // Resume's preset row SID cannot use the wrapper exception.
+                // Its legitimate child record must still work before binding.
+                assert!(record_omp_launch_pid(&db, &mut launch, 200).unwrap());
+            }
+            bind_omp_session_to_process_checked(&db, "sid-owner", OMP_LAUNCH_ID, &omp_claim_owner)
+                .unwrap();
+            let claimed = db_state(&db);
+            assert!(!record_omp_launch_pid(&db, &mut delayed_pre, 100).unwrap());
+            assert!(!record_omp_launch_pid(&db, &mut delayed_post, 300).unwrap());
+            assert_eq!(db_state(&db), claimed);
+            assert_eq!(
+                db.get_instance_full("luna").unwrap().unwrap().pid,
+                Some(200)
+            );
+            assert!(
+                capture_omp_launch_pid(&db, OMP_LAUNCH_ID, "luna")
+                    .unwrap()
+                    .is_none()
+            );
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn omp_pid_bookkeeping_refuses_reused_names_remapped_uuids_and_changed_epochs() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for after_prewrite in [false, true] {
+            for race in [
+                replace_pending_omp_row as fn(&HcomDb, &str),
+                remap_pending_omp_uuid,
+                renew_pending_omp_uuid_epoch,
+            ] {
+                let (db, path) = setup_test_db();
+                seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-prior"), None);
+                let mut launch = capture_omp_launch_pid(&db, OMP_LAUNCH_ID, "luna")
+                    .unwrap()
+                    .unwrap();
+                if after_prewrite {
+                    assert!(record_omp_launch_pid(&db, &mut launch, 100).unwrap());
+                }
+                race(&db, OMP_LAUNCH_ID);
+                let raced = db_state(&db);
+                assert!(!record_omp_launch_pid(&db, &mut launch, 300).unwrap());
+                assert_eq!(db_state(&db), raced);
+                OMP_OBSERVED_STATE.take();
+                cleanup(path);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn omp_named_recovery_requires_the_targets_actual_owner_and_rolls_back_failed_binds() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for case in [
+            "foreign-owner",
+            "pidless",
+            "wrapper",
+            "active",
+            "write-failure",
+            "owner",
+        ] {
+            let (db, path) = setup_test_db();
+            let pid = match case {
+                "pidless" => None,
+                "wrapper" => Some(100),
+                _ => Some(200),
+            };
+            seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-prior"), pid);
+            db.delete_process_binding(OMP_LAUNCH_ID).unwrap();
+            if case == "active" {
+                db.set_status("luna", "active", "tool").unwrap();
+            }
+            if case == "write-failure" {
+                db.conn()
+                    .execute_batch(
+                        "CREATE TRIGGER refuse_recovered_owner BEFORE INSERT ON process_bindings
+                         BEGIN SELECT RAISE(ABORT, 'cannot restore owner'); END;",
+                    )
+                    .unwrap();
+            }
+            let before = db_state(&db);
+            let id = if case == "foreign-owner" {
+                "omp-300-foreign"
+            } else {
+                "omp-200-owner"
+            };
+            let result = recover_process_binding_for_instance_checked(
+                &db,
+                "luna",
+                "sid-owner",
+                id,
+                &omp_claim_owner,
+            );
+            if case == "owner" {
+                assert_eq!(result.unwrap().as_deref(), Some("luna"));
+                let row = db.get_instance_full("luna").unwrap().unwrap();
+                assert_eq!(row.pid, Some(200));
+                assert_eq!(row.session_id.as_deref(), Some("sid-owner"));
+                assert_eq!(row.created_at.to_bits(), 1.25f64.to_bits());
+                assert_eq!(row.agent_id.as_deref(), Some("launch-agent"));
+                assert_eq!(
+                    db.get_process_binding_full(id).unwrap(),
+                    Some((Some("sid-owner".into()), "luna".into()))
+                );
+            } else {
+                assert!(result.is_err(), "{case}");
+                assert_eq!(db_state(&db), before, "{case}");
+            }
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn omp_pidless_canonical_retry_uses_its_existing_minted_owner_mapping() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        let id = "omp-200-owner";
+        seed_omp_claim(&db, id, Some("sid-owner"), None);
+        db.set_process_binding(id, "sid-owner", "luna").unwrap();
+        db.rebind_session("sid-owner", "luna").unwrap();
+        let original = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            bind_omp_session_to_process_checked(&db, "sid-owner", id, &omp_claim_owner)
+                .unwrap()
+                .as_deref(),
+            Some("luna")
+        );
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.pid, Some(200));
+        assert_eq!(row.created_at.to_bits(), original.created_at.to_bits());
+        assert_eq!(row.agent_id, original.agent_id);
+        assert_eq!(row.last_event_id, original.last_event_id);
+        cleanup(path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn omp_canonical_session_id_cannot_authorize_a_foreign_live_target() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        seed_omp_target(&db, "canonical");
+        let foreign = std::process::id();
+        db.update_instance_pid("fano", foreign).unwrap();
+        let owner = foreign.checked_add(10_000).unwrap();
+        let id = format!("omp-{owner}-new-owner");
+        let before = db_state(&db);
+        let error = bind_omp_session_to_process_checked(&db, "sid-owner", &id, &|anchor| {
+            (anchor == owner).then_some(OmpOwnerProof {
+                owner_pid: owner,
+                anchor_kind: AncestorProcess::Omp,
+            })
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("another live owner"),
+            "{error:#}"
+        );
+        assert_eq!(db_state(&db), before);
+        cleanup(path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn omp_displaced_stop_and_endpoint_wakes_roll_back_with_the_final_owner_pin() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for binding_path in ["canonical", "stopped"] {
+            let (db, path) = setup_test_db();
+            seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-prior"), Some(200));
+            db.set_process_binding(OMP_LAUNCH_ID, "sid-prior", "luna")
+                .unwrap();
+            db.rebind_session("sid-prior", "luna").unwrap();
+            seed_omp_target(&db, binding_path);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            db.upsert_notify_endpoint("luna", "pty", listener.local_addr().unwrap().port())
+                .unwrap();
+            db.conn()
+                .execute_batch(
+                    "CREATE TRIGGER refuse_pin_after_stop BEFORE UPDATE OF pid ON instances
+                     WHEN NEW.pid = 200 AND EXISTS (
+                         SELECT 1 FROM events WHERE instance = 'luna' AND type = 'life'
+                           AND json_extract(data, '$.by') = 'session_switch')
+                     BEGIN SELECT RAISE(ABORT, 'cannot pin after displaced stop'); END;",
+                )
+                .unwrap();
+            let before = db_state(&db);
+            let error = bind_omp_session_to_process_checked(
+                &db,
+                "sid-owner",
+                OMP_LAUNCH_ID,
+                &omp_claim_owner,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("cannot pin after displaced stop"),
+                "{error:#}"
+            );
+            assert_eq!(db_state(&db), before, "{binding_path}");
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn omp_bound_native_shim_reuses_one_source_proof_per_bind_phase() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        seed_omp_claim(&db, OMP_LAUNCH_ID, Some("sid-owner"), Some(300));
+        db.set_process_binding(OMP_LAUNCH_ID, "sid-owner", "luna")
+            .unwrap();
+        db.rebind_session("sid-owner", "luna").unwrap();
+        let anchors = std::cell::RefCell::new(Vec::new());
+        let proof = |anchor| {
+            anchors.borrow_mut().push(anchor);
+            omp_claim_owner(anchor)
+        };
+        assert_eq!(
+            bind_omp_session_to_process_checked(&db, "sid-owner", OMP_LAUNCH_ID, &proof)
+                .unwrap()
+                .as_deref(),
+            Some("luna")
+        );
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.pid, Some(200));
+        assert_eq!(row.session_id.as_deref(), Some("sid-owner"));
+        assert!(row.launch_context.is_none());
+        assert_eq!(
+            anchors.into_inner(),
+            vec![300, 300],
+            "pre/post bind refresh independently; canonical policy does not re-read the same anchor"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn omp_different_canonical_anchor_requires_its_own_complete_proof() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for target_kind in [
+            Some(AncestorProcess::OmpLauncherShim),
+            Some(AncestorProcess::Other),
+            None,
+        ] {
+            let (db, path) = setup_test_db();
+            let target = std::process::id();
+            let owner = target.checked_add(10_000).unwrap();
+            let id = format!("omp-{owner}-owner");
+            seed_omp_claim(&db, &id, Some("sid-owner"), Some(target));
+            db.set_process_binding(&id, "sid-owner", "luna").unwrap();
+            db.rebind_session("sid-owner", "luna").unwrap();
+            let before = db_state(&db);
+            let anchors = std::cell::RefCell::new(Vec::new());
+            let proof = |anchor| {
+                anchors.borrow_mut().push(anchor);
+                if anchor == owner {
+                    Some(OmpOwnerProof {
+                        owner_pid: owner,
+                        anchor_kind: AncestorProcess::Omp,
+                    })
+                } else if anchor == target {
+                    target_kind.map(|anchor_kind| OmpOwnerProof {
+                        owner_pid: owner,
+                        anchor_kind,
+                    })
+                } else {
+                    None
+                }
+            };
+            let result = bind_omp_session_to_process_checked(&db, "sid-owner", &id, &proof);
+            if target_kind == Some(AncestorProcess::OmpLauncherShim) {
+                assert_eq!(result.unwrap().as_deref(), Some("luna"));
+                assert_eq!(
+                    db.get_instance_full("luna").unwrap().unwrap().pid,
+                    Some(i64::from(owner))
+                );
+                assert_eq!(anchors.into_inner(), vec![owner, target, owner]);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(db_state(&db), before);
+                assert_eq!(
+                    anchors.into_inner(),
+                    vec![owner, target],
+                    "a classifier returning the same root must not repeat the failed proof"
+                );
+            }
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn omp_launch_pid_cas_refuses_changed_tool_or_origin() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for change in [
+            "UPDATE instances SET tool = 'claude' WHERE name = 'luna'",
+            "UPDATE instances SET origin_device_id = 'remote-device' WHERE name = 'luna'",
+        ] {
+            let (db, path) = setup_test_db();
+            seed_omp_claim(&db, OMP_LAUNCH_ID, None, None);
+            let mut captured = capture_omp_launch_pid(&db, OMP_LAUNCH_ID, "luna")
+                .unwrap()
+                .unwrap();
+            db.conn().execute(change, []).unwrap();
+            let before = db_state(&db);
+            assert!(!record_omp_launch_pid(&db, &mut captured, 100).unwrap());
+            assert_eq!(db_state(&db), before);
+            assert_eq!(db.get_instance_full("luna").unwrap().unwrap().pid, None);
+            cleanup(path);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn omp_launch_pid_cas_accepts_equivalent_local_origin_encodings() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        for (initial, current) in [
+            (None, None),
+            (Some(""), Some("")),
+            (None, Some("")),
+            (Some(""), None),
+        ] {
+            let (db, path) = setup_test_db();
+            seed_omp_claim(&db, OMP_LAUNCH_ID, None, None);
+            db.conn()
+                .execute(
+                    "UPDATE instances SET origin_device_id = ?1 WHERE name = 'luna'",
+                    rusqlite::params![initial],
+                )
+                .unwrap();
+            let mut captured = capture_omp_launch_pid(&db, OMP_LAUNCH_ID, "luna")
+                .unwrap()
+                .unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE instances SET origin_device_id = ?1 WHERE name = 'luna'",
+                    rusqlite::params![current],
+                )
+                .unwrap();
+            assert!(record_omp_launch_pid(&db, &mut captured, 100).unwrap());
+            assert_eq!(
+                db.get_instance_full("luna").unwrap().unwrap().pid,
+                Some(100)
+            );
+            cleanup(path);
+        }
+    }
+
+    const LAUNCH_PIN_PID: u32 = 424_242;
+    const LAUNCH_PIN_IDENTITY: &str = "launch-pin-birth-a";
+
+    /// Seed `luna` as this session's own unhooked OMP reservation pinned to
+    /// `LAUNCH_PIN_PID`. With `receipt_identity`, the stored receipt is
+    /// correlated to the row incarnation and the NULL-session process-binding
+    /// epoch exactly as `record_omp_launch_pid` writes it; the parse assert
+    /// proves the seed, so no verdict below can pass by silently degrading
+    /// to the receipt-less case.
+    fn seed_omp_launch_reservation(
+        db: &HcomDb,
+        receipt_identity: Option<&str>,
+    ) -> crate::db::InstanceRow {
+        seed_omp_claim(db, OMP_LAUNCH_ID, Some("sid-owner"), Some(LAUNCH_PIN_PID));
+        let context = match receipt_identity {
+            Some(identity) => {
+                let binding = process_binding_epoch(db, OMP_LAUNCH_ID).unwrap().unwrap();
+                assert_eq!(binding.session_id, None);
+                assert_eq!(binding.instance_name, "luna");
+                let row = db.get_instance_full("luna").unwrap().unwrap();
+                let receipt = serde_json::to_value(OmpLaunchPidReceipt {
+                    pid: LAUNCH_PIN_PID,
+                    identity: identity.to_owned(),
+                    process_id: OMP_LAUNCH_ID.to_owned(),
+                    binding_updated_at_bits: format!("{:016x}", binding.updated_at_bits),
+                    created_at_bits: format!("{:016x}", row.created_at.to_bits()),
+                })
+                .unwrap();
+                serde_json::json!({"pane_id": "kitty-42", "omp_launch_pid": receipt})
+            }
+            None => serde_json::json!({"pane_id": "kitty-42"}),
+        };
+        db.store_launch_context("luna", &context.to_string())
+            .unwrap();
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(
+            OmpLaunchPidReceipt::parse(db, &row).unwrap().is_some(),
+            receipt_identity.is_some(),
+            "seeded receipt correlation does not match the case under test"
+        );
+        row
+    }
+
+    fn assert_launch_pin_held(verdict: OmpLaunchPin, expected_reason: &str) {
+        match verdict {
+            OmpLaunchPin::Held { pid, reason } => {
+                assert_eq!(pid, i64::from(LAUNCH_PIN_PID));
+                assert_eq!(reason, expected_reason);
+            }
+            OmpLaunchPin::Replaceable(reason) => {
+                panic!("expected Held ({expected_reason}), got Replaceable ({reason})")
+            }
+            OmpLaunchPin::Unpinned => panic!("expected Held ({expected_reason}), got Unpinned"),
+        }
+    }
+
+    fn assert_launch_pin_replaceable(verdict: OmpLaunchPin, expected_reason: &str) {
+        match verdict {
+            OmpLaunchPin::Replaceable(reason) => assert_eq!(reason, expected_reason),
+            OmpLaunchPin::Held { pid, reason } => {
+                panic!("expected Replaceable ({expected_reason}), got Held pid={pid} ({reason})")
+            }
+            OmpLaunchPin::Unpinned => {
+                panic!("expected Replaceable ({expected_reason}), got Unpinned")
+            }
+        }
+    }
+
+    // Counterfactual anchor: temporarily flipping the matching-live arm
+    // (`(Some(_), Some(_))`) of `omp_launch_pin_verdict_checked` from Held to
+    // Replaceable must fail this test. Calling the verdict directly keeps
+    // every earlier CLI guard out of the way.
+    #[test]
+    fn omp_launch_pin_matching_live_receipt_is_held() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| false, &|pid| {
+            (pid == LAUNCH_PIN_PID).then_some(LAUNCH_PIN_IDENTITY.to_string())
+        })
+        .unwrap();
+        assert_launch_pin_held(verdict, "is still the running launch process");
+        cleanup(path);
+    }
+
+    #[test]
+    fn omp_launch_pin_receiptless_live_process_is_held() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, None);
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| false, &|pid| {
+            (pid == LAUNCH_PIN_PID).then_some("some-live-birth".to_string())
+        })
+        .unwrap();
+        assert_launch_pin_held(verdict, "is live and has no verifiable launch receipt");
+        cleanup(path);
+    }
+
+    // The correlated receipt is present, so this fails if an unreadable
+    // identity (`None`, dead still unproven on both probes) is ever read as
+    // a birth mismatch instead of Held.
+    #[test]
+    fn omp_launch_pin_unreadable_live_process_is_held_not_mismatched() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| false, &|_| None).unwrap();
+        assert_launch_pin_held(verdict, "cannot be read");
+        cleanup(path);
+    }
+
+    #[test]
+    fn omp_launch_pin_mismatched_correlated_receipt_is_replaceable() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| false, &|pid| {
+            (pid == LAUNCH_PIN_PID).then_some("launch-pin-birth-b".to_string())
+        })
+        .unwrap();
+        assert_launch_pin_replaceable(verdict, "now belongs to another process");
+        cleanup(path);
+    }
+
+    #[test]
+    fn omp_launch_pin_gone_process_is_replaceable() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| true, &|_| None).unwrap();
+        assert_launch_pin_replaceable(verdict, "exited");
+        cleanup(path);
+    }
+
+    // A zombie still reports its birth identity, so the supplied identity
+    // here matches the receipt; the positive `definitely_dead` proof (the
+    // native gone/zombie proof itself is covered against a real unreaped
+    // zombie in `omp_released_identity_restores_from_an_unreaped_zombie_owner`)
+    // must win, and must be consulted before identity is read at all.
+    #[test]
+    fn omp_launch_pin_zombie_with_matching_identity_is_replaceable() {
+        let (db, path) = setup_test_db();
+        let row = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let identity_reads = std::cell::Cell::new(0u32);
+        let verdict = omp_launch_pin_verdict_checked(&db, &row, &|_| true, &|pid| {
+            identity_reads.set(identity_reads.get() + 1);
+            (pid == LAUNCH_PIN_PID).then_some(LAUNCH_PIN_IDENTITY.to_string())
+        })
+        .unwrap();
+        assert_launch_pin_replaceable(verdict, "exited");
+        assert_eq!(
+            identity_reads.get(),
+            0,
+            "a positive gone/zombie proof must precede any identity read"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_own_omp_reservation_matching_live_pin_is_held_and_leaves_state_untouched() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        let seeded = seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        let before = db_state(&db);
+        let before_binding = process_binding_epoch(&db, OMP_LAUNCH_ID).unwrap();
+        let held = db
+            .with_immediate_transaction(|tx| {
+                prepare_own_omp_reservation_in_txn_checked(
+                    &db,
+                    tx,
+                    "luna",
+                    "sid-owner",
+                    "omp",
+                    &|_| false,
+                    &|pid| (pid == LAUNCH_PIN_PID).then_some(LAUNCH_PIN_IDENTITY.to_string()),
+                )
+            })
+            .unwrap();
+        let held = held.expect("matching live pin must be reported Held, not released");
+        assert_eq!(held.pid, i64::from(LAUNCH_PIN_PID));
+        assert_eq!(held.reason, "is still the running launch process");
+        // db_state covers every table, so this also proves no event was left
+        // behind by the transaction; the row fields are asserted by name.
+        assert_eq!(db_state(&db), before);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.pid, Some(i64::from(LAUNCH_PIN_PID)));
+        assert_eq!(row.launch_context, seeded.launch_context);
+        assert_eq!(
+            process_binding_epoch(&db, OMP_LAUNCH_ID).unwrap(),
+            before_binding
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_own_omp_reservation_mismatched_pin_clears_only_its_own_pin_and_binding() {
+        let _env = crate::hooks::test_helpers::isolated_test_env();
+        let (db, path) = setup_test_db();
+        seed_omp_launch_reservation(&db, Some(LAUNCH_PIN_IDENTITY));
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, created_at, agent_id, session_id, pid, status, status_context,
+                  last_event_id)
+                 VALUES ('fano', 'omp', 2.25, 'other-agent', 'sid-other', 777, 'inactive', 'new', 11)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("proc-other-seat", "", "fano")
+            .unwrap();
+        let other_before = db.get_instance_full("fano").unwrap().unwrap();
+        let other_binding_before = process_binding_epoch(&db, "proc-other-seat").unwrap();
+        let released = db
+            .with_immediate_transaction(|tx| {
+                prepare_own_omp_reservation_in_txn_checked(
+                    &db,
+                    tx,
+                    "luna",
+                    "sid-owner",
+                    "omp",
+                    &|_| false,
+                    &|pid| (pid == LAUNCH_PIN_PID).then_some("launch-pin-birth-b".to_string()),
+                )
+            })
+            .unwrap();
+        assert!(released.is_none(), "a released pin must not report Held");
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.pid, None);
+        assert_eq!(row.session_id.as_deref(), Some("sid-owner"));
+        assert_eq!(OmpLaunchPidReceipt::raw(&row), None);
+        let context: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert_eq!(context["pane_id"], "kitty-42");
+        assert_eq!(process_binding_epoch(&db, OMP_LAUNCH_ID).unwrap(), None);
+        let other = db.get_instance_full("fano").unwrap().unwrap();
+        assert_eq!(other.pid, other_before.pid);
+        assert_eq!(other.launch_context, other_before.launch_context);
+        assert_eq!(
+            process_binding_epoch(&db, "proc-other-seat").unwrap(),
+            other_binding_before
+        );
+        cleanup(path);
+    }
+
+    #[cfg(windows)]
+    mod native_windows {
+        use super::*;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+
+        struct OwnedChild(Child);
+
+        impl OwnedChild {
+            fn spawn() -> Self {
+                let system_root = std::env::var_os("SystemRoot").expect("Windows system root");
+                Self(
+                    Command::new(PathBuf::from(&system_root).join("System32").join("cmd.exe"))
+                        .args(["/d", "/s", "/c", "set /p HCOM101_IDLE="])
+                        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                        .env_clear()
+                        .env("SystemRoot", system_root)
+                        // Child retains the write end so the built-in read blocks until killed.
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .expect("spawn owned native child"),
+                )
+            }
+
+            fn assert_running(&mut self, identity: &str) {
+                assert_eq!(self.0.try_wait().unwrap(), None, "owned child exited");
+                assert_eq!(
+                    crate::sys::process::identity(self.0.id()).as_deref(),
+                    Some(identity),
+                    "owned child must retain its native birth identity"
+                );
+                assert!(!crate::sys::process::is_definitely_dead(self.0.id()));
+            }
+
+            fn assert_dead(&mut self) {
+                assert!(self.0.try_wait().unwrap().is_some());
+                assert!(crate::sys::process::is_definitely_dead(self.0.id()));
+            }
+
+            fn kill_and_wait(&mut self) {
+                self.0.kill().expect("kill owned native child");
+                self.0.wait().expect("reap owned native child");
+            }
+        }
+
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn record_child(db: &HcomDb, child: &mut OwnedChild) -> (InstanceRow, String) {
+            seed_omp_claim(db, OMP_LAUNCH_ID, Some("sid-owner"), None);
+            db.store_launch_context("luna", r#"{"pane_id":"kitty-42"}"#)
+                .unwrap();
+            let mut launch = capture_omp_launch_pid(db, OMP_LAUNCH_ID, "luna")
+                .unwrap()
+                .expect("unbound launcher UUID reservation");
+            assert!(record_omp_launch_pid(db, &mut launch, child.0.id()).unwrap());
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            let receipt = OmpLaunchPidReceipt::parse(db, &row)
+                .unwrap()
+                .expect("real recording must produce a correlated receipt");
+            let actual = crate::sys::process::identity(child.0.id())
+                .expect("read native child creation FILETIME");
+            let ticks: u64 = actual
+                .strip_prefix("windows:")
+                .expect("native Windows identity")
+                .parse()
+                .expect("creation FILETIME ticks");
+            assert!(ticks > 0);
+            assert_eq!(receipt.identity, actual);
+            assert_eq!(receipt.pid, child.0.id());
+            assert_eq!(receipt.process_id, OMP_LAUNCH_ID);
+            child.assert_running(&actual);
+            (row, actual)
+        }
+
+        fn assert_releases_only_own_pin(
+            db: &HcomDb,
+            reason: &str,
+            mut assert_child_state: impl FnMut(),
+        ) {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances
+                     (name,tool,created_at,session_id,pid,status,status_context,last_event_id)
+                     VALUES ('fano','omp',2.25,'sid-other',777,'inactive','new',11)",
+                    [],
+                )
+                .unwrap();
+            db.set_process_binding("proc-other-seat", "", "fano")
+                .unwrap();
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            assert_child_state();
+            let verdict = omp_launch_pin_verdict(db, &row).unwrap();
+            assert_child_state();
+            assert_launch_pin_replaceable(verdict, reason);
+            let binding = process_binding_epoch(db, OMP_LAUNCH_ID).unwrap().unwrap();
+            let before = db_state(db);
+            assert_child_state();
+            let released = db
+                .with_immediate_transaction(|tx| {
+                    prepare_own_omp_reservation_in_txn(db, tx, "luna", "sid-owner", "omp")
+                })
+                .unwrap();
+            assert_child_state();
+            assert!(released.is_none(), "replaceable pin must not report Held");
+            let cleared = db.get_instance_full("luna").unwrap().unwrap();
+            assert_eq!(cleared.pid, None);
+            assert_eq!(cleared.session_id.as_deref(), Some("sid-owner"));
+            assert_eq!(OmpLaunchPidReceipt::raw(&cleared), None);
+            let context: serde_json::Value =
+                serde_json::from_str(cleared.launch_context.as_deref().unwrap()).unwrap();
+            assert_eq!(context, serde_json::json!({"pane_id": "kitty-42"}));
+            assert_eq!(process_binding_epoch(db, OMP_LAUNCH_ID).unwrap(), None);
+
+            // Restore just the three authorized changes in this private DB.
+            // Equality across every table proves all other columns, bindings
+            // and events stayed untouched, including the other seat's pin.
+            db.conn()
+                .execute(
+                    "UPDATE instances SET pid=?1,launch_context=?2 WHERE name='luna'",
+                    rusqlite::params![row.pid, row.launch_context],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO process_bindings
+                     (process_id,session_id,instance_name,updated_at) VALUES (?1,NULL,'luna',?2)",
+                    rusqlite::params![OMP_LAUNCH_ID, f64::from_bits(binding.updated_at_bits)],
+                )
+                .unwrap();
+            assert_eq!(db_state(db), before);
+        }
+
+        #[test]
+        #[serial]
+        fn native_windows_launch_pin_matching_child_is_held() {
+            let _env = crate::hooks::test_helpers::isolated_test_env();
+            let (db, path) = setup_test_db();
+            let mut child = OwnedChild::spawn();
+            let (row, identity) = record_child(&db, &mut child);
+            let before = db_state(&db);
+            child.assert_running(&identity);
+            let verdict = omp_launch_pin_verdict(&db, &row).unwrap();
+            child.assert_running(&identity);
+            match verdict {
+                OmpLaunchPin::Held { pid, reason } => {
+                    assert_eq!(pid, i64::from(child.0.id()));
+                    assert_eq!(reason, "is still the running launch process");
+                }
+                _ => panic!("native matching child must hold the launch pin"),
+            }
+            child.assert_running(&identity);
+            let held = db
+                .with_immediate_transaction(|tx| {
+                    prepare_own_omp_reservation_in_txn(&db, tx, "luna", "sid-owner", "omp")
+                })
+                .unwrap();
+            child.assert_running(&identity);
+            let held = held.expect("native matching child must hold its own reservation");
+            assert_eq!(held.pid, i64::from(child.0.id()));
+            assert_eq!(held.reason, "is still the running launch process");
+            assert_eq!(db_state(&db), before);
+            cleanup(path);
+        }
+
+        #[test]
+        #[serial]
+        fn native_windows_launch_pin_mismatched_child_is_replaceable() {
+            let _env = crate::hooks::test_helpers::isolated_test_env();
+            let (db, path) = setup_test_db();
+            let mut child = OwnedChild::spawn();
+            let (row, identity) = record_child(&db, &mut child);
+            let mut context: serde_json::Value =
+                serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+            let ticks: u64 = identity.strip_prefix("windows:").unwrap().parse().unwrap();
+            context["omp_launch_pid"]["identity"] = serde_json::json!(format!(
+                "windows:{}",
+                ticks.checked_add(1).expect("distinct creation tick")
+            ));
+            db.conn()
+                .execute(
+                    "UPDATE instances SET launch_context=?1 WHERE name='luna'",
+                    rusqlite::params![context.to_string()],
+                )
+                .unwrap();
+            let mismatched = db.get_instance_full("luna").unwrap().unwrap();
+            let receipt = OmpLaunchPidReceipt::parse(&db, &mismatched)
+                .unwrap()
+                .expect("mismatched fixture must retain a correlated receipt");
+            assert_eq!(
+                receipt.identity,
+                format!(
+                    "windows:{}",
+                    ticks.checked_add(1).expect("distinct creation tick")
+                )
+            );
+            assert_ne!(receipt.identity, identity);
+            assert_releases_only_own_pin(&db, "now belongs to another process", || {
+                child.assert_running(&identity);
+            });
+            cleanup(path);
+        }
+
+        #[test]
+        #[serial]
+        fn native_windows_launch_pin_gone_child_is_replaceable() {
+            let _env = crate::hooks::test_helpers::isolated_test_env();
+            let (db, path) = setup_test_db();
+            let mut child = OwnedChild::spawn();
+            record_child(&db, &mut child);
+            child.kill_and_wait();
+            child.assert_dead();
+            assert_releases_only_own_pin(&db, "exited", || child.assert_dead());
+            cleanup(path);
+        }
     }
 }

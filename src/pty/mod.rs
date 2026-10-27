@@ -667,14 +667,45 @@ pub struct Proxy {
 impl Proxy {
     /// Spawn a new PTY process
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
-        // Anchor the launcher UUID before its tool exists. Foreground terminal
-        // launches do not return this wrapper's pid to the launcher, so the
-        // wrapper records itself on entry and replaces it with the child pid
-        // below as soon as spawn succeeds.
+        // Capture this launch before spawn. Only the original unbound UUID
+        // reservation may advance runner/NULL -> wrapper -> child.
+        let is_omp = config.target.known_tool() == Some(Tool::Omp);
+        let omp_process_id = is_omp
+            .then(|| {
+                config
+                    .env_vars
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == "HCOM_PROCESS_ID")
+                    .map(|(_, value)| value.clone())
+                    .or_else(|| std::env::var("HCOM_PROCESS_ID").ok())
+            })
+            .flatten();
+        let mut omp_launch_pid = None;
         if let Some(instance_name) = &config.instance_name
             && let Ok(db) = crate::db::HcomDb::open()
         {
-            let _ = db.update_instance_pid(instance_name, std::process::id());
+            if is_omp {
+                if let Some(process_id) = omp_process_id.as_deref()
+                    && let Ok(Some(mut expected)) = crate::instance_binding::capture_omp_launch_pid(
+                        &db,
+                        process_id,
+                        instance_name,
+                    )
+                    && matches!(
+                        crate::instance_binding::record_omp_launch_pid(
+                            &db,
+                            &mut expected,
+                            std::process::id(),
+                        ),
+                        Ok(true)
+                    )
+                {
+                    omp_launch_pid = Some(expected);
+                }
+            } else {
+                let _ = db.update_instance_pid(instance_name, std::process::id());
+            }
         }
         let winsize = terminal::get_terminal_size()?;
         let pty = openpty(&winsize, None).context("openpty failed")?;
@@ -745,7 +776,14 @@ impl Proxy {
         if let Some(ref instance_name) = config.instance_name
             && let Ok(db) = crate::db::HcomDb::open()
         {
-            let _ = db.update_instance_pid(instance_name, child.id());
+            if is_omp {
+                if let Some(expected) = omp_launch_pid.as_mut() {
+                    let _ =
+                        crate::instance_binding::record_omp_launch_pid(&db, expected, child.id());
+                }
+            } else {
+                let _ = db.update_instance_pid(instance_name, child.id());
+            }
 
             // Capture minimal launch context early so kill can close the terminal pane.
             // The start hook may later overwrite with richer context (git_branch, tty, env).
@@ -1890,38 +1928,11 @@ fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
 }
 
-/// Initialize delivery components with dependency injection for testing
-///
-/// Returns (db, notify) on success, Err on failure
-#[cfg(any(unix, windows))]
-fn initialize_delivery_components<DbF, NotifyF>(
-    instance_name: &str,
-    db_factory: DbF,
-    notify_factory: NotifyF,
-) -> anyhow::Result<(crate::db::HcomDb, crate::notify::NotifyServer)>
-where
-    DbF: FnOnce() -> anyhow::Result<crate::db::HcomDb>,
-    NotifyF: FnOnce() -> anyhow::Result<crate::notify::NotifyServer>,
-{
-    use anyhow::Context as _;
-    // Open database
-    let db = db_factory().context("Failed to open database")?;
-
-    // Create notify server
-    let notify = notify_factory().context("Failed to create notify server")?;
-
-    // Register notify port
-    db.register_notify_port(instance_name, notify.port())
-        .context("Failed to register notify port")?;
-
-    Ok((db, notify))
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        OMP_REROOT_PROMPT_WINDOW, PtyTarget, initialize_delivery_components,
-        omp_reroot_should_answer, prompt_submit_observed, strip_focus_events,
+        OMP_REROOT_PROMPT_WINDOW, PtyTarget, omp_reroot_should_answer, prompt_submit_observed,
+        strip_focus_events,
     };
     use std::time::Duration;
 
@@ -1958,10 +1969,6 @@ mod tests {
             false
         ));
     }
-    use anyhow::anyhow;
-    use rusqlite::Connection;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[cfg(unix)]
     #[test]
@@ -2032,30 +2039,6 @@ mod tests {
         assert_eq!(target.delivery_tool(), crate::tool::Tool::Adhoc);
     }
 
-    fn setup_test_db(with_notify_endpoints: bool) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!(
-            "test_hcom_pty_{}_{}.db",
-            std::process::id(),
-            test_id
-        ));
-
-        if with_notify_endpoints {
-            crate::db::HcomDb::open_at(&db_path).unwrap();
-        } else {
-            let _ = Connection::open(&db_path).unwrap();
-        }
-
-        db_path
-    }
-
-    fn cleanup_test_db(path: PathBuf) {
-        let _ = std::fs::remove_file(path);
-    }
-
     #[test]
     fn prompt_submit_observed_when_text_clears() {
         assert!(prompt_submit_observed(Some("run tests"), Some("")));
@@ -2093,105 +2076,6 @@ mod tests {
     #[test]
     fn prompt_submit_observed_ignores_text_edits() {
         assert!(!prompt_submit_observed(Some("run"), Some("run tests")));
-    }
-
-    #[test]
-    fn initialize_delivery_components_db_failure_short_circuits_notify() {
-        let notify_called = std::cell::Cell::new(false);
-
-        let result = initialize_delivery_components(
-            "test",
-            || Err(anyhow!("DB connection refused")),
-            || {
-                notify_called.set(true);
-                crate::notify::NotifyServer::new()
-            },
-        );
-
-        let err = match result {
-            Ok(_) => panic!("db failure should propagate"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string().contains("Failed to open database"),
-            "missing context: {err:#}"
-        );
-        assert!(
-            !notify_called.get(),
-            "notify factory should not be called after db failure"
-        );
-    }
-
-    #[test]
-    fn initialize_delivery_components_notify_failure_propagates() {
-        let db_path = setup_test_db(true);
-
-        let result = initialize_delivery_components(
-            "test",
-            || crate::db::HcomDb::open_raw(&db_path),
-            || Err(anyhow!("Port already in use")),
-        );
-
-        let err = match result {
-            Ok(_) => panic!("notify failure should propagate"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string().contains("Failed to create notify server"),
-            "missing context: {err:#}"
-        );
-
-        cleanup_test_db(db_path);
-    }
-
-    #[test]
-    fn initialize_delivery_components_register_failure_propagates() {
-        let db_path = setup_test_db(false);
-
-        let result = initialize_delivery_components(
-            "test",
-            || crate::db::HcomDb::open_raw(&db_path),
-            crate::notify::NotifyServer::new,
-        );
-
-        let err = match result {
-            Ok(_) => panic!("register notify port failure should propagate"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string().contains("Failed to register notify port"),
-            "missing context: {err:#}"
-        );
-
-        cleanup_test_db(db_path);
-    }
-
-    #[test]
-    fn initialize_delivery_components_registers_notify_port() {
-        let db_path = setup_test_db(true);
-
-        let (db, notify) = initialize_delivery_components(
-            "test",
-            || crate::db::HcomDb::open_raw(&db_path),
-            crate::notify::NotifyServer::new,
-        )
-        .expect("component init should succeed");
-        let notify_port = notify.port();
-        drop(db);
-        drop(notify);
-
-        let conn = Connection::open(&db_path).unwrap();
-        let (kind, port): (String, i64) = conn
-            .query_row(
-                "SELECT kind, port FROM notify_endpoints WHERE instance = 'test'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(kind, "pty");
-        assert_eq!(port, notify_port as i64);
-
-        cleanup_test_db(db_path);
     }
 
     // ---- pending_utf8_bytes tests ----

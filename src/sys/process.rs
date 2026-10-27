@@ -79,6 +79,14 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
         .ok()
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn proc_stat_is_zombie(stat: &str) -> bool {
+    // comm may contain closing parentheses, so state starts after the final one.
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().next())
+        == Some("Z")
+}
+
 /// One incarnation of `pid` on this host: its boot-relative start time in
 /// clock ticks (`/proc/<pid>/stat` field 22) and the host boot id
 /// (`/proc/sys/kernel/random/boot_id`). A reused pid differs in the start
@@ -132,6 +140,153 @@ pub(crate) fn process_info_apple(pid: u32) -> Option<libc::proc_bsdinfo> {
         )
     };
     (read == size).then_some(info)
+}
+
+/// One positive PID's `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)` reply.
+/// Only `state` decides; test builds also keep the raw reply so a failed native
+/// fixture shows exactly what the kernel said.
+#[cfg(all(
+    target_os = "macos",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+struct AppleProcStateReply {
+    /// The requested PID.
+    #[cfg(test)]
+    pid: libc::pid_t,
+    /// The `sysctl` return code.
+    #[cfg(test)]
+    ret: libc::c_int,
+    /// Raw errno, read immediately and only when `ret` is nonzero.
+    #[cfg(test)]
+    errno: Option<i32>,
+    /// The length `sysctl` left in `oldlenp`.
+    #[cfg(test)]
+    returned_bytes: usize,
+    /// `kp_proc.p_pid`, decoded only from a successful reply of one whole record.
+    #[cfg(test)]
+    decoded_pid: Option<libc::pid_t>,
+    /// `kp_proc.p_stat`, kept only from a successful reply of one whole record
+    /// whose `p_pid` is the requested PID.
+    state: Option<libc::c_char>,
+}
+
+#[cfg(all(
+    target_os = "macos",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+impl AppleProcStateReply {
+    /// Positive exit evidence: the requested PID's own record says `SZOMB`.
+    fn is_zombie(&self) -> bool {
+        self.state == Some(libc::SZOMB as libc::c_char)
+    }
+}
+
+/// Read the BSD run state of a positive `pid` as zombie evidence.
+///
+/// [`process_info_apple`] cannot provide it: `proc_pidinfo(PROC_PIDTBSDINFO)`
+/// looks up zombies only when its argument is nonzero (xnu-11417.140.69
+/// bsd/kern/proc_info.c:2152-2163). The `kern.proc.pid` handler walks the
+/// zombie list as well (bsd/kern/kern_sysctl.c:912-913) and copies out
+/// `p_stat` and `p_pid` (kern_sysctl.c:1201-1202).
+///
+/// Only the leading fields of the record are declared; the rest stays opaque.
+/// `struct kinfo_proc` starts with `struct extern_proc kp_proc`
+/// (bsd/sys/sysctl.h:978-979), which starts with the `p_un` union of two
+/// pointers and a `timeval`, then `p_vmspace`, `p_sigacts`, `p_flag`,
+/// `p_stat`, and `p_pid` (bsd/sys/proc.h:102-117). The whole record is
+/// 0x288 = 648 bytes on both arm64 and x86_64: golang/sys f5cb0306ac0e
+/// generates `SizeofKinfoProc = C.sizeof_struct_kinfo_proc`
+/// (unix/types_darwin.go:359-367) as 0x288 in unix/ztypes_darwin_arm64.go:740
+/// and unix/ztypes_darwin_amd64.go:740. No other Apple ABI is verified, so
+/// other Apple targets get no reader and their zombies stay unknown.
+#[cfg(all(
+    target_os = "macos",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+fn process_state_apple(pid: libc::pid_t) -> AppleProcStateReply {
+    const KINFO_PROC_BYTES: usize = 648;
+
+    #[repr(C)]
+    union AppleProcStart {
+        links: [*mut libc::c_void; 2],
+        started: libc::timeval,
+    }
+
+    #[repr(C)]
+    struct AppleExternProcPrefix {
+        p_un: AppleProcStart,
+        p_vmspace: *mut libc::c_void,
+        p_sigacts: *mut libc::c_void,
+        p_flag: libc::c_int,
+        p_stat: libc::c_char,
+        p_pid: libc::pid_t,
+    }
+
+    #[repr(C)]
+    struct AppleKinfoProcBuffer {
+        kp_proc: AppleExternProcPrefix,
+        opaque: [u8; KINFO_PROC_BYTES - std::mem::size_of::<AppleExternProcPrefix>()],
+    }
+
+    const _: () = {
+        assert!(std::mem::size_of::<AppleProcStart>() == 16);
+        assert!(std::mem::size_of::<AppleExternProcPrefix>() == 48);
+        assert!(std::mem::align_of::<AppleExternProcPrefix>() == 8);
+        assert!(std::mem::size_of::<AppleKinfoProcBuffer>() == KINFO_PROC_BYTES);
+    };
+
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut record = std::mem::MaybeUninit::<AppleKinfoProcBuffer>::uninit();
+    let mut len = KINFO_PROC_BYTES;
+    // SAFETY: `mib` is a four-element read-only query, `record` is a writable
+    // stack buffer of exactly `len` bytes, and a null `newp` with a zero
+    // `newlen` sets nothing.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            record.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // Test builds keep errno for the fixture's diagnostic. Read it immediately,
+    // and only when the call failed.
+    #[cfg(test)]
+    let errno = if ret == 0 {
+        None
+    } else {
+        std::io::Error::last_os_error().raw_os_error()
+    };
+    let mut reply = AppleProcStateReply {
+        #[cfg(test)]
+        pid,
+        #[cfg(test)]
+        ret,
+        #[cfg(test)]
+        errno,
+        #[cfg(test)]
+        returned_bytes: len,
+        #[cfg(test)]
+        decoded_pid: None,
+        state: None,
+    };
+    // An error, an empty reply (no such PID), or any other length leaves the
+    // buffer unread. A buffer too small for a whole record fails with ENOMEM
+    // rather than receiving part of one (kern_sysctl.c:923-926).
+    if ret == 0 && len == KINFO_PROC_BYTES {
+        // SAFETY: XNU zeroes each whole record, fills it, and copies all of it
+        // out (kern_sysctl.c:804-829), so a successful reply of exactly one
+        // record initialized every byte of `record`.
+        let kp_proc = unsafe { &record.assume_init_ref().kp_proc };
+        #[cfg(test)]
+        {
+            reply.decoded_pid = Some(kp_proc.p_pid);
+        }
+        reply.state = (kp_proc.p_pid == pid).then_some(kp_proc.p_stat);
+    }
+    reply
 }
 
 #[cfg(windows)]
@@ -233,6 +388,78 @@ pub fn is_alive(pid: u32) -> bool {
             }
             GetLastError() == ERROR_ACCESS_DENIED
         }
+    }
+}
+
+/// Positive evidence that a PID has exited or no longer exists. Probe failures
+/// are unknown, not death; unlike `is_alive`, this is safe for releasing a
+/// persisted owner's identity.
+pub fn is_definitely_dead(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: a positive PID and signal zero query one process, never a
+        // process group, without delivering a signal.
+        let ret = unsafe { libc::kill(pid, 0) };
+        if ret != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        // kill(pid, 0) still succeeds for an exited, unreaped zombie. Only a
+        // readable native zombie status is additional positive death evidence.
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .is_some_and(|stat| proc_stat_is_zombie(&stat))
+        }
+        #[cfg(all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        ))]
+        {
+            process_state_apple(pid).is_zombie()
+        }
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "linux",
+            all(
+                target_os = "macos",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            )
+        )))]
+        {
+            false
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: query-only access; an opened handle is closed exactly once,
+        // and GetExitCodeProcess receives a writable exit-code buffer.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return GetLastError() == ERROR_INVALID_PARAMETER;
+            }
+            let mut exit_code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut exit_code) != 0;
+            CloseHandle(handle);
+            ok && exit_code != STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
     }
 }
 
@@ -895,6 +1122,107 @@ mod tests {
     #[test]
     fn test_is_alive_dead_process() {
         assert!(!is_alive(99_999_999));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_definitely_dead_rejects_group_and_unrepresentable_pids() {
+        assert!(!is_definitely_dead(0));
+        assert!(!is_definitely_dead(u32::MAX));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn test_is_definitely_dead_observes_only_an_exited_fixture() {
+        #[cfg(unix)]
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = spawn_long_lived_child();
+        let pid = child.id();
+        let live_probe = is_definitely_dead(pid);
+        #[cfg(unix)]
+        child.kill().unwrap();
+        #[cfg(windows)]
+        kill_child_group(&mut child);
+        child.wait().unwrap();
+        let exited_probe = is_definitely_dead(pid);
+        assert!(!live_probe, "a live fixture must not be declared dead");
+        assert!(exited_probe, "an exited fixture must be positively dead");
+    }
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[test]
+    fn test_proc_stat_requires_an_exact_zombie_state() {
+        for (stat, zombie) in [
+            ("42 (fixture) Z 1 2 3", true),
+            ("42 (fixture ) Z inside) Z 1 2 3", true),
+            ("42 (fixture ) Z inside) S 1 2 3", false),
+            ("42 (fixture) R 1 2 3", false),
+            ("42 (fixture) Zz 1 2 3", false),
+            ("42 (fixture) ", false),
+            ("42 (fixture Z", false),
+            ("", false),
+        ] {
+            assert_eq!(proc_stat_is_zombie(stat), zombie, "{stat:?}");
+        }
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        all(
+            target_os = "macos",
+            any(target_arch = "aarch64", target_arch = "x86_64")
+        )
+    ))]
+    #[test]
+    fn test_is_definitely_dead_observes_an_unreaped_fixture() {
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let pid = child.id();
+        // SAFETY: waitid fills this writable siginfo buffer for our child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // WNOWAIT synchronizes exit without reaping, unlike Child::wait.
+            // SAFETY: P_PID selects only our fixture, and info is writable.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                child.wait().unwrap();
+                panic!("waitid for exited fixture: {error}");
+            }
+        }
+        // SAFETY: signal zero only queries this fixture's positive PID.
+        let kill_result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        let dead_probe = is_definitely_dead(pid);
+        // Keep the kernel's raw reply while the zombie still exists.
+        #[cfg(target_os = "macos")]
+        let native_reply = process_state_apple(pid as libc::pid_t);
+        // Reap before asserting so even a failed probe leaves no zombie behind.
+        child.wait().unwrap();
+        assert_eq!(kill_result, 0, "an unreaped fixture still exists for kill0");
+        #[cfg(target_os = "macos")]
+        assert!(
+            native_reply.is_zombie(),
+            "kern.proc.pid must read the unreaped fixture as SZOMB: \
+             pid={} ret={} errno={:?} returned_bytes={} decoded_pid={:?} state={:?}",
+            native_reply.pid,
+            native_reply.ret,
+            native_reply.errno,
+            native_reply.returned_bytes,
+            native_reply.decoded_pid,
+            native_reply.state
+        );
+        assert!(dead_probe, "an unreaped zombie is positively dead");
     }
 
     #[test]

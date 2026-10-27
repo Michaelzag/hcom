@@ -1284,6 +1284,151 @@ pub fn stop_instance(
         None,
     )
 }
+
+/// Release an unhooked local OMP reservation without inspecting or signaling processes.
+pub(crate) fn try_release_unhooked_omp_reservation(
+    db: &HcomDb,
+    expected: &InstanceRow,
+    binding_ids: &[String],
+    initiated_by: &str,
+) -> Option<StopOutcome> {
+    let eligible = |row: &InstanceRow| -> Result<bool> {
+        if !crate::instance_binding::is_unhooked_omp_reservation(db, row)?
+            || instances::is_subagent_instance(row)
+            || identity::validate_protected_identity(db, &row.name).is_err()
+        {
+            return Ok(false);
+        }
+        Ok(db.conn().query_row(
+            "SELECT NOT EXISTS (
+                SELECT 1 FROM instances
+                WHERE parent_name = ?1 OR parent_session_id = ?2
+             )",
+            params![row.name, row.session_id],
+            |row| row.get(0),
+        )?)
+    };
+    match eligible(expected) {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(error) => {
+            return Some(StopOutcome::RetryableError(StopError::database(
+                format!(
+                    "could not release reservation for {}: {error}",
+                    expected.name
+                ),
+                &error,
+            )));
+        }
+    }
+
+    #[cfg(test)]
+    if let Some(hook) = STOP_ENTRY_GAP_HOOK.with(std::cell::Cell::take) {
+        hook(db, &expected.name);
+    }
+
+    let stopped = db.with_immediate_transaction(|tx| {
+        let mut post = PostCommit::default();
+        let (row, ids) = HcomDb::instance_with_bindings_in(tx, &expected.name)?;
+        let Some(row) = row else {
+            return Ok((StopOutcome::AlreadyStopped, post));
+        };
+        if row.created_at.to_bits() != expected.created_at.to_bits()
+            || row.pid != expected.pid
+            || row.session_id != expected.session_id
+            || row.agent_id != expected.agent_id
+            || row.tool != expected.tool
+            || row.origin_device_id != expected.origin_device_id
+            || ids.iter().any(|id| !binding_ids.contains(id))
+        {
+            return Ok((re_registered_outcome(&expected.name), post));
+        }
+        if !eligible(&row)? {
+            anyhow::bail!(
+                "'{}' is no longer an unhooked OMP launch reservation; row left intact",
+                expected.name
+            );
+        }
+
+        let mut snapshot = stop_snapshot(&row);
+        snapshot["pid"] = Value::Null;
+        let event_data = serde_json::json!({
+            "action": "stopped",
+            "by": initiated_by,
+            "reason": "external",
+            "process_id": null,
+            "snapshot": snapshot,
+        });
+        post.wake_ports = crate::notify::snapshot_wake_ports(db, &row.name);
+        let (won, event_id) = db.finalize_instance_stop_in_txn(
+            tx,
+            &row.name,
+            row.created_at,
+            row.pid,
+            row.session_id.as_deref(),
+            row.agent_id.as_deref(),
+            &event_data,
+            None,
+            Some(binding_ids),
+        )?;
+        if !won {
+            anyhow::bail!(
+                "reservation for '{}' changed before release; row left intact",
+                expected.name
+            );
+        }
+        db.revoke_claude_actor_capabilities_for_instance(&row.name)?;
+        if let Some(event_id) = event_id {
+            post.events.push((event_id, row.name, event_data));
+        }
+        post.push = true;
+        Ok((StopOutcome::Stopped, post))
+    });
+    Some(match stopped {
+        Ok((outcome, post)) => {
+            post.fire(db);
+            outcome
+        }
+        Err(error) => StopOutcome::RetryableError(StopError::database(
+            format!(
+                "could not release reservation for {}: {error}",
+                expected.name
+            ),
+            &error,
+        )),
+    })
+}
+
+/// Preserve an instance's stop metadata without probing its recorded process.
+fn stop_snapshot(instance_data: &InstanceRow) -> Value {
+    serde_json::json!({
+        "name": instance_data.name,
+        "transcript_path": instance_data.transcript_path,
+        "session_id": instance_data.session_id,
+        "tool": instance_data.tool,
+        "directory": instance_data.directory,
+        "parent_name": instance_data.parent_name,
+        "parent_session_id": instance_data.parent_session_id,
+        "tag": instance_data.tag,
+        "wait_timeout": instance_data.wait_timeout,
+        "subagent_timeout": instance_data.subagent_timeout,
+        "hints": instance_data.hints,
+        "pid": instance_data.pid,
+        "created_at": instance_data.created_at,
+        "created_at_bits": instance_data.created_at.to_bits(),
+        "last_seen": instance_data.last_seen,
+        "background": instance_data.background,
+        "agent_id": instance_data.agent_id,
+        "name_announced": instance_data.name_announced,
+        "launch_args": instance_data.launch_args,
+        "origin_device_id": instance_data.origin_device_id,
+        "background_log_file": instance_data.background_log_file,
+        "last_event_id": instance_data.last_event_id,
+        "purpose": instance_data.purpose.as_deref().unwrap_or_default(),
+        "current": instance_data.current.as_deref().unwrap_or_default(),
+    })
+}
+
 pub(crate) fn stop_instance_with_capture(
     db: &HcomDb,
     instance_name: &str,
@@ -2191,32 +2336,7 @@ fn stop_instance_inner_scoped(
 
     // Prepare snapshot before delete (preserves data for transcript access)
     // Use Option values directly so None serializes as JSON null
-    let mut snapshot = serde_json::json!({
-        "name": instance_name,
-        "transcript_path": instance_data.transcript_path,
-        "session_id": instance_data.session_id,
-        "tool": instance_data.tool,
-        "directory": instance_data.directory,
-        "parent_name": instance_data.parent_name,
-        "parent_session_id": instance_data.parent_session_id,
-        "tag": instance_data.tag,
-        "wait_timeout": instance_data.wait_timeout,
-        "subagent_timeout": instance_data.subagent_timeout,
-        "hints": instance_data.hints,
-        "pid": instance_data.pid,
-        "created_at": instance_data.created_at,
-        "created_at_bits": instance_data.created_at.to_bits(),
-        "last_seen": instance_data.last_seen,
-        "background": instance_data.background,
-        "agent_id": instance_data.agent_id,
-        "name_announced": instance_data.name_announced,
-        "launch_args": instance_data.launch_args,
-        "origin_device_id": instance_data.origin_device_id,
-        "background_log_file": instance_data.background_log_file,
-        "last_event_id": instance_data.last_event_id,
-        "purpose": instance_data.purpose.as_deref().unwrap_or_default(),
-        "current": instance_data.current.as_deref().unwrap_or_default(),
-    });
+    let mut snapshot = stop_snapshot(&instance_data);
     crate::proctruth::record_anchor_identity(&mut snapshot);
 
     // Snapshot both child sets before deleting the parent. Only the teardown

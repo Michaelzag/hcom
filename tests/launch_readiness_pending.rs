@@ -39,6 +39,21 @@ const EXIT_NOW: &str = "exit-now";
 /// laundered into a pending launch by a surviving wrapper shell.
 const BOUND: &str = "bound";
 
+/// Releases the fake tool through its own voluntary-exit gate (`EXIT_NOW`) on
+/// drop, the unwind path included. The tool and the wrapper above it are
+/// detached descendants of hcom, not children this test owns, so neither is
+/// ever signalled from here: the tool exits on its gate, and `Hcom::drop`'s
+/// isolated `kill all` tears the wrapper down. Left running, the tool would
+/// still carry the seat's name into every later test in this binary, and
+/// hcom's name generator can hand any test the same name.
+struct ReleaseFakeTool(PathBuf);
+
+impl Drop for ReleaseFakeTool {
+    fn drop(&mut self) {
+        let _ = fs::write(self.0.join(EXIT_NOW), "");
+    }
+}
+
 fn open_db(h: &Hcom) -> rusqlite::Connection {
     rusqlite::Connection::open(h.path().join("hcom.db")).expect("open isolated hcom.db")
 }
@@ -344,6 +359,7 @@ fn a_late_ready_live_launch_is_pending_and_exits_zero() {
     let h = Hcom::new();
     init(&h);
     let (fakebin, out) = install_fake_claude(&h);
+    let _release = ReleaseFakeTool(out.clone());
 
     // `-p` is the detached background shape: hcom records the runner's pid on
     // the row, returns immediately, and then waits for readiness — the exact
@@ -364,12 +380,10 @@ fn a_late_ready_live_launch_is_pending_and_exits_zero() {
     // exactly the luvo case (ready long after the wait gave up).
     let name = launched_seat_name(&h).expect("the launch created a seat");
     let pid = row_pid(&h, &name).expect("the launcher recorded a pid");
-    h.track_cleanup_pid(pid);
     assert!(alive(pid), "recorded pid {pid} is not live");
-    let tool_pid = live_tool_under(pid, &fakebin).unwrap_or_else(|| {
+    if live_tool_under(pid, &fakebin).is_none() {
         panic!("no live tool under the recorded pid {pid}\nstdout={stdout}\nstderr={stderr}")
-    });
-    h.track_cleanup_pid(tool_pid);
+    }
 
     assert_eq!(
         code, 0,
@@ -395,11 +409,6 @@ fn a_late_ready_live_launch_is_pending_and_exits_zero() {
         stdout.contains("tool process") && stdout.contains(" alive"),
         "the pending line must report a live TOOL, not the wrapper:\n{stdout}"
     );
-
-    // The fake tool loops until told to stop, so release it here. Left running
-    // it would still carry the seat's name into every later test in this
-    // binary, and hcom's name generator can hand any test the same name.
-    fs::write(out.join(EXIT_NOW), "").expect("stop the fake tool");
 }
 
 /// The other half of the contract: a launch whose process is gone before ready
@@ -559,6 +568,7 @@ fn a_resume_that_is_late_but_alive_is_pending_not_refused() {
     // 30 s resume window has passed — the shape luvo actually had: alive,
     // bound, late to report, and so unproven to the wait, never refused.
     let (fakebin, out) = install_fake_claude_seeded(&h, &session_id, 35);
+    let _release = ReleaseFakeTool(out.clone());
     let name = seed_stopped_claude(&h, "seeded_luvo");
     assert_eq!(name, "seeded_luvo");
 
@@ -588,12 +598,10 @@ fn a_resume_that_is_late_but_alive_is_pending_not_refused() {
     // running, so the launch is pending — not failed, and never refused. A
     // resume reuses the seat's own row, so the name to read is the seeded one.
     let pid = row_pid(&h, &name).expect("the resume recorded a pid");
-    h.track_cleanup_pid(pid);
     assert!(alive(pid), "resumed pid {pid} is not live");
-    let tool_pid = live_tool_under(pid, &fakebin).unwrap_or_else(|| {
+    if live_tool_under(pid, &fakebin).is_none() {
         panic!("no live tool under the resumed pid {pid}\nstdout={stdout}\nstderr={stderr}")
-    });
-    h.track_cleanup_pid(tool_pid);
+    }
 
     assert_eq!(
         code, 0,
@@ -626,10 +634,6 @@ fn a_resume_that_is_late_but_alive_is_pending_not_refused() {
         row.hooks_bound,
         "the resumed seat must end up hook-bound\nstdout={stdout}\nstderr={stderr}"
     );
-
-    // Release the fake tool: it would otherwise still be carrying the seat's
-    // name when the next test in this binary runs.
-    fs::write(out.join(EXIT_NOW), "").expect("stop the fake tool");
 }
 
 /// Seed a `claude` seat as a real stop leaves it: an inactive row plus the

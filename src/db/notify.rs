@@ -12,7 +12,7 @@
 //!   protocol is unrelated to wake.
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use super::HcomDb;
 use crate::shared::time::now_epoch_f64;
@@ -55,25 +55,56 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Re-register a PTY's `pty` + `inject` endpoints only while its instance
-    /// row exists, so a delivery loop waking on its own stop can't recreate them.
-    /// Ported from upstream 4b5a36c for the session-switch endpoint refresh (26c5c44).
+    /// Publish both PTY endpoints while the captured row or this process's
+    /// current binding still authorizes them. Capture and publication share
+    /// one transaction so stop or replacement cannot interleave with either.
     pub fn refresh_pty_endpoints(
         &self,
         name: &str,
+        process_id: &str,
+        captured_created_at: &mut Option<f64>,
         notify_port: u16,
         inject_port: u16,
     ) -> Result<()> {
-        let now = now_epoch_f64();
-        let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO notify_endpoints (instance, kind, port, updated_at)
-             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM instances WHERE name = ?1)
-             ON CONFLICT(instance, kind) DO UPDATE SET
-                 port = excluded.port,
-                 updated_at = excluded.updated_at",
-        )?;
-        stmt.execute(params![name, "pty", notify_port as i64, now])?;
-        stmt.execute(params![name, "inject", inject_port as i64, now])?;
+        let held_created_at = *captured_created_at;
+        let authorized_created_at = self.with_immediate_transaction(|tx| {
+            let authorized_created_at: Option<f64> = tx
+                .query_row(
+                    "SELECT i.created_at
+                     FROM instances AS i
+                     WHERE i.name = ?1
+                       AND (
+                         i.created_at = ?2
+                         OR (
+                           ?3 != ''
+                           AND EXISTS (
+                             SELECT 1 FROM process_bindings AS b
+                             WHERE b.process_id = ?3 AND b.instance_name = i.name
+                           )
+                         )
+                       )",
+                    params![name, held_created_at, process_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(created_at) = authorized_created_at else {
+                return Ok(None);
+            };
+
+            let now = now_epoch_f64();
+            tx.execute(
+                "INSERT INTO notify_endpoints (instance, kind, port, updated_at)
+                 VALUES (?1, 'pty', ?2, ?4), (?1, 'inject', ?3, ?4)
+                 ON CONFLICT(instance, kind) DO UPDATE SET
+                     port = excluded.port,
+                     updated_at = excluded.updated_at",
+                params![name, notify_port as i64, inject_port as i64, now],
+            )?;
+            Ok(Some(created_at))
+        })?;
+        if let Some(created_at) = authorized_created_at {
+            *captured_created_at = Some(created_at);
+        }
         Ok(())
     }
 
@@ -180,6 +211,195 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
 
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn pty_endpoint_refresh_preserves_current_incarnation_after_pid_session_change() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, pid, session_id)
+                 VALUES ('alpha', 'omp', 1, 101, 'session-one')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("process-p", "session-one", "alpha")
+            .unwrap();
+        db.upsert_notify_endpoint("alpha", "plugin", 41003).unwrap();
+
+        let mut endpoint_created_at = None;
+        db.refresh_pty_endpoints("alpha", "process-p", &mut endpoint_created_at, 41001, 41002)
+            .unwrap();
+        assert_eq!(
+            db.notify_endpoint_ports("alpha").unwrap(),
+            vec![
+                ("inject".to_string(), 41002),
+                ("plugin".to_string(), 41003),
+                ("pty".to_string(), 41001),
+            ]
+        );
+
+        db.conn
+            .execute(
+                "UPDATE instances SET pid = 202, session_id = 'session-two' WHERE name = 'alpha'",
+                [],
+            )
+            .unwrap();
+        // A temporarily absent binding cannot revoke the already captured row.
+        db.delete_process_binding("process-p").unwrap();
+        db.refresh_pty_endpoints("alpha", "process-p", &mut endpoint_created_at, 42001, 42002)
+            .unwrap();
+        assert_eq!(
+            db.notify_endpoint_ports("alpha").unwrap(),
+            vec![
+                ("inject".to_string(), 42002),
+                ("plugin".to_string(), 41003),
+                ("pty".to_string(), 42001),
+            ]
+        );
+
+        drop(db);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn pty_endpoint_refresh_cannot_publish_after_finalize_stop() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, session_id)
+                 VALUES ('alpha', 'omp', 1, 'session-one')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("process-p", "session-one", "alpha")
+            .unwrap();
+        db.upsert_notify_endpoint("alpha", "plugin", 41003).unwrap();
+        let mut endpoint_created_at = None;
+        db.refresh_pty_endpoints("alpha", "process-p", &mut endpoint_created_at, 41001, 41002)
+            .unwrap();
+
+        let snapshot = db.get_instance_full("alpha").unwrap().unwrap();
+        let bindings = db.process_binding_ids("alpha").unwrap();
+        let event = serde_json::json!({
+            "action": "stopped",
+            "by": "test",
+            "reason": "killed",
+            "snapshot": db.get_instance("alpha").unwrap().unwrap(),
+        });
+        let (won, _) = db
+            .with_immediate_transaction(|tx| {
+                db.finalize_instance_stop_in_txn(
+                    tx,
+                    &snapshot.name,
+                    snapshot.created_at,
+                    snapshot.pid,
+                    snapshot.session_id.as_deref(),
+                    snapshot.agent_id.as_deref(),
+                    &event,
+                    Some("process-p"),
+                    Some(bindings.as_slice()),
+                )
+            })
+            .unwrap();
+        assert!(won, "the matching stop must remove this incarnation");
+        assert!(db.get_instance_full("alpha").unwrap().is_none());
+
+        let mut fresh_created_at = None;
+        for capture in [&mut endpoint_created_at, &mut fresh_created_at] {
+            db.refresh_pty_endpoints("alpha", "process-p", capture, 42001, 42002)
+                .unwrap();
+            assert!(db.notify_endpoint_ports("alpha").unwrap().is_empty());
+            let count: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM notify_endpoints WHERE instance = 'alpha'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+
+        drop(db);
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn pty_endpoint_refresh_cannot_overwrite_another_process_replacement() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, session_id)
+                 VALUES ('alpha', 'omp', 1, 'session-one')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("process-p", "session-one", "alpha")
+            .unwrap();
+        let mut endpoint_created_at = None;
+        db.refresh_pty_endpoints("alpha", "process-p", &mut endpoint_created_at, 41001, 41002)
+            .unwrap();
+
+        db.with_immediate_transaction(|tx| {
+            tx.execute_batch(
+                "DELETE FROM instances WHERE name = 'alpha';
+                 DELETE FROM process_bindings WHERE instance_name = 'alpha';
+                 DELETE FROM notify_endpoints WHERE instance = 'alpha';
+                 INSERT INTO instances (name, tool, created_at, pid, session_id, agent_id)
+                   VALUES ('alpha', 'omp', 2, 202, 'session-two', 'agent-q');
+                 INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                   VALUES ('process-q', 'session-two', 'alpha', 20);
+                 INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES
+                   ('alpha', 'pty', 43001, 21),
+                   ('alpha', 'inject', 43002, 22),
+                   ('alpha', 'plugin', 43003, 23);",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let endpoint_rows = || {
+            db.conn
+                .prepare(
+                    "SELECT instance, kind, port, updated_at FROM notify_endpoints
+                     WHERE instance = 'alpha' ORDER BY kind",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, f64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let replacement_endpoints = endpoint_rows();
+        let replacement = db.get_instance("alpha").unwrap().unwrap();
+        let replacement_binding = db.get_process_binding_full("process-q").unwrap();
+
+        let mut fresh_created_at = None;
+        for capture in [&mut endpoint_created_at, &mut fresh_created_at] {
+            db.refresh_pty_endpoints("alpha", "process-p", capture, 42001, 42002)
+                .unwrap();
+            assert_eq!(endpoint_rows(), replacement_endpoints);
+            assert_eq!(
+                db.get_instance("alpha").unwrap().as_ref(),
+                Some(&replacement)
+            );
+            assert_eq!(
+                db.get_process_binding_full("process-q").unwrap(),
+                replacement_binding
+            );
+            assert_eq!(db.process_binding_ids("alpha").unwrap(), vec!["process-q"]);
+            assert_eq!(db.get_process_binding("process-p").unwrap(), None);
+        }
+
+        drop(db);
         cleanup_test_db(db_path);
     }
 }

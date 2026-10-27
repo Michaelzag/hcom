@@ -217,7 +217,13 @@ impl HcomDb {
     /// Update instance PID after spawn
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
         self.conn.execute(
-            "UPDATE instances SET pid = ? WHERE name = ?",
+            "UPDATE instances SET pid = ?,
+                launch_context = CASE
+                    WHEN json_valid(launch_context)
+                         AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
+                    THEN json_remove(launch_context,'$.omp_launch_pid')
+                    ELSE launch_context END
+             WHERE name = ?",
             params![pid as i64, name],
         )?;
         Ok(())
@@ -227,10 +233,81 @@ impl HcomDb {
     /// it; an existing anchor (a PTY wrapper's, a launcher's) is never replaced.
     pub fn set_instance_pid_if_unset(&self, name: &str, pid: u32) -> Result<bool> {
         let changed = self.conn.execute(
-            "UPDATE instances SET pid = ?1 WHERE name = ?2 AND pid IS NULL",
+            "UPDATE instances SET pid = ?1,
+                launch_context = CASE
+                    WHEN json_valid(launch_context)
+                         AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
+                    THEN json_remove(launch_context,'$.omp_launch_pid')
+                    ELSE launch_context END
+             WHERE name = ?2 AND pid IS NULL",
             params![pid as i64, name],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Set or clear one captured row incarnation without overwriting a replacement
+    /// or a newer PID/session claim. The caller owns the immediate transaction.
+    /// Match InstanceRow's origin normalization: NULL and "" both mean local.
+    pub(crate) fn compare_and_set_instance_pid_in_txn(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        expected: &InstanceRow,
+        pid: Option<u32>,
+    ) -> Result<bool> {
+        let changed = tx.execute(
+            "UPDATE instances SET pid = ?1,
+                launch_context = CASE
+                    WHEN json_valid(launch_context)
+                         AND json_type(launch_context,'$.omp_launch_pid') IS NOT NULL
+                    THEN json_remove(launch_context,'$.omp_launch_pid')
+                    ELSE launch_context END
+             WHERE name = ?2 AND created_at = ?3 AND agent_id IS ?4
+               AND pid IS ?5 AND session_id IS ?6
+               AND tool = ?7 AND NULLIF(origin_device_id, '') IS ?8",
+            params![
+                pid.map(i64::from),
+                expected.name,
+                expected.created_at,
+                expected.agent_id,
+                expected.pid,
+                expected.session_id,
+                expected.tool,
+                expected.origin_device_id,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Pin one launch's PID and receipt atomically, preserving concurrent
+    /// context updates by matching both the row incarnation and context text.
+    pub(crate) fn compare_and_set_omp_launch_pin_in_txn(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        expected: &InstanceRow,
+        current_context_text: &str,
+        pid: u32,
+        new_context_text: &str,
+    ) -> Result<bool> {
+        let changed = tx.execute(
+            "UPDATE instances SET pid = ?1, launch_context = ?10
+             WHERE name = ?2 AND created_at = ?3 AND agent_id IS ?4
+               AND pid IS ?5 AND session_id IS ?6
+               AND tool = ?7 AND NULLIF(origin_device_id, '') IS ?8
+               AND COALESCE(launch_context, '') = ?9",
+            params![
+                i64::from(pid),
+                expected.name,
+                expected.created_at,
+                expected.agent_id,
+                expected.pid,
+                expected.session_id,
+                expected.tool,
+                expected.origin_device_id,
+                current_context_text,
+                new_context_text,
+            ],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Store launch_context JSON (terminal preset, pane_id, env snapshot).
@@ -708,6 +785,25 @@ impl HcomDb {
         found
             .map(|(name, data)| Ok((name, serde_json::from_str(&data)?)))
             .transpose()
+    }
+
+    /// Return the event ID and raw data of `name`'s newest `life.stopped`.
+    /// The name's newest stop is reclaim authority even when resuming an older
+    /// session. Do not parse the data or filter malformed snapshots away:
+    /// callers must see that newest stop rather than an older valid one.
+    pub fn find_latest_stopped_event_by_name(&self, name: &str) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, data FROM events
+                 WHERE type='life'
+                   AND instance=?
+                   AND json_extract(data, '$.action') = 'stopped'
+                 ORDER BY id DESC LIMIT 1",
+                params![name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?)
     }
 
     /// The `snapshot` of `name`'s newest `life.stopped` event whose snapshot

@@ -8,7 +8,7 @@
 //! - `--orphan`: recover orphaned PTY process
 //! - `--as`: rebind session identity
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -86,10 +86,36 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let mut ctx = HcomContext::from_os();
     let presented_process_id = ctx.process_id.clone();
     ctx.trust_process_id(&db);
-    // The id the trust gate just refused. Only a reclaim that restores the
-    // target's verified anchor pid may bind it, re-checking trust after the
-    // restore (see start_rebind); nothing else ever sees it.
+    // Keep a refused id only for a reclaim behind the target's verified,
+    // owned anchor. Dropping a borrowed live OMP id must not turn this call
+    // into a fresh start or let its inherited name authorize a rebind.
     let refused_process_id = presented_process_id.filter(|_| ctx.process_id.is_none());
+    if let Some(process_id) = refused_process_id.as_deref()
+        && let Some(name) = db.get_process_binding(process_id)?
+        && let Some(row) = db.get_instance_full(&name)?
+        && row.tool == "omp"
+        && row.origin_device_id.as_deref().unwrap_or("").is_empty()
+    {
+        match omp_row_carriers(&db, &row)? {
+            crate::proctruth::CarrierVerdict::Orphaned(_) => {}
+            crate::proctruth::CarrierVerdict::Rooted { pid, .. } => {
+                bail!(
+                    "Refusing to start: the presented process id was refused and is bound to \
+                     local OMP instance '{}' with live root {pid}. No identity was changed. \
+                     Run from that instance's owning OMP session.",
+                    row.name
+                );
+            }
+            crate::proctruth::CarrierVerdict::Undetermined(why) => {
+                bail!(
+                    "Refusing to start: the presented process id was refused and ownership of \
+                     local OMP instance '{}' cannot be proved ({why}). No identity was changed. \
+                     Relaunch the OMP session before retrying.",
+                    row.name
+                );
+            }
+        }
+    }
     let verified_actor = claude_actor::resolve_env_actor(&db).map_err(anyhow::Error::new)?;
     if let (Some(actor), Some(name)) = (verified_actor.as_ref(), flags.name.as_deref()) {
         claude_actor::ensure_explicit_matches(&db, actor, name).map_err(anyhow::Error::new)?;
@@ -173,6 +199,62 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         .map(|actor| actor.name.as_str())
         .or(requested_name.as_deref());
     start_bare(&db, &hcom_dir, &ctx, effective_name)
+}
+
+/// Classify an OMP row without treating an unreadable binding registry as
+/// evidence that its prior owner is gone.
+fn omp_row_carriers(db: &HcomDb, row: &InstanceRow) -> Result<crate::proctruth::CarrierVerdict> {
+    let binding_ids = db.process_binding_ids(&row.name).with_context(|| {
+        format!(
+            "Refusing to reclaim '{}': its OMP process bindings could not be read",
+            row.name
+        )
+    })?;
+    Ok(crate::proctruth::classify_row_carriers(
+        db,
+        row,
+        &binding_ids,
+    ))
+}
+
+/// A raw name or inherited environment is not authority to replace an OMP
+/// row. Proven owners may rejoin even when their minted row has no pid.
+fn ensure_omp_rebind_owner(db: &HcomDb, row: &InstanceRow, process_id: Option<&str>) -> Result<()> {
+    if row.tool != "omp"
+        || row
+            .origin_device_id
+            .as_deref()
+            .is_some_and(|device| !device.is_empty())
+    {
+        return Ok(());
+    }
+    if let Some(process_id) = process_id
+        && db.get_process_binding(process_id)?.as_deref() == Some(row.name.as_str())
+        && crate::proctruth::trusted_process_id_for_omp(db, process_id)
+    {
+        return Ok(());
+    }
+    match omp_row_carriers(db, row)? {
+        crate::proctruth::CarrierVerdict::Orphaned(_) => Ok(()),
+        crate::proctruth::CarrierVerdict::Rooted { pid, .. } => {
+            if crate::proctruth::caller_owns_omp_anchor(pid) {
+                return Ok(());
+            }
+            bail!(
+                "Refusing to reclaim '{}': its live OMP root {pid} is not this caller's \
+                 nearest OMP owner. No identity was changed. Run from the owning OMP session; \
+                 if its anchor is an older wrapper, relaunch that session.",
+                row.name
+            );
+        }
+        crate::proctruth::CarrierVerdict::Undetermined(why) => {
+            bail!(
+                "Refusing to reclaim '{}': its OMP owner cannot be proved ({why}). \
+                 No identity was changed. Relaunch the OMP session before retrying.",
+                row.name
+            );
+        }
+    }
 }
 
 /// Resolve a live child row directly by agent_id (or by its exact row name).
@@ -483,6 +565,13 @@ fn start_rebind(
     // position, which would skip the target's unread messages.
     let mut last_event_id = target_meta.as_ref().map(|m| m.last_event_id);
     let target_data = db.get_instance_full(&target_name)?;
+    let presented_process_id = ctx.process_id.as_deref().or(refused_process_id);
+    if let Some(row) = target_data.as_ref() {
+        ensure_omp_rebind_owner(db, row, presented_process_id)?;
+    }
+    if let Some(row) = current_row.as_ref() {
+        ensure_omp_rebind_owner(db, row, presented_process_id)?;
+    }
 
     // Final fallback: use current max to avoid re-delivering old messages
     if last_event_id.is_none() {
@@ -515,6 +604,66 @@ fn start_rebind(
     // history, verified against the live process table. Both reads happen
     // before the deletions below rewrite the rows and bindings they consult.
     let anchor = match_reclaim_anchor(db, &target_name);
+    let target_is_omp = target_meta.as_ref().is_some_and(|meta| meta.tool == "omp")
+        || match &anchor {
+            Ok(matched) => matched.is_omp,
+            Err(miss) => miss.is_omp,
+        };
+    let historical_is_omp = target_is_omp
+        || match &anchor {
+            Ok(matched) => matched.stored_minted_omp,
+            Err(miss) => miss.stored_minted_omp,
+        };
+    if let Err(miss) = &anchor
+        && miss.read_error
+        && (target_data.is_none() || refused_process_id.is_some())
+    {
+        bail!(
+            "Refusing to reclaim '{target_name}': its stopped identity history could not \
+             be read ({}). No identity was changed. Resolve the history read error before \
+             retrying.",
+            miss.reason
+        );
+    }
+    // A full release removes the row and bindings, not the recorded OMP
+    // owner's authority. A missing/refused id or a different tool hint cannot
+    // bypass that owner. Present rows keep their existing ownership guard.
+    if target_data.is_none() && historical_is_omp {
+        let authorization = match &anchor {
+            Ok(matched) => matched.omp_authorization,
+            Err(miss) => miss.omp_authorization,
+        };
+        if let Err(reason) = authorization {
+            bail!(
+                "Refusing to reclaim '{target_name}': {reason}. No identity was changed. \
+                 Run from its owning OMP session, or wait until that owner has exited."
+            );
+        }
+    }
+    if let Ok(matched) = &anchor
+        && target_is_omp
+        && !crate::proctruth::caller_owns_omp_anchor(matched.pid)
+    {
+        bail!(
+            "Refusing to reclaim '{target_name}': its stopped OMP anchor {} is not this \
+             caller's nearest OMP owner. No identity was changed. An inherited id or an older \
+             wrapper anchor cannot prove ownership; relaunch the OMP session.",
+            matched.pid
+        );
+    }
+    if target_is_omp
+        && refused_process_id.is_some()
+        && let Err(miss) = &anchor
+    {
+        bail!(
+            "Refusing to reclaim '{target_name}': the presented process id was refused and \
+             no owned OMP anchor could be restored ({}). No identity was changed. \
+             Relaunch the OMP session. For an explicit reclaim of a stopped identity from \
+             a fresh shell carrying an old id, clear the stale HCOM_PROCESS_ID first; \
+             live-owner and spawn validation still apply.",
+            miss.reason
+        );
+    }
     // The refused id may ride on the restored anchor only when it is tied to
     // the same history: it must be the process id recorded on the very stop
     // event the anchor was verified from, and no binding may hold it for
@@ -839,6 +988,9 @@ struct ReclaimAnchor {
     event_id: i64,
     pid: u32,
     process_id: Option<String>,
+    is_omp: bool,
+    stored_minted_omp: bool,
+    omp_authorization: Result<(), &'static str>,
 }
 
 /// Why a reclaim restores no anchor pid; `event_id` is the snapshot
@@ -847,6 +999,10 @@ struct ReclaimAnchor {
 struct AnchorMiss {
     event_id: Option<i64>,
     reason: &'static str,
+    is_omp: bool,
+    stored_minted_omp: bool,
+    read_error: bool,
+    omp_authorization: Result<(), &'static str>,
 }
 
 /// Match `name`'s own newest `life.stopped` snapshot against the live
@@ -854,40 +1010,60 @@ struct AnchorMiss {
 /// pid must be a live ancestor of this process, still the incarnation the
 /// snapshot recorded (start time, boot id).
 fn match_reclaim_anchor(db: &HcomDb, name: &str) -> Result<ReclaimAnchor, AnchorMiss> {
-    use rusqlite::OptionalExtension;
-    let newest = db
-        .conn()
-        .query_row(
-            "SELECT id, data FROM events
-             WHERE type='life'
-               AND instance=?
-               AND json_extract(data, '$.action') = 'stopped'
-             ORDER BY id DESC LIMIT 1",
-            rusqlite::params![name],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional();
+    let newest = db.find_latest_stopped_event_by_name(name);
     let (event_id, data) = match newest {
         Ok(Some(newest)) => newest,
         Ok(None) => {
             return Err(AnchorMiss {
                 event_id: None,
                 reason: "no stop snapshot for this name",
+                is_omp: false,
+                stored_minted_omp: false,
+                read_error: false,
+                omp_authorization: Err("no stop snapshot for this name"),
             });
         }
         Err(_) => {
             return Err(AnchorMiss {
                 event_id: None,
                 reason: "stop snapshot unreadable",
+                is_omp: false,
+                stored_minted_omp: false,
+                read_error: true,
+                omp_authorization: Err("stop snapshot unreadable"),
             });
         }
     };
-    let data = serde_json::from_str::<serde_json::Value>(&data).unwrap_or_default();
+    let data = match serde_json::from_str::<serde_json::Value>(&data) {
+        Ok(data) => data,
+        Err(_) => {
+            return Err(AnchorMiss {
+                event_id: Some(event_id),
+                reason: "stop snapshot unreadable",
+                is_omp: false,
+                stored_minted_omp: false,
+                read_error: true,
+                omp_authorization: Err("stop snapshot unreadable"),
+            });
+        }
+    };
     let process_id = data
         .get("process_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     let snapshot = data.get("snapshot").cloned().unwrap_or_default();
+    let is_omp = snapshot.get("tool").and_then(serde_json::Value::as_str) == Some("omp");
+    let stored_minted_omp = process_id
+        .as_deref()
+        .and_then(crate::proctruth::omp_minted_pid)
+        .is_some_and(|pid| pid > 0);
+    let omp_authorization = crate::proctruth::authorize_historical_omp_reclaim(
+        &snapshot,
+        process_id.as_deref(),
+        &crate::proctruth::caller_owns_omp_anchor,
+        &crate::sys::process::is_definitely_dead,
+        &crate::sys::process::procfs_start_identity,
+    );
     crate::proctruth::verify_reclaim_anchor(
         &snapshot,
         &crate::proctruth::caller_ancestor_pids(),
@@ -897,10 +1073,17 @@ fn match_reclaim_anchor(db: &HcomDb, name: &str) -> Result<ReclaimAnchor, Anchor
         event_id,
         pid,
         process_id,
+        is_omp,
+        stored_minted_omp,
+        omp_authorization,
     })
     .map_err(|reason| AnchorMiss {
         event_id: Some(event_id),
         reason,
+        is_omp,
+        stored_minted_omp,
+        read_error: false,
+        omp_authorization,
     })
 }
 
@@ -2037,28 +2220,6 @@ mod tests {
         (h.finish() % 900000) as u32 + 100000
     }
 
-    /// A name-carrying orphan in a tree of its own: `sh` spawns it in the
-    /// background and exits, so the sleeper is reparented to init — its ppid
-    /// chain never passes through the test process. Not our child: kill it
-    /// with `libc::kill`.
-    #[cfg(unix)]
-    fn spawn_detached_named_sleeper(name: &str, process_id: &str) -> u32 {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 300 >/dev/null 2>&1 & echo $!")
-            .env("HCOM_INSTANCE_NAME", name)
-            .env("HCOM_PROCESS_ID", process_id)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .expect("spawn detached sleeper");
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .expect("detached sleeper pid")
-    }
-
     #[cfg(unix)]
     fn backdate_binding(db: &HcomDb, process_id: &str, updated_at: f64) {
         db.conn()
@@ -2085,7 +2246,10 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let orphan = spawn_detached_named_sleeper(&target, &format!("proc-old-{}", rand_suffix()));
+        let (orphan, _gate) = crate::proctruth::gated_fixtures::spawn_detached_named_sleeper(
+            &target,
+            &format!("proc-old-{}", rand_suffix()),
+        );
         wait_for_carrier(&target, orphan);
         let start = crate::proctruth::processes_for_instance(&target, &[], &[])
             .into_iter()
@@ -2121,9 +2285,6 @@ mod tests {
             binding,
             "refused rebind leaves the bindings alone"
         );
-        unsafe {
-            libc::kill(orphan as libc::pid_t, libc::SIGKILL);
-        }
     }
 
     /// A caller bound to a live identity: row with a delivery cursor, plus
@@ -2334,9 +2495,14 @@ mod tests {
     const SEAT_UUID: &str = "5a1e0c3d-7b2f-4e8a-9c1d-0f2e3a4b5c6d";
 
     #[cfg(target_os = "linux")]
-    fn stop_snapshot_for(pid: u32, start_time: u64, boot_id: &str) -> serde_json::Value {
+    fn stop_snapshot_for(
+        tool: &str,
+        pid: u32,
+        start_time: u64,
+        boot_id: &str,
+    ) -> serde_json::Value {
         json!({
-            "tool": "omp",
+            "tool": tool,
             "directory": "/tmp/project",
             "last_event_id": 0,
             "pid": pid,
@@ -2345,11 +2511,15 @@ mod tests {
         })
     }
 
-    /// A launcher seat whose row was lost reclaims its own name from inside
-    /// itself: the trust gate refuses its launcher id first, exactly as in
-    /// `run`. Returns the exit code and the stop snapshot's event id.
+    /// A launcher seat whose row was lost attempts to reclaim its name.
+    /// The trust gate refuses its launcher id first, exactly as in `run`.
+    /// Returns the reclaim result and the stop snapshot's event id.
     #[cfg(target_os = "linux")]
-    fn lost_seat_reclaim(db: &HcomDb, target: &str, snapshot: serde_json::Value) -> (i32, i64) {
+    fn lost_seat_reclaim(
+        db: &HcomDb,
+        target: &str,
+        snapshot: serde_json::Value,
+    ) -> (Result<i32>, i64) {
         lost_seat_reclaim_recorded(db, target, snapshot, SEAT_UUID)
     }
 
@@ -2361,7 +2531,12 @@ mod tests {
         target: &str,
         snapshot: serde_json::Value,
         recorded_id: &str,
-    ) -> (i32, i64) {
+    ) -> (Result<i32>, i64) {
+        let tool_env = match snapshot.get("tool").and_then(serde_json::Value::as_str) {
+            Some("omp") => ("OMPCODE", "1"),
+            Some("claude") => ("CLAUDECODE", "1"),
+            tool => panic!("unexpected test tool: {tool:?}"),
+        };
         let event_id = db
             .log_event(
                 "life",
@@ -2375,17 +2550,14 @@ mod tests {
                 }),
             )
             .unwrap();
-        let mut ctx = make_ctx(
-            &[("OMPCODE", "1"), ("HCOM_PROCESS_ID", SEAT_UUID)],
-            "/tmp/project",
-        );
+        let mut ctx = make_ctx(&[tool_env, ("HCOM_PROCESS_ID", SEAT_UUID)], "/tmp/project");
         let presented = ctx.process_id.clone();
         ctx.trust_process_id(db);
         assert!(
             ctx.process_id.is_none(),
             "the lost seat's id starts refused"
         );
-        let code = start_rebind(db, target, &ctx, None, presented.as_deref()).unwrap();
+        let code = start_rebind(db, target, &ctx, None, presented.as_deref());
         (code, event_id)
     }
 
@@ -2413,17 +2585,46 @@ mod tests {
         unsafe { libc::getppid() as u32 }
     }
 
-    /// No anchor restored: the row stays pid-less, the refused id stays
-    /// unbound and untrusted, and the life event says why.
+    /// A refused OMP identity cannot fall back to an unbound recreated row.
     #[cfg(target_os = "linux")]
-    fn assert_reclaimed_without_anchor(db: &HcomDb, target: &str, event_id: i64, why: &str) {
+    fn assert_refused_omp_reclaim(db: &HcomDb, target: &str, event_id: i64, result: Result<i32>) {
+        result.expect_err("a refused OMP identity needs an owned anchor before any writes");
+        assert!(db.get_instance_full(target).unwrap().is_none());
+        assert_eq!(db.get_process_binding(SEAT_UUID).unwrap(), None);
+        assert!(!crate::proctruth::trusted_process_id_for_omp(db, SEAT_UUID));
+        let history: (i64, Option<i64>) = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*), MAX(id) FROM events WHERE type = 'life' AND instance = ?",
+                params![target],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            history,
+            (1, Some(event_id)),
+            "no reclaim life event was written"
+        );
+    }
+
+    /// Generic non-OMP reclaim still recreates the identity without trusting
+    /// a launcher id when the stopped process's incarnation cannot be proved.
+    #[cfg(target_os = "linux")]
+    fn assert_reclaimed_without_anchor(
+        db: &HcomDb,
+        target: &str,
+        event_id: i64,
+        result: Result<i32>,
+        why: &str,
+    ) {
+        assert_eq!(result.unwrap(), 0);
         let row = db
             .get_instance_full(target)
             .unwrap()
             .expect("reclaimed row");
-        assert_eq!(row.pid, None, "no verified anchor, no pid");
+        assert_eq!(row.pid, None);
         assert_eq!(db.get_process_binding(SEAT_UUID).unwrap(), None);
-        assert!(!crate::proctruth::trusted_process_id_for_omp(db, SEAT_UUID));
+        assert!(!crate::proctruth::trusted_process_id(db, SEAT_UUID));
         let record = reclaim_anchor_record(db, target);
         assert_eq!(record["restored"], false);
         assert_eq!(record["snapshot_event_id"], event_id);
@@ -2431,9 +2632,8 @@ mod tests {
         assert!(reason.contains(why), "reason {reason:?} lacks {why:?}");
     }
 
-    /// valo's case: the snapshot's pid is a live ancestor, still the recorded
-    /// incarnation, so the reclaim restores it, binds the refused launcher
-    /// id behind it, and the trust gate then accepts that id.
+    /// Non-OMP tools retain generic incarnation-checked ancestor restoration.
+    /// Unlike an OMP owner, their anchor may be an ordinary wrapper process.
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
@@ -2447,10 +2647,10 @@ mod tests {
         let (code, event_id) = lost_seat_reclaim(
             &db,
             &target,
-            stop_snapshot_for(anchor, start_time, &boot_id),
+            stop_snapshot_for("claude", anchor, start_time, &boot_id),
         );
 
-        assert_eq!(code, 0);
+        assert_eq!(code.unwrap(), 0);
         let row = db
             .get_instance_full(&target)
             .unwrap()
@@ -2462,7 +2662,7 @@ mod tests {
             Some(target.as_str())
         );
         assert!(
-            crate::proctruth::trusted_process_id_for_omp(&db, SEAT_UUID),
+            crate::proctruth::trusted_process_id(&db, SEAT_UUID),
             "the restored anchor proves the launcher id"
         );
         let record = reclaim_anchor_record(&db, &target);
@@ -2471,8 +2671,88 @@ mod tests {
         assert_eq!(record["pid"], anchor);
     }
 
-    /// The refused id is another pid-less seat's binding: the anchor still
-    /// restores for the target, but that seat keeps its binding and row.
+    /// A live ancestor with the right incarnation is still not an OMP owner
+    /// when it is an old wrapper rather than the OMP process itself.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_refuses_non_omp_wrapper_anchor() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_wrapper_{}", std::process::id());
+        let anchor = std::process::id();
+        let (start_time, boot_id) = crate::sys::process::procfs_start_identity(anchor).unwrap();
+        let (result, event_id) = lost_seat_reclaim(
+            &db,
+            &target,
+            stop_snapshot_for("omp", anchor, start_time, &boot_id),
+        );
+
+        assert_refused_omp_reclaim(&db, &target, event_id, result);
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_refuses_omp_identity_without_owned_anchor() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_missing_{}", std::process::id());
+        let (result, event_id) = lost_seat_reclaim(
+            &db,
+            &target,
+            json!({
+                "tool": "omp",
+                "directory": "/tmp/project",
+                "last_event_id": 0,
+            }),
+        );
+
+        assert_refused_omp_reclaim(&db, &target, event_id, result);
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_reclaim_refuses_unreadable_history_despite_non_omp_tool_claim() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let target = format!("anchor_unreadable_{}", std::process::id());
+        let event_id = db
+            .log_event(
+                "life",
+                &target,
+                &json!({
+                    "action": "stopped",
+                    "process_id": SEAT_UUID,
+                    "snapshot": {
+                        "tool": "omp",
+                        "directory": "/tmp/project",
+                        "last_event_id": 0,
+                    },
+                }),
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE events SET data = '{' WHERE id = ?",
+                params![event_id],
+            )
+            .unwrap();
+        for refused_id in [None, Some(SEAT_UUID)] {
+            let mut ctx = make_claude_ctx(None, "/tmp/project");
+            ctx.process_id = refused_id.map(str::to_string);
+            ctx.trust_process_id(&db);
+            assert!(ctx.process_id.is_none());
+
+            let result = start_rebind(&db, &target, &ctx, None, refused_id);
+
+            assert_refused_omp_reclaim(&db, &target, event_id, result);
+        }
+    }
+
+    /// A non-OMP reclaim may restore its wrapper anchor, but another seat
+    /// keeps its refused process id's binding and row.
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
@@ -2488,10 +2768,10 @@ mod tests {
         let (code, _) = lost_seat_reclaim(
             &db,
             &target,
-            stop_snapshot_for(anchor, start_time, &boot_id),
+            stop_snapshot_for("claude", anchor, start_time, &boot_id),
         );
 
-        assert_eq!(code, 0);
+        assert_eq!(code.unwrap(), 0);
         assert_eq!(
             db.get_process_binding(SEAT_UUID).unwrap().as_deref(),
             Some(other.as_str()),
@@ -2524,11 +2804,11 @@ mod tests {
         let (code, _) = lost_seat_reclaim_recorded(
             &db,
             &target,
-            stop_snapshot_for(anchor, start_time, &boot_id),
+            stop_snapshot_for("claude", anchor, start_time, &boot_id),
             "0badc0de-0000-4000-8000-000000000000",
         );
 
-        assert_eq!(code, 0);
+        assert_eq!(code.unwrap(), 0);
         assert_eq!(db.get_process_binding(SEAT_UUID).unwrap(), None);
         assert!(!crate::proctruth::trusted_process_id_for_omp(
             &db, SEAT_UUID
@@ -2538,6 +2818,7 @@ mod tests {
     /// Two reclaims of one name race: A recreates the row after B cleared
     /// it, before B recreates it. B must neither write its anchor onto A's
     /// row nor bind onto it; it refuses, and A's own restore still lands.
+    /// This generic non-OMP fixture may use a wrapper rather than an OMP owner.
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
@@ -2564,13 +2845,13 @@ mod tests {
         let (code, _) = lost_seat_reclaim(
             &db,
             &target,
-            stop_snapshot_for(anchor, start_time, &boot_id),
+            stop_snapshot_for("claude", anchor, start_time, &boot_id),
         );
         REBIND_CREATE_GAP_HOOK.with(|hook| hook.set(None));
 
         let row = db.get_instance_full(&target).unwrap().expect("A's row");
         assert_eq!(row.pid, None, "B wrote its anchor onto A's row");
-        assert_eq!(code, 1, "the reclaim that lost the race refuses");
+        assert_eq!(code.unwrap(), 1, "the reclaim that lost the race refuses");
         assert_eq!(db.get_process_binding(SEAT_UUID).unwrap(), None);
         // A's own restore still finds the row pid-less and lands its pid.
         let a_pid = std::process::id();
@@ -2593,11 +2874,10 @@ mod tests {
         let (code, event_id) = lost_seat_reclaim(
             &db,
             &target,
-            stop_snapshot_for(anchor, start_time + 1, &boot_id),
+            stop_snapshot_for("claude", anchor, start_time + 1, &boot_id),
         );
 
-        assert_eq!(code, 0, "the reclaim still binds, without a pid");
-        assert_reclaimed_without_anchor(&db, &target, event_id, "start time");
+        assert_reclaimed_without_anchor(&db, &target, event_id, code, "start time");
     }
 
     /// A start time recorded on another boot says nothing about this one.
@@ -2614,11 +2894,15 @@ mod tests {
         let (code, event_id) = lost_seat_reclaim(
             &db,
             &target,
-            stop_snapshot_for(anchor, start_time, "00000000-0000-0000-0000-000000000000"),
+            stop_snapshot_for(
+                "claude",
+                anchor,
+                start_time,
+                "00000000-0000-0000-0000-000000000000",
+            ),
         );
 
-        assert_eq!(code, 0);
-        assert_reclaimed_without_anchor(&db, &target, event_id, "boot id");
+        assert_reclaimed_without_anchor(&db, &target, event_id, code, "boot id");
     }
 
     /// A live process with the exact recorded identity that is not above the
@@ -2640,13 +2924,12 @@ mod tests {
         let (code, event_id) = lost_seat_reclaim(
             &db,
             &target,
-            stop_snapshot_for(sibling.id(), start_time, &boot_id),
+            stop_snapshot_for("claude", sibling.id(), start_time, &boot_id),
         );
         sibling.kill().ok();
         sibling.wait().ok();
 
-        assert_eq!(code, 0);
-        assert_reclaimed_without_anchor(&db, &target, event_id, "not a live ancestor");
+        assert_reclaimed_without_anchor(&db, &target, event_id, code, "not a live ancestor");
     }
 
     /// A snapshot written before stops recorded the anchor's incarnation
@@ -2663,15 +2946,14 @@ mod tests {
             &db,
             &target,
             json!({
-                "tool": "omp",
+                "tool": "claude",
                 "directory": "/tmp/project",
                 "last_event_id": 0,
                 "pid": parent_pid(),
             }),
         );
 
-        assert_eq!(code, 0);
-        assert_reclaimed_without_anchor(&db, &target, event_id, "predates");
+        assert_reclaimed_without_anchor(&db, &target, event_id, code, "predates");
     }
 
     /// The rename stop records the renamed-away row's anchor incarnation.
@@ -2792,7 +3074,34 @@ mod tests {
         let target = format!("valo_third_{}", std::process::id());
         let third = format!("meme_third_{}", std::process::id());
         let process_id = format!("omp-third-{}", std::process::id());
-        log_stopped_snapshot(&db, &target, "omp", "/tmp/project", "sess-third", 3);
+        // The target's last owner has exited and been reaped: the released
+        // OMP history authorizes a reclaim, so the third-seat guard decides.
+        let dead_owner_pid = {
+            let mut old_owner = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--list")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = old_owner.id();
+            assert!(old_owner.wait().unwrap().success());
+            pid
+        };
+        db.log_life_event(
+            &target,
+            "stopped",
+            "cli",
+            "vanished",
+            Some(json!({
+                "tool": "omp",
+                "directory": "/tmp/project",
+                "session_id": "sess-third",
+                "last_event_id": 3,
+                "pid": dead_owner_pid,
+            })),
+            None,
+        )
+        .unwrap();
         // A plain seat binds its process with no session id, so nothing in the
         // reclaim resolves to the third seat as the caller's own identity.
         db.conn()
@@ -2811,11 +3120,11 @@ mod tests {
         );
         let err = start_rebind(&db, &target, &ctx, None, None)
             .expect_err("a process bound to another live seat is not the caller's to rebind");
-
         assert!(
             err.to_string().contains(&third),
             "the refusal names the seat that holds the process: {err}"
         );
+
         assert_eq!(
             db.get_process_binding(&process_id).unwrap().as_deref(),
             Some(third.as_str()),

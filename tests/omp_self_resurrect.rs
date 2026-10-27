@@ -26,7 +26,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
-use support::{Hcom, unique_suffix};
+use support::{Hcom, child_identity, terminate_owned_child_group, unique_suffix};
 
 use serde_json::{Value, json};
 
@@ -51,7 +51,9 @@ bound_name() { sed -n 's/.*"name":"\([^"]*\)".*/\1/p' start.json; }
 rejoin_as() {
     local name
     name=$(bound_name)
-    (cd "$TEST_CWD" && H start --as "$name")
+    (cd "$TEST_CWD" &&
+        HCOM_PROCESS_ID="omp-$$-1-1" HCOM_LAUNCHED=1 HCOM_TOOL=omp \
+        exec "$TEST_BIN" start --as "$name")
 }
 on_term() {
     step exit-stop H omp-stop --name "$(bound_name)" --reason shutdown
@@ -72,9 +74,19 @@ while :; do
 done
 "#;
 
+/// Owns the fake omp's direct child and its birth identity, recorded before
+/// anything can reap it. The group is signalled only through
+/// `terminate_owned_child_group`, on `kill` and on the unwind path.
 struct FakeOmp {
     child: Child,
+    identity: Option<String>,
     out_dir: PathBuf,
+}
+
+impl Drop for FakeOmp {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 impl FakeOmp {
@@ -121,11 +133,10 @@ impl FakeOmp {
         )
     }
 
+    /// SIGKILL the group this still-owned leader heads (spawned with
+    /// `process_group(0)`), then reap it. A no-op once the leader is reaped.
     fn kill(&mut self) {
-        unsafe {
-            libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
-        }
-        let _ = self.child.wait();
+        terminate_owned_child_group(&mut self.child, self.identity.as_deref());
     }
 }
 
@@ -151,8 +162,12 @@ fn spawn_fake_omp(h: &Hcom, tag: &str, session_id: &str) -> FakeOmp {
         .process_group(0)
         .spawn()
         .unwrap_or_else(|e| panic!("spawn fake omp {tag}: {e}"));
-    h.track_cleanup_pid(child.id() as i64);
-    FakeOmp { child, out_dir }
+    let identity = child_identity(&child);
+    FakeOmp {
+        child,
+        identity,
+        out_dir,
+    }
 }
 
 fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
