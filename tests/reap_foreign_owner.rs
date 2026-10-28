@@ -43,19 +43,23 @@ fn environ_carries(pid: u32, entry: &str) -> bool {
         .is_some_and(|env| env.split(|byte| *byte == 0).any(|var| var == marker))
 }
 
-fn wait_for_child_pid(path: &Path) -> u32 {
+fn wait_for_child_pid(path: &Path, process_id: &str) -> u32 {
+    // The parent publishes $! before exec installs the child's environment.
+    // A live pid alone is not readiness for the identity assertions below.
+    let marker = format!("HCOM_PROCESS_ID={process_id}");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(pid) = fs::read_to_string(path)
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok())
             && live(pid)
+            && environ_carries(pid, &marker)
         {
             return pid;
         }
         assert!(
             Instant::now() < deadline,
-            "fixture child never reported a live pid"
+            "fixture child never reported a live pid with the expected process identity"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -92,7 +96,7 @@ fn spawn_minted_omp_seat(h: &Hcom, id_suffix: &str) -> Seat {
         .spawn()
         .expect("spawn minted omp seat");
     let process_id = format!("omp-{}-{id_suffix}", owner.id());
-    let inside = wait_for_child_pid(&child_pid_file);
+    let inside = wait_for_child_pid(&child_pid_file, &process_id);
     assert_eq!(parent_pid(inside), Some(owner.id()));
     assert_eq!(
         fs::read_to_string(format!("/proc/{}/comm", owner.id()))
@@ -325,7 +329,7 @@ fn stop_refuses_a_carrier_carrying_another_live_rows_process_id() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the stopped row's owner shell");
-    let inside = wait_for_child_pid(&child_pid_file);
+    let inside = wait_for_child_pid(&child_pid_file, &seat_process_id);
     assert_eq!(parent_pid(inside), Some(owner.id()));
     let mut carriers = Carriers {
         owner,
