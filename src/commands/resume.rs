@@ -4450,24 +4450,16 @@ mod tests {
     }
 
     /// Point claude_config_dir() at `dir` for the duration of `f` by setting
-    /// CLAUDE_CONFIG_DIR. Restored on exit. serial_test required.
+    /// CLAUDE_CONFIG_DIR. The shared environment guard restores it on exit.
     fn with_claude_config_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        // SAFETY: tests using this must be serial_test::serial — only one
-        // test at a time touches this env var.
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe {
             std::env::set_var("CLAUDE_CONFIG_DIR", dir);
         }
-        let out = f();
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", v) },
-            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
-        }
-        out
+        f()
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_resolve_claude_thread_name_prefers_last_custom_title() {
         // A session renamed A → B → C must match for C (the current title),
         // not A or B (obsolete).
@@ -4498,7 +4490,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_resolve_claude_thread_name_bails_on_within_tool_duplicate() {
         // Two distinct sessions both currently have customTitle="dup" — must
         // bail rather than silently pick by mtime.
@@ -4854,12 +4845,12 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_extract_cwd_gemini_reverse_hash_lookup() {
         // Gemini writes sha256(cwd) as `projectHash` in the session JSON, and
         // stores cwd → short-id in ~/.gemini/projects.json. This test wires up
         // a fake GEMINI_CLI_HOME and confirms the reverse lookup.
         use sha2::{Digest, Sha256};
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         let base_dir = tempfile::tempdir().unwrap();
         let base = base_dir.path();
         let gemini = base.join(".gemini");
@@ -4887,17 +4878,10 @@ mod tests {
         std::fs::write(&session_path, format!(r#"{{"projectHash":"{hex}"}}"#)).unwrap();
 
         // Stub GEMINI_CLI_HOME so recover_gemini_cwd reads from our fake tree.
-        let prev = std::env::var("GEMINI_CLI_HOME").ok();
-        // SAFETY: test is single-threaded enough for this module; serial_test
-        // isn't in scope here, but other tests don't touch GEMINI_CLI_HOME.
         unsafe {
             std::env::set_var("GEMINI_CLI_HOME", base);
         }
         let result = extract_cwd_from_transcript(session_path.to_str().unwrap(), "gemini");
-        match prev {
-            Some(v) => unsafe { std::env::set_var("GEMINI_CLI_HOME", v) },
-            None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
-        }
 
         assert_eq!(result, Some(fake_cwd.to_string()));
     }
@@ -4958,24 +4942,19 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn test_extract_cwd_gemini_no_registry_returns_none() {
         // When projects.json is missing, we can't reverse the hash → return None.
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         let base_dir = tempfile::tempdir().unwrap();
         let base = base_dir.path();
         let gemini = base.join(".gemini/tmp/x/chats");
         std::fs::create_dir_all(&gemini).unwrap();
         let path = gemini.join("test.json");
         std::fs::write(&path, r#"{"projectHash":"deadbeef"}"#).unwrap();
-        let prev = std::env::var("GEMINI_CLI_HOME").ok();
         unsafe {
             std::env::set_var("GEMINI_CLI_HOME", base);
         }
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "gemini");
-        match prev {
-            Some(v) => unsafe { std::env::set_var("GEMINI_CLI_HOME", v) },
-            None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
-        }
         assert_eq!(result, None);
     }
     #[cfg(unix)]
@@ -6152,7 +6131,7 @@ mod tests {
         // resumed omp runs in: for A, its snapshot's directory. A's file lives
         // only under `<A's directory>/agent`, so the earlier-session check
         // must resolve the root there, as the resume of A will.
-        with_omp_home(|_| {
+        with_omp_home(|home| {
             let seats = seat_dir();
             let (db, a_dir, _) = poisoned_seat_db(seats.path(), false, OMP_MISSING_SID);
             // config.toml first: a config load with none rewrites the env file.
@@ -6174,13 +6153,62 @@ mod tests {
                 .err()
                 .expect("resume of a dead newest snapshot must fail")
                 .to_string();
-            assert_eq!(
-                err,
-                format!(
-                    "session file not found: {OMP_MISSING_SID}; earlier session \
-                     {OMP_EARLIER_SID} is resumable: hcom r lave --restore-earlier"
-                )
+            let expected = format!(
+                "session file not found: {OMP_MISSING_SID}; earlier session \
+                 {OMP_EARLIER_SID} is resumable: hcom r lave --restore-earlier"
             );
+            if err != expected {
+                let env = resume_child_env(&Default::default(), false);
+                let mut names: Vec<_> = env.keys().collect();
+                names.sort_unstable();
+                let path_values: std::collections::BTreeMap<_, _> = env
+                    .iter()
+                    .filter(|(key, _)| {
+                        matches!(key.as_str(), "HOME" | "HCOM_DIR")
+                            || key.starts_with("PI_")
+                            || key.starts_with("XDG_")
+                            || crate::hooks::test_helpers::TOOL_HOME_ENV_VARS
+                                .contains(&key.as_str())
+                    })
+                    .map(|(key, value)| {
+                        let safe_value = if key == "OPENCODE_CONFIG_CONTENT"
+                            || (key.starts_with("PI_")
+                                && !crate::hooks::test_helpers::TOOL_HOME_ENV_VARS
+                                    .contains(&key.as_str()))
+                        {
+                            "<redacted non-path value>"
+                        } else {
+                            value.as_str()
+                        };
+                        (key, safe_value)
+                    })
+                    .collect();
+                let roots =
+                    resume_working_dir(None, false, &a_dir, true, Some("lave")).map(|(cwd, _)| {
+                        crate::transcript::omp_session_roots_for_env(
+                            &env,
+                            std::path::Path::new(&cwd),
+                        )
+                    });
+                let fixture = crate::config::load_env_extras(&home.join(".hcom/env"));
+                let mut fixture_names: Vec<_> = fixture.keys().collect();
+                fixture_names.sort_unstable();
+                let fixture_pi: std::collections::BTreeMap<_, _> = fixture
+                    .iter()
+                    .filter(|(key, _)| {
+                        key.starts_with("PI_")
+                            && crate::hooks::test_helpers::TOOL_HOME_ENV_VARS
+                                .contains(&key.as_str())
+                    })
+                    .collect();
+                eprintln!(
+                    "child env names: {names:?}\nchild path overrides: {path_values:?}\n\
+                     resolved session roots: {roots:?}\nfixture env names: {fixture_names:?}\n\
+                     fixture PI paths: {fixture_pi:?}\nprocess cwd: {:?}",
+                    std::env::current_dir()
+                );
+            }
+            assert_eq!(err, expected);
             let (_, plan) =
                 resolve_restore_earlier_plan(&db, "lave", &[], &GlobalFlags::default(), false)
                     .unwrap();

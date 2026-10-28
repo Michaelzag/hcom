@@ -38,7 +38,7 @@ pub mod test_helpers {
     }
 
     // Keep saving, clearing, and sentinel coverage tied to the same overrides.
-    const TOOL_HOME_ENV_VARS: &[&str] = &[
+    pub(crate) const TOOL_HOME_ENV_VARS: &[&str] = &[
         "CLAUDE_CONFIG_DIR",
         "GEMINI_CLI_HOME",
         "CODEX_HOME",
