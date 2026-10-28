@@ -3386,8 +3386,10 @@ mod tests {
     }
 
     #[test]
+    // serial protects shared detection vars; EnvGuard protects the PI tool home.
     #[serial]
     fn test_build_launch_env_strips_closed_categories() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
         unsafe { std::env::set_var("HCOM_PROCESS_ID", "pid-stale") }
         unsafe { std::env::set_var("CLAUDECODE", "1") }
         unsafe { std::env::set_var("CODEX_THREAD_ID", "thread-stale") }
@@ -3409,7 +3411,6 @@ mod tests {
         unsafe { std::env::remove_var("HCOM_PROCESS_ID") }
         unsafe { std::env::remove_var("CLAUDECODE") }
         unsafe { std::env::remove_var("CODEX_THREAD_ID") }
-        unsafe { std::env::remove_var("PI_CODING_AGENT_DIR") }
         unsafe { std::env::remove_var("KITTY_WINDOW_ID") }
     }
 

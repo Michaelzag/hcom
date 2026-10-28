@@ -178,10 +178,8 @@ mod escape_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use crate::hooks::test_helpers::EnvGuard;
-    use serial_test::serial;
 
     #[test]
-    #[serial]
     fn tool_config_root_uses_home_when_hcom_dir_has_no_parent() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -197,7 +195,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn tool_config_root_uses_parent_of_resolved_hcom_dir() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -223,7 +220,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn user_home_prefers_home_env_when_set() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -238,7 +234,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn user_home_falls_through_when_home_env_empty() {
         let _guard = EnvGuard::new();
 
@@ -252,7 +247,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn user_config_home_prefers_xdg_config_home_when_set() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -267,7 +261,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn user_config_home_empty_xdg_falls_back_to_dot_config() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -284,33 +277,7 @@ mod tests {
         assert_eq!(super::user_config_home(), Some(home.join(".config")));
     }
 
-    /// RAII guard for XDG_DATA_HOME, which crate::hooks::test_helpers::EnvGuard
-    /// does not track.
-    struct XdgDataHomeGuard(Option<String>);
-
-    impl XdgDataHomeGuard {
-        fn set(value: &str) -> Self {
-            let saved = std::env::var("XDG_DATA_HOME").ok();
-            unsafe {
-                std::env::set_var("XDG_DATA_HOME", value);
-            }
-            Self(saved)
-        }
-    }
-
-    impl Drop for XdgDataHomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                    None => std::env::remove_var("XDG_DATA_HOME"),
-                }
-            }
-        }
-    }
-
     #[test]
-    #[serial]
     fn opencode_family_data_dir_prefers_xdg_data_home_when_it_exists() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -324,7 +291,7 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        let _xdg_guard = XdgDataHomeGuard::set(xdg_data.to_str().unwrap());
+        unsafe { std::env::set_var("XDG_DATA_HOME", &xdg_data) };
 
         // XDG_DATA_HOME wins even though ~/.local/share/opencode also exists.
         assert_eq!(
@@ -334,7 +301,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn opencode_family_data_dir_trusts_nonexistent_xdg_candidate() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -349,7 +315,7 @@ mod tests {
         // exist on disk yet. An explicit override must win unconditionally
         // rather than falling back to a stale ~/.local/share/opencode.
         let xdg_data_missing = temp.path().join("xdg-data-missing");
-        let _xdg_guard = XdgDataHomeGuard::set(xdg_data_missing.to_str().unwrap());
+        unsafe { std::env::set_var("XDG_DATA_HOME", &xdg_data_missing) };
 
         assert_eq!(
             super::opencode_family_data_dir("opencode"),
@@ -358,7 +324,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn opencode_family_data_dir_empty_xdg_falls_back_to_local_share() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -369,7 +334,7 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        let _xdg_guard = XdgDataHomeGuard::set("");
+        unsafe { std::env::set_var("XDG_DATA_HOME", "") };
 
         // Empty XDG_DATA_HOME is treated as unset (no candidate added for it).
         assert_eq!(
@@ -379,7 +344,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn opencode_family_data_dir_returns_local_share_even_when_it_does_not_exist() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -389,7 +353,7 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &home);
         }
-        let _xdg_guard = XdgDataHomeGuard::set("");
+        unsafe { std::env::set_var("XDG_DATA_HOME", "") };
 
         // ~/.local/share/opencode doesn't exist under this isolated HOME, but
         // it's still the only non-override candidate (OpenCode/Kilo never use

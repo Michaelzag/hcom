@@ -645,12 +645,6 @@ mod tests {
             unsafe { std::env::set_var(key, value) };
             Self { key, original }
         }
-
-        fn remove(key: &'static str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe { std::env::remove_var(key) };
-            Self { key, original }
-        }
     }
 
     impl Drop for EnvGuard {
@@ -788,10 +782,10 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_ensure_codex_home_writable_probes_existing_dir() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
 
         ensure_codex_home_writable().unwrap();
 
@@ -799,11 +793,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_ensure_codex_home_writable_skips_missing_explicit_home() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let codex_home = dir.path().join("missing-codex-home");
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", &codex_home) };
 
         ensure_codex_home_writable().unwrap();
 
@@ -812,13 +806,13 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_ensure_codex_home_writable_probes_parent_when_default_home_missing() {
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir(&home).unwrap();
-        let _codex_home_guard = EnvGuard::remove("CODEX_HOME");
-        let _home_guard = EnvGuard::set("HOME", home.to_string_lossy().as_ref());
+        unsafe { std::env::remove_var("CODEX_HOME") };
+        unsafe { std::env::set_var("HOME", &home) };
 
         ensure_codex_home_writable().unwrap();
 
@@ -834,11 +828,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_add_hook_trust_bypass_supported() {
-        let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         let workspace = clean_workspace();
         let args = s(&["-m", "o3"]);
         let result = bypass_args(&args, workspace.path());
@@ -853,12 +847,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_add_hook_trust_bypass_skips_when_hcom_hooks_trusted() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         let workspace = clean_workspace();
 
@@ -868,12 +861,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_add_hook_trust_bypass_self_heals_version_mismatch() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         let workspace = clean_workspace();
         stale_hcom_codex_hook_trust(dir.path());
@@ -902,12 +894,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_add_hook_trust_bypass_self_heals_stale_trusted_hash() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         let workspace = clean_workspace();
         let config_path = dir.path().join("config.toml");
@@ -925,12 +916,12 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_add_hook_trust_bypass_falls_back_when_self_heal_fails() {
-        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let _hooks_guard = EnvGuard::set("HCOM_TEST_CODEX_HOOKS_LIST_JSON", "__fail__");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         let workspace = clean_workspace();
 
         let args = s(&["-m", "o3"]);
@@ -944,12 +935,11 @@ mod tests {
     /// turns every launch on such a machine into a bypass decision the user is
     /// warned about and that was never needed.
     #[test]
-    #[serial]
     fn test_no_bypass_when_hooks_list_fails_but_trust_state_is_exact() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         // Only now: setup itself needs a working hooks/list to write trust state.
         let _hooks_guard = EnvGuard::set("HCOM_TEST_CODEX_HOOKS_LIST_JSON", "__fail__");
@@ -963,9 +953,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_add_hook_trust_bypass_no_duplicate_when_user_supplied() {
-        let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let workspace = clean_workspace();
         let args = s(&[BYPASS_HOOK_TRUST_FLAG, "-m", "o3"]);
         let result = bypass_args(&args, workspace.path());
@@ -979,9 +969,9 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_add_hook_trust_bypass_unsupported() {
-        let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.130.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.130.0") };
         let workspace = clean_workspace();
         let args = s(&["-m", "o3"]);
         let result = bypass_args(&args, workspace.path());
@@ -989,11 +979,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_add_hook_trust_bypass_keeps_resume_session_first() {
-        let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         let workspace = clean_workspace();
         let args = s(&["resume", "thread-1", "--model", "gpt-5"]);
         let result = bypass_args(&args, workspace.path());
@@ -1007,11 +997,11 @@ mod tests {
     /// B1: Codex answered hooks/list and every enabled untrusted hook is hcom's,
     /// so the invocation-wide flag unlocks nothing else.
     #[test]
-    #[serial]
     fn test_bypass_granted_when_only_hcom_hooks_are_untrusted() {
-        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         let workspace = clean_workspace();
         // An already-trusted third-party hook is not unlocked by the flag.
         let _hooks_guard = EnvGuard::set(
@@ -1035,11 +1025,11 @@ mod tests {
     /// B1: a foreign hook living in hcom's *own* hooks.json — the real-world
     /// shape, since hcom merges its entries into whatever file is already there.
     #[test]
-    #[serial]
     fn test_bypass_withheld_for_foreign_untrusted_hook_in_hcom_hooks_json() {
-        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         let workspace = clean_workspace();
         let hooks_path = crate::hooks::codex::get_codex_hooks_path();
         let _hooks_guard = EnvGuard::set(
@@ -1065,11 +1055,11 @@ mod tests {
 
     /// B1: an unrelated project hook must not be unlocked either.
     #[test]
-    #[serial]
     fn test_bypass_withheld_for_foreign_untrusted_project_hook() {
-        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         let workspace = clean_workspace();
         let _hooks_guard = EnvGuard::set(
             "HCOM_TEST_CODEX_HOOKS_LIST_JSON",
@@ -1095,11 +1085,11 @@ mod tests {
     /// B1: a project hook that impersonates an hcom command string is still
     /// foreign — command equality is not identity.
     #[test]
-    #[serial]
     fn test_bypass_withheld_for_project_hook_impersonating_hcom_command() {
-        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         let workspace = clean_workspace();
         let impersonated = crate::hooks::codex::test_expected_hook_specs()[0].1.clone();
         let _hooks_guard = EnvGuard::set(
@@ -1124,12 +1114,11 @@ mod tests {
     /// B2: hooks/list unavailable and only hcom's own hooks exist on disk, so the
     /// bypass is granted — but hcom's workspace-trust injection is suppressed.
     #[test]
-    #[serial]
     fn test_local_scan_bypass_suppresses_workspace_trust() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         stale_hcom_codex_hook_trust(dir.path());
         // Set only after setup, which needs the synthesized hook list to succeed.
@@ -1148,12 +1137,11 @@ mod tests {
     /// B2: a foreign hook definition on disk in the launch dir's own project
     /// layer withholds the bypass.
     #[test]
-    #[serial]
     fn test_local_scan_withholds_bypass_for_project_hook_definition() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         stale_hcom_codex_hook_trust(dir.path());
         // Set only after setup, which needs the synthesized hook list to succeed.
@@ -1169,12 +1157,11 @@ mod tests {
     /// B2: a project hook that copies an hcom command string is still foreign —
     /// only hcom's own hooks.json can hold hcom hooks.
     #[test]
-    #[serial]
     fn test_local_scan_withholds_bypass_for_impersonating_project_hook() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         stale_hcom_codex_hook_trust(dir.path());
         // Set only after setup, which needs the synthesized hook list to succeed.
@@ -1191,12 +1178,11 @@ mod tests {
 
     /// B2: a third-party hook sharing hcom's own hooks.json withholds the bypass.
     #[test]
-    #[serial]
     fn test_local_scan_withholds_bypass_for_foreign_hook_in_hcom_hooks_json() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         stale_hcom_codex_hook_trust(dir.path());
         // Set only after setup, which needs the synthesized hook list to succeed.
@@ -1222,12 +1208,11 @@ mod tests {
     /// B2: a `[hooks]` table in the user's config.toml is a hook source too, and
     /// hcom never writes there, so anything in it is foreign.
     #[test]
-    #[serial]
     fn test_local_scan_withholds_bypass_for_config_toml_hooks() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         stale_hcom_codex_hook_trust(dir.path());
         // Set only after setup, which needs the synthesized hook list to succeed.
@@ -1249,12 +1234,11 @@ mod tests {
     /// B2: `[hooks.state]` is trust bookkeeping, not a declaration — hcom writes
     /// it itself and it must not disqualify the bypass.
     #[test]
-    #[serial]
     fn test_local_scan_ignores_hook_state_table() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         stale_hcom_codex_hook_trust(dir.path());
         // Set only after setup, which needs the synthesized hook list to succeed.
@@ -1275,12 +1259,11 @@ mod tests {
 
     /// B2: installed plugins can contribute hook sources hcom cannot enumerate.
     #[test]
-    #[serial]
     fn test_local_scan_withholds_bypass_when_plugins_installed() {
         let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
         let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         stale_hcom_codex_hook_trust(dir.path());
         // Set only after setup, which needs the synthesized hook list to succeed.
@@ -1297,11 +1280,11 @@ mod tests {
     /// A user-supplied workspace-trust override is never touched, even when the
     /// local-scan bypass suppresses hcom's own injection.
     #[test]
-    #[serial]
     fn test_local_scan_bypass_leaves_user_projects_override_alone() {
-        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         stale_hcom_codex_hook_trust(dir.path());
         // Set only after setup, which needs the synthesized hook list to succeed.
@@ -1426,11 +1409,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_preprocess_codex_args_full_pipeline() {
-        let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         init_config();
         let args = s(&["-m", "o3"]);
         let result = preprocess_codex_args(
@@ -1447,11 +1430,11 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_preprocess_resume_keeps_session_before_hook_trust_bypass() {
-        let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         init_config();
         let args = s(&["resume", "thread-1", "--model", "gpt-5"]);
         let result = preprocess_codex_args(
