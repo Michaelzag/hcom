@@ -2938,6 +2938,78 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_concurrent_codex_homes_preserve_sidecar_trust_updates() {
+        let (tmp, hcom_dir, _home, _guard) = isolated_test_env();
+        std::fs::create_dir_all(&hcom_dir).unwrap();
+        let lock_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(hcom_dir.join("codex-hook-trust.json.lock"))
+            .unwrap();
+        crate::sys::fs::lock_exclusive(&lock_file).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut writers = Vec::new();
+        let mut expected = Vec::new();
+        for name in ["codex-a", "codex-b"] {
+            let home = tmp.path().join(name);
+            std::fs::create_dir_all(&home).unwrap();
+            let hooks_path = home.join("hooks.json");
+            let config_path = home.join("config.toml");
+            let key = format!("{}:stop:0:0", hooks_path.display());
+            expected.push((
+                codex_hook_trust_home_key(&config_path).unwrap(),
+                key.clone(),
+            ));
+            let barrier = barrier.clone();
+            let done_tx = done_tx.clone();
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let result = write_hcom_hook_trust_state(
+                    &config_path,
+                    &hooks_path,
+                    &[CodexHookTrustEntry {
+                        key: key.clone(),
+                        command: "hcom codex-stop".to_string(),
+                        current_hash: "sha256:current".to_string(),
+                    }],
+                    &HashSet::new(),
+                    "0.131.0",
+                    &HashMap::from([(key, "sha256:definition".to_string())]),
+                );
+                done_tx.send(()).unwrap();
+                result
+            }));
+        }
+        barrier.wait();
+        // Neither writer may finish while another process owns the stable lock.
+        let blocked = done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err();
+        // Model the lock owner's commit before either waiting writer proceeds.
+        paths::atomic_write_io(&codex_hook_trust_sidecar_path(), "{}").unwrap();
+        drop(lock_file);
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let sidecar = read_codex_hook_trust_sidecar().unwrap();
+        for (home, key) in expected {
+            let stamp = &sidecar[&home][&key];
+            assert_eq!(stamp.codex_cli_version, "0.131.0");
+            assert_eq!(
+                stamp.hook_definition_hash.as_deref(),
+                Some("sha256:definition")
+            );
+        }
+        assert!(
+            blocked,
+            "a writer committed without holding the sidecar lock"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn test_missing_sidecar_file_is_not_verified() {
         let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
         unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
