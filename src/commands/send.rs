@@ -1859,6 +1859,58 @@ mod tests {
 
     #[test]
     #[serial]
+    fn send_succeeds_once_when_notify_spawn_fails() {
+        let (db, path, _env) = luna_db();
+        let probes: Vec<_> = (0..2)
+            .map(|_| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                listener
+            })
+            .collect();
+        for (probe, kind) in probes.iter().zip(["pty", "hook"]) {
+            db.upsert_notify_endpoint("luna", kind, probe.local_addr().unwrap().port())
+                .unwrap();
+        }
+        // A refused inline wake must not fail the committed send or prevent
+        // the remaining live endpoints from being notified.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        db.upsert_notify_endpoint("luna", "listen", closed_port)
+            .unwrap();
+
+        let rc = crate::notify::wake::with_spawn_failure(|| {
+            cmd_send(
+                &db,
+                &send_argv(&["send", "luna", "--", "survive EAGAIN"]),
+                Some(&sender_ctx()),
+            )
+        });
+
+        assert_eq!(rc, 0);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let (_, data) = last_message(&db);
+        assert_eq!(data["text"], "survive EAGAIN");
+        assert_eq!(delivered_to_luna(&db), vec!["luna".to_string()]);
+        // Every spawn was forced to fail on this thread. Actual connections
+        // therefore prove the fallback notified both endpoints inline.
+        for probe in probes {
+            probe.accept().expect("inline wake did not reach listener");
+        }
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
     fn separator_makes_every_positional_a_target_without_an_at_sign() {
         // The PowerShell-safe form: no `@` to be swallowed, and `luna` lands
         // in exact_targets as an ordinary target.

@@ -1,5 +1,10 @@
 ## Unreleased
 
+`hcom send` stays successful after delivery when a notification thread can't
+start (for example, under a low systemd `TasksMax`). Wakeups fall back to
+inline connections with the same per-endpoint timeout. Failed fallback
+connections are logged without inviting a retry of an already-stored message.
+
 Codex no longer warns about unrecognized hcom keys. hcom's Codex hook trust
 bookkeeping moved out of Codex's `config.toml` into a sidecar at
 `$HCOM_DIR/codex-hook-trust.json`, keyed by canonical Codex home and then

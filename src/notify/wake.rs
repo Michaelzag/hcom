@@ -6,7 +6,7 @@
 //! `inject` endpoints are NOT pinged here — they speak a bidirectional protocol
 //! (`commands::term`) and would mishandle a connect-drop.
 
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use rusqlite::params;
@@ -88,19 +88,67 @@ pub fn snapshot_wake_ports(db: &HcomDb, instance: &str) -> Vec<u16> {
     snapshot_wake_ports_for(db, instance, &[])
 }
 
-/// Connect-and-close on each port to fire a wake. Best-effort; errors ignored.
+#[cfg(test)]
+thread_local! {
+    static FORCE_SPAWN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_spawn_failure<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_SPAWN_FAILURE.set(self.0);
+        }
+    }
+    let _reset = Reset(FORCE_SPAWN_FAILURE.replace(true));
+    f()
+}
+
+fn spawn_wake<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    port: u16,
+    timeout: Duration,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, ()>> {
+    #[cfg(test)]
+    if FORCE_SPAWN_FAILURE.get() {
+        return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+    }
+    std::thread::Builder::new()
+        .name("hcom-wake".into())
+        .spawn_scoped(scope, move || {
+            let _ = wake_port(port, timeout);
+        })
+}
+
+fn wake_port(port: u16, timeout: Duration) -> std::io::Result<()> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, timeout).map(drop)
+}
+
+/// Connect-and-close on each port to fire a wake. Best-effort: if a worker
+/// cannot be spawned, connect inline with the same timeout. Neither failure
+/// changes the result of an already-committed send.
 pub fn wake_ports(ports: &[u16], timeout_ms: u64) {
     let timeout = Duration::from_millis(timeout_ms);
     let valid_ports: Vec<u16> = ports.iter().copied().filter(|port| *port > 0).collect();
     for ports in valid_ports.chunks(MAX_WAKE_FANOUT_WORKERS) {
         std::thread::scope(|scope| {
             for &port in ports {
-                scope.spawn(move || {
-                    let addr = format!("127.0.0.1:{port}");
-                    if let Ok(addr) = addr.parse() {
-                        let _ = TcpStream::connect_timeout(&addr, timeout);
+                if let Err(err) = spawn_wake(scope, port, timeout) {
+                    crate::log::log_warn(
+                        "notify",
+                        "wake.spawn_failed",
+                        &format!("port={port}: {err}; attempting wake inline"),
+                    );
+                    if let Err(err) = wake_port(port, timeout) {
+                        crate::log::log_warn(
+                            "notify",
+                            "wake.inline_failed",
+                            &format!("port={port}: {err}"),
+                        );
                     }
-                });
+                }
             }
         });
     }
