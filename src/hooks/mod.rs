@@ -19,6 +19,7 @@ use serde_json::Value;
 /// Shared test helpers for hook test modules (claude, codex, gemini).
 #[cfg(test)]
 pub mod test_helpers {
+    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -36,24 +37,36 @@ pub mod test_helpers {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// RAII guard that saves/restores HCOM_DIR and HOME env vars, and resets Config.
+    // Keep saving, clearing, and sentinel coverage tied to the same overrides.
+    pub(crate) const TOOL_HOME_ENV_VARS: &[&str] = &[
+        "CLAUDE_CONFIG_DIR",
+        "GEMINI_CLI_HOME",
+        "CODEX_HOME",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_CONTENT",
+        "KILO_CONFIG_DIR",
+        "KILO_DB",
+        "CURSOR_CONFIG_DIR",
+        "KIMI_CODE_HOME",
+        "COPILOT_HOME",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ];
+
+    /// RAII guard that saves/restores the test environment and resets Config.
     pub struct EnvGuard {
         saved_hcom: Option<String>,
         saved_home: Option<String>,
-        saved_cursor_config_dir: Option<String>,
-        saved_xdg_config_home: Option<String>,
-        saved_xdg_data_home: Option<String>,
-        saved_codex_home: Option<String>,
-        saved_gemini_cli_home: Option<String>,
-        saved_kilo_config_dir: Option<String>,
-        saved_kimi_code_home: Option<String>,
-        saved_copilot_home: Option<String>,
+        saved_tool_home_env: [Option<OsString>; TOOL_HOME_ENV_VARS.len()],
         saved_test_codex_cli_version: Option<String>,
-        saved_pi_coding_agent_dir: Option<String>,
-        saved_pi_coding_agent_session_dir: Option<String>,
-        saved_pi_config_dir: Option<String>,
-        saved_omp_profile: Option<String>,
-        saved_pi_profile: Option<String>,
         saved_build_root: Option<String>,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
@@ -72,21 +85,10 @@ pub mod test_helpers {
             Self {
                 saved_hcom: std::env::var("HCOM_DIR").ok(),
                 saved_home: std::env::var("HOME").ok(),
-                saved_cursor_config_dir: std::env::var("CURSOR_CONFIG_DIR").ok(),
-                saved_xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
-                saved_xdg_data_home: std::env::var("XDG_DATA_HOME").ok(),
-                saved_codex_home: std::env::var("CODEX_HOME").ok(),
-                saved_gemini_cli_home: std::env::var("GEMINI_CLI_HOME").ok(),
-                saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
-                saved_kimi_code_home: std::env::var("KIMI_CODE_HOME").ok(),
-                saved_copilot_home: std::env::var("COPILOT_HOME").ok(),
+                saved_tool_home_env: std::array::from_fn(|i| {
+                    std::env::var_os(TOOL_HOME_ENV_VARS[i])
+                }),
                 saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
-                saved_pi_coding_agent_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
-                saved_pi_coding_agent_session_dir: std::env::var("PI_CODING_AGENT_SESSION_DIR")
-                    .ok(),
-                saved_pi_config_dir: std::env::var("PI_CONFIG_DIR").ok(),
-                saved_omp_profile: std::env::var("OMP_PROFILE").ok(),
-                saved_pi_profile: std::env::var("PI_PROFILE").ok(),
                 saved_build_root: std::env::var("HCOM_BUILD_ROOT").ok(),
                 _lock: lock,
             }
@@ -104,61 +106,15 @@ pub mod test_helpers {
                     Some(v) => std::env::set_var("HOME", v),
                     None => std::env::remove_var("HOME"),
                 }
-                match &self.saved_cursor_config_dir {
-                    Some(v) => std::env::set_var("CURSOR_CONFIG_DIR", v),
-                    None => std::env::remove_var("CURSOR_CONFIG_DIR"),
-                }
-                match &self.saved_xdg_config_home {
-                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-                match &self.saved_xdg_data_home {
-                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                    None => std::env::remove_var("XDG_DATA_HOME"),
-                }
-                match &self.saved_codex_home {
-                    Some(v) => std::env::set_var("CODEX_HOME", v),
-                    None => std::env::remove_var("CODEX_HOME"),
-                }
-                match &self.saved_gemini_cli_home {
-                    Some(v) => std::env::set_var("GEMINI_CLI_HOME", v),
-                    None => std::env::remove_var("GEMINI_CLI_HOME"),
-                }
-                match &self.saved_kilo_config_dir {
-                    Some(v) => std::env::set_var("KILO_CONFIG_DIR", v),
-                    None => std::env::remove_var("KILO_CONFIG_DIR"),
-                }
-                match &self.saved_kimi_code_home {
-                    Some(v) => std::env::set_var("KIMI_CODE_HOME", v),
-                    None => std::env::remove_var("KIMI_CODE_HOME"),
-                }
-                match &self.saved_copilot_home {
-                    Some(v) => std::env::set_var("COPILOT_HOME", v),
-                    None => std::env::remove_var("COPILOT_HOME"),
+                for (key, value) in TOOL_HOME_ENV_VARS.iter().zip(&self.saved_tool_home_env) {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
                 }
                 match &self.saved_test_codex_cli_version {
                     Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
                     None => std::env::remove_var("HCOM_TEST_CODEX_CLI_VERSION"),
-                }
-                match &self.saved_pi_coding_agent_dir {
-                    Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-                    None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-                }
-                match &self.saved_pi_coding_agent_session_dir {
-                    Some(v) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", v),
-                    None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
-                }
-                match &self.saved_pi_config_dir {
-                    Some(v) => std::env::set_var("PI_CONFIG_DIR", v),
-                    None => std::env::remove_var("PI_CONFIG_DIR"),
-                }
-                match &self.saved_omp_profile {
-                    Some(v) => std::env::set_var("OMP_PROFILE", v),
-                    None => std::env::remove_var("OMP_PROFILE"),
-                }
-                match &self.saved_pi_profile {
-                    Some(v) => std::env::set_var("PI_PROFILE", v),
-                    None => std::env::remove_var("PI_PROFILE"),
                 }
                 match &self.saved_build_root {
                     Some(v) => std::env::set_var("HCOM_BUILD_ROOT", v),
@@ -183,7 +139,13 @@ pub mod test_helpers {
     pub fn isolated_test_env_with_config(
         config: Option<&str>,
     ) -> (tempfile::TempDir, PathBuf, PathBuf, EnvGuard) {
-        let guard = EnvGuard::new();
+        isolated_test_env_with_guard(config, EnvGuard::new())
+    }
+
+    fn isolated_test_env_with_guard(
+        config: Option<&str>,
+        guard: EnvGuard,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, EnvGuard) {
         let dir = tempfile::tempdir().unwrap();
         let test_home = dir.path().to_path_buf();
         let hcom_dir = test_home.join(".hcom");
@@ -195,6 +157,9 @@ pub mod test_helpers {
         // geography alone is not enough — see paths::test_roots).
         crate::paths::test_roots::register(&test_home);
         unsafe {
+            for key in TOOL_HOME_ENV_VARS {
+                std::env::remove_var(key);
+            }
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
             std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
@@ -204,6 +169,65 @@ pub mod test_helpers {
         crate::config::Config::reset();
         crate::config::Config::init();
         (dir, hcom_dir, test_home, guard)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_test_env_keeps_hook_installs_out_of_inherited_tool_homes() {
+        use super::{antigravity, claude, codex, copilot, cursor, gemini, kimi, omp, opencode, pi};
+
+        // Acquire the same lock as every isolated helper before seeding env vars.
+        // Moving the guard into the helper also preserves the original env on panic.
+        let guard = EnvGuard::new();
+        let sentinels = tempfile::tempdir().unwrap();
+        for key in TOOL_HOME_ENV_VARS {
+            let path = sentinels.path().join(key);
+            std::fs::create_dir(&path).unwrap();
+            unsafe { std::env::set_var(key, path) };
+        }
+        let (_temp, _hcom_dir, home, guard) = isolated_test_env_with_guard(None, guard);
+
+        codex::try_setup_codex_hooks(true).unwrap();
+        claude::try_setup_claude_hooks(true).unwrap();
+        gemini::try_setup_gemini_hooks(true).unwrap();
+        antigravity::try_setup_antigravity_hooks(true).unwrap();
+        cursor::try_setup_cursor_hooks(true).unwrap();
+        kimi::try_setup_kimi_hooks(true).unwrap();
+        copilot::try_setup_copilot_hooks(true).unwrap();
+        assert!(opencode::install_opencode_plugin().unwrap());
+        assert!(opencode::install_kilo_plugin().unwrap());
+        assert!(pi::install_pi_plugin().unwrap());
+        assert!(omp::install_omp_plugin().unwrap());
+
+        for relative in [
+            ".codex/config.toml",
+            ".codex/hooks.json",
+            ".claude/settings.json",
+            ".gemini/settings.json",
+            ".gemini/config/hooks.json",
+            ".cursor/hooks.json",
+            ".kimi-code/config.toml",
+            ".copilot/hooks/hcom.json",
+            ".config/opencode/plugins/hcom.ts",
+            ".config/kilo/plugins/hcom.ts",
+            ".pi/agent/extensions/hcom.ts",
+            ".omp/agent/extensions/hcom.ts",
+        ] {
+            assert!(
+                home.join(relative).is_file(),
+                "missing hook install under test HOME: {relative}"
+            );
+        }
+        for key in TOOL_HOME_ENV_VARS {
+            assert!(
+                std::fs::read_dir(sentinels.path().join(key))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+                "hook install wrote to inherited {key}"
+            );
+        }
+        drop(guard);
     }
 }
 

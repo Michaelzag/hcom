@@ -2710,8 +2710,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_derive_transcript_finds_file() {
+        let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions").join("project");
         std::fs::create_dir_all(&sessions).unwrap();
@@ -2719,18 +2719,11 @@ mod tests {
         let transcript = sessions.join("rollout-1-abc-123-def.jsonl");
         std::fs::File::create(&transcript).unwrap();
 
-        let saved = std::env::var("CODEX_HOME").ok();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
 
         let result = derive_codex_transcript_path("abc-123-def");
         assert!(result.is_some(), "should find transcript file");
         assert!(result.unwrap().contains("rollout-1-abc-123-def.jsonl"));
-
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("CODEX_HOME", v) };
-        } else {
-            unsafe { std::env::remove_var("CODEX_HOME") };
-        }
     }
 
     // -- build_codex_rules --
