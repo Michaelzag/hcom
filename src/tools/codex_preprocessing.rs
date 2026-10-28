@@ -567,14 +567,22 @@ mod tests {
     /// Corrupting `trusted_hash` would not work: hcom cannot recompute Codex's
     /// `currentHash`, so it never validates that value locally.
     fn stale_hcom_codex_hook_trust(codex_home: &std::path::Path) {
-        let config_path = codex_home.join("config.toml");
-        let config = std::fs::read_to_string(&config_path).unwrap();
-        let stale = config.replace(
-            "hcom_codex_cli_version = \"0.131.0\"",
-            "hcom_codex_cli_version = \"0.130.0\"",
-        );
-        assert_ne!(config, stale, "expected hcom trust entries to go stale");
-        std::fs::write(&config_path, stale).unwrap();
+        let sidecar_path = crate::paths::hcom_dir().join("codex-hook-trust.json");
+        let mut sidecar: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+        let home = std::fs::canonicalize(codex_home).unwrap();
+        let entries = sidecar[home.to_string_lossy().as_ref()]
+            .as_object_mut()
+            .unwrap();
+        for entry in entries.values_mut() {
+            assert_eq!(entry["codex_cli_version"], "0.131.0");
+            entry["codex_cli_version"] = serde_json::json!("0.130.0");
+        }
+        std::fs::write(
+            &sidecar_path,
+            serde_json::to_string_pretty(&sidecar).unwrap(),
+        )
+        .unwrap();
     }
 
     /// A workspace with no Codex hook definitions of its own. The `.git` marker
@@ -840,8 +848,8 @@ mod tests {
 
     #[test]
     fn test_add_hook_trust_bypass_skips_when_hcom_hooks_trusted() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
@@ -854,29 +862,41 @@ mod tests {
 
     #[test]
     fn test_add_hook_trust_bypass_self_heals_version_mismatch() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
         let workspace = clean_workspace();
-        let config_path = dir.path().join("config.toml");
-        let stale = std::fs::read_to_string(&config_path)
-            .unwrap()
-            .replace("0.131.0", "0.130.0");
-        std::fs::write(&config_path, stale).unwrap();
+        stale_hcom_codex_hook_trust(dir.path());
 
         let args = s(&["-m", "o3"]);
         let result = bypass_args(&args, workspace.path());
         assert!(!result.contains(&BYPASS_HOOK_TRUST_FLAG.to_string()));
-        let healed = std::fs::read_to_string(config_path).unwrap();
-        assert!(healed.contains("hcom_codex_cli_version = \"0.131.0\""));
+        let healed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(crate::paths::hcom_dir().join("codex-hook-trust.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        for entry in healed[home.to_string_lossy().as_ref()]
+            .as_object()
+            .unwrap()
+            .values()
+        {
+            assert_eq!(entry["codex_cli_version"], "0.131.0");
+        }
+        assert!(
+            !std::fs::read_to_string(dir.path().join("config.toml"))
+                .unwrap()
+                .contains("hcom_")
+        );
     }
 
     #[test]
     fn test_add_hook_trust_bypass_self_heals_stale_trusted_hash() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
@@ -916,8 +936,8 @@ mod tests {
     /// warned about and that was never needed.
     #[test]
     fn test_no_bypass_when_hooks_list_fails_but_trust_state_is_exact() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
@@ -1095,8 +1115,8 @@ mod tests {
     /// bypass is granted — but hcom's workspace-trust injection is suppressed.
     #[test]
     fn test_local_scan_bypass_suppresses_workspace_trust() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
@@ -1118,8 +1138,8 @@ mod tests {
     /// layer withholds the bypass.
     #[test]
     fn test_local_scan_withholds_bypass_for_project_hook_definition() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
@@ -1138,8 +1158,8 @@ mod tests {
     /// only hcom's own hooks.json can hold hcom hooks.
     #[test]
     fn test_local_scan_withholds_bypass_for_impersonating_project_hook() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
@@ -1159,8 +1179,8 @@ mod tests {
     /// B2: a third-party hook sharing hcom's own hooks.json withholds the bypass.
     #[test]
     fn test_local_scan_withholds_bypass_for_foreign_hook_in_hcom_hooks_json() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
@@ -1189,8 +1209,8 @@ mod tests {
     /// hcom never writes there, so anything in it is foreign.
     #[test]
     fn test_local_scan_withholds_bypass_for_config_toml_hooks() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
@@ -1215,8 +1235,8 @@ mod tests {
     /// it itself and it must not disqualify the bypass.
     #[test]
     fn test_local_scan_ignores_hook_state_table() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());
@@ -1240,8 +1260,8 @@ mod tests {
     /// B2: installed plugins can contribute hook sources hcom cannot enumerate.
     #[test]
     fn test_local_scan_withholds_bypass_when_plugins_installed() {
-        let _env_guard = crate::hooks::test_helpers::EnvGuard::new();
-        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0") };
+        let (_tmp, _hcom_dir, _home, _env) = crate::hooks::test_helpers::isolated_test_env();
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("CODEX_HOME", dir.path()) };
         write_trusted_hcom_codex_hooks(dir.path());

@@ -1484,6 +1484,36 @@ fn detect_codex_hooks_feature_key() -> CodexHooksFeatureKey {
     })
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CodexHookTrustMetadata {
+    codex_cli_version: String,
+    hook_definition_hash: Option<String>,
+}
+
+/// Canonical Codex home -> hooks.state id -> hcom's private trust stamps.
+type CodexHookTrustSidecar = HashMap<String, HashMap<String, CodexHookTrustMetadata>>;
+
+fn codex_hook_trust_sidecar_path() -> PathBuf {
+    paths::hcom_dir().join("codex-hook-trust.json")
+}
+
+fn codex_hook_trust_home_key(config_path: &Path) -> Result<String, String> {
+    let home = config_path
+        .parent()
+        .ok_or_else(|| "Codex config path has no parent".to_string())?;
+    std::fs::canonicalize(home)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|e| e.to_string())
+}
+
+fn read_codex_hook_trust_sidecar() -> Result<CodexHookTrustSidecar, String> {
+    match std::fs::read_to_string(codex_hook_trust_sidecar_path()) {
+        Ok(content) => serde_json::from_str(&content).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn write_hcom_hook_trust_state(
     config_path: &Path,
     hooks_path: &Path,
@@ -1510,6 +1540,19 @@ fn write_hcom_hook_trust_state(
         ));
     }
 
+    let sidecar_path = codex_hook_trust_sidecar_path();
+    std::fs::create_dir_all(paths::hcom_dir()).map_err(|e| e.to_string())?;
+    let sidecar_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sidecar_path.with_file_name("codex-hook-trust.json.lock"))
+        .map_err(|e| e.to_string())?;
+    // This is the only trust-write lock. Take it before reading either file;
+    // keep the fd alive through both atomic replacements, including error paths.
+    // Lock the stable sibling, never the sidecar inode that rename replaces.
+    crate::sys::fs::lock_exclusive(&sidecar_lock).map_err(|e| e.to_string())?;
+
     let mut doc: DocumentMut = if config_path.exists() {
         std::fs::read_to_string(config_path)
             .map_err(|e| e.to_string())?
@@ -1532,6 +1575,14 @@ fn write_hcom_hook_trust_state(
         .as_table_like_mut()
         .ok_or_else(|| "hooks.state config section is not a table".to_string())?;
 
+    // Clean cutover, including entries that no longer belong to hcom.
+    for (_, item) in state.iter_mut() {
+        if let Some(entry) = item.as_table_like_mut() {
+            entry.remove(HCOM_CODEX_CLI_VERSION_KEY);
+            entry.remove(HCOM_HOOK_DEFINITION_HASH_KEY);
+        }
+    }
+
     for key in stale_keys {
         state.remove(key);
     }
@@ -1548,16 +1599,30 @@ fn write_hcom_hook_trust_state(
         };
         item["trusted_hash"] = value(entry.current_hash.clone());
         item["enabled"] = value(true);
-        item[HCOM_CODEX_CLI_VERSION_KEY] = value(codex_cli_version.to_string());
-        if let Some(definition_hash) = definition_hashes.get(&entry.key) {
-            item[HCOM_HOOK_DEFINITION_HASH_KEY] = value(definition_hash.clone());
-        }
     }
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    paths::atomic_write_io(config_path, &doc.to_string()).map_err(|e| e.to_string())
+    let mut sidecar = read_codex_hook_trust_sidecar()?;
+    let home_key = codex_hook_trust_home_key(config_path)?;
+    let metadata = sidecar.entry(home_key).or_default();
+    for key in stale_keys {
+        metadata.remove(key);
+    }
+    for entry in entries {
+        metadata.insert(
+            entry.key.clone(),
+            CodexHookTrustMetadata {
+                codex_cli_version: codex_cli_version.to_string(),
+                hook_definition_hash: definition_hashes.get(&entry.key).cloned(),
+            },
+        );
+    }
+
+    paths::atomic_write_io(config_path, &doc.to_string()).map_err(|e| e.to_string())?;
+    let content = serde_json::to_string_pretty(&sidecar).map_err(|e| e.to_string())?;
+    paths::atomic_write_io(&sidecar_path, &content).map_err(|e| e.to_string())
 }
 
 /// Rewrite hcom's own `hooks.state` entries from an authoritative hooks/list
@@ -1972,9 +2037,21 @@ fn codex_hcom_hook_keys_trusted_for_version(
     else {
         return false;
     };
+    let Ok(sidecar) = read_codex_hook_trust_sidecar() else {
+        return false;
+    };
+    let Ok(home_key) = codex_hook_trust_home_key(config_path) else {
+        return false;
+    };
+    let Some(metadata) = sidecar.get(&home_key) else {
+        return false;
+    };
 
     keys.iter().all(|key| {
         let Some(entry) = state.get(key) else {
+            return false;
+        };
+        let Some(stamp) = metadata.get(key) else {
             return false;
         };
         let Some(trusted_hash) = entry.get("trusted_hash").and_then(|v| v.as_str()) else {
@@ -1982,13 +2059,8 @@ fn codex_hcom_hook_keys_trusted_for_version(
         };
         !trusted_hash.is_empty()
             && entry.get("enabled").and_then(|v| v.as_bool()) != Some(false)
-            && entry
-                .get(HCOM_CODEX_CLI_VERSION_KEY)
-                .and_then(|v| v.as_str())
-                == Some(codex_cli_version)
-            && entry
-                .get(HCOM_HOOK_DEFINITION_HASH_KEY)
-                .and_then(|v| v.as_str())
+            && stamp.codex_cli_version == codex_cli_version
+            && stamp.hook_definition_hash.as_deref()
                 == definition_hashes.get(key).map(String::as_str)
     })
 }
@@ -2024,6 +2096,11 @@ fn verify_hcom_hook_keys_trusted_for_version(
         .and_then(|hooks| hooks.get("state"))
         .and_then(|state| state.as_table_like())
         .ok_or_else(|| VerifyFailReason::HookTrustUnavailable("hooks.state missing".to_string()))?;
+    let sidecar =
+        read_codex_hook_trust_sidecar().map_err(VerifyFailReason::HookTrustUnavailable)?;
+    let home_key =
+        codex_hook_trust_home_key(config_path).map_err(VerifyFailReason::HookTrustUnavailable)?;
+    let metadata = sidecar.get(&home_key);
 
     for entry in entries {
         let command = entry.command.clone();
@@ -2042,18 +2119,13 @@ fn verify_hcom_hook_keys_trusted_for_version(
         if trusted_hash.is_empty() {
             return Err(VerifyFailReason::HookTrustMissing { command });
         }
-        if state_entry
-            .get(HCOM_CODEX_CLI_VERSION_KEY)
-            .and_then(|v| v.as_str())
-            != Some(codex_cli_version)
-        {
+        let Some(stamp) = metadata.and_then(|home| home.get(&entry.key)) else {
+            return Err(VerifyFailReason::HookTrustMissing { command });
+        };
+        if stamp.codex_cli_version != codex_cli_version {
             return Err(VerifyFailReason::HookTrustStale { command });
         }
-        if state_entry
-            .get(HCOM_HOOK_DEFINITION_HASH_KEY)
-            .and_then(|v| v.as_str())
-            != Some(entry.definition_hash.as_str())
-        {
+        if stamp.hook_definition_hash.as_deref() != Some(entry.definition_hash.as_str()) {
             return Err(VerifyFailReason::HookTrustStale { command });
         }
     }
@@ -2778,8 +2850,181 @@ mod tests {
         let config_content = std::fs::read_to_string(get_codex_config_path()).unwrap();
         assert!(config_content.contains("trusted_hash"));
         assert!(config_content.contains("enabled = true"));
-        assert!(config_content.contains("hcom_codex_cli_version = \"0.131.0\""));
-        assert!(config_content.contains("hcom_hook_definition_hash"));
+        assert!(!config_content.contains("hcom_"));
+        let sidecar: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex_hook_trust_sidecar_path()).unwrap(),
+        )
+        .unwrap();
+        let home = std::fs::canonicalize(codex_config_dir()).unwrap();
+        let entries = hcom_hook_local_entries_from_hooks_path(&get_codex_hooks_path()).unwrap();
+        for entry in entries {
+            let stamp = &sidecar[home.to_string_lossy().as_ref()][&entry.key];
+            assert_eq!(stamp["codex_cli_version"], "0.131.0");
+            assert_eq!(stamp["hook_definition_hash"], entry.definition_hash);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_codex_hooks_migrates_legacy_trust_metadata_preserving_user_keys() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
+        let config_path = get_codex_config_path();
+        let original = concat!(
+            "# user's config\n",
+            "model = 'o3' # keep this formatting\n",
+            "[hooks.state.\"other-hook\"]\n",
+            "trusted_hash = 'sha256:user'\n",
+            "enabled = false\n",
+            "user_note = 'leave me alone' # keep this too\n",
+            "hcom_codex_cli_version = '0.130.0'\n",
+            "hcom_hook_definition_hash = 'old'\n",
+            "[hooks.state]\n",
+            "inline-hook = { enabled = false, user_note = 'inline', hcom_codex_cli_version = 'old', hcom_hook_definition_hash = 'old' }\n",
+        );
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, original).unwrap();
+
+        assert!(setup_codex_hooks(false));
+        assert!(verify_codex_hooks_installed(false));
+        let migrated = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!migrated.contains("hcom_"));
+        assert!(migrated.contains("# user's config\nmodel = 'o3' # keep this formatting\n"));
+        assert!(migrated.contains("user_note = 'leave me alone' # keep this too\n"));
+        let doc = migrated.parse::<DocumentMut>().unwrap();
+        let state = &doc["hooks"]["state"];
+        assert_eq!(
+            state["other-hook"]["trusted_hash"].as_str(),
+            Some("sha256:user")
+        );
+        assert_eq!(state["other-hook"]["enabled"].as_bool(), Some(false));
+        assert_eq!(state["inline-hook"]["enabled"].as_bool(), Some(false));
+        assert_eq!(state["inline-hook"]["user_note"].as_str(), Some("inline"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_missing_sidecar_entry_is_not_verified_even_with_legacy_metadata() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
+        assert!(setup_codex_hooks(false));
+        let config_path = get_codex_config_path();
+        let mut sidecar = read_codex_hook_trust_sidecar().unwrap();
+        let home_key = codex_hook_trust_home_key(&config_path).unwrap();
+        let metadata = sidecar.get_mut(&home_key).unwrap();
+        let key = metadata.keys().next().unwrap().clone();
+        let stamp = metadata.remove(&key).unwrap();
+        paths::atomic_write_io(
+            &codex_hook_trust_sidecar_path(),
+            &serde_json::to_string_pretty(&sidecar).unwrap(),
+        )
+        .unwrap();
+        let mut doc = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        doc["hooks"]["state"][&key][HCOM_CODEX_CLI_VERSION_KEY] = value(stamp.codex_cli_version);
+        doc["hooks"]["state"][&key][HCOM_HOOK_DEFINITION_HASH_KEY] =
+            value(stamp.hook_definition_hash.unwrap());
+        paths::atomic_write_io(&config_path, &doc.to_string()).unwrap();
+
+        assert!(matches!(
+            verify_codex_hooks_inner(false),
+            Err(VerifyFailReason::HookTrustMissing { .. })
+        ));
+        assert!(!codex_hcom_hooks_trusted_locally_for_version("0.131.0"));
+        assert!(setup_codex_hooks(false));
+        assert!(verify_codex_hooks_installed(false));
+        assert!(
+            !std::fs::read_to_string(config_path)
+                .unwrap()
+                .contains("hcom_")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_concurrent_codex_homes_preserve_sidecar_trust_updates() {
+        let (tmp, hcom_dir, _home, _guard) = isolated_test_env();
+        std::fs::create_dir_all(&hcom_dir).unwrap();
+        let lock_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(hcom_dir.join("codex-hook-trust.json.lock"))
+            .unwrap();
+        crate::sys::fs::lock_exclusive(&lock_file).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut writers = Vec::new();
+        let mut expected = Vec::new();
+        for name in ["codex-a", "codex-b"] {
+            let home = tmp.path().join(name);
+            std::fs::create_dir_all(&home).unwrap();
+            let hooks_path = home.join("hooks.json");
+            let config_path = home.join("config.toml");
+            let key = format!("{}:stop:0:0", hooks_path.display());
+            expected.push((
+                codex_hook_trust_home_key(&config_path).unwrap(),
+                key.clone(),
+            ));
+            let barrier = barrier.clone();
+            let done_tx = done_tx.clone();
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let result = write_hcom_hook_trust_state(
+                    &config_path,
+                    &hooks_path,
+                    &[CodexHookTrustEntry {
+                        key: key.clone(),
+                        command: "hcom codex-stop".to_string(),
+                        current_hash: "sha256:current".to_string(),
+                    }],
+                    &HashSet::new(),
+                    "0.131.0",
+                    &HashMap::from([(key, "sha256:definition".to_string())]),
+                );
+                done_tx.send(()).unwrap();
+                result
+            }));
+        }
+        barrier.wait();
+        // Neither writer may finish while another process owns the stable lock.
+        let blocked = done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err();
+        // Model the lock owner's commit before either waiting writer proceeds.
+        paths::atomic_write_io(&codex_hook_trust_sidecar_path(), "{}").unwrap();
+        drop(lock_file);
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let sidecar = read_codex_hook_trust_sidecar().unwrap();
+        for (home, key) in expected {
+            let stamp = &sidecar[&home][&key];
+            assert_eq!(stamp.codex_cli_version, "0.131.0");
+            assert_eq!(
+                stamp.hook_definition_hash.as_deref(),
+                Some("sha256:definition")
+            );
+        }
+        assert!(
+            blocked,
+            "a writer committed without holding the sidecar lock"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_missing_sidecar_file_is_not_verified() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
+        assert!(setup_codex_hooks(false));
+        std::fs::remove_file(codex_hook_trust_sidecar_path()).unwrap();
+        assert!(!verify_codex_hooks_installed(false));
+        assert!(!codex_hcom_hooks_trusted_locally_for_version("0.131.0"));
+        assert!(setup_codex_hooks(false));
+        assert!(verify_codex_hooks_installed(false));
     }
 
     #[test]
@@ -2855,7 +3100,14 @@ mod tests {
         assert!(setup_codex_hooks(false));
         assert!(verify_codex_hooks_installed(false));
         let repaired = std::fs::read_to_string(get_codex_config_path()).unwrap();
-        assert!(repaired.contains("hcom_codex_cli_version = \"0.132.0\""));
+        assert!(!repaired.contains("hcom_"));
+        let sidecar = read_codex_hook_trust_sidecar().unwrap();
+        let home_key = codex_hook_trust_home_key(&get_codex_config_path()).unwrap();
+        assert!(
+            sidecar[&home_key]
+                .values()
+                .all(|stamp| stamp.codex_cli_version == "0.132.0")
+        );
     }
 
     #[test]
