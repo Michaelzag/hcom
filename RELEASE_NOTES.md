@@ -1,5 +1,23 @@
 ## Unreleased
 
+Codex no longer warns about unrecognized hcom keys. hcom's Codex hook trust
+bookkeeping moved out of Codex's `config.toml` into a sidecar at
+`$HCOM_DIR/codex-hook-trust.json`, keyed by canonical Codex home and then
+`hooks.state` id. Codex 0.165 rejected the two private keys hcom used to
+write there and warned about them on every launch. Codex's own `trusted_hash`
+and `enabled` values stay in TOML.
+
+**Upgrade behavior:** the next `hcom codex` launch strips the legacy
+`hcom_codex_cli_version` and `hcom_hook_definition_hash` keys from every
+`hooks.state` table, including foreign and inline tables, and leaves your own
+settings untouched. A missing or stale sidecar fails verification instead of
+falling back to the legacy TOML keys, so trust is recorded again on the next
+launch. Concurrent writers across Codex homes are serialized by a stable
+`codex-hook-trust.json.lock` sibling.
+
+Hook tests now clear inherited tool-home overrides, so a fixture can't write
+into the operator's real Codex, Claude, Gemini, or Cursor configuration.
+
 Kill now retries a busy database while finalizing the stopped snapshot and
 releasing the row. The retry window is 30 seconds plus at most one final
 5-second SQLite wait. If it still can't write, the error distinguishes the
