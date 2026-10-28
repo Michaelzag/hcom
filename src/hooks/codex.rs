@@ -1540,6 +1540,19 @@ fn write_hcom_hook_trust_state(
         ));
     }
 
+    let sidecar_path = codex_hook_trust_sidecar_path();
+    std::fs::create_dir_all(paths::hcom_dir()).map_err(|e| e.to_string())?;
+    let sidecar_lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sidecar_path.with_file_name("codex-hook-trust.json.lock"))
+        .map_err(|e| e.to_string())?;
+    // This is the only trust-write lock. Take it before reading either file;
+    // keep the fd alive through both atomic replacements, including error paths.
+    // Lock the stable sibling, never the sidecar inode that rename replaces.
+    crate::sys::fs::lock_exclusive(&sidecar_lock).map_err(|e| e.to_string())?;
+
     let mut doc: DocumentMut = if config_path.exists() {
         std::fs::read_to_string(config_path)
             .map_err(|e| e.to_string())?
@@ -1609,7 +1622,7 @@ fn write_hcom_hook_trust_state(
 
     paths::atomic_write_io(config_path, &doc.to_string()).map_err(|e| e.to_string())?;
     let content = serde_json::to_string_pretty(&sidecar).map_err(|e| e.to_string())?;
-    paths::atomic_write_io(&codex_hook_trust_sidecar_path(), &content).map_err(|e| e.to_string())
+    paths::atomic_write_io(&sidecar_path, &content).map_err(|e| e.to_string())
 }
 
 /// Rewrite hcom's own `hooks.state` entries from an authoritative hooks/list
