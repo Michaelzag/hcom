@@ -665,6 +665,26 @@ impl HcomDb {
         let now = now_epoch_f64();
         let validation_key = claude_lineage_validation_key(session_id);
         self.with_immediate_transaction(|txn| {
+            let omp_owner = txn
+                .query_row(
+                    "SELECT name FROM instances
+                     WHERE tool = 'omp'
+                       AND (name = ?1 OR session_id = ?2 OR name = (
+                           SELECT instance_name FROM session_bindings WHERE session_id = ?2
+                       ))
+                     LIMIT 1",
+                    params![instance_name, session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(omp_owner) = omp_owner {
+                bail!(
+                    "cannot attach Claude generation {} over OMP owner {}",
+                    session_id,
+                    omp_owner
+                );
+            }
+
             let old_primary_session = txn
                 .query_row(
                     "SELECT session_id FROM instances WHERE name = ?",

@@ -404,7 +404,8 @@ pub fn generate_unique_name(db: &HcomDb) -> Result<String> {
     reserve_generated_name(db)
 }
 
-pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
+/// Hold this lock before opening the writer transaction that allocates a name.
+pub(crate) fn lock_name_generation(db: &HcomDb) -> Result<std::fs::File> {
     use std::fs::{File, create_dir_all};
 
     let lock_path = db
@@ -423,10 +424,13 @@ pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
         .truncate(false)
         .open(&lock_path)?;
 
-    // Acquire exclusive file lock; released when `lock_file` drops at scope end.
     crate::sys::fs::lock_exclusive(&lock_file)
         .map_err(|e| anyhow::anyhow!("flock failed: {}", e))?;
+    Ok(lock_file)
+}
 
+pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
+    let lock_file = lock_name_generation(db)?;
     let result = (|| -> Result<String> {
         let name = allocate_unreserved_name(db)?;
         crate::identity::validate_new_identity_name(db, &name)?;

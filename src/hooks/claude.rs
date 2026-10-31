@@ -1072,6 +1072,14 @@ fn bind_lineage_owner(
     process_id: &str,
     process_owner: Option<&str>,
 ) -> Result<(), String> {
+    let instance = db
+        .get_instance_full(owner)
+        .map_err(|error| error.to_string())?
+        .ok_or("selected instance not found")?;
+    if instance.tool == "omp" {
+        return Err("cannot attach Claude generation to OMP instance".to_string());
+    }
+
     match db.attach_claude_generation(
         owner,
         session_id,
@@ -1157,10 +1165,13 @@ fn handle_compact_recovery(
         .or_else(|| {
             process_id.and_then(|pid| instance_binding::resolve_process_binding(db, Some(pid)))
         })?;
+    let inst = db.get_instance_full(&instance_name).ok()??;
+    if inst.tool == "omp" {
+        return None;
+    }
 
     let bootstrap = if process_id.is_some() {
         // hcom-launched: inject full bootstrap
-        let inst = db.get_instance_full(&instance_name).ok()??;
         let tag = inst.tag.as_deref().unwrap_or("");
         bootstrap::get_bootstrap(
             db,
@@ -3994,6 +4005,257 @@ mod tests {
         assert!(!should_scan_sessionstart_lineage(
             false, "clear", true, true, false,
         ));
+    }
+
+    fn seed_sessionstart_target(db: &HcomDb, tool: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, session_id, pid, created_at, status, status_context,
+                  status_time, last_seen, last_event_id, name_announced, directory,
+                  transcript_path, launch_context)
+                 VALUES ('nova', ?1, 'sess-original', 4321, 1, 'active', 'tool:work',
+                         2, 3, 17, 1, '/tmp/target-directory', '/tmp/target.jsonl',
+                         '{\"pane_id\":\"target-pane\",\"omp_owner\":{\"pid\":4321,\"incarnation\":\"target-incarnation\"}}')",
+                [tool],
+            )
+            .unwrap();
+        db.set_session_binding("sess-original", "nova").unwrap();
+        db.set_process_binding("process-target", "sess-original", "nova")
+            .unwrap();
+        db.upsert_notify_endpoint("nova", "plugin", 1).unwrap();
+        db.upsert_notify_endpoint("nova", "pty", 2).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, timestamp, instance, data)
+                 VALUES (17, 'life', '2026-01-01T00:00:00Z', 'nova',
+                         '{\"action\":\"created\"}'),
+                        (18, 'message', '2026-01-01T00:00:01Z', 'luna',
+                         '{\"from\":\"luna\",\"text\":\"pending\",\"scope\":\"broadcast\"}')",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn sessionstart_db_state(db: &HcomDb) -> Vec<String> {
+        let tables: Vec<String> = db
+            .conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut state = Vec::new();
+        for table in tables {
+            let mut statement = db
+                .conn()
+                .prepare(&format!("SELECT * FROM \"{table}\""))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .map(|values| format!("{table}: {:?}", values.unwrap()))
+                .collect();
+            rows.sort();
+            state.extend(rows);
+        }
+        state
+    }
+
+    #[test]
+    #[serial]
+    fn selected_lineage_rejects_omp_target_without_mutation() {
+        crate::config::Config::init();
+        for tool in ["omp", "claude"] {
+            let (_dir, _guard, db) = make_isolated_test_db();
+            seed_sessionstart_target(&db, tool);
+            let before = sessionstart_db_state(&db);
+
+            let result = bind_lineage_owner(
+                &db,
+                "nova",
+                "sess-new",
+                "/tmp/new-generation.jsonl",
+                "process-target",
+                Some("nova"),
+            );
+
+            if tool == "omp" {
+                assert!(result.is_err(), "Claude must not attach an OMP generation");
+                assert_eq!(sessionstart_db_state(&db), before);
+                continue;
+            }
+
+            result.unwrap();
+            let instance = db.get_instance_full("nova").unwrap().unwrap();
+            assert_eq!(instance.tool, "claude");
+            assert_eq!(instance.session_id.as_deref(), Some("sess-new"));
+            assert_eq!(instance.transcript_path, "/tmp/new-generation.jsonl");
+            assert_eq!(instance.status, ST_LISTENING);
+            assert_eq!(instance.status_context, "start");
+            assert_eq!(
+                db.get_session_binding("sess-original").unwrap().as_deref(),
+                Some("nova"),
+                "attaching a Claude generation must preserve its ancestor alias"
+            );
+            assert_eq!(
+                db.get_validated_claude_session_owner("sess-new")
+                    .unwrap()
+                    .as_deref(),
+                Some("nova")
+            );
+            assert_eq!(
+                db.get_process_binding_full("process-target").unwrap(),
+                Some((Some("sess-new".to_string()), "nova".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn selected_lineage_rejects_displaced_omp_owner_without_mutation() {
+        crate::config::Config::init();
+        for tool in ["omp", "claude"] {
+            for primary_session in [true, false] {
+                let (_dir, _guard, db) = make_isolated_test_db();
+                seed_sessionstart_target(&db, tool);
+                db.conn()
+                    .execute(
+                        "INSERT INTO instances
+                         (name, tool, session_id, created_at, status, status_context,
+                          status_time, last_event_id, transcript_path)
+                         VALUES ('kolo', 'claude', 'sess-selected', 1, 'active',
+                                 'tool:work', 2, 17, '/tmp/selected.jsonl')",
+                        [],
+                    )
+                    .unwrap();
+                bind_validated_session(&db, "sess-selected", "kolo");
+                db.set_process_binding("process-selected", "sess-selected", "kolo")
+                    .unwrap();
+                db.set_session_binding("sess-target-alias", "nova").unwrap();
+                let incoming_session = if primary_session {
+                    db.conn()
+                        .execute(
+                            "DELETE FROM session_bindings WHERE session_id = 'sess-original'",
+                            [],
+                        )
+                        .unwrap();
+                    "sess-original"
+                } else {
+                    "sess-target-alias"
+                };
+                let before = sessionstart_db_state(&db);
+
+                let result = bind_lineage_owner(
+                    &db,
+                    "kolo",
+                    incoming_session,
+                    "/tmp/selected-generation.jsonl",
+                    "process-selected",
+                    Some("kolo"),
+                );
+
+                if tool == "omp" {
+                    assert!(result.is_err(), "Claude must not displace an OMP owner");
+                    assert_eq!(sessionstart_db_state(&db), before);
+                    continue;
+                }
+
+                result.unwrap();
+                let selected = db.get_instance_full("kolo").unwrap().unwrap();
+                assert_eq!(selected.session_id.as_deref(), Some(incoming_session));
+                assert_eq!(selected.transcript_path, "/tmp/selected-generation.jsonl");
+                assert_eq!(selected.status, ST_LISTENING);
+                assert_eq!(
+                    db.get_validated_claude_session_owner(incoming_session)
+                        .unwrap()
+                        .as_deref(),
+                    Some("kolo")
+                );
+                assert_eq!(
+                    db.get_process_binding_full("process-selected").unwrap(),
+                    Some((Some(incoming_session.to_string()), "kolo".to_string()))
+                );
+                assert_eq!(
+                    db.get_instance_full("nova")
+                        .unwrap()
+                        .unwrap()
+                        .session_id
+                        .as_deref(),
+                    if primary_session {
+                        None
+                    } else {
+                        Some("sess-original")
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn compact_without_process_id_rejects_omp_target_without_mutation() {
+        crate::config::Config::init();
+        for tool in ["omp", "claude"] {
+            let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+            let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+            db.init_db().unwrap();
+            seed_sessionstart_target(&db, tool);
+            let env = std::collections::HashMap::from([(
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().to_string(),
+            )]);
+            let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+            let raw = serde_json::json!({
+                "source": "compact",
+                "session_id": "sess-original",
+                "transcript_path": "/tmp/compacted-generation.jsonl",
+            });
+            let before = sessionstart_db_state(&db);
+
+            if tool == "omp" {
+                for process_id in [None, Some("process-target")] {
+                    assert!(
+                        handle_compact_recovery(&db, &ctx, "sess-original", process_id).is_none()
+                    );
+                    assert_eq!(sessionstart_db_state(&db), before);
+                }
+            }
+
+            let (exit_code, stdout) = handle_sessionstart(
+                &db,
+                &ctx,
+                "sess-original",
+                raw["transcript_path"].as_str(),
+                &raw,
+            );
+
+            assert_eq!(exit_code, 0);
+            if tool == "omp" {
+                assert_eq!(sessionstart_db_state(&db), before);
+                continue;
+            }
+
+            let output: Value = serde_json::from_str(&stdout).unwrap();
+            assert!(
+                output["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hcom start --as nova")
+            );
+            let instance = db.get_instance_full("nova").unwrap().unwrap();
+            assert_eq!(instance.name_announced, 0);
+            assert_eq!(instance.session_id.as_deref(), Some("sess-original"));
+            assert_eq!(instance.transcript_path, "/tmp/target.jsonl");
+            assert_eq!(instance.status, ST_ACTIVE);
+            assert_eq!(instance.last_event_id, 17);
+        }
     }
 
     #[test]

@@ -74,15 +74,29 @@ pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
 
 /// Pre-gate check: should hooks proceed?
 ///
-///
-/// - HCOM-launched (process_id or is_launched) → always proceed
-/// - Otherwise: check if DB has any instances → if not, skip (exit 0, empty output)
+/// - Rejected OMP-target identities and failed ownership lookups never proceed.
+/// - A trusted process_id or launch claim proceeds.
+/// - Otherwise: check if DB has any instances → if not, skip (exit 0, empty output).
 ///
 /// This prevents outputting hints/errors when hcom is installed but not actively used.
 pub fn hook_gate_check(ctx: &mut HcomContext, db: &HcomDb) -> bool {
-    // Sanitize once before the gate reads identity. The context's presenter
-    // tool selects OMP's strict proof or the other hooks' carriage rule.
+    // Identity protection follows an OMP target even when the presenter
+    // claims another tool. A rejected OMP id cannot use the nonempty-DB
+    // activity fallback to reach a generic hook handler.
+    let omp_target = match omp_hook_process_id(ctx) {
+        Some(id) => match crate::proctruth::process_id_targets_omp(db, id) {
+            Ok(target) => target,
+            Err(error) => {
+                log::log_warn("hooks", "gate.owner_db_error", &error.to_string());
+                return false;
+            }
+        },
+        None => false,
+    };
     ctx.trust_process_id(db);
+    if omp_target && ctx.process_id.is_none() {
+        return false;
+    }
     if ctx.process_id.is_some() || ctx.is_launched {
         return true;
     }
@@ -102,6 +116,90 @@ pub fn hook_gate_check(ctx: &mut HcomContext, db: &HcomDb) -> bool {
             true // On DB error, proceed rather than silently disabling hooks
         }
     }
+}
+
+/// OMP's RPC errors are terminal unless SQLite reports lock contention.
+/// In particular, an ownership refusal must never invite a remint/retry.
+pub(crate) fn omp_hook_failure(error: &anyhow::Error) -> (i32, String) {
+    let mut response = serde_json::json!({"error": error.to_string()});
+    if crate::db::is_busy_error(error) {
+        response["transient"] = serde_json::json!(true);
+    }
+    (0, response.to_string())
+}
+
+/// Keep the presented identity available even after the general activity gate
+/// strips it. Only `authenticated_omp_owner`, never this string, proves it.
+pub(crate) fn omp_hook_process_id(ctx: &HcomContext) -> Option<&str> {
+    ctx.raw_env
+        .get("HCOM_PROCESS_ID")
+        .map(String::as_str)
+        .or(ctx.process_id.as_deref())
+        .filter(|id| !id.is_empty())
+}
+
+/// Authorize every recognized OMP lifecycle RPC before activity checks or
+/// handler side effects. Read/format/check also have delivery side effects.
+/// Unknown hooks keep their existing dispatch behavior.
+pub(crate) fn omp_hook_caller_gate(
+    ctx: &HcomContext,
+    db: &HcomDb,
+    hook_name: &str,
+    argv: &[String],
+) -> std::result::Result<Option<crate::proctruth::OmpOwner>, (i32, String)> {
+    if !matches!(
+        hook_name,
+        "omp-start" | "omp-status" | "omp-read" | "omp-beforetool" | "omp-stop" | "omp-role"
+    ) {
+        return Ok(None);
+    }
+    let authorize = || -> Result<crate::proctruth::OmpOwner> {
+        let process_id =
+            omp_hook_process_id(ctx).ok_or_else(|| anyhow::anyhow!("HCOM_PROCESS_ID not set"))?;
+        let owner = crate::instance_binding::authenticated_omp_owner(db, process_id)?;
+        let name = argv
+            .iter()
+            .position(|arg| arg == "--name")
+            .and_then(|index| argv.get(index + 1))
+            .filter(|name| !name.is_empty());
+        if let Some(name) = name {
+            crate::identity::validate_protected_identity_checked(db, name)?;
+        }
+        if hook_name == "omp-start" {
+            return Ok(owner);
+        }
+        let name = name.ok_or_else(|| anyhow::anyhow!("Missing --name"))?;
+        anyhow::ensure!(
+            db.get_process_binding(process_id)?.as_deref() == Some(name.as_str()),
+            "OMP ownership refused: --name is not bound to this process"
+        );
+        let mut row = db
+            .get_instance_full(name)?
+            .ok_or_else(|| anyhow::anyhow!("OMP ownership refused: instance no longer exists"))?;
+        if row.pid.is_none() {
+            // Name/protected checks above must precede even enrollment of the
+            // caller's own predecessor row. The writer repeats them under lock.
+            crate::instance_binding::enroll_pidless_legacy_omp_owner(db, process_id, name, &owner)?;
+            row = db.get_instance_full(name)?.ok_or_else(|| {
+                anyhow::anyhow!("OMP ownership refused: instance no longer exists")
+            })?;
+        }
+        anyhow::ensure!(
+            row.tool == "omp"
+                && row.origin_device_id.as_deref().unwrap_or("").is_empty()
+                && row.pid == Some(i64::from(owner.pid)),
+            "OMP ownership refused: target is not this local OMP owner"
+        );
+        // The binding authenticator checks strict native legacy registration;
+        // PID-less rows are pinned above before this strict owner postcondition.
+        if let Some(stored) = crate::proctruth::stored_omp_owner(&row)? {
+            anyhow::ensure!(stored == owner, "OMP ownership refused: owner changed");
+        }
+        Ok(owner)
+    };
+    authorize()
+        .map(Some)
+        .map_err(|error| omp_hook_failure(&error))
 }
 
 /// Refuse a hook invocation that claims a protected identity through `--name`.

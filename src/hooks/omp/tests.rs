@@ -41,6 +41,64 @@ fn save_test_instance(db: &HcomDb, name: &str, status: &str) {
     db.save_instance_named(name, &row).unwrap();
 }
 
+fn test_omp_owner() -> crate::proctruth::OmpOwner {
+    let pid = std::process::id();
+    crate::proctruth::OmpOwner {
+        pid,
+        incarnation: crate::sys::process::identity(pid).expect("native test process identity"),
+    }
+}
+
+fn test_process_id(suffix: &str) -> String {
+    format!("omp-{}-{suffix}", std::process::id())
+}
+
+fn pin_test_omp_owner(db: &HcomDb, name: &str) {
+    let owner = test_omp_owner();
+    let row = db.get_instance_full(name).unwrap().unwrap();
+    let mut context: serde_json::Map<String, serde_json::Value> = row
+        .launch_context
+        .as_deref()
+        .map(|json| serde_json::from_str(json).unwrap())
+        .unwrap_or_default();
+    context.insert("omp_owner".into(), serde_json::json!(owner));
+    db.update_instance_fields(
+        name,
+        &serde_json::Map::from_iter([
+            ("pid".into(), serde_json::json!(owner.pid)),
+            (
+                "launch_context".into(),
+                serde_json::json!(serde_json::to_string(&context).unwrap()),
+            ),
+        ]),
+    )
+    .unwrap();
+}
+
+fn bind_test_omp_process(db: &HcomDb, name: &str, session: &str, suffix: &str) {
+    pin_test_omp_owner(db, name);
+    db.set_process_binding(&test_process_id(suffix), session, name)
+        .unwrap();
+}
+
+fn start_through_caller_gate(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String) {
+    let owner = match crate::hooks::common::omp_hook_caller_gate(ctx, db, "omp-start", argv) {
+        Ok(Some(owner)) => owner,
+        Err(refusal) => return refusal,
+        Ok(None) => unreachable!("omp-start is recognized"),
+    };
+    handle_start(ctx, db, argv, &owner)
+}
+
+// Only substitute the native caller boundary, scoped to this one invocation.
+// Real process-id shape, mapped-row evidence, owner pins and all writes remain
+// checked by the production binding/readiness path.
+fn start_as_test_owner(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String) {
+    crate::instance_binding::with_omp_binding_owner(test_omp_owner(), || {
+        start_through_caller_gate(ctx, db, argv)
+    })
+}
+
 fn bind_probe() -> TcpListener {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -203,26 +261,12 @@ fn plugin_keeps_ack_gate_until_command_succeeds() {
 }
 
 #[test]
-fn plugin_rebinds_identity_on_session_branch() {
-    // /branch mints a new session id and emits only session_branch (not
-    // session_switch); the plugin must reset+rebind or delivery dies.
-    // keepOwner retains process-env identity ownership so nested task
-    // extensions still skip bind while this instance rebinds.
-    let idx = PLUGIN_SOURCE
-        .find("pi.on(\"session_branch\"")
-        .expect("session_branch handler present");
-    let handler = &PLUGIN_SOURCE[idx..];
-    assert!(handler.contains("resetBinding({ keepOwner: true })"));
-    assert!(handler.contains("bindIdentity(ctx)"));
-}
-
-#[test]
 fn start_handler_registering_plugin_notify_wakes_pty_delivery_loop() {
     let _env = isolated_omp_env();
     let (db, path) = setup_test_db();
     let temp = tempfile::TempDir::new().unwrap();
     save_test_instance(&db, "luna", ST_ACTIVE);
-    db.set_process_binding("pid-omp", "", "luna").unwrap();
+    bind_test_omp_process(&db, "luna", "", "notify");
 
     let pty_listener = bind_probe();
     let pty_port = pty_listener.local_addr().unwrap().port();
@@ -232,13 +276,13 @@ fn start_handler_registering_plugin_notify_wakes_pty_delivery_loop() {
     let plugin_port = plugin_listener.local_addr().unwrap().port();
 
     let env = std::collections::HashMap::from([
-        ("HCOM_PROCESS_ID".to_string(), "pid-omp".to_string()),
+        ("HCOM_PROCESS_ID".to_string(), test_process_id("notify")),
         ("HCOM_LAUNCHED".to_string(), "1".to_string()),
         ("HCOM_TOOL".to_string(), "omp".to_string()),
     ]);
     let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
 
-    let (code, output) = handle_start(
+    let (code, output) = start_as_test_owner(
         &ctx,
         &db,
         &[
@@ -288,14 +332,14 @@ fn omp_role_registers_delivery_role_for_the_bound_session() {
     let (db, path) = setup_test_db();
     let temp = tempfile::TempDir::new().unwrap();
     save_test_instance(&db, "luna", ST_ACTIVE);
-    db.set_process_binding("pid-omp", "", "luna").unwrap();
+    bind_test_omp_process(&db, "luna", "", "role");
     let env = std::collections::HashMap::from([
-        ("HCOM_PROCESS_ID".to_string(), "pid-omp".to_string()),
+        ("HCOM_PROCESS_ID".to_string(), test_process_id("role")),
         ("HCOM_LAUNCHED".to_string(), "1".to_string()),
         ("HCOM_TOOL".to_string(), "omp".to_string()),
     ]);
     let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
-    let (code, output) = handle_start(
+    let (code, output) = start_as_test_owner(
         &ctx,
         &db,
         &["--session-id".to_string(), "sid-omp".to_string()],
@@ -360,7 +404,7 @@ fn plugin_notify_registration_failure_does_not_wake_delivery_loop() {
 
     let plugin_listener = bind_probe();
     let plugin_port = plugin_listener.local_addr().unwrap().port();
-    upsert_plugin_notify_endpoint(&db, "luna", plugin_port);
+    assert!(upsert_plugin_notify_endpoint(&db, "luna", plugin_port).is_err());
 
     assert!(!db.has_notify_endpoint_kind("luna", "plugin"));
     assert!(
@@ -429,6 +473,7 @@ fn start_handler_uses_central_binding_for_existing_session() {
     canonical.insert("created_at".into(), serde_json::json!(1.0));
     db.save_instance_named("miso", &canonical).unwrap();
     db.rebind_session("sid-123", "miso").unwrap();
+    pin_test_omp_owner(&db, "miso");
 
     let mut placeholder = serde_json::Map::new();
     placeholder.insert("name".into(), serde_json::json!("temp"));
@@ -438,16 +483,16 @@ fn start_handler_uses_central_binding_for_existing_session() {
     placeholder.insert("status_detail".into(), serde_json::json!(""));
     placeholder.insert("created_at".into(), serde_json::json!(1.0));
     db.save_instance_named("temp", &placeholder).unwrap();
-    db.set_process_binding("pid-123", "", "temp").unwrap();
+    bind_test_omp_process(&db, "temp", "", "canonical");
 
     let env = std::collections::HashMap::from([
-        ("HCOM_PROCESS_ID".to_string(), "pid-123".to_string()),
+        ("HCOM_PROCESS_ID".to_string(), test_process_id("canonical")),
         ("HCOM_LAUNCHED".to_string(), "1".to_string()),
         ("HCOM_TOOL".to_string(), "omp".to_string()),
     ]);
     let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
 
-    let (code, output) = handle_start(
+    let (code, output) = start_as_test_owner(
         &ctx,
         &db,
         &[
@@ -462,7 +507,8 @@ fn start_handler_uses_central_binding_for_existing_session() {
     assert_eq!(response.get("name").and_then(|v| v.as_str()), Some("miso"));
     assert!(db.get_instance_full("temp").unwrap().is_none());
     assert_eq!(
-        db.get_process_binding("pid-123").unwrap(),
+        db.get_process_binding(&test_process_id("canonical"))
+            .unwrap(),
         Some("miso".to_string())
     );
 
@@ -501,13 +547,13 @@ fn start_handler_restores_swept_row_from_stopped_snapshot() {
     .unwrap();
 
     let env = std::collections::HashMap::from([
-        ("HCOM_PROCESS_ID".to_string(), "omp-777-aa-bb".to_string()),
+        ("HCOM_PROCESS_ID".to_string(), test_process_id("swept")),
         ("HCOM_LAUNCHED".to_string(), "1".to_string()),
         ("HCOM_TOOL".to_string(), "omp".to_string()),
     ]);
     let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
 
-    let (code, output) = handle_start(
+    let (code, output) = start_as_test_owner(
         &ctx,
         &db,
         &[
@@ -529,7 +575,7 @@ fn start_handler_restores_swept_row_from_stopped_snapshot() {
         Some("valo".to_string())
     );
     assert_eq!(
-        db.get_process_binding("omp-777-aa-bb").unwrap(),
+        db.get_process_binding(&test_process_id("swept")).unwrap(),
         Some("valo".to_string())
     );
     // No minted identity: valo is the only row.
@@ -764,8 +810,7 @@ fn start_rebinds_via_process_binding_after_soft_stop() {
             [],
         )
         .unwrap();
-    db.set_process_binding("pid-recover", "sid-old", "miso")
-        .unwrap();
+    bind_test_omp_process(&db, "miso", "sid-old", "rebind");
     db.rebind_session("sid-old", "miso").unwrap();
 
     let (stop_code, _) = handle_stop(
@@ -778,18 +823,18 @@ fn start_rebinds_via_process_binding_after_soft_stop() {
     );
     assert_eq!(stop_code, 0);
     assert_eq!(
-        db.get_process_binding("pid-recover").unwrap(),
+        db.get_process_binding(&test_process_id("rebind")).unwrap(),
         Some("miso".to_string())
     );
 
     let env = std::collections::HashMap::from([
-        ("HCOM_PROCESS_ID".to_string(), "pid-recover".to_string()),
+        ("HCOM_PROCESS_ID".to_string(), test_process_id("rebind")),
         ("HCOM_LAUNCHED".to_string(), "1".to_string()),
         ("HCOM_TOOL".to_string(), "omp".to_string()),
     ]);
     let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
 
-    let (code, output) = handle_start(
+    let (code, output) = start_as_test_owner(
         &ctx,
         &db,
         &[
@@ -804,7 +849,7 @@ fn start_rebinds_via_process_binding_after_soft_stop() {
     let response: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(response.get("name").and_then(|v| v.as_str()), Some("miso"));
     assert_eq!(
-        db.get_process_binding("pid-recover").unwrap(),
+        db.get_process_binding(&test_process_id("rebind")).unwrap(),
         Some("miso".to_string())
     );
     assert_eq!(
@@ -819,28 +864,29 @@ fn start_rebinds_via_process_binding_after_soft_stop() {
 }
 
 #[test]
-fn start_recovers_binding_via_instance_name_when_process_binding_cleared() {
+fn start_recovers_active_same_owner_binding_when_process_mapping_cleared() {
     let _env = isolated_omp_env();
     let (db, path) = setup_test_db();
     let temp = tempfile::TempDir::new().unwrap();
     save_test_instance(&db, "miso", ST_LISTENING);
     db.conn()
         .execute(
-            "UPDATE instances SET session_id = 'sid-old', status = 'inactive' WHERE name = 'miso'",
+            "UPDATE instances SET session_id = 'sid-old' WHERE name = 'miso'",
             [],
         )
         .unwrap();
     db.rebind_session("sid-old", "miso").unwrap();
+    pin_test_omp_owner(&db, "miso");
 
     let env = std::collections::HashMap::from([
-        ("HCOM_PROCESS_ID".to_string(), "pid-recover".to_string()),
+        ("HCOM_PROCESS_ID".to_string(), test_process_id("repair")),
         ("HCOM_INSTANCE_NAME".to_string(), "miso".to_string()),
         ("HCOM_LAUNCHED".to_string(), "1".to_string()),
         ("HCOM_TOOL".to_string(), "omp".to_string()),
     ]);
     let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
 
-    let (code, output) = handle_start(
+    let (code, output) = start_as_test_owner(
         &ctx,
         &db,
         &[
@@ -855,7 +901,7 @@ fn start_recovers_binding_via_instance_name_when_process_binding_cleared() {
     let response: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(response.get("name").and_then(|v| v.as_str()), Some("miso"));
     assert_eq!(
-        db.get_process_binding("pid-recover").unwrap(),
+        db.get_process_binding(&test_process_id("repair")).unwrap(),
         Some("miso".to_string())
     );
     assert_eq!(
@@ -872,10 +918,7 @@ fn start_recovers_binding_via_instance_name_when_process_binding_cleared() {
 /// false because no launcher issued the id.
 fn plain_session_ctx(cwd: &std::path::Path) -> HcomContext {
     let env = std::collections::HashMap::from([
-        (
-            "HCOM_PROCESS_ID".to_string(),
-            "omp-4242-plain-a".to_string(),
-        ),
+        ("HCOM_PROCESS_ID".to_string(), test_process_id("plain")),
         ("HCOM_LAUNCHED".to_string(), "1".to_string()),
         ("HCOM_TOOL".to_string(), "omp".to_string()),
     ]);
@@ -895,16 +938,21 @@ fn plain_session_without_opt_in_does_not_mint() {
     let (_dir, home, _guard) = isolated_omp_env();
     let (db, path) = setup_test_db();
 
-    let (code, output) = handle_start(
+    let (code, output) = start_as_test_owner(
         &plain_session_ctx(&home),
         &db,
         &["--session-id".to_string(), "sid-plain".to_string()],
     );
 
     assert_eq!(code, 0);
-    assert!(output.contains("No instance bound"), "got: {output}");
+    let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert!(response["error"].is_string(), "{output}");
+    assert!(response.get("transient").is_none(), "{output}");
     assert_eq!(instance_count(&db), 0);
-    assert_eq!(db.get_process_binding("omp-4242-plain-a").unwrap(), None);
+    assert_eq!(
+        db.get_process_binding(&test_process_id("plain")).unwrap(),
+        None
+    );
     assert_eq!(db.get_session_binding("sid-plain").unwrap(), None);
 
     cleanup(path);
@@ -920,7 +968,7 @@ fn plain_session_with_opt_in_mints_identity() {
     .unwrap();
     let (db, path) = setup_test_db();
 
-    let (code, output) = handle_start(
+    let (code, output) = start_as_test_owner(
         &plain_session_ctx(&home),
         &db,
         &["--session-id".to_string(), "sid-plain".to_string()],
@@ -934,7 +982,7 @@ fn plain_session_with_opt_in_mints_identity() {
         .unwrap_or_else(|| panic!("expected a minted name, got: {output}"))
         .to_string();
     assert_eq!(
-        db.get_process_binding("omp-4242-plain-a").unwrap(),
+        db.get_process_binding(&test_process_id("plain")).unwrap(),
         Some(name.clone())
     );
     assert_eq!(
@@ -960,8 +1008,8 @@ fn start_hook_replaces_stale_installed_plugin() {
     std::fs::write(&plugin, r#"const x = customType: "hcom-bootstrap";"#).unwrap();
     let (db, path) = setup_test_db();
 
-    // Refused start (plain session, no opt-in): the refresh still happens.
-    let (code, _) = handle_start(
+    // Authenticated plain session without opt-in: policy refusal still refreshes.
+    let (code, _) = start_as_test_owner(
         &plain_session_ctx(&home),
         &db,
         &["--session-id".to_string(), "sid-refresh".to_string()],
@@ -984,54 +1032,662 @@ fn recover_rejects_non_omp_tool() {
         )
         .unwrap();
 
-    assert_eq!(
-        crate::instance_binding::recover_process_binding_for_instance(
-            &db, "luna", "sid-new", "pid-1"
-        ),
-        None
-    );
+    crate::instance_binding::with_omp_binding_owner(test_omp_owner(), || {
+        assert!(
+            crate::instance_binding::recover_omp_process_binding_for_instance(
+                &db,
+                "luna",
+                "sid-new",
+                &test_process_id("repair-other-tool")
+            )
+            .is_err()
+        );
+    });
 
     cleanup(path);
 }
 
 #[test]
-fn recover_rejects_active_instance() {
+fn recover_rejects_unproven_active_instance() {
     let (db, path) = setup_test_db();
     save_test_instance(&db, "luna", ST_LISTENING);
 
-    assert_eq!(
-        crate::instance_binding::recover_process_binding_for_instance(
-            &db, "luna", "sid-new", "pid-1"
-        ),
-        None
-    );
+    crate::instance_binding::with_omp_binding_owner(test_omp_owner(), || {
+        assert!(
+            crate::instance_binding::recover_omp_process_binding_for_instance(
+                &db,
+                "luna",
+                "sid-new",
+                &test_process_id("repair-unproven")
+            )
+            .is_err()
+        );
+    });
 
     cleanup(path);
 }
 
+const OMP_CALLER_GATE_CASES: &[(&str, &[&str])] = &[
+    (
+        "omp-start",
+        &["--session-id", "sid-own", "--notify-port", "32101"],
+    ),
+    ("omp-status", &["--name", "luna", "--status", "listening"]),
+    ("omp-read", &["--name", "luna"]),
+    ("omp-read", &["--name", "luna", "--format"]),
+    ("omp-read", &["--name", "luna", "--check"]),
+    ("omp-read", &["--name", "luna", "--ack", "--up-to", "99"]),
+    ("omp-beforetool", &["--name", "luna", "--tool", "bash"]),
+    ("omp-stop", &["--name", "luna", "--soft"]),
+    ("omp-stop", &["--name", "luna"]),
+    (
+        "omp-role",
+        &[
+            "--name",
+            "luna",
+            "--session-id",
+            "sid-own",
+            "--role",
+            "conductor",
+        ],
+    ),
+];
+
 #[test]
-fn plugin_source_pins_soft_stop_polish_markers() {
-    assert!(PLUGIN_SOURCE.contains("Symbol.for(\"hcom.omp.identity\")"));
-    assert!(PLUGIN_SOURCE.contains("stopReconcileTimer"));
-    assert!(PLUGIN_SOURCE.contains("tearingDown"));
-    assert!(PLUGIN_SOURCE.contains("HCOM_TIMEOUT_MS"));
-    assert!(PLUGIN_SOURCE.contains("1800"));
-    let shutdown_idx = PLUGIN_SOURCE
-        .find("pi.on(\"session_shutdown\"")
-        .expect("session_shutdown handler present");
-    let handler = &PLUGIN_SOURCE[shutdown_idx..];
-    assert!(
-        handler.contains("keepOwner = !softStopOk"),
-        "failed soft-stop path must keepOwner"
+fn caller_gate_refuses_missing_or_borrowed_ids_for_every_hook_mode() {
+    let (db, path) = setup_test_db();
+    save_test_instance(&db, "luna", ST_ACTIVE);
+    bind_test_omp_process(&db, "luna", "sid-own", "borrowed");
+    let launcher = "550e8400-e29b-41d4-a716-446655440123";
+    db.set_process_binding(launcher, "sid-own", "luna").unwrap();
+    let owner = test_omp_owner();
+    let descendant = crate::proctruth::OmpOwner {
+        pid: owner.pid + 1,
+        incarnation: "descendant-native-incarnation".to_string(),
+    };
+    let before = db.get_instance("luna").unwrap().unwrap();
+
+    for identity in [
+        None,
+        Some(test_process_id("borrowed")),
+        Some(launcher.to_string()),
+    ] {
+        let env = identity
+            .as_ref()
+            .map(|id| std::collections::HashMap::from([("HCOM_PROCESS_ID".into(), id.clone())]))
+            .unwrap_or_default();
+        let mut ctx = HcomContext::from_env(&env, std::env::temp_dir());
+        // Entry-point sanitation must not turn a present refused id into an
+        // absent-id/activity fallback on a database containing other rows.
+        ctx.process_id = None;
+        crate::instance_binding::with_omp_binding_owner(descendant.clone(), || {
+            for (hook, args) in OMP_CALLER_GATE_CASES {
+                let argv: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+                let (code, output) =
+                    crate::hooks::common::omp_hook_caller_gate(&ctx, &db, hook, &argv).unwrap_err();
+                let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(code, 0, "{hook}: {output}");
+                assert!(response["error"].is_string(), "{hook}: {output}");
+                assert!(response.get("transient").is_none(), "{hook}: {output}");
+            }
+        });
+    }
+    assert_eq!(db.get_instance("luna").unwrap().unwrap(), before);
+    assert!(!db.has_notify_endpoint_kind("luna", "plugin"));
+    cleanup(path);
+}
+
+#[test]
+fn caller_gate_requires_the_authenticated_process_exact_mapped_name() {
+    let (db, path) = setup_test_db();
+    save_test_instance(&db, "luna", ST_ACTIVE);
+    save_test_instance(&db, "other", ST_ACTIVE);
+    bind_test_omp_process(&db, "other", "sid-other", "name-mismatch");
+    pin_test_omp_owner(&db, "luna");
+    let env = std::collections::HashMap::from([(
+        "HCOM_PROCESS_ID".to_string(),
+        test_process_id("name-mismatch"),
+    )]);
+    let ctx = HcomContext::from_env(&env, std::env::temp_dir());
+    crate::instance_binding::with_omp_binding_owner(test_omp_owner(), || {
+        for (hook, args) in OMP_CALLER_GATE_CASES
+            .iter()
+            .filter(|(hook, _)| *hook != "omp-start")
+        {
+            let argv: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            let (_, output) =
+                crate::hooks::common::omp_hook_caller_gate(&ctx, &db, hook, &argv).unwrap_err();
+            let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert!(response["error"].is_string(), "{hook}: {output}");
+            assert!(response.get("transient").is_none(), "{hook}: {output}");
+        }
+    });
+    cleanup(path);
+}
+
+#[test]
+#[serial_test::serial]
+fn pidless_legacy_omp_name_refusal_does_not_enroll_mapped_identity() {
+    let (_dir, home, _guard) = isolated_omp_env();
+    let (db, path) = setup_test_db();
+    let process_id = test_process_id("pidless-name-refusal");
+    let name = crate::instance_binding::create_orphaned_pty_identity(
+        &db,
+        "sid-legacy-name",
+        Some(&process_id),
+        "omp",
+    )
+    .unwrap();
+    let row = db.get_instance_full(&name).unwrap().unwrap();
+    assert_eq!(row.pid, None);
+    assert_eq!(crate::proctruth::stored_omp_owner(&row).unwrap(), None);
+    db.upsert_notify_endpoint(&name, "plugin", 54_311).unwrap();
+    let before = db.get_instance(&name).unwrap().unwrap();
+    let binding = db.get_process_binding_full(&process_id).unwrap();
+    let registered = db.process_bindings_registered(&name).unwrap();
+    let ctx = HcomContext::from_env(
+        &std::collections::HashMap::from([("HCOM_PROCESS_ID".into(), process_id.clone())]),
+        home,
     );
-    assert!(
-        handler.contains("reg.tearingDown = false"),
-        "failed soft-stop keepOwner must clear tearingDown so owner can rebind"
+    crate::instance_binding::with_omp_binding_owner(test_omp_owner(), || {
+        assert_eq!(
+            crate::instance_binding::authenticated_omp_owner(&db, &process_id).unwrap(),
+            test_omp_owner(),
+        );
+        for refused_name in [None, Some("another-seat"), Some("bigboss")] {
+            for hook in ["omp-read", "omp-status", "omp-stop", "omp-role"] {
+                let argv = refused_name
+                    .map(|name| vec!["--name".into(), name.into()])
+                    .unwrap_or_default();
+                let (_, output) =
+                    crate::hooks::common::omp_hook_caller_gate(&ctx, &db, hook, &argv).unwrap_err();
+                let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert!(response["error"].is_string(), "{hook}: {output}");
+                assert!(response.get("transient").is_none(), "{hook}: {output}");
+                assert_eq!(db.get_instance(&name).unwrap().unwrap(), before);
+                assert_eq!(db.get_process_binding_full(&process_id).unwrap(), binding);
+                assert_eq!(db.process_bindings_registered(&name).unwrap(), registered);
+                assert_eq!(
+                    db.get_session_binding("sid-legacy-name").unwrap(),
+                    Some(name.clone()),
+                );
+                let port: i64 = db
+                    .conn()
+                    .query_row(
+                        "SELECT port FROM notify_endpoints WHERE instance = ? AND kind = 'plugin'",
+                        rusqlite::params![name],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(port, 54_311);
+            }
+        }
+    });
+    cleanup(path);
+}
+
+#[test]
+fn caller_gate_accepts_native_pins_and_verified_legacy_registration() {
+    let (db, path) = setup_test_db();
+    save_test_instance(&db, "luna", ST_ACTIVE);
+    bind_test_omp_process(&db, "luna", "sid-own", "gate-owner");
+    let env = std::collections::HashMap::from([(
+        "HCOM_PROCESS_ID".to_string(),
+        test_process_id("gate-owner"),
+    )]);
+    let mut ctx = HcomContext::from_env(&env, std::env::temp_dir());
+    ctx.process_id = None;
+    crate::instance_binding::with_omp_binding_owner(test_omp_owner(), || {
+        for legacy in [false, true] {
+            if legacy {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET launch_context = '{}' WHERE name = 'luna'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            for (hook, args) in OMP_CALLER_GATE_CASES {
+                let argv: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+                assert_eq!(
+                    crate::hooks::common::omp_hook_caller_gate(&ctx, &db, hook, &argv).unwrap(),
+                    Some(test_omp_owner()),
+                    "{hook}, legacy={legacy}"
+                );
+            }
+        }
+        db.delete_process_binding(&test_process_id("gate-owner"))
+            .unwrap();
+        assert_eq!(
+            crate::hooks::common::omp_hook_caller_gate(&ctx, &db, "omp-start", &[]).unwrap(),
+            Some(test_omp_owner())
+        );
+        assert!(
+            crate::hooks::common::omp_hook_caller_gate(
+                &ctx,
+                &db,
+                "omp-status",
+                &["--name".into(), "luna".into()]
+            )
+            .is_err()
+        );
+    });
+    // Unknown RPCs do not acquire an identity requirement.
+    let empty = HcomContext::from_env(&Default::default(), std::env::temp_dir());
+    assert_eq!(
+        crate::hooks::common::omp_hook_caller_gate(&empty, &db, "omp-unknown", &[]).unwrap(),
+        None
     );
-    assert!(
-        PLUGIN_SOURCE.contains("reg.tearingDown && !ownsIdentity"),
-        "tearingDown must not block the owning extension from rebinding"
+    cleanup(path);
+}
+
+#[test]
+fn generic_activity_gate_cannot_reenable_an_omp_target_after_identity_stripping() {
+    let _env = isolated_omp_env();
+    let (db, path) = setup_test_db();
+    save_test_instance(&db, "luna", ST_ACTIVE);
+    bind_test_omp_process(&db, "luna", "sid-own", "activity");
+    let launcher = "550e8400-e29b-41d4-a716-446655440124";
+    db.set_process_binding(launcher, "sid-own", "luna").unwrap();
+    for id in [test_process_id("activity"), launcher.to_string()] {
+        let env = std::collections::HashMap::from([
+            ("HCOM_PROCESS_ID".to_string(), id),
+            ("HCOM_TOOL".to_string(), "claude".to_string()),
+        ]);
+        let mut ctx = HcomContext::from_env(&env, std::env::temp_dir());
+        ctx.process_id = None;
+        assert!(!crate::hooks::common::hook_gate_check(&mut ctx, &db));
+    }
+    let generic_env = std::collections::HashMap::from([(
+        "HCOM_PROCESS_ID".to_string(),
+        "generic-session".to_string(),
+    )]);
+    let mut generic = HcomContext::from_env(&generic_env, std::env::temp_dir());
+    assert!(crate::hooks::common::hook_gate_check(&mut generic, &db));
+    db.conn()
+        .execute_batch("DROP TABLE process_bindings")
+        .unwrap();
+    let env =
+        std::collections::HashMap::from([("HCOM_PROCESS_ID".to_string(), launcher.to_string())]);
+    let mut failed_lookup = HcomContext::from_env(&env, std::env::temp_dir());
+    assert!(!crate::hooks::common::hook_gate_check(
+        &mut failed_lookup,
+        &db
+    ));
+    cleanup(path);
+}
+
+#[test]
+fn caller_gate_preserves_sql_contention_after_identity_stripping() {
+    let (db, path) = setup_test_db();
+    save_test_instance(&db, "luna", ST_ACTIVE);
+    db.conn()
+        .execute_batch("PRAGMA journal_mode=DELETE; PRAGMA busy_timeout=0;")
+        .unwrap();
+    let locker = rusqlite::Connection::open(&path).unwrap();
+    locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let env =
+        std::collections::HashMap::from([("HCOM_PROCESS_ID".to_string(), test_process_id("busy"))]);
+    let mut ctx = HcomContext::from_env(&env, std::env::temp_dir());
+    ctx.process_id = None;
+    let (code, output) =
+        crate::hooks::common::omp_hook_caller_gate(&ctx, &db, "omp-start", &[]).unwrap_err();
+    let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(code, 0);
+    assert!(response["error"].is_string(), "{output}");
+    assert_eq!(response["transient"], true);
+    locker.execute_batch("ROLLBACK").unwrap();
+    drop(locker);
+    cleanup(path);
+}
+
+#[test]
+fn protected_name_contention_retains_its_sqlite_type_for_hook_retry() {
+    let _env = isolated_omp_env();
+    let (db, path) = setup_test_db();
+    db.conn()
+        .execute_batch("PRAGMA journal_mode=DELETE; PRAGMA busy_timeout=0;")
+        .unwrap();
+    let locker = rusqlite::Connection::open(&path).unwrap();
+    locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    // Exercise the protected-name lookup directly, so an earlier caller-auth
+    // query cannot mask a string-erasing validator on the hook error path.
+    let error = crate::identity::validate_protected_identity_checked(&db, "luna").unwrap_err();
+    assert!(crate::db::is_busy_error(&error));
+    let (code, output) = crate::hooks::common::omp_hook_failure(&error);
+    let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(code, 0);
+    assert!(response["error"].is_string());
+    assert_eq!(response["transient"], true);
+    locker.execute_batch("ROLLBACK").unwrap();
+    drop(locker);
+    cleanup(path);
+}
+
+#[test]
+fn start_readiness_fences_both_newer_process_mapping_and_row_session() {
+    let (_dir, home, _guard) = isolated_omp_env();
+    for row_only_fence in [false, true] {
+        let (db, path) = setup_test_db();
+        save_test_instance(&db, "luna", ST_ACTIVE);
+        bind_test_omp_process(&db, "luna", "", "stale-readiness");
+        let process_id = test_process_id("stale-readiness");
+        let env =
+            std::collections::HashMap::from([("HCOM_PROCESS_ID".to_string(), process_id.clone())]);
+        let ctx = HcomContext::from_env(&env, home.clone());
+        crate::instance_binding::with_omp_binding_owner(test_omp_owner(), || {
+            assert_eq!(
+                crate::instance_binding::bind_omp_session_to_process(&db, "sid-old", &process_id)
+                    .unwrap(),
+                Some("luna".to_string())
+            );
+            assert_eq!(
+                crate::instance_binding::bind_omp_session_to_process(&db, "sid-new", &process_id)
+                    .unwrap(),
+                Some("luna".to_string())
+            );
+            if row_only_fence {
+                // A matching process binding alone does not authorize
+                // completion if the row already belongs to a newer session.
+                db.set_process_binding(&process_id, "sid-old", "luna")
+                    .unwrap();
+            }
+            db.conn()
+                .execute(
+                    "UPDATE instances SET directory = 'new-dir', transcript_path = 'new.jsonl',
+                 status = 'active', last_event_id = 73 WHERE name = 'luna'",
+                    [],
+                )
+                .unwrap();
+            db.upsert_notify_endpoint("luna", "plugin", 32102).unwrap();
+            let before = db.get_instance("luna").unwrap().unwrap();
+            let argv: Vec<String> = [
+                "--cwd",
+                "old-dir",
+                "--transcript-path",
+                "old.jsonl",
+                "--notify-port",
+                "32101",
+            ]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+            assert!(
+                super::handlers::complete_start_readiness(
+                    &ctx,
+                    &db,
+                    &argv,
+                    "luna",
+                    "sid-old",
+                    &process_id,
+                    &test_omp_owner()
+                )
+                .is_err()
+            );
+            assert_eq!(db.get_instance("luna").unwrap().unwrap(), before);
+            let port: u16 = db
+                .conn()
+                .query_row(
+                    "SELECT port FROM notify_endpoints WHERE instance = 'luna' AND kind = 'plugin'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(port, 32102);
+        });
+        cleanup(path);
+    }
+}
+
+#[test]
+fn start_replays_a_committed_bind_after_endpoint_failure_without_reminting() {
+    let (_dir, home, _guard) = isolated_omp_env();
+    let (db, path) = setup_test_db();
+    save_test_instance(&db, "luna", ST_ACTIVE);
+    bind_test_omp_process(&db, "luna", "", "readiness-replay");
+    let process_id = test_process_id("readiness-replay");
+    let env =
+        std::collections::HashMap::from([("HCOM_PROCESS_ID".to_string(), process_id.clone())]);
+    let ctx = HcomContext::from_env(&env, home.clone());
+    db.conn()
+        .execute(
+            "UPDATE instances SET directory = 'before-dir', transcript_path = 'before.jsonl',
+         last_event_id = 42 WHERE name = 'luna'",
+            [],
+        )
+        .unwrap();
+    let listener = bind_probe();
+    db.upsert_notify_endpoint("luna", "pty", listener.local_addr().unwrap().port())
+        .unwrap();
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_start_endpoint BEFORE INSERT ON notify_endpoints
+         WHEN NEW.kind = 'plugin' BEGIN SELECT RAISE(ABORT, 'endpoint blocked'); END;",
+        )
+        .unwrap();
+    let argv: Vec<String> = [
+        "--session-id",
+        "sid-ready",
+        "--cwd",
+        "after-dir",
+        "--transcript-path",
+        "after.jsonl",
+        "--notify-port",
+        "32103",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    let (code, output) = start_as_test_owner(&ctx, &db, &argv);
+    let failed: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(code, 0);
+    assert!(failed["error"].is_string(), "{output}");
+    assert!(failed.get("transient").is_none(), "{output}");
+    assert!(failed.get("name").is_none(), "{output}");
+    assert_eq!(
+        db.get_process_binding_full(&process_id).unwrap(),
+        Some((Some("sid-ready".to_string()), "luna".to_string()))
     );
+    let before_replay = db.get_instance_full("luna").unwrap().unwrap();
+    assert_eq!(before_replay.directory, "before-dir");
+    assert_eq!(before_replay.transcript_path, "before.jsonl");
+    assert_eq!(before_replay.last_event_id, 42);
+    assert!(!db.has_notify_endpoint_kind("luna", "plugin"));
+    assert!(!await_connect(&listener, Duration::from_millis(100)));
+
+    db.conn()
+        .execute_batch("DROP TRIGGER fail_start_endpoint")
+        .unwrap();
+    for _ in 0..2 {
+        let (code, output) = start_as_test_owner(&ctx, &db, &argv);
+        let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(response["name"], "luna", "{output}");
+        assert_eq!(response["session_id"], "sid-ready", "{output}");
+        let ready = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(ready.status, ST_LISTENING);
+        assert_eq!(ready.session_id.as_deref(), Some("sid-ready"));
+        assert_eq!(ready.last_event_id, 42);
+        assert_eq!(ready.directory, "after-dir");
+        assert_eq!(ready.transcript_path, "after.jsonl");
+        assert_eq!(
+            crate::proctruth::stored_omp_owner(&ready).unwrap(),
+            Some(test_omp_owner())
+        );
+        assert_eq!(instance_count(&db), 1);
+    }
+    assert!(await_connect(&listener, Duration::from_millis(500)));
+    cleanup(path);
+}
+
+#[test]
+fn readiness_status_write_failure_rolls_back_metadata_and_endpoint() {
+    let (_dir, home, _guard) = isolated_omp_env();
+    let (db, path) = setup_test_db();
+    save_test_instance(&db, "luna", ST_ACTIVE);
+    bind_test_omp_process(&db, "luna", "sid-status", "status-failure");
+    db.conn()
+        .execute(
+            "UPDATE instances SET session_id = 'sid-status', directory = 'before-dir',
+         last_event_id = 42 WHERE name = 'luna'",
+            [],
+        )
+        .unwrap();
+    let process_id = test_process_id("status-failure");
+    let env =
+        std::collections::HashMap::from([("HCOM_PROCESS_ID".to_string(), process_id.clone())]);
+    let ctx = HcomContext::from_env(&env, home);
+    let before = db.get_instance("luna").unwrap().unwrap();
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_start_status BEFORE UPDATE OF status ON instances
+         WHEN NEW.status = 'listening' BEGIN SELECT RAISE(ABORT, 'status blocked'); END;",
+        )
+        .unwrap();
+    let argv: Vec<String> = ["--cwd", "after-dir", "--notify-port", "32104"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    crate::instance_binding::with_omp_binding_owner(test_omp_owner(), || {
+        let error = match super::handlers::complete_start_readiness(
+            &ctx,
+            &db,
+            &argv,
+            "luna",
+            "sid-status",
+            &process_id,
+            &test_omp_owner(),
+        ) {
+            Ok(_) => panic!("failed listening write reported readiness"),
+            Err(error) => error,
+        };
+        let (code, output) = crate::hooks::common::omp_hook_failure(&error);
+        let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(code, 0);
+        assert!(response["error"].is_string());
+        assert!(response.get("transient").is_none());
+    });
+    assert_eq!(db.get_instance("luna").unwrap().unwrap(), before);
+    assert!(!db.has_notify_endpoint_kind("luna", "plugin"));
+    cleanup(path);
+}
+
+#[test]
+fn refused_start_does_not_refresh_a_plugin_or_create_an_identity() {
+    let (_dir, home, _guard) = isolated_omp_env();
+    let plugin = get_omp_plugin_path();
+    std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+    let stale = r#"const x = customType: "hcom-bootstrap";"#;
+    std::fs::write(&plugin, stale).unwrap();
+    let (db, path) = setup_test_db();
+    let mut ctx = plain_session_ctx(&home);
+    ctx.raw_env
+        .insert("HCOM_PROCESS_ID".into(), "omp-0-borrowed".into());
+    ctx.process_id = None;
+    let (code, output) = start_through_caller_gate(
+        &ctx,
+        &db,
+        &["--session-id".to_string(), "sid-refused".to_string()],
+    );
+    let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(code, 0);
+    assert!(response["error"].is_string());
+    assert!(response.get("transient").is_none());
+    assert_eq!(std::fs::read_to_string(&plugin).unwrap(), stale);
+    assert_eq!(instance_count(&db), 0);
+    cleanup(path);
+}
+
+#[test]
+fn failed_bind_or_named_repair_never_falls_through_to_mint() {
+    let (_dir, home, _guard) = isolated_omp_env();
+    std::fs::write(
+        crate::paths::config_toml_path(),
+        "[launch.omp]\nplain_sessions = true\n",
+    )
+    .unwrap();
+    for canonical in [false, true] {
+        let (db, path) = setup_test_db();
+        save_test_instance(&db, "other", ST_ACTIVE);
+        let owner = test_omp_owner();
+        let stale = serde_json::json!({
+            "omp_owner": {
+                "pid": owner.pid,
+                "incarnation": format!("{}-not-this-owner", owner.incarnation),
+            },
+        });
+        db.conn()
+            .execute(
+                "UPDATE instances SET pid = ?1, launch_context = ?2, session_id = 'sid-other'
+             WHERE name = 'other'",
+                rusqlite::params![i64::from(owner.pid), stale.to_string()],
+            )
+            .unwrap();
+        if canonical {
+            db.rebind_session("sid-other", "other").unwrap();
+        }
+        let process_id = test_process_id("no-remint");
+        let env = std::collections::HashMap::from([
+            ("HCOM_PROCESS_ID".to_string(), process_id.clone()),
+            ("HCOM_INSTANCE_NAME".to_string(), "other".to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, home.clone());
+        let before = db.get_instance("other").unwrap().unwrap();
+        let (code, output) =
+            start_as_test_owner(&ctx, &db, &["--session-id".into(), "sid-other".into()]);
+        let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            response["error"].is_string(),
+            "canonical={canonical}: {output}"
+        );
+        assert!(response.get("name").is_none(), "{output}");
+        assert!(response.get("transient").is_none(), "{output}");
+        assert_eq!(db.get_process_binding(&process_id).unwrap(), None);
+        assert_eq!(db.get_instance("other").unwrap().unwrap(), before);
+        assert_eq!(instance_count(&db), 1);
+        cleanup(path);
+    }
+}
+
+#[test]
+fn own_stopped_start_response_is_preserved_only_after_caller_authentication() {
+    let (_dir, home, _guard) = isolated_omp_env();
+    let (db, path) = setup_test_db();
+    let process_id = test_process_id("own-stopped");
+    db.log_life_event(
+        "luna",
+        "stopped",
+        "hook",
+        "shutdown",
+        Some(serde_json::json!({"tool": "omp", "session_id": "sid-stopped"})),
+        Some(&process_id),
+    )
+    .unwrap();
+    let env = std::collections::HashMap::from([("HCOM_PROCESS_ID".to_string(), process_id)]);
+    let ctx = HcomContext::from_env(&env, home);
+    let (code, output) =
+        start_as_test_owner(&ctx, &db, &["--session-id".into(), "sid-stopped".into()]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+        serde_json::json!({"ok": true, "restored": false, "stopped": "luna"}),
+    );
+    let descendant = crate::proctruth::OmpOwner {
+        pid: std::process::id() + 1,
+        incarnation: "different-native-incarnation".into(),
+    };
+    crate::instance_binding::with_omp_binding_owner(descendant, || {
+        let (code, output) =
+            start_through_caller_gate(&ctx, &db, &["--session-id".into(), "sid-stopped".into()]);
+        let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(code, 0);
+        assert!(response["error"].is_string());
+        assert!(response.get("restored").is_none());
+        assert!(response.get("transient").is_none());
+    });
+    assert_eq!(instance_count(&db), 0);
+    cleanup(path);
 }
 
 /// Manual/CI scenario: nested OMP task extension must not steal parent identity

@@ -214,23 +214,83 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Update instance PID after spawn
+    /// Update the spawn anchor. For OMP, the PID and its native launch receipt
+    /// change together; the authenticated binder replaces this with an owner pin.
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
+        if self.conn.is_autocommit() {
+            self.with_immediate_transaction(|_tx| self.update_instance_pid_receipt(name, pid))
+        } else {
+            self.update_instance_pid_receipt(name, pid)
+        }
+    }
+
+    fn update_instance_pid_receipt(&self, name: &str, pid: u32) -> Result<()> {
+        let existing: Option<(String, Option<i64>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT tool, pid, launch_context FROM instances WHERE name = ?",
+                params![name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((tool, old_pid, context)) = existing
+            && tool == "omp"
+            && old_pid != Some(i64::from(pid))
+        {
+            let mut context = match context.as_deref().filter(|s| !s.is_empty()) {
+                Some(json) => {
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json)?
+                }
+                None => serde_json::Map::new(),
+            };
+            let changed = if let Some(incarnation) = crate::sys::process::identity(pid) {
+                context.insert(
+                    "omp_launch_anchor".into(),
+                    serde_json::json!({ "pid": pid, "incarnation": incarnation }),
+                );
+                true
+            } else {
+                // Missing native facts must never leave a prior PID's receipt
+                // usable. The later authenticated bind will refuse enrollment.
+                context.remove("omp_launch_anchor").is_some()
+            };
+            if changed {
+                self.conn.execute(
+                    "UPDATE instances SET pid = ?1, launch_context = ?2 WHERE name = ?3",
+                    params![i64::from(pid), serde_json::to_string(&context)?, name],
+                )?;
+                return Ok(());
+            }
+        }
         self.conn.execute(
             "UPDATE instances SET pid = ? WHERE name = ?",
-            params![pid as i64, name],
+            params![i64::from(pid), name],
         )?;
         Ok(())
     }
 
-    /// Record `pid` only while the row has none. Returns whether this call set
-    /// it; an existing anchor (a PTY wrapper's, a launcher's) is never replaced.
+    /// Record the initial anchor only while unset, including its launch receipt.
     pub fn set_instance_pid_if_unset(&self, name: &str, pid: u32) -> Result<bool> {
-        let changed = self.conn.execute(
-            "UPDATE instances SET pid = ?1 WHERE name = ?2 AND pid IS NULL",
-            params![pid as i64, name],
-        )?;
-        Ok(changed > 0)
+        let set = || -> Result<bool> {
+            let unset = self
+                .conn
+                .query_row(
+                    "SELECT pid IS NULL FROM instances WHERE name = ?",
+                    params![name],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if unset {
+                self.update_instance_pid_receipt(name, pid)?;
+            }
+            Ok(unset)
+        };
+        if self.conn.is_autocommit() {
+            self.with_immediate_transaction(|_tx| set())
+        } else {
+            set()
+        }
     }
 
     /// Store launch_context JSON (terminal preset, pane_id, env snapshot).
@@ -251,15 +311,15 @@ impl HcomDb {
         name: &str,
         context_json: &str,
     ) -> Result<()> {
-        let existing_json: Option<String> = tx
+        let existing_json: Option<Option<String>> = tx
             .query_row(
                 "SELECT launch_context FROM instances WHERE name = ?",
                 params![name],
-                |row| row.get(0),
+                |row| row.get::<_, Option<String>>(0),
             )
             .optional()?;
 
-        let existing_json = existing_json.unwrap_or_default();
+        let existing_json = existing_json.flatten().unwrap_or_default();
         if existing_json.is_empty() {
             tx.execute(
                 "UPDATE instances SET launch_context = ? WHERE name = ?",
