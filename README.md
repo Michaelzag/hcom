@@ -167,7 +167,7 @@ Brokers and network observers cannot read or forge payloads without the PSK. The
 
 The join token contains the relay ID, broker URL, and raw PSK. hcom does not ask a server to validate it. It has no expiry, no scope, and no revocation list.
 
-On public brokers, a leaked token gives an attacker full control of the relay. They can decrypt captured traffic, publish authenticated relay traffic, send text to listening agents, launch agents on enrolled devices, kill running agents, and use remote relay RPCs. If those agents can run tools, treat that as shell access on every enrolled device in the relay.
+On public brokers, a leaked token gives an attacker full control of the relay. They can decrypt captured traffic, publish authenticated relay traffic, send text to listening agents, launch agents on enrolled devices, kill running agents, and use remote relay RPCs. If those agents can run tools, treat them as shell access on every enrolled device in the relay.
 
 On private brokers with `--password`, the token still leaks the PSK, so captured traffic is still exposed. But the token alone is not enough to publish unless the attacker also has the broker password. Use a private broker when broker-side access control matters, or when the metadata shape of your traffic is itself sensitive. `--password` is broker access control, not another layer of message encryption.
 
@@ -255,6 +255,64 @@ hcom claude --headless            # Run normal claude in background pty (works f
 For subagents, run `hcom claude`, then prompt:
 
 > run 2x task tool and get them to talk to each other in hcom
+
+#### Oh My Pi seats
+
+An omp seat's identity belongs to the omp process itself, not to the environment it
+inherits. Every omp lifecycle call (`omp-start`, `omp-status`, `omp-read`,
+`omp-beforetool`, `omp-stop`, `omp-role`) is authorized against the one real `omp`
+process on the caller's path to its launch anchor, matched by pid and by the native
+process incarnation (boot id and start time). Two omp processes on that path, an
+unreadable one, an omp worker, a vanished owner or a reused pid refuses; an ancestor
+above the anchor can neither supply nor invalidate the owner. A refusal is terminal:
+it never mints a replacement identity and never invites a retry.
+
+The owning seat keeps working. A session switch or branch rebinds its row, moves the
+runtime state and the notify endpoints, and releases the displaced row in one
+transaction, and the same owner may repair its own row's poisoned session metadata. A
+second minted id for the same live omp is that same holder, not another one: the
+switch migrates the row instead of leaving the old one bound, and a late failure inside
+that migration rolls the whole switch back.
+
+The plugin recovers a failed bind on its own. The 1800 ms hook cap is unchanged; a
+bind that timed out or reported a transient error is retried from the plugin's own
+reconcile timer with bounded backoff — 5 s, then 10 s, 20 s and 30 s, five attempts at
+most — reusing the same process id and the same notify endpoint, so a start that
+committed before the timeout recovers that row instead of a second identity. Ownership
+refusals, an intentional stop and other terminal answers are never retried, and a retry
+belongs to the session generation that asked for it.
+
+A seat's own stop stays the seat's own. `omp-stop --soft` keeps the row and the
+process binding, which is what `/restart` needs when it execs the same pid and
+rebinds; a hard stop releases the row on Linux, and off Linux the row is soft-stopped
+instead because nothing there can see the session's other carriers. The exiting
+session's own process tree is excluded from the stop's signals, while every other
+carrier (tool subprocesses, MCP/LSP servers) is still reaped and a survivor still
+blocks the release. A nested extension inside the same omp process — an omp task
+subagent loads a fresh extension instance in the parent process — never binds and
+never stops, so it cannot take the parent's seat, and a throwaway omp process (a
+print or RPC run, or one with no session file) stays inert: it binds nothing, stops
+nothing and opens no notify server.
+
+Plain seats registered by v0.7.61 recorded no pid at all. Those rows migrate under a
+proven owner: the owner is pinned on the existing row in place, so the old plugin's
+read, ack, status, stop and restart keep working and no second identity is minted. A
+row with another owner, another live holder or a reused pid is refused and left
+alone.
+
+The plugin and the binary ship together. Refresh the installed plugin with the new
+binary — `hcom hooks add omp` (`install` is an alias) — using the environment the seat
+actually runs in. The destination is resolved, not fixed:
+`$PI_CODING_AGENT_DIR/extensions/hcom.ts` when that is set, otherwise
+`~/.omp/agent/extensions/hcom.ts`, or `<root>/.omp/extensions/hcom.ts` for a non-home
+root. The installer byte-compares the embedded plugin, rewrites an hcom-owned stale
+`hcom.ts`, and refuses a foreign `hcom.ts` instead of overwriting it. The refresh is
+disk-only: a running omp keeps the plugin it already loaded until it is restarted, so
+roll the binary and the plugin to a seat and restart that seat before relying on the
+new behaviour.
+
+Plain (not hcom-launched) omp sessions join only with the `plain_sessions` opt-in
+below, and the plugin starts no recovery of its own while that opt-in is off.
 
 </details>
 
@@ -395,6 +453,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
 | `relay_suffix_only_devices` | Devices (UUIDs or short ids) never resolved by bare name; always use `name:SHORT` for them |
 | `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` | Default args passed to the tool |
+| `plain_sessions` | Let plain (non-hcom-launched) omp sessions join hcom |
 
 Bare seat names resolve consistently for messages, resume, kill, stop, terminal
 injection, and compact. A live local seat matches by base name **or** tagged
