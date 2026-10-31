@@ -2,6 +2,8 @@
 
 use std::time::Instant;
 
+use anyhow::{Context, Result};
+
 use serde_json::Value;
 
 use crate::bootstrap;
@@ -26,38 +28,35 @@ fn has_flag(argv: &[String], flag: &str) -> bool {
     argv.iter().any(|a| a == flag)
 }
 
-pub(crate) fn upsert_plugin_notify_endpoint(db: &HcomDb, instance_name: &str, port: u16) {
-    if let Err(e) = db.upsert_notify_endpoint(instance_name, "plugin", port) {
-        log_error(
-            "native",
-            "omp.register_notify_fail",
-            &format!(
-                "Failed to register plugin notify port for {}: {}",
-                instance_name, e
-            ),
-        );
-        return;
-    }
-
-    crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+pub(crate) fn upsert_plugin_notify_endpoint(
+    db: &HcomDb,
+    instance_name: &str,
+    port: u16,
+) -> Result<()> {
+    db.upsert_notify_endpoint(instance_name, "plugin", port)
+        .with_context(|| format!("Failed to register plugin notify port for {instance_name}"))
 }
 
-fn initialize_last_event_id(db: &HcomDb, instance_name: &str) {
-    if let Ok(Some(existing)) = db.get_instance_full(instance_name)
-        && existing.last_event_id == 0
-    {
-        let launch_event_id: Option<i64> = std::env::var("HCOM_LAUNCH_EVENT_ID")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let current_max = db.get_last_event_id();
-        let new_id = match launch_event_id {
-            Some(lei) if lei <= current_max => lei,
-            _ => current_max,
-        };
-        let mut updates = serde_json::Map::new();
-        updates.insert("last_event_id".into(), serde_json::json!(new_id));
-        instances::update_instance_position(db, instance_name, &updates);
+fn initialize_last_event_id(db: &HcomDb, instance_name: &str, current: i64) -> Result<i64> {
+    if current != 0 {
+        return Ok(current);
     }
+    let launch_event_id: Option<i64> = std::env::var("HCOM_LAUNCH_EVENT_ID")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let current_max: i64 =
+        db.conn()
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                row.get(0)
+            })?;
+    let new_id = match launch_event_id {
+        Some(lei) if lei <= current_max => lei,
+        _ => current_max,
+    };
+    let mut updates = serde_json::Map::new();
+    updates.insert("last_event_id".into(), serde_json::json!(new_id));
+    db.update_instance_fields(instance_name, &updates)?;
+    Ok(new_id)
 }
 
 fn instance_name_from_env(ctx: &HcomContext) -> Option<String> {
@@ -95,11 +94,139 @@ fn bootstrap_for(ctx: &HcomContext, db: &HcomDb, instance_name: &str) -> String 
     )
 }
 
-pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String) {
-    // Refresh a stale installed plugin (older hcom's hcom.ts) so the next omp
-    // session loads the one this binary embeds. Best effort: the running
-    // session already has its plugin loaded, so a failure here must never
-    // fail the start hook.
+/// Readiness is separate from the checked bind so a lost RPC response can be
+/// replayed. Both ends of this transaction fence an obsolete start completion.
+fn require_start_binding(
+    db: &HcomDb,
+    instance_name: &str,
+    session_id: &str,
+    process_id: &str,
+    owner: &crate::proctruth::OmpOwner,
+) -> Result<crate::db::InstanceRow> {
+    anyhow::ensure!(
+        db.get_process_binding_full(process_id)?
+            .as_ref()
+            .is_some_and(|(session, name)| {
+                name == instance_name && session.as_deref() == Some(session_id)
+            }),
+        "OMP start superseded by a newer process binding"
+    );
+    let row = db
+        .get_instance_full(instance_name)?
+        .ok_or_else(|| anyhow::anyhow!("OMP start instance no longer exists"))?;
+    anyhow::ensure!(
+        row.tool == "omp"
+            && row.origin_device_id.as_deref().unwrap_or("").is_empty()
+            && row.session_id.as_deref() == Some(session_id)
+            && row.pid == Some(i64::from(owner.pid))
+            && crate::proctruth::stored_omp_owner(&row)?.as_ref() == Some(owner),
+        "OMP start superseded: session or native owner changed"
+    );
+    Ok(row)
+}
+
+pub(super) fn complete_start_readiness(
+    ctx: &HcomContext,
+    db: &HcomDb,
+    argv: &[String],
+    instance_name: &str,
+    session_id: &str,
+    process_id: &str,
+    owner: &crate::proctruth::OmpOwner,
+) -> Result<common::PostCommit> {
+    let transcript_path = parse_flag(argv, "--transcript-path").filter(|path| !path.is_empty());
+    let cwd = parse_flag(argv, "--cwd").filter(|path| !path.is_empty());
+    let directory = cwd.as_deref().or_else(|| ctx.cwd.to_str());
+    let notify_port: Option<u16> = parse_flag(argv, "--notify-port").and_then(|s| s.parse().ok());
+    // git/tty/terminal receipt I/O must not hold the database write lock.
+    let mut captured = instance_binding::capture_context();
+    captured.insert("process_id".into(), serde_json::json!(process_id));
+    db.with_immediate_transaction(|_| {
+        anyhow::ensure!(
+            instance_binding::authenticated_omp_owner(db, process_id)? == *owner,
+            "OMP ownership refused: start owner changed"
+        );
+        let existing = require_start_binding(db, instance_name, session_id, process_id, owner)?;
+        let cursor = initialize_last_event_id(db, instance_name, existing.last_event_id)?;
+        let mut post = common::PostCommit::default();
+        let status_time = crate::shared::time::now_epoch_i64();
+        lifecycle::set_status_collected(
+            db,
+            instance_name,
+            ST_LISTENING,
+            "start",
+            Default::default(),
+            &mut post,
+        );
+        instance_binding::store_captured_launch_context(db, instance_name, captured)?;
+
+        let mut updates = serde_json::Map::new();
+        updates.insert("tool".into(), serde_json::json!("omp"));
+        updates.insert("session_id".into(), serde_json::json!(session_id));
+        if let Some(path) = transcript_path.as_deref() {
+            updates.insert("transcript_path".into(), serde_json::json!(path));
+        }
+        if let Some(directory) = directory {
+            updates.insert("directory".into(), serde_json::json!(directory));
+        }
+        db.update_instance_fields(instance_name, &updates)?;
+        if let Some(port) = notify_port {
+            upsert_plugin_notify_endpoint(db, instance_name, port)?;
+            post.collect_wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+        }
+
+        // The lifecycle writer is intentionally void. Verify its required
+        // state along with the checked metadata and endpoint before commit.
+        let ready = require_start_binding(db, instance_name, session_id, process_id, owner)?;
+        anyhow::ensure!(
+            ready.status == ST_LISTENING
+                && ready.status_context == "start"
+                && ready.status_detail.is_empty()
+                && ready.status_time >= status_time
+                && ready.last_stop >= status_time
+                && ready.last_event_id == cursor
+                && directory.is_none_or(|directory| ready.directory == directory)
+                && transcript_path
+                    .as_deref()
+                    .is_none_or(|path| ready.transcript_path == path),
+            "OMP start readiness could not be stored"
+        );
+        if let Some(port) = notify_port {
+            let stored: u16 = db.conn().query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = ?1 AND kind = 'plugin'",
+                rusqlite::params![instance_name],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                stored == port,
+                "OMP start notify endpoint could not be stored"
+            );
+        }
+        // Re-authenticate native caller facts immediately before this
+        // transaction commits, not merely before the earlier binding commit.
+        anyhow::ensure!(
+            instance_binding::authenticated_omp_owner(db, process_id)? == *owner,
+            "OMP ownership refused: start owner changed before commit"
+        );
+        Ok(post)
+    })
+}
+
+pub(crate) fn handle_start(
+    ctx: &HcomContext,
+    db: &HcomDb,
+    argv: &[String],
+    owner: &crate::proctruth::OmpOwner,
+) -> (i32, String) {
+    // The dispatcher (and direct-test boundary) already ran the shared caller
+    // gate. Retain that proof instead of walking the same ancestry again.
+    let process_id = common::omp_hook_process_id(ctx).expect("caller gate authenticated an id");
+    let session_id = match parse_flag(argv, "--session-id").filter(|sid| !sid.is_empty()) {
+        Some(sid) => sid,
+        None => return common::omp_hook_failure(&anyhow::anyhow!("Missing --session-id")),
+    };
+
+    // Best effort: the running session already has its plugin loaded.
     if !crate::hooks::omp::ensure_omp_plugin_installed() {
         log_info(
             "hooks",
@@ -111,26 +238,8 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
         );
     }
 
-    // Plugin RPC returns JSON errors on exit 0 so the extension can handle
-    // setup failures without Pi treating the hook itself as failed.
-    let session_id = match parse_flag(argv, "--session-id") {
-        Some(sid) => sid,
-        None => return (0, r#"{"error":"Missing --session-id"}"#.to_string()),
-    };
-    let transcript_path = parse_flag(argv, "--transcript-path");
-    let cwd = parse_flag(argv, "--cwd");
-    let notify_port: Option<u16> = parse_flag(argv, "--notify-port").and_then(|s| s.parse().ok());
-
-    let process_id = match &ctx.process_id {
-        Some(pid) => pid.clone(),
-        None => return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string()),
-    };
-
-    // A late omp-start from the process whose own stop is recorded (its plugin
-    // rebinding while it exits, or a seat stopped from outside) must not
-    // restore the stopped row. A no-op success: a start hook never fails.
     if let Some(stopped) =
-        instance_binding::stopped_restore_for_own_process(db, &session_id, &process_id)
+        instance_binding::stopped_restore_for_own_process(db, &session_id, process_id)
     {
         log_info(
             "hooks",
@@ -146,124 +255,79 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
         );
     }
 
-    let instance_name = match instance_binding::bind_session_to_process(
-        db,
-        &session_id,
-        Some(&process_id),
-    ) {
-        Ok(Some(name)) => name,
-        // A failed bind (already logged) must not mint a replacement identity.
-        Err(_) => {
-            return (
-                0,
-                r#"{"error":"No instance bound to this process"}"#.to_string(),
-            );
-        }
-        Ok(None) => match instance_name_from_env(ctx).and_then(|name| {
-            instance_binding::recover_process_binding_for_instance(
+    let bound = match instance_binding::bind_omp_session_to_process(db, &session_id, process_id) {
+        Ok(name) => name,
+        Err(error) => return common::omp_hook_failure(&error),
+    };
+    let recovered = if bound.is_none() {
+        match instance_name_from_env(ctx) {
+            Some(name) => match instance_binding::recover_omp_process_binding_for_instance(
                 db,
                 &name,
                 &session_id,
-                &process_id,
-            )
-        }) {
-            Some(name) => name,
-            None => {
-                // Launcher-less first bind: no launcher-created row for this
-                // `HCOM_PROCESS_ID`. Mint an identity the same way
-                // Claude/Gemini/Kimi do for orphaned PTY sessions: generate a
-                // name, create the row, and bind session+process to it.
-                // `ctx.is_launched` requires a proven launcher UUID whose
-                // recorded pid is an ancestor; inherited HCOM_LAUNCHED=1 or
-                // a provable OMP-minted id does not claim a launch. A plain
-                // session joins only with `[launch.omp].plain_sessions`.
-                let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
-                if ctx.is_launched || hcom_config.plain_sessions {
-                    match instance_binding::create_orphaned_pty_identity(
-                        db,
-                        &session_id,
-                        Some(&process_id),
-                        "omp",
-                    ) {
-                        Some(name) => {
-                            log_info(
-                                "hooks",
-                                "omp-start.minted_identity",
-                                &format!(
-                                    "instance={} session_id={} process_id={}",
-                                    name, session_id, process_id
-                                ),
-                            );
-                            name
-                        }
-                        None => {
-                            log_error(
-                                "hooks",
-                                "omp-start.mint_failed",
-                                &format!("session_id={} process_id={}", session_id, process_id),
-                            );
-                            return (
-                                0,
-                                r#"{"error":"No instance bound to this process"}"#.to_string(),
-                            );
-                        }
-                    }
-                } else {
-                    // Log the refusal: a silent return here is the hardest
-                    // failure to debug (a plain session sees no delivery and
-                    // no diagnostic explaining why).
+                process_id,
+            ) {
+                Ok(name) => name,
+                Err(error) => return common::omp_hook_failure(&error),
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    let instance_name = match bound.or(recovered) {
+        Some(name) => name,
+        None => {
+            let hcom_config = crate::config::HcomConfig::load(None).unwrap_or_default();
+            // Direct callers cannot turn an inherited HCOM_LAUNCHED=1 into
+            // launch provenance for an OMP-minted plain-session id.
+            let is_launched =
+                ctx.is_launched && crate::proctruth::is_launcher_process_id(process_id);
+            if !is_launched && !hcom_config.plain_sessions {
+                log_info(
+                    "hooks",
+                    "omp-start.unbound_no_launch",
+                    &format!(
+                        "no instance bound, not hcom-launched, and [launch.omp].plain_sessions is off \
+                         (enable with `hcom config plain_sessions true`); session_id={session_id} process_id={process_id}"
+                    ),
+                );
+                return common::omp_hook_failure(&anyhow::anyhow!(
+                    "No instance bound to this process"
+                ));
+            }
+            match instance_binding::create_omp_identity(db, &session_id, process_id) {
+                Ok(name) => {
                     log_info(
                         "hooks",
-                        "omp-start.unbound_no_launch",
-                        &format!(
-                            "no instance bound, not hcom-launched, and [launch.omp].plain_sessions is off \
-                             (enable with `hcom config plain_sessions true`); session_id={} process_id={}",
-                            session_id, process_id
-                        ),
+                        "omp-start.minted_identity",
+                        &format!("instance={name} session_id={session_id} process_id={process_id}"),
                     );
-                    return (
-                        0,
-                        r#"{"error":"No instance bound to this process"}"#.to_string(),
-                    );
+                    name
                 }
+                Err(error) => return common::omp_hook_failure(&error),
             }
-        },
+        }
     };
 
-    initialize_last_event_id(db, &instance_name);
-    lifecycle::set_status(
+    let post = match complete_start_readiness(
+        ctx,
         db,
+        argv,
         &instance_name,
-        ST_LISTENING,
-        "start",
-        Default::default(),
-    );
-    instance_binding::capture_and_store_launch_context(db, &instance_name);
-
-    let mut updates = serde_json::Map::new();
-    updates.insert("tool".into(), serde_json::json!("omp"));
-    updates.insert("session_id".into(), serde_json::json!(&session_id));
-    if let Some(path) = transcript_path.as_ref().filter(|p| !p.is_empty()) {
-        updates.insert("transcript_path".into(), serde_json::json!(path));
-    }
-    let cwd_value = cwd
-        .as_deref()
-        .filter(|p| !p.is_empty())
-        .or_else(|| ctx.cwd.to_str());
-    if let Some(cwd) = cwd_value {
-        updates.insert("directory".into(), serde_json::json!(cwd));
-    }
-    instances::update_instance_position(db, &instance_name, &updates);
-    if let Some(port) = notify_port {
-        upsert_plugin_notify_endpoint(db, &instance_name, port);
-    }
-    // A configured role nobody holds means its filter is off: say so at
-    // every bind (crate::delivery_policy).
+        &session_id,
+        process_id,
+        owner,
+    ) {
+        Ok(post) => post,
+        Err(error) => return common::omp_hook_failure(&error),
+    };
+    post.fire(db);
     crate::delivery_policy::warn_unheld_roles(db);
     log_info(
         "hooks",
         "omp-start.bind",
-        &format!("instance={} session_id={}", instance_name, session_id),
+        &format!("instance={instance_name} session_id={session_id}"),
     );
     crate::relay::worker::ensure_worker(true);
 
@@ -476,14 +540,24 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
     } else {
         argv.to_vec()
     };
-    // Any explicit --name naming a protected identity is refused before the
-    // handler match (and before the activity gate, so the refusal is visible
-    // even against an empty database).
-    if let Some(refusal) = common::protected_hook_name_refusal(&db, &handler_argv) {
-        return refusal;
-    }
-    if !common::hook_gate_check(&mut ctx, &db) && hook_name != "omp-start" {
-        return (0, String::new());
+    let caller_owner = match common::omp_hook_caller_gate(&ctx, &db, hook_name, &handler_argv) {
+        Ok(owner) => owner,
+        Err(refusal) => return refusal,
+    };
+    if caller_owner.is_none() {
+        // Unknown hooks retain the existing protected-name/activity behavior.
+        if let Some(refusal) = common::protected_hook_name_refusal(&db, &handler_argv) {
+            return refusal;
+        }
+        if !common::hook_gate_check(&mut ctx, &db) {
+            return (0, String::new());
+        }
+    } else {
+        // The authenticated owner already proves this presented identity.
+        // Only a launcher UUID can additionally substantiate a launch claim.
+        ctx.is_launched = ctx.is_launched
+            && common::omp_hook_process_id(&ctx)
+                .is_some_and(crate::proctruth::is_launcher_process_id);
     }
     let hook_name_owned = hook_name.to_string();
     let handler_start = Instant::now();
@@ -495,7 +569,14 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
             serde_json::json!({"error": "internal panic"}).to_string(),
         ),
         || match hook_name_owned.as_str() {
-            "omp-start" => handle_start(&ctx, &db, &handler_argv),
+            "omp-start" => handle_start(
+                &ctx,
+                &db,
+                &handler_argv,
+                caller_owner
+                    .as_ref()
+                    .expect("recognized start has a caller owner"),
+            ),
             "omp-status" => handle_status(&db, &handler_argv),
             "omp-read" => handle_read(&db, &handler_argv),
             "omp-beforetool" => handle_beforetool(&db, &handler_argv),

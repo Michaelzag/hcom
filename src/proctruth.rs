@@ -42,8 +42,9 @@
 //!   root after the seat died is an orphan, never signalled and never
 //!   evidence. The sweep, stop, resume and kill all read this one verdict.
 //!
-//! Unix only: `/proc` enumeration is compiled out on other platforms, where
-//! every query reports empty (verified-no-holders) and reap is a no-op.
+//! The permissive carrier enumeration is Unix-only; off Unix it reports empty
+//! and reap is a no-op. Checked UUID-adoption evidence instead stays unknown
+//! wherever the native process environment source is unsupported.
 
 #[cfg(unix)]
 use std::collections::{HashMap, HashSet};
@@ -167,6 +168,93 @@ pub(crate) fn has_live_carriers(
     processes_for_instance(name, binding_ids, owners)
         .iter()
         .any(|m| !process_gone(m.pid))
+}
+
+/// Checked carrier evidence for the dead-UUID adoption gate. Only a complete,
+/// readable observation can establish absence; uncertainty never releases a UUID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OmpCarrierPresence {
+    #[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+    Present,
+    Absent,
+    Unknown,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) struct OmpCarrierProbeFixture {
+    pub candidates: Vec<u32>,
+    pub environment_permission_denied_pid: Option<u32>,
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static OMP_CARRIER_PRESENCE: std::cell::Cell<Option<OmpCarrierPresence>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+thread_local! {
+    static OMP_CARRIER_PROBE_FIXTURE: std::cell::RefCell<Option<OmpCarrierProbeFixture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Scope only the carrier observation, not caller or native owner authentication.
+#[cfg(all(test, unix))]
+pub(crate) fn with_omp_carrier_presence<T>(
+    presence: OmpCarrierPresence,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<OmpCarrierPresence>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OMP_CARRIER_PRESENCE.with(|slot| slot.set(self.0));
+        }
+    }
+
+    let _restore = Restore(OMP_CARRIER_PRESENCE.with(|slot| slot.replace(Some(presence))));
+    f()
+}
+
+/// Scope candidate enumeration and one optional environment IO failure only.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+pub(crate) fn with_omp_carrier_probe_fixture<T>(
+    fixture: OmpCarrierProbeFixture,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<OmpCarrierProbeFixture>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OMP_CARRIER_PROBE_FIXTURE.set(self.0.take());
+        }
+    }
+
+    let _restore = Restore(OMP_CARRIER_PROBE_FIXTURE.replace(Some(fixture)));
+    f()
+}
+
+/// Observe exact name or retained binding-ID carriers in the moving owner's
+/// native user scope, without the permissive scanner's unreadable-process blind
+/// spot. Exclude the moving PID only with fresh incarnation and liveness proof.
+pub(crate) fn omp_carrier_presence(
+    name: &str,
+    binding_ids: &[String],
+    moving_owner: &OmpOwner,
+) -> OmpCarrierPresence {
+    #[cfg(all(test, unix))]
+    if let Some(presence) = OMP_CARRIER_PRESENCE.with(|slot| slot.get()) {
+        return presence;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        omp_carrier_presence_proc(name, binding_ids, moving_owner)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = (name, binding_ids, moving_owner);
+        OmpCarrierPresence::Unknown
+    }
 }
 
 /// A minted `omp-<pid>-...` binding and when it was registered. `<pid>` holds
@@ -1109,6 +1197,203 @@ fn carrier_in_signal_scope(pid: u32, name: &str, scope: &CarrierTreeScope) -> bo
     false
 }
 
+/// Native real/effective/saved/filesystem users for the checked UUID probe.
+/// Proc-directory ownership is not a user identity: non-dumpable processes can
+/// have root-owned proc inodes without changing any of these user IDs.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn omp_carrier_user_ids(pid: u32) -> Option<[u32; 4]> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let mut uid_lines = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
+    let mut fields = uid_lines.next()?.split_ascii_whitespace();
+    let mut users = [0; 4];
+    for user in &mut users {
+        let value = fields.next()?;
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        *user = value.parse().ok()?;
+    }
+    (fields.next().is_none() && uid_lines.next().is_none()).then_some(users)
+}
+
+/// Unlike `enumerate_unix`, this UUID-release proof retains incomplete evidence.
+/// Its explicit user scope formalizes hcom's same-user session premise only for
+/// this adoption gate: disjoint native user tuples are unrelated, while any
+/// overlap or undecidable user evidence stays in scope. Present dominates doubt.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn omp_carrier_presence_proc(
+    name: &str,
+    binding_ids: &[String],
+    moving_owner: &OmpOwner,
+) -> OmpCarrierPresence {
+    #[cfg(test)]
+    if let Some(presence) = OMP_CARRIER_PROBE_FIXTURE.with_borrow(|fixture| {
+        fixture.as_ref().map(|fixture| {
+            omp_carrier_presence_from_candidates(
+                name,
+                binding_ids,
+                moving_owner,
+                fixture.candidates.iter().copied().map(Ok),
+                |pid| {
+                    if fixture.environment_permission_denied_pid == Some(pid) {
+                        Err(std::io::Error::from_raw_os_error(libc::EACCES))
+                    } else {
+                        std::fs::read(format!("/proc/{pid}/environ"))
+                    }
+                },
+            )
+        })
+    }) {
+        return presence;
+    }
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return OmpCarrierPresence::Unknown;
+    };
+    let candidates = dir.filter_map(|entry| match entry {
+        Ok(entry) => {
+            let file_name = entry.file_name();
+            let pid = file_name.to_str()?.parse::<u32>().ok()?;
+            Some(Ok(pid))
+        }
+        Err(error) => Some(Err(error)),
+    });
+    omp_carrier_presence_from_candidates(name, binding_ids, moving_owner, candidates, |pid| {
+        std::fs::read(format!("/proc/{pid}/environ"))
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn omp_carrier_presence_from_candidates(
+    name: &str,
+    binding_ids: &[String],
+    moving_owner: &OmpOwner,
+    candidates: impl IntoIterator<Item = std::io::Result<u32>>,
+    read_environment: impl Fn(u32) -> std::io::Result<Vec<u8>>,
+) -> OmpCarrierPresence {
+    let want = format!("HCOM_INSTANCE_NAME={name}");
+    let self_pid = std::process::id();
+    let owner_users = if crate::sys::process::identity(moving_owner.pid).as_deref()
+        == Some(moving_owner.incarnation.as_str())
+        && !process_gone(moving_owner.pid)
+    {
+        let users = omp_carrier_user_ids(moving_owner.pid);
+        if crate::sys::process::identity(moving_owner.pid).as_deref()
+            == Some(moving_owner.incarnation.as_str())
+            && !process_gone(moving_owner.pid)
+        {
+            users
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Even an otherwise empty scan must prove the native environment source
+    // exists. Reading our own proc environment never inspects or reports values.
+    let mut unknown = owner_users.is_none() || read_environment(self_pid).is_err();
+    for candidate in candidates {
+        let pid = match candidate {
+            Ok(pid) => pid,
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        };
+        if pid == self_pid || process_gone(pid) {
+            continue;
+        }
+        let identity = crate::sys::process::identity(pid);
+        let mut candidate_unknown = false;
+        if pid == moving_owner.pid {
+            if identity.as_deref() == Some(moving_owner.incarnation.as_str())
+                && !process_gone(pid)
+                && crate::sys::process::identity(pid).as_ref() == identity.as_ref()
+            {
+                continue;
+            }
+            candidate_unknown = true;
+        }
+        let unreadable_ancestry = std::cell::Cell::new(false);
+        let eligible = carrier_eligible_with(
+            pid,
+            |pid| {
+                let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
+                if comm.is_none() {
+                    unreadable_ancestry.set(true);
+                }
+                comm
+            },
+            |pid| {
+                let parent = parent_pid(pid);
+                if parent.is_none() {
+                    unreadable_ancestry.set(true);
+                }
+                parent
+            },
+        );
+        if !eligible && !unreadable_ancestry.get() {
+            let current_identity = crate::sys::process::identity(pid);
+            if !process_gone(pid) {
+                unknown |= candidate_unknown
+                    || identity.is_none()
+                    || current_identity.as_ref() != identity.as_ref();
+            }
+            continue;
+        }
+        let users = omp_carrier_user_ids(pid);
+        let user_identity = crate::sys::process::identity(pid);
+        if process_gone(pid) {
+            continue;
+        }
+        if identity.is_none() || user_identity.as_ref() != identity.as_ref() {
+            // A different incarnation cannot inherit a previous PID's foreign
+            // user proof. Keep scanning for Present, but never infer absence.
+            candidate_unknown = true;
+        } else if let (Some(owner_users), Some(users)) = (owner_users, users)
+            && users.iter().all(|user| !owner_users.contains(user))
+        {
+            unknown |= candidate_unknown;
+            continue;
+        }
+        if users.is_none() {
+            candidate_unknown = true;
+        }
+        let env = match read_environment(pid) {
+            Ok(env) => env,
+            Err(_) => {
+                if !process_gone(pid) {
+                    unknown = true;
+                }
+                continue;
+            }
+        };
+        let (carries_name, process_id) = identity_facts(&env, want.as_bytes());
+        if process_gone(pid) {
+            continue;
+        }
+        if carries_name || is_bound_process_id(&process_id, binding_ids) {
+            return OmpCarrierPresence::Present;
+        }
+        let current_identity = crate::sys::process::identity(pid);
+        if !process_gone(pid) {
+            unknown |= candidate_unknown
+                || identity.is_none()
+                || current_identity.as_ref() != identity.as_ref();
+        }
+    }
+    if crate::sys::process::identity(moving_owner.pid).as_deref()
+        != Some(moving_owner.incarnation.as_str())
+        || process_gone(moving_owner.pid)
+    {
+        unknown = true;
+    }
+    if unknown {
+        OmpCarrierPresence::Unknown
+    } else {
+        OmpCarrierPresence::Absent
+    }
+}
+
 #[cfg(unix)]
 fn enumerate_unix(
     name: &str,
@@ -1666,9 +1951,15 @@ fn mac_ancestor_pids(lookup: &MacProcessLookup) -> Vec<u32> {
 /// Which program an ancestor pid is running, as far as the platform will say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AncestorProcess {
-    /// Linux/Android `/proc/<pid>/comm` is `omp`, macOS `pbi_comm` is
-    /// `omp`, or Windows ToolHelp `szExeFile` is `omp.exe`.
+    /// Non-worker OMP: Linux/Android `comm` is `omp` with readable argv,
+    /// macOS `pbi_comm` is `omp`, or Windows ToolHelp names `omp.exe`.
     Omp,
+    /// An OMP broker or mux, never a session owner or a path to one.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_os = "macos", test)),
+        allow(dead_code)
+    )]
+    OmpWorker,
     /// A readable process name that does not name OMP.
     #[cfg_attr(
         not(any(
@@ -1680,7 +1971,7 @@ pub(crate) enum AncestorProcess {
         allow(dead_code)
     )]
     Other,
-    /// Unreadable process name. Never satisfies the `Omp` clause.
+    /// Unreadable process facts. Never proves ownership on an OMP segment.
     Unknown,
 }
 
@@ -1700,19 +1991,51 @@ pub(crate) fn omp_minted_pid(id: &str) -> Option<u32> {
     head.parse::<u32>().ok()
 }
 
-/// What `pid` is running: `Omp` only when `/proc/<pid>/comm` is `omp`.
+/// Fixed titles reserved for OMP workers, not arbitrary executable names.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", test))]
+fn is_omp_worker_title(name: &[u8]) -> bool {
+    matches!(name, b"omp daemon broker" | b"omp lsp mux")
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", test))]
+fn is_omp_worker_comm(comm: &[u8]) -> bool {
+    is_omp_worker_title(comm) || matches!(comm, b"omp daemon brok" | b"omp daemon broke")
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn ancestor_process_kind_from_linux(comm: Option<&str>, cmdline: Option<&[u8]>) -> AncestorProcess {
+    let Some(comm) = comm.map(str::trim).filter(|comm| !comm.is_empty()) else {
+        return AncestorProcess::Unknown;
+    };
+    if is_omp_worker_comm(comm.as_bytes()) {
+        return AncestorProcess::OmpWorker;
+    }
+    if comm != "omp" {
+        return AncestorProcess::Other;
+    }
+    let Some(cmdline) = cmdline.filter(|args| args.first().is_some_and(|&byte| byte != 0)) else {
+        return AncestorProcess::Unknown;
+    };
+    if cmdline
+        .split(|&byte| byte == 0)
+        .any(|arg| arg.starts_with(b"__omp_worker_") || is_omp_worker_title(arg))
+    {
+        AncestorProcess::OmpWorker
+    } else {
+        AncestorProcess::Omp
+    }
+}
+
+/// Only an exact `omp` comm with readable, non-worker argv can own a session.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn ancestor_process_kind(pid: u32) -> AncestorProcess {
-    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-        Ok(comm) => {
-            if comm.trim() == "omp" {
-                AncestorProcess::Omp
-            } else {
-                AncestorProcess::Other
-            }
-        }
-        Err(_) => AncestorProcess::Unknown,
-    }
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
+    let cmdline = if comm.as_deref().is_some_and(|comm| comm.trim() == "omp") {
+        std::fs::read(format!("/proc/{pid}/cmdline")).ok()
+    } else {
+        None
+    };
+    ancestor_process_kind_from_linux(comm.as_deref(), cmdline.as_deref())
 }
 
 /// Windows ToolHelp executable names identify OMP even when the installed
@@ -1749,11 +2072,160 @@ fn ancestor_process_kind_from_comm(comm: Option<&[u8]>) -> AncestorProcess {
         .iter()
         .position(|&byte| byte == 0)
         .unwrap_or(comm.len());
-    if comm[..end].trim_ascii() == b"omp" {
+    let comm = comm[..end].trim_ascii();
+    if comm.is_empty() {
+        AncestorProcess::Unknown
+    } else if is_omp_worker_comm(comm) {
+        AncestorProcess::OmpWorker
+    } else if comm == b"omp" {
         AncestorProcess::Omp
     } else {
         AncestorProcess::Other
     }
+}
+
+/// Stable owner of one OMP row; session ids are deliberately not owner facts.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OmpOwner {
+    pub(crate) pid: u32,
+    pub(crate) incarnation: String,
+}
+
+/// The sole OMP on the caller-to-anchor segment, both endpoints included.
+/// Older ancestors outside the segment cannot supply or invalidate its owner.
+pub(crate) fn nearest_omp_owner(
+    ancestors: &[u32],
+    anchor_pid: u32,
+    ancestor_kind: &dyn Fn(u32) -> AncestorProcess,
+) -> Option<u32> {
+    if anchor_pid == 0 {
+        return None;
+    }
+    let anchor_index = ancestors.iter().position(|&pid| pid == anchor_pid)?;
+    let mut owner = None;
+    for &pid in &ancestors[..=anchor_index] {
+        match ancestor_kind(pid) {
+            AncestorProcess::Omp => {
+                if owner.replace(pid).is_some() {
+                    return None;
+                }
+            }
+            AncestorProcess::Other => {}
+            AncestorProcess::Unknown | AncestorProcess::OmpWorker => return None,
+        }
+    }
+    owner
+}
+
+/// Share each platform's ancestry and name readers without new native surfaces.
+fn with_caller_process_ancestry<T>(
+    decide: impl FnOnce(&[u32], &dyn Fn(u32) -> AncestorProcess) -> T,
+) -> T {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        decide(&caller_ancestor_pids(), &ancestor_process_kind)
+    }
+    #[cfg(windows)]
+    {
+        let snapshot = crate::sys::process::snapshot_parents(true);
+        let ancestors = walk_ancestor_links(
+            std::process::id(),
+            |pid| snapshot.as_ref()?.get(&pid).map(|entry| entry.parent_pid),
+            crate::sys::process::creation_ticks_win,
+        );
+        decide(&ancestors, &|pid| {
+            snapshot
+                .as_ref()
+                .map_or(AncestorProcess::Unknown, |entries| {
+                    ancestor_process_kind(pid, entries)
+                })
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let lookup = MacProcessLookup::default();
+        let ancestors = mac_ancestor_pids(&lookup);
+        decide(&ancestors, &|pid| {
+            let facts = lookup.get(pid);
+            ancestor_process_kind_from_comm(facts.as_ref().map(|facts| facts.comm.as_slice()))
+        })
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
+    {
+        decide(&[std::process::id()], &|_| AncestorProcess::Unknown)
+    }
+}
+
+/// Prove the caller's actual OMP owner under a live ancestor anchor.
+/// Capture its native incarnation before a fresh ancestry proof and re-read it
+/// afterward: disappearance, unreadable facts and PID reuse all refuse.
+pub(crate) fn omp_caller_owner(anchor_pid: u32) -> anyhow::Result<OmpOwner> {
+    let owner_pid = with_caller_process_ancestry(|ancestors, ancestor_kind| {
+        nearest_omp_owner(ancestors, anchor_pid, ancestor_kind)
+    })
+    .ok_or_else(|| anyhow::anyhow!("cannot prove one OMP owner under anchor pid {anchor_pid}"))?;
+    let incarnation = crate::sys::process::identity(owner_pid)
+        .filter(|identity| !identity.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("OMP owner pid {owner_pid} identity is unreadable"))?;
+    anyhow::ensure!(
+        !process_gone(owner_pid),
+        "OMP owner pid {owner_pid} is gone"
+    );
+    let proven_owner = with_caller_process_ancestry(|ancestors, ancestor_kind| {
+        nearest_omp_owner(ancestors, anchor_pid, ancestor_kind)
+    });
+    anyhow::ensure!(
+        proven_owner == Some(owner_pid),
+        "OMP owner ancestry changed under anchor pid {anchor_pid}"
+    );
+    anyhow::ensure!(
+        crate::sys::process::identity(owner_pid).as_deref() == Some(incarnation.as_str())
+            && !process_gone(owner_pid),
+        "OMP owner pid {owner_pid} incarnation changed or is unreadable"
+    );
+    Ok(OmpOwner {
+        pid: owner_pid,
+        incarnation,
+    })
+}
+
+/// Read the row's owner stamp only; a missing stamp is not registration proof.
+pub(crate) fn stored_omp_owner(row: &crate::db::InstanceRow) -> anyhow::Result<Option<OmpOwner>> {
+    let Some(context) = row
+        .launch_context
+        .as_deref()
+        .filter(|context| !context.is_empty())
+    else {
+        return Ok(None);
+    };
+    let mut context: serde_json::Map<String, serde_json::Value> = serde_json::from_str(context)
+        .map_err(|error| anyhow::anyhow!("invalid OMP launch context: {error}"))?;
+    let Some(owner) = context.remove("omp_owner") else {
+        return Ok(None);
+    };
+    let owner: OmpOwner = serde_json::from_value(owner)
+        .map_err(|error| anyhow::anyhow!("invalid stored OMP owner: {error}"))?;
+    anyhow::ensure!(owner.pid != 0, "stored OMP owner pid is zero");
+    anyhow::ensure!(
+        !owner.incarnation.trim().is_empty(),
+        "stored OMP owner incarnation is empty"
+    );
+    Ok(Some(owner))
+}
+
+/// Require exactly the same caller owner and native process incarnation.
+pub(crate) fn require_omp_owner_current(owner: &OmpOwner) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        omp_caller_owner(owner.pid)? == *owner,
+        "OMP owner pid {} belongs to a different incarnation",
+        owner.pid
+    );
+    Ok(())
 }
 
 /// True when `pid` carries exactly `HCOM_PROCESS_ID=<id>` in its environ —
@@ -1865,13 +2337,11 @@ pub(crate) fn verify_reclaim_anchor(
 /// records no pid. The trust table, in order:
 ///
 /// - empty id → refused;
-/// - `omp-<pid>-…` → trusted iff `<pid>` is in `ancestors` AND that
-///   ancestor runs OMP ([`AncestorProcess::Omp`]); a shell ancestor
-///   carrying a leaked id is not proof;
-/// - launcher UUID → trusted iff a binding row records an ancestor pid.
-///   A missing row OR a row with NULL pid is refused even when an ancestor
-///   carries the id. The PTY wrapper records its own pid on entry before
-///   spawning the tool, then replaces that anchor with the tool pid;
+/// - `omp-<pid>-…` → trusted iff `<pid>` is the sole actual OMP on the
+///   caller-to-pid segment, regardless of which tool presents the id;
+/// - launcher UUID → a binding row records an ancestor pid. OMP-owned rows
+///   additionally require the sole-OMP and native-incarnation proof in the IO
+///   wrapper. A missing row or NULL pid is refused even with env carriage;
 /// - other id shapes → a recorded row pid must be an ancestor; without a
 ///   recorded pid, non-OMP hooks retain carriage trust for synthetic,
 ///   relay and adhoc ids. OMP hooks reject these shapes outright, even
@@ -1880,8 +2350,8 @@ pub(crate) fn verify_reclaim_anchor(
 /// READ BEFORE TRUSTING THE NON-OMP CARRIAGE ARM: `ancestor_carries_id` is
 /// carriage, not proof. `ancestors` is self-inclusive and the caller's live
 /// environ holds the presented `HCOM_PROCESS_ID`, so it cannot authenticate
-/// an inherited synthetic id. Non-OMP tools keep the pre-0.7.30 basis;
-/// OMP only trusts proven launcher UUIDs or proven OMP-minted ids.
+/// an inherited synthetic id. Non-OMP-owned identities retain carriage trust;
+/// OMP identities always need proof, even from a different hook presenter.
 ///
 /// Linux/Android prove `/proc` ancestry, Windows uses ToolHelp plus creation
 /// ticks, and macOS uses proc_pidinfo BSD parent/start/comm facts. Other
@@ -1916,7 +2386,7 @@ fn process_id_trusted_for_presenter(
         return false;
     }
     if let Some(pid) = omp_minted_pid(id) {
-        return ancestors.contains(&pid) && ancestor_kind(pid) == AncestorProcess::Omp;
+        return nearest_omp_owner(ancestors, pid, ancestor_kind) == Some(pid);
     }
     let launcher_id = is_launcher_process_id(id);
     if presenter_is_omp && !launcher_id {
@@ -1924,12 +2394,21 @@ fn process_id_trusted_for_presenter(
     }
     match binding_row_pid {
         None => !launcher_id && ancestor_carries_id(id),
-        Some(Some(pid)) => ancestors.contains(&pid),
+        Some(Some(pid)) => {
+            if presenter_is_omp {
+                nearest_omp_owner(ancestors, pid, ancestor_kind).is_some()
+            } else {
+                ancestors.contains(&pid)
+            }
+        }
         // A launcher promises both a pre-registered row and a recorded anchor.
         Some(None) => !launcher_id && ancestor_carries_id(id),
     }
 }
 
+/// Strict OMP trust: its encoded or bound anchor must reach exactly one OMP,
+/// with neither a worker nor unreadable process facts anywhere on the segment.
+#[cfg(test)]
 pub(crate) fn process_id_trusted_for_omp(
     id: &str,
     ancestors: &[u32],
@@ -1947,19 +2426,33 @@ pub(crate) fn process_id_trusted_for_omp(
     )
 }
 
-/// IO wrapper for [`process_id_trusted`]: reads caller ancestry and the
-/// binding row (`get_process_binding` → `get_instance_full`). A DB read error,
-/// dangling binding or invalid recorded pid reads as "no row" (fail closed).
+/// Whether this identity belongs to OMP, independently of its hook presenter.
+/// Dangling launcher bindings and unreadable ownership rows cannot downgrade
+/// into the non-OMP carriage path.
+pub(crate) fn process_id_targets_omp(db: &HcomDb, id: &str) -> anyhow::Result<bool> {
+    if omp_minted_pid(id).is_some() {
+        return Ok(true);
+    }
+    if !is_launcher_process_id(id) {
+        return Ok(false);
+    }
+    let Some(name) = db.get_process_binding(id)? else {
+        return Ok(false);
+    };
+    let row = db
+        .get_instance_full(&name)?
+        .ok_or_else(|| anyhow::anyhow!("process binding targets missing instance '{name}'"))?;
+    Ok(row.tool == "omp")
+}
+
+/// IO wrapper for [`process_id_trusted`]. OMP-owned identities always use the
+/// strict native owner gate; other identities retain the non-OMP trust rules.
 pub fn trusted_process_id(db: &HcomDb, id: &str) -> bool {
-    trusted_process_id_for_presenter(db, id, false)
-}
-
-/// OMP hooks accept only a proven launcher UUID or a proven OMP-minted id.
-pub(crate) fn trusted_process_id_for_omp(db: &HcomDb, id: &str) -> bool {
-    trusted_process_id_for_presenter(db, id, true)
-}
-
-fn trusted_process_id_for_presenter(db: &HcomDb, id: &str, presenter_is_omp: bool) -> bool {
+    match process_id_targets_omp(db, id) {
+        Ok(true) => return trusted_process_id_for_omp(db, id),
+        Ok(false) => {}
+        Err(_) => return false,
+    }
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
@@ -1968,10 +2461,9 @@ fn trusted_process_id_for_presenter(db: &HcomDb, id: &str, presenter_is_omp: boo
     )))]
     {
         // Unshipped targets get no inherited-id trust without ancestry proof.
-        let _ = (db, id, presenter_is_omp);
-        return false;
+        let _ = (db, id);
+        false
     }
-
     #[cfg(any(
         target_os = "linux",
         target_os = "android",
@@ -1989,64 +2481,49 @@ fn trusted_process_id_for_presenter(db: &HcomDb, id: &str, presenter_is_omp: boo
             },
             _ => None,
         };
-        let decide = if presenter_is_omp {
-            process_id_trusted_for_omp
-        } else {
-            process_id_trusted
-        };
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            let ancestors = caller_ancestor_pids();
-            decide(
-                id,
-                &ancestors,
-                &ancestor_process_kind,
-                binding_row_pid,
-                &|want| ancestors.iter().any(|&pid| carries_process_id(pid, want)),
-            )
-        }
-        #[cfg(windows)]
-        {
-            // One ToolHelp snapshot supplies both parent links and exe names.
-            let snapshot = crate::sys::process::snapshot_parents(true);
-            let ancestors = walk_ancestor_links(
-                std::process::id(),
-                |pid| snapshot.as_ref()?.get(&pid).map(|entry| entry.parent_pid),
-                crate::sys::process::creation_ticks_win,
-            );
-            decide(
-                id,
-                &ancestors,
-                &|pid| {
-                    snapshot
-                        .as_ref()
-                        .map_or(AncestorProcess::Unknown, |entries| {
-                            ancestor_process_kind(pid, entries)
-                        })
-                },
-                binding_row_pid,
-                &|want| ancestors.iter().any(|&pid| carries_process_id(pid, want)),
-            )
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let lookup = MacProcessLookup::default();
-            let ancestors = mac_ancestor_pids(&lookup);
-            decide(
-                id,
-                &ancestors,
-                &|pid| {
-                    let facts = lookup.get(pid);
-                    ancestor_process_kind_from_comm(
-                        facts.as_ref().map(|facts| facts.comm.as_slice()),
-                    )
-                },
-                binding_row_pid,
-                // Self-carriage retains the non-OMP synthetic-id basis;
-                // Darwin has no shipped reader for other pids' environ.
-                &|want| ancestors.iter().any(|&pid| carries_process_id(pid, want)),
-            )
-        }
+        with_caller_process_ancestry(|ancestors, ancestor_kind| {
+            process_id_trusted(id, ancestors, ancestor_kind, binding_row_pid, &|want| {
+                ancestors.iter().any(|&pid| carries_process_id(pid, want))
+            })
+        })
+    }
+}
+
+/// Read-only OMP trust also checks the row's exact stored native owner, if any.
+/// Missing legacy stamps are provisional: binding must prove enrollment in its
+/// transaction before it mutates identity, cursor or endpoint state.
+pub(crate) fn trusted_process_id_for_omp(db: &HcomDb, id: &str) -> bool {
+    let minted_pid = omp_minted_pid(id);
+    if minted_pid.is_none() && !is_launcher_process_id(id) {
+        return false;
+    }
+    let row = match db.get_process_binding(id) {
+        Ok(Some(name)) => match db.get_instance_full(&name) {
+            Ok(Some(row)) => Some(row),
+            _ => return false,
+        },
+        Ok(None) => None,
+        Err(_) => return false,
+    };
+    let anchor_pid = minted_pid.or_else(|| {
+        row.as_ref()?
+            .pid
+            .and_then(|pid| u32::try_from(pid).ok())
+            .filter(|&pid| pid != 0)
+    });
+    let Some(anchor_pid) = anchor_pid else {
+        return false;
+    };
+    let Ok(owner) = omp_caller_owner(anchor_pid) else {
+        return false;
+    };
+    if minted_pid.is_some_and(|pid| owner.pid != pid) {
+        return false;
+    }
+    match row.as_ref().map(stored_omp_owner) {
+        None | Some(Ok(None)) => true,
+        Some(Ok(Some(stored))) => stored == owner,
+        Some(Err(_)) => false,
     }
 }
 
@@ -3974,6 +4451,57 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn sleep")
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn omp_carrier_presence_requires_matching_moving_owner_incarnation() {
+        let name = unique_name("checked-owner");
+        let mut carrier = spawn_named_sleeper(&name, "");
+        let pid = carrier.id();
+        wait_for_enumerated(&name, &[], pid);
+        let moving_owner = OmpOwner {
+            pid,
+            incarnation: format!(
+                "{}-stale",
+                crate::sys::process::identity(pid).expect("live carrier identity")
+            ),
+        };
+        // The PID alone cannot exclude this live name carrier. Its match also
+        // dominates the uncertainty retained for the mismatched owner proof.
+        let presence = omp_carrier_presence(&name, &[], &moving_owner);
+        carrier.kill().ok();
+        carrier.wait().ok();
+        assert_eq!(presence, OmpCarrierPresence::Present);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn omp_carrier_presence_observes_live_name_and_registered_id() {
+        let owner_name = unique_name("checked-moving");
+        let mut owner = spawn_named_sleeper(&owner_name, "");
+        wait_for_enumerated(&owner_name, &[], owner.id());
+        let moving_owner = OmpOwner {
+            pid: owner.id(),
+            incarnation: crate::sys::process::identity(owner.id()).expect("live owner identity"),
+        };
+        let name = unique_name("checked-carrier");
+        let process_id = uuid::Uuid::new_v4().to_string();
+        let mut carrier = spawn_named_sleeper(&name, &process_id);
+        wait_for_enumerated(&name, &[], carrier.id());
+
+        let by_name = omp_carrier_presence(&name, &[], &moving_owner);
+        let by_id = omp_carrier_presence(
+            &unique_name("checked-different-name"),
+            std::slice::from_ref(&process_id),
+            &moving_owner,
+        );
+        carrier.kill().ok();
+        carrier.wait().ok();
+        owner.kill().ok();
+        owner.wait().ok();
+        assert_eq!(by_name, OmpCarrierPresence::Present);
+        assert_eq!(by_id, OmpCarrierPresence::Present);
     }
 
     #[cfg(target_os = "linux")]
@@ -6315,10 +6843,308 @@ mod tests {
         assert!(process_id_trusted_for_omp(
             "550e8400-e29b-41d4-a716-446655440000",
             &[7, 3],
-            &|_| AncestorProcess::Other,
+            &|pid| if pid == 7 {
+                AncestorProcess::Omp
+            } else {
+                AncestorProcess::Other
+            },
             Some(Some(3)),
             &|_| false,
         ));
+    }
+
+    #[test]
+    fn process_id_trusted_rejects_borrowed_nested_omp_ids_for_every_presenter() {
+        let ancestors = [90, 80, 70, 60];
+        let kind = |pid| match pid {
+            80 | 60 => AncestorProcess::Omp,
+            _ => AncestorProcess::Other,
+        };
+        assert!(!process_id_trusted_for_omp(
+            "omp-60-1-2",
+            &ancestors,
+            &kind,
+            None,
+            &|_| true,
+        ));
+        assert!(!process_id_trusted_for_omp(
+            "550e8400-e29b-41d4-a716-446655440000",
+            &ancestors,
+            &kind,
+            Some(Some(60)),
+            &|_| true,
+        ));
+        // A generic presenter cannot borrow an OMP-minted id either.
+        assert!(!process_id_trusted(
+            "omp-60-1-2",
+            &ancestors,
+            &kind,
+            None,
+            &|_| false,
+        ));
+        // This pure signature has no row tool; IO dispatch checks UUID ownership.
+        assert!(process_id_trusted(
+            "550e8400-e29b-41d4-a716-446655440000",
+            &ancestors,
+            &kind,
+            Some(Some(60)),
+            &|_| false,
+        ));
+    }
+
+    #[test]
+    fn process_id_trusted_omp_strict_keeps_the_nearest_owners_ids() {
+        let ancestors = [90, 80, 70, 60];
+        let kind = |pid| match pid {
+            80 | 60 => AncestorProcess::Omp,
+            _ => AncestorProcess::Other,
+        };
+        // The older OMP is outside the child's own minted or wrapper segment.
+        for id in ["omp-80-session-one", "omp-80-session-two"] {
+            assert!(process_id_trusted_for_omp(
+                id,
+                &ancestors,
+                &kind,
+                None,
+                &|_| false,
+            ));
+        }
+        assert!(process_id_trusted_for_omp(
+            "550e8400-e29b-41d4-a716-446655440000",
+            &ancestors,
+            &kind,
+            Some(Some(70)),
+            &|_| false,
+        ));
+        // A minted anchor must itself be OMP, not its launcher wrapper.
+        assert!(!process_id_trusted_for_omp(
+            "omp-70-1-2",
+            &ancestors,
+            &kind,
+            None,
+            &|_| true,
+        ));
+    }
+
+    #[test]
+    fn nearest_omp_owner_requires_an_anchor_and_one_omp() {
+        let ancestors = [90, 80, 70, 60];
+        let kind = |pid| match pid {
+            80 => AncestorProcess::Omp,
+            60 => AncestorProcess::Unknown,
+            _ => AncestorProcess::Other,
+        };
+        assert_eq!(nearest_omp_owner(&ancestors, 70, &kind), Some(80));
+        assert_eq!(nearest_omp_owner(&ancestors, 80, &kind), Some(80));
+        assert_eq!(nearest_omp_owner(&ancestors, 90, &kind), None);
+        assert_eq!(nearest_omp_owner(&ancestors, 60, &kind), None);
+        assert_eq!(nearest_omp_owner(&ancestors, 50, &kind), None);
+        assert_eq!(nearest_omp_owner(&[], 80, &kind), None);
+        assert_eq!(nearest_omp_owner(&[0], 0, &|_| AncestorProcess::Omp), None);
+        assert_eq!(
+            nearest_omp_owner(&[80], 80, &|_| AncestorProcess::Omp),
+            Some(80)
+        );
+    }
+
+    #[test]
+    fn process_id_trusted_omp_strict_refuses_unreadable_and_worker_segments() {
+        for barrier in [AncestorProcess::Unknown, AncestorProcess::OmpWorker] {
+            let minted_kind = |pid| match pid {
+                80 => barrier,
+                70 => AncestorProcess::Omp,
+                _ => AncestorProcess::Other,
+            };
+            assert!(!process_id_trusted_for_omp(
+                "omp-70-1-2",
+                &[90, 80, 70],
+                &minted_kind,
+                None,
+                &|_| true,
+            ));
+            for barrier_pid in [90, 70, 60] {
+                let kind = |pid| {
+                    if pid == barrier_pid {
+                        barrier
+                    } else if pid == 80 {
+                        AncestorProcess::Omp
+                    } else {
+                        AncestorProcess::Other
+                    }
+                };
+                assert_eq!(nearest_omp_owner(&[90, 80, 70, 60], 60, &kind), None);
+                assert!(!process_id_trusted_for_omp(
+                    "550e8400-e29b-41d4-a716-446655440000",
+                    &[90, 80, 70, 60],
+                    &kind,
+                    Some(Some(60)),
+                    &|_| true,
+                ));
+            }
+        }
+        assert!(!process_id_trusted_for_omp(
+            "550e8400-e29b-41d4-a716-446655440000",
+            &[90, 80],
+            &|_| AncestorProcess::Other,
+            Some(Some(80)),
+            &|_| true,
+        ));
+    }
+
+    #[test]
+    fn omp_process_kinds_recognize_only_reserved_worker_facts() {
+        for comm in [
+            "omp daemon broker",
+            "omp daemon brok",
+            "omp daemon broke",
+            "omp lsp mux",
+        ] {
+            assert_eq!(
+                ancestor_process_kind_from_linux(Some(comm), None),
+                AncestorProcess::OmpWorker
+            );
+        }
+        for cmdline in [
+            b"omp\0__omp_worker_daemon_broker\0".as_slice(),
+            b"bun\0/dist/cli.js\0__omp_worker_daemon_broker\0".as_slice(),
+            b"omp daemon broker\0".as_slice(),
+            b"omp lsp mux\0".as_slice(),
+        ] {
+            assert_eq!(
+                ancestor_process_kind_from_linux(Some("omp"), Some(cmdline)),
+                AncestorProcess::OmpWorker
+            );
+        }
+        for cmdline in [
+            b"omp\0".as_slice(),
+            b"bun\0/dist/cli.js\0".as_slice(),
+            b"omp\0prefix__omp_worker_daemon_broker\0".as_slice(),
+            b"omp tiny model\0".as_slice(),
+        ] {
+            assert_eq!(
+                ancestor_process_kind_from_linux(Some("omp"), Some(cmdline)),
+                AncestorProcess::Omp
+            );
+        }
+        // Worker arguments cannot promote arbitrary executable names into OMP.
+        assert_eq!(
+            ancestor_process_kind_from_linux(
+                Some("node"),
+                Some(b"node\0/dist/cli.js\0__omp_worker_daemon_broker\0")
+            ),
+            AncestorProcess::Other
+        );
+    }
+
+    #[test]
+    fn omp_process_kinds_refuse_missing_process_facts() {
+        for cmdline in [None, Some(b"".as_slice()), Some(b"\0".as_slice())] {
+            assert_eq!(
+                ancestor_process_kind_from_linux(Some("omp"), cmdline),
+                AncestorProcess::Unknown
+            );
+        }
+        for comm in [None, Some("")] {
+            assert_eq!(
+                ancestor_process_kind_from_linux(comm, Some(b"omp\0")),
+                AncestorProcess::Unknown
+            );
+        }
+        assert_eq!(
+            ancestor_process_kind_from_linux(Some("sh"), None),
+            AncestorProcess::Other
+        );
+    }
+
+    #[test]
+    fn stored_omp_owner_uses_native_owner_not_session_or_row_pid() {
+        let db = test_db();
+        insert_row(&db, "stored-owner", "active", Some(999));
+        let mut row = db.get_instance_full("stored-owner").unwrap().unwrap();
+        let owner = OmpOwner {
+            pid: 80,
+            incarnation: "linux:boot:12345".to_string(),
+        };
+        row.launch_context = Some(
+            serde_json::json!({
+                "process_id": "omp-999-leaked",
+                "omp_owner": owner,
+            })
+            .to_string(),
+        );
+        row.session_id = Some("session-one".to_string());
+        assert_eq!(stored_omp_owner(&row).unwrap(), Some(owner.clone()));
+        row.session_id = Some("session-two".to_string());
+        row.pid = Some(888);
+        assert_eq!(stored_omp_owner(&row).unwrap(), Some(owner));
+    }
+
+    #[test]
+    fn stored_omp_owner_distinguishes_absent_from_malformed_evidence() {
+        let db = test_db();
+        insert_row(&db, "stored-owner", "active", Some(80));
+        let mut row = db.get_instance_full("stored-owner").unwrap().unwrap();
+        for context in [
+            None,
+            Some(""),
+            Some("{}"),
+            Some(r#"{"process_id":"omp-80-1"}"#),
+        ] {
+            row.launch_context = context.map(str::to_string);
+            assert_eq!(stored_omp_owner(&row).unwrap(), None);
+        }
+        for context in [
+            "not json",
+            "null",
+            r#"{"omp_owner":null}"#,
+            r#"{"omp_owner":{"pid":0,"incarnation":"linux:boot:1"}}"#,
+            r#"{"omp_owner":{"pid":-1,"incarnation":"linux:boot:1"}}"#,
+            r#"{"omp_owner":{"pid":4294967296,"incarnation":"linux:boot:1"}}"#,
+            r#"{"omp_owner":{"pid":"80","incarnation":"linux:boot:1"}}"#,
+            r#"{"omp_owner":{"pid":80}}"#,
+            r#"{"omp_owner":{"pid":80,"incarnation":""}}"#,
+            r#"{"omp_owner":{"pid":80,"incarnation":" "}}"#,
+        ] {
+            row.launch_context = Some(context.to_string());
+            assert!(stored_omp_owner(&row).is_err(), "{context}");
+        }
+    }
+
+    #[test]
+    fn process_id_targets_omp_follows_identity_ownership() {
+        let db = test_db();
+        assert!(process_id_targets_omp(&db, "omp-80-1-2").unwrap());
+        for id in ["", "pid-other", "omp-80", "omp-not-a-pid-1"] {
+            assert!(!process_id_targets_omp(&db, id).unwrap());
+        }
+        let launcher = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(!process_id_targets_omp(&db, launcher).unwrap());
+        insert_row(&db, "launcher-owner", "active", Some(80));
+        db.set_process_binding(launcher, "session", "launcher-owner")
+            .unwrap();
+        assert!(!process_id_targets_omp(&db, launcher).unwrap());
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'omp' WHERE name = 'launcher-owner'",
+                [],
+            )
+            .unwrap();
+        assert!(process_id_targets_omp(&db, launcher).unwrap());
+    }
+
+    #[test]
+    fn process_id_targets_omp_refuses_unreadable_or_dangling_bindings() {
+        let db = test_db();
+        let launcher = "550e8400-e29b-41d4-a716-446655440000";
+        db.set_process_binding(launcher, "session", "missing-owner")
+            .unwrap();
+        assert!(process_id_targets_omp(&db, launcher).is_err());
+        assert!(!trusted_process_id(&db, launcher));
+        db.conn()
+            .execute("DROP TABLE process_bindings", [])
+            .unwrap();
+        assert!(process_id_targets_omp(&db, launcher).is_err());
+        assert!(!trusted_process_id(&db, launcher));
     }
 
     #[test]

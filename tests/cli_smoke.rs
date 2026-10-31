@@ -574,8 +574,79 @@ fn argv_hook_hosted_name_refusal_matrix(read: &str, status: &str, stop: &str) {
 }
 
 #[test]
-fn security_argv_hook_hosted_name_refused_omp() {
-    argv_hook_hosted_name_refusal_matrix("omp-read", "omp-status", "omp-stop");
+fn unauthenticated_omp_rpc_hosted_name_refusal_preserves_state() {
+    let h = Hcom::new();
+    let me = h.start_with_process_id("pr127-cli-caller");
+    let other = h.start();
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO instances (name, tool, status, created_at)
+         VALUES ('michael', 'buzz', 'listening', 1000.0);",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = h.run([
+        "send",
+        "michael",
+        "--name",
+        &other,
+        "--",
+        "private connector-owned hook probe",
+    ]);
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    let snapshot = || {
+        [
+            "instances",
+            "hosted_names",
+            "process_bindings",
+            "session_bindings",
+            "notify_endpoints",
+        ]
+        .map(|table| {
+            let mut stmt = db
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        })
+    };
+    let before = snapshot();
+    // UNAUTHENTICATED RPC protocol + state coverage only: this CLI fixture
+    // has no native OMP caller. Missing-ID refusal is not protected-name proof.
+    // pr127_authenticated_hosted_* unit tests cover the authenticated guard.
+    for name in ["michael", me.as_str()] {
+        for argv in [
+            vec!["omp-read", "--name", name],
+            vec!["omp-read", "--name", name, "--ack"],
+            vec![
+                "omp-status",
+                "--name",
+                name,
+                "--status",
+                "active",
+                "--context",
+                "forged",
+            ],
+            vec!["omp-stop", "--name", name, "--reason", "forged"],
+        ] {
+            let (code, stdout, stderr) = h.run(&argv);
+            assert_eq!(code, 0, "{argv:?}: {stdout} {stderr}");
+            let response: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert!(response["error"].is_string(), "{argv:?}: {stdout}");
+            assert!(response.get("transient").is_none(), "{argv:?}: {stdout}");
+            assert!(
+                !stdout.contains("private connector-owned hook probe"),
+                "{stdout}"
+            );
+            assert_eq!(snapshot(), before, "{argv:?} mutated state");
+        }
+    }
 }
 
 #[test]
@@ -591,8 +662,9 @@ fn security_argv_hook_hosted_name_refused_opencode() {
 /// The reservation set used to live only in `hcom.db`, so `hcom reset` (or a
 /// deleted database) reopened every name the hub had hosted until the
 /// connector or a mirror re-registered it. After a reset, and before any such
-/// re-registration, the hosted name must still be refused on the claim,
-/// external-send and hook-read paths — while unknown names stay mintable.
+/// re-registration, claims and external sends must still reject hosted names
+/// while unknown names stay mintable. The OMP read checks only unauthenticated
+/// terminal RPC refusal and unchanged state; it does not prove the name guard.
 #[test]
 fn security_hosted_reservation_survives_reset() {
     let h = Hcom::new();
@@ -638,11 +710,50 @@ fn security_hosted_reservation_survives_reset() {
         "{stdout}{stderr}"
     );
 
-    // Hook read refused, with no row and no re-registration in between.
+    // UNAUTHENTICATED RPC protocol + state coverage, not evidence that this
+    // request reaches the protected-name guard. Authenticated durable-only
+    // guard coverage lives in pr127_authenticated_hosted_* unit tests.
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let snapshot = || {
+        [
+            "instances",
+            "hosted_names",
+            "process_bindings",
+            "session_bindings",
+            "notify_endpoints",
+        ]
+        .map(|table| {
+            let mut stmt = db
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        })
+    };
+    let before = snapshot();
     let (code, stdout, stderr) = h.run(["omp-read", "--name", "michael"]);
+    assert_eq!(code, 0, "terminal RPC refusal: {stdout} {stderr}");
+    let response: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(response["error"].is_string(), "{stdout}");
+    assert!(response.get("transient").is_none(), "{stdout}");
+    assert_eq!(
+        snapshot(),
+        before,
+        "unauthenticated RPC mutated reset state"
+    );
+    // Preserve the consumer-visible reservation, without inspecting the
+    // durable registry's representation.
+    let (code, stdout, stderr) = h.run(["start", "--name", "michael"]);
     assert_ne!(
         code, 0,
-        "post-reset omp-read as a hosted name must be refused: {stdout} {stderr}"
+        "RPC must not release the reservation: {stdout} {stderr}"
     );
     assert!(
         format!("{stdout}{stderr}").contains("reserved"),

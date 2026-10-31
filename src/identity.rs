@@ -157,11 +157,18 @@ pub fn validate_sender_label(name: &str) -> Result<(), HcomError> {
 /// Reservations survive mirror expiry and connector shutdown. Every database
 /// error is an error, never permission to mint the name.
 pub fn hosted_participant_refusal(db: &HcomDb, name: &str) -> Result<Option<String>, HcomError> {
+    hosted_participant_refusal_checked(db, name).map_err(|error| {
+        match error.downcast::<HcomError>() {
+            Ok(error) => error,
+            Err(error) => HcomError::DatabaseError(error.to_string()),
+        }
+    })
+}
+
+fn hosted_participant_refusal_checked(db: &HcomDb, name: &str) -> anyhow::Result<Option<String>> {
     let bare = name.split_once(':').map_or(name, |(base, _)| base);
-    let reserved: bool = db
-        .conn()
-        .query_row(
-            "SELECT EXISTS(
+    let reserved: bool = db.conn().query_row(
+        "SELECT EXISTS(
                 SELECT 1 FROM hosted_names WHERE name = ?1 COLLATE NOCASE
                 UNION ALL
                 SELECT 1 FROM instances WHERE tool = ?2 AND
@@ -169,10 +176,9 @@ pub fn hosted_participant_refusal(db: &HcomDb, name: &str) -> Result<Option<Stri
                         THEN substr(name, 1, instr(name, ':') - 1) ELSE name END
                     = ?1 COLLATE NOCASE
              )",
-            rusqlite::params![bare, crate::hosted::HOSTED_TOOL_BUZZ],
-            |row| row.get(0),
-        )
-        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+        rusqlite::params![bare, crate::hosted::HOSTED_TOOL_BUZZ],
+        |row| row.get(0),
+    )?;
     if reserved {
         return Ok(Some(format!(
             "'{name}' is reserved for a connector-hosted participant; only its connector may use that identity."
@@ -204,6 +210,18 @@ pub fn validate_protected_identity(db: &HcomDb, name: &str) -> Result<(), HcomEr
     }
     if let Some(refusal) = hosted_participant_refusal(db, name)? {
         return Err(HcomError::InvalidInput(refusal));
+    }
+    Ok(())
+}
+
+/// Preserve typed database failures for hook callers that distinguish
+/// retryable lock contention from terminal identity refusals.
+pub(crate) fn validate_protected_identity_checked(db: &HcomDb, name: &str) -> anyhow::Result<()> {
+    if let Some(refusal) = reserved_operator_refusal(name) {
+        anyhow::bail!(refusal);
+    }
+    if let Some(refusal) = hosted_participant_refusal_checked(db, name)? {
+        anyhow::bail!(refusal);
     }
     Ok(())
 }

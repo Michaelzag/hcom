@@ -164,7 +164,7 @@ function hcom(args: string[]): Promise<HcomResult> {
 			stderr = stderr || String(error);
 			finish(127);
 		});
-		child.on("close", (code) => finish(code === null ? 1 : code));
+		child.on("close", (code) => finish(code === null ? 127 : code));
 	});
 }
 
@@ -699,6 +699,12 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	let nestedOptOut = false;
 	let bootstrapText: string | null = null;
 	let bindingPromise: Promise<void> | null = null;
+	// Reset replaces the current promise, but never overlaps an older start.
+	let bindingTail: Promise<void> = Promise.resolve();
+	// Retries belong to this session generation, not to user-input events.
+	let bindingStopped = false;
+	let bindingAttempts = 0;
+	let bindingRetryAt = 0;
 	let notifyServer: Server | null = null;
 	let notifyPort: number | null = null;
 	let currentCtx: ExtensionContext | null = null;
@@ -740,6 +746,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	const DELIVERY_ROLE_MAX_ATTEMPTS = 5;
 	const FALLBACK_PENDING_POLL_MS = 5_000;
 	const IDLE_DEBOUNCE_MS = 250;
+	const BIND_MAX_ATTEMPTS = 5;
 
 	function statusKey(status: string, context: string, detail: string): string {
 		return `${status}\0${context}\0${detail}`;
@@ -827,10 +834,14 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		});
 	}
 
-	function startNotifyServer(): Promise<number | null> {
+	function startNotifyServer(ctx: ExtensionContext, sid: string, generation: number): Promise<number | null> {
 		if (notifyServer && notifyPort) return Promise.resolve(notifyPort);
 		return new Promise((resolve) => {
 			const server = createServer((socket) => {
+				if (notifyServer !== server || !isCurrentBinding(ctx, sid, generation)) {
+					socket.destroy();
+					return;
+				}
 				let settled = false;
 				// Connection that sends no context request: end it and deliver
 				// pending messages, exactly as before. Every existing wake sender
@@ -838,6 +849,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				const wake = () => {
 					if (settled) return;
 					settled = true;
+					if (notifyServer !== server || !isCurrentBinding(ctx, sid, generation)) return;
 					try {
 						socket.end();
 					} catch {}
@@ -848,6 +860,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				socket.setEncoding("utf8");
 				socket.on("data", (chunk: Buffer | string) => {
 					if (settled) return;
+					if (notifyServer !== server || !isCurrentBinding(ctx, sid, generation)) {
+						socket.destroy();
+						return;
+					}
 					buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
 					const newline = buffer.indexOf("\n");
 					if (newline < 0) return;
@@ -877,12 +893,27 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				socket.on("close", wake);
 				socket.on("error", () => {});
 			});
+			// Track even a pending listen so reset/shutdown can close it.
+			notifyServer = server;
 			server.on("error", (error) => {
-				log("ERROR", "notify_server.start_failed", instanceName, { error: String(error) });
+				if (notifyServer === server) {
+					notifyServer = null;
+					notifyPort = null;
+				}
+				if (isCurrentBinding(ctx, sid, generation)) {
+					log("ERROR", "notify_server.start_failed", instanceName, { error: String(error) });
+				}
 				resolve(null);
 			});
+			server.once("close", () => resolve(null));
 			server.listen(0, "127.0.0.1", () => {
-				notifyServer = server;
+				if (notifyServer !== server || !isCurrentBinding(ctx, sid, generation)) {
+					try {
+						server.close();
+					} catch {}
+					resolve(null);
+					return;
+				}
 				const address = server.address();
 				notifyPort = typeof address === "object" && address ? address.port : null;
 				log("INFO", "notify_server.started", instanceName, { port: notifyPort });
@@ -938,73 +969,113 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		return probeReason;
 	}
 
+	function isCurrentBinding(ctx: ExtensionContext, sid: string, generation: number): boolean {
+		return !bindingStopped && generation === bindingGeneration &&
+			ctx.sessionManager.getSessionId() === sid && currentCtx?.sessionManager.getSessionId() === sid;
+	}
+
 	async function bindIdentity(ctx: ExtensionContext): Promise<void> {
-		currentCtx = ctx;
-		if (probeSkipReason(ctx)) return;
+		if (bindingStopped || probeSkipReason(ctx)) return;
 		if (instanceName || bindingPromise) return bindingPromise ?? Promise.resolve();
-		if (!inheritedLauncherCandidate && !(await plainSessionsEnabled())) return;
-		const skipReason = nestedSkipReason();
-		if (skipReason) {
-			nestedOptOut = true;
-			const reg = getIdentityRegistry();
-			log("INFO", "plugin.bind_skipped_nested", null, {
-				reason: skipReason,
-				owner: reg.owner ?? process.env[IDENTITY_OWNER_ENV] ?? null,
-			});
-			return;
-		}
-		bindingPromise = (async () => {
+		if (Date.now() < bindingRetryAt) return;
+		currentCtx = ctx;
+		const sid = ctx.sessionManager.getSessionId();
+		const generation = bindingGeneration;
+		const preceding = bindingTail;
+		const attempt = (async () => {
 			try {
-				const reg = getIdentityRegistry();
-				if ((reg.tearingDown && !ownsIdentity) || (reg.owner && !ownsIdentity)) {
+				await preceding;
+				if (!isCurrentBinding(ctx, sid, generation)) return;
+				if (!inheritedLauncherCandidate && !(await plainSessionsEnabled())) {
+					if (isCurrentBinding(ctx, sid, generation)) {
+						bindingStopped = true;
+						stopReconcileTimer();
+					}
+					return;
+				}
+				if (!isCurrentBinding(ctx, sid, generation)) return;
+				const skipReason = nestedSkipReason();
+				if (skipReason) {
 					nestedOptOut = true;
+					bindingStopped = true;
+					stopReconcileTimer();
+					stopNotifyServer();
+					const reg = getIdentityRegistry();
 					log("INFO", "plugin.bind_skipped_nested", null, {
-						reason: reg.tearingDown && !ownsIdentity ? "tearing_down" : "nested_registry",
-						owner: reg.owner,
+						reason: skipReason,
+						owner: reg.owner ?? process.env[IDENTITY_OWNER_ENV] ?? null,
 					});
 					return;
 				}
-				const sid = ctx.sessionManager.getSessionId();
+				// The idle timer must already exist when the first start times out.
+				startReconcileTimer();
 				const transcriptPath = ctx.sessionManager.getSessionFile();
-				const port = await startNotifyServer();
+				const port = await startNotifyServer(ctx, sid, generation);
+				if (!isCurrentBinding(ctx, sid, generation)) return;
 				const args = ["omp-start", "--session-id", sid, "--cwd", ctx.cwd];
 				if (transcriptPath) args.push("--transcript-path", transcriptPath);
 				if (port) args.push("--notify-port", String(port));
-				let result = await hcom(args);
-				if (result.code !== 0) {
-					stopNotifyServer();
-					log("WARN", "plugin.bind_failed", null, { exit_code: result.code, stderr: result.stderr.slice(0, 300) });
+				bindingAttempts++;
+				// Retain the same process id and endpoint: a timed-out start may
+				// already have committed the row that this retry must recover.
+				const result = await hcom(args);
+				if (!isCurrentBinding(ctx, sid, generation)) return;
+				let json: {
+					name?: unknown; session_id?: unknown; bootstrap?: unknown; error?: unknown;
+					ok?: unknown; refuse?: unknown; refused?: unknown; stopped?: unknown;
+					restored?: unknown; transient?: unknown;
+				} = {};
+				try {
+					const parsed: unknown = JSON.parse(result.stdout || "{}");
+					if (parsed && typeof parsed === "object" && !Array.isArray(parsed) &&
+						("name" in parsed || "error" in parsed || "ok" in parsed ||
+							"refuse" in parsed || "refused" in parsed || "stopped" in parsed || "restored" in parsed)) {
+						json = parsed;
+					}
+				} catch {}
+				const retryableError = "error" in json && json.transient === true;
+				const refused = "refuse" in json || json.refused === true || "stopped" in json ||
+					json.restored === false || (!retryableError && (json.ok === false || "error" in json));
+				const transient = !refused && (retryableError || result.code === 124 || result.code === 127);
+				if (refused || transient || result.code !== 0 || typeof json.name !== "string" || !json.name ||
+					(json.session_id && json.session_id !== sid)) {
+					const retry = transient && bindingAttempts < BIND_MAX_ATTEMPTS;
+					if (retry) {
+						bindingRetryAt = Date.now() + Math.min(5_000 * 2 ** (bindingAttempts - 1), 30_000);
+					} else {
+						bindingStopped = true;
+						stopReconcileTimer();
+						stopNotifyServer();
+					}
+					log("WARN", "plugin.bind_failed", null, {
+						exit_code: result.code,
+						error: json.error || "No instance bound to this session",
+						stderr: result.stderr.slice(0, 300),
+						attempts: bindingAttempts,
+						retry,
+					});
 					return;
 				}
-				let json = JSON.parse(result.stdout || "{}");
-				if (inheritedLauncherCandidate && json.error === "HCOM_PROCESS_ID not set" && (await plainSessionsEnabled())) {
-					// The hook refused the inherited UUID. With the plain-session
-					// opt-in, give this OMP process its own id and try only once.
-					process.env.HCOM_PROCESS_ID = mintProcessId();
-					log("INFO", "identity_resolved", null, { minted: true, reason: "unproven_launcher" });
-					result = await hcom(args);
-					if (result.code !== 0) {
-						stopNotifyServer();
-						log("WARN", "plugin.bind_failed", null, { exit_code: result.code, stderr: result.stderr.slice(0, 300) });
-						return;
-					}
-					json = JSON.parse(result.stdout || "{}");
-				}
-				if (json.error || !json.name) {
+				const reg = getIdentityRegistry();
+				// Another extension may have claimed the process while start ran.
+				if (nestedSkipReason()) {
+					nestedOptOut = true;
+					bindingStopped = true;
+					stopReconcileTimer();
 					stopNotifyServer();
-					log("WARN", "plugin.bind_failed", null, { error: json.error || "No instance bound to this process" });
 					return;
 				}
 				instanceName = json.name;
-				sessionId = json.session_id || sid;
+				sessionId = sid;
 				ownsIdentity = true;
 				reg.owner = instanceName;
+				reg.tearingDown = false;
 				syncIdentityOwnerEnv(instanceName ?? "1");
 				// A re-bound row must never be released by an older armed exit release.
 				reg.pendingExitRelease = null;
 				installExitSignalRecorders(reg);
 				bootstrapText = typeof json.bootstrap === "string" ? json.bootstrap : null;
-				startReconcileTimer();
+				bindingRetryAt = 0;
 				log("INFO", "plugin.bound", instanceName, {
 					session_id: sessionId,
 					notify_port: port,
@@ -1012,13 +1083,21 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				});
 				await ensureDeliveryRole(ctx);
 			} catch (error) {
+				if (!isCurrentBinding(ctx, sid, generation)) return;
+				bindingStopped = true;
+				stopReconcileTimer();
 				stopNotifyServer();
 				log("ERROR", "plugin.bind_error", null, { error: String(error) });
-			} finally {
-				bindingPromise = null;
 			}
 		})();
-		await bindingPromise;
+		bindingTail = attempt;
+		bindingPromise = attempt;
+		try {
+			await attempt;
+		} finally {
+			// An obsolete completion must not unlock a newer generation's bind.
+			if (bindingPromise === attempt) bindingPromise = null;
+		}
 	}
 
 	// Register the bound row for the `conductor` delivery role once per binding
@@ -1031,7 +1110,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	// log line; a transient failure (locked DB, timeout) retries next turn and
 	// gives up with one warning after DELIVERY_ROLE_MAX_ATTEMPTS.
 	async function ensureDeliveryRole(ctx: ExtensionContext): Promise<void> {
-		if (deliveryRoleDone || deliveryRoleInFlight || !instanceName || !sessionId) return;
+		if (bindingStopped || deliveryRoleDone || deliveryRoleInFlight || !instanceName || !sessionId) return;
 		let marked = false;
 		try {
 			marked = ctx.sessionManager
@@ -1043,10 +1122,11 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		if (!marked) return;
 		const generation = bindingGeneration;
 		const name = instanceName;
+		const sid = sessionId;
 		deliveryRoleInFlight = true;
 		deliveryRoleAttempts++;
-		const result = await hcom(["omp-role", "--name", name, "--session-id", sessionId, "--role", "conductor"]);
-		if (generation !== bindingGeneration) return; // rebound meanwhile; the new binding asks again
+		const result = await hcom(["omp-role", "--name", name, "--session-id", sid, "--role", "conductor"]);
+		if (!isCurrentBinding(ctx, sid, generation) || name !== instanceName) return;
 		deliveryRoleInFlight = false;
 		let json: { ok?: boolean; error?: string; transient?: boolean } = {};
 		try {
@@ -1098,8 +1178,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	async function deliverPending(ctx: ExtensionContext): Promise<boolean> {
 		currentCtx = ctx;
 		if (probeSkipReason(ctx)) return false;
+		const sid = ctx.sessionManager.getSessionId();
+		const generation = bindingGeneration;
 		await bindIdentity(ctx);
-		if (!instanceName || !sessionId) return false;
+		if (!isCurrentBinding(ctx, sid, generation) || !instanceName || !sessionId) return false;
 		if (!isBoundSession(ctx.sessionManager.getSessionId())) return false;
 		if (deliveryInFlight || pendingAckId !== null) {
 			// A delivery is mid-flight or awaiting ack. Drop nothing: record the wake
@@ -1259,12 +1341,15 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	async function reportStatus(ctx: ExtensionContext, status: "active" | "listening", context = "", detail = ""): Promise<void> {
 		if (probeSkipReason(ctx)) return;
+		const sid = ctx.sessionManager.getSessionId();
+		const generation = bindingGeneration;
 		await bindIdentity(ctx);
-		if (!instanceName) return;
+		if (!isCurrentBinding(ctx, sid, generation) || !instanceName) return;
 		const args = ["omp-status", "--name", instanceName, "--status", status];
 		if (context) args.push("--context", context);
 		if (detail) args.push("--detail", detail);
 		await hcom(args);
+		if (!isCurrentBinding(ctx, sid, generation)) return;
 		lastReportedStatusKey = statusKey(status, context, detail);
 	}
 
@@ -1289,24 +1374,34 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	async function reconcile(): Promise<void> {
-		if (reconcileInFlight || !currentCtx || !instanceName) return;
+		if (reconcileInFlight || !currentCtx || bindingStopped) return;
+		const ctx = currentCtx;
+		const sid = ctx.sessionManager.getSessionId();
+		const generation = bindingGeneration;
 		reconcileInFlight = true;
 		try {
+			await bindIdentity(ctx);
+			if (!isCurrentBinding(ctx, sid, generation) || !instanceName) return;
 			if (pendingAckId !== null) await ackPending("reconcile");
-			if (currentCtx.isIdle()) {
-				await reportReconciledStatus(currentCtx);
-				await pollPendingIfDue(currentCtx);
+			if (!isCurrentBinding(ctx, sid, generation)) return;
+			if (ctx.isIdle()) {
+				await reportReconciledStatus(ctx);
+				if (!isCurrentBinding(ctx, sid, generation)) return;
+				await pollPendingIfDue(ctx);
 			}
 		} catch (error) {
-			log("ERROR", "plugin.reconcile_error", instanceName, { error: String(error) });
+			if (isCurrentBinding(ctx, sid, generation)) {
+				log("ERROR", "plugin.reconcile_error", instanceName, { error: String(error) });
+			}
 		} finally {
-			reconcileInFlight = false;
+			if (generation === bindingGeneration) reconcileInFlight = false;
 		}
 	}
 
 	function startReconcileTimer(): void {
-		stopReconcileTimer();
+		if (reconcileTimer) return;
 		reconcileTimer = setInterval(() => void reconcile(), 5_000);
+		reconcileTimer.unref?.();
 	}
 
 	function stopReconcileTimer(): void {
@@ -1316,10 +1411,14 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	function resetBinding(opts?: { keepOwner?: boolean }): void {
+	function resetBinding(opts?: { keepOwner?: boolean; stopped?: boolean }): void {
 		stopReconcileTimer();
 		stopNotifyServer();
 		bindingGeneration++;
+		bindingStopped = opts?.stopped ?? false;
+		bindingAttempts = 0;
+		bindingRetryAt = 0;
+		reconcileInFlight = false;
 		instanceName = null;
 		sessionId = null;
 		bootstrapText = null;
@@ -1359,20 +1458,25 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	// Stop only when THIS extension instance owns the identity (nested task
 	// instances never bind, so they never stop the parent).
 	pi.on("session_shutdown", async () => {
+		const stopName = instanceName ?? (ownsIdentity ? getIdentityRegistry().owner : null);
+		// Invalidate pending starts before the first await, not after omp-stop.
+		resetBinding({ keepOwner: true, stopped: true });
+		currentCtx = null;
+		const generation = bindingGeneration;
 		if (probeReason) {
 			log("INFO", "plugin.session_shutdown_skipped", null, { reason: "probe", probe_reason: probeReason });
-			resetBinding();
+			resetBinding({ stopped: true });
 			return;
 		}
 		let keepOwner = false;
-		if (instanceName && ownsIdentity) {
+		if (stopName && ownsIdentity) {
 			const reg = getIdentityRegistry();
 			reg.tearingDown = true;
 			const reason = "shutdown";
-			const stopName = instanceName;
 			// Lets a same-tick signal listener record the signal: omp's postmortem
 			// listener runs first and reaches this handler synchronously.
 			await Promise.resolve();
+			if (generation !== bindingGeneration) return;
 			if (reg.exitSignal) {
 				// Signal exit: postmortem runs cleanup, then exits without firing
 				// `exit`. Release the row now, while omp is still alive.
@@ -1384,6 +1488,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				let softStopOk = false;
 				try {
 					const result = await hcom(["omp-stop", "--name", stopName, "--reason", reason, "--soft"]);
+					if (generation !== bindingGeneration) return;
 					softStopOk = result.code === 0;
 					if (!softStopOk) {
 						log("WARN", "plugin.session_shutdown_stop_failed", stopName, {
@@ -1394,6 +1499,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 						});
 					}
 				} catch (error) {
+					if (generation !== bindingGeneration) return;
 					log("ERROR", "plugin.session_shutdown_stop_error", stopName, {
 						error: String(error),
 						reason,
@@ -1403,8 +1509,8 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				armExitRelease(reg, stopName, reason);
 				keepOwner = !softStopOk;
 			}
-			// Shutdown attempt finished. If we retain ownership after a failed stop,
-			// drop tearingDown so the owner can re-omp-start; nested skip still uses reg.owner.
+			// A failed stop retains ownership, but only a legitimate new session
+			// generation may bind again; the stopped generation stays inert.
 			if (keepOwner) {
 				reg.tearingDown = false;
 			}
@@ -1420,7 +1526,8 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				});
 			}
 		}
-		resetBinding({ keepOwner });
+		if (generation !== bindingGeneration) return;
+		resetBinding({ keepOwner, stopped: true });
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
@@ -1453,8 +1560,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	pi.on("input", async (event: InputEvent, ctx) => {
 		currentCtx = ctx;
+		const sid = ctx.sessionManager.getSessionId();
+		const generation = bindingGeneration;
 		await bindIdentity(ctx);
-		if (!instanceName) return {};
+		if (!isCurrentBinding(ctx, sid, generation) || !instanceName) return {};
 		if (event.source === "extension") {
 			// Acks happen only on consume (message_start or the transform
 			// submission below): an extension-sourced input is not proof that OUR
@@ -1486,9 +1595,12 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		currentCtx = ctx;
+		const generation = bindingGeneration;
+		const boundSid = ctx.sessionManager.getSessionId();
 		await bindIdentity(ctx);
-		if (!instanceName) return undefined;
+		if (!isCurrentBinding(ctx, boundSid, generation) || !instanceName) return undefined;
 		await ensureDeliveryRole(ctx);
+		if (!isCurrentBinding(ctx, boundSid, generation) || !instanceName) return undefined;
 		// Consume proof for the bodyless-wake transform: the input handler
 		// rewrote the wake into our delivery text and omp applied that transform
 		// INLINE and submitted it (it never re-emits an input event with source
@@ -1519,9 +1631,12 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		currentCtx = ctx;
 		if (probeSkipReason(ctx)) return undefined;
+		const sid = ctx.sessionManager.getSessionId();
+		const generation = bindingGeneration;
 		await bindIdentity(ctx);
-		if (!instanceName) return undefined;
+		if (!isCurrentBinding(ctx, sid, generation) || !instanceName) return undefined;
 		await reportStatus(ctx, "active", `tool:${event.toolName}`, String((event.input as any)?.path ?? (event.input as any)?.command ?? ""));
+		if (!isCurrentBinding(ctx, sid, generation) || !instanceName) return undefined;
 		const result = await hcom([
 			"omp-beforetool",
 			"--name",
@@ -1531,6 +1646,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			"--input-json",
 			JSON.stringify(event.input ?? {}),
 		]);
+		if (!isCurrentBinding(ctx, sid, generation)) return undefined;
 		try {
 			const json = JSON.parse(result.stdout || "{}");
 			if (json.decision === "block") {
