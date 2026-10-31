@@ -1167,6 +1167,194 @@ fn caller_gate_requires_the_authenticated_process_exact_mapped_name() {
 
 #[test]
 #[serial_test::serial]
+fn pr127_authenticated_hosted_active_reservation() {
+    authenticated_hosted_reservation_refusal(false);
+}
+
+#[test]
+#[serial_test::serial]
+fn pr127_authenticated_hosted_durable_only_reservation() {
+    authenticated_hosted_reservation_refusal(true);
+}
+
+fn authenticated_hosted_reservation_refusal(durable_only: bool) {
+    let (_dir, home, _guard) = isolated_omp_env();
+    let db = HcomDb::open().unwrap();
+    let process_id = test_process_id("hosted-reservation");
+    save_test_instance(&db, "luna", ST_LISTENING);
+    bind_test_omp_process(&db, "luna", "sid-hosted-caller", "hosted-reservation");
+    db.set_session_binding("sid-hosted-caller", "luna").unwrap();
+    db.upsert_notify_endpoint("luna", "plugin", 54_311).unwrap();
+    let ctx = HcomContext::from_env(
+        &std::collections::HashMap::from([("HCOM_PROCESS_ID".into(), process_id.clone())]),
+        home,
+    );
+    let dispatch = |hook: &str, argv: &[String]| {
+        let previous = std::env::var_os("HCOM_PROCESS_ID");
+        unsafe {
+            std::env::set_var("HCOM_PROCESS_ID", &process_id);
+        }
+        let result = dispatch_omp_hook(hook, argv);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HCOM_PROCESS_ID", value),
+                None => std::env::remove_var("HCOM_PROCESS_ID"),
+            }
+        }
+        result
+    };
+    crate::instance_binding::with_omp_binding_owner(test_omp_owner(), || {
+        let own_args = vec!["--name".into(), "luna".into()];
+        assert_eq!(
+            crate::hooks::common::omp_hook_caller_gate(&ctx, &db, "omp-status", &own_args).unwrap(),
+            Some(test_omp_owner()),
+        );
+        assert_eq!(
+            crate::hooks::common::omp_hook_caller_gate(&ctx, &db, "omp-start", &own_args).unwrap(),
+            Some(test_omp_owner()),
+        );
+        let (code, output) = dispatch(
+            "omp-status",
+            &[
+                "--name",
+                "luna",
+                "--status",
+                "active",
+                "--context",
+                "prompt",
+            ]
+            .map(String::from),
+        );
+        assert_eq!(code, 0, "{output}");
+        let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(response.get("error").is_none(), "{output}");
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().status,
+            ST_ACTIVE
+        );
+
+        db.conn()
+            .execute_batch(
+                "INSERT INTO instances (name, tool, status, created_at, last_event_id)
+                 VALUES ('michael', 'buzz', 'listening', 1000.0, 17);",
+            )
+            .unwrap();
+        db.upsert_notify_endpoint("michael", "connector", 54_312)
+            .unwrap();
+        crate::hosted::carry_hosted_names_forward(db.conn()).unwrap();
+        if durable_only {
+            // Reset carries names forward before deleting the database. Leave
+            // only that durable reservation, with no hosted row or SQL seed.
+            db.conn()
+                .execute_batch(
+                    "DELETE FROM notify_endpoints WHERE instance = 'michael';
+                     DELETE FROM instances WHERE name = 'michael';
+                     DELETE FROM hosted_names WHERE name = 'michael';",
+                )
+                .unwrap();
+        }
+        assert!(crate::hosted::hosted_name_is_reserved(db.path(), "michael").unwrap());
+        assert_eq!(db.get_instance("michael").unwrap().is_none(), durable_only);
+        let snapshot = || {
+            [
+                "instances",
+                "hosted_names",
+                "process_bindings",
+                "session_bindings",
+                "notify_endpoints",
+            ]
+            .map(|table| {
+                let mut stmt = db
+                    .conn()
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                    .unwrap();
+                let columns = stmt.column_count();
+                let rows = stmt
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap();
+                rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            })
+        };
+        let before = snapshot();
+        let registered = db.process_bindings_registered("luna").unwrap();
+        let hosted_args = vec!["--name".into(), "michael".into()];
+        // Unlike read/status/stop, start has no later exact-name ownership
+        // rejection. This assertion fails if the protected-name gate is removed,
+        // rather than passing on a different ownership error.
+        let (code, output) =
+            crate::hooks::common::omp_hook_caller_gate(&ctx, &db, "omp-start", &hosted_args)
+                .unwrap_err();
+        let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(code, 0, "{output}");
+        assert!(response["error"].is_string(), "{output}");
+        assert!(response.get("transient").is_none(), "{output}");
+        if durable_only {
+            let sql_reservations: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM hosted_names WHERE name = 'michael'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sql_reservations, 0, "only the durable reservation remains");
+            // Exercise the existing checked start/RPC boundary without opening
+            // another DB handle: full dispatch would legitimately reseed the
+            // SQL reservation table and erase this durable-only precondition.
+            let (code, output) = start_as_test_owner(&ctx, &db, &hosted_args);
+            let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(code, 0, "{output}");
+            assert!(response["error"].is_string(), "{output}");
+            assert!(response.get("transient").is_none(), "{output}");
+            assert_eq!(snapshot(), before, "durable-only refusal mutated state");
+            assert_eq!(db.process_bindings_registered("luna").unwrap(), registered);
+            assert!(crate::hosted::hosted_name_is_reserved(db.path(), "michael").unwrap());
+            return;
+        }
+        for (hook, args) in [
+            ("omp-start", hosted_args.clone()),
+            ("omp-read", hosted_args.clone()),
+            (
+                "omp-read",
+                vec!["--name".into(), "michael".into(), "--ack".into()],
+            ),
+            (
+                "omp-status",
+                [
+                    "--name",
+                    "michael",
+                    "--status",
+                    "active",
+                    "--context",
+                    "forged",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ),
+            ("omp-stop", hosted_args),
+        ] {
+            let (code, output) = dispatch(hook, &args);
+            let response: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(code, 0, "{hook}: {output}");
+            assert!(response["error"].is_string(), "{hook}: {output}");
+            assert!(response.get("transient").is_none(), "{hook}: {output}");
+            assert_eq!(
+                snapshot(),
+                before,
+                "{hook} mutated protected or caller state"
+            );
+            assert_eq!(db.process_bindings_registered("luna").unwrap(), registered);
+            assert!(crate::hosted::hosted_name_is_reserved(db.path(), "michael").unwrap());
+        }
+    });
+}
+
+#[test]
+#[serial_test::serial]
 fn pidless_legacy_omp_name_refusal_does_not_enroll_mapped_identity() {
     let (_dir, home, _guard) = isolated_omp_env();
     let (db, path) = setup_test_db();

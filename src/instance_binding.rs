@@ -396,15 +396,16 @@ fn held_by_another_live_process(
             .get_instance_full(name)?
             .with_context(|| format!("Missing displaced OMP identity '{name}'"))?;
         let native_owner = omp_native_identity(owner.pid);
-        for (id, registered) in bindings {
+        let mut carrier_presence = None;
+        for (id, registered) in &bindings {
             if id == moving_process_id {
                 continue;
             }
-            if let Some(pid) = crate::proctruth::omp_minted_pid(&id) {
-                let session = db.get_process_binding_full(&id)?.and_then(|(sid, _)| sid);
+            if let Some(pid) = crate::proctruth::omp_minted_pid(id) {
+                let session = db.get_process_binding_full(id)?.and_then(|(sid, _)| sid);
                 if pid == owner.pid
                     && native_owner.as_deref() == Some(owner.incarnation.as_str())
-                    && validate_omp_registration(&row, session.as_deref(), registered, &id, owner)
+                    && validate_omp_registration(&row, session.as_deref(), *registered, id, owner)
                         .is_ok()
                 {
                     // Multiple minted ids are one holder only with the row's
@@ -413,6 +414,39 @@ fn held_by_another_live_process(
                     continue;
                 }
                 if crate::proctruth::process_gone(pid) {
+                    continue;
+                }
+            }
+            if crate::proctruth::is_launcher_process_id(id) {
+                let presence = match carrier_presence {
+                    Some(presence) => presence,
+                    None => {
+                        let Some(stored) = crate::proctruth::stored_omp_owner(&row)? else {
+                            return Ok(true);
+                        };
+                        let pid = omp_row_pid(&row)?;
+                        anyhow::ensure!(stored.pid == pid, "OMP stamp/PID mismatch for '{name}'");
+                        if !crate::proctruth::process_gone(pid) {
+                            return Ok(true);
+                        }
+                        // A retained launcher UUID is stale only when its
+                        // stamped native owner is gone AND a checked scan rules
+                        // out every other carrier of this row or retained UUID.
+                        let retained_ids = bindings
+                            .iter()
+                            .filter(|(id, _)| {
+                                id != moving_process_id
+                                    && crate::proctruth::is_launcher_process_id(id)
+                            })
+                            .map(|(id, _)| id.clone())
+                            .collect::<Vec<_>>();
+                        let presence =
+                            crate::proctruth::omp_carrier_presence(name, &retained_ids, owner);
+                        carrier_presence = Some(presence);
+                        presence
+                    }
+                };
+                if presence == crate::proctruth::OmpCarrierPresence::Absent {
                     continue;
                 }
             }
@@ -1001,9 +1035,8 @@ fn validate_omp_registration(
         if pid != owner.pid {
             anyhow::ensure!(
                 crate::proctruth::is_launcher_process_id(process_id)
-                    && is_true_launch_placeholder(Some(row))
                     && binding_session.is_none_or(str::is_empty),
-                "Only an unbound OMP launch placeholder may hand off its wrapper"
+                "Only an unbound OMP launch registration may hand off its wrapper"
             );
         }
         return Ok(());
@@ -1205,11 +1238,28 @@ fn validate_omp_target(
         None => {
             // Parse a present receipt even on a historical row: malformed
             // evidence is never repaired by treating it as absent.
-            stored_omp_launch_anchor(&row)?;
-            anyhow::ensure!(
-                crate::proctruth::process_gone(pid),
-                "Canonical OMP native owner for '{name}' is live or unreadable"
-            );
+            let launch_anchor = stored_omp_launch_anchor(&row)?;
+            if launch_anchor.is_some()
+                && crate::proctruth::is_launcher_process_id(process_id)
+                && db
+                    .get_process_binding_full(process_id)?
+                    .is_some_and(|(session, mapped)| {
+                        mapped == name && session.as_deref().is_none_or(str::is_empty)
+                    })
+            {
+                // A resumed launch already carries its prior session on the
+                // row, but this exact registration has not bound it yet. Prove
+                // its current wrapper-to-child handoff again on this writer.
+                anyhow::ensure!(
+                    authenticated_omp_owner(db, process_id)? == *owner,
+                    "OMP launch handoff owner changed for '{name}'"
+                );
+            } else {
+                anyhow::ensure!(
+                    crate::proctruth::process_gone(pid),
+                    "Canonical OMP native owner for '{name}' is live or unreadable"
+                );
+            }
         }
     }
     anyhow::ensure!(
@@ -5148,6 +5198,36 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn omp_carrier_probe_test_child(
+        name: &str,
+        process_id: &str,
+    ) -> (tempfile::TempDir, OmpTestChild) {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("omp");
+        std::os::unix::fs::symlink("/bin/sh", &executable).unwrap();
+        // A native omp comm marker stays eligible even below a shared tool broker.
+        // The held pipe blocks the shell builtin without spawning another child.
+        let child = OmpTestChild(
+            std::process::Command::new(&executable)
+                .args(["-c", "read _"])
+                .env("HCOM_INSTANCE_NAME", name)
+                .env("HCOM_PROCESS_ID", process_id)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("/proc/{}/comm", child.pid()))
+                .unwrap()
+                .trim_end(),
+            "omp"
+        );
+        (dir, child)
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -5231,6 +5311,871 @@ mod tests {
         let row = db.get_instance_full("luna").unwrap().unwrap();
         assert_eq!(row.session_id.as_deref(), Some("sid-new"));
         assert_eq!(omp_launch_context(&row).unwrap()["pane_id"], "launch-pane");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_resumed_launch_handoff_authenticates_and_binds_through_both_target_paths() {
+        for canonical_exists in [false, true] {
+            let (db, _dir, owner) = omp_test_db();
+            let mut wrapper = OmpTestChild::spawn();
+            let launcher = "550e8400-e29b-41d4-a716-446655440000";
+            crate::launcher::register_launch_instance(
+                &db,
+                "luna",
+                Some("sid-prior"),
+                launcher,
+                "omp",
+                false,
+                None,
+                "/tmp/omp-resumed-launch",
+            )
+            .unwrap();
+            assert!(db.set_instance_pid_if_unset("luna", wrapper.pid()).unwrap());
+            store_captured_launch_context(
+                &db,
+                "luna",
+                serde_json::Map::from_iter([("pane_id".into(), serde_json::json!("resume-pane"))]),
+            )
+            .unwrap();
+            if canonical_exists {
+                db.rebind_session("sid-prior", "luna").unwrap();
+            }
+            let launched = db.get_instance_full("luna").unwrap().unwrap();
+            assert_eq!(launched.session_id.as_deref(), Some("sid-prior"));
+            assert_eq!(launched.pid, Some(i64::from(wrapper.pid())));
+            assert!(!is_true_launch_placeholder(Some(&launched)));
+            assert_eq!(
+                stored_omp_launch_anchor(&launched).unwrap(),
+                Some(OmpOwner {
+                    pid: wrapper.pid(),
+                    incarnation: crate::sys::process::identity(wrapper.pid()).unwrap(),
+                })
+            );
+            assert_eq!(
+                db.get_process_binding_full(launcher).unwrap(),
+                Some((None, "luna".into()))
+            );
+            // Deliberately omit the launcher's later child-PID update: the
+            // live wrapper and its receipt are still on this resumed row.
+            let before_auth = db_state(&db);
+            with_omp_binding_owner(owner.clone(), || {
+                OMP_BINDING_OWNER_FIXTURE.with_borrow_mut(|fixture| {
+                    fixture.as_mut().unwrap().launch_anchor = Some(wrapper.pid());
+                });
+                assert_eq!(authenticated_omp_owner(&db, launcher).unwrap(), owner);
+                assert_eq!(db_state(&db), before_auth);
+                assert_eq!(
+                    bind_omp_session_to_process(&db, "sid-prior", launcher)
+                        .unwrap()
+                        .as_deref(),
+                    Some("luna")
+                );
+            });
+            assert_omp_pin(&db, "luna", &owner);
+            let bound = db.get_instance_full("luna").unwrap().unwrap();
+            assert_eq!(bound.name, launched.name);
+            assert_eq!(bound.created_at, launched.created_at);
+            assert_eq!(bound.session_id.as_deref(), Some("sid-prior"));
+            assert_eq!(
+                omp_launch_context(&bound).unwrap()["pane_id"],
+                "resume-pane"
+            );
+            assert_eq!(
+                db.get_session_binding("sid-prior").unwrap().as_deref(),
+                Some("luna")
+            );
+            assert_eq!(
+                db.get_process_binding_full(launcher).unwrap(),
+                Some((Some("sid-prior".into()), "luna".into()))
+            );
+            assert!(wrapper.0.try_wait().unwrap().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_resumed_launch_foreign_and_stale_receipts_leave_complete_state() {
+        let (db, _dir, owner) = omp_test_db();
+        let wrapper = OmpTestChild::spawn();
+        let foreign = OmpTestChild::spawn();
+        let launcher = "550e8400-e29b-41d4-a716-446655440000";
+        crate::launcher::register_launch_instance(
+            &db,
+            "luna",
+            Some("sid-prior"),
+            launcher,
+            "omp",
+            false,
+            None,
+            "/tmp/omp-resumed-launch",
+        )
+        .unwrap();
+        assert!(db.set_instance_pid_if_unset("luna", wrapper.pid()).unwrap());
+        with_omp_binding_owner(owner, || {
+            OMP_BINDING_OWNER_FIXTURE.with_borrow_mut(|fixture| {
+                fixture.as_mut().unwrap().launch_anchor = Some(wrapper.pid());
+            });
+            for anchor in [
+                OmpOwner {
+                    pid: wrapper.pid(),
+                    incarnation: "prior-wrapper-incarnation".into(),
+                },
+                OmpOwner {
+                    pid: foreign.pid(),
+                    incarnation: crate::sys::process::identity(foreign.pid()).unwrap(),
+                },
+            ] {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET launch_context = ? WHERE name = 'luna'",
+                        rusqlite::params![
+                            serde_json::json!({
+                                "omp_launch_anchor": anchor,
+                                "pane_id": "resume-pane",
+                            })
+                            .to_string()
+                        ],
+                    )
+                    .unwrap();
+                let before = db_state(&db);
+                assert!(authenticated_omp_owner(&db, launcher).is_err());
+                assert!(bind_omp_session_to_process(&db, "sid-prior", launcher).is_err());
+                assert_eq!(db_state(&db), before);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_resumed_launch_pin_failure_reaches_pin_and_rolls_back_complete_state() {
+        let (db, _dir, owner) = omp_test_db();
+        let wrapper = OmpTestChild::spawn();
+        let launcher = "550e8400-e29b-41d4-a716-446655440000";
+        crate::launcher::register_launch_instance(
+            &db,
+            "luna",
+            Some("sid-prior"),
+            launcher,
+            "omp",
+            false,
+            None,
+            "/tmp/omp-resumed-launch",
+        )
+        .unwrap();
+        assert!(db.set_instance_pid_if_unset("luna", wrapper.pid()).unwrap());
+        store_captured_launch_context(
+            &db,
+            "luna",
+            serde_json::Map::from_iter([("pane_id".into(), serde_json::json!("resume-pane"))]),
+        )
+        .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER refuse_resumed_launch_pin BEFORE UPDATE OF pid ON instances
+                 WHEN NEW.name = 'luna'
+                 BEGIN SELECT RAISE(ABORT, 'pr127 resumed launch pin refused'); END;",
+            )
+            .unwrap();
+        let before = db_state(&db);
+        let error = with_omp_binding_owner(owner.clone(), || {
+            OMP_BINDING_OWNER_FIXTURE.with_borrow_mut(|fixture| {
+                fixture.as_mut().unwrap().launch_anchor = Some(wrapper.pid());
+            });
+            assert_eq!(authenticated_omp_owner(&db, launcher).unwrap(), owner);
+            bind_omp_session_to_process(&db, "sid-prior", launcher).unwrap_err()
+        });
+        assert!(
+            format!("{error:#}").contains("pr127 resumed launch pin refused"),
+            "{error:#}"
+        );
+        assert_eq!(db_state(&db), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_resumed_launch_receipt_never_authorizes_another_mapped_registration() {
+        let (db, _dir, owner) = omp_test_db();
+        let wrapper = OmpTestChild::spawn();
+        let launcher = "550e8400-e29b-41d4-a716-446655440000";
+        let moving_launcher = "550e8400-e29b-41d4-a716-446655440001";
+        let moving = format!("omp-{}-moving", owner.pid);
+        seed_omp_owner_row(&db, "xrow", Some("sid-old"), Some(&moving), &owner);
+        db.set_process_binding(moving_launcher, "sid-old", "xrow")
+            .unwrap();
+        crate::launcher::register_launch_instance(
+            &db,
+            "luna",
+            Some("sid-prior"),
+            launcher,
+            "omp",
+            false,
+            None,
+            "/tmp/omp-resumed-launch",
+        )
+        .unwrap();
+        assert!(db.set_instance_pid_if_unset("luna", wrapper.pid()).unwrap());
+        with_omp_binding_owner(owner.clone(), || {
+            OMP_BINDING_OWNER_FIXTURE.with_borrow_mut(|fixture| {
+                fixture.as_mut().unwrap().launch_anchor = Some(wrapper.pid());
+            });
+            for id in [&*moving, moving_launcher] {
+                let before = db_state(&db);
+                assert_eq!(authenticated_omp_owner(&db, id).unwrap(), owner);
+                let error = bind_omp_session_to_process(&db, "sid-prior", id).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("is live or unreadable"),
+                    "{error:#}"
+                );
+                assert_eq!(db_state(&db), before);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_resumed_launch_handoff_still_rejects_a_foreign_live_holder() {
+        let (db, _dir, owner) = omp_test_db();
+        let wrapper = OmpTestChild::spawn();
+        let mut foreign = OmpTestChild::spawn();
+        let launcher = "550e8400-e29b-41d4-a716-446655440000";
+        crate::launcher::register_launch_instance(
+            &db,
+            "luna",
+            Some("sid-prior"),
+            launcher,
+            "omp",
+            false,
+            None,
+            "/tmp/omp-resumed-launch",
+        )
+        .unwrap();
+        assert!(db.set_instance_pid_if_unset("luna", wrapper.pid()).unwrap());
+        let foreign_id = format!("omp-{}-foreign", foreign.pid());
+        db.set_process_binding(&foreign_id, "sid-prior", "luna")
+            .unwrap();
+        let before = db_state(&db);
+        let error = with_omp_binding_owner(owner.clone(), || {
+            OMP_BINDING_OWNER_FIXTURE.with_borrow_mut(|fixture| {
+                fixture.as_mut().unwrap().launch_anchor = Some(wrapper.pid());
+            });
+            assert_eq!(authenticated_omp_owner(&db, launcher).unwrap(), owner);
+            bind_omp_session_to_process(&db, "sid-prior", launcher).unwrap_err()
+        });
+        assert!(
+            format!("{error:#}").contains("has another live holder"),
+            "{error:#}"
+        );
+        assert_eq!(db_state(&db), before);
+        assert!(foreign.0.try_wait().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_dead_owner_retained_launchers_adopt_canonical_and_move_runtime() {
+        let (db, _dir, owner) = omp_test_db();
+        let mut historical = OmpTestChild::spawn();
+        let historical_owner = OmpOwner {
+            pid: historical.pid(),
+            incarnation: crate::sys::process::identity(historical.pid()).unwrap(),
+        };
+        historical.0.kill().unwrap();
+        historical.0.wait().unwrap();
+        assert!(crate::proctruth::process_gone(historical_owner.pid));
+        let moving = format!("omp-{}-moving", owner.pid);
+        let launcher = "550e8400-e29b-41d4-a716-446655440000";
+        let other_launcher = "550e8400-e29b-41d4-a716-446655440001";
+        seed_omp_owner_row(&db, "xrow", Some("sid-old"), Some(&moving), &owner);
+        seed_omp_owner_row(
+            &db,
+            "yrow",
+            Some("sid-new"),
+            Some(launcher),
+            &historical_owner,
+        );
+        db.set_process_binding(other_launcher, "sid-new", "yrow")
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_event_id = 41, launch_context = ? WHERE name = 'yrow'",
+                rusqlite::params![serde_json::json!({"omp_owner": historical_owner}).to_string()],
+            )
+            .unwrap();
+        for (name, kind, port) in [
+            ("xrow", "pty", 54_341),
+            ("xrow", "plugin", 54_342),
+            ("yrow", "inject", 54_343),
+        ] {
+            db.upsert_notify_endpoint(name, kind, port).unwrap();
+        }
+        let result = with_omp_binding_owner(owner.clone(), || {
+            crate::proctruth::with_omp_carrier_presence(
+                crate::proctruth::OmpCarrierPresence::Absent,
+                || bind_omp_session_to_process(&db, "sid-new", &moving),
+            )
+        })
+        .unwrap();
+        assert_eq!(result.as_deref(), Some("yrow"));
+        assert_omp_pin(&db, "yrow", &owner);
+        assert_released_session(
+            &db,
+            "xrow",
+            "sid-old",
+            17,
+            "/tmp/omp-binding-transcript.jsonl",
+        );
+        assert_eq!(db.get_session_binding("sid-old").unwrap(), None);
+        assert_eq!(
+            db.get_session_binding("sid-new").unwrap().as_deref(),
+            Some("yrow")
+        );
+        for id in [&*moving, launcher, other_launcher] {
+            assert_eq!(
+                db.get_process_binding_full(id).unwrap(),
+                Some((Some("sid-new".into()), "yrow".into()))
+            );
+        }
+        let row = db.get_instance_full("yrow").unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("sid-new"));
+        assert_eq!(row.last_event_id, 41);
+        assert_eq!(omp_launch_context(&row).unwrap()["pane_id"], "xrow-pane");
+        assert_eq!(
+            endpoint_rows(db.conn()),
+            vec![
+                ("yrow".into(), "inject".into(), 54_343),
+                ("yrow".into(), "plugin".into(), 54_342),
+                ("yrow".into(), "pty".into(), 54_341),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_retained_launcher_live_native_owner_refuses_without_mutation() {
+        let (db, _dir, owner) = omp_test_db();
+        let mut foreign = OmpTestChild::spawn();
+        let foreign_owner = OmpOwner {
+            pid: foreign.pid(),
+            incarnation: crate::sys::process::identity(foreign.pid()).unwrap(),
+        };
+        let moving = format!("omp-{}-moving", owner.pid);
+        let launcher = "550e8400-e29b-41d4-a716-446655440000";
+        seed_omp_owner_row(&db, "xrow", Some("sid-old"), Some(&moving), &owner);
+        seed_omp_owner_row(&db, "yrow", Some("sid-new"), Some(launcher), &foreign_owner);
+        db.upsert_notify_endpoint("xrow", "pty", 54_351).unwrap();
+        db.upsert_notify_endpoint("yrow", "plugin", 54_352).unwrap();
+        assert!(!crate::proctruth::process_gone(foreign_owner.pid));
+        let before = db_state(&db);
+        let error = with_omp_binding_owner(owner, || {
+            crate::proctruth::with_omp_carrier_presence(
+                crate::proctruth::OmpCarrierPresence::Absent,
+                || bind_omp_session_to_process(&db, "sid-new", &moving).unwrap_err(),
+            )
+        });
+        assert!(
+            format!("{error:#}").contains("belongs to another live owner"),
+            "{error:#}"
+        );
+        assert_eq!(db_state(&db), before);
+        assert!(foreign.0.try_wait().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_dead_owner_retained_launcher_unknown_carriers_preserve_complete_state() {
+        let (db, _dir, owner) = omp_test_db();
+        let mut historical = OmpTestChild::spawn();
+        let historical_owner = OmpOwner {
+            pid: historical.pid(),
+            incarnation: crate::sys::process::identity(historical.pid()).unwrap(),
+        };
+        historical.0.kill().unwrap();
+        historical.0.wait().unwrap();
+        assert!(crate::proctruth::process_gone(historical_owner.pid));
+        let moving = format!("omp-{}-moving", owner.pid);
+        let launcher = "550e8400-e29b-41d4-a716-446655440000";
+        seed_omp_owner_row(&db, "xrow", Some("sid-old"), Some(&moving), &owner);
+        seed_omp_owner_row(
+            &db,
+            "yrow",
+            Some("sid-new"),
+            Some(launcher),
+            &historical_owner,
+        );
+        db.upsert_notify_endpoint("xrow", "pty", 54_361).unwrap();
+        db.upsert_notify_endpoint("yrow", "plugin", 54_362).unwrap();
+        let before = db_state(&db);
+        let error = with_omp_binding_owner(owner, || {
+            crate::proctruth::with_omp_carrier_presence(
+                crate::proctruth::OmpCarrierPresence::Unknown,
+                || bind_omp_session_to_process(&db, "sid-new", &moving).unwrap_err(),
+            )
+        });
+        assert!(
+            format!("{error:#}").contains("has another live holder"),
+            "{error:#}"
+        );
+        assert_eq!(db_state(&db), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_dead_owner_retained_launcher_live_exact_carriers_preserve_complete_state() {
+        for (carrier_name, carrier_id) in [
+            ("yrow", ""),
+            ("another-row", "550e8400-e29b-41d4-a716-446655440000"),
+        ] {
+            let (db, _dir, owner) = omp_test_db();
+            let mut historical = OmpTestChild::spawn();
+            let historical_owner = OmpOwner {
+                pid: historical.pid(),
+                incarnation: crate::sys::process::identity(historical.pid()).unwrap(),
+            };
+            historical.0.kill().unwrap();
+            historical.0.wait().unwrap();
+            assert!(crate::proctruth::process_gone(historical_owner.pid));
+            let moving = format!("omp-{}-moving", owner.pid);
+            let launcher = "550e8400-e29b-41d4-a716-446655440000";
+            seed_omp_owner_row(&db, "xrow", Some("sid-old"), Some(&moving), &owner);
+            seed_omp_owner_row(
+                &db,
+                "yrow",
+                Some("sid-new"),
+                Some(launcher),
+                &historical_owner,
+            );
+            let mut carrier = OmpTestChild(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .env("HCOM_INSTANCE_NAME", carrier_name)
+                    .env("HCOM_PROCESS_ID", carrier_id)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let before = db_state(&db);
+            let error = with_omp_binding_owner(owner, || {
+                crate::proctruth::with_omp_carrier_presence(
+                    crate::proctruth::OmpCarrierPresence::Present,
+                    || bind_omp_session_to_process(&db, "sid-new", &moving).unwrap_err(),
+                )
+            });
+            assert!(
+                format!("{error:#}").contains("has another live holder"),
+                "{error:#}"
+            );
+            assert_eq!(db_state(&db), before);
+            assert!(carrier.0.try_wait().unwrap().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_dead_owner_retained_launcher_pin_failure_rolls_back_the_complete_switch() {
+        let (db, _dir, owner) = omp_test_db();
+        let mut historical = OmpTestChild::spawn();
+        let historical_owner = OmpOwner {
+            pid: historical.pid(),
+            incarnation: crate::sys::process::identity(historical.pid()).unwrap(),
+        };
+        historical.0.kill().unwrap();
+        historical.0.wait().unwrap();
+        assert!(crate::proctruth::process_gone(historical_owner.pid));
+        let moving = format!("omp-{}-moving", owner.pid);
+        let launcher = "550e8400-e29b-41d4-a716-446655440000";
+        seed_omp_owner_row(&db, "xrow", Some("sid-old"), Some(&moving), &owner);
+        seed_omp_owner_row(
+            &db,
+            "yrow",
+            Some("sid-new"),
+            Some(launcher),
+            &historical_owner,
+        );
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_event_id = 41 WHERE name = 'yrow'",
+                [],
+            )
+            .unwrap();
+        db.upsert_notify_endpoint("xrow", "pty", 54_371).unwrap();
+        db.upsert_notify_endpoint("yrow", "plugin", 54_372).unwrap();
+        // PID migration occurs while xrow still exists. Only the final owner
+        // pin runs after its release, so this cannot pass on an earlier error.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER refuse_retained_launcher_pin BEFORE UPDATE OF pid ON instances
+                 WHEN NEW.name = 'yrow' AND NOT EXISTS
+                      (SELECT 1 FROM instances WHERE name = 'xrow')
+                 BEGIN SELECT RAISE(ABORT, 'pr127 retained launcher final pin refused'); END;",
+            )
+            .unwrap();
+        let before = db_state(&db);
+        let error = with_omp_binding_owner(owner, || {
+            crate::proctruth::with_omp_carrier_presence(
+                crate::proctruth::OmpCarrierPresence::Absent,
+                || bind_omp_session_to_process(&db, "sid-new", &moving).unwrap_err(),
+            )
+        });
+        assert!(
+            format!("{error:#}").contains("pr127 retained launcher final pin refused"),
+            "{error:#}"
+        );
+        assert_eq!(db_state(&db), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_retained_binding_release_requires_complete_dead_native_owner_evidence() {
+        for case in [
+            "missing-stamp",
+            "malformed-context",
+            "malformed-stamp",
+            "partial-stamp",
+            "missing-pid",
+            "mismatched-pid",
+            "reused-live-pid",
+            "opaque-id",
+            "additional-live-holder",
+        ] {
+            let (db, _dir, owner) = omp_test_db();
+            let mut historical = OmpTestChild::spawn();
+            let historical_owner = OmpOwner {
+                pid: historical.pid(),
+                incarnation: crate::sys::process::identity(historical.pid()).unwrap(),
+            };
+            historical.0.kill().unwrap();
+            historical.0.wait().unwrap();
+            assert!(crate::proctruth::process_gone(historical_owner.pid));
+            let mut foreign = OmpTestChild::spawn();
+            let moving = format!("omp-{}-moving", owner.pid);
+            let retained = if case == "opaque-id" {
+                "opaque-retained-id"
+            } else {
+                "550e8400-e29b-41d4-a716-446655440000"
+            };
+            seed_omp_owner_row(&db, "xrow", Some("sid-old"), Some(&moving), &owner);
+            seed_omp_owner_row(
+                &db,
+                "yrow",
+                Some("sid-new"),
+                Some(retained),
+                &historical_owner,
+            );
+            let context = match case {
+                "missing-stamp" => Some("{}".to_string()),
+                "malformed-context" => Some("{malformed".to_string()),
+                "malformed-stamp" => Some(r#"{"omp_owner":null}"#.to_string()),
+                "partial-stamp" => Some(
+                    serde_json::json!({"omp_owner": {"pid": historical_owner.pid}}).to_string(),
+                ),
+                "reused-live-pid" => Some(
+                    serde_json::json!({"omp_owner": {
+                        "pid": foreign.pid(), "incarnation": "prior-native-incarnation",
+                    }})
+                    .to_string(),
+                ),
+                _ => None,
+            };
+            if let Some(context) = context {
+                db.conn()
+                    .execute(
+                        "UPDATE instances SET launch_context = ? WHERE name = 'yrow'",
+                        rusqlite::params![context],
+                    )
+                    .unwrap();
+            }
+            match case {
+                "missing-pid" => {
+                    db.conn()
+                        .execute("UPDATE instances SET pid = NULL WHERE name = 'yrow'", [])
+                        .unwrap();
+                }
+                "mismatched-pid" | "reused-live-pid" => {
+                    db.conn()
+                        .execute(
+                            "UPDATE instances SET pid = ? WHERE name = 'yrow'",
+                            rusqlite::params![i64::from(foreign.pid())],
+                        )
+                        .unwrap();
+                }
+                "additional-live-holder" => {
+                    db.set_process_binding(
+                        &format!("omp-{}-foreign", foreign.pid()),
+                        "sid-new",
+                        "yrow",
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            let before = db_state(&db);
+            with_omp_binding_owner(owner.clone(), || {
+                crate::proctruth::with_omp_carrier_presence(
+                    crate::proctruth::OmpCarrierPresence::Absent,
+                    || {
+                        let held = held_by_another_live_process(&db, "yrow", &moving, Some(&owner));
+                        if matches!(
+                            case,
+                            "malformed-context"
+                                | "malformed-stamp"
+                                | "partial-stamp"
+                                | "missing-pid"
+                                | "mismatched-pid"
+                        ) {
+                            assert!(held.is_err(), "{case}");
+                        } else {
+                            assert!(held.unwrap(), "{case}");
+                        }
+                        assert!(
+                            bind_omp_session_to_process(&db, "sid-new", &moving).is_err(),
+                            "{case}"
+                        );
+                    },
+                );
+            });
+            assert_eq!(db_state(&db), before, "{case}");
+            assert!(foreign.0.try_wait().unwrap().is_none(), "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pr127_dead_owner_retained_launcher_checked_native_platform_contract() {
+        let (db, _dir, mut owner) = omp_test_db();
+        // The checked probe reads native facts directly, not the binding-owner
+        // seam. Give the authenticated moving owner its real incarnation.
+        owner.incarnation = crate::sys::process::identity(owner.pid).unwrap();
+        let mut historical = OmpTestChild::spawn();
+        let historical_owner = OmpOwner {
+            pid: historical.pid(),
+            incarnation: crate::sys::process::identity(historical.pid()).unwrap(),
+        };
+        historical.0.kill().unwrap();
+        historical.0.wait().unwrap();
+        assert!(crate::proctruth::process_gone(historical_owner.pid));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let (_unrelated_dir, mut unrelated) =
+            omp_carrier_probe_test_child("pr127-native-unrelated", "pr127-native-unrelated-id");
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let mut unrelated = OmpTestChild::spawn();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let owner_status =
+                std::fs::read_to_string(format!("/proc/{}/status", owner.pid)).unwrap();
+            let unrelated_status =
+                std::fs::read_to_string(format!("/proc/{}/status", unrelated.pid())).unwrap();
+            assert_eq!(
+                owner_status
+                    .lines()
+                    .find(|line| line.starts_with("Uid:"))
+                    .unwrap(),
+                unrelated_status
+                    .lines()
+                    .find(|line| line.starts_with("Uid:"))
+                    .unwrap()
+            );
+            assert!(crate::proctruth::carrier_eligible(unrelated.pid()));
+            let environment = std::fs::read(format!("/proc/{}/environ", unrelated.pid())).unwrap();
+            assert!(
+                environment
+                    .split(|byte| *byte == 0)
+                    .any(|entry| entry == b"HCOM_INSTANCE_NAME=pr127-native-unrelated")
+            );
+            assert!(
+                environment
+                    .split(|byte| *byte == 0)
+                    .any(|entry| entry == b"HCOM_PROCESS_ID=pr127-native-unrelated-id")
+            );
+        }
+        let moving = format!("omp-{}-native-moving", owner.pid);
+        let launcher = "13712700-0000-4000-8000-000000000127";
+        let source = "pr127-native-source";
+        let target = "pr127-native-target";
+        seed_omp_owner_row(&db, source, Some("sid-native-old"), Some(&moving), &owner);
+        seed_omp_owner_row(
+            &db,
+            target,
+            Some("sid-native-new"),
+            Some(launcher),
+            &historical_owner,
+        );
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_event_id = 41 WHERE name = ?",
+                rusqlite::params![target],
+            )
+            .unwrap();
+        db.upsert_notify_endpoint(source, "pty", 54_381).unwrap();
+        db.upsert_notify_endpoint(target, "plugin", 54_382).unwrap();
+        let before = db_state(&db);
+        let fixture = crate::proctruth::OmpCarrierProbeFixture {
+            candidates: vec![owner.pid, historical_owner.pid, unrelated.pid()],
+            environment_permission_denied_pid: None,
+        };
+        crate::proctruth::with_omp_carrier_probe_fixture(fixture, || {
+            with_omp_binding_owner(owner.clone(), || {
+                assert_eq!(authenticated_omp_owner(&db, &moving).unwrap(), owner);
+                // Both calls share the same candidate IO, never a final observation override.
+                let presence =
+                    crate::proctruth::omp_carrier_presence(target, &[launcher.to_string()], &owner);
+                if cfg!(any(target_os = "linux", target_os = "android")) {
+                    assert_eq!(presence, crate::proctruth::OmpCarrierPresence::Absent);
+                    assert_eq!(
+                        bind_omp_session_to_process(&db, "sid-native-new", &moving)
+                            .unwrap()
+                            .as_deref(),
+                        Some(target)
+                    );
+                    assert_omp_pin(&db, target, &owner);
+                    assert_released_session(
+                        &db,
+                        source,
+                        "sid-native-old",
+                        17,
+                        "/tmp/omp-binding-transcript.jsonl",
+                    );
+                    assert_eq!(db.get_session_binding("sid-native-old").unwrap(), None);
+                    assert_eq!(
+                        db.get_session_binding("sid-native-new").unwrap().as_deref(),
+                        Some(target)
+                    );
+                    for id in [&*moving, launcher] {
+                        assert_eq!(
+                            db.get_process_binding_full(id).unwrap(),
+                            Some((Some("sid-native-new".into()), target.into()))
+                        );
+                    }
+                    let row = db.get_instance_full(target).unwrap().unwrap();
+                    assert_eq!(row.session_id.as_deref(), Some("sid-native-new"));
+                    assert_eq!(row.last_event_id, 41);
+                    assert_eq!(
+                        endpoint_rows(db.conn()),
+                        vec![
+                            (target.into(), "plugin".into(), 54_382),
+                            (target.into(), "pty".into(), 54_381),
+                        ]
+                    );
+                } else {
+                    assert_eq!(presence, crate::proctruth::OmpCarrierPresence::Unknown);
+                    let error =
+                        bind_omp_session_to_process(&db, "sid-native-new", &moving).unwrap_err();
+                    assert!(
+                        format!("{error:#}").contains("has another live holder"),
+                        "{error:#}"
+                    );
+                    assert_eq!(db_state(&db), before);
+                }
+            });
+        });
+        assert!(unrelated.0.try_wait().unwrap().is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn pr127_dead_owner_retained_launcher_native_environment_permission_denied_preserves_complete_state()
+     {
+        let (db, _dir, mut owner) = omp_test_db();
+        owner.incarnation = crate::sys::process::identity(owner.pid).unwrap();
+        let mut historical = OmpTestChild::spawn();
+        let historical_owner = OmpOwner {
+            pid: historical.pid(),
+            incarnation: crate::sys::process::identity(historical.pid()).unwrap(),
+        };
+        historical.0.kill().unwrap();
+        historical.0.wait().unwrap();
+        assert!(crate::proctruth::process_gone(historical_owner.pid));
+        let (_unrelated_dir, mut unrelated) = omp_carrier_probe_test_child(
+            "pr127-native-eacces-unrelated",
+            "pr127-native-eacces-unrelated-id",
+        );
+        let owner_status = std::fs::read_to_string(format!("/proc/{}/status", owner.pid)).unwrap();
+        let unrelated_status =
+            std::fs::read_to_string(format!("/proc/{}/status", unrelated.pid())).unwrap();
+        assert_eq!(
+            owner_status
+                .lines()
+                .find(|line| line.starts_with("Uid:"))
+                .unwrap(),
+            unrelated_status
+                .lines()
+                .find(|line| line.starts_with("Uid:"))
+                .unwrap()
+        );
+        assert!(crate::proctruth::carrier_eligible(unrelated.pid()));
+        let moving = format!("omp-{}-native-eacces-moving", owner.pid);
+        let launcher = "13712700-0000-4000-8000-000000000128";
+        let source = "pr127-native-eacces-source";
+        let target = "pr127-native-eacces-target";
+        seed_omp_owner_row(&db, source, Some("sid-eacces-old"), Some(&moving), &owner);
+        seed_omp_owner_row(
+            &db,
+            target,
+            Some("sid-eacces-new"),
+            Some(launcher),
+            &historical_owner,
+        );
+        db.upsert_notify_endpoint(source, "pty", 54_391).unwrap();
+        db.upsert_notify_endpoint(target, "plugin", 54_392).unwrap();
+        let before = db_state(&db);
+        with_omp_binding_owner(owner.clone(), || {
+            assert_eq!(authenticated_omp_owner(&db, &moving).unwrap(), owner);
+            crate::proctruth::with_omp_carrier_probe_fixture(
+                crate::proctruth::OmpCarrierProbeFixture {
+                    candidates: vec![owner.pid, historical_owner.pid, unrelated.pid()],
+                    environment_permission_denied_pid: None,
+                },
+                || {
+                    assert_eq!(
+                        crate::proctruth::omp_carrier_presence(
+                            target,
+                            &[launcher.to_string()],
+                            &owner,
+                        ),
+                        crate::proctruth::OmpCarrierPresence::Absent
+                    );
+                },
+            );
+            crate::proctruth::with_omp_carrier_probe_fixture(
+                crate::proctruth::OmpCarrierProbeFixture {
+                    candidates: vec![owner.pid, historical_owner.pid, unrelated.pid()],
+                    environment_permission_denied_pid: Some(unrelated.pid()),
+                },
+                || {
+                    assert_eq!(
+                        crate::proctruth::omp_carrier_presence(
+                            target,
+                            &[launcher.to_string()],
+                            &owner,
+                        ),
+                        crate::proctruth::OmpCarrierPresence::Unknown
+                    );
+                    let error =
+                        bind_omp_session_to_process(&db, "sid-eacces-new", &moving).unwrap_err();
+                    assert!(
+                        format!("{error:#}").contains("has another live holder"),
+                        "{error:#}"
+                    );
+                    assert_eq!(db_state(&db), before);
+                },
+            );
+        });
+        assert_eq!(db_state(&db), before);
+        assert!(unrelated.0.try_wait().unwrap().is_none());
     }
 
     fn expire_omp_owner_before_commit(_db: &HcomDb, _name: &str) {

@@ -30,9 +30,10 @@ fn review_custom_case(
     let _guard = crate::hooks::test_helpers::isolated_test_env_with_config(Some(&config));
     let db = HcomDb::open_raw(&scratch.path().join("test.db")).unwrap();
     db.init_db().unwrap();
+    let process_id = "550e8400-e29b-41d4-a716-446655440000";
     let env = HashMap::from([
         ("HCOM_INSTANCE_NAME".to_string(), launch_as.to_string()),
-        ("HCOM_PROCESS_ID".to_string(), "review-nonce".to_string()),
+        ("HCOM_PROCESS_ID".to_string(), process_id.to_string()),
     ]);
     let (result, _) = terminal::launch_terminal(
         ":",
@@ -49,7 +50,7 @@ fn review_custom_case(
     let saved: Vec<_> = [
         ("HCOM_LAUNCHED_PRESET", "myterm"),
         ("MYTERM_PANE", pane_env),
-        ("HCOM_PROCESS_ID", "review-nonce"),
+        ("HCOM_PROCESS_ID", process_id),
     ]
     .into_iter()
     .map(|(key, value)| {
@@ -58,16 +59,15 @@ fn review_custom_case(
         (key, old)
     })
     .collect();
-    db.save_instance_named(
-        launch_as,
-        &serde_json::Map::from_iter([
-            ("tool".into(), serde_json::json!("omp")),
-            ("created_at".into(), serde_json::json!(1.0)),
-            ("status".into(), serde_json::json!("pending")),
-            ("status_context".into(), serde_json::json!("new")),
-        ]),
+    crate::launcher::register_launch_instance(
+        &db, launch_as, None, process_id, "omp", false, None, "/x",
     )
     .unwrap();
+    let owner = OmpOwner {
+        pid: std::process::id(),
+        incarnation: crate::sys::process::identity(std::process::id()).unwrap(),
+    };
+    assert!(db.set_instance_pid_if_unset(launch_as, owner.pid).unwrap());
     capture_and_store_launch_context(&db, launch_as);
     for (key, old) in saved {
         unsafe {
@@ -84,11 +84,14 @@ fn review_custom_case(
                 ("tool".into(), serde_json::json!("omp")),
                 ("created_at".into(), serde_json::json!(1.0)),
                 ("status".into(), serde_json::json!("inactive")),
+                ("pid".into(), serde_json::json!(owner.pid)),
+                (
+                    "launch_context".into(),
+                    serde_json::json!({"omp_owner": owner}).to_string().into(),
+                ),
             ]),
         )
         .unwrap();
-        db.set_process_binding("review-nonce", "", launch_as)
-            .unwrap();
         if transactional {
             db.log_life_event(
                 kill_as,
@@ -103,9 +106,11 @@ fn review_custom_case(
             db.rebind_session("review-session", kill_as).unwrap();
         }
         assert_eq!(
-            bind_session_to_process(&db, "review-session", Some("review-nonce"))
-                .unwrap()
-                .as_deref(),
+            with_omp_binding_owner(owner, || {
+                bind_session_to_process(&db, "review-session", Some(process_id))
+            })
+            .unwrap()
+            .as_deref(),
             Some(kill_as)
         );
         assert!(db.get_instance_full(launch_as).unwrap().is_none());

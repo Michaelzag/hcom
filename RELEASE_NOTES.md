@@ -106,13 +106,13 @@ take the parent's seat. A throwaway omp process (a print or RPC run, or one
 with no session file) stays inert: it binds nothing, stops nothing and opens
 no notify server.
 
-**Upgrade behavior:** seats registered by v0.7.61 recorded no pid at all.
-Those rows migrate under a proven owner: the owner is pinned on the existing
-row in place, so the old plugin's read, ack, status, stop and restart keep
-working and no second identity is minted. A row with another owner, another
-live holder or a reused pid is refused and left untouched. Plain
-(non-hcom-launched) omp sessions join only with the `plain_sessions` opt-in,
-and the plugin starts no recovery of its own while that opt-in is off.
+**Upgrade behavior:** plain seats registered by v0.7.61 recorded no pid at
+all. Those rows migrate under a proven owner: the owner is pinned on the
+existing row in place, so the old plugin's read, ack, status, stop and
+restart keep working and no second identity is minted. A row with another
+owner, another live holder or a reused pid is refused and left untouched.
+Plain (non-hcom-launched) omp sessions join only with the `plain_sessions`
+opt-in, and the plugin starts no recovery of its own while that opt-in is off.
 
 The plugin and the binary ship together. Refresh the installed plugin with
 the new binary — `hcom hooks add omp` (`install` is an alias) — using the

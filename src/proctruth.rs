@@ -42,8 +42,9 @@
 //!   root after the seat died is an orphan, never signalled and never
 //!   evidence. The sweep, stop, resume and kill all read this one verdict.
 //!
-//! Unix only: `/proc` enumeration is compiled out on other platforms, where
-//! every query reports empty (verified-no-holders) and reap is a no-op.
+//! The permissive carrier enumeration is Unix-only; off Unix it reports empty
+//! and reap is a no-op. Checked UUID-adoption evidence instead stays unknown
+//! wherever the native process environment source is unsupported.
 
 #[cfg(unix)]
 use std::collections::{HashMap, HashSet};
@@ -167,6 +168,88 @@ pub(crate) fn has_live_carriers(
     processes_for_instance(name, binding_ids, owners)
         .iter()
         .any(|m| !process_gone(m.pid))
+}
+
+/// Checked carrier evidence for the dead-UUID adoption gate. Only a complete,
+/// readable observation can establish absence; uncertainty never releases a UUID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OmpCarrierPresence {
+    Present,
+    Absent,
+    Unknown,
+}
+
+#[cfg(test)]
+pub(crate) struct OmpCarrierProbeFixture {
+    pub candidates: Vec<u32>,
+    pub environment_permission_denied_pid: Option<u32>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static OMP_CARRIER_PRESENCE: std::cell::Cell<Option<OmpCarrierPresence>> =
+        const { std::cell::Cell::new(None) };
+    static OMP_CARRIER_PROBE_FIXTURE: std::cell::RefCell<Option<OmpCarrierProbeFixture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Scope only the carrier observation, not caller or native owner authentication.
+#[cfg(test)]
+pub(crate) fn with_omp_carrier_presence<T>(
+    presence: OmpCarrierPresence,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<OmpCarrierPresence>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OMP_CARRIER_PRESENCE.with(|slot| slot.set(self.0));
+        }
+    }
+
+    let _restore = Restore(OMP_CARRIER_PRESENCE.with(|slot| slot.replace(Some(presence))));
+    f()
+}
+
+/// Scope candidate enumeration and one optional environment IO failure only.
+#[cfg(test)]
+pub(crate) fn with_omp_carrier_probe_fixture<T>(
+    fixture: OmpCarrierProbeFixture,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<OmpCarrierProbeFixture>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OMP_CARRIER_PROBE_FIXTURE.set(self.0.take());
+        }
+    }
+
+    let _restore = Restore(OMP_CARRIER_PROBE_FIXTURE.replace(Some(fixture)));
+    f()
+}
+
+/// Observe exact name or retained binding-ID carriers in the moving owner's
+/// native user scope, without the permissive scanner's unreadable-process blind
+/// spot. Exclude the moving PID only with fresh incarnation and liveness proof.
+pub(crate) fn omp_carrier_presence(
+    name: &str,
+    binding_ids: &[String],
+    moving_owner: &OmpOwner,
+) -> OmpCarrierPresence {
+    #[cfg(test)]
+    if let Some(presence) = OMP_CARRIER_PRESENCE.with(|slot| slot.get()) {
+        return presence;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        omp_carrier_presence_proc(name, binding_ids, moving_owner)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = (name, binding_ids, moving_owner);
+        OmpCarrierPresence::Unknown
+    }
 }
 
 /// A minted `omp-<pid>-...` binding and when it was registered. `<pid>` holds
@@ -1107,6 +1190,203 @@ fn carrier_in_signal_scope(pid: u32, name: &str, scope: &CarrierTreeScope) -> bo
     }
     log_carrier_out_of_scope(pid, name, scope);
     false
+}
+
+/// Native real/effective/saved/filesystem users for the checked UUID probe.
+/// Proc-directory ownership is not a user identity: non-dumpable processes can
+/// have root-owned proc inodes without changing any of these user IDs.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn omp_carrier_user_ids(pid: u32) -> Option<[u32; 4]> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let mut uid_lines = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
+    let mut fields = uid_lines.next()?.split_ascii_whitespace();
+    let mut users = [0; 4];
+    for user in &mut users {
+        let value = fields.next()?;
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        *user = value.parse().ok()?;
+    }
+    (fields.next().is_none() && uid_lines.next().is_none()).then_some(users)
+}
+
+/// Unlike `enumerate_unix`, this UUID-release proof retains incomplete evidence.
+/// Its explicit user scope formalizes hcom's same-user session premise only for
+/// this adoption gate: disjoint native user tuples are unrelated, while any
+/// overlap or undecidable user evidence stays in scope. Present dominates doubt.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn omp_carrier_presence_proc(
+    name: &str,
+    binding_ids: &[String],
+    moving_owner: &OmpOwner,
+) -> OmpCarrierPresence {
+    #[cfg(test)]
+    if let Some(presence) = OMP_CARRIER_PROBE_FIXTURE.with_borrow(|fixture| {
+        fixture.as_ref().map(|fixture| {
+            omp_carrier_presence_from_candidates(
+                name,
+                binding_ids,
+                moving_owner,
+                fixture.candidates.iter().copied().map(Ok),
+                |pid| {
+                    if fixture.environment_permission_denied_pid == Some(pid) {
+                        Err(std::io::Error::from_raw_os_error(libc::EACCES))
+                    } else {
+                        std::fs::read(format!("/proc/{pid}/environ"))
+                    }
+                },
+            )
+        })
+    }) {
+        return presence;
+    }
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return OmpCarrierPresence::Unknown;
+    };
+    let candidates = dir.filter_map(|entry| match entry {
+        Ok(entry) => {
+            let file_name = entry.file_name();
+            let pid = file_name.to_str()?.parse::<u32>().ok()?;
+            Some(Ok(pid))
+        }
+        Err(error) => Some(Err(error)),
+    });
+    omp_carrier_presence_from_candidates(name, binding_ids, moving_owner, candidates, |pid| {
+        std::fs::read(format!("/proc/{pid}/environ"))
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn omp_carrier_presence_from_candidates(
+    name: &str,
+    binding_ids: &[String],
+    moving_owner: &OmpOwner,
+    candidates: impl IntoIterator<Item = std::io::Result<u32>>,
+    read_environment: impl Fn(u32) -> std::io::Result<Vec<u8>>,
+) -> OmpCarrierPresence {
+    let want = format!("HCOM_INSTANCE_NAME={name}");
+    let self_pid = std::process::id();
+    let owner_users = if crate::sys::process::identity(moving_owner.pid).as_deref()
+        == Some(moving_owner.incarnation.as_str())
+        && !process_gone(moving_owner.pid)
+    {
+        let users = omp_carrier_user_ids(moving_owner.pid);
+        if crate::sys::process::identity(moving_owner.pid).as_deref()
+            == Some(moving_owner.incarnation.as_str())
+            && !process_gone(moving_owner.pid)
+        {
+            users
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Even an otherwise empty scan must prove the native environment source
+    // exists. Reading our own proc environment never inspects or reports values.
+    let mut unknown = owner_users.is_none() || read_environment(self_pid).is_err();
+    for candidate in candidates {
+        let pid = match candidate {
+            Ok(pid) => pid,
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        };
+        if pid == self_pid || process_gone(pid) {
+            continue;
+        }
+        let identity = crate::sys::process::identity(pid);
+        let mut candidate_unknown = false;
+        if pid == moving_owner.pid {
+            if identity.as_deref() == Some(moving_owner.incarnation.as_str())
+                && !process_gone(pid)
+                && crate::sys::process::identity(pid).as_ref() == identity.as_ref()
+            {
+                continue;
+            }
+            candidate_unknown = true;
+        }
+        let unreadable_ancestry = std::cell::Cell::new(false);
+        let eligible = carrier_eligible_with(
+            pid,
+            |pid| {
+                let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
+                if comm.is_none() {
+                    unreadable_ancestry.set(true);
+                }
+                comm
+            },
+            |pid| {
+                let parent = parent_pid(pid);
+                if parent.is_none() {
+                    unreadable_ancestry.set(true);
+                }
+                parent
+            },
+        );
+        if !eligible && !unreadable_ancestry.get() {
+            let current_identity = crate::sys::process::identity(pid);
+            if !process_gone(pid) {
+                unknown |= candidate_unknown
+                    || identity.is_none()
+                    || current_identity.as_ref() != identity.as_ref();
+            }
+            continue;
+        }
+        let users = omp_carrier_user_ids(pid);
+        let user_identity = crate::sys::process::identity(pid);
+        if process_gone(pid) {
+            continue;
+        }
+        if identity.is_none() || user_identity.as_ref() != identity.as_ref() {
+            // A different incarnation cannot inherit a previous PID's foreign
+            // user proof. Keep scanning for Present, but never infer absence.
+            candidate_unknown = true;
+        } else if let (Some(owner_users), Some(users)) = (owner_users, users)
+            && users.iter().all(|user| !owner_users.contains(user))
+        {
+            unknown |= candidate_unknown;
+            continue;
+        }
+        if users.is_none() {
+            candidate_unknown = true;
+        }
+        let env = match read_environment(pid) {
+            Ok(env) => env,
+            Err(_) => {
+                if !process_gone(pid) {
+                    unknown = true;
+                }
+                continue;
+            }
+        };
+        let (carries_name, process_id) = identity_facts(&env, want.as_bytes());
+        if process_gone(pid) {
+            continue;
+        }
+        if carries_name || is_bound_process_id(&process_id, binding_ids) {
+            return OmpCarrierPresence::Present;
+        }
+        let current_identity = crate::sys::process::identity(pid);
+        if !process_gone(pid) {
+            unknown |= candidate_unknown
+                || identity.is_none()
+                || current_identity.as_ref() != identity.as_ref();
+        }
+    }
+    if crate::sys::process::identity(moving_owner.pid).as_deref()
+        != Some(moving_owner.incarnation.as_str())
+        || process_gone(moving_owner.pid)
+    {
+        unknown = true;
+    }
+    if unknown {
+        OmpCarrierPresence::Unknown
+    } else {
+        OmpCarrierPresence::Absent
+    }
 }
 
 #[cfg(unix)]
@@ -4166,6 +4446,57 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn sleep")
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn omp_carrier_presence_requires_matching_moving_owner_incarnation() {
+        let name = unique_name("checked-owner");
+        let mut carrier = spawn_named_sleeper(&name, "");
+        let pid = carrier.id();
+        wait_for_enumerated(&name, &[], pid);
+        let moving_owner = OmpOwner {
+            pid,
+            incarnation: format!(
+                "{}-stale",
+                crate::sys::process::identity(pid).expect("live carrier identity")
+            ),
+        };
+        // The PID alone cannot exclude this live name carrier. Its match also
+        // dominates the uncertainty retained for the mismatched owner proof.
+        let presence = omp_carrier_presence(&name, &[], &moving_owner);
+        carrier.kill().ok();
+        carrier.wait().ok();
+        assert_eq!(presence, OmpCarrierPresence::Present);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn omp_carrier_presence_observes_live_name_and_registered_id() {
+        let owner_name = unique_name("checked-moving");
+        let mut owner = spawn_named_sleeper(&owner_name, "");
+        wait_for_enumerated(&owner_name, &[], owner.id());
+        let moving_owner = OmpOwner {
+            pid: owner.id(),
+            incarnation: crate::sys::process::identity(owner.id()).expect("live owner identity"),
+        };
+        let name = unique_name("checked-carrier");
+        let process_id = uuid::Uuid::new_v4().to_string();
+        let mut carrier = spawn_named_sleeper(&name, &process_id);
+        wait_for_enumerated(&name, &[], carrier.id());
+
+        let by_name = omp_carrier_presence(&name, &[], &moving_owner);
+        let by_id = omp_carrier_presence(
+            &unique_name("checked-different-name"),
+            std::slice::from_ref(&process_id),
+            &moving_owner,
+        );
+        carrier.kill().ok();
+        carrier.wait().ok();
+        owner.kill().ok();
+        owner.wait().ok();
+        assert_eq!(by_name, OmpCarrierPresence::Present);
+        assert_eq!(by_id, OmpCarrierPresence::Present);
     }
 
     #[cfg(target_os = "linux")]
