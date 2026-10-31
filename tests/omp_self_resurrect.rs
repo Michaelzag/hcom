@@ -49,9 +49,17 @@ step() {
 }
 bound_name() { sed -n 's/.*"name":"\([^"]*\)".*/\1/p' start.json; }
 rejoin_as() {
-    local name
+    local name original_cwd status
+    original_cwd="$PWD"
     name=$(bound_name)
-    (cd "$TEST_CWD" && H start --as "$name")
+    cd "$TEST_CWD" || return 1
+    if H start --as "$name"; then
+        status=0
+    else
+        status=$?
+    fi
+    cd "$original_cwd" || return 1
+    return "$status"
 }
 on_term() {
     step exit-stop H omp-stop --name "$(bound_name)" --reason shutdown
@@ -290,6 +298,7 @@ fn exiting_seat_late_start_leaves_no_row_and_stop_succeeds() {
     let sid = format!("sid-exit-{}", unique_suffix());
     let mut omp = spawn_fake_omp(&h, "exit", &sid);
     let name = bind(&h, &omp);
+    let created_before_stop = life_count(&h, &name, "created");
 
     let (stop_code, stop_out, stop_err) = stop_seat(&h, &mut omp, &name);
     let (code, _) = omp.wait_step(&h, "exit-stop");
@@ -310,10 +319,10 @@ fn exiting_seat_late_start_leaves_no_row_and_stop_succeeds() {
         0,
         "the exiting seat's row was resurrected"
     );
-    // A minted bind writes no `created`; a restore would.
+    // The stopped seat's late start must not add a lifecycle creation event.
     assert_eq!(
         life_count(&h, &name, "created"),
-        0,
+        created_before_stop,
         "the late start restored"
     );
     assert_eq!(bound_instance(&h, &omp.process_id()), None);
@@ -369,6 +378,7 @@ fn stopped_live_process_hook_does_not_restore_but_explicit_start_rejoins() {
     let sid = format!("sid-external-{}", unique_suffix());
     let mut omp = spawn_fake_omp(&h, "external", &sid);
     let name = bind(&h, &omp);
+    let created_before_stop = life_count(&h, &name, "created");
 
     let (code, _) = omp.run_step(&h, "release");
     assert_eq!(code, "0", "{}", omp.detail("release"));
@@ -391,7 +401,7 @@ fn stopped_live_process_hook_does_not_restore_but_explicit_start_rejoins() {
     assert_eq!(row_count(&h, &name), 0, "the hook undid the stop");
     assert_eq!(
         life_count(&h, &name, "created"),
-        0,
+        created_before_stop,
         "the late start restored"
     );
     assert_eq!(skipped_restore_logs(&h, &name), 1);
