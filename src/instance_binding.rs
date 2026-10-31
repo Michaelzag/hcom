@@ -392,6 +392,7 @@ fn held_by_another_live_process(
         if bindings.iter().all(|(id, _)| id == moving_process_id) {
             return Ok(false);
         }
+        let moving_is_bound_here = bindings.iter().any(|(id, _)| id == moving_process_id);
         let row = db
             .get_instance_full(name)?
             .with_context(|| format!("Missing displaced OMP identity '{name}'"))?;
@@ -427,17 +428,21 @@ fn held_by_another_live_process(
                         let pid = omp_row_pid(&row)?;
                         anyhow::ensure!(stored.pid == pid, "OMP stamp/PID mismatch for '{name}'");
                         if !crate::proctruth::process_gone(pid) {
+                            if moving_is_bound_here
+                                && stored == *owner
+                                && native_owner.as_deref() == Some(owner.incarnation.as_str())
+                            {
+                                // This bound native owner may retain its own launcher aliases.
+                                continue;
+                            }
                             return Ok(true);
                         }
                         // A retained launcher UUID is stale only when its
                         // stamped native owner is gone AND a checked scan rules
-                        // out every other carrier of this row or retained UUID.
+                        // out every other carrier of this row or any retained binding ID.
                         let retained_ids = bindings
                             .iter()
-                            .filter(|(id, _)| {
-                                id != moving_process_id
-                                    && crate::proctruth::is_launcher_process_id(id)
-                            })
+                            .filter(|(id, _)| id != moving_process_id)
                             .map(|(id, _)| id.clone())
                             .collect::<Vec<_>>();
                         let presence =
@@ -6021,18 +6026,23 @@ mod tests {
             .unwrap();
         db.upsert_notify_endpoint(source, "pty", 54_381).unwrap();
         db.upsert_notify_endpoint(target, "plugin", 54_382).unwrap();
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let before = db_state(&db);
-        let fixture = crate::proctruth::OmpCarrierProbeFixture {
-            candidates: vec![owner.pid, historical_owner.pid, unrelated.pid()],
-            environment_permission_denied_pid: None,
-        };
-        crate::proctruth::with_omp_carrier_probe_fixture(fixture, || {
-            with_omp_binding_owner(owner.clone(), || {
-                assert_eq!(authenticated_omp_owner(&db, &moving).unwrap(), owner);
-                // Both calls share the same candidate IO, never a final observation override.
-                let presence =
-                    crate::proctruth::omp_carrier_presence(target, &[launcher.to_string()], &owner);
-                if cfg!(any(target_os = "linux", target_os = "android")) {
+        with_omp_binding_owner(owner.clone(), || {
+            assert_eq!(authenticated_omp_owner(&db, &moving).unwrap(), owner);
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                let fixture = crate::proctruth::OmpCarrierProbeFixture {
+                    candidates: vec![owner.pid, historical_owner.pid, unrelated.pid()],
+                    environment_permission_denied_pid: None,
+                };
+                crate::proctruth::with_omp_carrier_probe_fixture(fixture, || {
+                    // Both calls share candidate IO, never a final observation override.
+                    let presence = crate::proctruth::omp_carrier_presence(
+                        target,
+                        &[launcher.to_string()],
+                        &owner,
+                    );
                     assert_eq!(presence, crate::proctruth::OmpCarrierPresence::Absent);
                     assert_eq!(
                         bind_omp_session_to_process(&db, "sid-native-new", &moving)
@@ -6069,17 +6079,22 @@ mod tests {
                             (target.into(), "pty".into(), 54_381),
                         ]
                     );
-                } else {
-                    assert_eq!(presence, crate::proctruth::OmpCarrierPresence::Unknown);
-                    let error =
-                        bind_omp_session_to_process(&db, "sid-native-new", &moving).unwrap_err();
-                    assert!(
-                        format!("{error:#}").contains("has another live holder"),
-                        "{error:#}"
-                    );
-                    assert_eq!(db_state(&db), before);
-                }
-            });
+                });
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                assert_eq!(
+                    crate::proctruth::omp_carrier_presence(target, &[launcher.to_string()], &owner),
+                    crate::proctruth::OmpCarrierPresence::Unknown
+                );
+                let error =
+                    bind_omp_session_to_process(&db, "sid-native-new", &moving).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("has another live holder"),
+                    "{error:#}"
+                );
+                assert_eq!(db_state(&db), before);
+            }
         });
         assert!(unrelated.0.try_wait().unwrap().is_none());
     }
@@ -6176,6 +6191,245 @@ mod tests {
         });
         assert_eq!(db_state(&db), before);
         assert!(unrelated.0.try_wait().unwrap().is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[serial]
+    fn pr127_dead_owner_retained_minted_alias_live_native_carrier_refuses() {
+        let (db, _dir, mut owner) = omp_test_db();
+        owner.incarnation = crate::sys::process::identity(owner.pid).unwrap();
+        let mut historical = OmpTestChild::spawn();
+        let historical_owner = OmpOwner {
+            pid: historical.pid(),
+            incarnation: crate::sys::process::identity(historical.pid()).unwrap(),
+        };
+        let moving = format!("omp-{}-native-alias-moving", owner.pid);
+        let old_alias = format!("omp-{}-retained-alias", historical_owner.pid);
+        let launcher = "13712700-0000-4000-8000-000000000129";
+        let other_launcher = "13712700-0000-4000-8000-000000000130";
+        let source = "pr127-native-alias-source";
+        let target = "pr127-native-alias-target";
+        seed_omp_owner_row(&db, source, Some("sid-alias-old"), Some(&moving), &owner);
+        seed_omp_owner_row(
+            &db,
+            target,
+            Some("sid-alias-new"),
+            Some(launcher),
+            &historical_owner,
+        );
+        db.set_process_binding(other_launcher, "sid-alias-new", target)
+            .unwrap();
+        db.set_process_binding(&old_alias, "sid-alias-new", target)
+            .unwrap();
+        historical.0.kill().unwrap();
+        historical.0.wait().unwrap();
+        assert!(crate::proctruth::process_gone(historical_owner.pid));
+        let (_carrier_dir, mut carrier) = omp_carrier_probe_test_child("", &old_alias);
+        assert_ne!(carrier.pid(), owner.pid);
+        assert_ne!(carrier.pid(), historical_owner.pid);
+        let carrier_incarnation = crate::sys::process::identity(carrier.pid()).unwrap();
+        let owner_status = std::fs::read_to_string(format!("/proc/{}/status", owner.pid)).unwrap();
+        let carrier_status =
+            std::fs::read_to_string(format!("/proc/{}/status", carrier.pid())).unwrap();
+        assert_eq!(
+            owner_status
+                .lines()
+                .find(|line| line.starts_with("Uid:"))
+                .unwrap(),
+            carrier_status
+                .lines()
+                .find(|line| line.starts_with("Uid:"))
+                .unwrap()
+        );
+        assert!(crate::proctruth::carrier_eligible(carrier.pid()));
+        let environment = std::fs::read(format!("/proc/{}/environ", carrier.pid())).unwrap();
+        assert!(
+            environment
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == b"HCOM_INSTANCE_NAME=")
+        );
+        let alias_entry = format!("HCOM_PROCESS_ID={old_alias}");
+        assert!(
+            environment
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == alias_entry.as_bytes())
+        );
+        db.upsert_notify_endpoint(source, "pty", 54_401).unwrap();
+        db.upsert_notify_endpoint(target, "plugin", 54_402).unwrap();
+        let retained_ids = db
+            .process_binding_ids(target)
+            .unwrap()
+            .into_iter()
+            .filter(|id| id != &moving)
+            .collect::<Vec<_>>();
+        let before = db_state(&db);
+        let fixture = crate::proctruth::OmpCarrierProbeFixture {
+            candidates: vec![owner.pid, historical_owner.pid, carrier.pid()],
+            environment_permission_denied_pid: None,
+        };
+        crate::proctruth::with_omp_carrier_probe_fixture(fixture, || {
+            with_omp_binding_owner(owner.clone(), || {
+                assert_eq!(authenticated_omp_owner(&db, &moving).unwrap(), owner);
+                assert_eq!(
+                    crate::proctruth::omp_carrier_presence(target, &retained_ids, &owner),
+                    crate::proctruth::OmpCarrierPresence::Present
+                );
+                let error = bind_omp_session_to_process(&db, "sid-alias-new", &moving)
+                    .expect_err("a live retained minted-alias carrier must prevent adoption");
+                assert!(
+                    format!("{error:#}").contains("has another live holder"),
+                    "{error:#}"
+                );
+                assert_eq!(db_state(&db), before);
+                assert!(carrier.0.try_wait().unwrap().is_none());
+                assert_eq!(
+                    crate::sys::process::identity(carrier.pid()).as_deref(),
+                    Some(carrier_incarnation.as_str())
+                );
+
+                carrier.0.kill().unwrap();
+                carrier.0.wait().unwrap();
+                assert!(crate::proctruth::process_gone(carrier.pid()));
+                assert_eq!(
+                    crate::proctruth::omp_carrier_presence(target, &retained_ids, &owner),
+                    crate::proctruth::OmpCarrierPresence::Absent
+                );
+                assert_eq!(
+                    bind_omp_session_to_process(&db, "sid-alias-new", &moving)
+                        .unwrap()
+                        .as_deref(),
+                    Some(target)
+                );
+                assert_omp_pin(&db, target, &owner);
+                assert_released_session(
+                    &db,
+                    source,
+                    "sid-alias-old",
+                    17,
+                    "/tmp/omp-binding-transcript.jsonl",
+                );
+                assert_eq!(db.get_session_binding("sid-alias-old").unwrap(), None);
+                assert_eq!(
+                    db.get_session_binding("sid-alias-new").unwrap().as_deref(),
+                    Some(target)
+                );
+                for id in [&*moving, launcher, other_launcher, &*old_alias] {
+                    assert_eq!(
+                        db.get_process_binding_full(id).unwrap(),
+                        Some((Some("sid-alias-new".into()), target.into()))
+                    );
+                }
+                let row = db.get_instance_full(target).unwrap().unwrap();
+                assert_eq!(row.session_id.as_deref(), Some("sid-alias-new"));
+                assert_eq!(row.last_event_id, 17);
+                let endpoints = endpoint_rows(db.conn());
+                assert_eq!(
+                    endpoints,
+                    vec![
+                        (target.into(), "plugin".into(), 54_402),
+                        (target.into(), "pty".into(), 54_401),
+                    ]
+                );
+                let mut expected_ids = [&*moving, launcher, other_launcher, &*old_alias];
+                expected_ids.sort_unstable();
+                let mut actual_ids = db.process_binding_ids(target).unwrap();
+                actual_ids.sort_unstable();
+                assert!(
+                    actual_ids.iter().map(String::as_str).eq(expected_ids),
+                    "{actual_ids:?}"
+                );
+
+                let unmapped = format!("omp-{}-native-alias-unbound", owner.pid);
+                assert_eq!(db.get_process_binding_full(&unmapped).unwrap(), None);
+                assert_eq!(authenticated_omp_owner(&db, &unmapped).unwrap(), owner);
+                let before_unmapped = db_state(&db);
+                let error = bind_omp_session_to_process(&db, "sid-alias-new", &unmapped)
+                    .expect_err("an unmapped same-owner minted ID must not reuse retained UUIDs");
+                assert!(
+                    format!("{error:#}").contains("has another live holder"),
+                    "{error:#}"
+                );
+                assert_eq!(db_state(&db), before_unmapped);
+
+                assert_eq!(
+                    bind_omp_session_to_process(&db, "sid-alias-new", &moving)
+                        .expect("same-session replay must retain the adopted canonical identity")
+                        .as_deref(),
+                    Some(target)
+                );
+                assert_omp_pin(&db, target, &owner);
+                assert_eq!(
+                    db.get_session_binding("sid-alias-new").unwrap().as_deref(),
+                    Some(target)
+                );
+                for id in [&*moving, launcher, other_launcher, &*old_alias] {
+                    assert_eq!(
+                        db.get_process_binding_full(id).unwrap(),
+                        Some((Some("sid-alias-new".into()), target.into()))
+                    );
+                }
+                let replayed = db.get_instance_full(target).unwrap().unwrap();
+                assert_eq!(replayed.session_id.as_deref(), Some("sid-alias-new"));
+                assert_eq!(replayed.last_event_id, row.last_event_id);
+                assert_eq!(replayed.transcript_path, row.transcript_path);
+                assert_eq!(replayed.directory, row.directory);
+                assert_eq!(
+                    omp_launch_context(&replayed).unwrap(),
+                    omp_launch_context(&row).unwrap()
+                );
+                assert_eq!(endpoint_rows(db.conn()), endpoints);
+                let mut actual_ids = db.process_binding_ids(target).unwrap();
+                actual_ids.sort_unstable();
+                assert!(
+                    actual_ids.iter().map(String::as_str).eq(expected_ids),
+                    "{actual_ids:?}"
+                );
+
+                let fresh_session = "sid-alias-branch";
+                assert_eq!(db.get_session_binding(fresh_session).unwrap(), None);
+                assert!(
+                    db.find_stopped_snapshot_by_session_id(fresh_session)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    bind_omp_session_to_process(&db, fresh_session, &moving)
+                        .expect("a fresh session branch must reuse the adopted canonical identity")
+                        .as_deref(),
+                    Some(target)
+                );
+                assert_omp_pin(&db, target, &owner);
+                assert_eq!(
+                    db.get_session_binding(fresh_session).unwrap().as_deref(),
+                    Some(target)
+                );
+                assert_eq!(db.get_session_binding("sid-alias-new").unwrap(), None);
+                assert_eq!(
+                    db.get_process_binding_full(&moving).unwrap(),
+                    Some((Some(fresh_session.into()), target.into()))
+                );
+                for id in [launcher, other_launcher, &*old_alias] {
+                    assert_eq!(db.get_process_binding(id).unwrap().as_deref(), Some(target));
+                }
+                let branched = db.get_instance_full(target).unwrap().unwrap();
+                assert_eq!(branched.session_id.as_deref(), Some(fresh_session));
+                assert_eq!(branched.last_event_id, row.last_event_id);
+                assert_eq!(branched.transcript_path, row.transcript_path);
+                assert_eq!(branched.directory, row.directory);
+                assert_eq!(
+                    omp_launch_context(&branched).unwrap(),
+                    omp_launch_context(&row).unwrap()
+                );
+                assert_eq!(endpoint_rows(db.conn()), endpoints);
+                let mut actual_ids = db.process_binding_ids(target).unwrap();
+                actual_ids.sort_unstable();
+                assert!(
+                    actual_ids.iter().map(String::as_str).eq(expected_ids),
+                    "{actual_ids:?}"
+                );
+            });
+        });
     }
 
     fn expire_omp_owner_before_commit(_db: &HcomDb, _name: &str) {

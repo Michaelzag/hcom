@@ -63,6 +63,40 @@ fn open_db(h: &Hcom) -> rusqlite::Connection {
     rusqlite::Connection::open(h.path().join("hcom.db")).expect("open isolated hcom.db")
 }
 
+// Full-row snapshot convention shared with the native binding tests.
+fn db_state(h: &Hcom) -> Vec<String> {
+    let db = open_db(h);
+    let mut tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("prepare table snapshot");
+    let names = tables
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query snapshot tables")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read snapshot tables");
+    let mut state = Vec::new();
+    for table in names {
+        let quoted = table.replace('"', "\"\"");
+        let mut stmt = db
+            .prepare(&format!("SELECT * FROM \"{quoted}\""))
+            .expect("prepare row snapshot");
+        let columns = stmt.column_count();
+        let mut rows = stmt
+            .query_map([], |row| {
+                let values = (0..columns)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(format!("{table}: {values:?}"))
+            })
+            .expect("query snapshot rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("read snapshot rows");
+        rows.sort();
+        state.extend(rows);
+    }
+    state
+}
+
 fn count(db: &rusqlite::Connection, sql: &str, params: &[&str]) -> i64 {
     db.query_row(sql, rusqlite::params_from_iter(params.iter()), |r| r.get(0))
         .expect("count query")
@@ -477,28 +511,29 @@ fn inherited_synthetic_omp_id_does_not_join_without_plain_sessions() {
 }
 
 #[test]
-fn unproven_launcher_uuid_retries_as_plain_with_opt_in() {
-    // Model the plugin's one retry: first present an inherited launcher UUID
-    // without a row, then replace it with this OMP process's minted id.
+fn unproven_launcher_uuid_is_terminal_without_identity_mutation_even_with_opt_in() {
+    // An explicit unproven launcher UUID is terminal even when plain sessions
+    // are enabled; it must not be replaced with a freshly minted identity.
     let h = Hcom::new();
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
     enable_plain_sessions(&h);
     let inherited_id = "550e8400-e29b-41d4-a716-446655440000";
-    let sid = format!("sid-retry-{}", unique_suffix());
+    let sid = format!("sid-refused-{}", unique_suffix());
+    let owner_name = format!("sentinel{}", unique_suffix());
+    let owner_sid = format!("owner-{sid}");
+    let owner_id = format!("owner-process-{sid}");
+    seed_identity(&h, &owner_name, &owner_sid, &owner_id);
     let fakebin = h.root_path().join("fakebin");
     fs::create_dir_all(&fakebin).expect("create fakebin dir");
     let omp = fakebin.join("omp");
     unix_fs::symlink("/bin/bash", &omp).expect("symlink omp -> /bin/bash");
-    let out_dir = h.root_path().join("retry-session");
-    fs::create_dir_all(&out_dir).expect("create retry output dir");
+    let out_dir = h.root_path().join("refused-session");
+    fs::create_dir_all(&out_dir).expect("create refusal output dir");
     let script = out_dir.join("session.sh");
     fs::write(
         &script,
         r#"
-HCOM_LAUNCHED=1 HCOM_TOOL=omp "$TEST_BIN" omp-start --session-id "$TEST_SID" --cwd "$TEST_CWD" \
-    > "$TEST_OUT_DIR/first.json" 2> "$TEST_OUT_DIR/first.stderr"
-export HCOM_PROCESS_ID=omp-$$-1-1
 printf "%s" "$HCOM_PROCESS_ID" > "$TEST_OUT_DIR/id.txt"
 HCOM_LAUNCHED=1 HCOM_TOOL=omp "$TEST_BIN" omp-start --session-id "$TEST_SID" --cwd "$TEST_CWD" \
     > "$TEST_OUT_DIR/start.json" 2> "$TEST_OUT_DIR/start.stderr"
@@ -506,7 +541,7 @@ printf "%s" "$?" > "$TEST_OUT_DIR/start.code"
 while :; do sleep 1; done
 "#,
     )
-    .expect("write retry script");
+    .expect("write refusal script");
     let mut cmd = h.external_cmd(&omp);
     cmd.arg("-c")
         .arg(format!(
@@ -520,22 +555,26 @@ while :; do sleep 1; done
         .env("TEST_SID", &sid)
         .env("TEST_CWD", &h.workspace)
         .process_group(0);
-    let child = cmd.spawn().expect("spawn fake omp retry session");
+    let before = db_state(&h);
+    let child = cmd.spawn().expect("spawn fake omp refusal session");
     h.track_cleanup_pid(child.id() as i64);
     let mut session = FakeOmpSession { child, out_dir };
     let (start_code, start) = wait_for_start(&h, &session);
-    assert_eq!(start_code, "0", "retry exit {}", session.detail(&start));
-    let first: Value =
-        serde_json::from_str(&session.read("first.json")).expect("initial hook refusal JSON");
-    assert_eq!(first["error"], "HCOM_PROCESS_ID not set", "{first}");
+    assert_eq!(start_code, "0", "hook exit {}", session.detail(&start));
     assert!(
-        first.get("name").is_none(),
-        "unproven UUID bound on first attempt: {first}"
+        start["error"].is_string() && start.get("name").is_none(),
+        "unproven UUID was not refused: {start}"
     );
-    let name = start["name"].as_str().expect("plain retry bound own id");
-    assert_eq!(session.read("id.txt"), session.minted_id());
+    assert!(
+        start.get("transient").is_none(),
+        "refusal was marked transient: {start}"
+    );
+    assert!(
+        start.get("session_id").is_none(),
+        "unproven UUID bound a session: {start}"
+    );
+    assert_eq!(session.read("id.txt"), inherited_id);
     let db = open_db(&h);
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM instances", &[]), 1);
     assert_eq!(
         count(
             &db,
@@ -547,12 +586,18 @@ while :; do sleep 1; done
     assert_eq!(
         count(
             &db,
-            "SELECT COUNT(*) FROM process_bindings WHERE process_id = ?1 AND instance_name = ?2",
-            &[session.minted_id().as_str(), name],
+            "SELECT COUNT(*) FROM process_bindings WHERE process_id = ?1",
+            &[session.minted_id().as_str()],
         ),
-        1
+        0
+    );
+    assert_eq!(
+        db_state(&h),
+        before,
+        "the refused unmapped UUID mutated the database"
     );
     drop(db);
+    assert_no_bind_and_owner_intact(&h, &sid, &owner_name, &owner_sid, &owner_id);
     kill_group(&mut session.child);
 }
 
@@ -561,12 +606,11 @@ fn provable_omp_ancestor_is_trusted_and_reaped_as_carrier() {
     // Rule pinned (design §1, `omp-<pid>-...` row): a provable chain IS
     // honoured — the id's pid is a live ancestor whose comm is exactly "omp"
     // (a process exec'd from a file named `omp`), so the id survives
-    // sanitization and binds. An untrusted id is sanitized to ABSENT before
-    // the handler even with the config gate open ("HCOM_PROCESS_ID not
-    // set"), so the successful bind below is itself the trust proof. The
-    // follow-up external `omp-stop` reaping the ancestor proves the ancestor
-    // is enumerated as a carrier of the instance (its environ carries the
-    // binding id) — the same observable tests/omp_stop_release.rs uses.
+    // sanitization and binds, so the successful bind below is itself the
+    // trust proof. The follow-up operator `stop` reaping the ancestor proves
+    // the ancestor is enumerated as a carrier of the instance (its environ
+    // carries the binding id) — the same observable tests/omp_stop_release.rs
+    // uses.
     let h = Hcom::new();
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
@@ -612,15 +656,36 @@ fn provable_omp_ancestor_is_trusted_and_reaped_as_carrier() {
     assert_eq!(bound_id, name);
     drop(db);
 
-    // External release: this caller carries no identity facts and the fake
-    // omp is not its ancestor, so the ancestor is in signal scope only
-    // through carrier enumeration.
-    let (stop_code, stop_out, stop_err) =
+    // An external hook without identity facts cannot release this owner.
+    let before = db_state(&h);
+    let (hook_code, hook_out, hook_err) =
         h.run(["omp-stop", "--name", &name, "--reason", "carrier-proof"]);
-    assert_eq!(stop_code, 0, "omp-stop failed: {stop_out} {stop_err}");
+    assert_eq!(hook_code, 0, "omp-stop failed: {hook_out} {hook_err}");
+    let refused: Value = serde_json::from_str(hook_out.trim()).expect("omp-stop refusal JSON");
+    assert!(refused["error"].is_string(), "{refused}");
+    assert!(refused.get("transient").is_none(), "{refused}");
+    assert!(refused.get("name").is_none(), "{refused}");
+    assert_eq!(
+        db_state(&h),
+        before,
+        "unauthenticated stop mutated the database"
+    );
+    assert!(
+        session
+            .child
+            .try_wait()
+            .expect("poll owner after refusal")
+            .is_none(),
+        "unauthenticated stop killed the owner"
+    );
+
+    // Authorized operator release: the fake omp is not this caller's
+    // ancestor, so it is in signal scope only through carrier enumeration.
+    let (stop_code, stop_out, stop_err) = h.run(["stop", &name]);
+    assert_eq!(stop_code, 0, "stop failed: {stop_out} {stop_err}");
     let Some(status) = wait_with_deadline(&mut session.child, Duration::from_secs(30)) else {
         kill_group(&mut session.child);
-        panic!("the provable omp ancestor survived omp-stop: never reaped as a carrier");
+        panic!("the provable omp ancestor survived operator stop: never reaped as a carrier");
     };
     assert!(
         status.signal().is_some(),
@@ -789,24 +854,14 @@ fn plain_sessions_gate_controls_provable_chain_minting() {
 
 #[test]
 fn start_hook_replaces_stale_installed_plugin() {
-    // Rule pinned (design §4.2): `handle_start` refreshes a stale installed
-    // plugin first thing, so the next omp session loads the hcom.ts this
-    // binary embeds. The refresh runs before any identity logic, so driving
-    // the hook down its refusal path (no `HCOM_PROCESS_ID`) still exercises
-    // it — the gate only needs one instance row to exist.
+    // An authenticated native session refreshes a stale managed plugin so
+    // the next omp session loads the hcom.ts this binary embeds.
     let h = Hcom::new();
     let (code, _, stderr) = h.run(["status", "--json"]);
     assert_eq!(code, 0, "status failed: {stderr}");
 
     let suffix = unique_suffix();
-    // Seed one row so `hook_gate_check`'s "any instance exists" fallback
-    // lets the hook through to `handle_start`.
-    seed_identity(
-        &h,
-        &format!("plugin{suffix}"),
-        &format!("sid-owner-{suffix}"),
-        &format!("omp-seed-{suffix}"),
-    );
+    enable_plain_sessions(&h);
 
     // Resolved plugin path under the fixture env: `tool_config_root()` is the
     // parent of `$HCOM_DIR` (`<root>/hcom-state` -> `<root>`), which differs
@@ -825,20 +880,21 @@ fn start_hook_replaces_stale_installed_plugin() {
     fs::write(&plugin_path, stale).expect("write stale plugin");
 
     let sid = format!("sid-plugin-{suffix}");
-    let (hook_code, stdout, stderr) = h.run([
-        "omp-start",
-        "--session-id",
-        &sid,
-        "--cwd",
-        &h.workspace.to_string_lossy(),
-    ]);
-    assert_eq!(hook_code, 0, "omp-start failed: {stderr}");
-    let response: Value =
-        serde_json::from_str(stdout.trim()).expect("omp-start returns JSON on the RPC contract");
-    assert!(
-        response.get("error").is_some(),
-        "expected the identity-less refusal after the plugin refresh: {response}"
+    let mut session = spawn_provable_omp_session(&h, &format!("plugin{suffix}"), &sid);
+    let (hook_code, response) = wait_for_start(&h, &session);
+    assert_eq!(
+        hook_code,
+        "0",
+        "omp-start exit {}",
+        session.detail(&response)
     );
+    assert!(
+        response.get("error").is_none(),
+        "authenticated start refused: {}",
+        session.detail(&response)
+    );
+    assert!(response["name"].as_str().is_some(), "{response}");
+    assert_eq!(response["session_id"].as_str(), Some(sid.as_str()));
 
     let installed =
         fs::read_to_string(&plugin_path).expect("plugin file present after the start hook");
@@ -854,4 +910,5 @@ fn start_hook_replaces_stale_installed_plugin() {
         installed, PLUGIN_SOURCE,
         "installed plugin does not byte-match the embedded PLUGIN_SOURCE"
     );
+    kill_group(&mut session.child);
 }

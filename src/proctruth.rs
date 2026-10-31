@@ -174,27 +174,32 @@ pub(crate) fn has_live_carriers(
 /// readable observation can establish absence; uncertainty never releases a UUID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OmpCarrierPresence {
+    #[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
     Present,
     Absent,
     Unknown,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 pub(crate) struct OmpCarrierProbeFixture {
     pub candidates: Vec<u32>,
     pub environment_permission_denied_pid: Option<u32>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static OMP_CARRIER_PRESENCE: std::cell::Cell<Option<OmpCarrierPresence>> =
         const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+thread_local! {
     static OMP_CARRIER_PROBE_FIXTURE: std::cell::RefCell<Option<OmpCarrierProbeFixture>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Scope only the carrier observation, not caller or native owner authentication.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn with_omp_carrier_presence<T>(
     presence: OmpCarrierPresence,
     f: impl FnOnce() -> T,
@@ -212,7 +217,7 @@ pub(crate) fn with_omp_carrier_presence<T>(
 }
 
 /// Scope candidate enumeration and one optional environment IO failure only.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 pub(crate) fn with_omp_carrier_probe_fixture<T>(
     fixture: OmpCarrierProbeFixture,
     f: impl FnOnce() -> T,
@@ -237,7 +242,7 @@ pub(crate) fn omp_carrier_presence(
     binding_ids: &[String],
     moving_owner: &OmpOwner,
 ) -> OmpCarrierPresence {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if let Some(presence) = OMP_CARRIER_PRESENCE.with(|slot| slot.get()) {
         return presence;
     }
